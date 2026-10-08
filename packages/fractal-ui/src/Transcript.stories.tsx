@@ -229,12 +229,78 @@ export const SendIdentity: Story = { render: args => <SendIdentityStory scheme={
 } }
 export const SendIdentityLight: Story = { ...SendIdentity, args: { scheme: 'light' } }
 
+const appendBase = fixture('streaming', 'append')
+const appendTurn = appendBase.turns[0]!
+const appendInitialItems: readonly ConversationItem[] = [
+  appendTurn.items[0]!, appendTurn.items[3]!,
+  { ...(appendTurn.items[4] as TextItem), text: Array.from({ length: 24 }, (_, index) => `Observed row ${index + 1} stays in the retained transcript.`).join('\n\n') },
+]
+const appendItems: readonly ConversationItem[] = [
+  { _tag: 'ToolCall', id: 'append/new-tool', callId: 'append/new-tool', name: 'run', input: { command: "printf '%s\\n' 'retained rows'" }, status: 'running', callSeen: true, at },
+  { _tag: 'Reasoning', id: 'append/new-thinking', text: 'New reasoning follows the observed tool call.', streaming: true, at },
+  { _tag: 'Text', id: 'append/new-answer', role: 'assistant', text: 'New answer content follows the retained rows.', attachments: [], streaming: true, at },
+]
+function AppendedItemsStory({ scheme = 'dark' }: { scheme?: Scheme }) {
+  const [count, setCount] = React.useState(0)
+  const data = React.useMemo<TranscriptStoryData>(() => {
+    const items = [...appendInitialItems, ...appendItems.slice(0, count)]
+    return { sync: appendBase.sync, turns: [{ ...appendTurn, items, work: workLogTurnFromItems(items, { kindFor: name => name === 'run' ? 'run' : 'read', running: true, failed: false, interrupted: false, startedAt: at, completeHistory: true }) }] }
+  }, [count])
+  return <main data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><button type="button" disabled={count === appendItems.length} onClick={() => setCount(value => value + 1)}>Append {count === 0 ? 'tool' : count === 1 ? 'reasoning' : 'answer'}</button><div {...stylex.props(styles.frame)}><RuntimeTranscript data={data} onOpenTool={() => {}} onRetry={() => {}} /></div></main>
+}
+export const AppendedItems: Story = { render: args => <AppendedItemsStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const turn = await canvas.findByTestId('transcript-turn')
+  const prompt = await canvas.findByTestId('user-message')
+  const answerRow = await canvas.findByTestId('agent-message')
+  const work = within(turn).getByTestId('work-log')
+  const tool = within(work).getByRole('button', { name: /^read src\/rows\.ts\b/ })
+  await userEvent.click(tool)
+  await expect(tool).toHaveAttribute('aria-expanded', 'true')
+  const thinking = within(work).getByTestId('thinking-entry')
+  const thinkingControl = within(thinking).getByRole('button', { name: 'Thinking' })
+  await userEvent.click(thinkingControl)
+  await expect(thinkingControl).toHaveAttribute('aria-expanded', 'true')
+  const lane = canvas.getByTestId('transcript-scroll')
+  lane.scrollTop = 48
+  lane.dispatchEvent(new Event('scroll'))
+  const scrollTop = lane.scrollTop
+  await expect(scrollTop).toBeGreaterThan(0)
+  const retained = [turn, prompt, answerRow, work, tool, thinking]
+  const removed: Node[] = []
+  const recordRemovals = (records: MutationRecord[]) => {
+    for (const record of records) for (const node of record.removedNodes) {
+      if (retained.some(element => node === element || node.contains(element))) removed.push(node)
+    }
+  }
+  const observer = new MutationObserver(recordRemovals)
+  observer.observe(canvasElement, { subtree: true, childList: true })
+  try {
+    for (const [index, label] of ['tool', 'reasoning', 'answer'].entries()) {
+      await userEvent.click(canvas.getByRole('button', { name: `Append ${label}` }))
+      await waitFor(() => expect(index === 0 ? work.querySelector('[data-tool-status="running"]') : index === 1 ? within(work).queryAllByTestId('thinking-entry').length === 2 : within(turn).queryByText('New answer content follows the retained rows.')).toBeTruthy())
+      recordRemovals(observer.takeRecords())
+      await expect(removed).toHaveLength(0)
+      await expect(canvas.getByTestId('transcript-turn')).toBe(turn)
+      await expect(canvas.getByTestId('user-message')).toBe(prompt)
+      await expect(canvasElement.querySelector('[data-item-id="append/answer"]')).toBe(answerRow)
+      await expect(within(turn).getByTestId('work-log')).toBe(work)
+      await expect(within(work).getByRole('button', { name: /^read src\/rows\.ts\b/ })).toBe(tool)
+      await expect(within(work).getAllByTestId('thinking-entry')[0]).toBe(thinking)
+      await expect(tool).toHaveAttribute('aria-expanded', 'true')
+      await expect(thinkingControl).toHaveAttribute('aria-expanded', 'true')
+      await expect(lane.scrollTop).toBe(scrollTop)
+    }
+  } finally { observer.disconnect() }
+} }
+export const AppendedItemsLight: Story = { ...AppendedItems, args: { scheme: 'light' } }
+
 const retrySend = fn<(itemId: string) => void>()
 function FailedRetryStory({ scheme = 'dark' }: { scheme?: Scheme }) {
   const [state, setState] = React.useState<State>('failed-send')
   const data = React.useMemo(() => fixture(state, 'retry'), [state])
   const retry = (itemId: string) => { retrySend(itemId); setState('pending-send') }
-  return <main data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><h1>Failed → Retry</h1><button type="button" onClick={() => setState('settled')}>Deliver echo</button><div {...stylex.props(styles.frame)}><RuntimeTranscript data={data} onOpenTool={() => {}} onRetry={() => {}} onRetrySend={retry} /></div></main>
+  return <main data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><h2>Failed → Retry</h2><button type="button" onClick={() => setState('settled')}>Deliver echo</button><div {...stylex.props(styles.frame)}><RuntimeTranscript data={data} onOpenTool={() => {}} onRetry={() => {}} onRetrySend={retry} /></div></main>
 }
 export const FailedRetry: Story = { name: 'Failed → Retry', render: args => <FailedRetryStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
   retrySend.mockClear()
@@ -382,8 +448,54 @@ export const DefaultEmpty: Story = { args: { state: 'empty' }, play: async ({ ca
   await expect(within(canvasElement).getByTestId('transcript-empty')).toHaveTextContent('No messages yet')
 } }
 export const SettledAnswerMetaLight: Story = { ...SettledAnswerMeta, args: { scheme: 'light' } }
+
+const tokenAnswer = 'Quoted shell and diff tokens stay neutral.\n\n```bash\nprintf \'%s\\n\' "retained rows"\necho \'single quoted\' > "out file.txt"\n```\n\n```diff\n--- a/src/rows.ts\n+++ b/src/rows.ts\n@@ -1,2 +1,2 @@\n-const label = "old row"\n+const label = "new row"\n```'
+const tokenItems: readonly ConversationItem[] = cases.settled.turns[0]!.items.map(item => item._tag === 'ToolCall' && item.name === 'run' ? { ...item, input: { command: 'printf \'%s\\n\' "retained rows"' }, result: { content: 'printf \'%s\\n\' "retained rows"\n+inserted line', mediaType: 'text/x-diff', isError: false, at } } : item._tag === 'Text' && item.role === 'assistant' ? { ...item, id: 'tokens/answer', text: tokenAnswer } : item)
+const tokenData: TranscriptStoryData = { sync: { _tag: 'Live', since: now }, turns: [{ ...cases.settled.turns[0]!, id: 'tokens', items: tokenItems, work: workLogTurnFromItems([cases.settled.turns[0]!.prompt!, ...tokenItems], { kindFor: name => name === 'run' ? 'run' : 'read', running: false, failed: false, interrupted: false, durationMs: 24000, startedAt: at, completeHistory: true }) }] }
+const noGreenData: readonly (readonly [string, TranscriptStoryData])[] = [['tokens', tokenData], ['semantic', semanticData], ...(Object.keys(cases) as State[]).map(state => [state, cases[state]] as const)]
+// Green is hue 90-170° with HSL saturation above 25%; any colour function the parser cannot read fails too.
+function greenFindings(root: Element): string[] {
+  const findings: string[] = []
+  const properties = ['color', 'background-color', 'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color', 'outline-color', 'text-decoration-color', 'caret-color', 'fill', 'stroke', 'box-shadow', 'background-image']
+  for (const element of [root, ...root.querySelectorAll('*')]) for (const pseudo of [null, '::before', '::after']) {
+    const style = getComputedStyle(element, pseudo)
+    for (const property of properties) {
+      const value = style.getPropertyValue(property)
+      if (/\b(?:oklch|oklab|lab|lch|hsla?|hwb)\(/.test(value)) { findings.push(`${property} unparsed ${value}`); continue }
+      for (const match of value.matchAll(/rgba?\(([^)]*)\)|color\(srgb ([^)]*)\)/g)) {
+        const parts = (match[1] ?? match[2]!).split(/[\s,/]+/).filter(Boolean).map(Number)
+        const scale = match[1] === undefined ? 1 : 255
+        const [red, green, blue] = parts.slice(0, 3).map(part => part / scale) as [number, number, number]
+        if ((parts[3] ?? 1) === 0) continue
+        const max = Math.max(red, green, blue), min = Math.min(red, green, blue), lightness = (max + min) / 2
+        if (max === min) continue
+        const saturation = (max - min) / (1 - Math.abs(2 * lightness - 1))
+        const hue = (max === red ? ((green - blue) / (max - min) + 6) % 6 : max === green ? (blue - red) / (max - min) + 2 : (red - green) / (max - min) + 4) * 60
+        if (hue >= 90 && hue <= 170 && saturation > 0.25) findings.push(`${element.tagName.toLowerCase()}${pseudo ?? ''}[${element.getAttribute('data-syntax-token') ?? element.getAttribute('data-testid') ?? ''}] ${property} ${match[0]}`)
+      }
+    }
+  }
+  return findings
+}
+function NoGreenStory({ scheme = 'dark' }: { scheme?: Scheme }) {
+  return <main data-scheme={scheme} {...stylex.props(styles.all, ...baselineTheme, scheme === 'light' && lightTheme)}>{noGreenData.map(([name, data]) => <section key={name} data-no-green-state={name}><h2>{name}</h2><div {...stylex.props(styles.cell)}><RuntimeTranscript data={data} onOpenTool={() => {}} onRetry={() => {}} onRetrySend={() => {}} /></div></section>)}</main>
+}
+export const NoGreenAllStates: Story = { render: args => <NoGreenStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
+  await within(canvasElement).findAllByTestId('transcript-turn')
+  for (let pass = 0; pass < 4; pass++) {
+    const closed = [...canvasElement.querySelectorAll<HTMLElement>('[aria-expanded="false"]:not([disabled]):not([aria-disabled="true"])')]
+    for (const control of closed) await userEvent.click(control)
+  }
+  const tokens = canvasElement.querySelector('[data-no-green-state="tokens"]')!
+  await waitFor(() => expect(tokens.querySelector('[data-syntax-token~="inserted"]')).not.toBeNull())
+  await expect(tokens.querySelectorAll('[data-syntax-token~="string"]').length).toBeGreaterThan(2)
+  await expect(tokens.querySelector('[data-testid="tool-detail-preview"]')).not.toBeNull()
+  await expect(canvasElement.querySelectorAll('[data-testid="thinking-entry"]').length).toBeGreaterThan(0)
+  await expect(greenFindings(canvasElement)).toEqual([])
+} }
+export const NoGreenAllStatesLight: Story = { ...NoGreenAllStates, args: { scheme: 'light' } }
 const styles = stylex.create({
   root: { height: '100vh', width: '100%', minWidth: 0, boxSizing: 'border-box', display: 'flex', flexDirection: 'column', backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans },
-  frame: { flex: '1 1 0', minHeight: 0 }, detail: { padding: s.lg, maxHeight: g.previewMax, overflow: 'auto', fontSize: t.metaSize },
+  frame: { flex: '1 1 0', minHeight: 0 }, cell: { height: '720px', display: 'flex', flexDirection: 'column' }, detail: { padding: s.lg, maxHeight: g.previewMax, overflow: 'auto', fontSize: t.metaSize },
   all: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: s.lg, padding: s.lg, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans },
 })
