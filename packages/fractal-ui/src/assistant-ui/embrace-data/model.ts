@@ -32,6 +32,8 @@ export type ConversationItem =
       readonly text: string
       readonly attachments: readonly Attachment[]
       readonly streaming: boolean
+      /** Host-observed send lifecycle for user prompts; absent means not reported. */
+      readonly sendState?: SendState
       readonly model?: string
       readonly at: string
       readonly sender?: Sender
@@ -127,3 +129,9 @@ export type UsageItem = Extract<ConversationItem, { _tag: 'Usage' }>
 export type NoticeItem = Extract<ConversationItem, { _tag: 'Notice' }>
 export type EventItem = Extract<ConversationItem, { _tag: 'Event' }>
 export type UnknownEventItem = Extract<ConversationItem, { _tag: 'UnknownEvent' }>
+
+/** Delivery lifecycle for a user prompt, from the host's own observations. */
+export type SendState =
+  | { readonly _tag: 'Sent' }
+  | { readonly _tag: 'Pending' }
+  | { readonly _tag: 'Failed'; readonly reason: string; readonly detail?: string }

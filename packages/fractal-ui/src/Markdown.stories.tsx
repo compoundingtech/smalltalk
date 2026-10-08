@@ -93,6 +93,38 @@ const requireElement = <T extends Element>(root: Element, selector: string): T =
   if (element === null) throw new Error(`Missing ${selector}`)
   return element
 }
+
+function streamingTailStory(text: string, terminalSelector: string): Story {
+  return {
+    render: ({ scheme }) => <main data-testid="markdown-story" {...stylex.props(styles.canvas, ...baselineTheme, scheme === 'light' && lightTheme)}><ThemePortal><div {...stylex.props(styles.lane)}><Markdown text={text} streaming /></div></ThemePortal></main>,
+    play: async ({ canvasElement }) => {
+      await document.fonts.ready
+      const markdown = requireElement<HTMLElement>(canvasElement, '[data-testid="markdown"]')
+      const tails = markdown.querySelectorAll<HTMLElement>('[data-streaming-tail="true"]')
+      if (tails.length !== 1) throw new Error(`Expected one streaming caret after ${terminalSelector}, found ${tails.length}`)
+      const tail = tails[0]!
+      const caret = getComputedStyle(tail, '::after')
+      if (caret.content !== '""' || caret.display !== 'inline-block' || parseFloat(caret.width) <= 0 || parseFloat(caret.height) <= 0 || caret.backgroundColor === 'rgba(0, 0, 0, 0)') throw new Error('Streaming caret exists but is not painted')
+      if (terminalSelector === 'p') {
+        if (tail !== markdown.lastElementChild || tail.tagName !== 'P') throw new Error('Paragraph caret must stay inside the final paragraph, not on its own line')
+        const range = document.createRange()
+        range.selectNodeContents(tail)
+        const lines = range.getClientRects()
+        if (lines.length !== 1 || tail.getBoundingClientRect().height > parseFloat(getComputedStyle(tail).lineHeight) + 1) throw new Error('Paragraph caret introduced another line')
+      } else if (tail !== markdown.lastElementChild || tail.tagName !== 'SPAN' || !tail.previousElementSibling?.matches(terminalSelector)) throw new Error(`Streaming fallback must follow the terminal ${terminalSelector}`)
+    },
+  }
+}
+export const StreamingCodeBlock: Story = streamingTailStory('The current implementation is:\n\n```typescript\nexport const selected = "row-3";\n```', '[data-testid="markdown-code-block"]')
+export const StreamingHeading: Story = streamingTailStory('The next section is:\n\n## Selection details', 'h2')
+export const StreamingTable: Story = streamingTailStory('Current resources:\n\n| Resource | State |\n| --- | --- |\n| Selection model | Ready |', '[role="region"]')
+export const StreamingTightList: Story = streamingTailStory('Current checks:\n\n- Preserve selection identity.\n- Restore keyboard focus.', 'ul')
+export const StreamingParagraph: Story = streamingTailStory('Selection identity stays stable.\n\nThe current result is ready.\n', 'p')
+export const StreamingCodeBlockLight: Story = { ...StreamingCodeBlock, args: { scheme: 'light' } }
+export const StreamingHeadingLight: Story = { ...StreamingHeading, args: { scheme: 'light' } }
+export const StreamingTableLight: Story = { ...StreamingTable, args: { scheme: 'light' } }
+export const StreamingTightListLight: Story = { ...StreamingTightList, args: { scheme: 'light' } }
+export const StreamingParagraphLight: Story = { ...StreamingParagraph, args: { scheme: 'light' } }
 export const RichText: Story = {
   play: async ({ canvasElement }) => {
     const root = requireElement(canvasElement, '[data-testid="markdown"]')
@@ -126,8 +158,10 @@ export const Languages: Story = {
     }
   },
 }
-export const Light: Story = { args: { scheme: 'light' } }
+export const Light: Story = { ...RichText, args: { scheme: 'light' } }
 export const AllStates: Story = { args: { scenario: 'all' } }
+export const LanguagesLight: Story = { ...Languages, args: { scenario: 'languages', scheme: 'light' } }
+export const AllStatesLight: Story = { args: { scenario: 'all', scheme: 'light' } }
 export const StreamingControlsPersistence: Story = {
   args: { scenario: 'streaming' },
   play: async ({ canvasElement }) => {
@@ -168,6 +202,7 @@ export const StreamingControlsPersistence: Story = {
     }
   },
 }
+export const StreamingControlsPersistenceLight: Story = { ...StreamingControlsPersistence, args: { scenario: 'streaming', scheme: 'light' } }
 export const StreamingInlineMarkup: Story = {
   args: { scenario: 'inline-streaming' },
   play: async ({ canvasElement }) => {

@@ -64,6 +64,8 @@ export const convertConversationItem = (item: ConversationItem): ThreadMessageLi
       const text = { type: 'text', id: `${item.id}:text`, text: item.text } as const
       if (item.attachments.length > 0) diagnostics.push('opaque-attachments-retained')
       if (item.role === 'user') return {
+        // assistant-ui rejects `status` on user messages; sendState travels on metadata.custom.item
+        // and the message keeps its id from Pending to Sent.
         ...common, role: 'user', content: [text],
         attachments: item.attachments.map((attachment): NonNullable<ThreadMessageLike['attachments']>[number] => ({
           id: attachment.id,
