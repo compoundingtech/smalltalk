@@ -12,6 +12,7 @@ use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OpenFlags, Transaction};
 
 mod transaction_finalizer;
+mod writer_queue;
 use transaction_finalizer::TransactionFinalizers;
 pub use transaction_finalizer::WriterTransaction;
 
@@ -259,7 +260,7 @@ pub fn truncate_idle_wal(connection: &Connection) -> Result<bool> {
 }
 
 /// The store's only write connection, owned by one writer thread. Writes queue in front of it in
-/// arrival order: a batched write runs on the writer thread with the others queued behind it, each
+/// foreground arrival order: a batched write runs on the writer thread with the others queued behind it, each
 /// in a savepoint of one transaction that commits once for all of them, and its caller hears back
 /// after that commit. `write` lends the connection itself to its caller until the guard drops,
 /// for writes that manage their own transactions. Nothing else ever takes SQLite's write lock.
@@ -269,6 +270,7 @@ pub struct WriterConnection {
     pub committed_index: Arc<AtomicU64>,
     observers: Arc<CommitObservers>,
     finalizers: Arc<TransactionFinalizers>,
+    background: Arc<writer_queue::BackgroundAdmission>,
     mutation_observer: Option<Arc<writer_observer::MutationState>>,
     /// Transactions the writer committed for batched writes, and the batched writes in them.
     /// Tests read them; `st replication status` counts every commit.
@@ -285,6 +287,16 @@ pub enum WriterJob {
         /// When profiling, when its caller began to wait and who held the writer then.
         wait: Option<crate::profile::WriterWait>,
         done: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
+    /// Opt-in background queue notification. No SQL or connection is carried here.
+    #[doc(hidden)]
+    BackgroundReady(Arc<writer_queue::BackgroundQueue>),
+    /// A configuration barrier drains background loans admitted before its watermark.
+    #[doc(hidden)]
+    FenceLend {
+        through: u64,
+        lent: std::sync::mpsc::SyncSender<Connection>,
+        returned: std::sync::mpsc::Receiver<Connection>,
     },
     /// Hands the connection to a caller until its guard gives it back.
     Lend {
@@ -348,6 +360,8 @@ impl WriterConnection {
         let observed = observers.clone();
         let finalizers = Arc::new(TransactionFinalizers::default());
         let finalized = finalizers.clone();
+        let background = Arc::new(writer_queue::BackgroundAdmission::default());
+        let background_queue = background.clone();
         let thread = std::thread::Builder::new()
             .name("st3-writer".into())
             .spawn(move || {
@@ -358,6 +372,7 @@ impl WriterConnection {
                     &counted,
                     (&observed, &finalized),
                     mutations.as_ref(),
+                    background_queue,
                 )
             })
             .expect("the writer thread starts");
@@ -367,6 +382,7 @@ impl WriterConnection {
             committed_index,
             observers,
             finalizers,
+            background,
             mutation_observer,
             batches,
         })
@@ -420,7 +436,7 @@ impl WriterConnection {
         prepare: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
         finalize: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
     ) -> Result<()> {
-        let _writer = self.write();
+        let _writer = self.write_fence();
         self.finalizers.install(prepare, finalize)
     }
 
@@ -434,15 +450,60 @@ impl WriterConnection {
             .expect("the writer thread runs while the store is open");
     }
 
-    /// The writer connection itself, lent until the guard drops, after every write queued before
-    /// this one. A panic while it is lent rolls back the open transaction as it unwinds and still
-    /// gives the connection back, so it cannot disable the store.
+    /// Borrow the foreground writer. Foreground jobs retain their arrival order and can
+    /// overtake explicitly background loans. Nothing preempts a loan already in progress.
+    /// A panic rolls back its open transaction while its guard returns the connection.
     pub fn write(&self) -> WriterGuard<'_> {
+        self.lend_writer(writer_queue::LoanClass::Foreground)
+    }
+
+    /// Borrow the same writer for one bounded maintenance/publication page. Pending foreground
+    /// work is preferred, but a background loan runs after at most eight foreground dispatch
+    /// turns. A turn is one loan or one bounded group-commit batch, not a wall-time guarantee.
+    /// Background callers must release the guard between pages and revalidate captured source,
+    /// authority and prepared CAS evidence after acquisition. No operator work belongs here.
+    pub fn write_background(&self) -> WriterGuard<'_> {
+        self.lend_writer(writer_queue::LoanClass::Background)
+    }
+
+    fn write_fence(&self) -> WriterGuard<'_> {
+        self.lend_writer(writer_queue::LoanClass::Fence)
+    }
+
+    fn lend_writer(&self, class: writer_queue::LoanClass) -> WriterGuard<'_> {
         debug_assert_no_pinned_read();
         let wait = crate::profile::writer_waiting();
         let (lent, lent_here) = std::sync::mpsc::sync_channel(1);
         let (give_back, returned) = std::sync::mpsc::sync_channel(1);
-        self.send(WriterJob::Lend { lent, returned });
+        match class {
+            writer_queue::LoanClass::Foreground => self.send(WriterJob::Lend { lent, returned }),
+            writer_queue::LoanClass::Background => {
+                self.enqueue_background(WriterJob::Lend { lent, returned });
+            }
+            writer_queue::LoanClass::Fence => {
+                // Hold the admission lock while recording the barrier and enqueueing it.
+                // Later foreground work cannot overtake it; background work is watermarked.
+                let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+                let through = self
+                    .background
+                    .queue
+                    .get()
+                    .map_or(0, |queue| queue.watermark());
+                let job = if through == 0 {
+                    WriterJob::Lend { lent, returned }
+                } else {
+                    WriterJob::FenceLend {
+                        through,
+                        lent,
+                        returned,
+                    }
+                };
+                jobs.as_ref()
+                    .expect("the writer queue is open while the store is")
+                    .send(job)
+                    .expect("the writer thread runs while the store is open");
+            }
+        }
         let connection = lent_here
             .recv()
             .expect("the writer thread lends its connection");
@@ -455,6 +516,24 @@ impl WriterConnection {
             finalizers: &self.finalizers,
             mutation_observer: self.mutation_observer.as_ref(),
             acquired: crate::profile::writer_acquired(wait),
+        }
+    }
+
+    fn enqueue_background(&self, job: WriterJob) {
+        // The same admission lock orders the queue notification before any configuration fence.
+        let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let queue = self
+            .background
+            .queue
+            .get_or_init(|| Arc::new(writer_queue::BackgroundQueue::default()));
+        if self.background.closed.load(Ordering::Acquire) {
+            queue.close();
+        }
+        if queue.push(job) {
+            jobs.as_ref()
+                .expect("the writer queue is open while the store is")
+                .send(WriterJob::BackgroundReady(queue.clone()))
+                .expect("the writer thread runs while the store is open");
         }
     }
 
@@ -567,19 +646,12 @@ fn write_queue(
     batches: &(AtomicU64, AtomicU64),
     callbacks: (&CommitObservers, &TransactionFinalizers),
     mutation_observer: Option<&Arc<writer_observer::MutationState>>,
+    background: Arc<writer_queue::BackgroundAdmission>,
 ) {
-    let mut next = None;
-    loop {
-        let job = match next.take() {
-            Some(job) => job,
-            None => match queue.recv() {
-                Ok(job) => job,
-                // The store closed its queue.
-                Err(_) => return,
-            },
-        };
+    let mut admission = writer_queue::Admission::new(queue, background);
+    while let Some(job) = admission.next() {
         match job {
-            WriterJob::Lend { lent, returned } => {
+            WriterJob::Lend { lent, returned } | WriterJob::FenceLend { lent, returned, .. } => {
                 if let Err(std::sync::mpsc::SendError(back)) = lent.send(connection) {
                     connection = back;
                     continue;
@@ -589,16 +661,18 @@ fn write_queue(
                     Err(_) => return,
                 }
             }
+            WriterJob::BackgroundReady(_) => unreachable!("admission consumes notifications"),
             batched => {
-                next = run_write_batch(
+                let next = run_write_batch(
                     &mut connection,
                     batched,
-                    &queue,
+                    &admission.queue,
                     committed_index,
                     batches,
                     callbacks,
                     mutation_observer,
                 );
+                admission.put_back(next);
             }
         }
     }
