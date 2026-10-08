@@ -220,22 +220,31 @@ pub(crate) fn register_value(state: &crate::api::AppState, session_id: &str) -> 
         else {
             return Ok(None);
         };
-        let activity = observed_activity(&state.store, &owner, index,
-            crate::api::client_now_ms())?;
-        let (context, spend) = state.store.conversation_usage_observations(&owner, &incarnation)?;
+        let activity = observed_activity(&state.store, &owner, index, crate::api::client_now_ms())?;
+        let (context, spend) = state
+            .store
+            .conversation_usage_observations(&owner, &incarnation)?;
         let usage = if spend.is_some() {
-            state.store.usage_summary_at(&owner, Some(&incarnation), Some(index))?
+            state
+                .store
+                .usage_summary_at(&owner, Some(&incarnation), Some(index))?
         } else {
             None
         };
-        let cost = usage.as_ref()
+        let cost = usage
+            .as_ref()
             .filter(|usage| usage.currency.as_deref() == Some("USD"))
             .and_then(|usage| usage.cost)
             .zip(spend.as_ref());
-        let todo = crate::api::conversation_todo_value(
-            &state.store, &owner, Some(&incarnation), index,
-        )?;
-        Ok(map_register(&incarnation, activity.as_ref(), context.as_ref(), cost, &todo))
+        let todo =
+            crate::api::conversation_todo_value(&state.store, &owner, Some(&incarnation), index)?;
+        Ok(map_register(
+            &incarnation,
+            activity.as_ref(),
+            context.as_ref(),
+            cost,
+            &todo,
+        ))
     });
     match result {
         Ok(value) => value,
@@ -279,8 +288,13 @@ fn map_register(
             _ => None,
         };
         if let Some(working) = working {
-            header.insert("working".into(), register_field(json!(working),
-                &crate::api::client_timestamp(activity.observed_at_unix_ms)));
+            header.insert(
+                "working".into(),
+                register_field(
+                    json!(working),
+                    &crate::api::client_timestamp(activity.observed_at_unix_ms),
+                ),
+            );
         }
     }
     if let Some((claim, fields)) = context.and_then(|claim| fresh_fields(claim, incarnation)) {
@@ -291,24 +305,38 @@ fn map_register(
         let tokens = fields["context_used_tokens"].as_u64();
         let window = fields["context_window_tokens"].as_u64();
         if tokens.is_some() || window.is_some() {
-            header.insert("context".into(), register_field(json!({
-                "tokens": tokens, "window": window,
-            }), &at));
+            header.insert(
+                "context".into(),
+                register_field(
+                    json!({
+                        "tokens": tokens, "window": window,
+                    }),
+                    &at,
+                ),
+            );
         }
     }
     if let Some((usd, claim)) = cost
         && usd.is_finite()
         && fresh_fields(claim, incarnation).is_some()
     {
-        header.insert("cost".into(), register_field(json!({"usd": usd}), &observed_at(claim)));
+        header.insert(
+            "cost".into(),
+            register_field(json!({"usd": usd}), &observed_at(claim)),
+        );
     }
     if todo["stale"] == false
         && todo["snapshot"]["incarnation_id"] == incarnation
         && let Some(phases) = todo["snapshot"]["phases"].as_array()
     {
-        let phases = phases.iter().map(|phase| json!({
-            "phase": phase["name"], "items": phase["tasks"],
-        })).collect::<Vec<_>>();
+        let phases = phases
+            .iter()
+            .map(|phase| {
+                json!({
+                    "phase": phase["name"], "items": phase["tasks"],
+                })
+            })
+            .collect::<Vec<_>>();
         if let Some(at) = todo["snapshot"]["observed_at"].as_str() {
             header.insert("todos".into(), register_field(json!(phases), at));
         }
@@ -321,13 +349,13 @@ fn fresh_fields<'a>(
     incarnation: &str,
 ) -> Option<(&'a crate::model::ClaimRecord, &'a Value)> {
     let fields = claim.body.get("fields").unwrap_or(&claim.body);
-    (fields["incarnation_id"] == incarnation && fields["stale"] != true)
-        .then_some((claim, fields))
+    (fields["incarnation_id"] == incarnation && fields["stale"] != true).then_some((claim, fields))
 }
 
 fn observed_at(claim: &crate::model::ClaimRecord) -> String {
     let fields = claim.body.get("fields").unwrap_or(&claim.body);
-    let at = fields["observed_at_unix_ms"].as_u64()
+    let at = fields["observed_at_unix_ms"]
+        .as_u64()
         .or_else(|| fields["observed_at_ms"].as_u64())
         .map_or(claim.accepted_at_unix_ms, u128::from);
     crate::api::client_timestamp(at)
@@ -720,33 +748,59 @@ mod tests {
     #[test]
     fn present_register_maps_activity_context_cost_and_todo_phases() {
         let activity = projected_activity("working", "one", 1000);
-        let context = observation("harness.usage", json!({
-            "incarnation_id": "one", "semantics": "context_occupancy",
-            "context_used_tokens": 42, "context_window_tokens": 100,
-            "model": "provider/model", "observed_at_unix_ms": 2000,
-        }));
-        let spend = observation("harness.usage", json!({
-            "incarnation_id": "one", "semantics": "session_cumulative",
-            "cost": 1.25, "currency": "USD", "total_tokens": 9000,
-        }));
-        let register = map_register("one", Some(&activity), Some(&context),
-            Some((1.25, &spend)), &todo_projection(false)).unwrap();
+        let context = observation(
+            "harness.usage",
+            json!({
+                "incarnation_id": "one", "semantics": "context_occupancy",
+                "context_used_tokens": 42, "context_window_tokens": 100,
+                "model": "provider/model", "observed_at_unix_ms": 2000,
+            }),
+        );
+        let spend = observation(
+            "harness.usage",
+            json!({
+                "incarnation_id": "one", "semantics": "session_cumulative",
+                "cost": 1.25, "currency": "USD", "total_tokens": 9000,
+            }),
+        );
+        let register = map_register(
+            "one",
+            Some(&activity),
+            Some(&context),
+            Some((1.25, &spend)),
+            &todo_projection(false),
+        )
+        .unwrap();
         let header = merge_register(json!({}), Some(&register)).unwrap();
         assert_eq!(header.as_object().unwrap().len(), 5);
         assert_eq!(header["working"]["value"], true);
         assert_eq!(header["working"]["as_of"], "1970-01-01T00:00:01.000Z");
         assert_eq!(header["model"]["value"], "provider/model");
-        assert_eq!(header["context"]["value"], json!({"tokens": 42, "window": 100}));
+        assert_eq!(
+            header["context"]["value"],
+            json!({"tokens": 42, "window": 100})
+        );
         assert_eq!(header["context"]["as_of"], "1970-01-01T00:00:02.000Z");
         assert_eq!(header["cost"]["value"], json!({"usd": 1.25}));
-        assert_eq!(header["cost"]["as_of"],
-            crate::api::client_timestamp(spend.accepted_at_unix_ms));
-        assert_eq!(header["todos"]["value"], json!([{"phase": "Review", "items": [
-            {"content": "read", "status": "completed"},
-            {"content": "edit", "status": "blocked", "blocker": "approval"},
-        ]}]));
+        assert_eq!(
+            header["cost"]["as_of"],
+            crate::api::client_timestamp(spend.accepted_at_unix_ms)
+        );
+        assert_eq!(
+            header["todos"]["value"],
+            json!([{"phase": "Review", "items": [
+                {"content": "read", "status": "completed"},
+                {"content": "edit", "status": "blocked", "blocker": "approval"},
+            ]}])
+        );
         assert_eq!(header["todos"]["as_of"], "2026-10-06T12:00:03Z");
-        assert!(header.as_object().unwrap().values().all(|field| field["source"] == "register"));
+        assert!(
+            header
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|field| field["source"] == "register")
+        );
     }
 
     #[test]
@@ -756,40 +810,72 @@ mod tests {
         let register = map_register("one", Some(&idle), None, None, &Value::Null).unwrap();
         assert_eq!(register.as_object().unwrap().len(), 1);
         assert_eq!(register["working"]["value"], false);
-        let limit = observation("harness.usage", json!({
-            "incarnation_id": "one", "context_window_tokens": 100,
-        }));
-        assert_eq!(map_register("one", None, Some(&limit), None, &Value::Null).unwrap()
-            ["context"]["value"], json!({"tokens": null, "window": 100}));
+        let limit = observation(
+            "harness.usage",
+            json!({
+                "incarnation_id": "one", "context_window_tokens": 100,
+            }),
+        );
+        assert_eq!(
+            map_register("one", None, Some(&limit), None, &Value::Null).unwrap()["context"]["value"],
+            json!({"tokens": null, "window": 100})
+        );
         let mut empty = todo_projection(false);
         empty["snapshot"]["phases"] = json!([]);
-        assert_eq!(map_register("one", None, None, None, &empty).unwrap()["todos"]["value"],
-            json!([]));
+        assert_eq!(
+            map_register("one", None, None, None, &empty).unwrap()["todos"]["value"],
+            json!([])
+        );
     }
 
     #[test]
     fn stale_register_cannot_override_transcript_or_claim_idle() {
         let activity = projected_activity("working", "one", 1000);
-        let context = observation("harness.usage", json!({
-            "incarnation_id": "one", "context_used_tokens": 42, "model": "old/model",
-        }));
-        assert_eq!(map_register("two", Some(&activity), Some(&context),
-            Some((1.25, &context)), &todo_projection(true)), None);
+        let context = observation(
+            "harness.usage",
+            json!({
+                "incarnation_id": "one", "context_used_tokens": 42, "model": "old/model",
+            }),
+        );
+        assert_eq!(
+            map_register(
+                "two",
+                Some(&activity),
+                Some(&context),
+                Some((1.25, &context)),
+                &todo_projection(true)
+            ),
+            None
+        );
         let mut stale = context.clone();
         stale.body["fields"]["stale"] = json!(true);
-        assert_eq!(map_register("one", None, Some(&stale), Some((1.25, &stale)),
-            &todo_projection(true)), None);
+        assert_eq!(
+            map_register(
+                "one",
+                None,
+                Some(&stale),
+                Some((1.25, &stale)),
+                &todo_projection(true)
+            ),
+            None
+        );
         for state in ["indeterminate", "blocked", "ended", "needs-login"] {
             let mut unknown = activity.clone();
             unknown.state = state.into();
-            assert_eq!(map_register("one", Some(&unknown), None, None, &Value::Null), None);
+            assert_eq!(
+                map_register("one", Some(&unknown), None, None, &Value::Null),
+                None
+            );
         }
         let transcript = json!({
             "model": {"value": "transcript/model", "source": "transcript",
                 "as_of": "2026-10-06T12:00:00Z"},
         });
         let stale = map_register("two", None, Some(&context), None, &todo_projection(true));
-        assert_eq!(merge_register(transcript.clone(), stale.as_ref()), Some(transcript));
+        assert_eq!(
+            merge_register(transcript.clone(), stale.as_ref()),
+            Some(transcript)
+        );
     }
 
     #[test]
@@ -797,40 +883,74 @@ mod tests {
         let store = crate::store::Store::open_memory("header-register").unwrap();
         let seat = "agent/header-register";
         let append = |kind: &str, fields: Value| {
-            store.append_claim(&crate::model::ClaimInput {
-                subject: seat.into(), kind: kind.into(), actor: Some(seat.into()),
-                fields: serde_json::from_value(fields).unwrap(),
-                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-            }).unwrap()
+            store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: seat.into(),
+                    kind: kind.into(),
+                    actor: Some(seat.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
         };
-        append("runtime.observed", json!({
-            "status": "running", "incarnation_id": "one", "runtime_id": "header-register",
-        }));
+        append(
+            "runtime.observed",
+            json!({
+                "status": "running", "incarnation_id": "one", "runtime_id": "header-register",
+            }),
+        );
         for total in [100, 200] {
-            append("harness.usage", json!({
-                "semantics": "session_cumulative", "driver": "omp", "incarnation_id": "one",
-                "total_tokens": total, "cost": 1.25, "currency": "USD",
-            }));
-            append("harness.usage", json!({
-                "semantics": "context_occupancy", "driver": "omp", "incarnation_id": "one",
-                "context_used_tokens": 42, "context_window_tokens": 100,
-            }));
+            append(
+                "harness.usage",
+                json!({
+                    "semantics": "session_cumulative", "driver": "omp", "incarnation_id": "one",
+                    "total_tokens": total, "cost": 1.25, "currency": "USD",
+                }),
+            );
+            append(
+                "harness.usage",
+                json!({
+                    "semantics": "context_occupancy", "driver": "omp", "incarnation_id": "one",
+                    "context_used_tokens": 42, "context_window_tokens": 100,
+                }),
+            );
             let (context, spend) = store.conversation_usage_observations(seat, "one").unwrap();
             assert_eq!(context.unwrap().body["fields"]["context_used_tokens"], 42);
             assert_eq!(spend.unwrap().body["fields"]["total_tokens"], total);
-            let usage = store.usage_summary_at(seat, Some("one"), None).unwrap().unwrap();
+            let usage = store
+                .usage_summary_at(seat, Some("one"), None)
+                .unwrap()
+                .unwrap();
             assert_eq!(usage.cost, Some(1.25));
             assert_eq!(usage.context.unwrap().used_tokens, Some(42));
         }
         let (context, spend) = store.conversation_usage_observations(seat, "two").unwrap();
-        assert!(context.is_none() && spend.is_none(), "another incarnation cannot reuse usage");
+        assert!(
+            context.is_none() && spend.is_none(),
+            "another incarnation cannot reuse usage"
+        );
     }
 
-    fn projected_activity(state: &str, incarnation: &str, at: u128) -> crate::model::CurrentHarnessView {
+    fn projected_activity(
+        state: &str,
+        incarnation: &str,
+        at: u128,
+    ) -> crate::model::CurrentHarnessView {
         crate::model::CurrentHarnessView {
-            state: state.into(), incarnation_id: incarnation.into(), driver: Some("omp".into()),
-            transport: None, reason: None, blocked_on: None, ask: None, input_buffer: None,
-            exit: None, claim: "current/header".into(), observed_at_unix_ms: at, since_unix_ms: at,
+            state: state.into(),
+            incarnation_id: incarnation.into(),
+            driver: Some("omp".into()),
+            transport: None,
+            reason: None,
+            blocked_on: None,
+            ask: None,
+            input_buffer: None,
+            exit: None,
+            claim: "current/header".into(),
+            observed_at_unix_ms: at,
+            since_unix_ms: at,
         }
     }
 
@@ -839,56 +959,111 @@ mod tests {
         let store = crate::store::Store::open_memory("aged-header").unwrap();
         let seat = "agent/aged-header";
         let append = |kind: &str, fields: Value| {
-            store.append_claim(&crate::model::ClaimInput {
-                subject: seat.into(), kind: kind.into(), actor: Some(seat.into()),
-                fields: serde_json::from_value(fields).unwrap(),
-                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-            }).unwrap()
+            store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: seat.into(),
+                    kind: kind.into(),
+                    actor: Some(seat.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
         };
-        append("runtime.observed", json!({
-            "status": "running", "incarnation_id": "one", "runtime_id": "aged-header",
-        }));
-        let idle = append("harness.observed", json!({
-            "state": "idle", "driver": "omp", "incarnation_id": "one",
-        }));
+        append(
+            "runtime.observed",
+            json!({
+                "status": "running", "incarnation_id": "one", "runtime_id": "aged-header",
+            }),
+        );
+        let idle = append(
+            "harness.observed",
+            json!({
+                "state": "idle", "driver": "omp", "incarnation_id": "one",
+            }),
+        );
         let index = store.index().unwrap();
-        assert!(observed_activity(&store, seat, index, idle.accepted_at_unix_ms).unwrap().is_some());
-        let aged = observed_activity(&store, seat, index, idle.accepted_at_unix_ms + 91_000).unwrap();
+        assert!(
+            observed_activity(&store, seat, index, idle.accepted_at_unix_ms)
+                .unwrap()
+                .is_some()
+        );
+        let aged =
+            observed_activity(&store, seat, index, idle.accepted_at_unix_ms + 91_000).unwrap();
         assert!(aged.is_none());
-        assert_eq!(map_register("one", aged.as_ref(), None, None, &Value::Null), None);
+        assert_eq!(
+            map_register("one", aged.as_ref(), None, None, &Value::Null),
+            None
+        );
     }
 
     #[test]
     fn diagnostic_fences_retract_idle_from_header() {
-        for code in ["provider-auth-expired", "provider-trust-prompt",
-            "provider-update-prompt", "claude-channel-unattached"]
-        {
+        for code in [
+            "provider-auth-expired",
+            "provider-trust-prompt",
+            "provider-update-prompt",
+            "claude-channel-unattached",
+        ] {
             let store = crate::store::Store::open_memory("fenced-header").unwrap();
             let seat = "agent/fenced-header";
             let append = |kind: &str, fields: Value| {
-                store.append_claim(&crate::model::ClaimInput {
-                    subject: seat.into(), kind: kind.into(), actor: Some(seat.into()),
-                    fields: serde_json::from_value(fields).unwrap(),
-                    evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-                }).unwrap()
+                store
+                    .append_claim(&crate::model::ClaimInput {
+                        subject: seat.into(),
+                        kind: kind.into(),
+                        actor: Some(seat.into()),
+                        fields: serde_json::from_value(fields).unwrap(),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap()
             };
-            append("runtime.observed", json!({
-                "status": "running", "incarnation_id": "one", "runtime_id": "fenced-header",
-            }));
-            append("harness.observed", json!({
-                "state": "idle", "driver": "claude", "incarnation_id": "one",
-            }));
-            let before = observed_activity(&store, seat, store.index().unwrap(),
-                crate::api::client_now_ms()).unwrap();
-            assert_eq!(map_register("one", before.as_ref(), None, None, &Value::Null)
-                .unwrap()["working"]["value"], false);
-            let diagnostic = append("harness.diagnostic", json!({
-                "code": code, "driver": "claude", "incarnation_id": "one",
-                "reason": "fixture", "severity": "warning",
-            }));
-            let fenced = observed_activity(&store, seat, store.index().unwrap(),
-                diagnostic.accepted_at_unix_ms).unwrap();
-            assert_eq!(map_register("one", fenced.as_ref(), None, None, &Value::Null), None, "{code}");
+            append(
+                "runtime.observed",
+                json!({
+                    "status": "running", "incarnation_id": "one", "runtime_id": "fenced-header",
+                }),
+            );
+            append(
+                "harness.observed",
+                json!({
+                    "state": "idle", "driver": "claude", "incarnation_id": "one",
+                }),
+            );
+            let before = observed_activity(
+                &store,
+                seat,
+                store.index().unwrap(),
+                crate::api::client_now_ms(),
+            )
+            .unwrap();
+            assert_eq!(
+                map_register("one", before.as_ref(), None, None, &Value::Null).unwrap()["working"]
+                    ["value"],
+                false
+            );
+            let diagnostic = append(
+                "harness.diagnostic",
+                json!({
+                    "code": code, "driver": "claude", "incarnation_id": "one",
+                    "reason": "fixture", "severity": "warning",
+                }),
+            );
+            let fenced = observed_activity(
+                &store,
+                seat,
+                store.index().unwrap(),
+                diagnostic.accepted_at_unix_ms,
+            )
+            .unwrap();
+            assert_eq!(
+                map_register("one", fenced.as_ref(), None, None, &Value::Null),
+                None,
+                "{code}"
+            );
         }
     }
 }

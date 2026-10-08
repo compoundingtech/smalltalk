@@ -267,14 +267,26 @@ mod tests {
 
     #[test]
     fn register_context_limits_render_without_occupancy() {
-        assert_eq!(line(&json!({
-            "context": {"value": {"tokens": null, "window": 100},
-                "source": "register", "as_of": "2026-10-06T12:00:00Z"},
-        }), "2026-10-06T12:00:00Z"), "context limit 100 tokens · register · 0s ago");
-        assert_eq!(line(&json!({
-            "context": {"value": {"tokens": 42, "window": 100},
-                "source": "register", "as_of": "2026-10-06T12:00:00Z"},
-        }), "2026-10-06T12:00:00Z"), "context 42 tokens of 100 · register · 0s ago");
+        assert_eq!(
+            line(
+                &json!({
+                    "context": {"value": {"tokens": null, "window": 100},
+                        "source": "register", "as_of": "2026-10-06T12:00:00Z"},
+                }),
+                "2026-10-06T12:00:00Z"
+            ),
+            "context limit 100 tokens · register · 0s ago"
+        );
+        assert_eq!(
+            line(
+                &json!({
+                    "context": {"value": {"tokens": 42, "window": 100},
+                        "source": "register", "as_of": "2026-10-06T12:00:00Z"},
+                }),
+                "2026-10-06T12:00:00Z"
+            ),
+            "context 42 tokens of 100 · register · 0s ago"
+        );
     }
 
     #[test]
