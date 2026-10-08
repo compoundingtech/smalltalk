@@ -83,7 +83,7 @@ fn export_payload_budget_counts_legacy_text_past_nul_and_utf8_escapes() {
         let connection = source.readers.get();
         let (characters, bytes): (i64, i64) = connection
             .query_row(
-                "SELECT length(payload), length(CAST(payload AS BLOB))
+                "SELECT length(payload), octet_length(payload)
                  FROM replica_envelopes",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
