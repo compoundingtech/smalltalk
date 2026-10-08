@@ -9,8 +9,9 @@
  * stream ends with a final `Stale`. Every follow also exposes its freshness verdict
  * (`freshness.ts`), folded only from transport events the SDK really observes.
  * Rejected window rows are omitted from decoded items and reported through `onDiagnostics`
- * as `RowDecode` (collection, rowId, revision), once per identity/revision per follow run,
- * including across resync/reconnect. No row contents or decoder errors go to the console.
+ * as `RowDecode` (collection, rowId, revision), once while that rejected revision remains in
+ * the window. Reporting state drops departed/recovered rows and superseded revisions.
+ * No row contents or decoder errors go to the console.
  *
  * `messageSend` uses the generated HTTP action client and decodes its acknowledgement; it does
  * not retry ambiguous delivery. Daemon refusals retain the complete error envelope and HTTP
@@ -18,6 +19,7 @@
  * bypassing cached discovery so the composer's fence refresh is authoritative.
  */
 import {
+  type Resource as ResourceWire,
   ClientError,
   type ActionOf,
   type ErrorEnvelope,
@@ -679,8 +681,6 @@ const make = (options: St3Options) =>
       follow<WindowValue>({
         spec,
         makeProtocol: (observe) => {
-          // Protocol resets retain reporting identity; a new stream run owns a fresh set.
-          const reported = new Map<string, Set<string>>()
           const ingest = makeWindowIngest<Resource>({
             publish: (window) => observe(window, window.snapshot),
             ...(options.onDiagnostics === undefined
@@ -688,22 +688,16 @@ const make = (options: St3Options) =>
               : {
                   onSlice: (elapsedMs: number) =>
                     options.onDiagnostics?.({ _tag: 'Decode', elapsedMs }),
+                  onRejected: (row: ResourceWire) =>
+                    options.onDiagnostics?.({
+                      _tag: 'RowDecode', collection: spec.collection,
+                      rowId: row.id, revision: row.revision,
+                    }),
                 }),
             decode: (row) => {
               try {
                 return decodeResource(row)
               } catch {
-                if (options.onDiagnostics !== undefined) {
-                  const revisions = reported.get(row.id) ?? new Set<string>()
-                  if (!revisions.has(row.revision)) {
-                    revisions.add(row.revision)
-                    reported.set(row.id, revisions)
-                    options.onDiagnostics({
-                      _tag: 'RowDecode', collection: spec.collection,
-                      rowId: row.id, revision: row.revision,
-                    })
-                  }
-                }
                 return undefined
               }
             },
