@@ -455,6 +455,9 @@ CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, st
 CREATE INDEX IF NOT EXISTS claims_subject_kind_accepted_index
 ON claims(subject, kind, length(accepted_at_unix_ms), accepted_at_unix_ms);
 CREATE INDEX IF NOT EXISTS claims_batch_index ON claims(batch_id, store_index);
+-- Heal compares claim identities, not bodies. Keep both join keys in a compact index so a
+-- range digest does not visit every body-bearing claim page.
+CREATE INDEX IF NOT EXISTS claims_batch_claim_id ON claims(batch_id, id);
 CREATE INDEX IF NOT EXISTS claims_accepted_order_index
 ON claims(length(accepted_at_unix_ms), accepted_at_unix_ms, store_index);
 CREATE INDEX IF NOT EXISTS claims_operation_index
@@ -565,6 +568,10 @@ CREATE INDEX IF NOT EXISTS replica_records_state
 ON replica_records(state, writer, sequence);
 CREATE INDEX IF NOT EXISTS replica_records_claim
 ON replica_records(claim_id, position);
+-- Any repaired copy excludes the original claim. This partial identity index answers that
+-- existence check without fetching the retained raw record of every admitted claim.
+CREATE INDEX IF NOT EXISTS replica_records_repaired_claim
+ON replica_records(claim_id) WHERE state='repaired';
 
 CREATE TABLE IF NOT EXISTS projection_health (
     aggregate TEXT PRIMARY KEY,
