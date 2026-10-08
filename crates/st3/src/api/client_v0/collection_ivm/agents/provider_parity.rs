@@ -496,6 +496,131 @@ fn expiry() -> u64 {
 }
 
 #[tokio::test]
+async fn actual_service_changed_desired_body_raw_gap_reopen_full_public_parity() {
+    let _exclusive = PRODUCER.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut f = Fixture::new(root.path()).await;
+    f.names("IVM profile000", "IVM profile001").await;
+    f.window(local()).await;
+    let before_rows = f.oracle().await;
+    let before_index = f.state.store.index().unwrap();
+    let before_namespace = f
+        .state
+        .store
+        .ivm_views()
+        .unwrap()
+        .installed_root(
+            &f.state.store.readers.get(),
+            &f.state.store.ivm_installer().unwrap(),
+            super::cards::VIEW,
+        )
+        .unwrap()
+        .namespace;
+    let (claim_id, claim_index, raw): (String, u64, String) = f.state.store.readers.get()
+        .query_row("SELECT id,store_index,body FROM claims WHERE subject=?1 AND kind='intent.desired' ORDER BY store_index DESC LIMIT 1",
+            [AMBER], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    let mut body: Value = serde_json::from_str(&raw).unwrap();
+    let mut desired: crate::model::DesiredSubject = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(
+        desired.member.as_ref().unwrap().display_name.as_deref(),
+        Some("IVM profile000")
+    );
+    desired
+        .set_display_name(Some("IVM repaired declaration"))
+        .unwrap();
+    // Preserve other claim-body metadata and the existing identity/rank/index. This changes
+    // both the authored KDL name and its normalized member projection, not a no-op field.
+    body["desired"] = desired.desired;
+    body["member"] = serde_json::to_value(desired.member).unwrap();
+    assert_ne!(body, serde_json::from_str::<Value>(&raw).unwrap());
+    assert_eq!(
+        f.state
+            .store
+            .connection
+            .write()
+            .execute(
+                "UPDATE claims SET body=?1 WHERE id=?2",
+                rusqlite::params![body.to_string(), claim_id],
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(f.state.store.index().unwrap(), before_index);
+    assert_eq!(
+        f.state
+            .store
+            .readers
+            .get()
+            .query_row(
+                "SELECT store_index FROM claims WHERE id=?1",
+                [&claim_id],
+                |r| r.get::<_, u64>(0),
+            )
+            .unwrap(),
+        claim_index
+    );
+    let refused = f.read(local(), None, Arc::new(BTreeMap::new())).await;
+    assert!(
+        matches!(
+            refused,
+            Err(_)
+                | Ok(Candidate {
+                    output: Output::Unavailable,
+                    ..
+                })
+        ),
+        "raw same-index changed source must immediately refuse public row delivery"
+    );
+    drop(f);
+
+    let recovered = Fixture::unready(root.path());
+    recovered.window(local()).await;
+    assert_eq!(recovered.state.store.index().unwrap(), before_index);
+    assert_eq!(
+        recovered
+            .state
+            .store
+            .readers
+            .get()
+            .query_row(
+                "SELECT store_index FROM claims WHERE id=?1",
+                [&claim_id],
+                |r| r.get::<_, u64>(0),
+            )
+            .unwrap(),
+        claim_index
+    );
+    let after_namespace = recovered
+        .state
+        .store
+        .ivm_views()
+        .unwrap()
+        .installed_root(
+            &recovered.state.store.readers.get(),
+            &recovered.state.store.ivm_installer().unwrap(),
+            super::cards::VIEW,
+        )
+        .unwrap()
+        .namespace;
+    assert_ne!(
+        after_namespace, before_namespace,
+        "recovery must publish a fresh actual namespace"
+    );
+    let declarations = recovered.state.store.desired_subjects().unwrap();
+    let repaired = declarations.iter().find(|s| s.subject == AMBER).unwrap();
+    assert_eq!(
+        repaired.member.as_ref().unwrap().display_name.as_deref(),
+        Some("IVM repaired declaration"),
+        "native desired projection must replay the changed canonical value"
+    );
+    assert_ne!(
+        recovered.oracle().await,
+        before_rows,
+        "full public rows must reflect the correction"
+    );
+}
+
+#[tokio::test]
 async fn actual_service_declarations_before_initial_publication_settle_without_extra_readiness() {
     let _exclusive = PRODUCER.lock().await;
     let root = tempfile::tempdir().unwrap();
