@@ -986,8 +986,8 @@ impl AfterCommit for CacheMarker {
     }
 }
 
-#[test]
-fn retained_source_identity_mismatch_keeps_store_open_without_rebinding() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_source_identity_mismatch_keeps_store_open_without_rebinding() {
     for (fingerprint, epoch) in [
         ("fixture.cache-only.retired", 1_u64),
         ("fixture.cache-only.v1", 2_u64),
@@ -1002,6 +1002,7 @@ fn retained_source_identity_mismatch_keeps_store_open_without_rebinding() {
             refused_commits: AtomicUsize::new(0),
         });
         let sibling = source("fixture.sibling", "fixture.sibling.rows", None, false);
+        sibling.observe_progress.store(true, Ordering::SeqCst);
         let store = Store::open_with_collection_sources(
             &path,
             "alder",
@@ -1054,7 +1055,48 @@ fn retained_source_identity_mismatch_keeps_store_open_without_rebinding() {
                 .is_err()
         );
         // Native writer admission and the independent sibling still work.
-        replace(&reopened, sibling.source, 9);
+        let mut notices = reopened.prepared_ivm_publisher().unwrap().subscribe();
+        reopened
+            .connection
+            .batched(|tx| -> Result<()> {
+                tx.execute(
+                    "INSERT INTO local_fixture_reactor_pending VALUES(?1,9)",
+                    [sibling.source],
+                )?;
+                tx.execute(
+                    "UPDATE ivm_install_sources SET revision=revision+1 WHERE name=?1",
+                    [sibling.source],
+                )?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        let commit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match notices.recv().await.unwrap() {
+                    events::Notice::Source(events::SourceWake::Committed(commit)) => break commit,
+                    events::Notice::Source(events::SourceWake::Invalidated(reason)) => {
+                        assert_eq!(reason.source, cache.progress_identity());
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(commit.sources.len(), 1);
+        assert_eq!(
+            commit.sources[0].identity,
+            sibling.progress_identity().unwrap()
+        );
+        assert_eq!(commit.sources[0].revision, 1);
+        assert!(commit.sources[0].available);
+        match next_source_notice(&mut notices, false).await {
+            events::SourceWake::Invalidated(reason) => {
+                assert_eq!(reason.source, cache.progress_identity());
+            }
+            _ => unreachable!(),
+        }
         assert_eq!(
             reopened
                 .readers
