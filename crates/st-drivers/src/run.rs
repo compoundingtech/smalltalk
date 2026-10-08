@@ -3320,13 +3320,15 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
 }
 
 /// Best-effort detection of this machine's short hostname (the catalog's host segment), used as the
-/// default reconcile host filter. Falls back to `localhost` if it can't be determined.
+/// default reconcile host filter. Reads the kernel hostname without depending on PATH, and falls
+/// back to `localhost` if the syscall fails or the short name is empty.
 pub fn detect_host() -> String {
-    // `hostname` is ubiquitous; take the first dotted label (short name, e.g. `example-linux`).
-    if let Ok(out) = Command::new("hostname").output()
-        && out.status.success()
-    {
-        let full = String::from_utf8_lossy(&out.stdout);
+    // Linux and macOS hostnames fit in 256 bytes, including the terminating NUL.
+    let mut name = [0_u8; 256];
+    // SAFETY: name points to a writable buffer of exactly the length passed to gethostname.
+    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } == 0 {
+        let len = name.iter().position(|&byte| byte == 0).unwrap_or(name.len());
+        let full = String::from_utf8_lossy(&name[..len]);
         if let Some(short) = full.trim().split('.').next()
             && !short.is_empty()
         {

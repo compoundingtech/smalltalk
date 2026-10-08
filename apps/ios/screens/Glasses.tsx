@@ -2,7 +2,7 @@ import { useLayoutEffect, useMemo } from 'react';
 import { ScrollView, StyleSheet, View } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { Banners, Empty, StatusLine, useListsOnFocus } from '../chrome';
+import { Banners, Empty, StatusLine, useListsOnFocus, useMissionsOnFocus } from '../chrome';
 import { glassChoices, glassGroups, groupBoxes, spaceSummary, type GlassLists, type PaneTarget } from '../glassesView';
 import { navigationRef, type RootParams, type RootScreen } from '../navigation';
 import { useStore } from '../store';
@@ -78,6 +78,7 @@ export function GlassesScreen() {
 export function SpaceScreen({ route, navigation }: RootScreen<'Space'>) {
   const { glasses } = useStore();
   useListsOnFocus(['machines']);
+  useMissionsOnFocus();
   const lists = useLists();
   const glass = glasses.find(candidate => candidate.id === route.params.id);
   useLayoutEffect(() => { navigation.setOptions({ title: glass?.body?.name ?? route.params.title ?? 'Space' }); }, [navigation, glass?.body?.name, route.params.title]);

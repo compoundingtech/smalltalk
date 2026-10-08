@@ -636,6 +636,8 @@ ON local_observations(subject, kind, id);
 -- subject-and-kind index made it read every observation the seat ever had.
 CREATE INDEX IF NOT EXISTS local_observations_subject_id_index
 ON local_observations(subject, id);
+CREATE INDEX IF NOT EXISTS local_observations_after_store_index
+ON local_observations(after_store_index);
 CREATE INDEX IF NOT EXISTS local_observations_time_index
 ON local_observations(observed_at_unix_ms);
 CREATE UNIQUE INDEX IF NOT EXISTS local_observations_dedupe_index
@@ -10083,8 +10085,7 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                "SELECT COALESCE(MIN(id), (SELECT COALESCE(MAX(id), 0) + 1 FROM local_observations))
-                 FROM local_observations WHERE after_store_index >= ?1",
+                LOCAL_OBSERVATION_FLOOR_QUERY,
                 [store_index],
                 |row| row.get::<_, i64>(0),
             )
@@ -18825,6 +18826,13 @@ fn registered_client_claim_kind(kind: &str) -> bool {
 }
 
 const LOCAL_OBSERVATION_COLUMNS: &str = "SELECT id, after_store_index, subject, kind, actor, body, observed_at_unix_ms FROM local_observations";
+
+// MIN(id) makes SQLite walk rowids from the beginning until it finds a match, even with the
+// frontier index present. Unary + disables that shortcut so this reads only the covering
+// after_store_index range; id is the integer primary key carried by each index entry.
+const LOCAL_OBSERVATION_FLOOR_QUERY: &str =
+    "SELECT COALESCE(MIN(+id), (SELECT COALESCE(MAX(id), 0) + 1 FROM local_observations))
+     FROM local_observations WHERE after_store_index >= ?1";
 
 const LOCAL_OBSERVATION_ID_PREFIX: &str = "local-observation/";
 
@@ -47198,6 +47206,53 @@ mission "nested-work" state="ready" {
                 .local_observation_floor_after_claim(store.index().unwrap() + 1)
                 .unwrap(),
             19
+        );
+    }
+
+    #[test]
+    fn local_observation_floor_seeks_the_claim_frontier() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        {
+            let store = Store::open(&path, "node").unwrap();
+            assert_eq!(store.local_observation_floor_after_claim(0).unwrap(), 0);
+            let connection = store.connection.write();
+            connection
+                .execute_batch(
+                    "INSERT INTO local_observations(id,after_store_index,subject,kind,body,observed_at_unix_ms)
+                     VALUES(3,10,'agent/node.a','harness.timeline','{}',1),
+                           (7,30,'agent/node.a','harness.timeline','{}',1),
+                           (12,20,'agent/node.a','harness.timeline','{}',1);
+                     DROP INDEX local_observations_after_store_index;",
+                )
+                .unwrap();
+        }
+        // Opening an existing schema adds the index without replaying or changing rows.
+        let store = Store::open(&path, "node").unwrap();
+        assert_eq!(store.local_observation_floor_after_claim(0).unwrap(), 2);
+        assert_eq!(store.local_observation_floor_after_claim(10).unwrap(), 2);
+        assert_eq!(store.local_observation_floor_after_claim(11).unwrap(), 6);
+        assert_eq!(store.local_observation_floor_after_claim(20).unwrap(), 6);
+        assert_eq!(store.local_observation_floor_after_claim(21).unwrap(), 6);
+        assert_eq!(store.local_observation_floor_after_claim(31).unwrap(), 12);
+        let connection = store.readers.get();
+        let plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {LOCAL_OBSERVATION_FLOOR_QUERY}"))
+            .unwrap()
+            .query_map([30], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("; ");
+        assert!(
+            plan.contains("USING COVERING INDEX local_observations_after_store_index (after_store_index>?)"),
+            "{plan}"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM local_observations", [], |row| row.get::<_, u64>(0))
+                .unwrap(),
+            3
         );
     }
 

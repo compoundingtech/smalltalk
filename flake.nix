@@ -210,6 +210,9 @@
           "st2-pty-stats-component"
           "--exclude"
           "st2-vista-component"
+          # The standalone decision model has its own hermetic gate.
+          "--exclude"
+          "st-decision-fold"
           # `checks.st3` gates these crates with the runtime inputs their tests need.
           "--exclude"
           "smallclaims"
