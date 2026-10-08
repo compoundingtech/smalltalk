@@ -1326,3 +1326,29 @@ fn assistant_error_and_compaction_are_explicit_expandable_cards() {
         assert!(matches!(&entries[0].body, Body::Tool { output, state:actual, .. } if output == &expected && actual == &state));
     }
 }
+
+#[test]
+fn simplified_history_fill_counts_standalone_preview_and_error_cards() {
+    let entries: Vec<_> = [
+        "$ echo a", "$ echo b", "write demo · 2 lines",
+        "$ echo c", "$ echo d", "compaction · 100 → 20 tokens",
+        "$ echo e", "$ echo f", "assistant error · recovered · retried",
+        "$ echo g", "$ echo h",
+    ].into_iter().enumerate().map(|(index, title)| Entry {
+        id: format!("card-{index}"),
+        at: String::new(),
+        body: Body::Tool { title: title.into(), state: ToolState::Ok, output: Vec::new() },
+    }).collect();
+    assert_eq!(display_rows(&entries), 7);
+    #[cfg(feature = "ratatui")]
+    {
+        let doc = Cache::default().render_as(
+            &entries, 80, &HashSet::new(), "*", &theme(), Density::Simple,
+        );
+        let lines: Vec<_> = doc.lines.iter().map(text::plain).collect();
+        assert_eq!(lines.iter().filter(|line| line.contains("2 tool calls")).count(), 4);
+        for title in ["write demo", "compaction", "assistant error"] {
+            assert!(lines.iter().any(|line| line.contains(title)), "{lines:?}");
+        }
+    }
+}
