@@ -1,8 +1,9 @@
 #![cfg(target_os = "linux")]
-//! A real, isolated daemon pauses inside canonical replay. Observation must work while SQLite
-//! holds its write transaction, then advance to serving only after both listeners bind.
+//! A real, isolated daemon pauses inside canonical replay. Connections queue on both listeners,
+//! but no response or serving readiness is published before migrations and replay complete.
 
 use std::collections::BTreeMap;
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -109,36 +110,22 @@ fn replay_is_visible_before_the_api_serves_and_stale_files_are_ignored() {
     assert!(readiness.total.unwrap() >= 3);
     let early_log = std::fs::read_to_string(&log_path).unwrap();
     assert!(early_log.contains("st: projection full replay phase=startup/project-replication-backlog reason=missing-health"), "fallback must be logged before the replay finishes: {early_log}");
-    // Old clients receive an immediate kernel connection refusal, never an accepted but stalled
-    // request. Their existing outage retry policy remains available to long-lived drivers.
-    assert!(std::os::unix::net::UnixStream::connect(&socket).is_err());
-    let started = Instant::now();
-    let doctor = command(root).args(["doctor", "--json"]).output().unwrap();
-    assert!(started.elapsed() < Duration::from_secs(5));
-    assert!(!doctor.status.success());
-    let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
-    assert_eq!(report["startup"]["phase"], "full-replay/base-claims");
-    assert_eq!(report["startup"]["status"], "starting");
-    let started = Instant::now();
-    let ordinary = command(root).args(["agents", "ls"]).output().unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "CLI waited through replay"
-    );
-    assert!(!ordinary.status.success());
-    assert!(String::from_utf8_lossy(&ordinary.stderr).contains("daemon starting"));
-    assert!(String::from_utf8_lossy(&ordinary.stderr).contains("full-replay/base-claims"));
-    let started = Instant::now();
-    let generated = command(root)
-        .args(["work", "ls", "--as", "agent/replay-readiness-probe"])
-        .output()
-        .unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "generated CLI waited through replay"
-    );
-    assert!(!generated.status.success());
-    assert!(String::from_utf8_lossy(&generated.stderr).contains("full-replay/base-claims"));
+    // Both HTTP requests arrive while replay holds its transaction. Binding is not serving:
+    // neither socket may respond from an incomplete or silently stale projection.
+    let mut pending = [
+        std::os::unix::net::UnixStream::connect(&socket).unwrap(),
+        std::os::unix::net::UnixStream::connect(root.join("run/client.sock")).unwrap(),
+    ];
+    for stream in &mut pending {
+        stream
+            .write_all(b"GET /v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let error = stream.read(&mut [0; 1]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    }
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -188,6 +175,15 @@ fn replay_is_visible_before_the_api_serves_and_stale_files_are_ignored() {
             std::fs::read_to_string(&log_path).unwrap()
         );
         std::thread::sleep(Duration::from_millis(20));
+    }
+    for mut stream in pending {
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["value"]["status"], "ready");
+        assert!(body["value"]["store_index"].as_u64().unwrap() >= 3);
     }
     assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
     assert!(std::os::unix::net::UnixStream::connect(root.join("run/client.sock")).is_ok());

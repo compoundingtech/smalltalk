@@ -409,11 +409,17 @@ fn a_restart_keeps_the_keys_and_rebuilds_the_same_verdicts() {
         store.set_node_key(node_key.clone()).unwrap();
         let claim = note(&store, Some("person/ada"), "before the restart");
         seal(&store);
+        store.judge_claims(true).unwrap();
         claim
     };
     let store = Store::open(&path, "studio", Arc::new(Plain)).unwrap();
     store.use_key_directory(&keys).unwrap();
     store.set_node_key(node_key).unwrap();
+    assert_eq!(
+        store.judge_claims(true).unwrap(),
+        0,
+        "unchanged trust roots and cached verdicts need no re-judging after reopen"
+    );
     let before = verdicts(&store);
     let second = note(&store, Some("person/ada"), "after the restart");
     seal(&store);

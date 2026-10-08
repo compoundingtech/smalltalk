@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Queue local connections while the daemon initializes its store",
+  "replay": { "status": "none", "detail": "Canonical projection catch-up still completes before requests are accepted." },
+  "schema": { "status": "none", "detail": "No database schema or migration changes." },
+  "rules": { "status": "none", "detail": "No checkpoint rule changes or coordinated upgrade requirement." },
+  "compatibility": { "status": "none", "detail": "Both Unix listeners bind before store initialization with a requested backlog of 1024. HTTP requests wait until the existing initialization sequence finishes; client deadlines and protocols are unchanged." },
+  "downtime": { "status": "none", "detail": "The stop-to-bind window and existing stream disconnects remain. Early binding removes connection refusals during subsequent store initialization, within the kernel backlog and client deadline limits." },
+  "manual": { "status": "none", "detail": "No configuration or migration steps required." },
+  "recovery": { "status": "none", "detail": "No new persistent state. A failed startup closes its queued connections; existing binary swap-back behavior is unchanged." }
+}
