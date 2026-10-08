@@ -5,6 +5,59 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::process::Stdio;
 
 #[test]
+fn setup_checks_idle_mcp_and_doctor_reads_evidence_without_running_a_provider() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let claude = bin.join("claude");
+    std::fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\nprintf invoked >> '{}'\nprintf '[]\\n'\n",
+            root.path().join("calls").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(claude, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let environment = std::collections::BTreeMap::from([
+        ("HOME".into(), root.path().display().to_string()),
+        ("PATH".into(), bin.display().to_string()),
+        ("ST_AGENT".into(), "agent/fixture/absent".into()),
+        ("ST3_SUBJECT".into(), "agent/fixture/absent".into()),
+    ]);
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_st3"));
+    let state = root.path().join("state");
+    st3::integrations::install("claude", false, executable, &state, &environment).unwrap();
+    let checks = st3::integrations::refresh_checks(executable, &state, &environment, true).unwrap();
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].name, "integration/claude");
+    assert_eq!(checks[0].status, "warn", "{checks:?}");
+    assert!(
+        checks[0].message.contains("st skill and idle MCP work"),
+        "{checks:?}"
+    );
+    let before = std::fs::read(root.path().join("calls")).unwrap();
+    let cached = st3::integrations::doctor_checks(executable, &state);
+    assert_eq!(cached[0].status, "warn", "{cached:?}");
+    assert_eq!(
+        std::fs::read(root.path().join("calls")).unwrap(),
+        before,
+        "doctor must not start the provider CLI or an MCP child"
+    );
+    std::fs::write(root.path().join(".claude/settings.json"), "{}").unwrap();
+    let stale = st3::integrations::doctor_checks(executable, &state);
+    assert!(stale[0].message.contains("evidence is stale"), "{stale:?}");
+    assert_eq!(std::fs::read(root.path().join("calls")).unwrap(), before);
+    assert!(
+        !state.join("claims.sqlite3").exists(),
+        "idle MCP must not create graph state"
+    );
+}
+
+#[test]
 fn unscoped_claude_channel_serves_mcp_until_eof_without_a_daemon_or_state() {
     if st3::test_support::supervise_test() {
         return;
@@ -45,7 +98,10 @@ fn unscoped_claude_channel_serves_mcp_until_eof_without_a_daemon_or_state() {
         }
     }
     std::thread::sleep(std::time::Duration::from_millis(50));
-    assert!(child.try_wait().unwrap().is_none(), "unscoped MCP must stay alive until its input closes");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "unscoped MCP must stay alive until its input closes"
+    );
     drop(stdin);
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{output:?}");

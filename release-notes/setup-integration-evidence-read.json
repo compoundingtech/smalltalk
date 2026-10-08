@@ -1,0 +1,32 @@
+{
+  "replay": {
+    "status": "none",
+    "detail": "No replay or projection changes; evidence is a local setup receipt."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or claim schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No replication or rule changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon or seat restart requested."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Discarding the local receipt returns doctor to incomplete evidence; setup can refresh it."
+  },
+  "version": 1,
+  "summary": "Explicit setup verifies native integrations; doctor reads recorded evidence without starting native subprocesses.",
+  "compatibility": {
+    "status": "changed",
+    "detail": "Native plugin registration and idle MCP checks move to explicit setup. Doctor compares installed asset bytes and a binary/registration-fenced receipt, without starting a login shell, provider CLI, credential helper or MCP child. Receipt stores only asset locations and check results, never the captured login environment."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Rerun setup after a binary or registration change to refresh stale evidence. Declining integrations records only the detected inventory and local asset status, with no native checks or integration installation. Provider authentication and model delivery remain separate."
+  }
+}

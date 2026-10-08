@@ -32,6 +32,8 @@ pub mod harness_events;
 /// The lifecycle hook set st3 publishes beneath its own state directory.
 pub mod hooks;
 pub mod incremental;
+/// Consent, installation and health checks for each discovered harness integration.
+pub mod integrations;
 pub mod lane;
 pub mod mailbox;
 /// Bounded local maintenance workers shared by daemon startup and lifecycle fixtures.

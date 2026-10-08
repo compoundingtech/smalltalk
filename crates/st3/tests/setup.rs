@@ -155,19 +155,72 @@ fn harness_probe_uses_login_path_order_and_flags_without_starting_a_seat() {
     let selected = success(&fixture.setup_config_only(&[]));
     assert_eq!(selected.matches("Selected harness: codex").count(), 1);
     assert!(!selected.contains("Which harness"));
-    assert!(success(&fixture.setup_config_only(&["--harness", "omp"])).contains("Selected harness: omp"));
-    assert!(success(&fixture.setup_config_only(&["--harness", "none"])).contains("Harness setup skipped"));
+    assert!(
+        success(&fixture.setup_config_only(&["--harness", "omp"]))
+            .contains("Selected harness: omp")
+    );
+    assert!(
+        success(&fixture.setup_config_only(&["--harness", "none"]))
+            .contains("Harness setup skipped")
+    );
     let missing = fixture.setup_config_only(&["--harness", "claude"]);
     assert!(!missing.status.success());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("not installed on the daemon's login PATH"));
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("not installed on the daemon's login PATH")
+    );
     let claude = fixture.path("bin/claude");
     fs::write(&claude, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
-    let inline = success(&fixture.setup_config_only(&["--harness", "claude", "--claude-channel", "false"]));
+    let inline =
+        success(&fixture.setup_config_only(&["--harness", "claude", "--claude-channel", "false"]));
     assert_eq!(inline.matches("Selected harness: claude").count(), 1);
     assert!(inline.contains("inline server:st3 development channel"));
     assert!(!fixture.path("home/.claude/plugins").exists());
-    assert!(!fixture.path("home/.local/state/st3/claims.sqlite3").exists());
+    assert!(
+        !fixture
+            .path("home/.local/state/st3/claims.sqlite3")
+            .exists()
+    );
+}
+
+#[test]
+fn setup_installs_integrations_for_all_found_harnesses_and_decline_writes_none() {
+    let fixture = Fixture::new();
+    for name in ["codex", "omp", "pi", "opencode"] {
+        let path = fixture.path(&format!("bin/{name}"));
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let skipped =
+        success(&fixture.setup_config_only(&["--harness", "codex", "--integrations", "false"]));
+    assert!(skipped.contains("Integrations: skipped"), "{skipped}");
+    assert!(!fixture.path("home/.agents/skills/st/SKILL.md").exists());
+    assert!(!fixture.path("home/.local/state/st3/hooks").exists());
+    let installed =
+        success(&fixture.setup_config_only(&["--harness", "codex", "--integrations", "true"]));
+    for name in ["codex", "omp", "pi", "opencode"] {
+        assert!(
+            installed.contains(&format!("Integration: {name} installed")),
+            "{installed}"
+        );
+    }
+    assert_eq!(installed.matches("Selected harness: codex").count(), 1);
+    assert_eq!(
+        fs::read_to_string(fixture.path("home/.agents/skills/st/SKILL.md")).unwrap(),
+        st3::skill::SKILL
+    );
+    let hooks = st3::hooks::set_dir(&fixture.path("home/.local/state/st3/hooks"));
+    st3::hooks::verify(&hooks).unwrap();
+    let skill = fixture.path("home/.agents/skills/st/SKILL.md");
+    let modified = fs::metadata(&skill).unwrap().modified().unwrap();
+    success(&fixture.setup_config_only(&["--harness", "omp", "--integrations", "true"]));
+    assert_eq!(fs::metadata(skill).unwrap().modified().unwrap(), modified);
+    assert!(
+        !fixture
+            .path("home/.local/state/st3/claims.sqlite3")
+            .exists()
+    );
 }
 
 #[test]
@@ -248,12 +301,29 @@ fn archive_setup_installs_st_and_starts_one_isolated_daemon_without_gh_or_harnes
             .unwrap();
     assert_eq!(config["node"].as_str(), Some("studio"));
     let before = Instant::now();
-    let missing = fixture.cli().args(["agents", "new", "fixture-missing", "--harness", "claude"]).output().unwrap();
+    let missing = fixture
+        .cli()
+        .args(["agents", "new", "fixture-missing", "--harness", "claude"])
+        .output()
+        .unwrap();
     assert!(!missing.status.success());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("not installed on the daemon's login PATH"));
-    assert!(before.elapsed() < Duration::from_secs(5), "missing harness must fail before waiting for a seat");
-    let agents = fixture.cli().args(["agents", "ls", "--json"]).output().unwrap();
-    assert!(!success(&agents).contains("fixture-missing"), "missing binary must not publish a restarting seat");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("not installed on the daemon's login PATH")
+    );
+    assert!(
+        before.elapsed() < Duration::from_secs(5),
+        "missing harness must fail before waiting for a seat"
+    );
+    let agents = fixture
+        .cli()
+        .args(["agents", "ls", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !success(&agents).contains("fixture-missing"),
+        "missing binary must not publish a restarting seat"
+    );
     let output = fixture
         .command(&fixture.path("home/.local/bin/st"))
         .args(["setup", "--yes", "--service", "false"])
