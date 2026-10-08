@@ -64,6 +64,43 @@ fn export_payload_budget_stops_before_fetching_the_next_envelope() {
         .is_err());
 }
 
+#[test]
+fn export_payload_budget_counts_legacy_text_past_nul_and_utf8_escapes() {
+    let source = node("birch");
+    let target = node("cedar");
+    page(&source, &target, 1);
+    let identities = source.replication_inventory().unwrap().envelopes;
+    assert_eq!(identities.len(), 1);
+    for text in [format!("A\0{}", "B".repeat(100)), "é\\\n\0C".repeat(30)] {
+        source
+            .connection
+            .write()
+            .execute(
+                "UPDATE replica_envelopes SET payload=?1",
+                rusqlite::params![text],
+            )
+            .unwrap();
+        let connection = source.readers.get();
+        let (characters, bytes): (i64, i64) = connection
+            .query_row(
+                "SELECT length(payload), length(CAST(payload AS BLOB))
+                 FROM replica_envelopes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(connection);
+        assert!(bytes > characters, "the metadata must count stored bytes");
+        let actual = serde_json::to_vec(&source.replica_envelopes(identities.clone()).unwrap()[0].payload)
+            .unwrap()
+            .len();
+        assert!(usize::try_from(bytes).unwrap() * 6 + 2 >= actual);
+        assert!(source
+            .replica_envelopes_with_wire_budget(identities.clone(), Some(actual - 1))
+            .is_err());
+    }
+}
+
 /// The injected SQL cost represents a populated runtime's per-claim admission work. The
 /// queued write must commit before the remainder of the page, and its ACK has a 100ms CI
 /// budget (including scheduler/commit overhead), separately from production's 50ms p99.

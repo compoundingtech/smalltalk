@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Bound the payload bytes fetched for one replication exchange page.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or projection rebuild changes. A later exchange continues from identities received in the prior page."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, index, trigger, or schema-version change. The exporter checks indexed envelope payload lengths before fetching their bytes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Inventory identity, authority digest, signatures, certificates, and frontier rules are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "A page carries at most 32 MiB of conservatively estimated serialized envelope payloads, so peers may need more exchanges. A single envelope above that limit returns an explicit error rather than being skipped. Legacy TEXT estimates count all stored bytes, including bytes after NUL, and may conservatively refuse an envelope whose actual JSON form would fit. Complete legacy inventory listings and signature arrays are separate from this payload-only limit and can still exceed the 64 MiB transport limit. The peer wire format is unchanged."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "A normal daemon restart is needed; production page work and local API latency have not yet been measured."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No store migration or configuration is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No stored format changes. Rolling back the binary restores the previous count-only envelope paging behavior."
+  }
+}

@@ -5887,7 +5887,7 @@ impl Store {
         let mut payload_lengths = wire_budget
             .map(|_| {
                 connection.prepare_cached(
-                    "SELECT typeof(payload), length(payload) FROM replica_envelopes
+                    "SELECT typeof(payload), length(CAST(payload AS BLOB)) FROM replica_envelopes
                      WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
                 )
             })
