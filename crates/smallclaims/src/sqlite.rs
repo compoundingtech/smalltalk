@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OpenFlags, Transaction};
 
+mod read_lifetime;
 pub mod writer_budget;
 mod transaction_finalizer;
 mod writer_queue;
@@ -855,6 +856,7 @@ pub struct ReadPool {
     pub path: PathBuf,
     pub shared_memory: bool,
     counts: Arc<ReaderCounts>,
+    diagnostic_id: u64,
 }
 
 #[derive(Default)]
@@ -866,6 +868,7 @@ struct ReaderCounts {
 
 /// Counts the actual connection lifetime, including a connection shared by a pinned snapshot.
 pub struct ReadConnection {
+    id: u64,
     connection: Connection,
     counts: Arc<ReaderCounts>,
 }
@@ -892,79 +895,12 @@ pub struct ReaderUsage {
     pub opened: u64,
 }
 
-/// Reads checked out right now, so a pinned WAL can be traced to its holder. SQLite keeps no
-/// list of who holds a snapshot, and the profile only records a read after it ends.
-static LIVE_READS: Mutex<std::collections::BTreeMap<u64, LiveRead>> =
-    Mutex::new(std::collections::BTreeMap::new());
-static NEXT_LIVE_READ: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Copy)]
-struct LiveRead {
-    started: std::time::Instant,
-    at: &'static std::panic::Location<'static>,
-    /// A `Store::read_snapshot`: one read transaction held open for the whole closure. Any other
-    /// checkout is a pooled connection lent out, which pins only while a statement is mid-step.
-    snapshot: bool,
-}
-
-/// Ends the live-read entry on every exit path.
-pub struct LiveReadToken(u64);
-
-impl Drop for LiveReadToken {
-    fn drop(&mut self) {
-        LIVE_READS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.0);
-    }
-}
-
-/// Note a read starting at the caller's location.
-#[track_caller]
-pub fn register_live_read(snapshot: bool) -> LiveReadToken {
-    let id = NEXT_LIVE_READ.fetch_add(1, Ordering::Relaxed);
-    LIVE_READS.lock().unwrap_or_else(PoisonError::into_inner).insert(
-        id,
-        LiveRead {
-            started: std::time::Instant::now(),
-            at: std::panic::Location::caller(),
-            snapshot,
-        },
-    );
-    LiveReadToken(id)
-}
-
-/// The longest-running read checked out now, and how many there are.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OldestLiveRead {
-    pub age_ms: u128,
-    pub snapshot: bool,
-    pub at: String,
-    pub live: usize,
-}
-
-pub fn oldest_live_read() -> Option<OldestLiveRead> {
-    let reads = LIVE_READS.lock().unwrap_or_else(PoisonError::into_inner);
-    let live = reads.len();
-    let oldest = reads.values().min_by_key(|read| read.started)?;
-    Some(OldestLiveRead {
-        age_ms: oldest.started.elapsed().as_millis(),
-        snapshot: oldest.snapshot,
-        at: format!("{}:{}", oldest.at.file(), oldest.at.line()),
-        live,
-    })
-}
-
-/// Every live read as (location, is_snapshot), for tests that look for their own entry.
+pub use read_lifetime::{
+    LiveReadToken, OldestLiveRead, ReadLifetime, ReadLifetimeReport, oldest_live_read,
+    register_live_read,
+};
 #[cfg(any(test, feature = "test-support"))]
-pub fn live_read_locations() -> Vec<(String, bool)> {
-    LIVE_READS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .values()
-        .map(|read| (format!("{}:{}", read.at.file(), read.at.line()), read.snapshot))
-        .collect()
-}
+pub use read_lifetime::live_read_locations;
 
 pub struct ReadGuard<'a> {
     pub pool: &'a ReadPool,
@@ -1029,6 +965,7 @@ impl ReadPool {
             path: path.to_path_buf(),
             shared_memory,
             counts: Arc::new(ReaderCounts::default()),
+            diagnostic_id: read_lifetime::next_pool_id(),
         };
         // Open one now, so a store that cannot be read fails to open.
         let connection = pool.open_connection()?;
@@ -1040,12 +977,24 @@ impl ReadPool {
         std::ptr::from_ref(self) as usize
     }
 
+    /// Candidates for this pool and separately unpooled process entries with unknown database
+    /// identity. Neither group proves who holds a WAL frame.
+    pub fn live_read_report(&self) -> ReadLifetimeReport {
+        read_lifetime::report(self.diagnostic_id)
+    }
+
+    #[track_caller]
+    pub(crate) fn register_snapshot(&self) -> LiveReadToken {
+        read_lifetime::register_in_pool(self.diagnostic_id, true, None)
+    }
+
     fn open_connection(&self) -> Result<ReadConnection> {
         let connection = open_read_connection(&self.path, self.shared_memory)?;
         let open = self.counts.open.fetch_add(1, Ordering::Relaxed) + 1;
         self.counts.peak.fetch_max(open, Ordering::Relaxed);
-        self.counts.opened.fetch_add(1, Ordering::Relaxed);
+        let id = self.counts.opened.fetch_add(1, Ordering::Relaxed) + 1;
         Ok(ReadConnection {
+            id,
             connection,
             counts: self.counts.clone(),
         })
@@ -1059,7 +1008,8 @@ impl ReadPool {
         let idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner).pop();
         let connection = match idle { Some(connection) => connection, None => self.open_connection()? };
         configure_read_cancellation(&connection);
-        let guard = ReadGuard { pool: self, connection: Some(connection), pinned: None, _live: Some(register_live_read(false)) };
+        let live = read_lifetime::register_in_pool(self.diagnostic_id, false, Some(connection.id));
+        let guard = ReadGuard { pool: self, connection: Some(connection), pinned: None, _live: Some(live) };
         crate::read_budget::check()?;
         Ok(guard)
     }
@@ -1166,11 +1116,12 @@ impl ReadPool {
             crate::profile::read_waited(waiting.elapsed());
         }
         configure_read_cancellation(&connection);
+        let live = read_lifetime::register_in_pool(self.diagnostic_id, false, Some(connection.id));
         ReadGuard {
             pool: self,
             connection: Some(connection),
             pinned: None,
-            _live: Some(register_live_read(false)),
+            _live: Some(live),
         }
     }
 
@@ -1180,7 +1131,17 @@ impl ReadPool {
         // Remove cancellation before reuse by an unrelated request. No other thread can
         // still own this connection; pinned readers return only after their last guard.
         connection.progress_handler(0, None::<fn() -> bool>);
-        let _ = connection.busy_timeout(std::time::Duration::from_secs(5));
+        // Raw BEGIN is available on ordinary guards. Never retain an idle read transaction:
+        // it can pin WAL after its live-read entry is gone. Cleanup happens only at physical
+        // return, after every legitimate pinned/outer owner has released the connection.
+        if !connection.is_autocommit()
+            && (connection.execute_batch("ROLLBACK").is_err() || !connection.is_autocommit())
+        {
+            return; // Closing a failed-cleanup connection is safer than reusing it.
+        }
+        if connection.busy_timeout(std::time::Duration::from_secs(5)).is_err() {
+            return;
+        }
         let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
         if idle.len() < max_idle_read_connections() {
             idle.push(connection);

@@ -4891,7 +4891,7 @@ impl Store {
             return read(index);
         }
         // The snapshot's own entry: the guard below is lent out and dropped at once.
-        let _live = crate::sqlite::register_live_read(true);
+        let live = self.readers.register_snapshot();
         let mut guard = self.readers.get();
         // Declared first so it drops last: on every exit it ends the transaction, releases the
         // pin, and returns the connection to the pool.
@@ -4911,6 +4911,7 @@ impl Store {
         connection.execute_batch("BEGIN")?;
         // The first read starts the snapshot; every later read in `read` sees the same one.
         let index = current_index(&connection)?;
+        live.snapshot_started(&connection);
         PINNED_READER.with(|slot| *slot.borrow_mut() = Some((key, connection)));
         read(index)
     }
