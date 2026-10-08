@@ -5,7 +5,7 @@ import { expect, fn, userEvent, waitFor, within } from 'storybook/test'
 import { Transcript, type TranscriptAvailability, type TranscriptHistory, type TranscriptTurn } from './assistant-ui/composition/Transcript'
 import type { TranscriptEmptyState } from './assistant-ui/composition/TranscriptFeedback'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
-import type { ConversationItem, TextItem } from './assistant-ui/embrace-data/model'
+import type { ConversationItem, SendState, TextItem } from './assistant-ui/embrace-data/model'
 import { workLogTurnFromItems, type WorkLogCall } from './assistant-ui/taste/work-log'
 import type { SyncStatus } from './assistant-ui/st3-views/sync-status'
 import { baselineTheme } from './assistant-ui/neutral-theme'
@@ -20,7 +20,7 @@ type State = 'settled' | 'expanded' | 'streaming' | 'failed' | 'interrupted' | '
 interface TranscriptStoryData { readonly turns: readonly TranscriptTurn[]; readonly sync: SyncStatus; readonly availability?: TranscriptAvailability; readonly history?: TranscriptHistory; readonly emptyState?: React.ReactNode | TranscriptEmptyState }
 function fixture(state: State, prefix: string): TranscriptStoryData {
   const running = state === 'streaming', failed = state === 'failed', interrupted = state === 'interrupted'
-  const prompt: TextItem & { role: 'user' } = { _tag: 'Text', id: `${prefix}/prompt`, role: 'user', text: 'Keep the row projection readable and verify that selection survives the change.', attachments: [], streaming: false, at, sender: { kind: 'human', label: 'Operator' }, sendState: state === 'pending-send' ? { _tag: 'Pending' } : state === 'failed-send' ? { _tag: 'Failed', reason: 'Message was not delivered', detail: 'The connection dropped while sending. Your draft is still saved; try again in a moment.' } : undefined }
+  const prompt: TextItem & { role: 'user' } = { _tag: 'Text', id: `${prefix}/prompt`, role: 'user', text: 'Keep the row projection readable and verify that selection survives the change.', attachments: [], streaming: false, at, sender: { kind: 'human', label: 'Operator' }, sendState: state === 'pending-send' ? { _tag: 'Pending' } : state === 'failed-send' ? { _tag: 'Failed', reason: { _tag: 'Failed' }, detail: 'The connection dropped while sending. Your draft is still saved; try again in a moment.' } : undefined }
   const calls: ConversationItem[] = [
     { _tag: 'ToolCall', id: `${prefix}/read`, callId: `${prefix}/read`, name: 'read', input: { path: 'src/rows.ts' }, status: 'success', result: { content: source, mediaType: 'text/plain', isError: false, at: '2026-01-15T12:00:03Z' }, callSeen: true, at: '2026-01-15T12:00:01Z' },
     { _tag: 'ToolCall', id: `${prefix}/run`, callId: `${prefix}/run`, name: 'run', input: { command: 'pnpm test rows' }, status: failed ? 'error' : interrupted ? 'interrupted' : running ? 'running' : 'success', result: running ? undefined : { content: failed ? 'The row assertion did not match the observed selection.' : interrupted ? 'Stopped before the checks completed.' : '✓ selection retained\n✓ visible count matches\n✓ empty rows handled', mediaType: 'text/x-shellscript', isError: failed, at: '2026-01-15T12:00:18Z' }, callSeen: true, at: '2026-01-15T12:00:05Z' },
@@ -40,7 +40,7 @@ function fixture(state: State, prefix: string): TranscriptStoryData {
 const cases: Readonly<Record<State, TranscriptStoryData>> = {
   settled: fixture('settled', 'settled'), expanded: fixture('expanded', 'expanded'), streaming: fixture('streaming', 'streaming'), failed: fixture('failed', 'failed'), interrupted: fixture('interrupted', 'interrupted'), unknown: fixture('unknown', 'unknown'), loading: fixture('loading', 'loading'), 'catching-up': fixture('catching-up', 'catching-up'), reconnecting: fixture('reconnecting', 'reconnecting'), 'sync-failed': fixture('sync-failed', 'sync-failed'), 'pending-send': fixture('pending-send', 'pending-send'), 'failed-send': fixture('failed-send', 'failed-send'), empty: fixture('empty', 'empty'),
 }
-function RuntimeTranscript({ data, onOpenTool, onRetry, onRetrySend, availability, history, emptyState }: { data: TranscriptStoryData; onOpenTool: (call: WorkLogCall) => void; onRetry: () => void; onRetrySend?: (itemId: string) => void; availability?: TranscriptAvailability; history?: TranscriptHistory; emptyState?: React.ReactNode | TranscriptEmptyState }) {
+function RuntimeTranscript({ data, onOpenTool, onRetry, onRetrySend, availability, history, emptyState }: { data: TranscriptStoryData; onOpenTool?: (call: WorkLogCall) => void; onRetry: () => void; onRetrySend?: (itemId: string) => void; availability?: TranscriptAvailability; history?: TranscriptHistory; emptyState?: React.ReactNode | TranscriptEmptyState }) {
   const messages = React.useMemo(() => data.turns.flatMap(turn => turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]), [data])
   const options = React.useMemo(() => ({ messages, isRunning: data.turns.some(turn => turn.work.running), onNew: async () => {} }), [messages, data])
   return <EmbraceRuntimeProvider options={options}><Transcript title="Row projection" turns={data.turns} sync={data.sync} now={now} observedAt={now - 8000} onOpenTool={onOpenTool} onRetryRun={onRetry} onRetrySync={onRetry} onRetrySend={onRetrySend} availability={availability} history={history} emptyState={emptyState} /></EmbraceRuntimeProvider>
@@ -107,8 +107,10 @@ export const FailedLight: Story = { ...Failed, args: { state: 'failed', scheme: 
 export const Interrupted: Story = { args: { state: 'interrupted' } }
 export const InterruptedLight: Story = { args: { state: 'interrupted', scheme: 'light' } }
 export const CompletionUnknown: Story = { args: { state: 'unknown' } }
-export const Loading: Story = { args: { state: 'loading' } }
-export const LoadingLight: Story = { args: { state: 'loading', scheme: 'light' } }
+export const Loading: Story = { args: { state: 'loading' }, play: async ({ canvasElement }) => {
+  await expect(await within(canvasElement).findByText('Loading conversation…')).toBeVisible()
+} }
+export const LoadingLight: Story = { ...Loading, args: { state: 'loading', scheme: 'light' } }
 export const CatchingUp: Story = { args: { state: 'catching-up' }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   await canvas.findByTestId('transcript-turn')
@@ -187,8 +189,8 @@ export const PendingSendLight: Story = { ...PendingSend, args: { state: 'pending
 export const FailedSend: Story = { args: { state: 'failed-send' }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   const failure = await canvas.findByTestId('send-failure')
-  await expect(failure).toHaveTextContent('Message was not delivered')
-  await userEvent.click(canvas.getByRole('button', { name: 'Message was not delivered' }))
+  await expect(failure).toHaveTextContent("Couldn't send")
+  await userEvent.click(canvas.getByRole('button', { name: "Couldn't send" }))
   await expect(failure).toHaveTextContent('The connection dropped while sending')
 } }
 export const FailedSendLight: Story = { ...FailedSend, args: { state: 'failed-send', scheme: 'light' } }
@@ -267,6 +269,48 @@ export const MidTurnHistory: Story = { render: args => <main {...stylex.props(st
   await expect(canvas.getByTestId('history-boundary').compareDocumentPosition(canvas.getByTestId('transcript-turn')) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
 } }
 export const MidTurnHistoryLight: Story = { ...MidTurnHistory, args: { scheme: 'light' } }
+
+export const ReadOnlyTools: Story = { render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><RuntimeTranscript data={cases.settled} onRetry={() => {}} /></main>, play: async ({ canvasElement }) => {
+  const work = await within(canvasElement).findByTestId('work-log')
+  await expect(work.querySelector('button, [role="button"], [data-row-disclosure]')).toBeNull()
+  await expect(work).toHaveTextContent('export const last = visibleRows.at(-1)')
+  await expect(work).toHaveTextContent('selection retained')
+  await expect(work.querySelectorAll('[data-testid="tool-preview-actions"]')).toHaveLength(0)
+} }
+export const ReadOnlyToolsLight: Story = { ...ReadOnlyTools, args: { scheme: 'light' } }
+const proseOnlyItems: readonly ConversationItem[] = [{ _tag: 'Text', id: 'prose/answer', role: 'assistant', text: 'A plain answer needs no work summary.', attachments: [], streaming: false, at }]
+const proseOnlyData: TranscriptStoryData = { sync: { _tag: 'Live' }, turns: [{ id: 'prose', items: proseOnlyItems, work: workLogTurnFromItems(proseOnlyItems, { kindFor: () => 'read', running: false, failed: false, interrupted: false, completeHistory: true }) }] }
+export const ProseOnly: Story = { render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><RuntimeTranscript data={proseOnlyData} onRetry={() => {}} /></main>, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  await expect(await canvas.findByTestId('agent-message')).toHaveTextContent('A plain answer')
+  await expect(canvas.queryByTestId('work-log')).toBeNull()
+  await expect(canvas.queryByText(/Worked/)).toBeNull()
+} }
+export const ProseOnlyLight: Story = { ...ProseOnly, args: { scheme: 'light' } }
+type FailureReason = Extract<SendState, { _tag: 'Failed' }>['reason']['_tag']
+const sendFailureStory = (tag: FailureReason, copy: string, retryable: boolean): Story => ({
+  render: args => {
+    const base = fixture('failed-send', 'failure')
+    const data: TranscriptStoryData = { ...base, turns: base.turns.map(turn => ({ ...turn, prompt: turn.prompt === undefined ? undefined : { ...turn.prompt, sendState: { _tag: 'Failed', reason: { _tag: tag }, detail: 'rpc_timeout' } } })) }
+    return <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><RuntimeTranscript data={data} onRetry={() => {}} onRetrySend={() => {}} /></main>
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement)
+    const failure = await canvas.findByTestId('send-failure')
+    await expect(failure).toHaveTextContent(copy)
+    await expect(failure).toHaveAttribute('data-send-failure-reason', tag)
+    await expect(failure.textContent).not.toContain(tag)
+    await expect(canvas.queryByText('rpc_timeout')).toBeNull()
+    if (retryable) await expect(within(failure).getByRole('button', { name: 'Retry' })).toBeVisible()
+    else await expect(within(failure).queryByRole('button', { name: 'Retry' })).toBeNull()
+  },
+})
+export const SendRejected: Story = sendFailureStory('Rejected', 'Message was rejected', false)
+export const SendUngranted: Story = sendFailureStory('Ungranted', "You don't have permission to send here", false)
+export const SendInvalid: Story = sendFailureStory('Invalid', "Message couldn't be sent: it isn't valid", false)
+export const SendGenericFailure: Story = sendFailureStory('Failed', "Couldn't send", true)
+export const SendStaleFence: Story = sendFailureStory('StaleFence', "Couldn't send: the conversation changed", true)
+export const SendSnapshotUnavailable: Story = sendFailureStory('SnapshotUnavailable', "Couldn't send: conversation not loaded yet. Nothing was sent.", true)
 const semanticItems: readonly ConversationItem[] = [
   { _tag: 'Text', id: 'semantic/system', role: 'system', text: 'System context retained.', attachments: [], streaming: false, at },
   { _tag: 'Notice', id: 'semantic/notice', kind: 'redaction', text: 'Notice content retained.', at },

@@ -6,15 +6,24 @@ import { Icon } from './Icons'
 import { surfaceVars as surface, textVars as ink, accentVars as accent, statusVars as status, typeVars as t, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
 
 export interface TranscriptEmptyState { readonly title: string; readonly body?: string }
+const sendFailureCopy: Readonly<Record<Extract<SendState, { _tag: 'Failed' }>['reason']['_tag'], string>> = {
+  Rejected: 'Message was rejected',
+  Ungranted: "You don't have permission to send here",
+  Invalid: "Message couldn't be sent: it isn't valid",
+  Failed: "Couldn't send",
+  StaleFence: "Couldn't send: the conversation changed",
+  SnapshotUnavailable: "Couldn't send: conversation not loaded yet. Nothing was sent.",
+}
 
 /** Failed send: danger reason line; host-supplied detail opens on disclosure. */
 export function SendFailure({ state, onRetry }: { readonly state: Extract<SendState, { _tag: 'Failed' }>; readonly onRetry?: () => void }) {
   const [open, setOpen] = React.useState(false)
   const detailId = React.useId()
-  return <div role="alert" data-testid="send-failure" {...stylex.props(styles.sendFailure)}>
-    <Button aria-expanded={open} aria-controls={state.detail === undefined ? undefined : detailId} onPress={() => setOpen(value => !value)} {...stylex.props(styles.sendFailureLine)}>{state.reason}{state.detail !== undefined && <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} />}</Button>
+  const retryable = state.reason._tag === 'Failed' || state.reason._tag === 'StaleFence' || state.reason._tag === 'SnapshotUnavailable'
+  return <div role="alert" data-testid="send-failure" data-send-failure-reason={state.reason._tag} {...stylex.props(styles.sendFailure)}>
+    <Button aria-expanded={open} aria-controls={state.detail === undefined ? undefined : detailId} onPress={() => setOpen(value => !value)} {...stylex.props(styles.sendFailureLine)}>{sendFailureCopy[state.reason._tag]}{state.detail !== undefined && <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} />}</Button>
     {open && state.detail !== undefined ? <div id={detailId} {...stylex.props(styles.sendFailureDetail)}>{state.detail}</div> : null}
-    {onRetry !== undefined && <Button onPress={onRetry} {...stylex.props(styles.sendFailureLine)}>Retry</Button>}
+    {retryable && onRetry !== undefined && <Button onPress={onRetry} {...stylex.props(styles.sendFailureLine)}>Retry</Button>}
   </div>
 }
 
