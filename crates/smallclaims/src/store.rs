@@ -3491,6 +3491,10 @@ fn load_compact_replication_inventory(
 /// the most identities one divergent exchange lists beyond its first differing range.
 pub const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 
+/// Leave half of the 64 MiB exchange cap for inventory identities, signatures, and JSON
+/// framing. A page stops before fetching the next payload once this wire-size budget is spent.
+const REPLICATION_EXCHANGE_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+
 /// Maximum envelopes admitted per writer transaction. Admission can take several milliseconds
 /// per envelope on a populated store; leave room for queued write acknowledgements below 50 ms.
 pub const ADMISSION_CHUNK_ENVELOPES: usize = 8;
@@ -5800,7 +5804,7 @@ impl Store {
                     accepts: Some(replication_accepts()),
                     checkpoint: self.trimmed_checkpoint()?,
                 },
-                envelopes: self.replica_envelopes(missing)?,
+                envelopes: self.replica_envelopes_for_exchange(missing)?,
                 signature_requests: Vec::new(),
                 signatures: Vec::new(),
             });
@@ -5851,7 +5855,7 @@ impl Store {
                     snapshot.inventory.public()
                 }
             },
-            envelopes: self.replica_envelopes(missing)?,
+            envelopes: self.replica_envelopes_for_exchange(missing)?,
             signature_requests: Vec::new(),
             signatures: Vec::new(),
         })
@@ -5861,10 +5865,33 @@ impl Store {
         &self,
         missing: Vec<ReplicaEnvelopeId>,
     ) -> Result<Vec<ReplicaEnvelope>> {
+        self.replica_envelopes_with_wire_budget(missing, None)
+    }
+
+    fn replica_envelopes_for_exchange(
+        &self,
+        missing: Vec<ReplicaEnvelopeId>,
+    ) -> Result<Vec<ReplicaEnvelope>> {
+        self.replica_envelopes_with_wire_budget(missing, Some(REPLICATION_EXCHANGE_PAYLOAD_BYTES))
+    }
+
+    fn replica_envelopes_with_wire_budget(
+        &self,
+        missing: Vec<ReplicaEnvelopeId>,
+        wire_budget: Option<usize>,
+    ) -> Result<Vec<ReplicaEnvelope>> {
         if missing.is_empty() {
             return Ok(Vec::new());
         }
         let connection = self.readers.get();
+        let mut payload_lengths = wire_budget
+            .map(|_| {
+                connection.prepare_cached(
+                    "SELECT typeof(payload), length(payload) FROM replica_envelopes
+                     WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+                )
+            })
+            .transpose()?;
         // Reuse one preparation for the whole page, including its signature subqueries.
         let mut statement = connection.prepare_cached(
             "SELECT envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload,
@@ -5882,7 +5909,40 @@ impl Store {
                  WHERE envelopes.writer=?1 AND envelopes.sequence=?2 AND envelopes.envelope_hash=?3",
         )?;
         let mut envelopes = Vec::with_capacity(missing.len());
+        let mut wire_bytes = 0usize;
         for identity in missing {
+            if let Some(budget) = wire_budget {
+                let length: Option<(String, i64)> = payload_lengths
+                    .as_mut()
+                    .expect("a wire budget prepares payload lengths")
+                    .query_row(
+                        params![identity.writer, identity.sequence, identity.hash],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((kind, length)) = length else {
+                    // The payload may have been trimmed after the inventory snapshot.
+                    continue;
+                };
+                let length = usize::try_from(length)?;
+                // BLOB payloads serialize as base64. Legacy TEXT may contain JSON escapes;
+                // six bytes per input byte is a safe upper bound without loading the payload.
+                let serialized = if kind == "blob" {
+                    length.div_ceil(3).checked_mul(4)
+                } else {
+                    length.checked_mul(6)
+                }
+                .and_then(|length| length.checked_add(2))
+                .ok_or_else(|| anyhow::anyhow!("replication envelope payload size overflow"))?;
+                if serialized > budget.saturating_sub(wire_bytes) {
+                    anyhow::ensure!(
+                        !envelopes.is_empty(),
+                        "one replication envelope exceeds the exchange payload budget"
+                    );
+                    break;
+                }
+                wire_bytes += serialized;
+            }
             // A trim can delete the payload after the snapshot listed the identity. The
             // tombstone stays in the inventory and the peer never needs the envelope.
             let envelope = statement.query_row(
