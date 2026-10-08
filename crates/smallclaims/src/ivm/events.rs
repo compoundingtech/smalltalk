@@ -15,6 +15,9 @@ use super::{Availability, AvailabilityToken, Readiness, SourceCut, Views, source
 use crate::{Store, sqlite::CommitObserver};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+pub use source_progress::{
+    SourceCommit, SourceIdentity, SourceInvalidation, SourceProgress, SourceToken, SourceWake,
+};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -423,6 +426,8 @@ pub enum Notice {
     Committed(CommitFrontiers),
     /// Recheck source/readiness; never convert a failed capture into a successful event.
     Unavailable(String),
+    /// Source-owner wake only; does not certify a prepared output, authorization or readiness.
+    Source(SourceWake),
 }
 
 /// One bridge per Store; graph-watch owns subscriber fanout outside the writer. The callback
@@ -432,6 +437,7 @@ pub enum Notice {
 pub struct Publisher {
     notices: broadcast::Sender<Notice>,
     _observer: CommitObserver,
+    source_scope: Option<Arc<source_progress::Scope>>,
 }
 
 impl Publisher {
@@ -466,12 +472,445 @@ impl Publisher {
         Ok(Self {
             notices,
             _observer: observer,
+            source_scope: None,
         })
+    }
+
+    /// Explicitly observe at most sixteen already-installed named sources on this same bridge.
+    /// Setup is read-only and must follow source/capture schema installation. Source owners
+    /// prove complete native capture and lifetime coverage; these tuples only wake consumers.
+    /// The opt-in observer adds two bounded metadata statements to the ordinary frontier read.
+    pub fn attach_with_sources(
+        store: &Store,
+        capacity: usize,
+        sources: &[SourceIdentity],
+    ) -> Result<Self> {
+        ensure!(
+            (1..=256).contains(&capacity),
+            "notice capacity outside 1..=256"
+        );
+        let (initial, scope, progress) = store.read_snapshot(|_| {
+            let connection = store.readers.get();
+            let initial = frontiers(&connection)?;
+            let scope = source_progress::Scope::attach(&connection, &initial.database_id, sources)?;
+            let progress = scope.capture(&connection, &initial.database_id)?;
+            Ok((initial, Arc::new(scope), progress))
+        })?;
+        let highwater = progress
+            .sources
+            .iter()
+            .map(|source| source.revision)
+            .collect::<Vec<_>>();
+        let last = Arc::new(Mutex::new((
+            Notice::Committed(initial),
+            SourceWake::Committed(progress),
+            highwater,
+        )));
+        let (notices, _) = broadcast::channel(capacity);
+        let send = notices.clone();
+        let capture_scope = scope.clone();
+        let observer = store.connection.observe_commits(move |connection| {
+            let captured = if connection.is_autocommit() {
+                frontiers(connection)
+            } else {
+                Err(anyhow::anyhow!(
+                    "writer returned with an unfinished transaction"
+                ))
+            };
+            let (notice, mut progress) = match captured {
+                Ok(frontiers) => {
+                    let progress = match capture_scope.capture(connection, &frontiers.database_id) {
+                        Ok(progress) => SourceWake::Committed(progress),
+                        Err(error) => capture_scope.unavailable(&format!("{error:#}")),
+                    };
+                    (Notice::Committed(frontiers), progress)
+                }
+                Err(error) => {
+                    let reason = format!("{error:#}");
+                    (
+                        Notice::Unavailable(reason.clone()),
+                        capture_scope.unavailable(&reason),
+                    )
+                }
+            };
+            // All SQLite work precedes this lock. A returned rollback/no-op emits nothing
+            // when its committed metadata is unchanged. Source availability is independent.
+            let mut last = last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let SourceWake::Committed(commit) = &progress {
+                if commit
+                    .sources
+                    .iter()
+                    .zip(&last.2)
+                    .any(|(source, previous)| source.revision < *previous)
+                {
+                    progress = capture_scope.unavailable("named-source revision moved backwards");
+                } else {
+                    for (previous, source) in last.2.iter_mut().zip(&commit.sources) {
+                        *previous = source.revision;
+                    }
+                }
+            }
+            if last.0 != notice {
+                last.0 = notice.clone();
+                let _ = send.send(notice);
+            }
+            if last.1 != progress {
+                last.1 = progress.clone();
+                let _ = send.send(Notice::Source(progress));
+            }
+        });
+        Ok(Self {
+            notices,
+            _observer: observer,
+            source_scope: Some(scope),
+        })
+    }
+
+    /// Call only after the source's successful AfterCommit check and immutable cache swap,
+    /// outside the writer. The token names an already-committed source position, not a new
+    /// counter. Always broadcasts, including when the raw tuple is unchanged. This wake does
+    /// not replace an authoritative read/coverage check or establish retained-root eligibility.
+    pub fn publication_completed(&self, token: &SourceToken) -> Result<()> {
+        self.source_scope
+            .as_ref()
+            .context("publisher has no named sources")?
+            .validate_token(token)?;
+        let _ = self
+            .notices
+            .send(Notice::Source(SourceWake::Published(token.clone())));
+        Ok(())
+    }
+
+    /// Wake after the source owner has guarded/fenced a failed post-commit publication.
+    /// Does not write a fence, change availability or undo an accepted source commit.
+    pub fn publication_invalidated(&self, source: &SourceIdentity, reason: &str) -> Result<()> {
+        let scope = self
+            .source_scope
+            .as_ref()
+            .context("publisher has no named sources")?;
+        scope.validate_identity(source)?;
+        let _ = self
+            .notices
+            .send(Notice::Source(scope.invalidated(source, reason)));
+        Ok(())
+    }
+
+    /// Identity captured at explicit named-source attachment. It scopes wake tokens only;
+    /// the source owner still checks its native database/lifetime and full publication cut.
+    pub fn source_database_id(&self) -> Option<&str> {
+        self.source_scope.as_ref().map(|scope| scope.database_id())
     }
 
     /// Subscribe before an authoritative snapshot/recheck. A commit before that snapshot is
     /// reflected by its durable boundary; one after it remains buffered on this receiver.
     pub fn subscribe(&self) -> broadcast::Receiver<Notice> {
         self.notices.subscribe()
+    }
+}
+
+mod source_progress {
+    use super::super::install::SourcePosition;
+    use anyhow::{Context, Result, ensure};
+    use rusqlite::{Connection, params_from_iter};
+
+    const MAX_SOURCES: usize = 16;
+    const MAX_NAME_BYTES: usize = 128;
+    const MAX_FINGERPRINT_BYTES: usize = 4096;
+    const MAX_METADATA_BYTES: usize = 64 * 1024;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SourceIdentity {
+        pub name: String,
+        pub fingerprint: String,
+        pub epoch: u64,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SourceProgress {
+        pub identity: SourceIdentity,
+        pub revision: u64,
+        pub available: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SourceCommit {
+        pub database_id: String,
+        /// Deterministic source-name order, including unavailable source state.
+        pub sources: Vec<SourceProgress>,
+    }
+
+    /// A wake token, not a publication/authorization/retention certificate. The source owner
+    /// supplies the already-committed position captured with its complete native cut.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SourceToken {
+        pub database_id: String,
+        pub position: SourcePosition,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SourceInvalidation {
+        pub database_id: String,
+        /// None invalidates all sources explicitly attached to this Publisher.
+        pub source: Option<SourceIdentity>,
+        pub reason: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SourceWake {
+        Committed(SourceCommit),
+        Published(SourceToken),
+        Invalidated(SourceInvalidation),
+    }
+
+    pub(super) struct Scope {
+        database_id: String,
+        identities: Vec<SourceIdentity>,
+        schema_version: i64,
+        query: String,
+    }
+
+    impl Scope {
+        pub(super) fn attach(
+            db: &Connection,
+            database_id: &str,
+            identities: &[SourceIdentity],
+        ) -> Result<Self> {
+            ensure!(
+                (1..=MAX_SOURCES).contains(&identities.len()),
+                "named-source count outside 1..=16"
+            );
+            ensure!(
+                !database_id.is_empty() && database_id.len() <= MAX_NAME_BYTES,
+                "invalid publisher database identity"
+            );
+            let mut identities = identities.to_vec();
+            identities.sort_by(|a, b| a.name.cmp(&b.name));
+            let mut bytes = database_id.len();
+            for (index, identity) in identities.iter().enumerate() {
+                ensure!(
+                    !identity.name.is_empty()
+                        && identity.name.len() <= MAX_NAME_BYTES
+                        && !identity.name.contains('\0'),
+                    "invalid named-source name"
+                );
+                ensure!(
+                    !identity.fingerprint.is_empty()
+                        && identity.fingerprint.len() <= MAX_FINGERPRINT_BYTES
+                        && !identity.fingerprint.contains('\0'),
+                    "invalid named-source fingerprint"
+                );
+                ensure!(
+                    identity.epoch <= i64::MAX as u64,
+                    "invalid named-source epoch"
+                );
+                ensure!(
+                    index == 0 || identities[index - 1].name != identity.name,
+                    "duplicate named source"
+                );
+                bytes += identity.name.len()
+                    + identity.fingerprint.len()
+                    + 3 * std::mem::size_of::<u64>();
+            }
+            ensure!(
+                bytes <= MAX_METADATA_BYTES,
+                "named-source metadata exceeds bound"
+            );
+            // Explicit setup only. The hot callback checks the cookie before querying any
+            // source rows. An altered/reset schema requires owner-reviewed reattachment.
+            let kind: (String, i64, i64) = db.query_row(
+                "SELECT type,wr,ncol FROM pragma_table_list WHERE schema='main' AND name='ivm_install_sources'",
+                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            ensure!(
+                kind == ("table".into(), 0, 7),
+                "named-source table schema incompatible"
+            );
+            let mut statement = db.prepare("SELECT name,type,pk,hidden FROM pragma_table_xinfo('ivm_install_sources','main') LIMIT 8")?;
+            let columns = statement
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let expected = [
+                ("name", "TEXT", 1),
+                ("fingerprint", "TEXT", 0),
+                ("epoch", "INTEGER", 0),
+                ("revision", "INTEGER", 0),
+                ("available", "INTEGER", 0),
+                ("journal_rows", "INTEGER", 0),
+                ("journal_bytes", "INTEGER", 0),
+            ];
+            ensure!(
+                columns.len() == expected.len()
+                    && columns
+                        .iter()
+                        .zip(expected)
+                        .all(|(actual, expected)| actual.0 == expected.0
+                            && actual.1 == expected.1
+                            && actual.2 == expected.2
+                            && actual.3 == 0),
+                "named-source columns incompatible"
+            );
+            // Check the actual ordered primary-key index and BINARY comparison, not just
+            // the column declaration, so the fixed exact-name queries remain point seeks.
+            let mut indexes = db.prepare("SELECT name FROM pragma_index_list('ivm_install_sources','main') WHERE origin='pk' LIMIT 2")?;
+            let indexes = indexes
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(indexes.len() == 1, "named-source primary index missing");
+            let mut keys = db.prepare(
+                "SELECT name,coll,desc FROM pragma_index_xinfo(?1,'main') WHERE key=1 LIMIT 2",
+            )?;
+            let keys = keys
+                .query_map([&indexes[0]], |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(
+                keys == vec![(Some("name".into()), "BINARY".into(), 0)],
+                "named-source primary key incompatible"
+            );
+            let schema_version = db.query_row("PRAGMA main.schema_version", [], |r| r.get(0))?;
+            let placeholders = (1..=identities.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            // Direct-column octet_length avoids copying a malformed oversized fingerprint
+            // into Rust. All dynamic SQL consists of generated parameter numbers only.
+            let query = format!("SELECT name,
+                CASE WHEN typeof(fingerprint)='text' AND octet_length(fingerprint)<={MAX_FINGERPRINT_BYTES} THEN fingerprint END,
+                CASE WHEN typeof(epoch)='integer' THEN epoch END,
+                CASE WHEN typeof(revision)='integer' THEN revision END,
+                CASE WHEN typeof(available)='integer' THEN available END
+                FROM main.ivm_install_sources WHERE name COLLATE BINARY IN ({placeholders}) ORDER BY name COLLATE BINARY");
+            Ok(Self {
+                database_id: database_id.into(),
+                identities,
+                schema_version,
+                query,
+            })
+        }
+
+        pub(super) fn capture(&self, db: &Connection, database_id: &str) -> Result<SourceCommit> {
+            ensure!(
+                database_id == self.database_id,
+                "publisher database identity replaced"
+            );
+            let cookie: i64 = db.query_row("PRAGMA main.schema_version", [], |r| r.get(0))?;
+            ensure!(
+                cookie == self.schema_version,
+                "named-source schema changed; explicit reattachment required"
+            );
+            let mut statement = db.prepare_cached(&self.query)?;
+            let rows = statement.query_map(
+                params_from_iter(self.identities.iter().map(|i| &i.name)),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )?;
+            let mut sources = Vec::with_capacity(self.identities.len());
+            for (index, row) in rows.enumerate() {
+                let expected = self
+                    .identities
+                    .get(index)
+                    .context("unexpected named-source metadata")?;
+                let (name, fingerprint, epoch, revision, available) = row?;
+                ensure!(
+                    name == expected.name
+                        && fingerprint.as_deref() == Some(expected.fingerprint.as_str())
+                        && epoch == Some(expected.epoch as i64),
+                    "named-source identity missing or replaced"
+                );
+                let revision = revision
+                    .filter(|r| *r >= 0)
+                    .context("invalid named-source revision")?
+                    as u64;
+                let available = available
+                    .filter(|a| *a == 0 || *a == 1)
+                    .context("invalid named-source availability")?
+                    == 1;
+                sources.push(SourceProgress {
+                    identity: expected.clone(),
+                    revision,
+                    available,
+                });
+            }
+            ensure!(
+                sources.len() == self.identities.len(),
+                "named source missing"
+            );
+            Ok(SourceCommit {
+                database_id: self.database_id.clone(),
+                sources,
+            })
+        }
+
+        pub(super) fn validate_identity(&self, identity: &SourceIdentity) -> Result<()> {
+            ensure!(
+                self.identities.iter().any(|expected| expected == identity),
+                "source not attached to this publisher"
+            );
+            Ok(())
+        }
+
+        pub(super) fn database_id(&self) -> &str {
+            &self.database_id
+        }
+
+        pub(super) fn validate_token(&self, token: &SourceToken) -> Result<()> {
+            ensure!(
+                token.database_id == self.database_id && token.position.revision <= i64::MAX as u64,
+                "invalid source publication token"
+            );
+            ensure!(
+                self.identities
+                    .iter()
+                    .any(|identity| identity.name == token.position.source
+                        && identity.fingerprint == token.position.fingerprint
+                        && identity.epoch == token.position.epoch),
+                "source not attached to this publisher"
+            );
+            Ok(())
+        }
+
+        pub(super) fn invalidated(&self, source: &SourceIdentity, reason: &str) -> SourceWake {
+            SourceWake::Invalidated(SourceInvalidation {
+                database_id: self.database_id.clone(),
+                source: Some(source.clone()),
+                reason: bounded_reason(reason),
+            })
+        }
+
+        pub(super) fn unavailable(&self, reason: &str) -> SourceWake {
+            SourceWake::Invalidated(SourceInvalidation {
+                database_id: self.database_id.clone(),
+                source: None,
+                reason: bounded_reason(reason),
+            })
+        }
+    }
+
+    fn bounded_reason(reason: &str) -> String {
+        let mut end = reason.len().min(1024);
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason[..end].into()
     }
 }

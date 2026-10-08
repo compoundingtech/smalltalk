@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add opt-in named Installer source commit wakes and distinct post-publication wakes on the existing IVM Publisher.",
+  "replay": {
+    "status": "none",
+    "detail": "No admission, replay, source capture, prepared publication or retained-root certification is supplied or changed."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, index, trigger, journal or persisted counter is created. Explicit attachment reads existing Installer metadata."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No authority, retention, checkpoint, digest or read-coverage rules change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The library adds Notice::Source with committed/publication/invalidation wake types. Exhaustive consumers must adapt. Existing Publisher::attach retains its frontier query and behavior; attach_with_sources is opt-in and requires complete owner-qualified sources. No native production activation is included."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Library-only source change; no deployment or restart behavior is implemented."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "An adopting owner explicitly configures at most sixteen bounded source identities after schema/capture setup and sends publication wakes only after guarded AfterCommit cache swap. No production adopter is installed by this change."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Named-source schema/identity changes invalidate the wake scope and require explicit owner-reviewed reattachment. Wake tokens do not restore availability, clear a fence or certify historical namespace retention. No production recovery implementation is included."
+  }
+}
