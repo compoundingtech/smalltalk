@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "Bind the native source idle regression control to its genuine current producer certificate interval.",
+  "commits": [
+    "b2afd028ae314adfab78f34e2bed00f6fe90fe61"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "Test-only timing correction; production source, certificate deadlines, readiness guards, rows and lifecycle are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Test-only timing correction; production source, certificate deadlines, readiness guards, rows and lifecycle are unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Test-only timing correction; production source, certificate deadlines, readiness guards, rows and lifecycle are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Test-only timing correction; production source, certificate deadlines, readiness guards, rows and lifecycle are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Test-only timing correction; production source, certificate deadlines, readiness guards, rows and lifecycle are unchanged."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Test-only timing correction; production source, certificate deadlines, readiness guards, rows and lifecycle are unchanged."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Test-only timing correction; production source, certificate deadlines, readiness guards, rows and lifecycle are unchanged."
+  }
+}

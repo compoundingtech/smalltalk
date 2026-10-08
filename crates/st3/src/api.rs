@@ -58,12 +58,13 @@ use crate::model::{
 use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
+pub(crate) mod agent_card;
 mod client_blobs;
 mod client_adapters;
 mod client_presence;
 mod client_v0;
 mod custom;
-mod delivery_presence;
+pub(crate) mod delivery_presence;
 mod delivery_probes;
 mod github_watch;
 mod harness_events;
@@ -2465,6 +2466,18 @@ fn client_agent_resources_uncached(
 ) -> anyhow::Result<Vec<Value>> {
     let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
     client_agent_resources_from_status(store, history, snapshot_index, None, status)
+}
+
+#[cfg(test)]
+pub(crate) fn agent_card_source_oracle(
+    store: &Store,
+    index: u64,
+    at: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let mut items = client_agent_resources_uncached(store, true, index)?;
+    add_agent_todos(store, &mut items, index)?;
+    overlay_agent_resources(store, &mut items, at)?;
+    Ok(items)
 }
 
 fn client_agent_resources_selected(

@@ -13,7 +13,10 @@
 //! so it is `outdated` rather than stale; its reason says whether it will follow the daemon's
 //! binary or needs a seat restart.
 
+pub(crate) mod source;
+
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -64,6 +67,10 @@ struct Presence {
     image: Option<String>,
     beats: Mutex<HashMap<String, Beat>>,
     monitors: Mutex<HashMap<String, Beat>>,
+    // One-way: first installation publishes this while holding both memory maps. Writers
+    // inspect it only under their complete mutation locks, never before acquiring them.
+    source_ever_enabled: AtomicBool,
+    source: Mutex<source::State>,
 }
 
 fn presence() -> &'static Presence {
@@ -73,6 +80,8 @@ fn presence() -> &'static Presence {
         image: st_drivers::reexec::running_identity().map(|identity| identity.token()),
         beats: Mutex::new(HashMap::new()),
         monitors: Mutex::new(HashMap::new()),
+        source_ever_enabled: AtomicBool::new(false),
+        source: Mutex::new(source::State::default()),
     })
 }
 
@@ -83,50 +92,38 @@ pub(crate) fn start() {
 
 /// Record one mailbox poll's delivery report for `recipient`.
 pub(crate) fn record(recipient: &str, report: &str) {
+    record_in(presence(), recipient, report);
+}
+
+fn record_in(presence: &Presence, recipient: &str, report: &str) {
     let Ok(report) = serde_json::from_str::<Report>(report) else {
         return;
     };
-    let presence = presence();
-    if let Ok(mut beats) = presence.beats.lock() {
-        beats.insert(
-            recipient.to_owned(),
-            Beat {
-                at: Instant::now(),
-                report,
-                fence: None,
-            },
-        );
-    }
+    replace_in(presence, recipient, report, None, false);
 }
 
 /// Title updates cannot establish delivery readiness. They can report the outer driver's
 /// attachment check, including a missing plugin for which no delivery process exists.
 pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) {
+    record_fenced_in(presence(), fence, raw);
+}
+
+fn record_fenced_in(presence: &Presence, fence: &crate::mailbox::Fence, raw: &str) {
     let Ok(report) = serde_json::from_str::<Report>(raw) else {
         return;
     };
-    let target = if fence.component == "delivery" {
-        if report.transport.as_deref() != Some("claude-channel")
-            && let Ok(mut monitors) = presence().monitors.lock()
-        {
-            monitors.remove(&fence.subject);
-        }
-        &presence().beats
-    } else if report.transport.as_deref() == Some("claude-channel") {
-        &presence().monitors
-    } else {
+    if fence.component != "delivery" && report.transport.as_deref() != Some("claude-channel") {
         return;
-    };
-    if let Ok(mut beats) = target.lock() {
-        beats.insert(
-            fence.subject.clone(),
-            Beat {
-                at: Instant::now(),
-                report,
-                fence: Some(fence.clone()),
-            },
-        );
     }
+    let clear_monitor =
+        fence.component == "delivery" && report.transport.as_deref() != Some("claude-channel");
+    replace_in(
+        presence,
+        &fence.subject,
+        report,
+        Some(fence.clone()),
+        clear_monitor,
+    );
 }
 
 pub(super) fn attachment(recipient: &str, incarnation: &str) -> Option<crate::mailbox::Fence> {
@@ -137,32 +134,83 @@ pub(super) fn attachment(recipient: &str, incarnation: &str) -> Option<crate::ma
         && beat.at.elapsed() <= Duration::from_millis(CHANNEL_STALE_AFTER_MS)
         && beat.report.transport.as_deref() == Some("claude-channel")
         && beat.report.ready == Some(true)
-        && beat.report.channel.as_ref().is_some_and(|channel|
-            channel.age_ms.is_some_and(|age| age <= CHANNEL_STALE_AFTER_MS)))
+        && beat.report.channel.as_ref().is_some_and(|channel| {
+            channel
+                .age_ms
+                .is_some_and(|age| age <= CHANNEL_STALE_AFTER_MS)
+        }))
     .then(|| fence.clone())
 }
 
 /// A metadata-free poll from a Unix peer proven to be this seat's native delivery process.
 /// This proves liveness, not that an old executable matches the installed binary.
 pub(crate) fn record_legacy(recipient: &str, transport: &str, pid: u32) {
+    record_legacy_in(presence(), recipient, transport, pid);
+}
+
+fn record_legacy_in(presence: &Presence, recipient: &str, transport: &str, pid: u32) {
     // A provider launched by an older driver has no title-side attachment monitor.
-    if let Ok(mut monitors) = presence().monitors.lock() {
-        monitors.remove(recipient);
-    }
-    if let Ok(mut beats) = presence().beats.lock() {
-        beats.insert(
-            recipient.into(),
-            Beat {
-                at: Instant::now(),
-                fence: None,
-                report: Report {
-                    transport: Some(transport.into()),
-                    pid: Some(pid),
-                    legacy: true,
-                    ..Report::default()
-                },
-            },
-        );
+    replace_in(
+        presence,
+        recipient,
+        Report {
+            transport: Some(transport.into()),
+            pid: Some(pid),
+            legacy: true,
+            ..Report::default()
+        },
+        None,
+        true,
+    );
+}
+
+/// Serialize complete memory replacement against first source installation. Lock order is
+/// monitors (when removed), then the target map, then source. Capture never holds source
+/// while acquiring either memory map. Every memory guard is released before the sink runs.
+fn replace_in(
+    presence: &Presence,
+    recipient: &str,
+    report: Report,
+    fence: Option<crate::mailbox::Fence>,
+    clear_monitor: bool,
+) {
+    let (change, updated) = {
+        let mut monitors = clear_monitor.then(|| presence.monitors.lock());
+        let target = if fence.as_ref().is_some_and(|f| f.component != "delivery") {
+            &presence.monitors
+        } else {
+            &presence.beats
+        };
+        let mut beats = target.lock();
+        // Even a poisoned lock result retains its guard until this scope ends. First
+        // installation refuses poison; an already enabled producer still records failure.
+        let change = source::Mutation::while_locked(presence, recipient);
+        let mut updated = true;
+        if let Some(monitors) = monitors.as_mut() {
+            match monitors {
+                Ok(monitors) => {
+                    monitors.remove(recipient);
+                }
+                Err(_) => updated = false,
+            }
+        }
+        match &mut beats {
+            Ok(beats) => {
+                beats.insert(
+                    recipient.to_owned(),
+                    Beat {
+                        at: Instant::now(),
+                        report,
+                        fence,
+                    },
+                );
+            }
+            Err(_) => updated = false,
+        }
+        (change, updated)
+    };
+    if let Some(change) = change {
+        change.finish(updated);
     }
 }
 

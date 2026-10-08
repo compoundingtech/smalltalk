@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Borrow transaction hook snapshots to reduce default writer overhead",
+  "replay": {
+    "status": "none",
+    "detail": "No history replay, source extraction, migration or backfill."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, triggers or registry changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Admission, authority, raw-gap fences and checkpoint rules are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Public transaction method signatures remain unchanged. Each outer transaction borrows the installed pair; hook installation remains serialized by the writer loan."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No production activation or restart required by this library change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new operator action or hook bypass."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Prepare/finalize failures, panics, rollback and SQLite commit errors keep existing behavior. Raw SQL COMMIT is still rejected by managed commit."
+  }
+}

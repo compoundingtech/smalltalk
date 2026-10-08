@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep normal checkpoint state writes inside managed prepare/finalize transactions",
+  "replay": {
+    "status": "none",
+    "detail": "No startup replay, history reconstruction or view migration."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No production schema, capture trigger or layout change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint preflight, state transitions, seal data and retention rules are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Public checkpoint method signatures are unchanged; installed prepare/finalize errors propagate through the existing result types."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No deployment or restart is performed by this library change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No source adapter is installed automatically."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "record_checkpoint_state, set_checkpoint_state and resume_checkpoints now execute and commit in a WriterGuard-managed transaction. Opt-in source adapters observe their checkpoint writes in the same prepare/finalize scope, rather than treating them as unsupported autocommit mutations. A hook failure rolls back the checkpoint update and its capture. Raw callers and other uncovered domains retain their source-gap fences."
+  }
+}

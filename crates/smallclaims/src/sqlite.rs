@@ -11,6 +11,10 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OpenFlags, Transaction};
 
+mod transaction_finalizer;
+use transaction_finalizer::TransactionFinalizers;
+pub use transaction_finalizer::WriterTransaction;
+
 pub(crate) mod writer_observer;
 pub use writer_observer::WriterObserver;
 
@@ -264,6 +268,7 @@ pub struct WriterConnection {
     pub thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     pub committed_index: Arc<AtomicU64>,
     observers: Arc<CommitObservers>,
+    finalizers: Arc<TransactionFinalizers>,
     mutation_observer: Option<Arc<writer_observer::MutationState>>,
     /// Transactions the writer committed for batched writes, and the batched writes in them.
     /// Tests read them; `st replication status` counts every commit.
@@ -300,6 +305,7 @@ pub struct WriterGuard<'a> {
     pub give_back: std::sync::mpsc::SyncSender<Connection>,
     pub committed_index: &'a AtomicU64,
     observers: &'a CommitObservers,
+    finalizers: &'a Arc<TransactionFinalizers>,
     mutation_observer: Option<&'a Arc<writer_observer::MutationState>>,
     /// When profiling, when this thread took the writer.
     pub acquired: Option<std::time::Instant>,
@@ -340,15 +346,27 @@ impl WriterConnection {
         let counted = batches.clone();
         let observers = Arc::new(CommitObservers::default());
         let observed = observers.clone();
+        let finalizers = Arc::new(TransactionFinalizers::default());
+        let finalized = finalizers.clone();
         let thread = std::thread::Builder::new()
             .name("st3-writer".into())
-            .spawn(move || write_queue(connection, queue, &index, &counted, &observed, mutations.as_ref()))
+            .spawn(move || {
+                write_queue(
+                    connection,
+                    queue,
+                    &index,
+                    &counted,
+                    (&observed, &finalized),
+                    mutations.as_ref(),
+                )
+            })
             .expect("the writer thread starts");
         Ok(Self {
             jobs: Mutex::new(Some(jobs)),
             thread: Mutex::new(Some(thread)),
             committed_index,
             observers,
+            finalizers,
             mutation_observer,
             batches,
         })
@@ -373,6 +391,37 @@ impl WriterConnection {
         callback: impl Fn(&Connection) + Send + Sync + 'static,
     ) -> CommitObserver {
         self.observers.register(callback)
+    }
+
+    /// Install exactly one transaction-owned adapter, explicitly and before attesting source
+    /// coverage. Acquiring the writer finishes all earlier queued/lent work before installation.
+    /// The callback runs once before each managed outer commit, with source and callback writes
+    /// in that same transaction. An error rolls back the outer transaction and propagates.
+    ///
+    /// Only batched writes and WriterGuard::transaction[_with_behavior] are covered. Raw
+    /// Connection transactions, autocommit and SQL BEGIN/COMMIT bypass this boundary and need
+    /// independent source capture/fencing. Registration is not a bootstrap or coverage proof.
+    /// The callback must bound its work, must not end the transaction, acquire the writer, or
+    /// retain a strong Store ownership cycle. It remains installed for this writer's lifetime.
+    pub fn install_transaction_finalizer(
+        &self,
+        callback: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.install_transaction_hooks(|_| Ok(()), callback)
+    }
+
+    /// Install one paired adapter. Prepare runs INSIDE the newly begun outer transaction
+    /// before any managed source job/helper; finalize runs before its commit. An adapter can
+    /// reject/fence preexisting raw capture and set/clear its transaction-owned scope marker.
+    /// Both phases share source rollback; failure/panic does not acknowledge a successful write.
+    /// The same coverage, work bounds and lifetime restrictions as the finalizer apply.
+    pub fn install_transaction_hooks(
+        &self,
+        prepare: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+        finalize: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+    ) -> Result<()> {
+        let _writer = self.write();
+        self.finalizers.install(prepare, finalize)
     }
 
     pub fn send(&self, job: WriterJob) {
@@ -403,6 +452,7 @@ impl WriterConnection {
             give_back,
             committed_index: &self.committed_index,
             observers: &self.observers,
+            finalizers: &self.finalizers,
             mutation_observer: self.mutation_observer.as_ref(),
             acquired: crate::profile::writer_acquired(wait),
         }
@@ -515,7 +565,7 @@ fn write_queue(
     queue: std::sync::mpsc::Receiver<WriterJob>,
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
-    observers: &CommitObservers,
+    callbacks: (&CommitObservers, &TransactionFinalizers),
     mutation_observer: Option<&Arc<writer_observer::MutationState>>,
 ) {
     let mut next = None;
@@ -546,7 +596,7 @@ fn write_queue(
                     &queue,
                     committed_index,
                     batches,
-                    observers,
+                    callbacks,
                     mutation_observer,
                 );
             }
@@ -564,17 +614,22 @@ fn run_write_batch(
     queue: &std::sync::mpsc::Receiver<WriterJob>,
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
-    observers: &CommitObservers,
+    callbacks: (&CommitObservers, &TransactionFinalizers),
     mutation_observer: Option<&Arc<writer_observer::MutationState>>,
 ) -> Option<WriterJob> {
+    let (observers, finalizers) = callbacks;
+    let hooks = finalizers.snapshot();
     let started = std::time::Instant::now();
     let mut answers = Vec::new();
     let mut lend = None;
     let (transaction, mut failure) =
         match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
             Ok(transaction) => (Some(transaction), None),
-            Err(error) => (None, Some(error)),
+            Err(error) => (None, Some(anyhow::Error::from(error))),
         };
+    if let (Some(transaction), Some(hooks)) = (&transaction, hooks) {
+        failure = hooks.prepare(transaction).err();
+    }
     let mut job = Some(first);
     while let Some(current) = job.take() {
         let WriterJob::Batched {
@@ -603,7 +658,7 @@ fn run_write_batch(
                     }
                 })();
                 crate::profile::writer_released(acquired);
-                failure = savepoint.err();
+                failure = savepoint.err().map(anyhow::Error::from);
             }
             // A batch that failed to begin answers its first write with the error.
             _ => drop(run),
@@ -619,7 +674,13 @@ fn run_write_batch(
     batches.0.fetch_add(1, Ordering::Relaxed);
     batches.1.fetch_add(answers.len() as u64, Ordering::Relaxed);
     let committed = match (transaction, failure) {
-        (Some(transaction), None) => transaction.commit(),
+        (Some(transaction), None) => {
+            let finalized = match hooks {
+                Some(hooks) => hooks.run(&transaction),
+                None => Ok(()),
+            };
+            finalized.and_then(|()| transaction.commit().map_err(anyhow::Error::from))
+        }
         // Dropping the transaction rolls back every write in the batch.
         (_, Some(error)) => Err(error),
         (None, None) => unreachable!("a batch without a transaction failed to begin"),
@@ -633,11 +694,45 @@ fn run_write_batch(
     if committed.is_ok() {
         observers.notify(connection);
     }
-    let committed = committed.map_err(|error| error.to_string());
+    let committed = committed.map_err(|error| format!("{error:#}"));
     for done in answers {
         let _ = done.send(committed.clone());
     }
     lend
+}
+
+impl WriterGuard<'_> {
+    /// Begin a managed transaction and run prepare before returning it. Existing helpers
+    /// accepting &Transaction can use the wrapper through dereference; commit finalizes
+    /// before COMMIT. Prepare failure rolls back and retains its original error cause.
+    pub fn transaction(&mut self) -> Result<WriterTransaction<'_>> {
+        let hooks = self.finalizers.snapshot();
+        let connection = self
+            .connection
+            .as_mut()
+            .context("writer guard has no connection")?;
+        let transaction = connection.transaction()?;
+        if let Some(hooks) = hooks {
+            hooks.prepare(&transaction)?;
+        }
+        Ok(WriterTransaction::new(transaction, hooks))
+    }
+
+    pub fn transaction_with_behavior(
+        &mut self,
+        behavior: rusqlite::TransactionBehavior,
+    ) -> Result<WriterTransaction<'_>> {
+        let hooks = self.finalizers.snapshot();
+        let connection = self
+            .connection
+            .as_mut()
+            .context("writer guard has no connection")?;
+        let transaction = connection.transaction_with_behavior(behavior)?;
+        if let Some(hooks) = hooks {
+            hooks.prepare(&transaction)?;
+        }
+        Ok(WriterTransaction::new(transaction, hooks))
+    }
 }
 
 impl Deref for WriterGuard<'_> {

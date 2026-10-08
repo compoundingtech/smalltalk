@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Retain bounded private source qualification refusal causes",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, extraction or installation eligibility change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No production schema or trigger change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No source, readiness or checkpoint rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "The scratch vehicle retains bounded setup and Installer phase errors in private stderr; preexec failures produce an unavailable result with no executed child exit code."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon or deployed source is changed by the scratch runner."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Any later attempt requires its existing authorization, a new consistent scratch backup and supported resource limits; no retry or limit waiver is introduced."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Failed scratch attempts remain single-use and retained for diagnosis; generic earlier failures cannot acquire retrospective causes."
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Compose explicit paired transaction scope and same-transaction capture-gap fencing for agent source integration.",
+  "replay": {"status": "none", "detail": "No replay, backfill or automatic gap restoration. Scope completion does not publish a source cut or certify a collection."},
+  "schema": {"status": "changed", "detail": "Explicit capture installation adds managed/guarded metadata; explicit scope activation installs the foundation Views singleton gap trigger. Ordinary Store opens install none."},
+  "rules": {"status": "none", "detail": "No claim admission, projection digest or registry rule changes."},
+  "compatibility": {"status": "none", "detail": "No default provider map, collection protocol or generated client changes."},
+  "downtime": {"status": "none", "detail": "No default startup work or activation; hooks are explicitly composed before source coverage attestation."},
+  "manual": {"status": "none", "detail": "No default deployment action. Source owners must qualify complete schema, canonical/local dependencies, namespace binding and raw/DDL exclusions before agent activation."},
+  "recovery": {"status": "unknown", "detail": "Gaps persist and fence availability without restoring Ready. Raw managed COMMIT remains unsupported and must fail the independent read gate. Source/IVM schema removal requires trigger uninstall before removal."}
+}

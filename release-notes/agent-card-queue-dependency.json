@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add namespace-owned agent-card queue and selected label dependencies",
+  "replay": {
+    "status": "none",
+    "detail": "No startup replay, source backfill, or reader activation is added. The owner explicitly installs and drains its namespace."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Private opt-in namespaced queue, order, counters, cursors and indexes are created only by the composing installer. Default Store schema is unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule or digest change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No public protocol, pagination token, route or client capability change. Default readers retain their existing behavior."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service restart or additional interruption is introduced by this dependency helper."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No user action or default installation is required. Production qualification and activation remain with the shared source and agent-card owners."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Default unopened components require no recovery. Explicitly installed private namespaces require bounded owner retirement/reclamation; dropping a binary does not remove their tables."
+  }
+}

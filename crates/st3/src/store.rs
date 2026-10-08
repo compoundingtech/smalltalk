@@ -1,3 +1,17 @@
+pub(crate) mod agent_card_ivm;
+mod agent_card_harness;
+mod agent_card_signals;
+mod agent_card_usage;
+mod agent_card_base;
+mod agent_card_rollout;
+mod agent_card_lifecycle;
+mod agent_card_desired;
+mod agent_card_owned;
+mod agent_card_aux;
+mod agent_card_launch;
+pub(crate) mod agent_card_source;
+mod agent_authority_ivm;
+pub(crate) mod agent_queue;
 pub mod custom;
 pub mod declarations;
 mod glass_heads;
@@ -14,6 +28,7 @@ mod resources;
 mod github_workflow_failures;
 pub(crate) mod message_subscriptions;
 mod rollouts;
+pub(crate) mod seat_queue_order;
 mod seat_status;
 pub(crate) mod step_labels;
 
@@ -128,6 +143,7 @@ mod agent_messages;
 pub mod agent_view;
 mod conversation_reads;
 mod runtime;
+pub mod collection_ivm;
 #[cfg(test)]
 mod tombstones_tests;
 pub use runtime::SmalltalkRuntime;
@@ -2637,6 +2653,47 @@ impl Store {
     /// or installation; availability and source coverage must be checked in a snapshot.
     pub fn ivm_views(&self) -> Option<Arc<smallclaims::ivm::Views>> {
         self.smalltalk.ivm_views.clone()
+    }
+
+    /// Explicitly install the complete native agent collection source. Default Store opens
+    /// retain the existing readers; registration does not grant rows before certification.
+    pub fn open_with_agent_collections(path: &Path, origin: &str) -> Result<Arc<Self>> {
+        collection_ivm::agent_source::service::open(path, origin)
+    }
+
+    /// Execute one bounded source-maintenance page. No source work runs on socket pings.
+    pub fn maintain_agent_collections(&self) -> Result<bool> {
+        let service=self.smalltalk.ivm_agent_service.get().context("agent source is not installed")?;
+        service.pump()
+    }
+
+    /// Inspect actual installed-source metadata for an isolated qualification process.
+    /// This grants neither authorized rows nor a transferable readiness certificate.
+    pub fn agent_collection_qualification_status(&self) -> Result<serde_json::Value> {
+        self.smalltalk.ivm_agent_service.get().context("agent source is not installed")?
+            .qualification_status(self)
+    }
+
+    pub fn has_agent_collection_source(&self) -> bool {
+        self.smalltalk.ivm_agent_service.get().is_some()
+    }
+
+    /// The exact source Installer for this Store. Registration alone cannot certify a read.
+    pub fn ivm_installer(&self) -> Option<Arc<smallclaims::ivm::install::Installer>> {
+        self.smalltalk.ivm_installer.get().cloned()
+    }
+
+    pub(crate) fn retain_collection_runtime(
+        &self,
+        installer: Arc<smallclaims::ivm::install::Installer>,
+        producer: crate::api::delivery_presence::source::Registration<'static>,
+    ) -> Result<()> {
+        anyhow::ensure!(self.ivm_views().is_some(), "collection source requires Store registry");
+        anyhow::ensure!(self.smalltalk.ivm_installer.get().is_none()
+            && self.smalltalk.ivm_delivery_source.get().is_none(), "collection source runtime already retained");
+        self.smalltalk.ivm_installer.set(installer).map_err(|_|anyhow::anyhow!("collection Installer attachment raced"))?;
+        self.smalltalk.ivm_delivery_source.set(producer).map_err(|_|anyhow::anyhow!("collection producer attachment raced"))?;
+        Ok(())
     }
 
     /// Lazily attach the one Store publisher shared by receipt waits and collection
@@ -9932,7 +9989,10 @@ impl Store {
         max_per_subject_kind: usize,
         chunk: usize,
     ) -> Result<usize> {
-        let chunk = chunk.max(1).min(i64::MAX as usize) as i64;
+        // A captured source page shares the transaction's quota with its maintenance clock.
+        let captured = self.has_agent_collection_source();
+        let capture_limit = if captured { 128 } else { usize::MAX };
+        let chunk = chunk.max(1).min(capture_limit).min(i64::MAX as usize) as i64;
         let max_per_subject_kind = max_per_subject_kind.max(1).min(i64::MAX as usize) as i64;
         let mut deleted = 0;
         // The newest observation of a subject and kind always stays. Rows past retention go
@@ -9941,9 +10001,10 @@ impl Store {
         // rank every row of the table with a window function inside the writer's hold, every
         // chunk of every pass, even when nothing was due.
         loop {
-            let connection = self.connection.write();
-            let removed = connection.execute(
-                "DELETE FROM local_observations WHERE id IN (
+            let mut connection = self.connection.write();
+            let trim = |connection: &rusqlite::Connection| {
+                connection.execute(
+                    "DELETE FROM local_observations WHERE id IN (
                     SELECT id FROM local_observations AS old
                     WHERE observed_at_unix_ms < ?1
                       AND EXISTS (SELECT 1 FROM local_observations AS newer
@@ -9952,11 +10013,17 @@ impl Store {
                     ORDER BY observed_at_unix_ms
                     LIMIT ?2
                  )",
-                params![
-                    older_than_unix_ms.min(i64::MAX as u128) as i64,
-                    chunk
-                ],
-            )?;
+                    params![older_than_unix_ms.min(i64::MAX as u128) as i64, chunk],
+                )
+            };
+            let removed = if captured {
+                let transaction = connection.transaction()?;
+                let removed = trim(&transaction)?;
+                transaction.commit()?;
+                removed
+            } else {
+                trim(&connection)?
+            };
             drop(connection);
             deleted += removed;
             if (removed as i64) < chunk {
@@ -9979,26 +10046,42 @@ impl Store {
         };
         for (subject, kind) in over_cap {
             loop {
-                let connection = self.connection.write();
-                // The newest id past the cap: rank `cap + 1` from the newest.
-                let boundary: Option<i64> = connection
-                    .query_row(
-                        "SELECT id FROM local_observations WHERE subject=?1 AND kind=?2
+                let mut connection = self.connection.write();
+                let trim = |connection: &rusqlite::Connection| -> rusqlite::Result<Option<usize>> {
+                    // The newest id past the cap: rank `cap + 1` from the newest.
+                    let boundary: Option<i64> = connection
+                        .query_row(
+                            "SELECT id FROM local_observations WHERE subject=?1 AND kind=?2
                          ORDER BY id DESC LIMIT 1 OFFSET ?3",
-                        params![subject, kind, max_per_subject_kind],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let Some(boundary) = boundary else {
-                    break;
-                };
-                let removed = connection.execute(
-                    "DELETE FROM local_observations WHERE id IN (
+                            params![subject, kind, max_per_subject_kind],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let Some(boundary) = boundary else {
+                        return Ok(None);
+                    };
+                    let removed = connection.execute(
+                        "DELETE FROM local_observations WHERE id IN (
                         SELECT id FROM local_observations
                         WHERE subject=?1 AND kind=?2 AND id<=?3 ORDER BY id LIMIT ?4
                      )",
-                    params![subject, kind, boundary, chunk],
-                )?;
+                        params![subject, kind, boundary, chunk],
+                    )?;
+                    Ok(Some(removed))
+                };
+                let removed = if captured {
+                    let transaction = connection.transaction()?;
+                    let removed = trim(&transaction)?;
+                    if removed.is_some() {
+                        transaction.commit()?;
+                    }
+                    removed
+                } else {
+                    trim(&connection)?
+                };
+                let Some(removed) = removed else {
+                    break;
+                };
                 drop(connection);
                 deleted += removed;
                 if (removed as i64) < chunk {

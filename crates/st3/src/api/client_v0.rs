@@ -68,6 +68,7 @@ const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
 /// commit kept a daemon busy for as long as a client stayed connected. Commits in between are
 /// read together; a new subscription is still read at once.
 const COLLECTION_REREAD_INTERVAL: Duration = Duration::from_millis(1_500);
+const COLLECTION_IVM_REREAD_INTERVAL: Duration = Duration::from_millis(100);
 // Observer grace periods and checkpoint waits can enter attention without a new claim.
 const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 const COLLECTION_PING_INTERVAL: Duration = Duration::from_secs(8);
@@ -509,9 +510,11 @@ async fn deliver_ivm_collection(
         Output::Silent => Refreshed::Current,
         output @ (Output::Unavailable | Output::Resync) => {
             let code = if matches!(output, Output::Resync) { "cursor-gap" } else { "internal" };
+            let message = if matches!(output, Output::Resync) { "a fresh authorized collection snapshot is required" }
+                else { "collection source is unavailable; held rows are stale until readiness returns or resubscription" };
             if send_collection(socket, json!({"kind":"resync", "id":subscription.request.id,
                 "collection":subscription.request.collection, "retryable":true,
-                "code":code, "message":"a fresh authorized collection snapshot is required"})).await {
+                "code":code, "message":message})).await {
                 Refreshed::Current
             } else { Refreshed::Closed }
         }
@@ -840,19 +843,11 @@ async fn collection_stream_socket(
 ) {
     let windows = collection_windows::Windows::attach(&state.store);
     // Complete source adapters are admitted explicitly, never inferred from partial view IDs.
-    let adapters = BTreeMap::new();
-    let sources = if adapters.is_empty() {
-        None
-    } else {
-        let store = state.store.clone();
-        match blocking_store(move || collection_ivm::Sources::from_store(store, adapters)).await {
-            Ok(sources) => sources,
-            Err(error) => {
-                tracing::warn!(message=%error.message, "collection source attachment failed");
-                return;
-            }
-        }
-    };
+    let (sources, source_error) = collection_sources(
+        state.store.clone(),
+        collection_ivm::adapters(state.store.clone()),
+    )
+    .await;
     collection_stream_socket_with_sources(
         socket,
         state,
@@ -861,12 +856,67 @@ async fn collection_stream_socket(
         sources,
         move |state, session, request, permit| {
             let windows = windows.clone();
+            let source_error = source_error.clone();
             async move {
-                collection_items_with_windows(&state, &session, &request, permit, windows).await
+                collection_items_without_source(
+                    &state,
+                    &session,
+                    &request,
+                    permit,
+                    windows,
+                    source_error,
+                )
+                .await
             }
         },
     )
     .await;
+}
+
+async fn collection_items_without_source(
+    state: &AppState,
+    session: &ClientSession,
+    request: &CollectionSubscribe,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    windows: Option<Arc<collection_windows::Windows>>,
+    source_error: Option<Arc<str>>,
+) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+    if request.collection == "agents"
+        && let Some(error) = source_error
+    {
+        let mut refusal = ApiError::internal(error);
+        // This constructor failure is cached for the socket lifetime. Drop this subscription
+        // rather than polling every other legacy window for a condition that cannot heal here.
+        refusal.status = StatusCode::CONFLICT;
+        return Err(refusal);
+    }
+    collection_items_with_windows(state, session, request, permit, windows).await
+}
+
+async fn collection_sources(
+    store: Arc<Store>,
+    adapters: anyhow::Result<BTreeMap<String, Arc<collection_ivm::Adapter>>>,
+) -> (Option<Arc<collection_ivm::Sources>>, Option<Arc<str>>) {
+    let result = match adapters {
+        Ok(adapters) if adapters.is_empty() => return (None, None),
+        Ok(adapters) => {
+            blocking_store(move || collection_ivm::Sources::from_store(store, adapters))
+                .await
+                .and_then(|sources| {
+                    sources.ok_or_else(|| {
+                        ApiError::internal("collection source registry is unavailable")
+                    })
+                })
+        }
+        Err(error) => Err(ApiError::internal(error)),
+    };
+    match result {
+        Ok(sources) => (Some(sources), None),
+        Err(error) => {
+            tracing::warn!(message=%error.message, "collection source setup failed; other collections remain available");
+            (None, Some(error.message.into()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -889,7 +939,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
 async fn collection_stream_socket_with_sources<F, Fut>(
     mut socket: WebSocket,
     state: AppState,
-    session: ClientSession,
+    mut session: ClientSession,
     presence: Option<super::client_presence::StreamGuard>,
     sources: Option<Arc<collection_ivm::Sources>>,
     read: F,
@@ -925,19 +975,66 @@ async fn collection_stream_socket_with_sources<F, Fut>(
     let mut weighed = state.store.index().unwrap_or_default();
     let mut reread_due = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
+    let mut ivm_due = false;
+    let mut last_ivm_read = tokio::time::Instant::now() - COLLECTION_IVM_REREAD_INTERVAL;
+    let mut last_ivm_warning: Option<tokio::time::Instant> = None;
     let mut reads = futures_util::stream::FuturesUnordered::new();
     let read_slots = Arc::new(tokio::sync::Semaphore::new(COLLECTION_MAX_SUBSCRIPTIONS));
     let mut generation = 0_u64;
+    type GrantCheck = std::pin::Pin<Box<dyn Future<Output = Result<ClientSession, ApiError>> + Send>>;
+    let mut grant_check: Option<GrantCheck> = None;
+    // Keep a pre-pulled command across select iterations when another ready arm wins.
+    let mut waiting = None;
     loop {
         // The subscriptions to read after this wake-up.
         let mut refresh = Vec::<String>::new();
         // A command already waiting goes first: under steady commits a commit wake is almost
         // always ready too, and a fair pick could keep rereading the held windows while a new
         // subscription waits. Otherwise every source gets a fair pick.
-        let waiting = futures_util::FutureExt::now_or_never(socket.recv());
+        let grant_deadline = session.pairing_expires_at.and_then(|expires| {
+            tokio::time::Instant::now().checked_add(Duration::from_millis(
+                expires.saturating_sub(client_now_ms()).min(u64::MAX as u128) as u64))
+        });
+        if waiting.is_none() {
+            waiting = futures_util::FutureExt::now_or_never(socket.recv());
+        }
         let command_waiting = waiting.is_some();
         tokio::select! {
-            incoming = async { match waiting { Some(incoming) => incoming, None => socket.recv().await } } => {
+            () = async {
+                match grant_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            }, if grant_deadline.is_some() && grant_check.is_none() => {
+                let (state, held) = (state.clone(), session.clone());
+                let slots = read_slots.clone();
+                grant_check = Some(Box::pin(async move {
+                    let permit = slots.acquire_owned().await.map_err(ApiError::internal)?;
+                    blocking_store(move || {
+                        let _permit = permit;
+                        state.store.read_snapshot(|_| Ok(revalidate_session(&state, &held)))
+                    }).await.and_then(std::convert::identity)
+                }));
+                continue;
+            }
+            current = async {
+                match grant_check.as_mut() {
+                    Some(check) => check.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                grant_check = None;
+                match current {
+                    Ok(current) => session = current,
+                    Err(error) => {
+                        let _ = send_collection(&mut socket, json!({"kind":"error", "code":error.code,
+                            "message":error.message, "retryable":false})).await;
+                        return;
+                    }
+                }
+                continue;
+            }
+            incoming = async { match waiting.take() { Some(incoming) => incoming, None => socket.recv().await } } => {
                 // Take every command already waiting, so subscriptions sent together are read
                 // together below.
                 let mut next = Some(incoming);
@@ -1022,7 +1119,10 @@ async fn collection_stream_socket_with_sources<F, Fut>(
                 let Some(subscription) = subscriptions.get_mut(&id) else { continue; };
                 if subscription.generation != generation { continue; }
                 subscription.reading = None;
-                if std::mem::take(&mut subscription.dirty) { refresh.push(id.clone()); }
+                if std::mem::take(&mut subscription.dirty) {
+                    if subscription.ivm.is_some() { ivm_due = true; }
+                    else { refresh.push(id.clone()); }
+                }
                 let refreshed = match result {
                     CollectionRead::Legacy(result) => deliver_collection(&mut socket, subscription, result).await,
                     CollectionRead::Ivm(result) => deliver_ivm_collection(&mut socket, subscription, *result, &mut refresh).await,
@@ -1047,7 +1147,12 @@ async fn collection_stream_socket_with_sources<F, Fut>(
                 match notice {
                     ViewWake::Committed(frontiers) => { let _ = frontiers; }
                     ViewWake::Lagged => {}
-                    ViewWake::Unavailable(error) => { tracing::warn!(%error, "collection IVM notice capture failed"); }
+                    ViewWake::Unavailable(error) => {
+                        if last_ivm_warning.is_none_or(|last| last.elapsed() >= COLLECTION_PING_INTERVAL) {
+                            tracing::warn!(%error, "collection IVM notice capture failed");
+                            last_ivm_warning = Some(tokio::time::Instant::now());
+                        }
+                    }
                     ViewWake::Closed => {
                         for subscription in subscriptions.values().filter(|s| s.ivm.is_some()) {
                             if !send_collection(&mut socket, json!({"kind":"resync", "id":subscription.request.id, "retryable":true, "code":"internal", "message":"collection source stopped"})).await { return; }
@@ -1055,7 +1160,16 @@ async fn collection_stream_socket_with_sources<F, Fut>(
                         return;
                     }
                 }
+                ivm_due = true;
+                if last_ivm_read.elapsed() >= COLLECTION_IVM_REREAD_INTERVAL {
+                    refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_some()).map(|(id, _)| id.clone()));
+                    ivm_due = false;
+                }
+            }
+            () = tokio::time::sleep_until(last_ivm_read + COLLECTION_IVM_REREAD_INTERVAL), if !command_waiting && ivm_due => {
                 refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_some()).map(|(id, _)| id.clone()));
+                ivm_due = false;
+                last_ivm_read = tokio::time::Instant::now();
             }
             result = changed.changed(), if !command_waiting => {
                 if result.is_err() { return; }
@@ -1135,6 +1249,9 @@ async fn collection_stream_socket_with_sources<F, Fut>(
         refresh.retain(|id| subscriptions.contains_key(id));
         if refresh.is_empty() {
             continue;
+        }
+        if refresh.iter().any(|id| subscriptions.get(id).is_some_and(|s| s.ivm.is_some())) {
+            last_ivm_read = tokio::time::Instant::now();
         }
         let legacy_windows = subscriptions.values().filter(|s| s.ivm.is_none()).count();
         let refreshed_legacy = refresh.iter().filter(|id| subscriptions.get(*id).is_some_and(|s| s.ivm.is_none())).count();
@@ -1652,6 +1769,8 @@ pub(super) struct ClientSession {
     /// The exact pairing grant that authenticated this session. Two pairings of the same
     /// person and device key share an actor, so only this subject names the exact grant.
     pub(super) pairing_grant: Option<String>,
+    /// Captured grant deadline; the socket can wake without periodic window reads.
+    pairing_expires_at: Option<u128>,
     pub(super) transport: &'static str,
     pub(super) custom_forms: bool,
     pub(super) conversation_blocks: bool,
@@ -1665,6 +1784,7 @@ impl ClientSession {
             actor: actor.into(),
             authority_actor: authority_actor.into(),
             pairing_grant: None,
+            pairing_expires_at: None,
             transport,
             custom_forms: true,
             conversation_blocks: false,
@@ -1687,6 +1807,7 @@ impl ClientSession {
                 actor: "client/local/read-only".into(),
                 authority_actor: "client/local/read-only".into(),
                 pairing_grant: None,
+            pairing_expires_at: None,
                 transport: "unix",
                 custom_forms,
                 conversation_blocks: false,
@@ -1702,6 +1823,7 @@ impl ClientSession {
             actor: person.into(),
             authority_actor: person.into(),
             pairing_grant: None,
+            pairing_expires_at: None,
             transport: "unix",
             custom_forms,
             conversation_blocks: false,
@@ -1714,6 +1836,7 @@ impl ClientSession {
             actor: "client/pairing/completion".into(),
             authority_actor: "client/pairing/completion".into(),
             pairing_grant: None,
+            pairing_expires_at: None,
             transport: "fabric-loopback",
             custom_forms: false,
             conversation_blocks: false,
@@ -1929,6 +2052,7 @@ fn paired_client_session(
         actor: actor.into(),
         authority_actor: authority_actor.into(),
         pairing_grant: Some(paired.subject.clone()),
+        pairing_expires_at: Some(expires_at),
         transport,
         custom_forms,
         conversation_blocks: false,
@@ -10066,6 +10190,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collections_socket_wakes_at_captured_grant_expiry_without_window_reads() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_tungstenite::tungstenite::Message;
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let paired = state.store.append_claim(&ClaimInput {
+            subject: "custom/client/deadline-reader".into(),
+            kind: "custom.client.pairing-completed".into(),
+            actor: Some("person/avery".into()),
+            fields: BTreeMap::from([
+                ("session_actor".into(), json!("client/deadline-reader")),
+                ("person_id".into(), json!("person/avery")),
+                ("scopes".into(), json!(["read.projections"])),
+                ("expires_at_unix_ms".into(), json!(client_now_ms() as u64 + 800)),
+            ]), evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let session = paired_client_session(&state, &paired, "paired", false).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = reads.clone();
+        let app = axum::Router::new().route("/stream", axum::routing::get(move |upgrade: WebSocketUpgrade| {
+            let (state, session, reads) = (state.clone(), session.clone(), reads.clone());
+            async move { upgrade.on_upgrade(move |socket| collection_stream_socket_with_reader(
+                socket, state, session, None, move |state, session, request, permit| {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    async move { collection_items(&state, &session, &request, permit).await }
+                })) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        socket.send(Message::Text(json!({"kind":"subscribe","id":"agents","collection":"agents","limit":2}).to_string().into())).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), socket.next()).await.unwrap().unwrap().unwrap();
+        let first: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+        assert_eq!(first["kind"], "snapshot");
+        let expiry = tokio::time::timeout(Duration::from_secs(2), socket.next()).await.unwrap().unwrap().unwrap();
+        let expiry: Value = serde_json::from_str(expiry.to_text().unwrap()).unwrap();
+        assert_eq!(expiry["kind"], "error");
+        assert_eq!(expiry["code"], "forbidden");
+        assert_eq!(expiry["retryable"], false);
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn collections_socket_keeps_sixteen_windows_and_refuses_the_seventeenth() {
         use futures_util::{SinkExt as _, StreamExt as _};
         assert!(
@@ -10464,6 +10634,198 @@ mod tests {
             &state.store, true, "2026-10-03T09:00:00Z", state.store.index().unwrap(),
         ).unwrap();
         assert!(items.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
+    }
+
+    #[tokio::test]
+    async fn collection_source_setup_refusal_keeps_other_windows_and_pings_live() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let missing = Arc::new(collection_ivm::Adapter {
+            view: "fixture.missing",
+            coverage: Arc::new(|_| Ok(false)),
+            rows: Arc::new(|_, _, _, _, _, _, _| panic!("missing source must not read rows")),
+        });
+        for adapters in [
+            Err(anyhow::anyhow!("injected adapter setup failure")),
+            Ok(BTreeMap::from([("agents".into(), missing)])),
+        ] {
+            let (sources, error) = collection_sources(state.store.clone(), adapters).await;
+            assert!(sources.is_none());
+            assert!(error.is_some());
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = count.clone();
+            let (state, error) = (state.clone(), error.clone());
+            let app = axum::Router::new().route(
+                "/stream",
+                axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                    let (state, error, seen) = (state.clone(), error.clone(), seen.clone());
+                    async move {
+                        upgrade.on_upgrade(move |socket| {
+                            collection_stream_socket_with_reader(
+                                socket,
+                                state,
+                                ClientSession::local(None).unwrap(),
+                                None,
+                                move |state, session, request, permit| {
+                                    let (error, seen) = (error.clone(), seen.clone());
+                                    async move {
+                                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        collection_items_without_source(
+                                            &state, &session, &request, permit, None, error,
+                                        )
+                                        .await
+                                    }
+                                },
+                            )
+                        })
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+                .await
+                .unwrap();
+            for collection in ["agents", "work"] {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"kind":"subscribe","id":collection,"collection":collection})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let mut received = BTreeMap::new();
+            for _ in 0..2 {
+                let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let value: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                received.insert(value["id"].as_str().unwrap().to_owned(), value);
+            }
+            assert_eq!(received["agents"]["kind"], "error");
+            assert_eq!(received["agents"]["retryable"], false);
+            assert_eq!(received["work"]["kind"], "snapshot");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Ping(
+                    vec![4, 7].into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                tokio_tungstenite::tungstenite::Message::Pong(vec![4, 7].into())
+            );
+            assert!(tokio::time::timeout(Duration::from_millis(1700), socket.next()).await.is_err());
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+            socket.close(None).await.unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn collection_grant_deadline_waiting_for_read_slots_keeps_ping_and_commands_live() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, entered) = (state.clone(), entered.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        let mut session = ClientSession::local(None).unwrap();
+                        session.transport = "fabric";
+                        session.pairing_expires_at = Some(client_now_ms() + 100);
+                        collection_stream_socket_with_reader(
+                            socket,
+                            state,
+                            session,
+                            None,
+                            move |_, _, _, permit| {
+                                entered.send(()).unwrap();
+                                async move {
+                                    let _permit = permit;
+                                    std::future::pending::<
+                                        Result<(ClientSnapshot, Vec<Value>, bool), ApiError>,
+                                    >()
+                                    .await
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await
+            .unwrap();
+        for index in 0..COLLECTION_MAX_SUBSCRIPTIONS {
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"kind":"subscribe","id":format!("held-{index}"),"collection":"agents"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        }
+        for _ in 0..COLLECTION_MAX_SUBSCRIPTIONS {
+            tokio::time::timeout(Duration::from_secs(5), entries.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Ping(
+                vec![8, 3].into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            tokio_tungstenite::tungstenite::Message::Pong(vec![8, 3].into())
+        );
+        // Unsubscribe frees a slot; only then can the expired grant check run and refuse.
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"unsubscribe","id":"held-0"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["kind"], "error");
+        assert_eq!(frame["code"], "forbidden");
+        server.abort();
     }
 
     #[tokio::test]
@@ -17111,6 +17473,7 @@ mission "example/zero-run" state="ready" {
             actor: "person/alex/session/device-one".into(),
             authority_actor: "person/alex".into(),
             pairing_grant: None,
+            pairing_expires_at: None,
             transport: "paired",
             custom_forms: false,
             conversation_blocks: false,
