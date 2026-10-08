@@ -7,7 +7,6 @@ import type {
   Runtime,
   Snapshot,
   TerminalScreen,
-  TimelineEntry,
 } from '@smalltalk/st3-client'
 import { Effect } from 'effect'
 import * as Option from 'effect/Option'
@@ -273,23 +272,6 @@ const withGateway = (
     yield* test(live, gateway)
   }).pipe(Effect.scoped)
 
-/** A selected visible page must commit before explicit background intent is eligible. */
-const selectAndPaint = (live: LiveSource, gateway: Gateway, ref = 'agent/selected') =>
-  Effect.gen(function* () {
-    live.registry.mount(live.source.conversationInterest!(ref))
-    yield* settle
-    gateway.send({
-      kind: 'conversation',
-      id: gateway.subscription('conversation').id,
-      collection: 'conversation',
-      session_id: `session/${ref.slice('agent/'.length)}`,
-      items: [],
-      replace: true,
-      has_more: false,
-    })
-    yield* settle
-  })
-
 describe('live feed sync sidecars', () => {
   it.live('records requested only after actual send and retains the last observed value as stale', () =>
     withGateway((live, gateway) =>
@@ -367,6 +349,58 @@ describe('live feed sync sidecars', () => {
         })
         yield* settle
         expect(live.registry.get(sync.agents).sync.status._tag).toBe('Failed')
+      }),
+    ),
+  )
+})
+
+
+describe('cold conversation admission', () => {
+  it.live('does not subscribe any conversation without explicit visible selection', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.agents)
+        live.registry.mount(live.source.conversation('agent/first'))
+        live.source.prefetchConversation?.('agent/first')
+        yield* settle
+        gateway.fleet([agent])
+        yield* settle
+        expect(gateway.commands.filter(
+          (command) => command.kind === 'subscribe' && command.collection === 'conversation',
+        )).toEqual([])
+      }),
+    ),
+  )
+
+  it.live('subscribes selected X first and blocks intent until its real first-page frame', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        const selected = 'agent/X'
+        live.source.prefetchConversation?.('agent/first')
+        live.registry.mount(live.source.conversationInterest!(selected))
+        live.source.prefetchConversation?.('agent/other')
+        yield* settle
+        const first = gateway.subscription('conversation')
+        expect(gateway.sentFollowSubscribes.map((event) => event.key))
+          .toEqual(['conversation:agent/X'])
+        gateway.send({
+          kind: 'conversation', id: first.id, collection: 'conversation',
+          session_id: 'session/X', items: [], replace: true, has_more: false,
+        })
+        // Decode the real frame, without running the scheduled frame writer.
+        for (let round = 0; round < 10; round += 1) {
+          yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(1))
+        }
+        live.source.prefetchConversation?.('agent/other')
+        expect(gateway.sentFollowSubscribes).toHaveLength(1)
+        yield* settle
+        // Early intent is not queued when the first page becomes visible.
+        expect(gateway.sentFollowSubscribes).toHaveLength(1)
+        live.source.prefetchConversation?.('agent/other')
+        yield* settle
+        expect(gateway.sentFollowSubscribes.map((event) => event.key))
+          .toEqual(['conversation:agent/X', 'conversation:agent/other'])
       }),
     ),
   )
