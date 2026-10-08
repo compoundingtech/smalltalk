@@ -11758,6 +11758,99 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The newest eligible local driver receipt after this exact check's request in writer
+    /// sequence/position order. The same statement reads current SystemLocal starts and
+    /// legacy admitted starts. A local row's after_store_index places it after that claim;
+    /// this is local log ordering, not the driver's original writer/deadline proof.
+    /// Multiple launches cannot bind a no-incarnation driver exit to the current process.
+    pub(crate) fn mechanical_gate_exit_receipt(
+        &self,
+        requested: &ClaimRecord,
+    ) -> Result<Option<(ClaimRecord, Option<String>)>> {
+        smallclaims::touched::note_read(|| requested.subject.clone());
+        smallclaims::touched::note_read(|| "kind:record.repaired".into());
+        if requested.origin != self.origin() {
+            return Ok(None);
+        }
+        let request_position = smallclaims::store::canonical::position_sql("request");
+        let launch_position = smallclaims::store::canonical::position_sql("created");
+        let exit_position = smallclaims::store::canonical::position_sql("claims");
+        let connection = self.readers.get();
+        let found = connection
+            .prepare_cached(&canonical_sql(&format!(
+                "WITH current_request AS MATERIALIZED (
+                   SELECT request.subject, request.batch_id, request.store_index,
+                          request_batch.replica_sequence AS sequence,
+                          {request_position} AS position
+                   FROM claims request JOIN batches request_batch ON request_batch.id=request.batch_id
+                   WHERE request.id=?1 AND request.subject=?2 AND request.kind='gate.requested'
+                     AND request.origin=?3 AND request_batch.origin=?3
+                     AND NOT EXISTS (SELECT 1 FROM replica_records repaired
+                       WHERE repaired.claim_id=request.id AND repaired.state='repaired')
+                 ), legacy_launches AS MATERIALIZED (
+                   SELECT json_extract(created.body, '$.fields.incarnation_id') AS incarnation,
+                          json_extract(created.body, '$.fields.runtime_id') AS runtime_id
+                   FROM claims created JOIN batches launch_batch ON launch_batch.id=created.batch_id
+                     JOIN current_request
+                   WHERE created.subject=?2 AND created.kind='runtime.action.succeeded'
+                     AND created.actor IS NULL
+                     AND created.origin=?3 AND launch_batch.origin=?3
+                     AND json_extract(created.body, '$.fields.action')='start'
+                     AND (launch_batch.replica_sequence, {launch_position})
+                         > (current_request.sequence, current_request.position)
+                     AND (launch_batch.replica_sequence<>current_request.sequence
+                          OR created.batch_id=current_request.batch_id)
+                     AND NOT EXISTS (SELECT 1 FROM replica_records repaired
+                       WHERE repaired.claim_id=created.id AND repaired.state='repaired')
+                   ORDER BY CANONICAL_DESC(created) LIMIT 2
+                 ), local_launches AS MATERIALIZED (
+                   SELECT json_extract(local.body, '$.fields.incarnation_id') AS incarnation,
+                          json_extract(local.body, '$.fields.runtime_id') AS runtime_id
+                   FROM local_observations local JOIN current_request
+                   WHERE local.subject=?2 AND local.kind='runtime.action.succeeded'
+                     AND local.actor IS NULL
+                     AND json_extract(local.body, '$.fields.action')='start'
+                     AND local.after_store_index>=current_request.store_index
+                   ORDER BY local.id DESC LIMIT 2
+                 ), launches AS MATERIALIZED (
+                   SELECT incarnation, runtime_id FROM legacy_launches
+                   UNION ALL SELECT incarnation, runtime_id FROM local_launches
+                 )
+                 SELECT {CLAIM_COLUMNS},
+                        (SELECT incarnation FROM launches LIMIT 1),
+                        (SELECT COUNT(*) FROM launches),
+                        (SELECT runtime_id FROM launches LIMIT 1)
+                 FROM claims JOIN batches ON batches.id=claims.batch_id JOIN current_request
+                 WHERE claims.subject=?2 AND claims.kind='runtime.observed' AND claims.actor=?2
+                   AND claims.origin=?3 AND batches.origin=?3
+                   AND (batches.replica_sequence, {exit_position})
+                       > (current_request.sequence, current_request.position)
+                   AND (batches.replica_sequence<>current_request.sequence
+                        OR claims.batch_id=current_request.batch_id)
+                   AND NOT EXISTS (SELECT 1 FROM replica_records repaired
+                     WHERE repaired.claim_id=claims.id AND repaired.state='repaired')
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1"
+            )))?
+            .query_row(
+                params![requested.id, requested.subject, self.origin()],
+                |row| {
+                    Ok((
+                        claim_from_row(row)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, u64>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(found
+            .filter(|(_, _, launches, runtime_id)| {
+                *launches <= 1 && runtime_id.as_deref()
+                    .is_none_or(|runtime_id| runtime_id == requested.subject.replace('/', "."))
+            })
+            .map(|(receipt, incarnation, _, _)| (receipt, incarnation)))
+    }
+
     /// Gate runners are launched directly rather than through desired declarations. Their
     /// owner is durable in the request; older mechanical/LLM requests encode it in the subject.
     pub(crate) fn mission_gate_runners(&self) -> Result<Vec<MissionGateRunner>> {
