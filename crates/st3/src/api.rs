@@ -5417,11 +5417,13 @@ pub fn start_native_session_discovery(state: &AppState) {
 }
 
 /// The shortest pause between two roster refreshes. A refresh also pauses as long as it took,
-/// so refreshing never takes more than about half a core however often readers ask.
-const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_millis(250);
+/// so refreshing never takes more than about half a core however often readers ask. Reads
+/// never wait for it: this bounds how stale a served roster can be, about a second plus a fold.
+const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_secs(1);
 
-/// How long a first page waits for the refresher to publish a roster at or after its own cut.
-const AGENT_ROSTER_READ_WAIT: Duration = Duration::from_secs(1);
+/// How long a read asking for a fresh roster waits for one at or after its own cut: long enough
+/// for the refresher's pause and one fold.
+const AGENT_ROSTER_READ_WAIT: Duration = Duration::from_secs(2);
 
 /// Keep the complete agents roster published off the request path. As the daemon starts it
 /// folds every agent's refs and the cards the largest window shows, then the rest of the cards.
