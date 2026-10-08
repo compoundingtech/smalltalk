@@ -76,6 +76,11 @@ void searchHit;
 // Rust None and TypeScript omission are both supported wire shapes.
 import type { CollectionCommand, CollectionFrame } from './Models.generated.ts';
 const nullFilters: CollectionCommand = { kind: 'subscribe', id: 'agents', collection: 'agents', person: null, actor: null, status: null };
+const exactAgent: CollectionCommand = { kind: 'subscribe', id: 'details', collection: 'agents', agent: 'agent/example/worker', limit: 1 };
+const noExactAgent: CollectionCommand = { ...exactAgent, agent: null };
+// @ts-expect-error Exact agent selectors are supported by agents only.
+const agentOnWork: CollectionCommand = { kind: 'subscribe', id: 'work', collection: 'work', agent: 'agent/example/worker' };
+void [exactAgent, noExactAgent, agentOnWork];
 const currentTerminal: CollectionCommand = { kind: 'subscribe', id: 'term', collection: 'terminal', terminal: 'terminal/example', capability: 'proof' };
 const nullIncarnation: CollectionCommand = { ...currentTerminal, incarnation: null };
 const collectionResync: CollectionFrame = { kind: 'resync', id: 'agents', code: 'internal', message: 'Retry', retryable: true };

@@ -2906,6 +2906,7 @@ impl Store {
         self.smalltalk.agent_resources_refolded_cards.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub(crate) fn cached_agent_resources(
         &self,
         index: u64,
@@ -2915,27 +2916,31 @@ impl Store {
         self.cached_agent_resources_for(index, history, None, build)
     }
 
-    /// The complete agents WS window inherits the queue deadline from its shared projection.
-    pub(crate) fn agent_roster_valid_until(&self, index: u64) -> Option<u128> {
+    /// A shared agents window inherits the queue deadline of its selected projection.
+    pub(crate) fn agent_roster_valid_until(&self, index: u64, agent: Option<&str>) -> Option<u128> {
         self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter().rev()
-            .find(|entry| entry.index == index && !entry.history && entry.covered.is_none())
+            .find(|entry| entry.index == index && !entry.history
+                && agent.map_or(entry.covered.is_none(), |agent| {
+                    entry.covered.as_ref().is_none_or(|covered| covered.contains(agent))
+                }))
             .and_then(|entry| entry.valid_until_unix_ms)
     }
 
     /// Queue selection changes at lease expiry even when the claim frontier is unchanged.
     /// Scan only on a cache miss, inside the same SQLite snapshot as the queue projection.
-    fn agent_queue_valid_until(&self, now: u128) -> Result<Option<u128>> {
+    fn agent_queue_valid_until(&self, now: u128, agent: Option<&str>) -> Result<Option<u128>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare_cached(
             "SELECT lease_expires_at_unix_ms FROM step_runs
              WHERE agentless=0 AND status IN ('claimed','working','verifying')
                AND status NOT IN ('completed','failed','cancelled')
+               AND (?1 IS NULL OR assignee=?1 OR lease_owner=?1)
                AND lease_expires_at_unix_ms IS NOT NULL
                AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)",
         )?;
         let mut deadline = None;
-        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+        for row in statement.query_map([agent], |row| row.get::<_, String>(0))? {
             if let Some(expiry) = row?.parse::<u128>().ok().filter(|expiry| *expiry > now) {
                 deadline = Some(deadline.map_or(expiry, |previous: u128| previous.min(expiry)));
             }
@@ -3005,6 +3010,8 @@ impl Store {
             return Ok(items);
         }
         let now = now_ms();
+        let selected_agent = selected.filter(|names| names.len() == 1)
+            .and_then(BTreeSet::first).map(String::as_str);
         let valid = |entry: &&runtime::AgentResourcesEntry| {
             entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
         };
@@ -3031,6 +3038,9 @@ impl Store {
         // is sufficient to discover the cards moved by a deadline without dropping the fleet.
         let previous = cache.iter()
             .filter(|entry| entry.index <= index && entry.local <= local && entry.history == history)
+            // Exact windows advance only their own coverage. A fleet projection (or a
+            // different selected window) must not turn a one-row read into a fleet refold.
+            .filter(|entry| selected.is_none_or(|names| entry.covered.as_ref() == Some(names)))
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
         drop(cache);
         let entry = crate::performance::task("roster/build",
@@ -3046,9 +3056,13 @@ impl Store {
                 let mut changed = delta.subjects;
                 if delta.membership {
                     let connection = self.readers.get();
-                    let names = connection.prepare_cached(RANGE_SUBJECTS)?
-                        .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
-                        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+                    let names = if let Some(selected) = selected {
+                        selected.clone()
+                    } else {
+                        connection.prepare_cached(RANGE_SUBJECTS)?
+                            .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+                            .collect::<rusqlite::Result<BTreeSet<_>>>()?
+                    };
                     let mut names = if history { names } else {
                         self.current_view_candidates(&connection, names, index, true)?
                     };
@@ -3106,7 +3120,7 @@ impl Store {
                         }
                     }
                     queue_metadata = Some(metadata);
-                    self.agent_queue_valid_until(now)?
+                    self.agent_queue_valid_until(now, selected_agent)?
                 } else {
                     previous.valid_until_unix_ms
                 };
@@ -3153,7 +3167,7 @@ impl Store {
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
                 Ok(runtime::AgentResourcesEntry {
                     index, local, history, covered: selected.cloned(),
-                    valid_until_unix_ms: self.agent_queue_valid_until(now)?,
+                    valid_until_unix_ms: self.agent_queue_valid_until(now, selected_agent)?,
                     items: Arc::new(items),
                 })
             }
@@ -3161,13 +3175,14 @@ impl Store {
         })?;
         let mut cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
-        // All endpoint callers hold admission. Direct internal readers may still race; never
-        // replace a complete published projection with a partial one.
+        // Roster windows hold admission; selected detail/internal readers may still race.
+        // Never replace an already published matching projection with a competing build.
         let published = cache.iter().filter(valid).find(|entry| {
             agent_resources_entry_hits(entry, now, index, local, history, selected)
         }).map(|entry| Arc::clone(&entry.items));
         let items = if let Some(published) = published { published } else {
-            cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
+            cache.retain(|entry| entry.index != index || entry.local != local
+                || entry.history != history || entry.covered.as_ref() != selected);
             let items = Arc::clone(&entry.items);
             cache.push_back(entry);
             if cache.len() > 8 { cache.pop_front(); }
@@ -6854,10 +6869,18 @@ impl Store {
     /// One current-step scan for the whole roster. This avoids replaying wake
     /// history or querying the step table separately for every agent card.
     pub fn agent_work_queues(&self) -> Result<BTreeMap<String, AgentWorkQueue>> {
+        self.agent_work_queues_for(None)
+    }
+
+    /// Build queue previews from the same selector, reading only one agent's inputs when named.
+    pub(crate) fn agent_work_queues_for(
+        &self,
+        selected_agent: Option<&str>,
+    ) -> Result<BTreeMap<String, AgentWorkQueue>> {
         crate::performance::task("agent_work_queues", || -> Result<BTreeMap<String, AgentWorkQueue>> {
         let connection = self.readers.get();
-        let orders = seat_run_orders_tx(&connection, None)?;
-        let rows = seat_step_rows_tx(&connection, None)?;
+        let orders = seat_run_orders_tx(&connection, selected_agent)?;
+        let rows = seat_step_rows_tx(&connection, selected_agent)?;
         let mut seats = BTreeMap::<&str, Vec<SeatStep<'_>>>::new();
         for row in &rows {
             let step = row.seat_step();
@@ -6866,6 +6889,9 @@ impl Store {
                 .flatten()
                 .collect::<BTreeSet<_>>()
             {
+                if selected_agent.is_some_and(|selected| selected != agent) {
+                    continue;
+                }
                 seats.entry(agent).or_default().push(step);
             }
         }
@@ -44144,6 +44170,10 @@ version 2
             .unwrap()
             .remove("agent/node.worker")
             .unwrap();
+        let selected = store.agent_work_queues_for(Some("agent/node.worker")).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected["agent/node.worker"], queue);
+        assert!(store.agent_work_queues_for(Some("agent/absent")).unwrap().is_empty());
         assert_eq!(queue.active_work_count, 0);
         assert_eq!(queue.queued_work_count, 2);
         assert_eq!(
@@ -44258,6 +44288,7 @@ version 2
             .unwrap()
             .remove("agent/node.worker")
             .unwrap();
+        assert_eq!(store.agent_work_queues_for(Some("agent/node.worker")).unwrap()["agent/node.worker"], queue);
         assert_eq!(queue.current_work_ids, [subject.clone()]);
         assert_eq!(queue.active_work_count, 1);
         assert_eq!(queue.next_work_id.as_deref(), Some(other.as_str()));
@@ -44288,6 +44319,7 @@ version 2
             .unwrap()
             .remove("agent/node.worker")
             .unwrap();
+        assert_eq!(store.agent_work_queues_for(Some("agent/node.worker")).unwrap()["agent/node.worker"], queue);
         assert!(queue.current_work_ids.is_empty());
         assert_eq!(queue.active_work_count, 0);
         assert_eq!(queue.queued_work_count, 2);

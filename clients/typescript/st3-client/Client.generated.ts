@@ -47,8 +47,8 @@ export type TerminalStreamOptions = {
 };
 export type TerminalStream = { close(): void };
 
-/** `person` applies to attention, `actor` to work, and `status` to agents. */
-export type CollectionFilters = { person?: string | null; actor?: string | null; status?: string | null };
+/** `person` applies to attention, `actor` to work, and `status`/exact `agent` to agents. */
+export type CollectionFilters = { person?: string | null; actor?: string | null; status?: string | null; agent?: string | null };
 /** The WebSocket surface the collections socket uses: a terminal socket that also sends. */
 export type CollectionSocket = TerminalSocket & {
     onopen: (() => void) | null;
