@@ -77,7 +77,12 @@ if any(a.startswith("--dangerously-load-development-channels") for a in argv):
 
 # The shared Claude fixture supports an inline st3 MCP server. Resolve the installed
 # packaged plugin to that same server while retaining the original route receipt.
-if "--channels" in argv and "--mcp-config" not in argv and not any(a.startswith("--mcp-config=") for a in argv):
+selectors=[]
+for index,argument in enumerate(argv):
+    for flag in ("--channels","--dangerously-load-development-channels"):
+        if argument==flag and index+1<len(argv): selectors.extend(argv[index+1].split(","))
+        elif argument.startswith(flag+"="): selectors.extend(argument.split("=",1)[1].split(","))
+if "plugin:st-channel@st" in selectors and "--mcp-config" not in argv and not any(a.startswith("--mcp-config=") for a in argv):
     if "st-channel@st" not in state["plugins"]: sys.exit("fixture plugin absent")
     server={"command":os.environ["ST3_BIN"],"args":["driver","claude-mcp"]}
     argv += ["--mcp-config",json.dumps({"mcpServers":{"st3":server}})]

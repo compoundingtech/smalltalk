@@ -67,3 +67,24 @@ after a container restart. The guest was removed. No harness/expert/mission-cont
 release-version, stock22 native compatibility or real-VM pass is implied. The
 candidate is a proof-only dev composition with no bundled loader/libc; native22
 is known to fail before main and remains install-story work.
+
+## Harness-only driver split
+
+The foundation archive also passed **23 native Codex checks**, exit0, with a
+disposable explicitly created seat and a matching successful read of the exact
+graph wake, app-server/TUI handshake, outside-seat MCP and seat stop. Reboot was
+explicitly skipped for this driver validation; the earlier setup proof includes it.
+native-codex-split.txt retains exact runner output. This validation preceded the
+new Selected harness assertion and proves driver plumbing, not the next candidate's
+setup detection. The latest --harness-only requires Selected harness exactly once
+and Claude setup/driver route and consent checks; default expert assertions remain.
+
+Two preceding attempts failed during container boot, before any setup or driver
+check. Retained startup diagnostics showed user manager Error24/Too many open
+files; the host developer UID had125 readable inotify instances against limit128.
+Assigning Docker ada UID42420 resolved the failure. The runner changes only its
+disposable guest UID, including when adapting old images, and keeps host kernel
+limits unchanged. All failed and successful containers were removed. Incus and
+external transports use the guest's actual UID. Six guard/consent checks now pass,
+including packaged selectors in approved, development split and development joined
+forms; their stdout is in rig-checks-harness.txt.

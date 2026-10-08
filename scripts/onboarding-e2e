@@ -24,7 +24,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv dbus dbus-user-session libpam-systemd python3 curl ca-certificates \\
  && rm -rf /var/lib/apt/lists/* \\
  && if getent passwd 1000 >/dev/null; then userdel $(getent passwd 1000 | cut -d: -f1); fi \\
- && useradd -m -u 1000 -s /bin/bash ada \\
+ && useradd -m -u 42420 -s /bin/bash ada \\
  && systemctl mask getty@tty1.service console-getty.service
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
@@ -45,7 +45,7 @@ raw=bytearray(); handled=[]; frame=False; navigated=False; quit_sent=False; home
 deadline=time.monotonic()+request.get("timeout",45)
 rules=[("Your name",b"ada\r"),("This machine's name",b"studio\r"),
        ("Keep st running in the background",b"\r"),("The st daemon is not running. Start it?",b"\r"),
-       ("Which harness",b"1\r")]
+       ("Which harness",b"1\r"),("Install the st Claude channel",b"\r")]
 while time.monotonic()<deadline:
  if select.select([master],[],[],0.1)[0]:
   try: chunk=os.read(master,65536)
@@ -89,7 +89,8 @@ class Machine:
         self.args,self.ubuntu,self.scenario=args,ubuntu,scenario
         self.name="st-onboarding-"+uuid.uuid4().hex[:12]
         self.created=False
-        self.uid=1000
+        # Avoid sharing the host developer's per-UID inotify quota in Docker.
+        self.uid=42420
 
     def prefix(self, root=False):
         if self.args.backend=="docker":
@@ -122,7 +123,11 @@ class Machine:
         if r.returncode: raise RuntimeError(r.stderr.decode(errors="replace"))
 
     def start(self):
-        if self.args.backend=="external": return
+        if self.args.backend=="external":
+            r=self.run("id -u")
+            if r["exit"]: raise RuntimeError("external test-user UID unavailable: "+r["stderr"])
+            self.uid=int(r["stdout"].strip())
+            return
         if self.args.backend=="incus":
             r=command(["incus","launch",f"images:ubuntu/{self.ubuntu}/cloud",self.name,"--vm",
                 "-c","limits.cpu=2","-c","limits.memory=3GiB"],timeout=300)
@@ -140,6 +145,9 @@ class Machine:
             r=command(argv,timeout=60)
         if r.returncode: raise RuntimeError(r.stderr.decode(errors="replace"))
         self.created=True
+        if self.args.backend=="docker":
+            r=self.run(f"test \"$(id -u ada)\" = {self.uid} || usermod -u {self.uid} ada",root=True)
+            if r["exit"]: raise RuntimeError("assign isolated fixture UID: "+r["stdout"]+r["stderr"])
         if self.args.backend=="incus":
             r=self.run("cloud-init status --wait",root=True,timeout=180)
             if r["exit"]: raise RuntimeError(str(r))
@@ -152,7 +160,9 @@ class Machine:
                 r=self.run("systemctl start user@"+str(self.uid)+".service",root=True,timeout=10)
                 if r["exit"]==0: break
                 time.sleep(0.5)
-            else: raise RuntimeError("systemd user manager failed to start")
+            else:
+                diagnosis=self.run(f"systemctl status user@{self.uid}.service --no-pager; journalctl -b -u user@{self.uid}.service --no-pager -n 30",root=True,timeout=10)
+                raise RuntimeError("systemd user manager failed to start: "+r["stdout"]+r["stderr"]+diagnosis["stdout"]+diagnosis["stderr"])
         if self.scenario=="hostname-spaces":
             # Kernel hostnames cannot contain spaces. hostnamectl's pretty name can.
             self.run("hostnamectl --pretty set-hostname 'Ada Studio'",root=True)
@@ -206,7 +216,7 @@ class Run:
 
     def save(self):
         result={"ubuntu":self.m.ubuntu,"scenario":self.m.scenario,"backend":self.m.args.backend,
-            "machine":self.m.name,"archive":self.metadata,"checks":self.checks,"commands":self.commands}
+            "machine":self.m.name,"fixture_uid":self.m.uid,"archive":self.metadata,"checks":self.checks,"commands":self.commands}
         (self.out/"result.json").write_text(json.dumps(result,indent=2)+"\n")
         lines=[f"# Onboarding: {self.m.ubuntu} / {self.m.scenario}","",f"Archive SHA256: `{self.metadata['sha256']}`.",""]
         lines += [f"- **{c['status']}** `{c['id']}`: {c['detail']}" for c in self.checks]
@@ -314,6 +324,13 @@ class Run:
         else:
             r=self.execute("Setup flags",shlex.join(argv)); ok=r["exit"]==0; text=self.output(r)
         if not self.check("setup-success",ok,"real candidate setup completed"): return
+        if self.m.args.harness_only and scenario in ("claude-policy-absent","claude-policy-present","codex","both","no-gh","gh-logged-out","gh-broken"):
+            expected="claude" if scenario.startswith("claude-") or scenario=="both" else "codex"
+            selected=re.findall(r"^Selected harness: (claude|codex|opencode|pi|omp)\s*$",text,re.M)
+            self.check("setup-selected-harness",selected==[expected],"setup discovers/selects "+expected+" exactly once on daemon login PATH")
+            if scenario.startswith("claude-"):
+                flag="--channels" if scenario=="claude-policy-present" else "--dangerously-load-development-channels"
+                self.check("setup-channel-route",flag in text and "plugin:st-channel@st" in text,"setup explains its policy/development plugin route")
         if scenario=="existing-store":
             existing_after=self.json_cli("Existing runs after setup","missions","ls","--all")
             self.check("existing-store-preserved",mission_runs(existing_before) is not None and mission_runs(existing_before)==mission_runs(existing_after),"setup preserves existing fleet run and adds no onboarding")
@@ -340,7 +357,8 @@ class Run:
         p=self.pty("Plain st renders; palette selects Home/Now",[self.st])
         self.check("tui-frame",p.get("frame",False) and p.get("home_frame",False) and p.get("quit_sent",False) and p.get("restored",False) and p.get("exit")==0,"first frame, visible Home/Now, Ctrl+Q and terminal restoration")
         if scenario not in ("setup","first-run","hostname-localhost","hostname-spaces","hostname-long","no-manager","linger-on","linger-off","existing-store"):
-            self.onboarding_checks(scenario)
+            if self.m.args.harness_only and scenario!="no-harness": self.harness_checks(scenario)
+            else: self.onboarding_checks(scenario)
         before=self.json_cli("Runs before rerun","missions","ls","--all")
         r=self.cli("Idempotent setup","setup","--person","ada","--node","studio","--yes","--service",service)
         after=self.json_cli("Runs after rerun","missions","ls","--all")
@@ -380,6 +398,49 @@ class Run:
             policy=json.dumps({"channelsEnabled":True,"allowedChannelPlugins":[{"marketplace":"st","plugin":"st-channel"}]},indent=2,sort_keys=True)+"\n"
             self.execute("Fixture managed policy", "mkdir -p /etc/claude-code/managed-settings.d; printf %s "+shlex.quote(policy)+" > /etc/claude-code/managed-settings.d/50-st-channel.json",root=True)
 
+    def harness_checks(self,scenario):
+        """Prove the native driver without depending on the future built-in expert."""
+        harness="claude" if scenario.startswith("claude-") or scenario=="both" else "codex"
+        subject="agent/fixture/onboarding-harness"
+        r=self.execute("Disposable workspace","mkdir -p ~/fixture-workspace")
+        if not self.check("fixture-workspace",r["exit"]==0,"private workspace created for the explicit test seat"): return
+        r=self.cli("Create disposable provider seat","agents","new","fixture/onboarding-harness","--harness",harness,"--workspace","/home/ada/fixture-workspace",timeout=35)
+        if not self.check("fixture-seat-start",r["exit"]==0,"explicit "+harness+" seat starts without built-in expert"):
+            self.cli("Stop failed fixture seat","agents","stop",subject,"--as","person/ada")
+            return
+        try:
+            r=self.cli("Wake provider through graph","conversations","send",subject,"--from","person/ada","--subject","Harness channel fixture","--body","Read this graph message using st; this is a native transport fixture.")
+            match=re.search(r"message/[0-9a-f]+",r["stdout"])
+            if not self.check("fixture-wake",r["exit"]==0 and match is not None,"real graph message sent to disposable seat"): return
+            reference=match.group(0)
+            deadline=time.monotonic()+35
+            while True:
+                r=self.execute("Disposable provider receipts","find ~ -name 'receipts-agent-fixture-onboarding-harness.jsonl' -exec cat {} +")
+                records=[json.loads(line) for line in r["stdout"].splitlines() if line.startswith("{")]
+                read=any(x.get("event")=="read" and x.get("reference")==reference and x.get("exit")==0 for x in records)
+                if read or time.monotonic()>=deadline: break
+                time.sleep(1)
+            self.check("fixture-read-message",read,"selected native provider successfully reads the exact wake")
+            receipts=r["stdout"]
+            if harness=="claude":
+                flag="--channels" if scenario=="claude-policy-present" else "--dangerously-load-development-channels"
+                self.check("claude-route",flag in receipts,"actual seat uses the expected policy/development route")
+                if scenario!="claude-policy-present":
+                    self.check("claude-dialog",any(x.get("event")=="development-consent" and x.get("accepted") for x in records),"driver answered the development dialog")
+            else:
+                self.check("codex-native-server",any(x.get("event")=="tui-ready" for x in records),"native app-server/TUI handshake completed")
+            if scenario in ("no-gh","gh-logged-out","gh-broken"):
+                self.github_check()
+            r=self.cli("Plain Claude MCP without a subject","driver","claude-mcp",timeout=5)
+            self.check("plain-mcp-idle",r["exit"]==0 and not r["stdout"],"no notifications or error outside a seat")
+        finally:
+            r=self.cli("Stop disposable provider seat","agents","stop",subject,"--as","person/ada")
+            self.check("fixture-seat-stopped",r["exit"]==0,"test-created seat stopped after proof")
+
+    def github_check(self):
+        r=self.cli("Optional GitHub watch refuses clearly","gh","watch","example/fixture#1","--as","person/ada",timeout=8)
+        self.check("gh-optional",r["exit"] not in (0,124) and bool(re.search(r"(not (found|installed|authenticated)|unavailable|auth|log.?in|could not|failed.*gh|gh.*failed)",self.output(r),re.I)) and "unexpected argument" not in self.output(r),"unavailable GitHub integration returns a clear error without hanging")
+
     def onboarding_checks(self,scenario):
         if scenario=="no-harness":
             self.check("no-harness-explained",bool(re.search(r"(no .*harness|no .*provider|install (claude|codex)|harness.*not .*found)","\n".join(c["stdout"]+c["stderr"] for c in self.commands if c["title"]=="Setup flags"),re.I)),"wizard explains that no provider is installed")
@@ -416,8 +477,7 @@ class Run:
                 if scenario.endswith("absent"):
                     self.check("claude-dialog",any(x.get("event")=="development-consent" and x.get("accepted") for x in records),"driver answered development dialog")
             if scenario in ("no-gh","gh-logged-out","gh-broken"):
-                r=self.cli("Optional GitHub watch refuses clearly","gh","watch","example/fixture#1","--as","person/ada",timeout=8)
-                self.check("gh-optional",r["exit"] not in (0,124) and bool(re.search(r"(not (found|installed|authenticated)|unavailable|auth|log.?in|could not|failed.*gh|gh.*failed)",self.output(r),re.I)) and "unexpected argument" not in self.output(r),"unavailable GitHub integration returns a clear error without hanging")
+                self.github_check()
             if self.m.args.require_wrap_up:
                 deadline=time.monotonic()+self.m.args.mission_timeout
                 while True:
@@ -482,6 +542,7 @@ def main():
     parser.add_argument("--image",help="prebuilt Docker image implementing the embedded clean-systemd recipe")
     parser.add_argument("--fixtures",type=Path,default=Path(__file__).resolve().parent/"st3-boot-canaries")
     parser.add_argument("--strict-release",action="store_true")
+    parser.add_argument("--harness-only",action="store_true",help="test a disposable native-driver seat without requiring the built-in expert or onboarding")
     parser.add_argument("--require-wrap-up",action="store_true",help="also require mission completion; basic native fixtures only read and claim")
     parser.add_argument("--mission-timeout",type=int,default=90)
     parser.add_argument("--no-reboot",action="store_true")
@@ -489,6 +550,7 @@ def main():
     args=parser.parse_args()
     scenarios=args.scenario or [args.mode or "setup"]
     if args.mode and args.scenario: parser.error("use mode or --scenario")
+    if args.harness_only and args.require_wrap_up: parser.error("--harness-only and --require-wrap-up test different phases; choose one")
     if any(s!="baseline" for s in scenarios) and not args.archive: parser.error("candidate scenarios require --archive")
     if args.backend in ("incus","external") and any(os.environ.get(k) for k in ("CI","GITHUB_ACTIONS","BUILDKITE")):
         parser.error("real-machine backends are manual only and are refused in CI")

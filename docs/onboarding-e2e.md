@@ -5,6 +5,9 @@ It consumes a verified release archive, copies bytes through stdin, and installs
 `ada`. It never builds Rust, installs a real provider, logs into an account, or runs
 a paid model. Docker instances have two CPUs, 3 GiB RAM and no host bind mounts.
 The systemd image uses a privileged container, matching the original experiment.
+Docker ada uses UID42420, including when adapting an older equivalent image,
+so its user manager does not share the host developer's per-UID inotify quota.
+The host kernel limits are unchanged; reports record the actual fixture UID.
 
 Run the pinned old-release baseline:
 
@@ -59,6 +62,21 @@ hostname and also tests rejection of a spaced node argument. The long kernel
 hostname uses the maximum legal 63 characters; a 64-character node is rejected.
 
 Provider scenarios use `scripts/st3-boot-canaries` and the Claude adapter in
+`scripts/onboarding-fixtures`. For the harness-and-channel step, add
+`--harness-only`: setup still probes providers and answers the choice, but the
+runner asserts the exact Selected harness output once, creates its own disposable
+native-driver seat, sends a graph message,
+requires a successful read of that exact message plus route/consent or app-server
+receipts, and stops the seat. It does not depend on the built-in expert or publish
+onboarding. The default provider scenarios retain the expert and one-run checks.
+For example:
+
+```sh
+scripts/onboarding-e2e --harness-only --scenario codex \
+  --archive /tmp/candidate.tar.gz --ubuntu 24.04 --out /tmp/harness-proof
+```
+
+The fixtures come from `scripts/st3-boot-canaries` and the adapter in
 `scripts/onboarding-fixtures`. The adapter implements the local plugin CLI and
 observed consent text; the shared fixture runs real hooks, MCP and message reads.
 These prove transport, not provider availability or model judgment. The existing

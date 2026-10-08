@@ -81,4 +81,36 @@ class RigChecks(unittest.TestCase):
             finally:
                 process.terminate(); process.wait(timeout=5); os.close(master)
 
+    def test_packaged_selectors_resolve_the_native_mcp_after_consent(self):
+        variants=(['--channels','plugin:st-channel@st'],
+                  ['--dangerously-load-development-channels','plugin:st-channel@st'],
+                  ['--dangerously-load-development-channels=plugin:st-channel@st'])
+        for args in variants:
+            with self.subTest(args=args),tempfile.TemporaryDirectory() as d:
+                directory=Path(d)
+                shutil.copyfile(SCRIPTS/'st3-boot-canaries/stubmodel.py',directory/'stubmodel.py')
+                shutil.copyfile(SCRIPTS/'onboarding-fixtures/claude.py',directory/'claude.py')
+                (directory/'.claude').mkdir()
+                (directory/'.claude/onboarding-fixture.json').write_text(json.dumps({'plugins':['st-channel@st'],'marketplaces':[]}))
+                (directory/'stub-claude.py').write_text('import json,sys\nfrom pathlib import Path\nPath("argv.json").write_text(json.dumps(sys.argv[1:]))\n')
+                master,slave=pty.openpty()
+                process=subprocess.Popen(['python3',str(directory/'claude.py'),*args],cwd=d,
+                    env={**os.environ,'HOME':d,'ST_AGENT':'agent/fixture','ST3_BIN':'/bin/true'},stdin=slave,stdout=slave,stderr=slave)
+                os.close(slave)
+                try:
+                    if args[0].startswith('--dangerously'):
+                        deadline=time.monotonic()+5
+                        receipt=directory/'receipts-agent-fixture.jsonl'
+                        while time.monotonic()<deadline and not receipt.exists(): time.sleep(0.05)
+                        self.assertTrue(receipt.exists())
+                        self.assertFalse((directory/'argv.json').exists())
+                        os.write(master,b'\r')
+                    self.assertEqual(process.wait(timeout=5),0)
+                    actual=json.loads((directory/'argv.json').read_text())
+                    config=json.loads(actual[actual.index('--mcp-config')+1])
+                    self.assertEqual(config['mcpServers']['st3'],{'command':'/bin/true','args':['driver','claude-mcp']})
+                finally:
+                    if process.poll() is None: process.terminate(); process.wait(timeout=5)
+                    os.close(master)
+
 if __name__=="__main__": unittest.main()
