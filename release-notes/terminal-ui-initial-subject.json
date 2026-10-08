@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Provide a first-run terminal UI entry point to open the newly published expert conversation.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay, projection rebuild or store recovery changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, columns, indexes, triggers or schema transitions."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or coordinated fleet-upgrade changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The UI library accepts a programmatic initial agent subject. It waits for fresh live agent and granted space inventory, opens the agent conversation once and preserves later navigation. Input before readiness cancels the request; an absent subject is not retried. Default UI launches are unchanged and paired-device mode ignores this request. No new CLI flag, wire format or profile transition."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon lifecycle changes or additional service restart requirement."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step or persisted-state migration for this optional UI entry point."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persisted-state format transition; removing the initial-subject request retains the ordinary restored UI view."
+  }
+}
