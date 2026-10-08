@@ -47,7 +47,9 @@ pub struct World {
     /// here, so what stui shows can be wrong until the host is repaired.
     pub diverged: Vec<String>,
     /// Lists st stopped serving after they loaded, each with st's reason: the rows shown are the
-    /// last it sent, and may be out of date until it serves them again.
+    /// last it sent, and may be out of date until it serves them again. Left out of the shared
+    /// contract while empty: the phone shows this on its own.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stale: Vec<String>,
     pub attention: Load<Vec<Attention>>,
     pub agents: Load<Vec<Agent>>,
