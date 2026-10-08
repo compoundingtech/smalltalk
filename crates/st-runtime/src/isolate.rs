@@ -154,6 +154,10 @@ pub fn wrap(unit: &str, program: &OsStr, arguments: &[&OsStr]) -> Command {
                     "--expand-environment=no",
                 ])
                 .arg(format!("--unit={unit}"))
+                // A fixed description: without one the manager records the
+                // full command line as the unit description, and that command
+                // line is not the place any environment value belongs.
+                .arg(format!("--description={unit}"))
                 .arg("--")
                 .arg(program)
                 .args(arguments);
@@ -466,6 +470,7 @@ mod tests {
                 assert!(arguments.contains(&"--scope".to_owned()));
                 assert!(arguments.contains(&"--unit=st3-work.scope".to_owned()));
                 assert!(arguments.contains(&"--expand-environment=no".to_owned()));
+                assert!(arguments.contains(&"--description=st3-work.scope".to_owned()));
             }
             Isolation::Detached | Isolation::DegradedDetached => {
                 assert_eq!(command.get_program(), OsStr::new("sh"));

@@ -16,7 +16,7 @@ A runtime restart reproduces the same environment from durable inputs.
 
 The current exec runtime adds declared values to `Command`. It does not clear inherited values first.
 
-The current PTY runtime passes repeated `--env` values. The `pty` launcher and member still inherit other values.
+The current PTY runtime passes repeated `--env` names; the `pty` launcher resolves each value from the launcher's inherited environment, and the member still inherits other values.
 
 The st2 launcher has the same inheritance. It removes only `NO_COLOR` from managed agents.
 

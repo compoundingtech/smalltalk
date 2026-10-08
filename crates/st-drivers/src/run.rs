@@ -282,9 +282,10 @@ impl PtyCli {
         resolve_task_cwd(target, spec_dir, &self.catalog_root)
     }
 
-    /// The st2-owned part of a PTY task's environment. This same final map is both inherited by the
-    /// initial `pty run` process and persisted through repeatable `--env KEY=VALUE` arguments, so a
-    /// manual `pty restart` recreates the task without snapshotting unrelated ambient OS variables.
+    /// The st2-owned part of a PTY task's environment. This same final map is inherited by the
+    /// initial `pty run` process and named through repeatable `--env KEY` arguments, so a manual
+    /// `pty restart` recreates the task without snapshotting unrelated ambient OS variables —
+    /// while no environment value is ever placed on a command line.
     fn managed_task_env(&self, target: &TaskTarget) -> BTreeMap<OsString, OsString> {
         let mut env = BTreeMap::from([
             (
@@ -390,8 +391,10 @@ impl PtyCli {
             cmd.arg("--tag").arg("keep=true");
         }
         // Apply the resolved managed overlay to the initial launcher exactly as before, and also
-        // persist it in PTY metadata for manual restart. PTY applies repeated `--env` entries
-        // last-wins, then forcibly injects the new session's own PTY_SESSION identity.
+        // name it through `--env` for manual restart. The values themselves travel in the
+        // launcher's inherited environment (set above): the pty launcher resolves each name-only
+        // `--env` from that environment, then applies repeated entries last-wins and forcibly
+        // injects the new session's own PTY_SESSION identity.
         let managed_env = self.managed_task_env(target);
         cmd.envs(&managed_env);
         // Coding-agent command runners commonly set NO_COLOR for their own captured output. That
@@ -401,11 +404,8 @@ impl PtyCli {
             cmd.env_remove("NO_COLOR");
             cmd.arg("--unset-env").arg("NO_COLOR");
         }
-        for (key, value) in &managed_env {
-            let mut assignment = key.clone();
-            assignment.push("=");
-            assignment.push(value);
-            cmd.arg("--env").arg(assignment);
+        for key in managed_env.keys() {
+            cmd.arg("--env").arg(key);
         }
         cmd.arg("--");
         match &target.launch {

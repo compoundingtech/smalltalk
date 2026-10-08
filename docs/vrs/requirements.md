@@ -160,11 +160,15 @@ accepted.
   complete effective launch definition, including environment and supported
   launch fields.
 - **R42 Launch argv transparency:** Every st2-added launch wrapper preserves the
-  effective task program and each argument as ordered, opaque OS strings. A
-  Linux systemd scope launch disables systemd command-line environment
-  expansion before the wrapper separator, so dollar-bearing literals including
-  `$HOME`, `${UNSET}`, and `$$` reach the task byte-for-byte. Detached and
-  degraded-detached launches remain exact pass-throughs.
+  effective task program and each argument as ordered, opaque OS strings, and
+  no launch environment value is ever formatted into a wrapper or launcher
+  argument: values travel in the inherited process environment and the PTY
+  launcher receives variable names only. A Linux systemd scope launch disables
+  systemd command-line environment expansion and pins the unit description to
+  the unit name before the wrapper separator, so dollar-bearing literals
+  including `$HOME`, `${UNSET}`, and `$$` reach the task byte-for-byte and no
+  environment value can enter a recorded command line or unit description.
+  Detached and degraded-detached launches remain exact pass-throughs.
 - **R07 Verified hooks:** Required hook content is installed explicitly and
   verified before a rendered agent depends on it. The selected receipt carries
   the binary's real source identity regardless of build system. Ordered

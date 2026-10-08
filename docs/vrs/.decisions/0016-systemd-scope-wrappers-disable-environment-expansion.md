@@ -47,11 +47,14 @@ st2-maintained encoding and would no longer be opaque launch argv.
 Linux scope launches use this exact outer argument order:
 
 ```text
-systemd-run --user --scope --collect --quiet --unit=<unit> --expand-environment=no -- <program> <arg>...
+systemd-run --user --scope --collect --quiet --unit=<unit> --description=<unit> --expand-environment=no -- <program> <arg>...
 ```
 
 `--expand-environment=no` is passed as a `systemd-run` option before the `--`
-separator. st2 appends the program and each argument after the separator as the
+separator. `--description=` pins the unit description to the unit name:
+without it the manager records the complete command line as the description,
+and a description must never be a place a launch environment value can reach.
+st2 appends the program and each argument after the separator as the
 original OS strings. It does not quote, escape, expand, or render those values
 through a shell. Detached and degraded-detached modes remain direct
 pass-throughs.
@@ -60,9 +63,9 @@ pass-throughs.
 
 - Dollar-bearing literals, including `$HOME`, `${UNSET}`, and `$$`, reach PTY
   and exec tasks byte-for-byte in scope mode.
-- The systemd option sequence is part of the tested wrapper contract; the only
-  addition to the prior shape is the expansion-disable option before the
-  separator.
+- The systemd option sequence is part of the tested wrapper contract; its only
+  additions to the prior shape are the expansion-disable option and the fixed
+  description, both before the separator.
 - macOS and Linux hosts without usable user scopes keep the existing direct
   program-and-argv path.
 - Scope lifetime and I/O behavior are unchanged. The supporting live evidence

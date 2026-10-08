@@ -903,25 +903,34 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   same effective color policy. Adoption of an already-live task remains
   non-mutating: this policy is applied only when st2 creates a generation.
 - **R42:** [Launch argv](ontology.md#launch-argv) is opaque at every
-  st2-added wrapper boundary. In Linux systemd scope mode the exact outer
-  command order is:
+  st2-added wrapper boundary, and no launch environment value is ever
+  formatted into any wrapper or launcher argument. In Linux systemd scope mode
+  the exact outer command order is:
 
   ```text
-  systemd-run --user --scope --collect --quiet --unit=<unit> --expand-environment=no -- <program> <arg>...
+  systemd-run --user --scope --collect --quiet --unit=<unit> --description=<unit> --expand-environment=no -- <program> <arg>...
   ```
 
   `--expand-environment=no` is an outer `systemd-run` option immediately before
-  the `--` separator. `<program>` and every `<arg>` are appended as their
+  the `--` separator. `--description=` pins the unit description to the unit
+  name, because without it the manager records the complete command line as
+  the unit description. `<program>` and every `<arg>` are appended as their
   original OS strings, without shell rendering, dollar escaping, or
   environment substitution. Detached and degraded-detached modes remain
   `<program> <arg>...` pass-throughs with no outer command.
+
+  Launch environment values reach the task through the process environment the
+  wrapper inherits: the PTY launcher receives name-only `--env <NAME>` flags
+  and resolves each value from that environment, so a service manager or
+  process listing recording the command line records names only.
 
   `src/isolate.rs::tests::wrap_scope_disables_expansion_and_preserves_dollar_bearing_argv`
   fixes the complete wrapper order and proves literal `$HOME`, `${UNSET}`, and
   `$$` after the separator.
   `src/isolate.rs::tests::wrap_detached_modes_preserve_exact_program_and_argv`
-  proves both pass-through modes. The live-system distinction and unaffected
-  scope semantics are recorded in the
+  proves both pass-through modes. `src/run/tests.rs::build_run_command_names_the_complete_managed_environment_without_its_values`
+  proves the managed environment is named without its values. The live-system
+  distinction and unaffected scope semantics are recorded in the
   [systemd scope argv experiment](.experiments/2026-09-05-systemd-scope-argv-transparency.md)
   and [`0016-systemd-scope-wrappers-disable-environment-expansion`](.decisions/0016-systemd-scope-wrappers-disable-environment-expansion.md).
 - **R07:** Hook bundles are explicit, content-addressed, installed separately,

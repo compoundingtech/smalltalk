@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Seat environment values travel in the launcher's inherited environment instead of process command lines: PTY launches pass variable names only, and transient scope units carry a fixed description.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or projection migration. The resolved environment a session child receives is unchanged; only its transport (inherited environment plus name-only --env flags) and the scope unit description change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or index change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or fleet coordination change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The pinned PTY revision adds name-only `--env NAME` (value read from the launcher's inherited environment) and owner-only registry records; KEY=VALUE is unchanged. The daemon now emits name-only flags, so the PTY binary and the daemon must ship together: an old PTY binary meeting a new daemon refuses the launch loudly (`Invalid env format ... Use --env KEY=VALUE`, exit 1) rather than dropping variables. A new PTY binary with an old daemon keeps working."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Install the release's daemon and PTY binaries together (the packaged release bundles both). A separately installed older PTY binary earlier on PATH must be upgraded before the new daemon, or new seat launches fail loudly until it is."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Rollback is symmetrical: an older daemon passes KEY=VALUE again, which the new PTY binary still accepts. Running sessions keep their recorded environment across either direction."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Ordinary daemon restart; no new interruption path is introduced and none was measured."
+  }
+}

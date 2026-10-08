@@ -354,11 +354,14 @@ impl PtyRuntime {
         terminal_env
             .entry("TERM".into())
             .or_insert_with(|| "xterm-256color".into());
-        for (key, value) in &terminal_env {
-            arguments.extend([
-                OsString::from("--env"),
-                OsString::from(format!("{key}={value}")),
-            ]);
+        // Name-only `--env`: the pty launcher resolves each name against its
+        // inherited environment (exported to it below), so no seat
+        // environment value is ever placed on a command line that a service
+        // manager or process listing records. The daemon still persists the
+        // resolved values in its session record, so a manual restart
+        // reproduces the same environment.
+        for key in terminal_env.keys() {
+            arguments.extend([OsString::from("--env"), OsString::from(key)]);
         }
         let mut effective_tags = tags.clone();
         if let Some((_, operation)) = cutover {
@@ -407,6 +410,7 @@ impl PtyRuntime {
                 command.env_clear().envs(environment);
             }
             command.env("PTY_ROOT", &self.root);
+            command.envs(&terminal_env);
             let output = match output_within(command, self.command_timeout) {
                 Ok(output) => output,
                 Err(error) => {
@@ -1067,6 +1071,18 @@ exit 0
         binary
     }
 
+    /// The variable names the built argv passed as name-only `--env` flags, in
+    /// order. The fake pty writes one argument per line, so each name is the line
+    /// after a `--env` line.
+    fn env_flag_names(arguments: &str) -> Vec<&str> {
+        let lines = arguments.lines().collect::<Vec<_>>();
+        lines
+            .iter()
+            .zip(lines.iter().skip(1))
+            .filter_map(|(flag, name)| (flag == &"--env").then_some(*name))
+            .collect()
+    }
+
     fn write_record(registry: &Path, name: &str, record: serde_json::Value) {
         fs::create_dir_all(registry).unwrap();
         fs::write(registry.join(format!("{name}.json")), record.to_string()).unwrap();
@@ -1444,7 +1460,8 @@ exit 0
             .unwrap();
         let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
         assert!(arguments.contains("st3.isolation="));
-        assert!(arguments.contains("TERM=xterm-256color"));
+        assert_eq!(env_flag_names(&arguments), ["TERM"]);
+        assert!(!arguments.contains("TERM="));
         assert!(arguments.contains("--force"));
         if crate::isolation_mode() == crate::Isolation::Scope {
             assert!(arguments.contains("st3.scope-unit=st3-work-"));
@@ -1466,8 +1483,46 @@ exit 0
         .unwrap();
 
         let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
-        assert!(arguments.contains("TERM=screen-256color"));
-        assert!(!arguments.contains("TERM=xterm-256color"));
+        assert_eq!(env_flag_names(&arguments), ["TERM"]);
+        assert!(
+            !arguments.contains("TERM="),
+            "terminal type values must stay off the argument list:\n{arguments}"
+        );
+    }
+
+    #[test]
+    fn spawn_passes_environment_values_by_name_not_on_the_argument_list() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_pty(
+            root.path(),
+            "fake-pty-secret",
+            "  printenv > \"$0.env\"\n  publish new",
+        );
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        const SECRET: &str = "synthetic-seat-secret-7c31";
+        runtime
+            .spawn(
+                "work",
+                &Launch::Argv(vec!["true".into()]),
+                root.path(),
+                &BTreeMap::from([("SEAT_TOKEN".into(), SECRET.into())]),
+                None,
+                &BTreeMap::new(),
+                None,
+            )
+            .unwrap();
+
+        let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
+        // The argument list names the variable and never carries its value.
+        assert_eq!(env_flag_names(&arguments), ["SEAT_TOKEN", "TERM"]);
+        assert!(
+            !arguments.contains(SECRET),
+            "the seat environment value leaked onto the launcher argv:\n{arguments}"
+        );
+        // The launcher still resolved the name from its inherited environment.
+        let inherited = fs::read_to_string(binary.with_extension("env")).unwrap();
+        assert!(inherited.contains(&format!("SEAT_TOKEN={SECRET}")));
     }
 
     #[test]

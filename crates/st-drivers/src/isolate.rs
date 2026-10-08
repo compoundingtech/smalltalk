@@ -136,6 +136,10 @@ fn wrap_for_mode(isolation: Isolation, unit: &str, program: &OsStr, args: &[&OsS
             let mut c = Command::new("systemd-run");
             c.args(["--user", "--scope", "--collect", "--quiet"])
                 .arg(format!("--unit={unit}"))
+                // A fixed description: without one the manager records the
+                // full command line as the unit description, and that command
+                // line is not the place any environment value belongs.
+                .arg(format!("--description={unit}"))
                 .arg("--expand-environment=no")
                 .arg("--")
                 .arg(program)
@@ -209,6 +213,7 @@ mod tests {
                 OsStr::new("--collect"),
                 OsStr::new("--quiet"),
                 OsStr::new("--unit=st-x.scope"),
+                OsStr::new("--description=st-x.scope"),
                 OsStr::new("--expand-environment=no"),
                 OsStr::new("--"),
                 OsStr::new("provider"),
