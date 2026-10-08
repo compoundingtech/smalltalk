@@ -30,7 +30,7 @@ pub const MAX_IDLE_READ_CONNECTIONS: usize = 128;
 
 /// A fixed page-cache target per reader, leaving retained schema and statement caches intact.
 /// SQLite's page-cache target excludes statements, schema, query results and allocator overhead.
-pub const READ_CACHE_KIB: usize = 2048;
+pub const READ_CACHE_KIB: usize = 8192;
 pub const WRITE_CACHE_KIB: usize = 32768;
 
 pub fn read_cache_kib() -> usize {
@@ -1652,6 +1652,7 @@ mod tests {
 
     #[test]
     fn reader_cache_override_rejects_values_that_disable_the_cache_limit() {
+        assert_eq!(READ_CACHE_KIB, 8192);
         for invalid in [
             None,
             Some(""),
@@ -1663,6 +1664,7 @@ mod tests {
             assert_eq!(configured_read_cache_kib(invalid), READ_CACHE_KIB);
         }
         assert_eq!(configured_read_cache_kib(Some("1024")), 1024);
+        assert_eq!(configured_read_cache_kib(Some("2048")), 2048);
         assert_eq!(configured_read_cache_kib(Some("8192")), 8192);
     }
 
