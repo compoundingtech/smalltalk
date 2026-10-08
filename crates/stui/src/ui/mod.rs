@@ -22,6 +22,7 @@ mod hyperlinks;
 #[path = "../../tests/support/terminal_tab.rs"]
 mod terminal_tab;
 pub use glass::set_glasses_version;
+pub use lastrun::log_panics as lastrun_log_panics;
 mod glass_store;
 mod lastrun;
 pub mod layout;

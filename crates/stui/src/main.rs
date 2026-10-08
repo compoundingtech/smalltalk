@@ -666,6 +666,7 @@ async fn send_terminal_key(
 fn main() -> Result<()> {
     // What `st clients` lists for this stui: its name and build, as reported.
     st3_client::set_client_name(version::client_name());
+    ui::lastrun_log_panics(&version::short(version::now()));
     // A designated test client (scripts/stui-test-client) can log the timing of its own requests
     // and collection frames: routes, statuses, sizes and durations only, never contents.
     if let Some(path) = std::env::var_os("STUI_TIMING_LOG") {
