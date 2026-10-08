@@ -63,6 +63,22 @@ run's steps in a mission detail read. An agent names its queue in
 path, title, first goal, and state, and the `subagents` its harness runs now.
 A work row names its `mission_id`.
 
+Clients that can apply field replacements may send `"field_deltas": true` on
+their collection subscription. The first snapshot still contains complete rows.
+Later changes may include optional `patches`: each names an existing row `id`,
+replacement top-level `fields`, and explicit `removed_fields`. A null field is
+a value; only `removed_fields` deletes a field. Identity (`id`) and resource
+`kind` never change in a patch. New rows and resource kind changes remain complete
+`upserts`. Apply patches, removals and upserts before displaying the new order.
+Omitting the option keeps complete upserts, including on older daemons.
+
+The Rust `apply_collection_patches` and TypeScript `applyWindow` helpers validate
+patches before changing the held rows. A missing base or malformed patch requires
+a fresh authoritative snapshot: mark the held window stale and resubscribe with
+the same ID. Never fill missing fields by guessing. Reconnecting always starts
+with a complete snapshot; these patches introduce no replay cursor. Each frame
+has at most 200 patches, each with at most 128 replacements and 128 removals.
+
 Each window is read inside one SQLite snapshot, and its fence names that
 snapshot's store index, so rows always match their fence. Commits that land
 while a window is read neither tear it nor delay it; they arrive in the next

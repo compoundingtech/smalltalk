@@ -2409,7 +2409,8 @@
             "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
             "person": { "type": ["string", "null"] },
             "actor": { "type": ["string", "null"] },
-            "status": { "type": ["string", "null"] }
+            "status": { "type": ["string", "null"] },
+            "field_deltas": { "type": "boolean", "description": "Opt in to field patches after the full snapshot; omitted defaults to full row upserts." }
           }
         },
         {
@@ -2457,6 +2458,16 @@
         }
       ]
     },
+    "CollectionPatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "fields", "removed_fields"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "fields": { "type": "object", "maxProperties": 128, "additionalProperties": {} },
+        "removed_fields": { "type": "array", "maxItems": 128, "uniqueItems": true, "items": { "type": "string" } }
+      }
+    },
     "CollectionFrame": {
       "oneOf": [
         {
@@ -2483,6 +2494,7 @@
             "collection": { "$ref": "#/$defs/CollectionName" },
             "snapshot": { "$ref": "#/$defs/Snapshot" },
             "upserts": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
+            "patches": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/CollectionPatch" } },
             "removes": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "order": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "has_more": { "type": "boolean" }

@@ -451,9 +451,15 @@ async fn connected(
                             return Ended::Closed;
                         }
                     }
-                    CollectionEvent::Changes { id, snapshot, upserts, removes, order, has_more } => {
+                    CollectionEvent::Changes { id, snapshot, upserts, patches, removes, order, has_more } => {
                         let Some(window) = Window::from_id(&id) else { continue };
                         let rows = windows.entry(window).or_default();
+                        if let Err(error) = st3_client::apply_collection_patches(rows, &patches) {
+                            if window_retries.failed(window, Instant::now()) && updates.send(Update::WindowFailed(window, error.to_string())).is_err() {
+                                return Ended::Closed;
+                            }
+                            continue;
+                        }
                         for id in removes {
                             rows.remove(&id);
                         }

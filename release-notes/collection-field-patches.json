@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "Send optional field replacements for changed collection rows without repeating unchanged values.",
+  "commits": [
+    "424e4ee7be1d80b727f538891953237003173bab"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "No claim projection, replay or admission changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or migration changes. The client JSON schema adds optional field delta commands and patches."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or fleet rules changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Clients may opt in with field_deltas=true on the existing collections v0 socket. Initial and reconnect snapshots remain complete, new rows and kind changes use full upserts, and changed existing rows may use patches. Null is a value; removed_fields deletes fields. Missing or malformed patch bases require an authoritative resubscription. Requests without the option keep full upserts; older daemons ignore the option and keep full upserts. Generated Rust and TypeScript helpers support patches, and the shared Rust feed retries invalid bases. Subscription bounds remain sixteen current/eight older."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Only the normal daemon replacement restart; clients reconnect for complete snapshots."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No installation steps. Consumers opt in only after adopting the field patch fold."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persisted state changes. Clients can omit the option, or replace the daemon with the prior build, to retain full upserts."
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Apply collection field patches only to rows held before the changes frame.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim or projection changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No JSON or database schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No fleet or checkpoint rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The TypeScript fold matches the Rust fold: a patch cannot borrow its base from a new upsert in the same frame. Missing patch bases request a fresh snapshot without partially changing the held window; a full replacement remains authoritative. Valid server frames and ordinary subscriptions keep their existing behavior."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No extra daemon interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new option beyond the existing field_deltas opt-in."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reconnect or refetch returns complete rows."
+  }
+}
