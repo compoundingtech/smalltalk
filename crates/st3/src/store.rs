@@ -9986,11 +9986,8 @@ impl Store {
         chunk: usize,
     ) -> Result<usize> {
         // A captured source page shares the transaction's quota with its maintenance clock.
-        let capture_limit = if self.has_agent_collection_source() {
-            128
-        } else {
-            usize::MAX
-        };
+        let captured = self.has_agent_collection_source();
+        let capture_limit = if captured { 128 } else { usize::MAX };
         let chunk = chunk.max(1).min(capture_limit).min(i64::MAX as usize) as i64;
         let max_per_subject_kind = max_per_subject_kind.max(1).min(i64::MAX as usize) as i64;
         let mut deleted = 0;
@@ -10001,9 +9998,9 @@ impl Store {
         // chunk of every pass, even when nothing was due.
         loop {
             let mut connection = self.connection.write();
-            let transaction = connection.transaction()?;
-            let removed = transaction.execute(
-                "DELETE FROM local_observations WHERE id IN (
+            let trim = |connection: &rusqlite::Connection| {
+                connection.execute(
+                    "DELETE FROM local_observations WHERE id IN (
                     SELECT id FROM local_observations AS old
                     WHERE observed_at_unix_ms < ?1
                       AND EXISTS (SELECT 1 FROM local_observations AS newer
@@ -10012,12 +10009,17 @@ impl Store {
                     ORDER BY observed_at_unix_ms
                     LIMIT ?2
                  )",
-                params![
-                    older_than_unix_ms.min(i64::MAX as u128) as i64,
-                    chunk
-                ],
-            )?;
-            transaction.commit()?;
+                    params![older_than_unix_ms.min(i64::MAX as u128) as i64, chunk],
+                )
+            };
+            let removed = if captured {
+                let transaction = connection.transaction()?;
+                let removed = trim(&transaction)?;
+                transaction.commit()?;
+                removed
+            } else {
+                trim(&connection)?
+            };
             drop(connection);
             deleted += removed;
             if (removed as i64) < chunk {
@@ -10041,27 +10043,41 @@ impl Store {
         for (subject, kind) in over_cap {
             loop {
                 let mut connection = self.connection.write();
-                let transaction = connection.transaction()?;
-                // The newest id past the cap: rank `cap + 1` from the newest.
-                let boundary: Option<i64> = transaction
-                    .query_row(
-                        "SELECT id FROM local_observations WHERE subject=?1 AND kind=?2
+                let trim = |connection: &rusqlite::Connection| -> rusqlite::Result<Option<usize>> {
+                    // The newest id past the cap: rank `cap + 1` from the newest.
+                    let boundary: Option<i64> = connection
+                        .query_row(
+                            "SELECT id FROM local_observations WHERE subject=?1 AND kind=?2
                          ORDER BY id DESC LIMIT 1 OFFSET ?3",
-                        params![subject, kind, max_per_subject_kind],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let Some(boundary) = boundary else {
-                    break;
-                };
-                let removed = transaction.execute(
-                    "DELETE FROM local_observations WHERE id IN (
+                            params![subject, kind, max_per_subject_kind],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let Some(boundary) = boundary else {
+                        return Ok(None);
+                    };
+                    let removed = connection.execute(
+                        "DELETE FROM local_observations WHERE id IN (
                         SELECT id FROM local_observations
                         WHERE subject=?1 AND kind=?2 AND id<=?3 ORDER BY id LIMIT ?4
                      )",
-                    params![subject, kind, boundary, chunk],
-                )?;
-                transaction.commit()?;
+                        params![subject, kind, boundary, chunk],
+                    )?;
+                    Ok(Some(removed))
+                };
+                let removed = if captured {
+                    let transaction = connection.transaction()?;
+                    let removed = trim(&transaction)?;
+                    if removed.is_some() {
+                        transaction.commit()?;
+                    }
+                    removed
+                } else {
+                    trim(&connection)?
+                };
+                let Some(removed) = removed else {
+                    break;
+                };
                 drop(connection);
                 deleted += removed;
                 if (removed as i64) < chunk {

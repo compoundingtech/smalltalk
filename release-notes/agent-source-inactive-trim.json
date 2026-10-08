@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep ordinary observation retention on its existing autocommit path",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill or source extraction change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No production schema or trigger change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Retention selections and newest-row protection remain unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only an explicitly enabled agent collection source uses managed bounded trim transactions; ordinary Store retention executes the original SQL in autocommit."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No activation or operator restart is required by this branch correction."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new operator action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Enabled source capture/fencing and rollback remain managed; no raw-gap bypass is introduced for an installed agent source."
+  }
+}
