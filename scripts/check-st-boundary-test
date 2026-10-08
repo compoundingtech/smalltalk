@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 sys.dont_write_bytecode = True
 from st_boundary import fresh_seat_findings, launch_findings
 
@@ -126,6 +127,77 @@ class BoundaryCheck(unittest.TestCase):
             connection.commit()
             self.assertTrue(any("SQLite schema" in error for error in
                                 fresh_seat_findings(self.root, self.processes)))
+
+    def vanish_before_open(self, path):
+        original_open = Path.open
+
+        def open_after_removal(candidate, *args, **kwargs):
+            if candidate == path:
+                candidate.unlink()
+            return original_open(candidate, *args, **kwargs)
+
+        return patch.object(Path, "open", open_after_removal)
+
+    def test_disappearing_sidecar_of_an_inspected_database_is_safe(self):
+        database = self.root / "state/events.sqlite"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE snapshots(body TEXT)")
+            connection.commit()
+        for suffix in ("-wal", "-shm"):
+            with self.subTest(suffix=suffix):
+                sidecar = database.with_name(database.name + suffix)
+                sidecar.write_bytes(b"neutral transient metadata")
+                with self.vanish_before_open(sidecar):
+                    self.assertEqual(list(fresh_seat_findings(self.root, self.processes)), [])
+
+    def test_disappearing_sidecar_preserves_database_and_path_findings(self):
+        database = self.root / "state/st2-events.sqlite"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE snapshots(body TEXT)")
+            connection.execute("INSERT INTO snapshots VALUES ('st2-provider')")
+            connection.commit()
+        sidecar = database.with_name(database.name + "-shm")
+        sidecar.write_bytes(b"neutral transient metadata")
+        with self.vanish_before_open(sidecar):
+            findings = list(fresh_seat_findings(self.root, self.processes))
+        self.assertTrue(any("SQLite record" in error for error in findings))
+        self.assertTrue(any("generated path" in error and "-shm" in error for error in findings))
+
+    def test_disappearing_regular_or_unbound_sidecar_output_fails(self):
+        for name in ("record.json", "unbound-wal", "unbound-shm"):
+            with self.subTest(name=name):
+                output = self.root / "state" / name
+                output.write_text("neutral")
+                with self.vanish_before_open(output), self.assertRaises(FileNotFoundError):
+                    list(fresh_seat_findings(self.root, self.processes))
+
+    def test_sidecar_named_database_is_still_inspected(self):
+        for suffix in ("-wal", "-shm"):
+            with self.subTest(suffix=suffix):
+                database = self.root / "state" / ("records" + suffix)
+                with sqlite3.connect(database) as connection:
+                    connection.execute("CREATE TABLE snapshots(body TEXT)")
+                    connection.execute("INSERT INTO snapshots VALUES ('st2-provider')")
+                    connection.commit()
+                self.assertTrue(any("SQLite record" in error for error in
+                                    fresh_seat_findings(self.root, self.processes)))
+
+    def test_sidecar_inspection_errors_other_than_disappearance_fail(self):
+        database = self.root / "state/events.sqlite"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE snapshots(body TEXT)")
+            connection.commit()
+        sidecar = database.with_name(database.name + "-shm")
+        sidecar.write_bytes(b"neutral transient metadata")
+        original_open = Path.open
+
+        def deny_sidecar(candidate, *args, **kwargs):
+            if candidate == sidecar:
+                raise PermissionError("injected inspection error")
+            return original_open(candidate, *args, **kwargs)
+
+        with patch.object(Path, "open", deny_sidecar), self.assertRaises(PermissionError):
+            list(fresh_seat_findings(self.root, self.processes))
 
     def test_opaque_envelope_does_not_mask_semantic_claims(self):
         database = self.root / "state/claims.sqlite3"
