@@ -410,9 +410,21 @@ fn structured_request(
                 .as_deref()
                 .or(subject.reference.as_deref())
                 .unwrap_or_default();
+            // A document opens in a tab of its own, read from st: the lines of its subject
+            // are the target.
+            let document = subject
+                .reference
+                .as_deref()
+                .filter(|reference| reference.starts_with("doc/") && reference.contains('@'));
+            let from_line = card.lines.len();
+            let label_style = if document.is_some() {
+                theme::strong(theme::ACCENT)
+            } else {
+                theme::text()
+            };
             card.lines(text::wrap(
                 &[
-                    text::run(subject.label.clone(), theme::text()),
+                    text::run(subject.label.clone(), label_style),
                     text::run(format!("  {target}"), theme::dim()),
                 ],
                 inner,
@@ -420,6 +432,17 @@ fn structured_request(
                 &[text::run("   ", theme::dim())],
                 None,
             ));
+            if let Some(reference) = document {
+                let to_line = card.lines.len();
+                for line in from_line..to_line {
+                    card.targets.push(crate::ui::doc::Target {
+                        line,
+                        column: 0,
+                        width: inner as u16,
+                        hit: Hit::Open(reference.to_owned()),
+                    });
+                }
+            }
         }
     }
     card.blank();
@@ -1321,6 +1344,19 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 Hit::Key('g'),
                 theme::OVERLAY1,
             ));
+        }
+        if let AttentionKind::Request {
+            structured: Some(request),
+            ..
+        } = &item.kind
+            && request.subjects.iter().any(|subject| {
+                subject
+                    .reference
+                    .as_deref()
+                    .is_some_and(|reference| reference.starts_with("doc/"))
+            })
+        {
+            buttons.push(("v", "Read the document", Hit::Key('v'), theme::LAVENDER));
         }
         card.buttons(&buttons);
     }

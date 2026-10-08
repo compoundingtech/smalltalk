@@ -156,6 +156,8 @@ enum Fetched {
     Sessions(Collection),
     /// The Fleet tab's machines and paired devices.
     Machines(Collection),
+    /// A document read for a tab: its name and its text, or why it could not be read.
+    Document(String, Result<String, String>),
     /// Token spend over a period of this many hours, or why st could not say.
     Usage(u64, Result<st3_client::UsagePeriod, String>),
     /// The clients connected to this member, or why they could not be read.
@@ -591,6 +593,7 @@ pub fn run(context: Context) -> Result<()> {
                         }
                     }
                 }
+                Fetched::Document(name, outcome) => ui.set_document(name, outcome),
                 Fetched::Said(query, outcome) => {
                     ui.said = Some((query, outcome));
                     changed = true;
@@ -1084,6 +1087,19 @@ pub fn run(context: Context) -> Result<()> {
                     page,
                     took: started.elapsed(),
                 });
+            });
+        }
+        // A document opened in a tab is read once, the first time it is drawn.
+        for name in ui.take_documents_wanted() {
+            let client = client.clone();
+            let tx = fetched_tx.clone();
+            runtime.spawn(async move {
+                let outcome = client
+                    .document_get(&name)
+                    .await
+                    .map(|content| String::from_utf8_lossy(&content.value.bytes).into_owned())
+                    .map_err(|error| error.plain());
+                let _ = tx.send(Fetched::Document(name, outcome));
             });
         }
         for effect in effects {

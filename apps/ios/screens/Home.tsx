@@ -11,6 +11,7 @@ import { attentionActionLabel, attentionKindLabel, blockedLine } from '../presen
 import { missionTitle } from '../missionsView';
 import { useStore } from '../store';
 import { randomName } from '../launcher';
+import { isDocumentName } from '../documents';
 import { theme } from '../theme';
 import { Button, Legend, ListRow, Markdown, Note, Screen, SectionHeader, T } from '../ui';
 import type { RootScreen } from '../navigation';
@@ -185,6 +186,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
 type Structured = NonNullable<Parameters<ReturnType<typeof useStore>['actions']['done']>[0]['request']>;
 function StructuredRequestView({ item, request, from, onAnswered }: { item: Parameters<ReturnType<typeof useStore>['actions']['done']>[0]; request: Structured; from: string; onAnswered: () => void }) {
   const { busy, status, actions } = useStore();
+  const navigation = useNavigation<NativeStackNavigationProp<RootParams>>();
   const disabled = busy || status !== 'online';
   const label = (id: string) => request.answers?.find(answer => answer.id === id)?.label ?? id;
   const send = (answer: { id: string; label: string; outcome?: string | null }) => answer.outcome === 'request_changes'
@@ -202,7 +204,9 @@ function StructuredRequestView({ item, request, from, onAnswered }: { item: Para
     {request.reasons?.length ? <View style={{ gap: 2 }}>{request.reasons.map((reason, index) => <T key={index}><T color={theme.lavender}>•  </T>{reason}</T>)}</View> : null}
     {request.subjects?.map((subject, index) => subject.url
       ? <Pressable key={index} onPress={() => void Linking.openURL(subject.url!)}><T color={theme.accent}>↗ {subject.label}</T></Pressable>
-      : <T key={index} dim>↗ {subject.label}  {subject.ref ?? ''}</T>)}
+      : isDocumentName(subject.ref)
+        ? <Pressable key={index} onPress={() => navigation.navigate('Document', { name: subject.ref! })}><T color={theme.accent}>▤ {subject.label}  <T dim>read it</T></T></Pressable>
+        : <T key={index} dim>↗ {subject.label}  {subject.ref ?? ''}</T>)}
     <T bold color={theme.person}>{from} is waiting on you.</T>
     {request.answers?.map(answer => <Pressable key={answer.id} disabled={disabled} onPress={() => send(answer)}
       style={{ borderLeftWidth: 2, borderLeftColor: request.recommendation?.answer === answer.id ? theme.green : theme.surface1, paddingLeft: 8, paddingVertical: 4, opacity: disabled ? 0.5 : 1 }}>

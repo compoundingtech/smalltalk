@@ -24,6 +24,8 @@ pub enum Pane {
     /// Token spend: one group's (`agent/…`, `mission/…`, `model/…` as the Usage list names
     /// them), or the whole period's.
     Usage(Option<String>),
+    /// An st document, read and drawn as markdown: `doc/NAME@HASH`.
+    Document(String),
     /// The new mission form.
     NewMission,
 }
@@ -43,6 +45,7 @@ impl Pane {
             Pane::Machine(subject) => with("machine", subject),
             Pane::Worktree(subject) => with("worktree", subject),
             Pane::Usage(subject) => with("usage", subject),
+            Pane::Document(name) => format!("document:{name}"),
             Pane::NewMission => "new-mission:".into(),
         }
     }
@@ -65,6 +68,7 @@ impl Pane {
             "machine" => Pane::Machine(subject),
             "worktree" => Pane::Worktree(subject),
             "usage" => Pane::Usage(subject),
+            "document" => Pane::Document(subject?),
             "new-mission" => Pane::NewMission,
             _ => return None,
         })
@@ -103,6 +107,7 @@ mod tests {
         assert_eq!(Pane::List(1).key(), "list:agents");
         assert_eq!(Pane::parse("list:nowhere"), None);
         assert_eq!(Pane::parse("terminal:"), None, "a terminal needs its agent");
+        assert_eq!(Pane::parse("document:"), None, "a document needs its name");
         assert_eq!(Pane::parse("a later kind:subject"), None);
         // The new-agent form is gone; a stored tab for it is dropped like any unknown kind.
         assert_eq!(Pane::parse("new-agent:"), None);

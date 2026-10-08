@@ -2186,6 +2186,13 @@ impl Ui {
                     .unwrap_or(id)
             }
             Pane::Machine(id) => find(id).trim_start_matches("machine/").to_owned(),
+            // A document is named by its last name part, without the hash.
+            Pane::Document(name) => name
+                .split('@')
+                .next()
+                .and_then(|name| name.rsplit('/').next())
+                .unwrap_or(name)
+                .to_owned(),
             Pane::Usage(None) => "Usage".into(),
             Pane::Usage(Some(id)) => format!("Usage · {}", super::usage::label(&self.world, id)),
             other => other.key(),
@@ -3824,6 +3831,8 @@ pub(crate) fn pane_for(id: &str) -> Option<Pane> {
         Some(Pane::Agent(Some(id)))
     } else if id.starts_with("machine/") {
         Some(Pane::Machine(Some(id)))
+    } else if id.starts_with("doc/") && id.contains('@') {
+        Some(Pane::Document(id))
     } else {
         None
     }
@@ -4040,6 +4049,78 @@ mod tests {
             draft_before,
             "nothing is typed into the draft of a tab that is not shown"
         );
+    }
+
+    #[test]
+    fn a_documents_subject_opens_as_a_tab_that_reads_and_draws_it() {
+        // Nathan, 2026-10-07: "I can't read this document from this screen."
+        const NAME: &str = "doc/fleet/example/proposal@0123456789abcdef";
+        let mut world = demo::world();
+        let request = st3_client::StructuredRequest {
+            version: 1,
+            entry_type: "decision".into(),
+            question: "Build it?".into(),
+            why_person: "Only you decide.".into(),
+            subjects: vec![st3_client::RequestSubject {
+                kind: "document".into(),
+                label: "The proposal".into(),
+                reference: Some(NAME.into()),
+                ..Default::default()
+            }],
+            answers: vec![st3_client::RequestAnswerOption {
+                id: "yes".into(),
+                label: "Yes".into(),
+                consequence: "Built.".into(),
+                outcome: Some("accept".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let item = Attention {
+            id: "attention/proposal".into(),
+            tier: Tier::Stopped,
+            title: "Proposal".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: None,
+            agent: Some("agent/example/cos".into()),
+            kind: AttentionKind::Request {
+                from: "Chief of Staff".into(),
+                from_id: "agent/example/cos".into(),
+                question: request.question.clone(),
+                structured: Some(Box::new(request)),
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+            blocked: None,
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.glasses = Some(Glasses::open(None, None));
+        ui.live = true;
+        ui.open_home();
+        let at = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/proposal")
+            .unwrap();
+        ui.select(at);
+        press(&mut ui, KeyCode::Char('v'), KeyModifiers::NONE);
+        ui.close_home();
+        // The tab shows it is reading, asks once, and then draws the markdown.
+        assert!(screen(&ui).contains("Reading the document"), "{}", screen(&ui));
+        assert_eq!(ui.take_documents_wanted().into_iter().collect::<Vec<_>>(), [NAME]);
+        screen(&ui);
+        assert!(ui.take_documents_wanted().is_empty(), "asked once");
+        ui.set_document(NAME.into(), Ok("# Resource sidebar\n\nFolders for **new** users.".into()));
+        let shown = screen(&ui);
+        assert!(shown.contains("Resource sidebar") && shown.contains("Folders for new users"), "{shown}");
+        ui.set_document(NAME.into(), Err("not found".into()));
+        assert!(screen(&ui).contains("Could not read it: not found"));
     }
 
     #[test]
