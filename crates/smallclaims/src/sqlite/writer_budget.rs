@@ -77,10 +77,26 @@ pub struct BudgetCommit<T> {
     pub writer_reusable: bool,
 }
 
+enum Clock {
+    Live(Instant),
+    #[cfg(test)]
+    Controlled(Arc<AtomicU64>),
+}
+
+impl Clock {
+    fn elapsed(&self) -> Duration {
+        match self {
+            Self::Live(started) => started.elapsed(),
+            #[cfg(test)]
+            Self::Controlled(nanos) => Duration::from_nanos(nanos.load(Ordering::Relaxed)),
+        }
+    }
+}
+
 struct Running {
     instructions: AtomicU64,
     interrupted: AtomicBool,
-    started: Instant,
+    started: Clock,
     callback_panic: Mutex<Option<String>>,
 }
 
@@ -135,6 +151,15 @@ impl WriterGuard<'_> {
         budget: WriterBudget,
         work: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<BudgetCommit<T>> {
+        self.budgeted_transaction_inner(budget, work, Clock::Live(Instant::now()))
+    }
+
+    fn budgeted_transaction_inner<T>(
+        &mut self,
+        budget: WriterBudget,
+        work: impl FnOnce(&Transaction<'_>) -> Result<T>,
+        clock: Clock,
+    ) -> Result<BudgetCommit<T>> {
         let policy = self
             .handler_policy
             .lock()
@@ -158,7 +183,7 @@ impl WriterGuard<'_> {
         let running = Arc::new(Running {
             instructions: AtomicU64::new(0),
             interrupted: AtomicBool::new(false),
-            started: Instant::now(),
+            started: clock,
             callback_panic: Mutex::new(None),
         });
         if let Err(error) = self.busy_timeout(Duration::ZERO) {
@@ -216,7 +241,19 @@ impl WriterGuard<'_> {
             let transaction =
                 self.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let value = work(&transaction)?;
-            transaction.commit()?;
+            transaction.commit_checked(|| {
+                if running.started.elapsed() >= budget.elapsed
+                    || running.instructions.load(Ordering::Relaxed) >= budget.vm_steps
+                {
+                    running.interrupted.store(true, Ordering::Relaxed);
+                    return Err(crate::error::Error::new(
+                        "writer-budget-exhausted",
+                        "managed transaction exceeded its budget before COMMIT",
+                    )
+                    .into());
+                }
+                Ok(())
+            })?;
             Ok(value)
         }));
         // Rust transaction drop normally rolled back already. Remove only OUR callback for
@@ -744,9 +781,74 @@ mod tests {
     }
 
     #[test]
-    fn success_after_cooperative_deadline_is_a_retained_commit_not_cancellation() {
+    fn known_expired_rust_work_and_finalizer_refuse_before_commit() {
+        for expire_finalizer in [false, true] {
+            let clock = Arc::new(AtomicU64::new(0));
+            let writer = WriterConnection::new_with_handler_policy(
+                connection(None),
+                Arc::new(AtomicU64::new(0)),
+                OwnedHandlerPolicy {
+                    busy: OwnedBusyPolicy::Timeout(Duration::ZERO),
+                    progress: None,
+                },
+            )
+            .unwrap();
+            if expire_finalizer {
+                let finalizer_clock = clock.clone();
+                writer
+                    .install_transaction_hooks(
+                        |_| Ok(()),
+                        move |_| {
+                            finalizer_clock.store(5_000_000, Ordering::Relaxed);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+            }
+            let mut guard = writer.write();
+            let error = match guard.budgeted_transaction_inner(
+                WriterBudget {
+                    vm_steps: 1_000_000,
+                    elapsed: Duration::from_millis(1),
+                    callback_interval: 1_000_000,
+                },
+                |tx| {
+                    tx.execute("INSERT INTO source VALUES(1,'uncommitted')", [])?;
+                    if !expire_finalizer {
+                        clock.store(5_000_000, Ordering::Relaxed);
+                    }
+                    Ok(())
+                },
+                Clock::Controlled(clock.clone()),
+            ) {
+                Ok(_) => panic!("known expired Rust work committed"),
+                Err(error) => error,
+            };
+            assert_eq!(crate::error::typed(error).code, "writer-budget-exhausted");
+            assert!(guard.is_autocommit());
+            assert_eq!(
+                guard
+                    .query_row("SELECT COUNT(*) FROM source", [], |row| row
+                        .get::<_, u64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn success_after_actual_commit_is_retained_not_retroactively_cancelled() {
+        let clock = Arc::new(AtomicU64::new(0));
+        let advance = clock.clone();
+        let connection = connection(None);
+        // This real SQLite hook runs after the explicit pre-COMMIT check. The controlled
+        // clock avoids shared-runner timing as an oracle; the SQL commit/row proof is real.
+        connection.commit_hook(Some(move || {
+            advance.store(5_000_000, Ordering::Relaxed);
+            false
+        }));
         let writer = WriterConnection::new_with_handler_policy(
-            connection(None),
+            connection,
             Arc::new(AtomicU64::new(0)),
             OwnedHandlerPolicy {
                 busy: OwnedBusyPolicy::Timeout(Duration::ZERO),
@@ -755,10 +857,8 @@ mod tests {
         )
         .unwrap();
         let mut guard = writer.write();
-        // A cooperative SQL callback is not a timer that can retroactively cancel COMMIT.
-        // Deliberately avoid a progress callback with this tiny transaction and large interval.
         let committed = guard
-            .budgeted_transaction(
+            .budgeted_transaction_inner(
                 WriterBudget {
                     vm_steps: 1_000_000,
                     elapsed: Duration::from_millis(1),
@@ -766,13 +866,14 @@ mod tests {
                 },
                 |tx| {
                     tx.execute("INSERT INTO source VALUES(1,'durable')", [])?;
-                    std::thread::sleep(Duration::from_millis(5));
                     Ok("accepted")
                 },
+                Clock::Controlled(clock),
             )
             .unwrap();
         assert_eq!(committed.value, "accepted");
-        assert!(committed.work.elapsed >= Duration::from_millis(5));
+        assert_eq!(committed.work.elapsed, Duration::from_millis(5));
+        assert!(committed.writer_reusable);
         drop(guard);
         assert_eq!(
             writer
