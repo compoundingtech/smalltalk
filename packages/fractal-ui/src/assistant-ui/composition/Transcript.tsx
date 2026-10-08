@@ -18,7 +18,8 @@ import { surfaceVars as surface, textVars as ink, borderVars as border, accentVa
 
 export interface TranscriptTurn {
   readonly id: string
-  readonly prompt: TextItem & { readonly role: 'user' }
+  /** Omitted when the visible history starts mid-turn or has assistant-only output. */
+  readonly prompt?: TextItem & { readonly role: 'user' }
   /** Exact runtime source references. The host owns turn/participant boundaries. */
   readonly items: readonly ConversationItem[]
   readonly work: WorkLogTurn
@@ -77,7 +78,7 @@ export function ToolDetailPreview({ call, onOpen }: { readonly call: WorkLogCall
 const PreparedTurn = React.memo(function PreparedTurn({ turn, onOpenTool, onRetryRun }: { turn: TranscriptTurn; onOpenTool: TranscriptProps['onOpenTool']; onRetryRun?: () => void }) {
   const detail = React.useCallback((call: WorkLogCall) => <ToolDetailPreview call={call} onOpen={onOpenTool} />, [onOpenTool])
   return <section data-testid="transcript-turn" data-item-id={turn.id} {...stylex.props(styles.turn)}>
-    <ThreadPrimitive.Unstable_MessageById messageId={turn.prompt.id} components={messageComponents} />
+    {turn.prompt !== undefined && <ThreadPrimitive.Unstable_MessageById messageId={turn.prompt.id} components={messageComponents} />}
     <WorkLogV1 turn={turn.work} ariaLabel={`Work log ${turn.id}`} listStyle={styles.workList} renderCallDetail={detail} previewCallDetail={!turn.work.running} hideLiveRow onRetry={onRetryRun} onOpenOutput={onOpenTool} expandedBody={turn.items.filter(item => item._tag === 'Reasoning').map(item => <ThinkingEntry key={item.id} text={item.text} streaming={item.streaming} />)} />
     {turn.items.filter(item => item._tag !== 'ToolCall' && item._tag !== 'Reasoning').map(item => <SenderCaption.Provider key={item.id} value={turn.senderCaptions?.[item.id]}><ThreadPrimitive.Unstable_MessageById messageId={item.id} components={messageComponents} /></SenderCaption.Provider>)}
     {turn.work.running && <div data-testid="live-work" role="status" aria-label="Response in progress" {...stylex.props(styles.liveActivity)}><span aria-hidden="true">◌</span></div>}
@@ -88,7 +89,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
   const messages = useAuiState(state => state.thread.messages)
   const committed = React.useMemo(() => {
     const ids = new Set(messages.map(message => message.id))
-    return turns.filter(turn => ids.has(turn.prompt.id) && turn.items.every(item => ids.has(item.id)))
+    return turns.filter(turn => (turn.prompt === undefined || ids.has(turn.prompt.id)) && turn.items.every(item => ids.has(item.id)))
   }, [messages, turns])
   const running = [...committed].reverse().find(turn => turn.work.running)
   const progress = sync._tag === 'Progress' && sync.stage === 'reading' && sync.done !== undefined && sync.total !== undefined ? sync : undefined
