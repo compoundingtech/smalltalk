@@ -4,7 +4,19 @@ import { Button, Link, Tooltip, TooltipTrigger, VisuallyHidden } from 'react-ari
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import type { Components, ExtraProps } from 'react-markdown'
 import type { Root, RootContent as SyntaxNode } from 'hast'
-import type { Syntax } from 'refractor/core'
+import { refractor } from 'refractor/core'
+import typescript from 'refractor/typescript'
+import tsx from 'refractor/tsx'
+import javascript from 'refractor/javascript'
+import json from 'refractor/json'
+import bash from 'refractor/bash'
+import diff from 'refractor/diff'
+import rust from 'refractor/rust'
+import nix from 'refractor/nix'
+import python from 'refractor/python'
+import yaml from 'refractor/yaml'
+import markdown from 'refractor/markdown'
+import css from 'refractor/css'
 import remarkGfm from 'remark-gfm'
 import { surfaceVars as surface, textVars as textColor, borderVars as border, accentVars as accent, statusVars as status, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
 
@@ -91,34 +103,13 @@ function InlineCode({ children }: React.ComponentProps<'code'>) {
   return rendered === undefined ? <code {...stylex.props(styles.inlineCode)}>{children}</code> : rendered
 }
 
-const languageLoaders = {
-  typescript: () => import('refractor/typescript'),
-  tsx: () => import('refractor/tsx'),
-  javascript: () => import('refractor/javascript'),
-  json: () => import('refractor/json'),
-  bash: () => import('refractor/bash'),
-  diff: () => import('refractor/diff'),
-  rust: () => import('refractor/rust'),
-  nix: () => import('refractor/nix'),
-  python: () => import('refractor/python'),
-  yaml: () => import('refractor/yaml'),
-  markdown: () => import('refractor/markdown'),
-  css: () => import('refractor/css'),
-} satisfies Record<string, () => Promise<{ default: Syntax }>>
-const languageAliases: Readonly<Record<string, keyof typeof languageLoaders>> = {
+// Eager, fixed package grammars: authored fences never trigger a module request.
+const grammars = { typescript, tsx, javascript, json, bash, diff, rust, nix, python, yaml, markdown, css }
+for (const grammar of Object.values(grammars)) refractor.register(grammar)
+const languageAliases: Readonly<Record<string, keyof typeof grammars>> = {
   ts: 'typescript', js: 'javascript', sh: 'bash', shell: 'bash', shellscript: 'bash',
   rs: 'rust', py: 'python', yml: 'yaml', md: 'markdown',
 }
-const highlighters: Readonly<Record<string, React.LazyExoticComponent<React.ComponentType<{ code: string }>>>> = Object.fromEntries(
-  Object.entries(languageLoaders).map(([language, load]) => [language, React.lazy(async () => {
-    const [{ refractor }, grammar] = await Promise.all([import('refractor/core'), load()])
-    refractor.register(grammar.default)
-    return { default: function HighlightedCode({ code }: { code: string }) {
-      const nodes = React.useMemo(() => refractor.highlight(code, language).children, [code])
-      return <>{nodes.map((node, index) => <SyntaxToken key={index} node={node} />)}</>
-    } }
-  })]),
-)
 
 function SyntaxToken({ node }: { node: SyntaxNode }): React.ReactNode {
   if (node.type === 'text') return node.value
@@ -137,8 +128,8 @@ function SyntaxToken({ node }: { node: SyntaxNode }): React.ReactNode {
 export function HighlightedSource({ code, language }: { code: string; language: string }) {
   const normalized = language.toLowerCase()
   const canonical = Object.hasOwn(languageAliases, normalized) ? languageAliases[normalized]! : normalized
-  const Highlighter = Object.hasOwn(highlighters, canonical) ? highlighters[canonical] : undefined
-  return Highlighter === undefined ? code : <React.Suspense fallback={code}><Highlighter code={code} /></React.Suspense>
+  const nodes = React.useMemo(() => Object.hasOwn(grammars, canonical) ? refractor.highlight(code, canonical).children : undefined, [code, canonical])
+  return nodes === undefined ? code : <>{nodes.map((node, index) => <SyntaxToken key={index} node={node} />)}</>
 }
 
 type CopyState = { tag: 'ready' } | { tag: 'copying' } | { tag: 'copied'; code: string } | { tag: 'failed' }
