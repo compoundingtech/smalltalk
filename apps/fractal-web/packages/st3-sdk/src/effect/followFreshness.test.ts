@@ -718,39 +718,6 @@ describe('follow freshness', () => {
       }),
     ))
 
-  it('numbers conversation subscriptions so a later replace page is distinguishable', () =>
-    run({ maxFollows: 4 }, (gateway) =>
-      Effect.gen(function* () {
-        const st3 = yield* St3
-        const ref = 'agent/serial'
-        const follow = yield* mountConversation(ref)
-        const page = () =>
-          gateway.send({
-            kind: 'conversation', id: gateway.conversationId(ref), collection: 'conversation',
-            session_id: 'session/1', replace: true, has_more: false, items: [],
-          })
-        page()
-        yield* settle
-        expect(follow.events.at(-1)).toMatchObject({
-          _tag: 'Observed',
-          value: { id: gateway.conversationId(ref), subscription: 1 },
-        })
-        expect(st3.subscribeSerial({ _tag: 'Conversation', ref })).toBe(1)
-        // The socket drops; the reopen resubscribes under a fresh serial.
-        gateway.end()
-        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(500))
-        yield* settle
-        expect(st3.subscribeSerial({ _tag: 'Conversation', ref })).toBe(2)
-        page()
-        yield* settle
-        expect(follow.events.at(-1)).toMatchObject({
-          _tag: 'Observed',
-          value: { subscription: 2 },
-        })
-        yield* follow.interrupt
-      }),
-    ))
-
   it('binds a conversation chunk to the subscribe generation that delivered it', () =>
     run({ maxFollows: 4 }, (gateway) =>
       Effect.gen(function* () {
@@ -783,33 +750,17 @@ describe('follow freshness', () => {
         // The superseded subscription is released, so the gateway stops its follower.
         expect(gateway.unsubscribed()).toContain(reopened)
         // A page the reopened subscription read before the retry replaced it arrives late:
-        // it must never claim the newer generation's serial.
+        // it must never be routed as a chunk of the newer subscription.
         page(reopened)
         yield* settle
-        expect(
-          follow.events.filter((event) => event._tag === 'Observed' && event.value.subscription === 3),
-        ).toEqual([])
+        expect(follow.events.filter((event) => event._tag === 'Observed')).toEqual([])
         page(current)
         yield* settle
         expect(follow.events.at(-1)).toMatchObject({
           _tag: 'Observed',
-          value: { id: current, subscription: 3 },
+          value: { id: current },
         })
         yield* follow.interrupt
-      }),
-    ))
-
-  it('forgets a follow subscribe serial when its run ends', () =>
-    run({ maxFollows: 4 }, () =>
-      Effect.gen(function* () {
-        const st3 = yield* St3
-        const ref = 'agent/serial-end'
-        const follow = yield* mountConversation(ref)
-        yield* settle
-        expect(st3.subscribeSerial({ _tag: 'Conversation', ref })).toBe(1)
-        yield* follow.interrupt
-        yield* settle
-        expect(st3.subscribeSerial({ _tag: 'Conversation', ref })).toBeUndefined()
       }),
     ))
 })

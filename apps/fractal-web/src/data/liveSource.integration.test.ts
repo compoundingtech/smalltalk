@@ -756,7 +756,7 @@ describe('optimistic conversation sends', () => {
     ),
   )
 
-  it.live('retires a settled send when a fresh subscription replaces the window without it', () =>
+  it.live('keeps a confirmed send Sent when a later subscription page lacks its echo, until the echo arrives', () =>
     withGateway((live, gateway) =>
       Effect.gen(function* () {
         live.registry.mount(live.source.conversationInterest!(agent.id))
@@ -781,16 +781,26 @@ describe('optimistic conversation sends', () => {
           replace: true, has_more: false, items: [],
         })
         yield* settle
-        // The first page of a subscription opened after completion is authoritative for
-        // the window: an identity it does not contain retires the settled outbox row.
+        // A later page may still precede owner-side replication of the confirmed send.
         expect(live.registry.get(conversation)).toMatchObject({
-          _tag: 'Observed', value: { items: [] },
+          _tag: 'Observed', value: { items: [
+            { _tag: 'Text', text: 'hello', sendState: { _tag: 'Sent' } },
+          ] },
         })
+        yield* Effect.promise(() => gateway.nextAction())
+        gateway.mailEcho()
+        yield* settle
+        const feed = live.registry.get(conversation)
+        expect(feed).toMatchObject({ _tag: 'Observed' })
+        if (feed._tag !== 'Observed') return
+        expect(feed.value.items.filter((item) => item._tag === 'Text')).toEqual([
+          expect.objectContaining({ id: 'timeline-entry/echo/content', text: 'hello' }),
+        ])
       }),
     ),
   )
 
-  it.live('keeps a settled send whose replace page predates its completion', () =>
+  it.live('keeps a confirmed send Sent when its current subscription page lacks its echo', () =>
     withGateway((live, gateway) =>
       Effect.gen(function* () {
         live.registry.mount(live.source.conversationInterest!(agent.id))
@@ -800,7 +810,7 @@ describe('optimistic conversation sends', () => {
         gateway.sendGate = Promise.resolve()
         yield* Effect.promise(() => live.source.attachments!.send(request))
         yield* settle
-        // Same subscription the row settled under: the page may lag the send, so the row stays.
+        // An empty page is not proof that the completed send is visible to the session owner.
         gateway.send({
           kind: 'conversation', id: gateway.subscription('conversation').id,
           collection: 'conversation', session_id: 'session/example',
@@ -816,15 +826,15 @@ describe('optimistic conversation sends', () => {
     ),
   )
 
-  it.live('retires a send that settles after its follow was evicted on the next fresh window', () =>
+  it.live('keeps a send that settles after follow eviction Sent on a later window without its echo', () =>
     withGateway((live, gateway) =>
       Effect.gen(function* () {
         const unmountInterest = live.registry.mount(live.source.conversationInterest!(agent.id))
         const conversation = live.source.conversation(agent.id)
         const unmountConversation = live.registry.mount(conversation)
         yield* settle
-        let resolvePost!: () => void
-        gateway.sendGate = new Promise<void>((resolve) => { resolvePost = resolve })
+        const post = Promise.withResolvers<void>()
+        gateway.sendGate = post.promise
         const sending = live.source.attachments!.send(request)
         yield* Effect.promise(() => gateway.nextAction())
         // The reader leaves while the POST is in flight; two more conversations exceed the
@@ -836,14 +846,13 @@ describe('optimistic conversation sends', () => {
         const unmountThirdInterest = live.registry.mount(live.source.conversationInterest!('agent/third'))
         const unmountThird = live.registry.mount(live.source.conversation('agent/third'))
         yield* settle
-        resolvePost()
+        post.resolve()
         expect((yield* Effect.promise(() => sending))._tag).toBe('Success')
         unmountOther()
         unmountOtherInterest()
         unmountThird()
         unmountThirdInterest()
-        // Returning mounts a subscription opened after completion; its first window is
-        // authoritative, retires the outbox row, and reports the whole page as changed.
+        // Returning opens a new follow, but its page still cannot prove send visibility.
         live.registry.mount(live.source.conversationInterest!(agent.id))
         live.registry.mount(conversation)
         yield* settle
@@ -860,7 +869,10 @@ describe('optimistic conversation sends', () => {
         yield* settle
         expect(live.registry.get(conversation)).toMatchObject({
           _tag: 'Observed', value: {
-            items: [{ _tag: 'Text', id: 'timeline-entry/resumed/content', text: 'resumed' }],
+            items: [
+              { _tag: 'Text', id: 'timeline-entry/resumed/content', text: 'resumed' },
+              { _tag: 'Text', text: 'hello', sendState: { _tag: 'Sent' } },
+            ],
             change: { index: 0 },
           },
         })
