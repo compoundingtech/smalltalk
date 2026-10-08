@@ -1563,6 +1563,8 @@ the conversation collection socket.
 Agent-card discovery also includes undeclared seats observed only through a current
 register in history. Sparse activity after an ended or indeterminate observation does
 not revive its former permission ask; a new explicit permission observation may block again.
+Declared cards retain their declaration revision; undeclared cards retain their canonical
+graph revision when one exists, with a register revision only for register-only seats.
 Todo phases map `name`/`tasks` to the header's `phase`/`items`; the existing todo projection's
 session/incarnation `stale` fence prevents an old binding from overriding transcript data.
 Each field retains its source observation time (falling back to acceptance time), with

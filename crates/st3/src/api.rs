@@ -19312,7 +19312,7 @@ mission "planned/direct" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let store = state(root.path()).store;
         let subject = "agent/diagnostic-run/sig.base";
-        store
+        let observed = store
             .append_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "harness.observed".into(),
@@ -19338,6 +19338,7 @@ mission "planned/direct" state="ready" {
         let agent = history.iter().find(|agent| agent["id"] == subject).unwrap();
         assert_eq!(agent["operational"]["layer"], "history");
         assert_eq!(agent["operational"]["reasons"], json!(["undeclared"]));
+        assert_eq!(agent["revision"], observed.id);
     }
 
     #[test]

@@ -1028,11 +1028,23 @@ fn subject_status_at_with_mode(
             let claims = if desired.is_some() {
                 Vec::new()
             } else {
-                connection.prepare_cached(&current_canonical_sql(
+                let graph = connection.prepare_cached(&canonical_sql(
                     "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2
                      ORDER BY CANONICAL_DESC(claims) LIMIT 1",
                 ))?.query_row(params![subject, at_index.unwrap_or(i64::MAX as u64)], |row| row.get::<_, String>(0))
-                    .optional()?.into_iter().collect()
+                    .optional()?;
+                // Match the full reducer's canonical claim revision whenever graph evidence
+                // exists. Registers supply a fallback only for seats with no graph claims.
+                let revision = if graph.is_some() {
+                    graph
+                } else {
+                    connection.prepare_cached(&current_canonical_sql(
+                        "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2
+                         ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                    ))?.query_row(params![subject, at_index.unwrap_or(i64::MAX as u64)], |row| row.get::<_, String>(0))
+                        .optional()?
+                };
+                revision.into_iter().collect()
             };
             (None, claims, Vec::new())
         }
