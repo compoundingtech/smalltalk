@@ -320,6 +320,25 @@ malformed operation metadata, an operation conflict, and `incremental-error:CODE
 incremental chunks produce no fallback log. The target is the admitted index observed at entry;
 a full replay can also include claims admitted since that observation.
 
+### Startup phase durations
+
+Every successful daemon start emits one structured stderr line when both listeners are ready:
+`st3: startup phases {"configuration_ms":...,"install_hooks_ms":...,"open_store_ms":...,...,"total_ms":...}`.
+The service journal captures this line without enabling profiling. Durations use a monotonic
+clock and milliseconds; `total_ms` starts at entry to daemon initialization, not process execution.
+Failed starts that never reach listener readiness do not emit this summary.
+
+The phase keys partition that interval: `configuration_ms`, `install_hooks_ms`,
+`open_store_ms`, `judge_claims_ms`, `validate_replication_backlog_ms`,
+`apply_replication_repairs_ms`, `settlement_projection_ms`, `runtime_prelude_ms`,
+`login_environment_ms`, `isolation_pty_ms`, `recorder_ms`, `app_state_ms`,
+`reconciler_ms`, `background_tasks_ms`, and `bind_ms`. Configuration includes identity and
+instance-lock setup; hooks include profiler initialization and the file-descriptor limit.
+Opening the store includes signing-key setup. Settlement and projection share one interval;
+the runtime prelude includes the startup claim, notification state, and PTY directory.
+Binding ends at the second listener's readiness callback. The summary adds no per-request
+instrumentation and is not repeated for projection chunks or readiness progress updates.
+
 ## Initial targeted mailbox wake comparison (2026-10-05)
 
 This comparison measured the initial implementation at `d9bcabb9b619895a73809038f2e429d599a580cd`
