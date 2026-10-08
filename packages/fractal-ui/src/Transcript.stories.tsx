@@ -41,7 +41,7 @@ const cases: Readonly<Record<State, TranscriptStoryData>> = {
   settled: fixture('settled', 'settled'), expanded: fixture('expanded', 'expanded'), streaming: fixture('streaming', 'streaming'), failed: fixture('failed', 'failed'), interrupted: fixture('interrupted', 'interrupted'), unknown: fixture('unknown', 'unknown'), loading: fixture('loading', 'loading'), 'catching-up': fixture('catching-up', 'catching-up'), reconnecting: fixture('reconnecting', 'reconnecting'), 'sync-failed': fixture('sync-failed', 'sync-failed'), 'pending-send': fixture('pending-send', 'pending-send'), 'failed-send': fixture('failed-send', 'failed-send'), empty: fixture('empty', 'empty'),
 }
 function RuntimeTranscript({ data, onOpenTool, onRetry, onRetrySend, availability, history, emptyState }: { data: TranscriptStoryData; onOpenTool: (call: WorkLogCall) => void; onRetry: () => void; onRetrySend?: (itemId: string) => void; availability?: TranscriptAvailability; history?: TranscriptHistory; emptyState?: React.ReactNode | TranscriptEmptyState }) {
-  const messages = React.useMemo(() => data.turns.flatMap(turn => [turn.prompt, ...turn.items]), [data])
+  const messages = React.useMemo(() => data.turns.flatMap(turn => turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]), [data])
   const options = React.useMemo(() => ({ messages, isRunning: data.turns.some(turn => turn.work.running), onNew: async () => {} }), [messages, data])
   return <EmbraceRuntimeProvider options={options}><Transcript title="Row projection" turns={data.turns} sync={data.sync} now={now} observedAt={now - 8000} onOpenTool={onOpenTool} onRetryRun={onRetry} onRetrySync={onRetry} onRetrySend={onRetrySend} availability={availability} history={history} emptyState={emptyState} /></EmbraceRuntimeProvider>
 }
@@ -253,6 +253,20 @@ export const FailedRetry: Story = { name: 'Failed → Retry', render: args => <F
   await expect(canvasElement.querySelector(selector)).toBe(row)
 } }
 export const FailedRetryLight: Story = { ...FailedRetry, args: { scheme: 'light' } }
+
+const promptlessData: TranscriptStoryData = {
+  sync: { _tag: 'Live' },
+  turns: fixture('settled', 'promptless').turns.map(({ prompt, ...turn }) => turn),
+}
+export const MidTurnHistory: Story = { render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><RuntimeTranscript data={promptlessData} onOpenTool={() => {}} onRetry={() => {}} history={{ _tag: 'HasOlder' }} /></main>, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  await expect(await canvas.findByTestId('history-boundary')).toHaveTextContent('Earlier messages not loaded')
+  await expect(await canvas.findByTestId('agent-message')).toHaveTextContent('The row projection now keeps')
+  await expect(canvas.queryByTestId('user-message')).toBeNull()
+  await expect(canvasElement.querySelectorAll('[data-testid="transcript-turn"]')).toHaveLength(1)
+  await expect(canvas.getByTestId('history-boundary').compareDocumentPosition(canvas.getByTestId('transcript-turn')) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+} }
+export const MidTurnHistoryLight: Story = { ...MidTurnHistory, args: { scheme: 'light' } }
 const semanticItems: readonly ConversationItem[] = [
   { _tag: 'Text', id: 'semantic/system', role: 'system', text: 'System context retained.', attachments: [], streaming: false, at },
   { _tag: 'Notice', id: 'semantic/notice', kind: 'redaction', text: 'Notice content retained.', at },
