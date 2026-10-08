@@ -72,6 +72,7 @@ const lifecycleOf = (row: St3.Agent): Agent['lifecycle'] => {
     case 'owner': return { _tag: 'Owner' }
     case 'bounded': return { _tag: 'Bounded' }
     case undefined: return unknown
+    default: return unknown
   }
 }
 

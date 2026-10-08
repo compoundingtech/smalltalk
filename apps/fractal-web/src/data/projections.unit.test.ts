@@ -1,8 +1,10 @@
-import { Agent, AgentId, Revision, decodeUnknownSync, type AgentEncoded } from '@smalltalk/st3-client/schema'
+import { Agent, AgentId, Resource, Revision, decodeUnknownSync, type AgentEncoded } from '@smalltalk/st3-client/schema'
 import { expect, test } from 'vitest'
 
 import { fixtureAttention, fixtureMissions } from '../missions/fixtures.ts'
 import { createProjections, fleetFromAgents, terminalSubjectForAgent } from './projections.ts'
+
+const decodeRosterResource = decodeUnknownSync(Resource)
 
 test.each([
   { state: 'running', harness_state: 'idle', blocked_on: null, fault: null, activity: 'idle' },
@@ -84,7 +86,7 @@ test.each([
   { name: 'Absent declaration', declaration: {}, expected: 'Unknown' },
   { name: 'Standing maintenance agent', declaration: {}, expected: 'Unknown' },
 ] as const)('roster lifecycle decodes $name as $expected', ({ name, declaration, expected }) => {
-  const decoded = decodeUnknownSync(Agent, 'strict')({
+  const decoded = decodeRosterResource({
     kind: 'agent',
     id: 'agent/lifecycle',
     name,
@@ -95,14 +97,27 @@ test.each([
     updated_at: '2026-10-04T12:00:00.000Z',
     ...declaration,
   } satisfies AgentEncoded)
+  if (decoded.kind !== 'agent') throw new TypeError('Expected an agent roster row')
   expect(fleetFromAgents([decoded]).agents[0]).toHaveProperty('lifecycle', { _tag: expected })
 })
 
-test('roster lifecycle rejects values outside the generated literal set', () => {
-  expect(() => decodeUnknownSync(Agent, 'strict')({
-    kind: 'agent', id: 'agent/lifecycle', name: 'Unknown declaration', runtime_ids: [],
+test('roster lifecycle future-kind stays Unknown without dropping the row', () => {
+  const decoded = decodeRosterResource({
+    kind: 'agent', id: 'agent/lifecycle', name: 'Future declaration', runtime_ids: [],
     reachability: 'reachable', state: 'running', revision: '1',
-    updated_at: '2026-10-04T12:00:00.000Z', lifecycle: 'permanent',
+    updated_at: '2026-10-04T12:00:00.000Z', lifecycle: 'future-kind',
+  })
+  if (decoded.kind !== 'agent') throw new TypeError('Expected an agent roster row')
+  const fleet = fleetFromAgents([decoded])
+  expect(fleet.agents).toHaveLength(1)
+  expect(fleet.agents[0]).toMatchObject({ ref: 'agent/lifecycle', lifecycle: { _tag: 'Unknown' } })
+})
+
+test('roster lifecycle tolerance keeps other fields strict', () => {
+  expect(() => decodeRosterResource({
+    kind: 'agent', id: 'agent/lifecycle', name: 'Future declaration', runtime_ids: [],
+    reachability: 'reachable', state: 'running', revision: '1',
+    updated_at: 'not-a-timestamp', lifecycle: 'future-kind',
   })).toThrow()
 })
 

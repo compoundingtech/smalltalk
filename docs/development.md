@@ -235,11 +235,16 @@ Both commands skip all live activity when the one-minute `/proc/loadavg` value i
 
 ## Fractal web roster lifecycle
 
-The generated client-v0 `Agent` schema accepts only the optional declared lifecycle literals
-`standing`, `owner` and `bounded`; an unrecognized value fails decoding. The app projects them
-to `Standing`, `Owner` and `Bounded` tags on `data/source.ts`'s `Agent.lifecycle`. An absent
-declaration is `Unknown`, including when the agent name sounds standing-like. Names, observed
-activity and runtime state never supply lifecycle intent.
+The generated client-v0 `Agent` schema models lifecycle as an optional open enum:
+`standing`, `owner` and `bounded` decode as known literals; an unrecognized string decodes to
+`{ _tag: 'Unknown', raw }` in the default tolerant mode. The roster uses plain generated
+resource decoding, with no app-side stripping. Other field schemas remain enforced (for
+example, invalid timestamps fail), while additional server fields and open-enum cases retain
+generated forward compatibility. Known lifecycles project to `Standing`, `Owner` and `Bounded`
+tags on `data/source.ts`'s `Agent.lifecycle`. Both an absent declaration and the generated
+unknown case project to the app's `Unknown`,
+including when the agent name sounds standing-like. Names, observed activity and runtime state
+never supply lifecycle intent; unknown values never supply glyphs.
 
 The sidebar already receives this projected agent from `useFleet` and passes it to `sidebarRow`. Kit C can wire its future
 row prop from that lifecycle field; `Unknown` must render no glyph. No kit prop is added here.
