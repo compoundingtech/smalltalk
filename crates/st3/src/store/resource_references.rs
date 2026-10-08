@@ -259,7 +259,11 @@ pub(super) fn spawn_backfill(connection: &WriterConnection) {
         .spawn(move || loop {
             match backfill_step(&jobs) {
                 Ok(step) if !step.complete => {}
-                _ => return,
+                Ok(_) => return,
+                Err(error) => {
+                    tracing::warn!(%error, "declared resource backfill failed; declaration reads remain active");
+                    return;
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         });

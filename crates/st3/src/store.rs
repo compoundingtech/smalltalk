@@ -18086,6 +18086,8 @@ fn desired_row_at(
     }
     selected
         .map(|(revision, claim_id, desired)| {
+            // URI-addressed subjects are shared across declarations, so no run owns them.
+            // The reserved prefix distinguishes them from run-owned legacy resources.
             let shared_uri = desired.subject.starts_with("resource/uri/");
             Ok(DesiredRow {
                 kind: desired.kind,
