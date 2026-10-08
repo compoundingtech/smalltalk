@@ -62,6 +62,8 @@ mod client_blobs;
 mod client_adapters;
 mod client_presence;
 mod client_v0;
+#[cfg(test)]
+mod attention_history_tests;
 mod custom;
 mod delivery_presence;
 mod delivery_probes;
@@ -194,6 +196,8 @@ struct ClientPageCursor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     after_key: Option<(u128, String)>,
     expires_at_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_snapshot: Option<crate::store::HistorySnapshot>,
 }
 
 fn signal_changed(state: &AppState) {
@@ -1591,6 +1595,7 @@ fn client_page_read(
     }
     let next_cursor = if has_more {
         Some(encode_client_cursor(&ClientPageCursor {
+            history_snapshot: None,
             snapshot: snapshot.clone(),
             collection: collection.into(),
             offset: end,
@@ -1624,6 +1629,7 @@ fn client_page_read(
         },
         sync: client_sync_notice(state),
         replicated: None,
+        history: None,
     })
 }
 
@@ -1642,6 +1648,11 @@ fn client_page_filters(collection: &str, query: &ClientListQuery) -> BTreeMap<St
         if let Some(value) = value {
             filters.insert(name.into(), value.clone());
         }
+    }
+    if collection == "attention"
+        && let Some(state) = &query.state
+    {
+        filters.insert("state".into(), state.clone());
     }
     if collection == "terminals" {
         for (name, value) in [
@@ -3256,6 +3267,9 @@ fn client_attention_compatibility(items: &mut [Value], custom_forms: bool) {
             item["custom_attention_kind"] = item["attention_kind"].clone();
             item["attention_kind"] = json!("agent-request");
             item["actions"] = json!([]);
+            if item["state"] == "resolved" {
+                continue;
+            }
             let p = &item["action_parameters"]["custom.reply"];
             let command = [
                 "st", "subject", "reply", item["source_id"].as_str().unwrap_or_default(),
@@ -4150,6 +4164,7 @@ async fn client_work_history(
     let next_cursor = has_more
         .then(|| {
             encode_client_cursor(&ClientPageCursor {
+                history_snapshot: None,
                 snapshot: snapshot.clone(),
                 collection: "work".into(),
                 offset: offset.saturating_add(items.len()),
@@ -4182,6 +4197,7 @@ async fn client_work_history(
         },
         sync: client_sync_notice(state),
         replicated: None,
+        history: None,
     };
     Ok((Extension(snapshot), Json(page)))
 }
@@ -4586,6 +4602,16 @@ async fn client_attention(
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
+    validate_attention_history_query(&query)?;
+    if query.history && query.state.as_deref() != Some("open") {
+        return client_attention_history_page(
+            &state,
+            snapshot,
+            &effective_query,
+            session.custom_forms,
+        )
+        .await;
+    }
     let history = query.history;
     client_snapshot_page(
         &state,
@@ -4593,7 +4619,8 @@ async fn client_attention(
         "attention",
         &effective_query,
         move |state, _| {
-            let mut items = client_attention_resources_with_previews(state, person.as_deref(), history)?;
+            let mut items =
+                client_attention_resources_with_previews(state, person.as_deref(), history)?;
             client_attention_compatibility(&mut items, session.custom_forms);
             Ok(items)
         },
@@ -4603,17 +4630,207 @@ async fn client_attention(
 
 async fn client_attention_detail(
     State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<client_v0::ClientSession>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
-    let mut items = client_attention_resources_with_previews(&state, person.as_deref(), query.history)
-        .map_err(ApiError::internal)?;
+    validate_attention_history_query(&query)?;
+    if query.history && query.state.as_deref() != Some("open") {
+        let person = attention_history_person(person.as_deref())?;
+        let store = state.store.clone();
+        let requested = client_detail_id("attention", &id);
+        let item = blocking_store(move || {
+            store.request_attention_history()?;
+            store.attention_history_item(&requested, &person, snapshot.store_index)
+        })
+        .await?;
+        let mut items = item.into_iter().collect::<Vec<_>>();
+        client_attention_compatibility(&mut items, session.custom_forms);
+        return client_detail(items, "attention", &id);
+    }
+    let mut items =
+        client_attention_resources_with_previews(&state, person.as_deref(), query.history)
+            .map_err(ApiError::internal)?;
     client_attention_compatibility(&mut items, session.custom_forms);
     client_detail(items, "attention", &id)
 }
 
+fn validate_attention_history_query(query: &ClientListQuery) -> Result<(), ApiError> {
+    if query
+        .state
+        .as_deref()
+        .is_some_and(|state| !matches!(state, "open" | "resolved"))
+        || (!query.history && query.state.as_deref() == Some("resolved"))
+    {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation-failed".into(),
+            message: "attention state must be open, or resolved with history=true".into(),
+            details: Box::default(),
+        });
+    }
+    Ok(())
+}
+
+// The complete cursor is authenticated, including the effective person, snapshot, limit,
+// filters and seek position. Process-local secrets expire cursors safely on daemon restart.
+fn attention_cursor_mac(cursor: &ClientPageCursor) -> Result<String, ApiError> {
+    use hmac::{Hmac, Mac};
+    static KEY: OnceLock<Result<[u8; 32], String>> = OnceLock::new();
+    let key = KEY
+        .get_or_init(|| {
+            let mut key = [0; 32];
+            getrandom::fill(&mut key)
+                .map_err(|error| format!("page cursor entropy unavailable: {error}"))?;
+            Ok(key)
+        })
+        .as_ref()
+        .map_err(ApiError::internal)?;
+    let mut unsigned = cursor.clone();
+    unsigned.items_digest.clear();
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(ApiError::internal)?;
+    mac.update(&serde_json::to_vec(&unsigned).map_err(ApiError::internal)?);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn attention_history_person(person: Option<&str>) -> Result<String, ApiError> {
+    person.filter(|person| person.starts_with("person/")).map(str::to_owned).ok_or_else(|| ApiError {
+        status: StatusCode::FORBIDDEN,
+        code: "forbidden".into(),
+        message: "closed attention history requires an explicit person filter and read.projections authority".into(),
+        details: Box::default(),
+    })
+}
+
+async fn client_attention_history_page(
+    state: &AppState,
+    snapshot: ClientSnapshot,
+    query: &ClientListQuery,
+    custom_forms: bool,
+) -> Result<ClientPageResponse, ApiError> {
+    let person = attention_history_person(query.person.as_deref())?;
+    let (snapshot, limit, expiry, after, history_snapshot) = if let Some(encoded) = &query.cursor {
+        let cursor = decode_client_cursor(encoded)?;
+        let expected = attention_cursor_mac(&cursor)?;
+        let authentic = cursor.items_digest.len() == expected.len()
+            && cursor
+                .items_digest
+                .bytes()
+                .zip(expected.bytes())
+                .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+                == 0;
+        if !authentic
+            || cursor.history_snapshot.is_none()
+            || cursor.collection != "attention"
+            || cursor.history != query.history
+            || cursor.person != query.person
+            || cursor.actor != query.actor
+            || cursor.owner_run != query.owner_run
+            || cursor.status != query.status
+            || cursor.state != query.state
+            || cursor.owner != query.owner
+            || cursor.native_only != query.native_only
+            || cursor.snapshot.id != snapshot.id
+            || cursor.snapshot.host_id != client_host_id(&state.node)
+            || query
+                .limit
+                .is_some_and(|n| n.clamp(1, CLIENT_MAX_PAGE_ITEMS) != cursor.limit)
+            || client_now_ms() > cursor.expires_at_unix_ms
+        {
+            return Err(client_page_expired(
+                "the attention history cursor expired or does not match this person, snapshot or filter",
+            ));
+        }
+        let after = cursor
+            .after_key
+            .as_ref()
+            .zip(cursor.before_index)
+            .map(|((ms, id), version)| (*ms as i64, id.clone(), version));
+        (
+            cursor.snapshot,
+            cursor.limit,
+            cursor.expires_at_unix_ms,
+            after,
+            cursor.history_snapshot,
+        )
+    } else {
+        (
+            snapshot,
+            query.limit.unwrap_or(5).clamp(1, CLIENT_MAX_PAGE_ITEMS),
+            client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
+            None,
+            None,
+        )
+    };
+    let reader = state.clone();
+    let index = snapshot.store_index;
+    let mut read = blocking_store(move || {
+        reader.store.request_attention_history()?;
+        reader.store.attention_history_page(
+            &person,
+            index,
+            history_snapshot.as_ref(),
+            limit,
+            after.as_ref(),
+        )
+    })
+    .await
+    .map_err(|error| {
+        if error.message.contains("attention-history-epoch-changed") {
+            client_page_expired("attention history was reset by replay or trim; restart pagination")
+        } else {
+            error
+        }
+    })?;
+    client_attention_compatibility(&mut read.items, custom_forms);
+    let has_more = read.next.is_some();
+    let next_cursor = read
+        .next
+        .map(|(ms, id, version)| {
+            let mut cursor = ClientPageCursor {
+                history_snapshot: Some(read.snapshot.clone()),
+                snapshot: snapshot.clone(),
+                collection: "attention".into(),
+                offset: 0,
+                limit,
+                history: query.history,
+                person: query.person.clone(),
+                actor: query.actor.clone(),
+                owner_run: query.owner_run.clone(),
+                status: query.status.clone(),
+                owner: query.owner.clone(),
+                state: query.state.clone(),
+                native_only: query.native_only,
+                items_digest: String::new(),
+                before_index: Some(version),
+                after_key: Some((ms as u128, id)),
+                expires_at_unix_ms: expiry,
+            };
+            cursor.items_digest = attention_cursor_mac(&cursor)?;
+            encode_client_cursor(&cursor)
+        })
+        .transpose()?;
+    Ok((
+        Extension(snapshot),
+        Json(ClientResourcePage {
+            kind: "page".into(),
+            collection: "attention".into(),
+            filters: client_page_filters("attention", query),
+            items: read.items,
+            page: ClientPageInfo {
+                limit,
+                has_more,
+                next_cursor,
+                cursor_expires_at: has_more.then(|| client_timestamp(expiry)),
+            },
+            sync: client_sync_notice(state),
+            replicated: None,
+            history: Some(read.availability),
+        }),
+    ))
+}
 async fn client_messages(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
@@ -4938,6 +5155,7 @@ async fn client_history(
         .next_cursor
         .map(|next| {
             encode_client_cursor(&ClientPageCursor {
+                history_snapshot: None,
                 snapshot: snapshot.clone(),
                 collection: "history".into(),
                 offset: offset.saturating_add(items.len()),
@@ -4987,6 +5205,7 @@ async fn client_history(
         },
         sync: client_sync_notice(&state),
         replicated: None,
+        history: None,
     }))
 }
 
@@ -20168,10 +20387,18 @@ version 2
                 .and_then(Value::as_str),
             Some(request_reference)
         );
+        let closed=store.attention_history_test_page("person/alex", 20).unwrap().items;
+        let launches=closed.iter().filter(|r|r["attention_kind"]=="launch-approval").collect::<Vec<_>>();
+        assert_eq!(launches.len(),2,"each reviewed launch preview is a distinct episode");
+        assert_eq!(launches[0]["resolution"]["kind"],"answered");
+        assert_eq!(launches[0]["resolution"]["answer_label"],"Approved");
+        assert_eq!(launches[1]["resolution"]["answer_label"],"Changes requested");
+        assert_eq!(launches[0]["resolution"]["by"],"person/alex");
         let before = serde_json::to_value(store.planning_session(session).unwrap()).unwrap();
         store.rebuild_claim_projections().unwrap();
         let after = serde_json::to_value(store.planning_session(session).unwrap()).unwrap();
         assert_eq!(after, before);
+        assert_eq!(store.attention_history_test_page("person/alex", 20).unwrap().items,closed);
     }
 
     #[tokio::test]
@@ -25123,6 +25350,9 @@ agent "seat" { workspace "/tmp"; command "true" }
             .unwrap()
             .unwrap();
         assert_eq!(projection.person_answers[0].respondent, actor);
+        let closed=state.store.attention_history_test_page("person/avery", 5).unwrap().items;
+        assert_eq!(closed[0]["resolution"]["by"],actor);
+        assert_eq!(closed[0]["resolution"]["kind"],"answered");
         assert_eq!(
             projection.person_answers[0].acted_for.as_deref(),
             Some("person/avery")

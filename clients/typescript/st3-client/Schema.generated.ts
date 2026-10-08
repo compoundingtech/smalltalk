@@ -1022,6 +1022,17 @@ export const AttentionBlocked = /*#__PURE__*/ (() => Schema.Struct({
 export type AttentionBlocked = typeof AttentionBlocked.Type
 export type AttentionBlockedEncoded = typeof AttentionBlocked.Encoded
 
+export const AttentionResolution = /*#__PURE__*/ (() => Schema.Struct({
+  "answer_label": optionalKey(Schema.String),
+  "at": optionalKey(Timestamp),
+  /** The source claim actor, including delegated agent IDs; never a device receipt. */
+  "by": optionalKey(Id),
+  "kind": optionalKey(Schema.Literals(["answered","withdrawn","cancelled","closed"])),
+  "reason": optionalKey(Schema.String)
+}).annotate({ identifier: "AttentionResolution" }))()
+export type AttentionResolution = typeof AttentionResolution.Type
+export type AttentionResolutionEncoded = typeof AttentionResolution.Encoded
+
 export const AttentionTargetState = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
   "since": optionalKey(Timestamp),
@@ -1080,6 +1091,8 @@ export const Attention = /*#__PURE__*/ (() => Schema.Struct({
   "request": optionalKey(StructuredRequest),
   "requested_at": Timestamp,
   "requester_id": optionalKey(Id),
+  /** Recorded source closure; every field is optional when historical provenance is unavailable. */
+  "resolution": optionalKey(AttentionResolution),
   "review_mode": optionalKey(Schema.Literals(["approve","feedback"])),
   "revision": Revision,
   "source_id": Id,
@@ -1097,6 +1110,14 @@ export const Attention = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "Attention" }))()
 export type Attention = typeof Attention.Type
 export type AttentionEncoded = typeof Attention.Encoded
+
+export const AttentionHistoryAvailability = /*#__PURE__*/ (() => Schema.Struct({
+  "complete": Schema.Boolean,
+  "note": optionalKey(Schema.String.check(Schema.isMaxLength(120))),
+  "since": optionalKey(Timestamp)
+}).annotate({ identifier: "AttentionHistoryAvailability" }))()
+export type AttentionHistoryAvailability = typeof AttentionHistoryAvailability.Type
+export type AttentionHistoryAvailabilityEncoded = typeof AttentionHistoryAvailability.Encoded
 
 export const BlobChunk = /*#__PURE__*/ (() => Schema.Struct({
   /** Base64 of up to 512 KiB starting at offset. */
@@ -2252,6 +2273,7 @@ export type MailBacklogEncoded = typeof MailBacklog.Encoded
 export const Page = /*#__PURE__*/ (() => Schema.Struct({
   "collection": Schema.String.check(Schema.makeFilter((value: string) => value !== "resources", { expected: "a string other than \"resources\"" })),
   "filters": Schema.Record(Schema.String, Schema.String),
+  "history": optionalKey(AttentionHistoryAvailability),
   "items": Schema.Array(Resource),
   "kind": Schema.Literal("page"),
   "page": PageInfo,

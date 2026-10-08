@@ -110,6 +110,8 @@ mod attention_snapshot;
     )
 )]
 pub(crate) mod attention_ivm;
+mod attention_history;
+pub(crate) use attention_history::HistorySnapshot;
 mod backup;
 mod checkpoint_rules;
 pub(crate) mod delegation;
@@ -27560,6 +27562,7 @@ fn replay_graph_from_nothing_with_progress_tx(
     stage("full-replay/arrangements");
     arrangements::rebuild(transaction).map_err(internal)?;
     stage("full-replay/flush");
+    attention_history::invalidate(transaction).map_err(internal)?;
     Ok(())
 }
 
@@ -49939,6 +49942,11 @@ version 2
             )
             .unwrap();
         assert_eq!(first_approval.status, "pending-approval");
+        let closed=store.attention_history_test_page("person/mission-reviewer", 5).unwrap().items;
+        assert_eq!(closed.len(),1);
+        assert_eq!(closed[0]["episode"],format!("{}:{}",proposal.source_generation,proposal.preview_hash.as_deref().unwrap()));
+        assert_eq!(closed[0]["resolution"]["by"],"person/mission-reviewer");
+        assert_eq!(closed[0]["resolution"]["answer_label"],"Approved");
         assert_eq!(first_approval.mission_run.generation, run.generation);
         assert!(
             store
@@ -49962,6 +49970,9 @@ version 2
             )
             .unwrap();
         assert_eq!(applied.status, "applied");
+        let closed=store.attention_history_test_page("person/step-reviewer", 5).unwrap().items;
+        assert_eq!(closed.len(),1);
+        assert_eq!(closed[0]["resolution"]["by"],"person/step-reviewer");
         assert_ne!(applied.mission_run.generation, run.generation);
         assert_eq!(
             applied

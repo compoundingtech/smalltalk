@@ -156,6 +156,7 @@ impl Runtime for SmalltalkRuntime {
         unread_mail::create_schema(connection)?;
         resources::create_schema(connection)?;
         custom::create_schema(connection)?;
+        attention_history::create_schema(connection)?;
         agent_messages::create_schema(connection)?;
         glass_heads::create_schema(connection)?;
         limits::create_limits_schema(connection)?;
@@ -198,6 +199,7 @@ impl Runtime for SmalltalkRuntime {
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
+            attention_history::open(transaction)?;
             return Ok(());
         }
         let upgraded: bool = transaction.query_row(
@@ -228,6 +230,7 @@ impl Runtime for SmalltalkRuntime {
             let _ = rebuilt;
         }
         migrate_occurrence_creation_projections_tx(transaction)?;
+        attention_history::open(transaction)?;
         Ok(())
     }
 
@@ -358,6 +361,7 @@ impl Runtime for SmalltalkRuntime {
     }
 
     fn clear_checkpoint_projections(&self, transaction: &Transaction<'_>) -> Result<()> {
+        attention_history::invalidate(transaction)?;
         checkpoint_rules::clear_projections(transaction)
     }
 

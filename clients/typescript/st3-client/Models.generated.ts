@@ -422,6 +422,7 @@ export type Attention = ResourceHeader & {
   request?: StructuredRequest;
   requested_at: Timestamp;
   requester_id?: Id;
+  resolution?: AttentionResolution;
   review_mode?: "approve" | "feedback";
   source_id: Id;
   source_kind?: string;
@@ -440,6 +441,20 @@ export type AttentionBlocked = {
   goal: string;
   step: string;
   step_run_id: Id;
+};
+
+export type AttentionHistoryAvailability = {
+  complete: boolean;
+  note?: string;
+  since?: Timestamp;
+};
+
+export type AttentionResolution = {
+  answer_label?: string;
+  at?: Timestamp;
+  by?: Id;
+  kind?: "answered" | "withdrawn" | "cancelled" | "closed";
+  reason?: string;
 };
 
 export type AttentionTargetState = {
@@ -1184,6 +1199,7 @@ export type Page = {
   filters: {
   [key: string]: string;
 };
+  history?: AttentionHistoryAvailability;
   items: Array<Resource>;
   kind: "page";
   page: PageInfo;

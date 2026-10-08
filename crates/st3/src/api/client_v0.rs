@@ -3453,6 +3453,7 @@ pub(super) async fn missions(
     let next_cursor = has_more
         .then(|| {
             encode_client_cursor(&ClientPageCursor {
+                history_snapshot: None,
                 snapshot: snapshot.clone(),
                 collection: "missions".into(),
                 offset: offset.saturating_add(items.len()),
@@ -3489,6 +3490,7 @@ pub(super) async fn missions(
         },
         sync: client_sync_notice(&state),
         replicated: None,
+        history: None,
     };
     Ok((Extension(snapshot), Json(page)))
 }
