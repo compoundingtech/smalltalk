@@ -3965,6 +3965,18 @@ impl Ui {
             for key in self.content.request_tool(conversation, &id) {
                 self.effects.push(Effect::LoadContent(key));
             }
+        } else {
+            self.content.release_tool(conversation, &id);
+            if let Some(first) = id.strip_prefix("bundle:")
+                && let Some(entries) = self.world.conversations.get(conversation)
+            {
+                for entry in entries.items().iter().skip_while(|entry| entry.id != first)
+                    .take_while(|entry| matches!(entry.body, Body::Tool { .. }))
+                {
+                    self.conversation_state.expanded.remove(&entry.id);
+                    self.content.release_tool(conversation, &entry.id);
+                }
+            }
         }
     }
 
@@ -4003,6 +4015,7 @@ impl Ui {
         {
             for tool in tools {
                 self.conversation_state.expanded.remove(&tool);
+                self.content.release_tool(&id, &tool);
             }
         } else {
             self.conversation_state.expanded.extend(tools);

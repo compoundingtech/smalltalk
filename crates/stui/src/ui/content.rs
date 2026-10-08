@@ -44,7 +44,7 @@ pub struct Content {
     groups: BTreeMap<(String, String), Vec<Group>>,
     loaded: BTreeMap<Key, Loaded>,
     shown: BTreeSet<Key>,
-    protocols: RefCell<BTreeMap<(Key, u16, u16), ratatui_image::protocol::Protocol>>,
+    protocols: RefCell<BTreeMap<Key, (u16, u16, ratatui_image::protocol::Protocol)>>,
     pub scroll_to: RefCell<BTreeMap<String, String>>,
     pub focused: BTreeMap<String, String>,
 }
@@ -125,7 +125,7 @@ impl Content {
         }).collect();
         self.loaded.retain(|key, _| active.contains(key));
         self.shown.retain(|key| active.contains(key));
-        self.protocols.borrow_mut().retain(|(key, _, _), _| active.contains(key));
+        self.protocols.borrow_mut().retain(|key, _| active.contains(key));
     }
 
     pub fn image_owner(&self, key: &Key) -> Option<(String, String)> {
@@ -155,6 +155,18 @@ impl Content {
         refs.into_iter().filter(|key| self.request(key)).collect()
     }
 
+    /// Closing a row releases its full values, pixels and terminal encodings.
+    pub fn release_tool(&mut self, conversation: &str, entry: &str) {
+        let Some(groups) = self.groups.get(&(conversation.to_owned(), entry.to_owned())) else { return };
+        for group in groups {
+            for (key, _) in &group.refs {
+                self.loaded.remove(key);
+                self.shown.remove(key);
+                self.protocols.get_mut().remove(key);
+            }
+        }
+    }
+
     fn request(&mut self, key: &Key) -> bool {
         if matches!(self.loaded.get(key), Some(Loaded::Loading | Loaded::Json { .. } | Loaded::Image { .. })) {
             return false;
@@ -168,7 +180,12 @@ impl Content {
             self.shown.insert(key.clone());
             return self.request(key);
         }
-        if !self.shown.insert(key.clone()) { self.shown.remove(key); return false; }
+        if !self.shown.insert(key.clone()) {
+            self.shown.remove(key);
+            self.loaded.remove(key);
+            self.protocols.get_mut().remove(key);
+            return false;
+        }
         self.request(key)
     }
 
@@ -284,13 +301,14 @@ impl Content {
         if !self.shown.contains(key) { return; }
         let Some(Loaded::Image { image, .. }) = self.loaded.get(key) else { return };
         let mut protocols = self.protocols.borrow_mut();
-        let identity = (key.clone(), area.width, area.height);
-        if !protocols.contains_key(&identity) {
+        if !protocols.get(key).is_some_and(|(width, height, _)| *width == area.width && *height == area.height) {
+            // One encoding per image, not one for every size visited while resizing.
+            protocols.remove(key);
             let Ok(protocol) = picker.new_protocol(image.clone(), ratatui::layout::Size::new(area.width, area.height),
                 ratatui_image::Resize::Fit(None)) else { return };
-            protocols.insert(identity.clone(), protocol);
+            protocols.insert(key.clone(), (area.width, area.height, protocol));
         }
-        if let Some(protocol) = protocols.get(&identity) {
+        if let Some((_, _, protocol)) = protocols.get(key) {
             use ratatui::widgets::Widget as _;
             ratatui_image::Image::new(protocol).render(area, buf);
         }
@@ -450,6 +468,54 @@ mod tests {
         assert!(buffer.content.iter().any(|cell| cell.symbol() != " "));
         assert!(!content.toggle_image(&key));
         assert!(!render(&content, &entries, true).targets.iter().any(|target| matches!(target.hit, Hit::InlineImage(_))));
+    }
+
+    #[test]
+    fn repeated_image_load_hide_and_resize_release_bytes_and_keep_one_protocol() {
+        let (mut content, _, entries) = fixture(true);
+        let key = content.tool_images("agent/example", &entries[0].id).pop().unwrap();
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 2, image::Rgb([255, 0, 0])))
+            .write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        for _ in 0..8 {
+            assert!(content.toggle_image(&key));
+            content.complete(key.clone(), Ok(("application/octet-stream".into(), encoded.get_ref().clone())));
+            assert_eq!(content.loaded.len(), 1);
+            let Some(Loaded::Image { image, .. }) = content.loaded.get(&key) else { panic!("loaded pixels") };
+            assert_eq!(image.as_bytes().len(), 12);
+            for width in 8..24 {
+                let area = Rect::new(0, 0, width, 12);
+                content.draw_image(&picker, &key, area, &mut Buffer::empty(area));
+                let protocols = content.protocols.borrow();
+                assert_eq!(protocols.len(), 1);
+                assert_eq!(protocols[&key].0, width);
+            }
+            assert!(!content.toggle_image(&key));
+            assert!(content.loaded.is_empty(), "hidden pixels must not remain retained");
+            assert!(content.shown.is_empty());
+            assert!(content.protocols.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn tool_collapse_releases_full_json_and_ignores_late_responses() {
+        let (mut content, _, _) = fixture(false);
+        for _ in 0..8 {
+            let key = content.request_tool("agent/example", "call").pop().unwrap();
+            content.complete(key.clone(), Ok(("application/json".into(),
+                serde_json::to_vec(&serde_json::json!({"output":"x".repeat(16384)})).unwrap())));
+            assert_eq!(content.loaded.len(), 1);
+            content.release_tool("agent/example", "call");
+            assert!(content.loaded.is_empty());
+            assert!(content.protocols.borrow().is_empty());
+            content.complete(key, Ok(("application/json".into(), b"{}".to_vec())));
+            assert!(content.loaded.is_empty());
+        }
+        let key = content.request_tool("agent/example", "call").pop().unwrap();
+        content.release_tool("agent/example", "call");
+        content.complete(key, Ok(("application/json".into(), b"{}".to_vec())));
+        assert!(content.loaded.is_empty(), "closing an in-flight request must not retain its result");
     }
 
     #[test]

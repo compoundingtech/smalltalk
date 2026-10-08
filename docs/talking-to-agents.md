@@ -21,7 +21,8 @@ using the terminal's image renderer. **Ctrl+O** keeps its pane-zoom action. On t
 **Show all** loads the clipped result and **Show less** collapses it; **Load image**
 displays the fetched image inline. Image media type and byte size
 become exact after loading. Expanded native output and fetched native images stay
-in memory only. This does not change mail attachment opening: stui still saves a
+in memory only, and collapsing output or hiding an image releases the fetched data.
+Reopening loads it again. This does not change mail attachment opening: stui still saves a
 received mail image under its attachment directory and opens the machine's viewer.
 
 ## From the CLI
