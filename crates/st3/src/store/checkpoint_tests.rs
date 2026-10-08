@@ -1891,6 +1891,76 @@ fn status_history_mixed_legacy_and_heartbeat_stamps_survive_both_checkpoint_cuts
 }
 
 #[test]
+fn status_history_legacy_boundary_keeps_the_transition_that_makes_it_visible() {
+    let cuts = ["2026-10-04T00:00:00Z", "2026-10-05T00:00:00Z"].map(|cut| {
+        chrono::DateTime::parse_from_rfc3339(cut).unwrap().timestamp_millis() as u128
+    });
+    let store = Store::open_memory("cedar").unwrap();
+    let subject = "agent/cedar";
+    let at = cuts[0] - 9 * 60 * 60 * 1_000;
+    let append = |kind: &str, fields: Value, time: u128| {
+        store.set_write_clock_at(time).unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        // Keep legacy unstamped sources verbatim instead of using today's stamp producer.
+        let claim = append_claim_tx(&transaction, &store.origin, subject, kind,
+            Some(subject), &json!({"fields":fields}), &[], None).unwrap();
+        transaction.commit().unwrap();
+        claim
+    };
+    append("runtime.observed", json!({
+        "status":"running", "runtime_id":"native", "incarnation_id":"one"
+    }), at);
+    let harness = |state: &str, time: u128, stamp: Option<bool>| {
+        let mut fields = json!({"state":state, "incarnation_id":"one", "observed_at_ms":time as u64});
+        if let Some(stamp) = stamp { fields["status_transition"] = json!(stamp); }
+        append("harness.observed", fields, time)
+    };
+    let old_idle = harness("idle", at + 1_000, Some(true));
+    let preceding_working = harness("working", at + 4 * 60 * 60 * 1_000, None);
+    let boundary_idle = harness("idle", at + 4 * 60 * 60 * 1_000 + 60_000, None);
+    for index in 1..seat_status::MAX_TRANSITIONS {
+        harness(if index % 2 == 0 { "idle" } else { "working" },
+            boundary_idle.accepted_at_unix_ms + index as u128 * 1_000, Some(true));
+    }
+    // Each cut reads the same fixed canonical sources, never the first cut's trimmed result.
+    for cut in cuts {
+        let connection = store.readers.get();
+        let (before, before_sources) = seat_status::history_at_with_sources(&connection, subject, cut, i64::MAX as u64).unwrap();
+        drop(connection);
+        assert_eq!(before["items"].as_array().unwrap().len(), seat_status::MAX_TRANSITIONS);
+        assert_eq!(before_sources[0].claim, boundary_idle.id);
+        let sealed = store.checkpoint_sealed_set(cut).unwrap();
+        let plan = plan_drops(&sealed);
+        assert!(!dropped(&plan).contains(&boundary_idle.id));
+        assert!(!dropped(&plan).contains(&old_idle.id));
+        let scratch = tempfile::tempdir().unwrap();
+        let copy = scratch.path().join("checkpoint.sqlite3");
+        store.copy_store_to(&copy).unwrap();
+        let proof = prove_on_copy(&copy, &sealed, &plan).unwrap();
+        let mut connection = Connection::open(&copy).unwrap();
+        smallclaims::store::projection_digest::register(&connection).unwrap();
+        let transaction = connection.transaction().unwrap();
+        record_checkpoint_tombstones_tx(&transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims).unwrap();
+        delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
+        let (after, after_sources) = seat_status::history_at_with_sources(&transaction, subject, cut, i64::MAX as u64).unwrap();
+        let before_items = before["items"].as_array().unwrap();
+        let after_items = after["items"].as_array().unwrap();
+        let first_difference = (0..before_items.len().max(after_items.len()))
+            .find(|index| before_items.get(*index) != after_items.get(*index));
+        println!("legacy-boundary cut={cut} before_len={} after_len={} first_difference={first_difference:?} boundary_kept={} predecessor_dropped={} before_sources={:?} after_sources={:?} before_first={} after_first={} tail_prefix_equal={} mismatches={:?}",
+            before_items.len(), after_items.len(), !dropped(&plan).contains(&boundary_idle.id),
+            dropped(&plan).contains(&preceding_working.id),
+            before_sources.iter().take(3).map(|source| &source.claim).collect::<Vec<_>>(),
+            after_sources.iter().take(3).map(|source| &source.claim).collect::<Vec<_>>(),
+            before_items[0], after_items[0], before_items[1..3] == after_items[1..3], proof.mismatches);
+        assert!(proof.passed, "a kept legacy boundary transition must remain visible: {:?}", proof.mismatches);
+        assert_eq!(after["items"], before["items"]);
+        transaction.rollback().unwrap();
+    }
+}
+
+#[test]
 fn status_history_mixed_stamps_keep_baselines_prompts_auth_and_canonical_ties() {
     for (ties, channels, older_baseline) in [
         (true, false, false), (false, true, false),
