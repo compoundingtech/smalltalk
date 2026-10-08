@@ -1494,6 +1494,14 @@ pub(crate) fn diagnostic(c: &Connection, ns: &Namespace) -> Result<Value> {
         "SELECT EXISTS(SELECT 1 FROM local_agent_card_source_work WHERE namespace=?1 AND kind<>'card')",
         [ns.as_str()], |r| r.get(0),
     )?;
+    let lifecycle_dirty: Vec<String> = c
+        .prepare_cached("SELECT agent FROM local_agent_lifecycle_dirty WHERE namespace=?1 ORDER BY agent LIMIT 4")?
+        .query_map([ns.as_str()], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let lifecycle_fences: Vec<Value> = c
+        .prepare_cached("SELECT agent,substr(reason,1,512) FROM local_agent_lifecycle_fences WHERE namespace=?1 ORDER BY agent LIMIT 4")?
+        .query_map([ns.as_str()], |r| Ok(json!({"agent":r.get::<_,String>(0)?,"reason":r.get::<_,String>(1)?})))?
+        .collect::<rusqlite::Result<_>>()?;
     Ok(json!({
         "at":at.to_string(), "snapshot_index":captured_index(c,ns)?,
         "shadow":state(shadow::clean(c,ns)),
@@ -1502,6 +1510,7 @@ pub(crate) fn diagnostic(c: &Connection, ns: &Namespace) -> Result<Value> {
         "queue":state(agent_queue::clean(c,ns,at)),
         "authority":state(agent_authority_ivm::ensure_closed(c,ns).map(|_|true)),
         "lifecycle":state(agent_card_lifecycle::ensure_closed(c,ns).map(|_|true)),
+        "lifecycle_dirty_sample":lifecycle_dirty, "lifecycle_fence_sample":lifecycle_fences,
         "launch":state(agent_card_launch::ensure_closed(c,ns).map(|_|true)),
         "card_pending":card_work(c,ns)?, "other_work_pending":other_work,
         "local_cut_pending":local_cut, "public_queue_pending":queue_public_pending(c,ns)?,
