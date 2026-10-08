@@ -85,6 +85,83 @@ fn modern_digest_domain_requires_both_peer_signals_and_the_complete_table_set() 
     ));
 }
 
+#[test]
+fn signed_exchange_limit_includes_the_actual_response_wrapper() {
+    let first = crate::claim::ReplicaEnvelope {
+        writer: "birch".into(),
+        sequence: 1,
+        previous_hash: None,
+        hash: "a".repeat(64),
+        accepted_at_unix_ms: 1,
+        payload: vec![42; 256].into(),
+        member_key: None,
+        signature: None,
+    };
+    let second = crate::claim::ReplicaEnvelope {
+        sequence: 2,
+        hash: "b".repeat(64),
+        ..first.clone()
+    };
+    let mut exchange = ReplicationExchange {
+        peer: "birch".into(),
+        fleet_id: "fleet/example".into(),
+        schema_digest: "schema/example".into(),
+        authority_digest: "authority/example".into(),
+        graph_digest: String::new(),
+        projection_digests: BTreeMap::new(),
+        inventory: ReplicationInventory {
+            digest: "inventory/example".into(),
+            envelopes: vec![
+                ReplicaEnvelopeId {
+                    writer: first.writer.clone(),
+                    sequence: first.sequence,
+                    hash: first.hash.clone(),
+                },
+                ReplicaEnvelopeId {
+                    writer: second.writer.clone(),
+                    sequence: second.sequence,
+                    hash: second.hash.clone(),
+                },
+            ],
+            ..Default::default()
+        },
+        envelopes: vec![first, second],
+        signature_requests: vec![ReplicaEnvelopeId {
+            writer: "birch".into(),
+            sequence: 2,
+            hash: "f".repeat(128),
+        }],
+        signatures: Vec::new(),
+    };
+    let original = exchange.clone();
+    let node = "cedar/\"escaped\nnode";
+    let store_index = u64::MAX;
+    let mut shell = exchange.clone();
+    shell.envelopes.clear();
+    let base = serde_json::to_vec(&PeerResponse::new(node, store_index, &shell))
+        .unwrap()
+        .len();
+    let first_bytes = serde_json::to_vec(&exchange.envelopes[0]).unwrap().len();
+    let limit = base + first_bytes;
+
+    fit_signed_replication_exchange(node, store_index, &mut exchange, limit).unwrap();
+    assert_eq!(exchange.envelopes.len(), 1);
+    assert_eq!(exchange.inventory.envelopes, original.inventory.envelopes);
+    assert_eq!(exchange.signature_requests.len(), 1);
+    assert_eq!(
+        serde_json::to_vec(&PeerResponse::new(node, store_index, &exchange))
+            .unwrap()
+            .len(),
+        limit
+    );
+    let mut missing_first = original.clone();
+    assert!(fit_signed_replication_exchange(node, store_index, &mut missing_first, limit - 1)
+        .is_err());
+    let mut oversized_proof = original;
+    assert!(fit_signed_replication_exchange(node, store_index, &mut oversized_proof, base - 1)
+        .is_err());
+}
+
 /// Different checkpoint lineages leave payloadless ranges that can never settle through
 /// envelope transport. Both live writers already have a shared range, so a summary alone
 /// cannot prove either of their later gaps.

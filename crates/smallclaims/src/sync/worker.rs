@@ -1645,8 +1645,23 @@ async fn receive_exchange<B: Backend>(
     })
     .await;
     match ready {
-        Ok(Some(Ok(export))) => {
+        Ok(Some(Ok(mut export))) => {
             finish_exchange_job(&state.fleet, &relay, &answer);
+            if let Err(error) = fit_signed_replication_exchange(
+                &state.node,
+                export.store_index,
+                &mut export.exchange,
+                MAX_EXCHANGE_BYTES,
+            ) {
+                return signed_error_response(
+                    &state,
+                    &request_digest,
+                    export.store_index,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &format!("replication response exceeds the exchange byte limit: {error:#}"),
+                )
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
             let authority_digest = export.exchange.authority_digest.clone();
             let response =
                 match signed_response(&state, &request_digest, export.store_index, export.exchange)
@@ -2036,6 +2051,26 @@ fn signed_refusal<B: Backend>(
         .insert("content-type", HeaderValue::from_static("application/json"));
     response.headers_mut().extend(headers);
     Ok(response)
+}
+
+/// Reserve the actual signed JSON wrapper before choosing the final payload prefix. The UUID
+/// request ID always serializes to 36 ASCII bytes, so a fresh ID has identical wire length.
+fn fit_signed_replication_exchange(
+    node: &str,
+    store_index: u64,
+    exchange: &mut ReplicationExchange,
+    limit: usize,
+) -> Result<()> {
+    let wrapper = PeerResponse::new(node, store_index, ());
+    let wrapper_bytes = crate::store::serialized_bytes_bounded(&wrapper, limit)?
+        .ok_or_else(|| anyhow::anyhow!("replication response wrapper exceeds the byte limit"))?;
+    // Unit serializes as `null`, and the value field has the same surrounding punctuation for
+    // every exchange. Escaping of the actual node name is included in wrapper_bytes.
+    let overhead = wrapper_bytes - b"null".len();
+    let inner_limit = limit
+        .checked_sub(overhead)
+        .ok_or_else(|| anyhow::anyhow!("replication response wrapper exceeds the byte limit"))?;
+    crate::store::fit_replication_exchange_body(exchange, inner_limit)
 }
 
 fn signed_response<B, T: Serialize>(

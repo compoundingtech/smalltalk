@@ -3491,6 +3491,66 @@ fn load_compact_replication_inventory(
 /// the most identities one divergent exchange lists beyond its first differing range.
 pub const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 
+/// Bound fetched payload memory while the complete response is fitted to the 64 MiB wire cap.
+/// Stored bytes are a lower bound on JSON bytes, so a single record larger than this cannot fit.
+const REPLICATION_EXCHANGE_STORED_PAYLOAD_BYTES: usize = crate::sync::MAX_EXCHANGE_BYTES;
+
+/// Count the exact uncompressed JSON bytes without constructing another copy of a page.
+/// The serializer stops at the transport cap, even for malformed legacy TEXT payloads.
+pub(crate) fn serialized_bytes_bounded<T: Serialize>(value: &T, limit: usize) -> Result<Option<usize>> {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let Some(next) = self.bytes.checked_add(bytes.len()) else {
+                return Err(std::io::Error::other("replication response size overflow"));
+            };
+            if next > self.limit {
+                return Err(std::io::Error::other("replication response exceeds byte limit"));
+            }
+            self.bytes = next;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { bytes: 0, limit };
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => Ok(Some(counter.bytes)),
+        Err(error) if error.is_io() => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The complete inventory and signature proof is indivisible. Only the payload envelope suffix
+/// may be shortened; the next exchange resumes from the prefix the peer received.
+pub(crate) fn fit_replication_exchange_body(
+    exchange: &mut ReplicationExchange,
+    limit: usize,
+) -> Result<()> {
+    let pending = std::mem::take(&mut exchange.envelopes);
+    let mut bytes = serialized_bytes_bounded(exchange, limit)?
+        .ok_or_else(|| anyhow::anyhow!("complete replication inventory or signatures exceed the exchange byte limit"))?;
+    for envelope in pending {
+        let separator = usize::from(!exchange.envelopes.is_empty());
+        let remaining = limit.saturating_sub(bytes.saturating_add(separator));
+        let Some(envelope_bytes) = serialized_bytes_bounded(&envelope, remaining)? else {
+            anyhow::ensure!(
+                !exchange.envelopes.is_empty(),
+                "one replication envelope exceeds the exchange byte limit"
+            );
+            break;
+        };
+        bytes += separator + envelope_bytes;
+        exchange.envelopes.push(envelope);
+    }
+    Ok(())
+}
+
 /// Maximum envelopes admitted per writer transaction. Admission can take several milliseconds
 /// per envelope on a populated store; leave room for queued write acknowledgements below 50 ms.
 pub const ADMISSION_CHUNK_ENVELOPES: usize = 8;
@@ -5681,7 +5741,7 @@ impl Store {
         let snapshot = self.replication_snapshot_with_legacy(legacy)?;
         let _timing = time_stage(&self.replication_timers.export);
         let signature_requests = self.replication_signature_requests()?;
-        Ok(ReplicationExchange {
+        let mut exchange = ReplicationExchange {
             peer: self.origin.clone(),
             fleet_id: fleet_id.to_owned(),
             schema_digest: self.runtime.schema_digest(),
@@ -5702,7 +5762,9 @@ impl Store {
             envelopes: Vec::new(),
             signature_requests,
             signatures: Vec::new(),
-        })
+        };
+        fit_replication_exchange_body(&mut exchange, crate::sync::MAX_EXCHANGE_BYTES)?;
+        Ok(exchange)
     }
 
     pub fn export_replication_exchange(
@@ -5754,6 +5816,7 @@ impl Store {
         let _timing = time_stage(&self.replication_timers.export);
         exchange.signatures = self.replication_signatures_for(signature_requests)?;
         exchange.signature_requests = self.replication_signature_requests()?;
+        fit_replication_exchange_body(&mut exchange, crate::sync::MAX_EXCHANGE_BYTES)?;
         Ok(exchange)
     }
 
@@ -5762,7 +5825,9 @@ impl Store {
         fleet_id: &str,
         remote: &ReplicationInventory,
     ) -> Result<ReplicationExchange> {
-        self.export_replication_difference_with_legacy(fleet_id, remote, true)
+        let mut exchange = self.export_replication_difference_with_legacy(fleet_id, remote, true)?;
+        fit_replication_exchange_body(&mut exchange, crate::sync::MAX_EXCHANGE_BYTES)?;
+        Ok(exchange)
     }
 
     fn export_replication_difference_with_legacy(
@@ -5800,7 +5865,7 @@ impl Store {
                     accepts: Some(replication_accepts()),
                     checkpoint: self.trimmed_checkpoint()?,
                 },
-                envelopes: self.replica_envelopes(missing)?,
+                envelopes: self.replica_envelopes_for_exchange(missing)?,
                 signature_requests: Vec::new(),
                 signatures: Vec::new(),
             });
@@ -5851,7 +5916,7 @@ impl Store {
                     snapshot.inventory.public()
                 }
             },
-            envelopes: self.replica_envelopes(missing)?,
+            envelopes: self.replica_envelopes_for_exchange(missing)?,
             signature_requests: Vec::new(),
             signatures: Vec::new(),
         })
@@ -5861,10 +5926,36 @@ impl Store {
         &self,
         missing: Vec<ReplicaEnvelopeId>,
     ) -> Result<Vec<ReplicaEnvelope>> {
+        self.replica_envelopes_with_stored_budget(missing, None)
+    }
+
+    fn replica_envelopes_for_exchange(
+        &self,
+        missing: Vec<ReplicaEnvelopeId>,
+    ) -> Result<Vec<ReplicaEnvelope>> {
+        self.replica_envelopes_with_stored_budget(
+            missing,
+            Some(REPLICATION_EXCHANGE_STORED_PAYLOAD_BYTES),
+        )
+    }
+
+    fn replica_envelopes_with_stored_budget(
+        &self,
+        missing: Vec<ReplicaEnvelopeId>,
+        stored_budget: Option<usize>,
+    ) -> Result<Vec<ReplicaEnvelope>> {
         if missing.is_empty() {
             return Ok(Vec::new());
         }
         let connection = self.readers.get();
+        let mut payload_lengths = stored_budget
+            .map(|_| {
+                connection.prepare_cached(
+                    "SELECT octet_length(payload) FROM replica_envelopes
+                     WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+                )
+            })
+            .transpose()?;
         // Reuse one preparation for the whole page, including its signature subqueries.
         let mut statement = connection.prepare_cached(
             "SELECT envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload,
@@ -5881,8 +5972,37 @@ impl Store {
                  FROM replica_envelopes AS envelopes
                  WHERE envelopes.writer=?1 AND envelopes.sequence=?2 AND envelopes.envelope_hash=?3",
         )?;
-        let mut envelopes = Vec::with_capacity(missing.len());
+        // A byte-limited page may stop after one record even when the peer lacks thousands.
+        let mut envelopes = Vec::with_capacity(missing.len().min(16));
+        let mut stored_bytes = 0usize;
         for identity in missing {
+            let mut next_stored_bytes = None;
+            if let Some(budget) = stored_budget {
+                let length: Option<i64> = payload_lengths
+                    .as_mut()
+                    .expect("a stored byte budget prepares payload lengths")
+                    .query_row(
+                        params![identity.writer, identity.sequence, identity.hash],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(length) = length else {
+                    // The payload may have been trimmed after the inventory snapshot.
+                    continue;
+                };
+                let length = usize::try_from(length)?;
+                // A wire-size upper bound can reject a legacy TEXT payload whose actual
+                // escaping fits. Fetch at most the transport cap in stored bytes, then
+                // fit the exact JSON body before signing the response.
+                if length > budget.saturating_sub(stored_bytes) {
+                    anyhow::ensure!(
+                        !envelopes.is_empty(),
+                        "one replication envelope exceeds the exchange stored-byte budget"
+                    );
+                    break;
+                }
+                next_stored_bytes = Some(stored_bytes + length);
+            }
             // A trim can delete the payload after the snapshot listed the identity. The
             // tombstone stays in the inventory and the peer never needs the envelope.
             let envelope = statement.query_row(
@@ -5905,6 +6025,11 @@ impl Store {
             let Some(envelope) = envelope else {
                 continue;
             };
+            // The row can be trimmed between the length probe and payload fetch. Only
+            // charge bytes for a payload actually included in this page.
+            if let Some(next) = next_stored_bytes {
+                stored_bytes = next;
+            }
             envelopes.push(envelope);
         }
         Ok(envelopes)

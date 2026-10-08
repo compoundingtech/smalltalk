@@ -37,6 +37,166 @@ fn page(source: &Store, target: &Store, count: usize) -> ReplicationExchange {
         .unwrap()
 }
 
+#[test]
+fn export_stored_payload_budget_stops_before_fetching_the_next_envelope() {
+    let source = node("birch");
+    let target = node("cedar");
+    page(&source, &target, 3);
+    let identities = source.replication_inventory().unwrap().envelopes;
+    assert_eq!(identities.len(), 3);
+    let all = source.replica_envelopes(identities.clone()).unwrap();
+    let first_stored = all[0].payload.bytes().unwrap().len();
+    let second_stored = all[1].payload.bytes().unwrap().len();
+    let budget = first_stored + second_stored - 1;
+
+    let first_page = source
+        .replica_envelopes_with_stored_budget(identities.clone(), Some(budget))
+        .unwrap();
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].hash, identities[0].hash);
+    let next_page = source
+        .replica_envelopes_with_stored_budget(identities[1..].to_vec(), Some(budget))
+        .unwrap();
+    assert!(!next_page.is_empty());
+    assert_eq!(next_page[0].hash, identities[1].hash);
+    assert!(source
+        .replica_envelopes_with_stored_budget(identities, Some(first_stored - 1))
+        .is_err());
+}
+
+#[test]
+fn export_stored_payload_budget_counts_legacy_text_past_nul_and_utf8_escapes() {
+    let source = node("birch");
+    let target = node("cedar");
+    page(&source, &target, 1);
+    let identities = source.replication_inventory().unwrap().envelopes;
+    assert_eq!(identities.len(), 1);
+    for text in [format!("A\0{}", "B".repeat(100)), "é\\\n\0C".repeat(30)] {
+        source
+            .connection
+            .write()
+            .execute(
+                "UPDATE replica_envelopes SET payload=?1",
+                rusqlite::params![text],
+            )
+            .unwrap();
+        let connection = source.readers.get();
+        let (characters, bytes): (i64, i64) = connection
+            .query_row(
+                "SELECT length(payload), octet_length(payload)
+                 FROM replica_envelopes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(connection);
+        assert!(bytes > characters, "the metadata must count stored bytes");
+        let actual = serde_json::to_vec(&source.replica_envelopes(identities.clone()).unwrap()[0].payload)
+            .unwrap()
+            .len();
+        let stored = usize::try_from(bytes).unwrap();
+        assert!(stored * 6 + 2 >= actual);
+        assert!(source
+            .replica_envelopes_with_stored_budget(identities.clone(), Some(stored - 1))
+            .is_err());
+        assert_eq!(
+            source
+                .replica_envelopes_with_stored_budget(identities.clone(), Some(stored))
+                .unwrap()
+                .len(),
+            1,
+            "a conservative JSON escape estimate must not reject a stored payload that fits"
+        );
+    }
+}
+
+#[test]
+fn export_keeps_a_single_envelope_that_fits_the_full_signed_wire_cap() {
+    let source = node("birch");
+    let target = node("cedar");
+    page(&source, &target, 1);
+    // Exercise the export size path with a large stored BLOB. Admission validity is
+    // tested separately; this diagnostic row tests that the wire budget does not
+    // reject a response that the existing transport can carry.
+    source
+        .connection
+        .write()
+        .execute(
+            "UPDATE replica_envelopes SET payload=?1",
+            rusqlite::params![vec![7u8; 25 * 1024 * 1024]],
+        )
+        .unwrap();
+    let exchange = source
+        .export_replication_exchange(FLEET, &target.replication_inventory().unwrap())
+        .unwrap();
+    assert_eq!(exchange.envelopes.len(), 1);
+    let bytes = serialized_bytes_bounded(&exchange, crate::sync::MAX_EXCHANGE_BYTES)
+        .unwrap()
+        .expect("the complete exchange fits the transport cap");
+    assert!(bytes > 32 * 1024 * 1024);
+}
+
+#[test]
+fn export_payload_page_sql_work_ignores_the_unfetched_tail() {
+    let measure = |count| {
+        let source = node("birch");
+        let target = node("cedar");
+        page(&source, &target, count);
+        let identities = source.replication_inventory().unwrap().envelopes;
+        let first = source.replica_envelopes(identities[..2].to_vec()).unwrap();
+        let first_stored = first[0].payload.bytes().unwrap().len();
+        let second_stored = first[1].payload.bytes().unwrap().len();
+        let before = crate::sqlite::work::total();
+        let selected = source
+            .replica_envelopes_with_stored_budget(
+                identities,
+                Some(first_stored + second_stored - 1),
+            )
+            .unwrap();
+        let work = crate::sqlite::work::total() - before;
+        assert_eq!(selected.len(), 1);
+        work
+    };
+    let small = measure(32);
+    let large = measure(256);
+    assert!(
+        large.vm_steps <= small.vm_steps + 100,
+        "export payload paging traversed the unfetched tail: small={small:?} large={large:?}"
+    );
+}
+
+#[test]
+fn export_body_limit_counts_complete_inventory_and_signature_proofs() {
+    let source = node("birch");
+    let target = node("cedar");
+    let mut exchange = page(&source, &target, 3);
+    assert_eq!(exchange.envelopes.len(), 3);
+    exchange.signature_requests.push(ReplicaEnvelopeId {
+        writer: "birch".into(),
+        sequence: 3,
+        hash: "f".repeat(512),
+    });
+    let original = exchange.clone();
+    let mut without_payloads = exchange.clone();
+    without_payloads.envelopes.clear();
+    let base_bytes = serde_json::to_vec(&without_payloads).unwrap().len();
+    let first_bytes = serde_json::to_vec(&exchange.envelopes[0]).unwrap().len();
+    let limit = base_bytes + first_bytes;
+
+    fit_replication_exchange_body(&mut exchange, limit).unwrap();
+    assert_eq!(exchange.envelopes.len(), 1);
+    assert_eq!(serde_json::to_vec(&exchange).unwrap().len(), limit);
+    assert_eq!(exchange.inventory.digest, original.inventory.digest);
+    assert_eq!(exchange.inventory.envelopes, original.inventory.envelopes);
+    assert_eq!(exchange.inventory.buckets.len(), original.inventory.buckets.len());
+    assert_eq!(exchange.signature_requests.len(), 1);
+
+    let mut missing_first = original.clone();
+    assert!(fit_replication_exchange_body(&mut missing_first, limit - 1).is_err());
+    let mut oversized_proof = original;
+    assert!(fit_replication_exchange_body(&mut oversized_proof, base_bytes - 1).is_err());
+}
+
 /// The injected SQL cost represents a populated runtime's per-claim admission work. The
 /// queued write must commit before the remainder of the page, and its ACK has a 100ms CI
 /// budget (including scheduler/commit overhead), separately from production's 50ms p99.
