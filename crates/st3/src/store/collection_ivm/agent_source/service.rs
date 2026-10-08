@@ -985,6 +985,87 @@ mod tests {
     }
 
     #[test]
+    fn local_cut_larger_than_one_page_finishes_without_extra_input() {
+        let _lock = TEST_LOCK.blocking_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            Store::open_with_agent_collections(&directory.path().join("local-cut.sqlite"), "node")
+                .unwrap();
+        settle(&store);
+        let anchor = store.index().unwrap() + 1;
+        for entry in 0..260 {
+            store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: "agent/node.future".into(),
+                    kind: "harness.timeline".into(),
+                    actor: Some("agent/node.future".into()),
+                    fields: BTreeMap::from([
+                        ("operation".into(), serde_json::json!("append")),
+                        (
+                            "entry_id".into(),
+                            serde_json::json!(format!("future-{entry}")),
+                        ),
+                        ("revision".into(), serde_json::json!(1)),
+                        ("role".into(), serde_json::json!("assistant")),
+                        ("entry_type".into(), serde_json::json!("content")),
+                        ("final".into(), serde_json::json!(true)),
+                        (
+                            "body".into(),
+                            serde_json::json!({"media_type":"text/plain","text":"Future content"}),
+                        ),
+                        ("driver".into(), serde_json::json!("codex")),
+                        (
+                            "incarnation_id".into(),
+                            serde_json::json!("future-incarnation"),
+                        ),
+                        ("sequence".into(), serde_json::json!(entry)),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("future:{entry}")),
+                })
+                .unwrap();
+            // A managed OLD/NEW replacement models a future anchored local input, as in
+            // the public-row parity controls. It supplies no cut or readiness evidence.
+            store.connection.batched(|tx| {
+                tx.execute("UPDATE local_observations SET after_store_index=?1 WHERE id=(SELECT max(id) FROM local_observations WHERE subject='agent/node.future')",[anchor])?;
+                Ok::<_, anyhow::Error>(())
+            }).unwrap().unwrap();
+        }
+        settle(&store);
+        store
+            .append_claim(&crate::model::ClaimInput {
+                subject: "agent/node.other".into(),
+                kind: "runtime.reconcile-decision".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("key".into(), serde_json::json!("activity-anchor")),
+                    ("decision".into(), serde_json::json!("noop")),
+                    ("reason".into(), serde_json::json!("At the activity anchor")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert_eq!(store.index().unwrap(), anchor);
+        // No further source write, native GET or external clock wakes the remaining pages.
+        settle(&store);
+        let service = store.smalltalk.ivm_agent_service.get().unwrap();
+        let c = store.readers.get();
+        let root = service.installer.root(&c, cards::VIEW).unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM local_agent_card_source_local_cut WHERE namespace=?1",
+                [root.namespace.as_str()],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn observation_retention_and_count_trim_keep_managed_capture_bounded() {
         let _lock = TEST_LOCK.blocking_lock();
         let directory = tempfile::tempdir().unwrap();
