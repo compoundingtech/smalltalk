@@ -11,6 +11,7 @@ mod backup;
 mod binary_payloads;
 mod boot_canaries;
 mod broken_gates;
+mod claude_idle;
 mod client_creation;
 mod client_glasses;
 mod client_presence;
@@ -43,6 +44,7 @@ mod message_send_once;
 mod messaging_faults;
 mod mission_cancellation;
 mod no_st2_seat;
+mod node_identity_cli;
 mod operational_state_contract;
 mod owned_sets;
 mod placement_handoff;
@@ -53,6 +55,7 @@ mod startup_readiness;
 mod subagent_publisher;
 mod subagents_seat;
 mod terminal_attach;
+mod terminal_binding;
 mod version;
 
 #[test]

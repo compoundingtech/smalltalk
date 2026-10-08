@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "Keep collection sockets alive with protocol ping/pong and close blocked sends.",
+  "commits": ["856721614c935e4fc59a5972ffadc2b999c20c67"],
+  "replay": {"status": "none", "detail": "No projection or replay changes."},
+  "schema": {"status": "none", "detail": "No database layout or migration changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or fleet digest changes."},
+  "compatibility": {"status": "changed", "detail": "The existing collections v0 socket sends standard WebSocket Ping every eight seconds, answers client Ping with its payload, and closes a send that blocks for eight seconds. JSON frames, collection names and subscription bounds are unchanged. The real-socket control proves ping/pong without extra window reads; deployed old-client pairs have not been measured."},
+  "downtime": {"status": "none", "detail": "No additional interruption beyond the normal daemon replacement restart. Existing clients reconnect for an authoritative snapshot."},
+  "manual": {"status": "none", "detail": "No installation-specific manual steps."},
+  "recovery": {"status": "none", "detail": "No persistent state changes; replacing the binary with the prior build restores the previous socket behavior."}
+}

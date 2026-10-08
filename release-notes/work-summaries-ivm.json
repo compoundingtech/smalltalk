@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Prepare canonical keyed work summaries with captured-time deadlines",
+  "replay": {
+    "status": "none",
+    "detail": "Default runtime and readers are unchanged. The prepared operator has no read/open history fold or implicit populated installation."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Explicit View registration creates local summary/clock tables and a deadline index, alongside the foundation contribution tables. No default production schema version changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Canonical admission, original-repair eligibility, effective work state and checkpoint rules are unchanged. Partial summary state does not certify work authority or checkpoint coverage."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No public routes, cursor, socket or action changes. The prepared relation preserves existing progress and completion summary interpretation."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No production registration or reader activation. No new startup replay or restart requirement."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Consumer adoption must explicitly register, capture all source mutations, certify complete projection, install populated candidates and drain bounded captured-time pages. Full work dependency and authority coverage needs separate proof."
+  },
+  "recovery": {
+    "status": "unknown",
+    "detail": "Source mutations remain fenced. Populated installation and checkpoint/digest/restore participation of custom summary rows are not certified."
+  }
+}

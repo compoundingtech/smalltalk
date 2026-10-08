@@ -1,0 +1,11 @@
+{
+ "version":1,
+ "summary":"Explicit bounded asynchronous catch-up for opt-in claims-only IVM stores",
+ "replay":{"status":"none","detail":"No automatic open/read/repair replay; explicit pages drain a captured delta queue."},
+ "schema":{"status":"changed","detail":"New local-derived async metadata/triggers only for explicitly constructed asynchronous ViewRuntime on a fresh or compatible file."},
+ "rules":{"status":"none","detail":"Canonical/admission/checkpoint rules unchanged. Unsupported rank/repair and local adapters fence or are refused."},
+ "compatibility":{"status":"changed","detail":"New opt-in Rust runtime, progress and worker APIs; no consumer migration or production activation."},
+ "downtime":{"status":"none","detail":"No live restart or existing-store conversion."},
+ "manual":{"status":"changed","detail":"Owners explicitly schedule/stop pages and retain event Publisher. Existing stores require a separate installation. See IVM_ASYNCHRONOUS.md."},
+ "recovery":{"status":"unknown","detail":"Quota overflow, capture loss, incompatible metadata and unsupported mutation require explicit recovery; no automatic rebuild. Production authority, checkpoint, retention and ordered operators remain gates."}
+}

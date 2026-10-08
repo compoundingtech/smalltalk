@@ -194,7 +194,7 @@ pub fn home_list(
                 .count();
             items.push(Item::Header {
                 title: if is_closed {
-                    "closed elsewhere: x clears each".into()
+                    "Recently closed: x clears each".into()
                 } else {
                     item.tier.title().into()
                 },
@@ -3092,6 +3092,148 @@ pub fn missions_tree(world: &World, spinner: &'static str, system: bool) -> List
     listing
 }
 
+
+// ------------------------------------------------------------- new mission
+
+pub const NEW_MISSION_FIELDS: [(&str, &str); 4] = [
+    ("title", "A short name, like 'Nightly dependency audit'"),
+    (
+        "what you want",
+        "Describe the outcome; the planner turns it into a mission",
+    ),
+    (
+        "mission id",
+        "Where it lives in the graph, like fleet/harbor/nightly-audit",
+    ),
+    ("workspace", "The directory the agents work in"),
+];
+
+/// The form behind Missions' New mission: it creates a launch, which a planner turns into a
+/// proposed mission on Home. Nothing runs until the person approves it there.
+/// `cursor` is where typing goes in the focused field.
+pub fn new_mission_form(fields: &[String; 4], focus: usize, cursor: usize, width: usize) -> Doc {
+    let mut inner = Doc::new();
+    let w = width.saturating_sub(4);
+    inner.blank();
+    inner.wrap(
+        &[run(
+            "Say what you want. A planner turns it into a proposed mission, which appears in Now for you to approve; nothing runs before that.",
+            theme::soft(),
+        )],
+        w,
+    );
+    inner.blank();
+    for (index, (label, hint)) in NEW_MISSION_FIELDS.iter().enumerate() {
+        let focused = index == focus;
+        let mut body = Doc::new();
+        let value = &fields[index];
+        if value.is_empty() && !focused {
+            body.line(Line::from(span(*hint, theme::dim())));
+        } else {
+            for runs in super::edit::lines(value, focused.then_some(cursor), theme::text()) {
+                body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
+            }
+        }
+        let start = inner.lines.len();
+        inner.card(
+            label,
+            if focused {
+                theme::ACCENT
+            } else {
+                theme::OVERLAY1
+            },
+            false,
+            body,
+            w,
+        );
+        for line in start..inner.lines.len() {
+            inner.targets.push(super::doc::Target {
+                line,
+                column: 0,
+                width: w as u16,
+                hit: Hit::Field(index),
+            });
+        }
+    }
+    inner.blank();
+    inner.buttons(&[
+        ("tab", "Next field", Hit::Key('\t'), theme::OVERLAY1),
+        ("enter", "Create the launch", Hit::Enter, theme::GREEN),
+        ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
+    ]);
+    inner.blank();
+    let mut doc = Doc::new();
+    doc.card("new mission", theme::ACCENT, false, inner, width);
+    doc
+}
+
+// ------------------------------------------------------------------ names
+
+/// A name nobody has to think of: `amber-otter`. The person can change it.
+pub fn random_name() -> String {
+    const FIRST: [&str; 16] = [
+        "amber", "brisk", "calm", "clever", "dusky", "eager", "gentle", "keen", "lucky", "merry",
+        "nimble", "quiet", "rapid", "steady", "sunny", "witty",
+    ];
+    const SECOND: [&str; 16] = [
+        "badger", "comet", "falcon", "fern", "harbor", "heron", "lantern", "maple", "otter",
+        "pebble", "quartz", "raven", "sparrow", "tide", "willow", "wren",
+    ];
+    let bits = uuid::Uuid::now_v7().as_u128();
+    // The low bits of a v7 id are random.
+    format!(
+        "{}-{}",
+        FIRST[(bits & 15) as usize],
+        SECOND[((bits >> 4) & 15) as usize]
+    )
+}
+
+// ------------------------------------------------------------------ devices
+
+pub fn devices_card(world: &World, width: usize) -> Doc {
+    let mut inner = Doc::new();
+    match &world.devices {
+        Load::Loading => inner.line(Line::from(span("Loading your devices…", theme::dim()))),
+        Load::Failed(error) => inner.wrap(
+            &[run(
+                format!("Could not read devices: {error}"),
+                theme::fg(theme::RED),
+            )],
+            width.saturating_sub(4),
+        ),
+        Load::Ready(devices) if devices.is_empty() => {
+            inner.line(Line::from(span("No paired devices.", theme::dim())))
+        }
+        Load::Ready(devices) => {
+            for device in devices {
+                inner.line(Line::from(vec![
+                    span(
+                        if device.state == "active" {
+                            "● "
+                        } else {
+                            "○ "
+                        },
+                        theme::fg(if device.state == "active" {
+                            theme::GREEN
+                        } else {
+                            theme::QUIET
+                        }),
+                    ),
+                    span(format!("{:<22}", device.name), theme::text()),
+                    span(format!("{:<24}", device.scopes.join(", ")), theme::soft()),
+                    span(format!("expires {}", device.expires), theme::dim()),
+                ]));
+                if device.state == "active" {
+                    inner.buttons(&[("", "Revoke", Hit::Revoke(device.id.clone()), theme::RED)]);
+                }
+            }
+        }
+    }
+    let mut doc = Doc::new();
+    doc.card("your devices", theme::OVERLAY1, false, inner, width);
+    doc
+}
+
 #[cfg(test)]
 mod tree_tests {
     use super::*;
@@ -3211,453 +3353,4 @@ mod tree_tests {
             "{kinds:#?}"
         );
     }
-}
-
-// ------------------------------------------------------------- new mission
-
-pub const NEW_MISSION_FIELDS: [(&str, &str); 4] = [
-    ("title", "A short name, like 'Nightly dependency audit'"),
-    (
-        "what you want",
-        "Describe the outcome; the planner turns it into a mission",
-    ),
-    (
-        "mission id",
-        "Where it lives in the graph, like fleet/harbor/nightly-audit",
-    ),
-    ("workspace", "The directory the agents work in"),
-];
-
-/// The form behind Missions' New mission: it creates a launch, which a planner turns into a
-/// proposed mission on Home. Nothing runs until the person approves it there.
-/// `cursor` is where typing goes in the focused field.
-pub fn new_mission_form(fields: &[String; 4], focus: usize, cursor: usize, width: usize) -> Doc {
-    let mut inner = Doc::new();
-    let w = width.saturating_sub(4);
-    inner.blank();
-    inner.wrap(
-        &[run(
-            "Say what you want. A planner turns it into a proposed mission, which appears in Now for you to approve; nothing runs before that.",
-            theme::soft(),
-        )],
-        w,
-    );
-    inner.blank();
-    for (index, (label, hint)) in NEW_MISSION_FIELDS.iter().enumerate() {
-        let focused = index == focus;
-        let mut body = Doc::new();
-        let value = &fields[index];
-        if value.is_empty() && !focused {
-            body.line(Line::from(span(*hint, theme::dim())));
-        } else {
-            for runs in super::edit::lines(value, focused.then_some(cursor), theme::text()) {
-                body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
-            }
-        }
-        let start = inner.lines.len();
-        inner.card(
-            label,
-            if focused {
-                theme::ACCENT
-            } else {
-                theme::OVERLAY1
-            },
-            false,
-            body,
-            w,
-        );
-        for line in start..inner.lines.len() {
-            inner.targets.push(super::doc::Target {
-                line,
-                column: 0,
-                width: w as u16,
-                hit: Hit::Field(index),
-            });
-        }
-    }
-    inner.blank();
-    inner.buttons(&[
-        ("tab", "Next field", Hit::Key('\t'), theme::OVERLAY1),
-        ("enter", "Create the launch", Hit::Enter, theme::GREEN),
-        ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
-    ]);
-    inner.blank();
-    let mut doc = Doc::new();
-    doc.card("new mission", theme::ACCENT, false, inner, width);
-    doc
-}
-
-// ------------------------------------------------------------------ new agent
-
-/// The harnesses st runs, the models each is known to take (the first, "default", leaves it to
-/// the harness), and the efforts. Fixed lists until st can say what each harness offers.
-pub const HARNESSES: [&str; 5] = ["claude", "codex", "omp", "pi", "opencode"];
-pub const EFFORTS: [&str; 5] = ["default", "low", "medium", "high", "xhigh"];
-
-pub fn models(harness: &str) -> &'static [&'static str] {
-    match harness {
-        "claude" => &[
-            "default",
-            "claude-opus-5-5",
-            "claude-sonnet-5-5",
-            "claude-haiku-4-5",
-            "claude-fable-5-1",
-        ],
-        "codex" => &["default", "gpt-6-sol"],
-        _ => &["default"],
-    }
-}
-
-/// The new agent form: what it should do (its first message), its name, and how it runs.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AgentForm {
-    pub task: String,
-    pub name: String,
-    pub repository: String,
-    /// Empty follows the safe simple name as it changes.
-    pub branch: String,
-    pub base: String,
-    pub workspace: String,
-    pub harness: usize,
-    pub model: usize,
-    pub effort: usize,
-    /// 0 is this machine; then the fleet's other machines in their list order.
-    pub host: usize,
-    pub focus: usize,
-}
-
-impl AgentForm {
-    pub const FIELDS: usize = 10;
-
-    pub fn branch(&self) -> String {
-        if self.branch.trim().is_empty() {
-            st3_client::agent_branch(self.name.trim())
-        } else {
-            self.branch.trim().to_owned()
-        }
-    }
-
-    pub fn base(&self) -> &str {
-        if self.base.trim().is_empty() {
-            "origin/main"
-        } else {
-            self.base.trim()
-        }
-    }
-
-    pub fn choice(&self) -> bool {
-        (2..=5).contains(&self.focus)
-    }
-
-    pub fn new(task: String) -> Self {
-        Self {
-            task,
-            name: random_name(),
-            ..Self::default()
-        }
-    }
-
-    pub fn harness(&self) -> &'static str {
-        HARNESSES[self.harness % HARNESSES.len()]
-    }
-
-    pub fn model(&self) -> Option<&'static str> {
-        let models = models(self.harness());
-        Some(models[self.model % models.len()]).filter(|model| *model != "default")
-    }
-
-    pub fn effort(&self) -> Option<&'static str> {
-        Some(EFFORTS[self.effort % EFFORTS.len()]).filter(|effort| *effort != "default")
-    }
-
-    /// Step a choice field (2 harness, 3 model, 4 effort, 5 host) by one, either way.
-    pub fn cycle(&mut self, forward: bool, hosts: usize) {
-        let step = |value: &mut usize, count: usize| {
-            *value = if forward {
-                (*value + 1) % count.max(1)
-            } else {
-                (*value + count.max(1) - 1) % count.max(1)
-            }
-        };
-        match self.focus {
-            2 => {
-                step(&mut self.harness, HARNESSES.len());
-                self.model = 0;
-            }
-            3 => {
-                let count = models(self.harness()).len();
-                step(&mut self.model, count)
-            }
-            4 => step(&mut self.effort, EFFORTS.len()),
-            5 => {
-                step(&mut self.host, hosts + 1);
-                self.repository.clear();
-                self.workspace.clear();
-            }
-            _ => {}
-        }
-    }
-}
-
-/// A name nobody has to think of: `amber-otter`. The person can change it.
-pub fn random_name() -> String {
-    const FIRST: [&str; 16] = [
-        "amber", "brisk", "calm", "clever", "dusky", "eager", "gentle", "keen", "lucky", "merry",
-        "nimble", "quiet", "rapid", "steady", "sunny", "witty",
-    ];
-    const SECOND: [&str; 16] = [
-        "badger", "comet", "falcon", "fern", "harbor", "heron", "lantern", "maple", "otter",
-        "pebble", "quartz", "raven", "sparrow", "tide", "willow", "wren",
-    ];
-    let bits = uuid::Uuid::now_v7().as_u128();
-    // The low bits of a v7 id are random.
-    format!(
-        "{}-{}",
-        FIRST[(bits & 15) as usize],
-        SECOND[((bits >> 4) & 15) as usize]
-    )
-}
-
-/// `cursors` are where typing goes in the prompt and the name.
-pub fn new_agent_form(
-    form: &AgentForm,
-    hosts: &[String],
-    cursors: [usize; 6],
-    repositories: &Load<Vec<String>>,
-    width: usize,
-) -> Doc {
-    let mut inner = Doc::new();
-    let w = width.saturating_sub(4);
-    inner.blank();
-    inner.wrap(
-        &[run(
-            "The prompt is the agent's first message. st starts the agent and its conversation opens here.",
-            theme::soft(),
-        )],
-        w,
-    );
-    inner.blank();
-    let field = |inner: &mut Doc, index: usize, label: &str, body: Doc| {
-        let start = inner.lines.len();
-        inner.card(
-            label,
-            if form.focus == index {
-                theme::ACCENT
-            } else {
-                theme::OVERLAY1
-            },
-            false,
-            body,
-            w,
-        );
-        for line in start..inner.lines.len() {
-            if inner
-                .targets
-                .iter()
-                .any(|target| target.line == line && matches!(target.hit, Hit::Repository(_)))
-            {
-                continue;
-            }
-            inner.targets.push(super::doc::Target {
-                line,
-                column: 0,
-                width: w as u16,
-                hit: Hit::Field(index),
-            });
-        }
-    };
-    for (index, label, value, hint) in [
-        (
-            0,
-            "prompt",
-            &form.task,
-            "Fix the flaky login test, then open a PR.",
-        ),
-        (1, "name", &form.name, "a name"),
-    ] {
-        let mut body = Doc::new();
-        let focused = form.focus == index;
-        if value.is_empty() && !focused {
-            body.line(Line::from(span(hint, theme::dim())));
-        } else {
-            for runs in super::edit::lines(value, focused.then_some(cursors[index]), theme::text())
-            {
-                body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
-            }
-        }
-        // The prompt gets room to write in from the start (Nathan, 2026-10-01).
-        if index == 0 {
-            while body.lines.len() < 4 {
-                body.blank();
-            }
-        }
-        field(&mut inner, index, label, body);
-    }
-    let host = match form.host {
-        0 => "this machine".to_owned(),
-        index => hosts
-            .get(index - 1)
-            .cloned()
-            .unwrap_or_else(|| "this machine".into()),
-    };
-    for (index, label, value) in [
-        (2, "harness", form.harness().to_owned()),
-        (
-            3,
-            "model",
-            form.model().unwrap_or("the harness's default").to_owned(),
-        ),
-        (
-            4,
-            "effort",
-            form.effort().unwrap_or("the harness's default").to_owned(),
-        ),
-        (5, "host", host),
-    ] {
-        let focused = form.focus == index;
-        let mut body = Doc::new();
-        body.line(Line::from(vec![
-            span(if focused { "◂ " } else { "  " }, theme::fg(theme::ACCENT)),
-            span(
-                value,
-                if focused {
-                    theme::text()
-                } else {
-                    theme::soft()
-                },
-            ),
-            span(
-                if focused {
-                    " ▸   ← → to choose"
-                } else {
-                    ""
-                },
-                theme::dim(),
-            ),
-        ]));
-        field(&mut inner, index, label, body);
-    }
-    inner.blank();
-    inner.wrap(&[run("Choose a repository for a worktree, or leave it empty for a plain workspace. Paths belong to the selected host.", theme::soft())], w);
-    for (cursor_index, index, label, value, hint) in [
-        (
-            2,
-            6,
-            "repository",
-            form.repository.as_str(),
-            "empty: plain workspace".to_owned(),
-        ),
-        (3, 7, "branch", form.branch.as_str(), form.branch()),
-        (4, 8, "base", form.base.as_str(), form.base().to_owned()),
-        (
-            5,
-            9,
-            "workspace",
-            form.workspace.as_str(),
-            "empty: st chooses a new directory".to_owned(),
-        ),
-    ] {
-        let mut body = Doc::new();
-        let focused = form.focus == index;
-        if value.is_empty() {
-            body.line(Line::from(span(hint, theme::dim())));
-        }
-        for runs in super::edit::lines(
-            value,
-            focused.then_some(cursors[cursor_index]),
-            theme::text(),
-        ) {
-            body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
-        }
-        if index == 6 {
-            match repositories {
-                Load::Loading => body.line(Line::from(span(
-                    "Loading this host’s repositories…",
-                    theme::dim(),
-                ))),
-                Load::Failed(why) => body.line(Line::from(span(
-                    format!("Suggestions unavailable: {why}"),
-                    theme::dim(),
-                ))),
-                Load::Ready(paths) => {
-                    body.line(Line::from(span(
-                        "ctrl+p / ctrl+n choose a repository; or type a path",
-                        theme::dim(),
-                    )));
-                    for path in paths
-                        .iter()
-                        .filter(|path| {
-                            form.repository.is_empty() || path.contains(&form.repository)
-                        })
-                        .take(5)
-                    {
-                        body.targets.push(super::doc::Target {
-                            line: body.lines.len(),
-                            column: 0,
-                            width: w.saturating_sub(4) as u16,
-                            hit: Hit::Repository(path.clone()),
-                        });
-                        body.line(Line::from(span(path.clone(), theme::soft())));
-                    }
-                }
-            }
-        }
-        field(&mut inner, index, label, body);
-    }
-    inner.blank();
-    inner.buttons(&[
-        ("tab", "Next field", Hit::Key('\t'), theme::OVERLAY1),
-        ("enter", "Start the agent", Hit::Enter, theme::GREEN),
-        ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
-    ]);
-    inner.blank();
-    let mut doc = Doc::new();
-    doc.card("new agent", theme::ACCENT, false, inner, width);
-    doc
-}
-
-// ------------------------------------------------------------------ devices
-
-pub fn devices_card(world: &World, width: usize) -> Doc {
-    let mut inner = Doc::new();
-    match &world.devices {
-        Load::Loading => inner.line(Line::from(span("Loading your devices…", theme::dim()))),
-        Load::Failed(error) => inner.wrap(
-            &[run(
-                format!("Could not read devices: {error}"),
-                theme::fg(theme::RED),
-            )],
-            width.saturating_sub(4),
-        ),
-        Load::Ready(devices) if devices.is_empty() => {
-            inner.line(Line::from(span("No paired devices.", theme::dim())))
-        }
-        Load::Ready(devices) => {
-            for device in devices {
-                inner.line(Line::from(vec![
-                    span(
-                        if device.state == "active" {
-                            "● "
-                        } else {
-                            "○ "
-                        },
-                        theme::fg(if device.state == "active" {
-                            theme::GREEN
-                        } else {
-                            theme::QUIET
-                        }),
-                    ),
-                    span(format!("{:<22}", device.name), theme::text()),
-                    span(format!("{:<24}", device.scopes.join(", ")), theme::soft()),
-                    span(format!("expires {}", device.expires), theme::dim()),
-                ]));
-                if device.state == "active" {
-                    inner.buttons(&[("", "Revoke", Hit::Revoke(device.id.clone()), theme::RED)]);
-                }
-            }
-        }
-    }
-    let mut doc = Doc::new();
-    doc.card("your devices", theme::OVERLAY1, false, inner, width);
-    doc
 }

@@ -55,13 +55,18 @@ assert.deepEqual(withUpdate.map(row => row.color), ['person', 'green']);
   assert.ok(kept.every(item => item.closedElsewhere && item.actions.length === 0));
   const rows = homeRows(kept, undefined, Date.parse('2026-10-07T07:05:00Z'));
   assert.equal(rows.length, 2, 'a resolved copy is replaced by the open one that was shown');
-  assert.match(rows[0].waiting, /closed elsewhere/);
+  assert.match(rows[0].waiting, /closed; stays/);
   const sections = homeSections(homeRows([open('attention/open'), ...kept], undefined, Date.parse('2026-10-07T07:05:00Z')));
-  assert.deepEqual(sections.map(section => [section.title, section.count]), [['when there is time', 1], ['closed elsewhere: clear each', 2]], 'closed items have a section of their own');
+  assert.deepEqual(sections.map(section => [section.title, section.count]), [['when there is time', 1], ['Recently closed: clear each', 2]], 'closed items have a section of their own');
   // Again, with the marked ones as the previous list: they stay.
   assert.equal(keepClosed(kept, next, new Set()).length, 2);
   // An item that was never open on Home is not invented.
   assert.deepEqual(keepClosed([{ ...open('attention/z'), state: 'resolved' }], [], new Set()), []);
+  // Only the latest five stay listed; the oldest drops first.
+  const all = [0, 1, 2, 3, 4, 5, 6, 7].map(n => open(`attention/${n}`));
+  let list = all;
+  for (let n = 0; n < 7; n++) list = keepClosed(list, all.slice(n + 1), new Set());
+  assert.deepEqual(list.filter(item => item.closedElsewhere).map(item => item.id).sort(), ['attention/2', 'attention/3', 'attention/4', 'attention/5', 'attention/6']);
   // An item that comes back open loses its mark.
   assert.equal(keepClosed(kept, [open('attention/a')], new Set()).find(item => item.id === 'attention/a').closedElsewhere, undefined);
 }

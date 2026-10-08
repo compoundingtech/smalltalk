@@ -2308,14 +2308,6 @@
       "verification": "live UI adapter plus daemon restart"
     },
     {
-      "effect": "CreateAgent",
-      "tests": [
-        "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
-        "crates/st3/tests/action_coverage.rs::creation_and_declaration_actions_survive_stale_fences_and_restarts"
-      ],
-      "verification": "live UI adapter plus daemon restart"
-    },
-    {
       "effect": "Resend",
       "tests": [
         "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
@@ -2439,14 +2431,6 @@
     },
     {
       "action": "CloseGlass",
-      "tests": [
-        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
-        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
-      ],
-      "verification": "local palette/reducer; resulting daemon effects are listed separately"
-    },
-    {
-      "action": "NewAgent",
       "tests": [
         "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
         "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep GitHub repository ingestion moving by separating open PR details from issue and PR identity lookups",
+  "replay": {"status": "none", "detail": "No graph replay change. The repository observer retries from its existing cursor after upgrade; its cursor format and item deduplication are unchanged."},
+  "schema": {"status": "none", "detail": "No database tables, indexes, triggers or schema version changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade is introduced."},
+  "compatibility": {"status": "changed", "detail": "GitHub repository observations use separate GraphQL requests for open PR details and remembered issue/PR identities. This avoids a combined query that GitHub can reject while accepting each part separately. A page with remembered identities uses one additional request; existing 100-item batches, ten-page PR limit, cache intervals and identity rotation remain. Client and replication protocols are unchanged."},
+  "downtime": {"status": "none", "detail": "No additional interruption beyond the normal daemon upgrade and restart. This change does not alter startup or health recovery; fleet restart durations have not been measured for this change."},
+  "manual": {"status": "changed", "detail": "Upgrade the daemon that owns the GitHub repository observer. Preserve its existing observation cursor and history. Verify that the observer's cursor advances and new issue and PR observations reach their subscriptions. No credential or subscription reconfiguration is required."},
+  "recovery": {"status": "none", "detail": "No migration or new binary recovery procedure. GraphQL failures still fail the observation without advancing its durable cursor; a later poll retries. Existing forward repair and deployment procedures continue to apply."}
+}

@@ -61,8 +61,24 @@ checkpoint once.
 The rules identity covers projection inputs and replay as well as retention. Version 11 includes
 `arrangements` and `arrangement_registers`, even when empty, and rebuilds them from sealed claims.
 Version 12 ages out the sekrets claims written before they became local observations.
+Version 13 makes status-history retention use the reader's source selection, excluding stamped
+heartbeats before finding transitions. Legacy transitions that the reader exposes remain retained.
 Different builds' rules digests must match exactly, not by version ordering: a mixed-version
 fleet waits at sealing until its participants use compatible rules, including during rollback.
+Verification also refuses seal terms whose rules digest differs from the running build, without
+consuming the node's first verification. The normal step replaces terms only for the newest due
+cut; quiet retries there do not establish verification of an older cut.
+
+A status-history proof mismatch logs bounded source diagnostics from the same scratch proof reads:
+the checkpoint, seal row, cut, build and rules/drop identities, array lengths and first differing
+index, and at most three items on each side for at most three subjects. Item metadata identifies
+the source claim, canonical position, state, incarnation, observation time and reset/drop status.
+It excludes content and stays outside reader answers and certificate digests. No additional copy
+or proof pass is made to collect it.
+Failure logging uses the existing bounded diagnostic limiter with a fixed stage/code bucket;
+repeated proofs within 60 seconds suppress output and report the suppressed count on the next
+allowed failure, with no scheduled flush or retry. Canonical source keys are cloned only for the
+reader's bounded history items during the proof and discarded afterward.
 
 **Stable.** A checkpoint is stable when every participant has published a verification that names
 the same participants and carries identical digests. Stability is a pure function of claims, like

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Opt-in read-after-write receipts and reactive IVM waits",
+  "replay": {"status": "none", "detail": "No read/open backfill or catch-up is enabled."},
+  "schema": {"status": "none", "detail": "Uses the explicitly installed IVM event identity, source cut and existing claims primary key."},
+  "rules": {"status": "none", "detail": "Canonical/admission/checkpoint rules remain unchanged."},
+  "compatibility": {"status": "changed", "detail": "Adds Rust APIs and a runnable example without routes or consumer migration. Local receipt identity is strict; foreign mapping is explicit."},
+  "downtime": {"status": "none", "detail": "No production activation or restart."},
+  "manual": {"status": "changed", "detail": "Adopters supply deadline/cancellation, certified source adapter and same-snapshot authority checks. See IVM_AFTER_WRITE.md."},
+  "recovery": {"status": "unknown", "detail": "Epoch/position/provider gaps require explicit resync. Production restore, checkpoint and authority coverage remain adapter gates."}
+}
