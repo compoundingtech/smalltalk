@@ -2881,6 +2881,9 @@ def start():
     pid_file.write_text(str(child.pid))
 if 'show' in args:
     print('LoadState=loaded\nActiveState=active\nSubState=running')
+elif 'st3-replication.service' in args and not (root / 'config/systemd/user/st3-replication.service').exists():
+    print('Failed to stop st3-replication.service: Unit not loaded.', file=sys.stderr)
+    sys.exit(5)
 elif 'st3.service' in args:
     if 'stop' in args or 'restart' in args or ('disable' in args and '--now' in args): stop()
     if 'start' in args or 'restart' in args: start()
@@ -2962,6 +2965,7 @@ PY
         if action == "reset" {
             assert!(!config.state_dir.join("must-be-erased").exists());
         }
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("Unit not loaded"));
         if matches!(action, "install" | "restart" | "reset") {
             Client::unix_as(&config.socket, PERSON)
                 .capabilities()

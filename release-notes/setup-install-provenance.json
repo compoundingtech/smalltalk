@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Uninstall removes executables copied by first-run setup from an extracted archive, and local service reset skips an absent replication unit.",
+  "replay": {"status": "none", "detail": "No claim replay or projection rebuilding changes."},
+  "schema": {"status": "none", "detail": "Setup uses the existing install.json file list consumed by uninstall; no graph schema changes."},
+  "rules": {"status": "none", "detail": "No rules or fleet transition changes."},
+  "compatibility": {"status": "changed", "detail": "When setup copies st3, st and pty into ~/.local/bin, it records their absolute paths in the user's st3 data directory. Managed executables kept in place and --install false are not adopted."},
+  "downtime": {"status": "none", "detail": "No automatic daemon restart or fleet downtime is added."},
+  "manual": {"status": "changed", "detail": "st uninstall can remove files recorded by future setup installs. Earlier unrecorded installs still require manual binary removal."},
+  "recovery": {"status": "changed", "detail": "The install record follows XDG_DATA_HOME or ~/.local/share and is saved atomically. Missing replication service files are skipped during stop, restart and uninstall; failures stopping installed units are reported."}
+}

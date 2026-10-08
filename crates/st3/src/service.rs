@@ -447,9 +447,7 @@ fn status_native_service() -> Result<ServiceStatusReport> {
 
 #[cfg(target_os = "linux")]
 fn restart_native_service(config: &Config) -> Result<()> {
-    let _ = Command::new("systemctl")
-        .args(["--user", "stop", REPLICATION_SERVICE_NAME])
-        .status();
+    stop_replication_systemd_user()?;
     run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
     if config.fleet_id.is_some() {
         run_command("systemctl", &["--user", "start", REPLICATION_SERVICE_NAME])?;
@@ -464,10 +462,16 @@ fn uninstall_native_service() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn stop_native_service() -> Result<()> {
-    let _ = Command::new("systemctl")
-        .args(["--user", "stop", REPLICATION_SERVICE_NAME])
-        .status();
+    stop_replication_systemd_user()?;
     run_command("systemctl", &["--user", "stop", SERVICE_NAME])
+}
+
+#[cfg(target_os = "linux")]
+fn stop_replication_systemd_user() -> Result<()> {
+    if replication_systemd_user_unit_path()?.exists() {
+        run_command("systemctl", &["--user", "stop", REPLICATION_SERVICE_NAME])?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -702,18 +706,14 @@ fn systemd_service_status(name: &str) -> Result<ServiceStatus> {
 
 #[cfg(target_os = "linux")]
 fn uninstall_systemd_user() -> Result<()> {
-    let _ = Command::new("systemctl")
-        .args(["--user", "disable", "--now", SERVICE_NAME])
-        .status();
-    let _ = Command::new("systemctl")
-        .args(["--user", "disable", "--now", REPLICATION_SERVICE_NAME])
-        .status();
     let unit_path = systemd_user_unit_path()?;
     if unit_path.exists() {
+        run_command("systemctl", &["--user", "disable", "--now", SERVICE_NAME])?;
         fs::remove_file(unit_path)?;
     }
     let replication_path = replication_systemd_user_unit_path()?;
     if replication_path.exists() {
+        run_command("systemctl", &["--user", "disable", "--now", REPLICATION_SERVICE_NAME])?;
         fs::remove_file(replication_path)?;
     }
     run_command("systemctl", &["--user", "daemon-reload"])
