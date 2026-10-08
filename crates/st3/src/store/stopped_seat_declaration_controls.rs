@@ -1,5 +1,5 @@
 const SEAT: &str = "agent/control/worker";
-const ACTOR: &str = "person/control-operator";
+const ACTOR: &str = "person/avery";
 
 fn publish(store: &Store, source: &str, key: &str) -> String {
     let intent = parse_intent(source, store.origin()).unwrap();
