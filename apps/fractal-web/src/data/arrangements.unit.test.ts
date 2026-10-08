@@ -256,6 +256,28 @@ describe('owner-wide arrangement inventory', () => {
     h.follow.close()
   })
 
+  it('refresh after a refusal during pagination aborts the stalled read before reopening', async () => {
+    const h = harness()
+    const stale = Promise.withResolvers<ArrangementPage>()
+    let fresh = false
+    h.answer((cursor) => cursor === undefined ? Promise.resolve(page([arrangement(1)], 'cursor/2')) : fresh ? Promise.resolve(page([arrangement(2, 'Fresh')])) : stale.promise)
+    await h.opened()
+    h.frame(initial)
+    await vi.waitFor(() => expect(h.calls).toEqual([undefined, 'cursor/2']))
+    h.frame({ kind: 'error', id: subscriptionId, collection: 'arrangements', message: 'forbidden', retryable: false })
+    expect(h.signals[1]!.aborted).toBe(false)
+    fresh = true
+    h.follow.refresh()
+    expect(h.signals[1]!.aborted).toBe(true)
+    await vi.waitFor(() => expect(h.sockets).toHaveLength(2))
+    await h.opened()
+    h.frame(initial)
+    await vi.waitFor(() => expect(h.names()).toEqual(['Refused', ['Arrangement 1', 'Fresh']]))
+    stale.resolve(page([arrangement(2, 'Stale')]))
+    expect(h.calls).toEqual([undefined, 'cursor/2', undefined, 'cursor/2'])
+    h.follow.close()
+  })
+
   it('binds the generated client request to the read signal', async () => {
     const requests: { url: string; signal: AbortSignal | null | undefined }[] = []
     const gateway = st3InventoryGateway({

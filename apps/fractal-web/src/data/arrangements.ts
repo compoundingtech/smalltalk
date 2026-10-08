@@ -171,7 +171,7 @@ export const followArrangementInventory = ({
         pending = current
         try {
           const inventory = await readArrangementInventory(gateway, owner, current.signal)
-          emit({ _tag: 'Complete', inventory })
+          if (!current.signal.aborted) emit({ _tag: 'Complete', inventory })
         } catch (error) {
           if (!dirty && !current.signal.aborted) emit({ _tag: 'ReadFailed', error: asError(error) })
         }
@@ -253,6 +253,8 @@ export const followArrangementInventory = ({
         } else void read()
         return
       }
+      // The socket ended or was refused mid-read: abandon that read; the new snapshot starts a fresh one.
+      pending?.abort()
       clearTimeout(timer)
       attempt = 0
       void open()
