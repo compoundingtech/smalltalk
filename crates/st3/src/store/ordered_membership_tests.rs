@@ -957,7 +957,8 @@ fn placement_migration_preserves_identity_folders_winners_and_real_actor() {
     assert_eq!(rows(&store)[0]["position"]["bucket"], FOLDER_A);
     assert_eq!(store.ordered_membership_count(CONTAINER).unwrap(), 1);
     assert_eq!(marker.actor, original.actor);
-    assert_eq!(store.claim_by_id(&original.id).unwrap().unwrap(), original);
+    assert_eq!(serde_json::to_value(store.claim_by_id(&original.id).unwrap().unwrap()).unwrap(),
+        serde_json::to_value(&original).unwrap());
     declare(&store, SEAT_B, "true", "migration-restore-b");
     declare(&store, SEAT_C, "true", "migration-restore-c");
     assert_eq!(store.ordered_membership_count(CONTAINER).unwrap(), 3);

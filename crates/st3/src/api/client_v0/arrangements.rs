@@ -349,7 +349,7 @@ mod tests {
             Extension(session), Json(request(&state, "migration-old-write", json!([
                 {"op":"subject.place","subject":"agent/missing/seat","folder":null,"key":"a9"}
             ])))).await.unwrap_err();
-        assert_eq!(error.code, ErrorCode::InvalidArrangementOperations);
+        assert_eq!(error.code, st3_client::ErrorCode::InvalidArrangementOperations);
         assert_eq!(state.store.index().unwrap(), index);
     }
 
