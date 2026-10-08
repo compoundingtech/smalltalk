@@ -483,9 +483,21 @@ fn optional_systemd_command(name: &str, arguments: &[&str]) -> Result<()> {
     }
     // A unit file may be gone while its service remains loaded. Only the manager can
     // establish that a failed stop/disable addressed an absent, inactive unit.
-    let status = systemd_service_status(name)?;
+    let status = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            name,
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--no-pager",
+        ])
+        .output()
+        .with_context(|| format!("check whether {name} is absent"))?;
+    let states = String::from_utf8_lossy(&status.stdout);
     anyhow::ensure!(
-        !status.installed && !status.running,
+        states.lines().any(|line| line == "LoadState=not-found")
+            && states.lines().any(|line| line == "ActiveState=inactive"),
         "systemctl {} failed with {}: {}",
         arguments.join(" "),
         output.status,
