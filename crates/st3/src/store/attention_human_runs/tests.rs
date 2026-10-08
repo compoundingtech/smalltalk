@@ -394,3 +394,113 @@ fn canonical_stop_arrangement_tracks_rekeys_removals_rollback_and_isolated_names
     );
     tx.commit().unwrap();
 }
+
+#[test]
+fn native_planning_and_revision_runs_survive_public_clock_filter_and_retract_separately() {
+    let (store, origin, _) = person_work::tests::fixture();
+    let ns = namespace(&store, "fixture/human-approvals");
+    let run = store.mission_run(&origin.run).unwrap().unwrap();
+    let kdl = "version 2\nmission \"human-approval-fixture\" state=\"ready\" { goal \"Review an invented plan\" }";
+    let intent = crate::graph::parse_test_intent(kdl, "alder").unwrap();
+    let mission = store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: kdl.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    let doc = store
+        .put_document(
+            "doc/human-approval-fixture/request",
+            b"Review an invented plan",
+            &None,
+            "human-approval-request",
+        )
+        .unwrap();
+    let reference = format!("{}@{}", doc.name, doc.hash);
+    let captured = now_ms();
+    store.set_write_clock_at(captured + 60_000).unwrap();
+    let planning = "planning-session/fixture-human-approval";
+    for (kind, fields) in [
+        (
+            "started",
+            json!({"mission":"mission/human-approval-fixture","request":reference,"workspace":"/tmp","requester":"person/avery","planner":"agent/alder.asker","target_run":run.subject,"target_generation":run.generation}),
+        ),
+        (
+            "candidate-submitted",
+            json!({"candidate_revision":1,"markdown":reference,"kdl":reference,"mission_revision":"fixture-plan-one"}),
+        ),
+        (
+            "previewed",
+            json!({"candidate_revision":1,"preview_hash":"fixture-preview-one","store_index":mission.store_index,"graph":"fixture","diff":"new","mission":mission}),
+        ),
+    ] {
+        append(
+            &store,
+            planning,
+            &format!("planning-session.{kind}"),
+            "person/avery",
+            fields,
+        );
+    }
+    let revision = "revision-proposal/fixture-human-approval";
+    append(
+        &store,
+        revision,
+        "revision-proposal.created",
+        "person/avery",
+        json!({
+            "run":run.subject,"source_generation":run.generation,"candidate_revision":run.revision,
+            "reason":"Review the invented revision","status":"pending-approval","cutover":"restart-active",
+            "compatible_steps":[],"reviewers":["person/avery","person/operator"],"preview_hash":"fixture-revision-preview"
+        }),
+    );
+    let raw = store.mission_run_attention_items(None).unwrap();
+    assert!(
+        raw.iter()
+            .any(|item| item.kind == "launch-approval" && item.subject == planning)
+    );
+    assert_eq!(
+        raw.iter()
+            .filter(|item| item.kind == "revision-approval" && item.subject == revision)
+            .count(),
+        2
+    );
+    assert!(store.attention_snapshot(None, captured).unwrap().is_empty());
+    assert_eq!(
+        refresh(&store, &ns, captured),
+        BTreeSet::from([run.subject.clone()])
+    );
+    {
+        let c = store.readers.get();
+        let selected = selected(&c, &ns, &[run.subject.clone()], captured).unwrap();
+        assert!(selected[0].waiting);
+        assert_eq!(
+            selected[0].next_deadline, None,
+            "approval membership has no common public clock filter"
+        );
+    }
+    append(
+        &store,
+        planning,
+        "planning-session.approved",
+        "person/avery",
+        json!({"mission_revision":"fixture-plan-one","requester":"person/avery"}),
+    );
+    assert_eq!(
+        refresh(&store, &ns, captured),
+        BTreeSet::from([run.subject.clone()])
+    );
+    append(
+        &store,
+        revision,
+        "revision-proposal.cancelled",
+        "person/avery",
+        json!({"status":"cancelled","reason":"Question withdrawn"}),
+    );
+    assert!(refresh(&store, &ns, captured).is_empty());
+    store.replay_replication_graph().unwrap();
+    assert!(refresh(&store, &ns, captured).is_empty());
+}
