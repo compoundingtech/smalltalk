@@ -1,4 +1,5 @@
-// Portable SyncStatus Amendment v2 contract.
+// Exact mirror of the kit's portable SyncStatus Amendment v2 contract.
+// The app's feedSync.ts proves equality without coupling the standalone SDK to the UI kit.
 /** Portable decoded observations. All timestamps are epoch milliseconds supplied by the host. */
 export type SyncStage = 'queued' | 'resolving' | 'routing' | 'reading'
 export type StaleReason =
