@@ -141,8 +141,9 @@ before each paid message. The first authentication or rate-limit error blocks al
 later upstream calls and stops the pair; no third attempt or silent retry is allowed.
 The HTTPS proxy uses a temporary guest certificate and `NODE_EXTRA_CA_CERTS`, only
 for the provider process, while retaining Claude's normal Anthropic endpoint.
-Setting a loopback `ANTHROPIC_BASE_URL` disabled channels in the retained native
-trial. The proxy forwards real provider responses; it supplies no model stand-in.
+The retained native loopback `ANTHROPIC_BASE_URL` trial reported unavailable
+channels; the later final corrected trial also reported this under the normal
+endpoint/proxy route. The admission cause remains unresolved. The proxy forwards real provider responses; it supplies no model stand-in.
 Other native metadata endpoints pass through without being recorded as model calls.
 
 Ada answers only actual current Home questions for this run and attempt, reads the
@@ -176,6 +177,18 @@ and preserves native tool-result/context fields. Its sanitized native-shape and
 HTTPS first-error guard tests pass, but the correction has not been rerun against
 the provider. Both paid attempts are exhausted: obtain a separate, specific rerun
 authorization before using this runner again for that evaluation.
+
+The owner later authorized one final corrected pair. Controls were pinned before
+launch and thirty offline guard tests passed. Its first fresh guest completed native
+welcome and consent, then the managed Claude seat explicitly reported unavailable
+channels. It made zero model/count requests and 25 successful metadata requests,
+with zero new usage cost. The pair stopped at that mechanical failure; variant2 was
+not run, and no repair, restart or provider diagnostic followed. The ordinary cleanup
+stopped the expert and cancelled the run, both exit0, checked credential privacy and
+removed the guest. [Final corrected evidence](../scripts/onboarding-evidence/2026-10-08/content-final-corrected.json)
+pins the new raw receipt bundle alongside both original failed outcomes. All gates
+remain untested, the count fix has no provider retest, and another attempt needs new
+owner authorization. The combined paid usage cost remains $0.070646.
 
 Each scenario writes `result.json` and `report.md` under OUT/RELEASE-SCENARIO, with
 exact commands, exit codes, separate stdout/stderr and elapsed seconds. Output
