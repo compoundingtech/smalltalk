@@ -13,8 +13,8 @@ export function observeSyncStatus(previous: SyncObservation | undefined, status:
 }
 const plainMessages: Readonly<Record<string, string>> = {
   'not-found': 'the requested resource was not found',
-  internal: 'st could not complete the read',
-  unavailable: 'the owner host is unavailable',
+  internal: 'the server could not complete the request',
+  unavailable: 'the server is unavailable',
   'subscription-limit': 'too many active subscriptions; close an unused pane and retry',
 }
 /** Shared vocabulary home for the workshop; intended to become the SDK-independent st3-views export. */
@@ -37,22 +37,21 @@ export function syncLine({ status, label, now, observedAt, gateway, socket = fal
       break
     case 'Requested':
       if (since < 400) return undefined
-      if (since >= 5000) { text = `No reply from st for ${Math.floor(since / 1000)}s`; announce = 'No reply from st'; tone = 'warning' }
-      else { text = `Asked st for ${label} · ${Math.floor(since / 1000)}s`; announce = `Asked st for ${label}` }
+      if (since >= 5000) { text = `Loading ${label} is taking longer than expected · ${Math.floor(since / 1000)}s`; announce = `Loading ${label} is taking longer than expected`; tone = 'warning' }
+      else { text = `Loading ${label}… · ${Math.floor(since / 1000)}s`; announce = `Loading ${label}` }
       break
     case 'Progress': {
       const stageAge = since
       const reportAge = Math.max(0, now - status.reportedAt)
       const elapsed = status.elapsedMs + reportAge
       if (elapsed < 400) return undefined
-      if (reportAge >= 5000) { text = `st stopped reporting at ${status.stage} · ${Math.floor(reportAge / 1000)}s`; announce = `st stopped reporting at ${status.stage}`; tone = 'warning'; break }
+      if (reportAge >= 5000) { text = `Loading ${label} · no update for ${Math.floor(reportAge / 1000)}s`; announce = `Loading ${label} · waiting for an update`; tone = 'warning'; break }
       animate = true
-      const host = status.host === undefined ? '' : ` on ${status.host}`
       switch (status.stage) {
-        case 'queued': text = `Queued at st · ${Math.floor(elapsed / 1000)}s`; announce = 'Queued at st'; break
-        case 'resolving': text = `Finding where this conversation lives · ${Math.floor(elapsed / 1000)}s${host}`; announce = `Finding where this conversation lives${host}`; break
-        case 'routing': text = `Waiting on ${status.host ?? 'owner host'} · ${Math.floor(elapsed / 1000)}s`; announce = `Waiting on ${status.host ?? 'owner host'}`; break
-        case 'reading': text = status.done !== undefined && status.total !== undefined ? `Reading ${label} · ${status.done} of ${status.total}${host}` : `Reading ${label} · ${Math.floor(elapsed / 1000)}s${host}`; announce = `Reading ${label}${host}`; break
+        case 'queued': text = `Waiting to load ${label} · ${Math.floor(elapsed / 1000)}s`; announce = `Waiting to load ${label}`; break
+        case 'resolving': text = `Finding ${label} · ${Math.floor(elapsed / 1000)}s`; announce = `Finding ${label}`; break
+        case 'routing': text = `Connecting to ${label} · ${Math.floor(elapsed / 1000)}s`; announce = `Connecting to ${label}`; break
+        case 'reading': text = status.done !== undefined && status.total !== undefined ? `Loading ${label} · ${status.done} of ${status.total}` : `Loading ${label}… · ${Math.floor(elapsed / 1000)}s`; announce = `Loading ${label}`; break
       }
       if (stageAge >= 10000) { text += ' · slow'; announce += ' · slow'; tone = 'warning' }
       break
@@ -66,16 +65,16 @@ export function syncLine({ status, label, now, observedAt, gateway, socket = fal
       switch (status.reason._tag) {
         case 'Evicted': return undefined
         case 'Unknown':
-          text = lastLive === undefined ? `Stale · observed ${Math.floor(since / 1000)}s ago` : `Stale · ${Math.floor(Math.max(0, now - lastLive) / 1000)}s since last live`
-          announce = 'Stale'
+          text = lastLive === undefined ? `Waiting for an update · ${Math.floor(since / 1000)}s` : `Last updated ${Math.floor(Math.max(0, now - lastLive) / 1000)}s ago`
+          announce = 'Waiting for an update'
           break
         case 'Resync':
           if (since < 400) return undefined
-          text = `${asOf} · st retrying: ${plainMessages[status.reason.code] ?? status.reason.message}`; announce = `st retrying: ${plainMessages[status.reason.code] ?? status.reason.message}`; break
-        case 'Quiet': text = `Last heard from st ${Math.floor(Math.max(0, now - status.reason.lastFrameAt) / 1000)}s ago`; announce = 'No heartbeat from st'; break
+          text = `${asOf} · retrying: ${plainMessages[status.reason.code] ?? 'the previous request did not complete'}`; announce = `Retrying ${label}`; break
+        case 'Quiet': text = `No update for ${Math.floor(Math.max(0, now - status.reason.lastFrameAt) / 1000)}s`; announce = 'Waiting for an update'; break
         case 'Reconnecting':
           if (since < 2000) return undefined
-          text = socket ? `Reconnecting in ${Math.ceil(Math.max(0, status.reason.nextAt - now) / 1000)}s · attempt ${status.reason.attempt} · ${status.reason.issue}` : `${asOf} · reconnecting`; announce = 'Reconnecting'; break
+          text = socket ? `Reconnecting in ${Math.ceil(Math.max(0, status.reason.nextAt - now) / 1000)}s · attempt ${status.reason.attempt}` : `${asOf} · reconnecting`; announce = 'Reconnecting'; break
       }
       break
     }
@@ -83,13 +82,13 @@ export function syncLine({ status, label, now, observedAt, gateway, socket = fal
       tone = 'error'
       switch (status.cause._tag) {
         case 'Server':
-          text = status.cause.code === 'forbidden' ? `No access to ${label} · ask the gateway owner` : status.cause.code === 'unsupported' ? `This gateway doesn't serve ${label}` : `Couldn't load ${label}: ${plainMessages[status.cause.code] ?? status.cause.message}`
+          text = status.cause.code === 'forbidden' ? `No access to ${label} · ask an administrator` : status.cause.code === 'unsupported' ? `${label} is not available here` : `Couldn't load ${label}: ${plainMessages[status.cause.code] ?? 'the request did not complete'}`
           break
         case 'Local':
-          text = status.cause.kind === 'subscription-limit' ? `Couldn't load ${label}: too many active subscriptions${status.cause.detail?.cap === undefined ? '' : ` (cap ${status.cause.detail.cap})`}; close an unused pane and retry` : `Couldn't load ${label}: ${status.cause.detail?.message ?? status.cause.kind}`
+          text = status.cause.kind === 'subscription-limit' ? `Couldn't load ${label}: too many active subscriptions${status.cause.detail?.cap === undefined ? '' : ` (cap ${status.cause.detail.cap})`}; close an unused pane and retry` : `Couldn't load ${label}: the request did not complete`
           break
         case 'Unknown':
-          text = `Couldn't load ${label} · cause unknown`
+          text = `Couldn't load ${label}. Try again.`
           break
       }
       announce = text
