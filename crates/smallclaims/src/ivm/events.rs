@@ -1025,6 +1025,14 @@ mod source_progress {
         })
     }
 
+    fn bounded_reason(reason: &str) -> String {
+        let mut end = reason.len().min(1024);
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason[..end].into()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1159,11 +1167,4 @@ mod source_progress {
         }
     }
 
-    fn bounded_reason(reason: &str) -> String {
-        let mut end = reason.len().min(1024);
-        while !reason.is_char_boundary(end) {
-            end -= 1;
-        }
-        reason[..end].into()
-    }
 }
