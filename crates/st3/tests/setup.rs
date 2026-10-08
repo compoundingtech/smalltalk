@@ -114,6 +114,210 @@ fn success(output: &Output) -> String {
 }
 
 #[test]
+fn archive_setup_records_its_files_for_uninstall_in_the_selected_data_home() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    for custom_data_home in [false, true] {
+        let fixture = Fixture::new();
+        fixture.unpack_archive();
+        let data = if custom_data_home {
+            fixture.path("custom-data")
+        } else {
+            fixture.path("home/.local/share")
+        };
+        let run = |executable: &Path, args: &[&str]| {
+            let mut command = fixture.command(executable);
+            if custom_data_home {
+                command.env("XDG_DATA_HOME", &data);
+            }
+            command.args(args).output().unwrap()
+        };
+        success(&run(
+            &fixture.path("archive/st"),
+            &[
+                "setup",
+                "--person",
+                "ada",
+                "--node",
+                "studio",
+                "--yes",
+                "--service",
+                "false",
+                "--start",
+                "false",
+            ],
+        ));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(data.join("st3/install.json")).unwrap()).unwrap();
+        for name in ["st3", "st", "pty"] {
+            let installed = fixture.path(&format!("home/.local/bin/{name}"));
+            assert!(
+                manifest["files"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(installed))
+            );
+        }
+        let installed = fixture.path("home/.local/bin/st");
+        if custom_data_home {
+            success(&run(
+                &installed,
+                &[
+                    "uninstall",
+                    "--yes",
+                    "--erase-local-graph",
+                    "--no-service",
+                    "--keep-binaries",
+                ],
+            ));
+            for name in ["st3", "st", "pty"] {
+                assert!(fixture.path(&format!("home/.local/bin/{name}")).exists());
+            }
+            // Setup is the archive installer again, so it can record this second install.
+            success(&run(
+                &fixture.path("archive/st"),
+                &[
+                    "setup",
+                    "--person",
+                    "ada",
+                    "--node",
+                    "studio",
+                    "--yes",
+                    "--service",
+                    "false",
+                    "--start",
+                    "false",
+                ],
+            ));
+        }
+        let dry = success(&run(&installed, &["uninstall", "--dry-run"]));
+        assert!(!dry.contains("no release install manifest"), "{dry}");
+        for name in ["st3", "st", "pty"] {
+            assert!(
+                dry.contains(&format!(
+                    "remove\t{}",
+                    fixture.path(&format!("home/.local/bin/{name}")).display()
+                )),
+                "{dry}"
+            );
+        }
+        success(&run(
+            &installed,
+            &["uninstall", "--yes", "--erase-local-graph", "--no-service"],
+        ));
+        for name in ["st3", "st", "pty"] {
+            assert!(
+                fs::symlink_metadata(fixture.path(&format!("home/.local/bin/{name}"))).is_err()
+            );
+            assert!(
+                fixture.path(&format!("archive/{name}")).exists(),
+                "source archive is preserved"
+            );
+        }
+        assert!(!data.join("st3").exists());
+    }
+}
+
+#[test]
+fn setup_does_not_claim_managed_executables_or_no_install_runs() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.unpack_archive();
+    success(&fixture.setup_config_only(&[]));
+    assert!(!fixture.path("home/.local/share/st3/install.json").exists());
+    let record = fixture.path("home/.local/share/st3/install.json");
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    fs::write(&record, b"existing managed installation record").unwrap();
+    let output = fixture
+        .command(&fixture.path("archive/st"))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fixture.path("archive").display(),
+                fixture.path("bin").display()
+            ),
+        )
+        .args(["setup", "--yes", "--service", "false", "--start", "false"])
+        .output()
+        .unwrap();
+    success(&output);
+    assert!(!fixture.path("home/.local/bin/st3").exists());
+    assert_eq!(
+        fs::read(&record).unwrap(),
+        b"existing managed installation record"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn removing_services_skips_absent_replication_but_preserves_installed_unit_errors() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.path("bin/systemctl"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/manager.log"
+if [ "$2" = show ]; then
+    if [ -f "$HOME/.config/systemd/user/$3" ] || { [ "$3" = st3-replication.service ] && [ -f "$HOME/loaded-replication" ]; }; then
+        printf 'LoadState=loaded\nActiveState=active\nSubState=running\n'
+        exit 0
+    fi
+    printf 'LoadState=not-found\nActiveState=inactive\nSubState=dead\n'
+    exit 4
+fi
+case "$*" in
+    *st3-replication.service*) echo 'replication unit denied' >&2; exit 7;;
+    *st3.service*) echo 'Unit not loaded' >&2; exit 5;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(
+        fixture.path("bin/systemctl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let output = fixture
+        .cli()
+        .args(["service", "uninstall"])
+        .output()
+        .unwrap();
+    success(&output);
+    assert!(output.stderr.is_empty());
+    let log = fixture.path("home/manager.log");
+    assert!(
+        fs::read_to_string(&log)
+            .unwrap()
+            .ends_with("--user daemon-reload\n")
+    );
+    fs::write(&log, "").unwrap();
+    let unit = fixture.path("home/.config/systemd/user/st3-replication.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "installed replication unit").unwrap();
+    for file_present in [true, false] {
+        if !file_present {
+            fs::remove_file(&unit).unwrap();
+            fs::write(fixture.path("home/loaded-replication"), "loaded service").unwrap();
+        }
+        let output = fixture
+            .cli()
+            .args(["service", "uninstall"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("replication unit denied"));
+        assert_eq!(unit.exists(), file_present);
+        assert!(!fs::read_to_string(&log).unwrap().contains("daemon-reload"));
+    }
+}
+
+#[test]
 fn flags_merge_config_without_prompting_and_invalid_names_do_not_write() {
     let fixture = Fixture::new();
     let config = fixture.path("home/.config/st3/config.toml");

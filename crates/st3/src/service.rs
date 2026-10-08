@@ -447,9 +447,10 @@ fn status_native_service() -> Result<ServiceStatusReport> {
 
 #[cfg(target_os = "linux")]
 fn restart_native_service(config: &Config) -> Result<()> {
-    let _ = Command::new("systemctl")
-        .args(["--user", "stop", REPLICATION_SERVICE_NAME])
-        .status();
+    optional_systemd_command(
+        REPLICATION_SERVICE_NAME,
+        &["--user", "stop", REPLICATION_SERVICE_NAME],
+    )?;
     run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
     if config.fleet_id.is_some() {
         run_command("systemctl", &["--user", "start", REPLICATION_SERVICE_NAME])?;
@@ -464,10 +465,45 @@ fn uninstall_native_service() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn stop_native_service() -> Result<()> {
-    let _ = Command::new("systemctl")
-        .args(["--user", "stop", REPLICATION_SERVICE_NAME])
-        .status();
+    optional_systemd_command(
+        REPLICATION_SERVICE_NAME,
+        &["--user", "stop", REPLICATION_SERVICE_NAME],
+    )?;
     run_command("systemctl", &["--user", "stop", SERVICE_NAME])
+}
+
+#[cfg(target_os = "linux")]
+fn optional_systemd_command(name: &str, arguments: &[&str]) -> Result<()> {
+    let output = Command::new("systemctl")
+        .args(arguments)
+        .output()
+        .with_context(|| format!("run systemctl {}", arguments.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // A unit file may be gone while its service remains loaded. Only the manager can
+    // establish that a failed stop/disable addressed an absent, inactive unit.
+    let status = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            name,
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--no-pager",
+        ])
+        .output()
+        .with_context(|| format!("check whether {name} is absent"))?;
+    let states = String::from_utf8_lossy(&status.stdout);
+    anyhow::ensure!(
+        states.lines().any(|line| line == "LoadState=not-found")
+            && states.lines().any(|line| line == "ActiveState=inactive"),
+        "systemctl {} failed with {}: {}",
+        arguments.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -702,12 +738,11 @@ fn systemd_service_status(name: &str) -> Result<ServiceStatus> {
 
 #[cfg(target_os = "linux")]
 fn uninstall_systemd_user() -> Result<()> {
-    let _ = Command::new("systemctl")
-        .args(["--user", "disable", "--now", SERVICE_NAME])
-        .status();
-    let _ = Command::new("systemctl")
-        .args(["--user", "disable", "--now", REPLICATION_SERVICE_NAME])
-        .status();
+    optional_systemd_command(SERVICE_NAME, &["--user", "disable", "--now", SERVICE_NAME])?;
+    optional_systemd_command(
+        REPLICATION_SERVICE_NAME,
+        &["--user", "disable", "--now", REPLICATION_SERVICE_NAME],
+    )?;
     let unit_path = systemd_user_unit_path()?;
     if unit_path.exists() {
         fs::remove_file(unit_path)?;

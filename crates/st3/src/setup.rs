@@ -561,8 +561,32 @@ fn install_binaries(executable: &Path) -> Result<PathBuf> {
         fs::rename(pending.path().join("st"), &link)?;
     }
     File::open(&bin)?.sync_all()?;
+    record_installed_binaries(&bin)?;
     println!("Installed st3, st and pty in {}", bin.display());
     Ok(target)
+}
+
+fn record_installed_binaries(bin: &Path) -> Result<()> {
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"))
+        .join("st3");
+    fs::create_dir_all(&data)?;
+    let bin = fs::canonicalize(bin)?;
+    let manifest = serde_json::json!({
+        "version": 1,
+        "source": "setup",
+        "files": [bin.join("st3"), bin.join("st"), bin.join("pty")],
+    });
+    let mut pending = tempfile::NamedTempFile::new_in(&data)?;
+    pending.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
+    pending.as_file().sync_all()?;
+    pending
+        .persist(data.join("install.json"))
+        .context("record setup-installed executables for st uninstall")?;
+    File::open(&data)?.sync_all()?;
+    Ok(())
 }
 
 fn check_login_path(executable: &Path) {
