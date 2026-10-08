@@ -448,7 +448,13 @@ fn registry_rejects_duplicate_lifetimes_and_managed_hooks_roll_back() {
             .unwrap(),
         2
     );
-    assert!(reopened.ivm_publisher().unwrap().is_some());
+    let prepared = reopened
+        .prepared_ivm_publisher()
+        .expect("publisher prepared before exposure");
+    assert!(Arc::ptr_eq(
+        &prepared,
+        &reopened.ivm_publisher().unwrap().unwrap()
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -13,7 +13,7 @@ pub struct SmalltalkRuntime {
     pub(crate) collection_sources: Option<Arc<collection_reactor::Registry>>,
     pub(crate) collection_reactor: Mutex<Option<collection_reactor::Reactor>>,
     /// Receipt waits and collection sockets share this one commit observer. Publisher
-    /// construction is serialized, including simultaneous first subscriptions.
+    /// construction finishes before explicit source/view Store exposure; consumers clone it.
     pub(crate) ivm_publisher: Mutex<Option<Arc<smallclaims::ivm::events::Publisher>>>,
     pub(crate) mailbox_wakes: std::sync::OnceLock<Arc<mailbox_wakes::Wakes>>,
     #[cfg(test)]
@@ -483,6 +483,7 @@ mod ivm_attachment_tests {
     fn ordinary_store_does_not_install_or_attach_shadow_views() {
         let store = Store::open_memory("alder").unwrap();
         assert!(store.ivm_views().is_none());
+        assert!(store.prepared_ivm_publisher().is_none());
         assert!(store.ivm_publisher().unwrap().is_none());
         let installed: bool = store
             .readers
@@ -509,6 +510,9 @@ mod ivm_attachment_tests {
             boundary(&store, &views).availability.readiness,
             Readiness::Ready(_)
         ));
+        let prepared = store
+            .prepared_ivm_publisher()
+            .expect("publisher prepared at open");
         let start = Arc::new(Barrier::new(8));
         let threads = (0..8)
             .map(|_| {
@@ -532,6 +536,7 @@ mod ivm_attachment_tests {
             &store.ivm_publisher().unwrap().unwrap(),
             &publishers[0]
         ));
+        assert!(Arc::ptr_eq(&prepared, &publishers[0]));
         let mut socket = publishers[0].subscribe();
         let mut receipt = publishers[1].subscribe();
         store

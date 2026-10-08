@@ -2684,27 +2684,38 @@ impl Store {
         Ok(true)
     }
 
-    /// Lazily attach the one Store publisher shared by receipt waits and collection
-    /// consumers. Registration and journal installation happen when the Store opens.
-    /// Attachment errors are returned on each call until attachment succeeds; failures
-    /// are not cached. A successful attachment is shared by all later callers.
+    /// Clone startup-prepared state only. This getter executes no SQL and never
+    /// attaches an observer, installs state, starts work, or repairs a cache.
+    pub fn prepared_ivm_publisher(&self) -> Option<Arc<smallclaims::ivm::events::Publisher>> {
+        self.smalltalk
+            .ivm_publisher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Receipt and collection consumers share the publisher prepared before Store
+    /// exposure. Absence is truthful not-ready; requests never initialize it.
     pub fn ivm_publisher(&self) -> Result<Option<Arc<smallclaims::ivm::events::Publisher>>> {
+        Ok(self.prepared_ivm_publisher())
+    }
+
+    fn prepare_ivm_publisher(&self) -> Result<()> {
         if self.smalltalk.ivm_views.is_none() {
-            return Ok(None);
+            return Ok(());
         }
         let mut publisher = self
             .smalltalk
             .ivm_publisher
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(publisher) = &*publisher {
-            return Ok(Some(publisher.clone()));
-        }
-        let attached = Arc::new(smallclaims::ivm::events::Publisher::attach(&self.graph, 128)?);
-        *publisher = Some(attached.clone());
-        Ok(Some(attached))
+        anyhow::ensure!(publisher.is_none(), "Store publisher already prepared");
+        *publisher = Some(Arc::new(smallclaims::ivm::events::Publisher::attach(
+            &self.graph,
+            128,
+        )?));
+        Ok(())
     }
-
     pub fn open(path: &Path, origin: impl Into<String>) -> Result<Self> {
         let smalltalk = Arc::new(SmalltalkRuntime::default());
         #[cfg_attr(not(test), allow(unused_mut))]
@@ -2726,7 +2737,9 @@ impl Store {
     ) -> Result<Self> {
         let smalltalk = Arc::new(SmalltalkRuntime::with_ivm_views(views));
         let graph = GraphStore::open(path, origin, smalltalk.clone())?;
-        Ok(Self { graph, smalltalk })
+        let store = Self { graph, smalltalk };
+        store.prepare_ivm_publisher()?;
+        Ok(store)
     }
 
     /// Explicit independent native sources beside the existing authority runtime. Each
@@ -2742,7 +2755,9 @@ impl Store {
         let smalltalk = Arc::new(SmalltalkRuntime::with_collection_sources(registry.clone()));
         let graph = GraphStore::open(path, origin, smalltalk.clone())?;
         registry.install_hooks(&graph.connection)?;
-        Ok(Self { graph, smalltalk })
+        let store = Self { graph, smalltalk };
+        store.prepare_ivm_publisher()?;
+        Ok(store)
     }
 
     /// Open a shared-memory store for sequential fixtures and short-lived tools.
