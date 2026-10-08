@@ -4,6 +4,7 @@ import { ActionBarPrimitive, MessagePrimitive, ThreadPrimitive, useAuiState } fr
 import { Button, ProgressBar } from 'react-aria-components'
 import type { ConversationItem, SendState, TextItem } from '../embrace-data/model'
 import { EmbraceScrollViewport } from '../EmbraceScrollViewport'
+import { EmbraceMessage } from '../EmbraceThread'
 import { WorkLogV1 } from '../taste/WorkLogV1'
 import { formatWorkDuration, workLogOutputLanguage, type WorkLogCall, type WorkLogTurn } from '../taste/work-log'
 import { SyncLine } from '../st3-views/SyncLine'
@@ -44,8 +45,9 @@ const SenderCaption = React.createContext<string | undefined>(undefined)
 function TranscriptMessage() {
   const item = useAuiState(state => state.message.metadata.custom.item) as ConversationItem | undefined
   const caption = React.useContext(SenderCaption)
-  if (item?._tag !== 'Text') return null
-  return item.role === 'user' ? <UserMessage item={{ ...item, role: 'user' }} /> : item.role === 'assistant' ? <AgentMessage item={{ ...item, role: 'assistant' }} senderLine={caption} /> : null
+  if (item === undefined) return null
+  if (item._tag !== 'Text' || item.role === 'system') return <EmbraceMessage />
+  return item.role === 'user' ? <UserMessage item={{ ...item, role: 'user' }} /> : <AgentMessage item={{ ...item, role: 'assistant' }} senderLine={caption} />
 }
 const messageComponents = { Message: TranscriptMessage }
 export function UserMessage({ item }: { readonly item: TextItem & { readonly role: 'user' } }) {
@@ -81,7 +83,7 @@ const PreparedTurn = React.memo(function PreparedTurn({ turn, onOpenTool, onRetr
   return <section data-testid="transcript-turn" data-item-id={turn.id} {...stylex.props(styles.turn)}>
     <ThreadPrimitive.Unstable_MessageById messageId={turn.prompt.id} components={messageComponents} />
     <WorkLogV1 turn={turn.work} ariaLabel={`Work log ${turn.id}`} listStyle={styles.workList} renderCallDetail={detail} previewCallDetail={!turn.work.running} hideLiveRow onRetry={onRetryRun} onOpenOutput={onOpenTool} expandedBody={turn.items.filter(item => item._tag === 'Reasoning').map(item => <ThinkingEntry key={item.id} text={item.text} streaming={item.streaming} />)} />
-    {turn.items.filter(item => item._tag === 'Text' && item.role === 'assistant').map(item => <SenderCaption.Provider key={item.id} value={turn.senderCaptions?.[item.id]}><ThreadPrimitive.Unstable_MessageById messageId={item.id} components={messageComponents} /></SenderCaption.Provider>)}
+    {turn.items.filter(item => item._tag !== 'ToolCall' && item._tag !== 'Reasoning').map(item => <SenderCaption.Provider key={item.id} value={turn.senderCaptions?.[item.id]}><ThreadPrimitive.Unstable_MessageById messageId={item.id} components={messageComponents} /></SenderCaption.Provider>)}
     {turn.work.running && <div data-testid="live-work" role="status" aria-label="Response in progress" {...stylex.props(styles.liveActivity)}><span aria-hidden="true">◌</span></div>}
   </section>
 })
@@ -89,8 +91,8 @@ const PreparedTurn = React.memo(function PreparedTurn({ turn, onOpenTool, onRetr
 export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, onRetrySync, onRetryRun, availability = { _tag: 'Available' }, history = { _tag: 'Complete' }, emptyState }: TranscriptProps) {
   const messages = useAuiState(state => state.thread.messages)
   const committed = React.useMemo(() => {
-    const sources = new Map(messages.map(message => [message.id, message.metadata.custom.item]))
-    return turns.filter(turn => sources.get(turn.prompt.id) === turn.prompt && turn.items.every(item => sources.get(item.id) === item))
+    const ids = new Set(messages.map(message => message.id))
+    return turns.filter(turn => ids.has(turn.prompt.id) && turn.items.every(item => ids.has(item.id)))
   }, [messages, turns])
   const running = [...committed].reverse().find(turn => turn.work.running)
   const progress = sync._tag === 'Progress' && sync.stage === 'reading' && sync.done !== undefined && sync.total !== undefined ? sync : undefined
@@ -106,7 +108,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
       {committed.length > 0 && <SyncLine status={sync} label="conversation" now={now} observedAt={observedAt} onRetry={onRetrySync} />}
       {running !== undefined && <><div role="progressbar" aria-label="Run in progress" aria-valuetext="Running" data-testid="run-progress" {...stylex.props(styles.runningProgress)}><span {...stylex.props(styles.runningSegment)} /></div><span data-testid="run-elapsed">Running{Number.isFinite(started) && started <= now ? ` · ${formatWorkDuration(now - started) || '<1s'}` : ''}</span></>}
     </header>
-    <ErrorOverlayHost><EmbraceScrollViewport items={committed} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(styles.content)}>
+    <ErrorOverlayHost lane><EmbraceScrollViewport items={committed} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(styles.content)}>
       {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
       {committed.length === 0 ? empty : <div {...stylex.props(styles.timeline)}>{committed.map(turn => <PreparedTurn key={turn.id} turn={turn} onOpenTool={onOpenTool} onRetryRun={onRetryRun} />)}</div>}
     </EmbraceScrollViewport>{failure?.tone === 'error' && <ErrorOverlay id={`sync-${failure.text}`} title={failure.text} detail="History stays on screen." onRetry={onRetrySync} />}</ErrorOverlayHost>
