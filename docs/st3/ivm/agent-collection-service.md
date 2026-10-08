@@ -37,15 +37,20 @@ shares one deletion budget with the Kernel reclaimer.
 Maintenance never ticks a permanently pending source repeatedly. Private indexed
 queue acknowledgments and finite cursor advances measure scheduling progress;
 they grant no coverage or readiness. After a page makes no progress, an unchanged
-SourcePosition waits for new captured input or a newly due deadline. An idle,
-current boundary performs no maintenance write.
+SourcePosition waits for new captured input or a newly due deadline. Staging
+catch-up can apply a previously queued clock after that wait starts; genuine
+acknowledgments and net forward seeks during catch-up permit another finite page.
+Cursor advance followed by a wrap inside one callback does not count as progress.
+An idle, current boundary performs no maintenance write.
 
-This constructor pin is for composition controls. Initial publication and a real
-managed write have passed local Service controls; actual provider/socket,
-reconnect, paired consumer authority and deployed callback profiling remain
-activation gates. The isolated daemon's initial namespace published, then a normal
-checkpoint autocommit fenced the source. Managed checkpoint writer fixes and a
-successful real daemon rerun remain required before activation.
+Local real Store controls cover publication, writes, complete public rows, ranked
+socket deltas, reconnect, paired authority and changed-value raw recovery. A real
+isolated daemon and stui also pass initial seeding, later writes, restart/reconnect
+and idle silence. Managed checkpoint writers and deferred native projection are
+included in that daemon. Current-cut readiness is briefly revoked after a write
+until affected dependencies and producer evidence close; delivered rows stay stale
+during that interval. Intended populated-source limits, physical device evidence,
+deployed callback profiling and hosted review/checks remain separate gates.
 
 Compatible reopening preserves the source fingerprint, epoch and revision. A
 capture gap or fenced view requires actual native projection replay followed by
