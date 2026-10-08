@@ -12810,6 +12810,10 @@ async fn revise_mission_run(
     let (_, reviewers) =
         crate::store::analyze_mission_revision(&old, replacement, &current.requester)
             .map_err(ApiError::bad)?;
+    state
+        .store
+        .validate_revision_seat_carry(&current, replacement)
+        .map_err(ApiError::bad)?;
     let mut publication = intent.clone();
     publication.subjects.clear();
     let mut planned = state

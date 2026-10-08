@@ -112,6 +112,9 @@ mod attention_snapshot;
 pub(crate) mod attention_ivm;
 mod backup;
 mod checkpoint_rules;
+mod mission_eligibility;
+pub(crate) use mission_eligibility::MISSING_AGENT_CONDITION;
+mod revision_seats;
 pub(crate) mod delegation;
 mod limits;
 mod person_work;
@@ -5978,6 +5981,15 @@ impl Store {
                 .map_err(internal)?;
             }
         }
+        revision_seats::carry_completed_agents_tx(
+            &transaction,
+            &self.origin,
+            &current,
+            mission,
+            &compatible,
+            &generation_subject,
+            None,
+        )?;
         cancel_descendant_mission_runs_tx(
             &transaction,
             &self.origin,
@@ -11669,6 +11681,7 @@ impl Store {
     }
 
     pub fn desired_subjects_for_owner_step(&self, owner_step: &str) -> Result<Vec<DesiredSubject>> {
+        smallclaims::touched::note_read(|| format!("owned-step:{owner_step}"));
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
@@ -11717,6 +11730,9 @@ impl Store {
         &self,
         owner_steps: &[String],
     ) -> Result<Vec<DesiredSubject>> {
+        for owner_step in owner_steps {
+            smallclaims::touched::note_read(|| format!("owned-step:{owner_step}"));
+        }
         if owner_steps.is_empty() {
             return Ok(Vec::new());
         }
@@ -17475,6 +17491,15 @@ fn adopt_declared_mission_revision_tx(
             claim_ids.push(claim.id);
         }
     }
+    claim_ids.extend(revision_seats::carry_completed_agents_tx(
+        transaction,
+        origin,
+        &current,
+        &next,
+        &compatible,
+        &generation_subject,
+        Some(batch_id),
+    )?);
     cancel_descendant_mission_runs_tx(
         transaction,
         origin,
