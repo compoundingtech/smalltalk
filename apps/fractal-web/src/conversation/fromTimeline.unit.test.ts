@@ -290,6 +290,70 @@ The person reads replies in st, not in the agent's session.`,
     expect(projected.changedFrom).toBe(0)
   })
 
+  it('keeps invocation results separate when a call identity is reused', () => {
+    const timeline = new LiveTimeline()
+    const callA = entry('timeline-entry/call-a', 4, 'tool_call', {
+      call_id: 'native-call', name: 'shell', arguments: { command: 'first' },
+    }, 'assistant')
+    const resultA = entry('timeline-entry/result-a', 7, 'tool_result', {
+      call_id: 'native-call', status: 'success', media_type: 'text/plain', content: 'first result',
+    }, 'tool')
+    const callB = entry('timeline-entry/call-b', 8, 'tool_call', {
+      call_id: 'native-call', name: 'shell', arguments: { command: 'second' },
+    }, 'assistant')
+    timeline.apply({ replace: true, hasMore: false, entries: [callA, resultA, callB] })
+    const before = timeline.project().items
+    expect(before).toMatchObject([
+      { id: callA.id, status: 'success', result: { content: 'first result' } },
+      { id: callB.id, status: 'running' },
+    ])
+    expect(before[1]).not.toHaveProperty('result')
+    timeline.apply({
+      replace: false, hasMore: false,
+      entries: [entry('timeline-entry/result-b', 11, 'tool_result', {
+        call_id: 'native-call', status: 'error', media_type: 'text/plain', content: 'second result',
+      }, 'tool')],
+    })
+    const after = timeline.project().items
+    expect(after).toMatchObject([
+      { id: callA.id, status: 'success', result: { content: 'first result' } },
+      { id: callB.id, status: 'error', result: { content: 'second result' } },
+    ])
+    expect(after[0]).toBe(before[0])
+  })
+
+  it.each([true, false])('segments reused identities by sequence when results arrive first (earlier call first: %s)', (earlierFirst) => {
+    const timeline = new LiveTimeline()
+    const resultA = entry('timeline-entry/result-a', 7, 'tool_result', {
+      call_id: 'native-call', status: 'success', media_type: 'text/plain', content: 'first result',
+    }, 'tool')
+    const resultB = entry('timeline-entry/result-b', 11, 'tool_result', {
+      call_id: 'native-call', status: 'error', media_type: 'text/plain', content: 'second result',
+    }, 'tool')
+    const callA = entry('timeline-entry/call-a', 4, 'tool_call', {
+      call_id: 'native-call', name: 'shell', arguments: { command: 'first' },
+    }, 'assistant')
+    const callB = entry('timeline-entry/call-b', 8, 'tool_call', {
+      call_id: 'native-call', name: 'shell', arguments: { command: 'second' },
+    }, 'assistant')
+    timeline.apply({ replace: true, hasMore: false, entries: [resultB, resultA] })
+    timeline.project()
+    timeline.apply({ replace: false, hasMore: false, entries: [earlierFirst ? callA : callB] })
+    expect(timeline.project().items).toMatchObject(earlierFirst
+      ? [{ id: callA.id, status: 'error', result: { content: 'second result' } }]
+      : [
+          { id: resultA.id, callSeen: false, result: { content: 'first result' } },
+          { id: callB.id, status: 'error', result: { content: 'second result' } },
+        ])
+    // A later-arriving invocation redistributes results by sequence, not array position.
+    timeline.apply({ replace: false, hasMore: false, entries: [earlierFirst ? callB : callA] })
+    const expected = [
+      { id: callA.id, status: 'success', result: { content: 'first result' } },
+      { id: callB.id, status: 'error', result: { content: 'second result' } },
+    ]
+    expect(timeline.project().items).toMatchObject(earlierFirst ? expected : expected.toReversed())
+  })
+
   it('removes every orphan row when its call arrives and joins the newest result by sequence', () => {
     const timeline = new LiveTimeline()
     const newer = entry('timeline-entry/newer', 8, 'tool_result', {
