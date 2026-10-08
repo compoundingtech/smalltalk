@@ -16,6 +16,7 @@
 pub(crate) mod source;
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,9 @@ struct Presence {
     image: Option<String>,
     beats: Mutex<HashMap<String, Beat>>,
     monitors: Mutex<HashMap<String, Beat>>,
+    // One-way: first installation publishes this while holding both memory maps. Writers
+    // inspect it only under their complete mutation locks, never before acquiring them.
+    source_ever_enabled: AtomicBool,
     source: Mutex<source::State>,
 }
 
@@ -76,6 +80,7 @@ fn presence() -> &'static Presence {
         image: st_drivers::reexec::running_identity().map(|identity| identity.token()),
         beats: Mutex::new(HashMap::new()),
         monitors: Mutex::new(HashMap::new()),
+        source_ever_enabled: AtomicBool::new(false),
         source: Mutex::new(source::State::default()),
     })
 }
@@ -94,21 +99,7 @@ fn record_in(presence: &Presence, recipient: &str, report: &str) {
     let Ok(report) = serde_json::from_str::<Report>(report) else {
         return;
     };
-    let change = source::Mutation::begin(presence, recipient);
-    let updated = if let Ok(mut beats) = presence.beats.lock() {
-        beats.insert(
-            recipient.to_owned(),
-            Beat {
-                at: Instant::now(),
-                report,
-                fence: None,
-            },
-        );
-        true
-    } else {
-        false
-    };
-    change.finish(updated);
+    replace_in(presence, recipient, report, None, false);
 }
 
 /// Title updates cannot establish delivery readiness. They can report the outer driver's
@@ -124,33 +115,15 @@ fn record_fenced_in(presence: &Presence, fence: &crate::mailbox::Fence, raw: &st
     if fence.component != "delivery" && report.transport.as_deref() != Some("claude-channel") {
         return;
     }
-    let change = source::Mutation::begin(presence, &fence.subject);
-    let mut updated = true;
-    let target = if fence.component == "delivery" {
-        if report.transport.as_deref() != Some("claude-channel") {
-            if let Ok(mut monitors) = presence.monitors.lock() {
-                monitors.remove(&fence.subject);
-            } else {
-                updated = false;
-            }
-        }
-        &presence.beats
-    } else {
-        &presence.monitors
-    };
-    if let Ok(mut beats) = target.lock() {
-        beats.insert(
-            fence.subject.clone(),
-            Beat {
-                at: Instant::now(),
-                report,
-                fence: Some(fence.clone()),
-            },
-        );
-    } else {
-        updated = false;
-    }
-    change.finish(updated);
+    let clear_monitor =
+        fence.component == "delivery" && report.transport.as_deref() != Some("claude-channel");
+    replace_in(
+        presence,
+        &fence.subject,
+        report,
+        Some(fence.clone()),
+        clear_monitor,
+    );
 }
 
 pub(super) fn attachment(recipient: &str, incarnation: &str) -> Option<crate::mailbox::Fence> {
@@ -176,32 +149,69 @@ pub(crate) fn record_legacy(recipient: &str, transport: &str, pid: u32) {
 }
 
 fn record_legacy_in(presence: &Presence, recipient: &str, transport: &str, pid: u32) {
-    let change = source::Mutation::begin(presence, recipient);
-    let mut updated = true;
     // A provider launched by an older driver has no title-side attachment monitor.
-    if let Ok(mut monitors) = presence.monitors.lock() {
-        monitors.remove(recipient);
-    } else {
-        updated = false;
+    replace_in(
+        presence,
+        recipient,
+        Report {
+            transport: Some(transport.into()),
+            pid: Some(pid),
+            legacy: true,
+            ..Report::default()
+        },
+        None,
+        true,
+    );
+}
+
+/// Serialize complete memory replacement against first source installation. Lock order is
+/// monitors (when removed), then the target map, then source. Capture never holds source
+/// while acquiring either memory map. Every memory guard is released before the sink runs.
+fn replace_in(
+    presence: &Presence,
+    recipient: &str,
+    report: Report,
+    fence: Option<crate::mailbox::Fence>,
+    clear_monitor: bool,
+) {
+    let (change, updated) = {
+        let mut monitors = clear_monitor.then(|| presence.monitors.lock());
+        let target = if fence.as_ref().is_some_and(|f| f.component != "delivery") {
+            &presence.monitors
+        } else {
+            &presence.beats
+        };
+        let mut beats = target.lock();
+        // Even a poisoned lock result retains its guard until this scope ends. First
+        // installation refuses poison; an already enabled producer still records failure.
+        let change = source::Mutation::while_locked(presence, recipient);
+        let mut updated = true;
+        if let Some(monitors) = monitors.as_mut() {
+            match monitors {
+                Ok(monitors) => {
+                    monitors.remove(recipient);
+                }
+                Err(_) => updated = false,
+            }
+        }
+        match &mut beats {
+            Ok(beats) => {
+                beats.insert(
+                    recipient.to_owned(),
+                    Beat {
+                        at: Instant::now(),
+                        report,
+                        fence,
+                    },
+                );
+            }
+            Err(_) => updated = false,
+        }
+        (change, updated)
+    };
+    if let Some(change) = change {
+        change.finish(updated);
     }
-    if let Ok(mut beats) = presence.beats.lock() {
-        beats.insert(
-            recipient.into(),
-            Beat {
-                at: Instant::now(),
-                fence: None,
-                report: Report {
-                    transport: Some(transport.into()),
-                    pid: Some(pid),
-                    legacy: true,
-                    ..Report::default()
-                },
-            },
-        );
-    } else {
-        updated = false;
-    }
-    change.finish(updated);
 }
 
 /// How one seat's delivery path looks from this daemon.

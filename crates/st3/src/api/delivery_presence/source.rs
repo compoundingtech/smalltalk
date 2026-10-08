@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail, ensure};
@@ -172,6 +173,17 @@ pub(crate) fn install_sink(
 }
 
 fn install_in(presence: &Presence, sink: Arc<Sink>) -> Result<Registration<'_>> {
+    // First enable cannot adopt a partially completed legacy memory mutation. Both map
+    // guards outlive publication of the one-way bit; every accepted writer holds its
+    // affected guards before consulting that bit. Reinstallation retains the epoch guard.
+    let _monitors = presence
+        .monitors
+        .lock()
+        .map_err(|_| anyhow!("delivery monitor lock poisoned"))?;
+    let _beats = presence
+        .beats
+        .lock()
+        .map_err(|_| anyhow!("delivery beat lock poisoned"))?;
     let mut state = presence
         .source
         .lock()
@@ -197,6 +209,7 @@ fn install_in(presence: &Presence, sink: Arc<Sink>) -> Result<Registration<'_>> 
         epoch: epoch.clone(),
         sink,
     });
+    presence.source_ever_enabled.store(true, Ordering::Release);
     Ok(Registration { presence, epoch })
 }
 
@@ -210,6 +223,16 @@ pub(super) struct Mutation<'a> {
 }
 
 impl<'a> Mutation<'a> {
+    /// Only called with all affected memory map guards held through the entire replacement.
+    /// First installation holds those same guards, so false cannot become true mid-mutation.
+    /// Once enabled, dropping/replacing the owner never restores this fast path.
+    pub(super) fn while_locked(presence: &'a Presence, recipient: &str) -> Option<Self> {
+        presence
+            .source_ever_enabled
+            .load(Ordering::Acquire)
+            .then(|| Self::begin(presence, recipient))
+    }
+
     pub(super) fn begin(presence: &'a Presence, recipient: &str) -> Self {
         let mut tracked = false;
         let change = presence.source.lock().ok().and_then(|mut state| {
@@ -725,6 +748,7 @@ mod tests {
             image: Some("new".into()),
             beats: Mutex::new(HashMap::new()),
             monitors: Mutex::new(HashMap::new()),
+            source_ever_enabled: std::sync::atomic::AtomicBool::new(false),
             source: Mutex::new(State::default()),
         }
     }
@@ -762,6 +786,187 @@ mod tests {
         let restarted = fixture();
         let _restart = install_in(&restarted, Arc::new(|_| Ok(()))).unwrap();
         assert!(read_in(&restarted, &[fresh], || Ok(())).is_err());
+    }
+
+    #[test]
+    fn never_installed_actual_writers_do_not_acquire_source_mutex() {
+        let p = fixture();
+        // Holding this lock proves the actual report paths cannot touch source bookkeeping.
+        let state = p.source.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (done, received) = std::sync::mpsc::channel();
+            let p = &p;
+            scope.spawn(move || {
+                poll(p);
+                record_legacy_in(p, RECIPIENT, "native", 7);
+                let delivery = crate::mailbox::Fence::new(RECIPIENT, "one", "delivery");
+                record_fenced_in(p, &delivery, r#"{"transport":"native","ready":true}"#);
+                record_fenced_in(
+                    p,
+                    &delivery,
+                    r#"{"transport":"claude-channel","ready":true}"#,
+                );
+                let title = crate::mailbox::Fence::new(RECIPIENT, "one", "title");
+                record_fenced_in(p, &title, r#"{"transport":"claude-channel","ready":false}"#);
+                done.send(()).unwrap();
+            });
+            let result = received.recv_timeout(Duration::from_secs(3));
+            // Release before asserting so a broken lock-free path cannot hang scope teardown.
+            drop(state);
+            result.unwrap();
+        });
+        let state = p.source.lock().unwrap();
+        assert_eq!(state.active_mutations, 0);
+        assert_eq!(state.memory_inflight, 0);
+        assert_eq!(state.global_revision, 0);
+        assert!(state.entries.is_empty());
+        assert!(p.beats.lock().unwrap().contains_key(RECIPIENT));
+        assert_eq!(
+            p.monitors.lock().unwrap()[RECIPIENT].report.ready,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn first_install_waits_for_single_map_untracked_replacement() {
+        for monitor in [false, true] {
+            let p = fixture();
+            let target = if monitor { &p.monitors } else { &p.beats };
+            let mut memory = target.lock().unwrap();
+            assert!(Mutation::while_locked(&p, RECIPIENT).is_none());
+            std::thread::scope(|scope| {
+                let (started, start) = std::sync::mpsc::channel();
+                let (done, received) = std::sync::mpsc::channel();
+                let p = &p;
+                scope.spawn(move || {
+                    started.send(()).unwrap();
+                    let _registration = install_in(p, Arc::new(|_| Ok(()))).unwrap();
+                    done.send(captured(p, if monitor { "claude" } else { "codex" }))
+                        .unwrap();
+                });
+                start.recv().unwrap();
+                assert!(received.recv_timeout(Duration::from_millis(25)).is_err());
+                assert!(!p.source_ever_enabled.load(Ordering::Acquire));
+                memory.insert(
+                    RECIPIENT.into(),
+                    Beat {
+                        at: Instant::now(),
+                        report: Report {
+                            transport: Some("before-install".into()),
+                            image: Some("new".into()),
+                            ready: Some(false),
+                            ..Report::default()
+                        },
+                        fence: None,
+                    },
+                );
+                drop(memory);
+                let capture = received.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(capture.assessment["transport"], "before-install");
+                assert_eq!(capture.certificate.revision, 0);
+            });
+            assert!(p.source_ever_enabled.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn first_install_cannot_split_actual_monitor_removal_and_beat_replacement() {
+        for legacy in [false, true] {
+            let p = fixture();
+            let title = crate::mailbox::Fence::new(RECIPIENT, "old", "title");
+            record_fenced_in(
+                &p,
+                &title,
+                r#"{"transport":"claude-channel","ready":false}"#,
+            );
+            let beats = p.beats.lock().unwrap();
+            std::thread::scope(|scope| {
+                let (wrote, written) = std::sync::mpsc::channel();
+                let p = &p;
+                scope.spawn(move || {
+                    if legacy {
+                        record_legacy_in(p, RECIPIENT, "replacement", 7);
+                    } else {
+                        let fence = crate::mailbox::Fence::new(RECIPIENT, "new", "delivery");
+                        record_fenced_in(
+                            p,
+                            &fence,
+                            r#"{"transport":"replacement","image":"new","ready":true}"#,
+                        );
+                    }
+                    wrote.send(()).unwrap();
+                });
+                // The actual writer must acquire monitors before blocking on our beat guard.
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let holds_monitors = loop {
+                    match p.monitors.try_lock() {
+                        Err(std::sync::TryLockError::WouldBlock) => break true,
+                        Err(error) => panic!("unexpected monitor poison: {error}"),
+                        Ok(guard) => drop(guard),
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::yield_now();
+                };
+                let (started, start) = std::sync::mpsc::channel();
+                let (installed, result) = std::sync::mpsc::channel();
+                scope.spawn(move || {
+                    started.send(()).unwrap();
+                    let _registration = install_in(p, Arc::new(|_| Ok(()))).unwrap();
+                    installed.send(captured(p, "claude")).unwrap();
+                });
+                start.recv().unwrap();
+                let premature = result.recv_timeout(Duration::from_millis(25));
+                drop(beats);
+                assert!(holds_monitors, "writer did not reach both-map mutation");
+                assert!(premature.is_err(), "installed during partial replacement");
+                written.recv_timeout(Duration::from_secs(3)).unwrap();
+                let capture = result.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(capture.assessment["transport"], "replacement");
+                assert_eq!(capture.certificate.revision, 0);
+                assert!(!p.monitors.lock().unwrap().contains_key(RECIPIENT));
+            });
+        }
+    }
+
+    #[test]
+    fn dropping_owner_never_restores_untracked_path_or_weakens_epoch_guard() {
+        let p = fixture();
+        let registration = install_in(&p, Arc::new(|_| Ok(()))).unwrap();
+        poll(&p);
+        let old = commit(&p, "codex");
+        drop(registration);
+        let memory = p.beats.lock().unwrap();
+        let mutation = Mutation::while_locked(&p, RECIPIENT).expect("one-way enable retained");
+        drop(memory);
+        assert!(install_in(&p, Arc::new(|_| Ok(()))).is_err());
+        assert_eq!(p.source.lock().unwrap().active_mutations, 1);
+        mutation.finish(true);
+        let _next = install_in(&p, Arc::new(|_| Ok(()))).unwrap();
+        assert!(read_in(&p, &[old], || Ok(())).is_err());
+        let next_memory = p.beats.lock().unwrap();
+        assert!(Mutation::while_locked(&p, RECIPIENT).is_some());
+        drop(next_memory);
+    }
+
+    #[test]
+    fn first_enable_refuses_poisoned_memory_instead_of_adopting_partial_reports() {
+        for monitor in [false, true] {
+            let p = fixture();
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                let _memory = if monitor {
+                    p.monitors.lock()
+                } else {
+                    p.beats.lock()
+                }
+                .unwrap();
+                panic!("injected memory replacement panic");
+            }));
+            assert!(install_in(&p, Arc::new(|_| Ok(()))).is_err());
+            assert!(!p.source_ever_enabled.load(Ordering::Acquire));
+            assert!(p.source.lock().unwrap().owner.is_none());
+        }
     }
 
     #[test]
