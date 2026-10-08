@@ -1,11 +1,11 @@
-import { cpSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { ANCHOR_MS, loadWorld, type Slice } from '../src/index.ts'
-import { decodeCatalog, decodeSlice, everyVariant } from '../scripts/decode.ts'
+import { decodeCatalog, decodeFixtures, decodeSlice, everyVariant } from '../scripts/decode.ts'
 import { checkTree, FIXTURES_DIR, generate } from '../scripts/emit.ts'
 import { scanContent, scanIdentities, scanVocabulary } from '../scripts/scan.ts'
 
@@ -32,6 +32,26 @@ describe('decode gate', () => {
     }
     const failures = decodeSlice(world.id, planted)
     expect(failures.map((failure) => failure.pointer)).toEqual(['/state/agents/0'])
+  })
+
+  it('decodes every committed fixture file from disk', () => {
+    expect(decodeFixtures(FIXTURES_DIR)).toEqual([])
+  })
+
+  it('fails on planted strict-invalid values in a committed file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'st3-scenarios-decode-'))
+    scratch.push(dir)
+    cpSync(FIXTURES_DIR, dir, { recursive: true })
+    const path = join(dir, 'fleet-mid-refactor/roster.json')
+    const file = JSON.parse(readFileSync(path, 'utf8')) as { state: { agents: Record<string, unknown>[] } }
+    file.state.agents[0]!.updated_at = 'not-an-rfc3339-timestamp'
+    file.state.agents[1]!.active_work_count = 'wrong-type'
+    writeFileSync(path, JSON.stringify(file))
+    const failures = decodeFixtures(dir)
+    expect(failures.map(({ world, slice, pointer }) => `${world}/${slice}${pointer}`)).toEqual([
+      'fleet-mid-refactor/roster/state/agents/0',
+      'fleet-mid-refactor/roster/state/agents/1',
+    ])
   })
 })
 
