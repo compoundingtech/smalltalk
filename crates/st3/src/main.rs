@@ -17920,12 +17920,14 @@ async fn drive_st2_native(
                     if completion_announced { continue; }
                 }
 
-                if driver == "claude" && mailbox.subscription.is_some()
-                    && let Err(error) = publish_claude_readiness_fallback(
+                if driver == "claude" && mailbox.subscription.is_some() {
+                    match publish_claude_readiness_fallback(
                         client, &mailbox, &mut observations, &mut loop_state, current_unix_ms()? as u64,
-                    ).await
-                {
-                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    ).await {
+                        Ok(ended) => completion_announced |= ended,
+                        Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
+                    }
+                    if completion_announced { continue; }
                 }
 
                 if driver == "opencode" && mailbox.subscription.is_some() {
@@ -21890,7 +21892,7 @@ async fn publish_claude_readiness_fallback(
     observations: &mut NativeObservations,
     state: &mut NativeLoopState,
     now_ms: u64,
-) -> Result<()> {
+) -> Result<bool> {
     state.claude_readiness_fallback.native_state_seen |= observations.native_state_seen;
     if !observations.enabled
         || state.ready
@@ -21900,7 +21902,7 @@ async fn publish_claude_readiness_fallback(
             .initialized_at_ms
             .is_some_and(|started| now_ms.saturating_sub(started) >= 15_000)
     {
-        return Ok(());
+        return Ok(false);
     }
     let fence = &mailbox.fence;
     anyhow::ensure!(
@@ -21918,7 +21920,7 @@ async fn publish_claude_readiness_fallback(
         {
             observations.native_state_seen = true;
             state.claude_readiness_fallback.native_state_seen = true;
-            return Ok(());
+            return Ok(false);
         }
     }
     let checked =
@@ -21927,17 +21929,19 @@ async fn publish_claude_readiness_fallback(
         .claude_readiness_fallback
         .observe_attachment(&checked, now_ms);
     if !checked?.attached {
-        return Ok(());
+        return Ok(false);
     }
     // Consume queued native state first, independently of the wake/tick select order.
     // If publication fails, no readiness claim may bypass that native observation.
     let drained = observations
-        .drain(client, &fence.subject, "claude", &mut state.ready)
+        .drain_live(client, &fence.subject, "claude", &mut state.ready)
         .await;
     state.claude_readiness_fallback.native_state_seen |= observations.native_state_seen;
-    drained?;
+    if drained? {
+        return Ok(true);
+    }
     if state.ready || state.claude_readiness_fallback.native_state_seen {
-        return Ok(());
+        return Ok(false);
     }
     let _: ClaimRecord = client
         .post(
@@ -21966,7 +21970,7 @@ async fn publish_claude_readiness_fallback(
         )
         .await?;
     state.ready = true;
-    Ok(())
+    Ok(false)
 }
 
 async fn check_claude_attachment(

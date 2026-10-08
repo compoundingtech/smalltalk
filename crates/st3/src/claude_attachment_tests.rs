@@ -20,6 +20,7 @@ struct Control {
     replacement: Mutex<Option<st3::mailbox::Fence>>,
     attachment_failure_once: AtomicBool,
     attachment_checks: AtomicUsize,
+    end_during_attachment: Mutex<Option<(PathBuf, u64)>>,
     after_post_attachment: AtomicU8,
     permanent: Mutex<Option<(u16, String)>>,
     reports: Mutex<Vec<Value>>,
@@ -58,6 +59,12 @@ async fn attachment(
             Json(json!({"code":"stale-mailbox-session","message":"superseded owner","details":{}})),
         )
             .into_response();
+    }
+    if let Some((dir, seq)) = control.end_during_attachment.lock().unwrap().take() {
+        st_drivers::harness_state::Writer::new(&dir, "example/quartz", "claude", None)
+            .with_ownership("provider-hookless-terminal", seq)
+            .ended("7")
+            .unwrap();
     }
     Json(json!({"api_version":"st3.v1", "value":{"attached": mode == 1}})).into_response()
 }
@@ -154,6 +161,7 @@ impl Fixture {
             replacement: Mutex::new(None),
             attachment_failure_once: AtomicBool::new(false),
             attachment_checks: AtomicUsize::new(0),
+            end_during_attachment: Mutex::new(None),
             after_post_attachment: AtomicU8::new(255),
             permanent: Mutex::new(None),
             reports: Mutex::new(vec![]),
@@ -1230,4 +1238,55 @@ async fn hookless_readiness_never_bypasses_native_blocked_ended_or_unknown_state
         .unwrap();
         assert!(f.control.requests.lock().unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn hookless_readiness_defers_terminal_state_queued_during_attachment_check() {
+    let mut f = Fixture::new().await;
+    let dir = f._root.path().join("observations");
+    st_drivers::harness_events::enable(&dir, &f.control.owner.incarnation).unwrap();
+    let seq = st_drivers::harness_state::claim(
+        &dir,
+        "example/quartz",
+        "claude",
+        "provider-hookless-terminal",
+    )
+    .unwrap();
+    let mut observations = NativeObservations::start(&dir, &f.control.owner.incarnation).unwrap();
+    assert!(!observations.native_state_seen);
+    // The first snapshot read sees only the claim placeholder. The admitted attachment
+    // response queues a matching terminal event before the fallback's extra drain.
+    *f.control.end_during_attachment.lock().unwrap() = Some((dir.clone(), seq));
+    let now = current_unix_ms().unwrap() as u64;
+    f.state.claude_readiness_fallback.initialized_at_ms = Some(now - 15_000);
+    let completion_announced = publish_claude_readiness_fallback(
+        &f.client,
+        &f.mailbox,
+        &mut observations,
+        &mut f.state,
+        now,
+    )
+    .await
+    .unwrap();
+    assert!(
+        completion_announced,
+        "the tick must stop until the provider task completes"
+    );
+    assert!(!f.state.ready);
+    assert!(f.control.requests.lock().unwrap().is_empty());
+    assert!(
+        f.control
+            .store
+            .current_harness(&f.control.owner.subject)
+            .unwrap()
+            .is_none()
+    );
+    let pending = st_drivers::harness_events::pending(&dir, 64).unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "the current terminal receipt must stay unacknowledged"
+    );
+    assert_eq!(pending[0].payload["state"], "ended");
+    assert_eq!(pending[0].payload["exit"], "7");
 }
