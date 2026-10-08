@@ -151,9 +151,16 @@ async fn completion_control(order: Option<&str>, exit: u8, rejection: Option<&st
     // Claude channel notification and exits. All files live under this fixture's HOME.
     let provider = root.path().join("fake-claude.py");
     let received = root.path().join("received.json");
+    let native_idle = root.path().join("native-idle");
     std::fs::write(&provider, r#"
 import json, os, subprocess, sys, time
 from pathlib import Path
+# These completion/fence controls exercise a healthy native session. Channel
+# initialization alone is deliberately no longer a native-state publication.
+subprocess.run([os.environ['ST3_BIN'], 'driver-hook', 'claude-observe', 'SessionStart'],
+    input=json.dumps({'session_id': '019a0000-0000-7000-8000-000000000004'}), text=True, check=True)
+while not Path(os.environ['FIXTURE_NATIVE_IDLE']).exists():
+    time.sleep(0.005)
 channel = subprocess.Popen([os.environ['ST3_BIN'], 'driver', 'claude-mcp', '--subject', os.environ['ST_AGENT']],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 try:
@@ -188,6 +195,7 @@ sys.exit(int(os.environ.get('FIXTURE_PROVIDER_EXIT', '0')))
         .env("ST3_DRIVER_STATE_DIR", root.path().join("drivers"))
         .env("ST3_MAILBOX_TRANSPORT", "push")
         .env("FIXTURE_RECEIVED", &received)
+        .env("FIXTURE_NATIVE_IDLE", &native_idle)
         .env("FIXTURE_PROVIDER", provider)
         .current_dir(root.path())
         .args(["--noprofile", "--norc", "-c", r#"
@@ -261,6 +269,21 @@ read -r _
         .write_all(b"launch\n")
         .await
         .unwrap();
+    // Admit the real SessionStart observation before releasing the provider to
+    // consume mail or finish. This does not grant readiness from channel presence.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if store.current_harness(SEAT).unwrap().is_some_and(|h| {
+                h.state == "idle" && h.incarnation_id == agent_incarnation
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the actual SessionStart must publish native idle for this incarnation");
+    std::fs::write(&native_idle, b"go").unwrap();
     let sent: MessageView = client
         .post(
             "/v1/messages",
