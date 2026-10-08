@@ -20,7 +20,7 @@ window.addEventListener('pagehide', (event) => {
   disposed = true
   // Stop registry consumers in the same event before asynchronous source teardown can rerender them.
   root.unmount()
-})
+}, { capture: true })
 
 void live.ready.then(() => {
   if (disposed) return
