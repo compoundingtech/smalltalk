@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Preserve the existing root help introduction while adding terminal UI examples.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay, projection rebuild or store recovery changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, columns, indexes, triggers or schema transitions."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or coordinated fleet-upgrade changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Help text ordering preserves the established introduction and adds terminal UI examples. No CLI or wire contract change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon lifecycle changes or additional service restart requirement."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No store, device profile or configuration migration required by the library fold."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persisted-state transition; swapping back to the prior binary restores its CLI entry points."
+  }
+}
