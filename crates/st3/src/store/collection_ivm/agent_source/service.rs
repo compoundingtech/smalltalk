@@ -643,7 +643,7 @@ impl Service {
                 None => self.installer.root(&c, cards::VIEW).map(|r| r.namespace),
             };
             Ok(format!(
-                "deferred={}, cut={:?}, namespace={:?}, footprint={:?}",
+                "deferred={}, cut={:?}, namespace={:?}, footprint={:?}, families={:?}",
                 store.replication_projection_deferred(),
                 self.current_cut(&c, store),
                 namespace.as_ref().map(Namespace::as_str),
@@ -651,7 +651,8 @@ impl Service {
                     .as_ref()
                     .ok()
                     .map(|ns| kernel::footprint(&c, ns, &self.receiver)
-                        .map(|f| (f.files.len(), f.earliest_monotonic_deadline)))
+                        .map(|f| (f.files.len(), f.earliest_monotonic_deadline))),
+                namespace.as_ref().ok().map(|ns| kernel::diagnostic(&c, ns))
             ))
         })
     }
