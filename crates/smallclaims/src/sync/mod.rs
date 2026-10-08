@@ -21,6 +21,8 @@ use sha2::{Digest as _, Sha256};
 use crate::fleet::{MemberKey, Sender, verify_signature};
 
 mod backend;
+mod body;
+mod manifest;
 mod worker;
 
 pub use backend::{Backend, Local, redemption_answer};
@@ -72,7 +74,7 @@ fn deflate(body: &[u8]) -> Result<Vec<u8>> {
 /// Inflate an exchange body, refusing one that would expand past `MAX_EXCHANGE_BYTES`.
 fn inflate(body: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read as _;
-    let mut inflated = Vec::with_capacity(body.len() * 3);
+    let mut inflated = Vec::with_capacity(body.len().saturating_mul(3).min(MAX_EXCHANGE_BYTES + 1));
     flate2::read::ZlibDecoder::new(body)
         .take(MAX_EXCHANGE_BYTES as u64 + 1)
         .read_to_end(&mut inflated)

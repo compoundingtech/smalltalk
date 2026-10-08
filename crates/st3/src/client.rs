@@ -11,7 +11,7 @@ use pty_client::{
     AttachParams, CURSOR_TO_BOTTOM, ClientIo, Reconnect, RouteRefusedError, TERMINAL_SANITIZE,
     attach,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
@@ -1453,22 +1453,42 @@ fn api_error(status: u16, bytes: &[u8]) -> anyhow::Error {
     .into()
 }
 
-fn decode_api_response<O: DeserializeOwned>(bytes: &[u8]) -> Result<O> {
-    let mut envelope: serde_json::Value =
+// Keep the potentially large response value in its original byte buffer. A generic Value
+// tree adds an allocation per array/object element before the typed value is built.
+#[derive(Deserialize)]
+struct BorrowedApiEnvelope<'a> {
+    #[serde(borrow, default, deserialize_with = "present_raw_value")]
+    api_version: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, default, deserialize_with = "present_raw_value")]
+    value: Option<&'a serde_json::value::RawValue>,
+}
+
+fn present_raw_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<&'de serde_json::value::RawValue>, D::Error> {
+    // Present null is still a value; only a missing field gets the default None.
+    <&serde_json::value::RawValue>::deserialize(deserializer).map(Some)
+}
+
+fn api_response_value(bytes: &[u8]) -> Result<&serde_json::value::RawValue> {
+    let envelope: BorrowedApiEnvelope<'_> =
         serde_json::from_slice(bytes).context("decode the st API response envelope")?;
     let version = envelope
-        .get("api_version")
-        .and_then(serde_json::Value::as_str)
+        .api_version
+        .and_then(|version| serde_json::from_str::<String>(version.get()).ok())
         .context("the st API response envelope has no api_version")?;
     anyhow::ensure!(
-        matches!(version, "st3.v1" | "st3.client.v0"),
+        matches!(version.as_str(), "st3.v1" | "st3.client.v0"),
         "the st API returned unsupported version {version}"
     );
-    let value = envelope
-        .as_object_mut()
-        .and_then(|envelope| envelope.remove("value"))
-        .context("the st API response envelope has no value")?;
-    serde_json::from_value(value).context("decode the st API response value")
+    envelope
+        .value
+        .context("the st API response envelope has no value")
+}
+
+fn decode_api_response<O: DeserializeOwned>(bytes: &[u8]) -> Result<O> {
+    serde_json::from_str(api_response_value(bytes)?.get())
+        .context("decode the st API response value")
 }
 
 #[cfg(test)]
@@ -1545,6 +1565,37 @@ mod tests {
         assert_eq!(
             decode_api_response::<Value>(&client).unwrap(),
             json!({"kind": "client"})
+        );
+    }
+
+    #[test]
+    fn response_decoding_borrows_large_values_and_preserves_present_null() {
+        let expected: Vec<String> = (0..4096).map(|n| format!("fixture-{n}")).collect();
+        let bytes = serde_json::to_vec(&test_envelope(json!(expected))).unwrap();
+        let raw = api_response_value(&bytes).unwrap().get();
+        let input = bytes.as_ptr_range();
+        assert!(input.contains(&raw.as_ptr()));
+        assert!(raw.len() <= bytes.len() - (raw.as_ptr() as usize - bytes.as_ptr() as usize));
+        assert_eq!(
+            decode_api_response::<Vec<String>>(&bytes).unwrap(),
+            expected
+        );
+        assert_eq!(
+            decode_api_response::<Value>(br#"{"api_version":"st3.v1","value":null}"#).unwrap(),
+            Value::Null
+        );
+        assert!(
+            decode_api_response::<Option<String>>(br#"{"api_version":"st3.v1","value":null}"#)
+                .unwrap()
+                .is_none()
+        );
+        // Escaped version text and unrelated envelope metadata remain valid.
+        assert_eq!(
+            decode_api_response::<u64>(
+                br#"{"api_version":"st3.\u00761","extra":{"large":[]},"value":18446744073709551615}"#
+            )
+            .unwrap(),
+            u64::MAX
         );
     }
 

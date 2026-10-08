@@ -37,7 +37,7 @@ use crate::model::{
     ApiResponse, ReplicaEnvelopeId, ReplicationExchange, ReplicationExportRequest,
     ReplicationExportResponse, ReplicationHealAnswer, ReplicationHealAnswerRequest,
     ReplicationHealNextRequest, ReplicationHealQuery, ReplicationHealStep, ReplicationInventory,
-    ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
+    ReplicationPeerFailureRequest, ReplicationReceiveResponse,
 };
 use crate::store::Store;
 use crate::store::{
@@ -1387,6 +1387,15 @@ pub struct MainBackend {
     client: Client,
 }
 
+#[derive(Serialize)]
+struct BorrowedReceipt<'a> {
+    peer: &'a str,
+    fleet_id: &'a str,
+    exchange: &'a ReplicationExchange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    round_trip_ms: Option<u64>,
+}
+
 impl MainBackend {
     pub fn new(socket: PathBuf) -> Self {
         Self {
@@ -1440,10 +1449,10 @@ impl Backend for MainBackend {
         self.client
             .post(
                 "/v1/internal/replication/receive",
-                &ReplicationReceiveRequest {
-                    peer: peer.to_owned(),
-                    fleet_id: fleet_id.to_owned(),
-                    exchange: exchange.clone(),
+                &BorrowedReceipt {
+                    peer,
+                    fleet_id,
+                    exchange,
                     round_trip_ms: round_trip.map(|duration| duration.as_millis() as u64),
                 },
             )
@@ -1646,6 +1655,40 @@ mod tests {
     use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt as _;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn borrowed_receipt_preserves_the_owned_wire_encoding() {
+        let exchange = ReplicationExchange {
+            peer: "fixture".into(),
+            fleet_id: "fleet/fixture".into(),
+            schema_digest: "schema".into(),
+            authority_digest: "authority".into(),
+            graph_digest: "graph".into(),
+            projection_digests: BTreeMap::new(),
+            inventory: ReplicationInventory::default(),
+            envelopes: Vec::new(),
+            signature_requests: Vec::new(),
+            signatures: Vec::new(),
+        };
+        for round_trip_ms in [None, Some(17)] {
+            let borrowed = BorrowedReceipt {
+                peer: "fixture",
+                fleet_id: "fleet/fixture",
+                exchange: &exchange,
+                round_trip_ms,
+            };
+            let owned = crate::model::ReplicationReceiveRequest {
+                peer: "fixture".into(),
+                fleet_id: "fleet/fixture".into(),
+                exchange: exchange.clone(),
+                round_trip_ms,
+            };
+            assert_eq!(
+                serde_json::to_vec(&borrowed).unwrap(),
+                serde_json::to_vec(&owned).unwrap()
+            );
+        }
+    }
 
     fn fleet_claim(store: &Store, kind: &str, subject: &str, fields: Value) {
         store

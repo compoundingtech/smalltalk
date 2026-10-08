@@ -59,7 +59,7 @@ impl Default for ExchangeJobs {
     }
 }
 
-type ExchangeAnswer = Result<crate::replication::ReplicationExportResponse, String>;
+type ExchangeAnswer = Result<Arc<crate::replication::ReplicationExportResponse>, String>;
 
 struct ExchangeJob {
     digest: String,
@@ -1489,7 +1489,10 @@ async fn receive_exchange<B: Backend>(
 ) -> Response {
     let body = if deflated(&headers) {
         match inflate(&body) {
-            Ok(body) => Bytes::from(body),
+            Ok(inflated) => {
+                drop(body);
+                Bytes::from(inflated)
+            }
             Err(error) => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -1612,12 +1615,15 @@ async fn receive_exchange<B: Backend>(
                     Ok::<_, anyhow::Error>(response)
                 }
                 .await
+                .map(Arc::new)
                 .map_err(|error| format!("replication request failed: {error:#}"));
                 done.send_replace(Some(result));
             });
         }
         jobs.get(&relay).unwrap().answer.clone()
     };
+    // The parsed request is owned by its job. No retry waiter needs the raw JSON body.
+    drop(body);
     let ready = tokio::time::timeout(EXCHANGE_RESPONSE_BUDGET, async {
         loop {
             if let Some(result) = answer.borrow_and_update().clone() {
@@ -1632,13 +1638,15 @@ async fn receive_exchange<B: Backend>(
     match ready {
         Ok(Some(Ok(export))) => {
             finish_exchange_job(&state.fleet, &relay, &answer);
+            drop(answer);
             let authority_digest = export.exchange.authority_digest.clone();
             let response =
-                match signed_response(&state, &request_digest, export.store_index, export.exchange)
+                match signed_response(&state, &request_digest, export.store_index, &export.exchange)
                 {
                     Ok(response) => response,
                     Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
                 };
+            drop(export);
             state
                 .fleet
                 .inbound_authority
@@ -1732,7 +1740,10 @@ async fn receive_heal<B: Backend>(
 ) -> Response {
     let body = if deflated(&headers) {
         match inflate(&body) {
-            Ok(body) => Bytes::from(body),
+            Ok(inflated) => {
+                drop(body);
+                Bytes::from(inflated)
+            }
             Err(error) => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -1847,11 +1858,8 @@ pub async fn fetch_checkpoint_manifest(
     checkpoint: &str,
     cut_unix_ms: u128,
 ) -> Result<CheckpointManifest> {
-    let mut manifest = CheckpointManifest {
-        checkpoint: checkpoint.to_owned(),
-        cut_unix_ms,
-        ..CheckpointManifest::default()
-    };
+    let mut assembly =
+        super::manifest::Assembly::new(checkpoint, cut_unix_ms, super::MAX_MANIFEST_BYTES)?;
     let mut after = None;
     loop {
         let request = CheckpointManifestRequest {
@@ -1860,9 +1868,9 @@ pub async fn fetch_checkpoint_manifest(
             after,
         };
         let page = fetch_checkpoint_manifest_page(http, peer, node, auth, fleet, &request).await?;
-        after = manifest.append(page).map_err(anyhow::Error::msg)?;
+        after = assembly.append(request.after.as_ref(), page)?;
         if after.is_none() {
-            return Ok(manifest);
+            return Ok(assembly.manifest);
         }
     }
 }
@@ -1875,7 +1883,7 @@ async fn fetch_checkpoint_manifest_page(
     fleet: &FleetContext,
     request: &CheckpointManifestRequest,
 ) -> Result<CheckpointManifestPage> {
-    let body = serde_json::to_vec(request)?;
+    let body = super::body::encode(request, MAX_EXCHANGE_BYTES)?;
     let request_digest = FleetAuth::body_digest(&body);
     let headers = auth.request_headers_for(CHECKPOINT_PATH, node, &body)?;
     let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), CHECKPOINT_PATH);
@@ -1890,9 +1898,11 @@ async fn fetch_checkpoint_manifest_page(
         .with_context(|| format!("checkpoint request to peer {} failed", peer.name))?;
     let status = response.status();
     let headers = response.headers().clone();
-    let bytes = response.bytes().await?.to_vec();
+    let bytes = super::body::read(response, MAX_EXCHANGE_BYTES).await?;
     let bytes = if deflated(&headers) {
-        inflate(&bytes)?
+        let inflated = inflate(&bytes)?;
+        drop(bytes);
+        inflated
     } else {
         bytes
     };
@@ -2009,7 +2019,7 @@ fn signed_refusal<B: Backend>(
             "member_key": refusal.member_key,
         }),
     );
-    let body = serde_json::to_vec(&envelope)?;
+    let body = super::body::encode(&envelope, MAX_EXCHANGE_BYTES)?;
     let headers =
         state
             .auth
@@ -2040,7 +2050,7 @@ pub fn signed_response_for<B, T: Serialize>(
     value: T,
 ) -> Result<Response> {
     let envelope = PeerResponse::new(&state.node, store_index, value);
-    let body = serde_json::to_vec(&envelope)?;
+    let body = super::body::encode(&envelope, MAX_EXCHANGE_BYTES)?;
     let headers = state
         .auth
         .response_headers_for(path, &state.node, &body, request_digest)?;
@@ -2060,7 +2070,7 @@ async fn deflate_response(response: Response, requested: bool) -> Result<Respons
         "accept-encoding",
         HeaderValue::from_static(EXCHANGE_ENCODING),
     );
-    let body = axum::body::to_bytes(body, usize::MAX)
+    let body = axum::body::to_bytes(body, MAX_EXCHANGE_BYTES)
         .await
         .context("read the signed response body")?;
     if !requested || body.len() < DEFLATE_MIN_BYTES {
@@ -2110,7 +2120,7 @@ pub fn signed_error_response_for<B: Backend>(
             "message": message,
         }),
     );
-    let body = serde_json::to_vec(&envelope)?;
+    let body = super::body::encode(&envelope, MAX_EXCHANGE_BYTES)?;
     let headers = state
         .auth
         .response_headers_for(path, &state.node, &body, request_digest)?;
@@ -2437,7 +2447,7 @@ async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
     request: &B,
     compress: bool,
 ) -> Result<(R, bool)> {
-    let body = serde_json::to_vec(request)?;
+    let body = super::body::encode(request, MAX_EXCHANGE_BYTES)?;
     let request_digest = FleetAuth::body_digest(&body);
     let headers = auth.request_headers_for(path, node, &body)?;
     let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), path);
@@ -2447,13 +2457,15 @@ async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
         .headers(headers)
         .header("content-type", "application/json")
         .header("accept-encoding", EXCHANGE_ENCODING);
-    request = if compress && body.len() >= DEFLATE_MIN_BYTES {
-        request
-            .header("content-encoding", EXCHANGE_ENCODING)
-            .body(deflate(&body)?)
+    let body = if compress && body.len() >= DEFLATE_MIN_BYTES {
+        let compressed = deflate(&body)?;
+        drop(body);
+        request = request.header("content-encoding", EXCHANGE_ENCODING);
+        compressed
     } else {
-        request.body(body)
+        body
     };
+    request = request.body(body);
     let response = request
         .send()
         .await
@@ -2466,8 +2478,7 @@ async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
         })?;
     let status = response.status();
     let headers = response.headers().clone();
-    let bytes = response
-        .bytes()
+    let bytes = super::body::read(response, MAX_EXCHANGE_BYTES)
         .await
         .with_context(|| {
             format!(
@@ -2475,14 +2486,15 @@ async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
                 peer.name,
                 started.elapsed().as_millis()
             )
-        })?
-        .to_vec();
+        })?;
     // A build older than a path answers an unsigned 404.
     if status == StatusCode::NOT_FOUND && headers.get(HEADER_SIGNATURE).is_none() {
         anyhow::bail!("peer {} runs a build without `{path}`", peer.name);
     }
     let bytes = if deflated(&headers) {
-        inflate(&bytes)?
+        let inflated = inflate(&bytes)?;
+        drop(bytes);
+        inflated
     } else {
         bytes
     };
