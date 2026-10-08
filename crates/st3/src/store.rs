@@ -2769,7 +2769,11 @@ impl Store {
     ) -> Result<Self> {
         let smalltalk = Arc::new(SmalltalkRuntime::with_ivm_views(views));
         let graph = GraphStore::open(path, origin, smalltalk.clone())?;
-        Ok(Self { graph, smalltalk })
+        Ok(Self {
+            graph,
+            smalltalk,
+            native_retention: Mutex::new(Default::default()),
+        })
     }
 
     /// Open a shared-memory store for sequential fixtures and short-lived tools.
