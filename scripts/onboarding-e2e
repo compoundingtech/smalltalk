@@ -540,8 +540,13 @@ class Run:
         stopped,ready=self.wait_seat(subject,stopped=True)
         if not self.check("expert-stopped",r["exit"]==0 and ready,"explicit stop leaves expert stopped and unreachable"): return
         r=self.cli("Cancel original onboarding run","missions","cancel","mission-run/st/onboarding","--reason","fixture","--as","person/ada")
-        overview=self.json_cli("Cancelled historical onboarding run","missions","show","mission/st/onboarding")
-        if not self.check("onboarding-cancelled",r["exit"]==0 and isinstance(overview,dict) and overview.get("total_runs")==1 and any(x["id"]=="mission-run/st/onboarding" and x.get("status")=="cancelled" for x in overview.get("newest",[])),"cancel is explicit and remains in historical run count"): return
+        deadline=time.monotonic()+35
+        while True:
+            overview=self.json_cli("Cancelled historical onboarding run","missions","show","mission/st/onboarding")
+            cancelled=isinstance(overview,dict) and overview.get("total_runs")==1 and any(x.get("id")=="mission-run/st/onboarding" and x.get("status")=="cancelled" for x in overview.get("newest",[]))
+            if r["exit"] or cancelled or time.monotonic()>=deadline: break
+            time.sleep(1)
+        if not self.check("onboarding-cancelled",r["exit"]==0 and cancelled,"explicit cancellation finishes cleanup before rerun and remains in historical run count"): return
         for n in (1,2):
             r=self.cli("Repeat setup with stopped expert "+str(n),"setup","--person","ada","--node","studio","--yes","--service","true")
             seat,stopped=self.wait_seat(subject,stopped=True)
