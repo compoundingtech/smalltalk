@@ -78,6 +78,8 @@ pub mod seat_queue;
 /// Runs any CLI with credentials no seat can read, through a gateway the sekrets user owns.
 pub mod sekrets;
 pub mod service;
+/// First-run configuration and human-only daemon startup.
+pub mod setup;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
 pub mod startup;

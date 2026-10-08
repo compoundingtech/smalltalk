@@ -103,6 +103,8 @@ const DEFAULT_DAEMON_WAIT_SECS: u64 = 30;
 
 #[derive(Subcommand)]
 enum Command {
+    /// Configure this machine and start st, with flags for unattended setup.
+    Setup(st3::setup::SetupArgs),
     /// Open the terminal interface: spaces, conversations, Home and agent terminals.
     #[command(version = st_drivers::version::display_version())]
     Ui(stui::Args),
@@ -4609,7 +4611,10 @@ fn main() -> ExitCode {
         std::io::stdout().is_terminal(),
         std::env::var_os("ST_AGENT").is_some(),
     ) {
-        // setup-core adds st3::setup::prepare_plain_ui() here, before the TUI runtime.
+        if let Err(error) = st3::setup::prepare_plain_ui() {
+            eprintln!("st: {}", plain_error(&error));
+            return ExitCode::FAILURE;
+        }
         return run_terminal_ui(stui::Args::default(), None);
     }
     if cli_help::all_help_requested(&arguments) {
@@ -5024,6 +5029,9 @@ async fn run(cli: Cli) -> Result<()> {
     let own = std::env::var("ST_AGENT").ok();
     let mission_run = std::env::var("ST_MISSION_RUN").ok();
     guard_mutating_cli_actor(&cli.command, own.as_deref(), mission_run.as_deref())?;
+    if let Command::Setup(args) = cli.command {
+        return st3::setup::run(args).await.map(|_| ());
+    }
     // Completion is a remote device operation. It needs neither a local daemon nor its config.
     if let Command::Devices(DevicesArgs {
         command:
@@ -5120,6 +5128,7 @@ async fn run(cli: Cli) -> Result<()> {
     // Drivers outlive daemon restarts and handle an outage in their own loops; doctor reports one.
     let immediate = Client::new(endpoint.clone());
     match cli.command {
+        Command::Setup(_) => unreachable!(),
         Command::Apply(args) => run_apply(&client, args, cli.json).await,
         Command::Sets { command } => run_owned_sets(&endpoint, command, cli.json).await,
         Command::Ui(_) => unreachable!("the TUI runs before the CLI runtime"),
@@ -11510,7 +11519,10 @@ fn render_checkpoint_plan(plan: &st3::store::CheckpointPlanView) -> String {
 fn run_service(command: ServiceCommand, json_output: bool) -> Result<()> {
     match command {
         ServiceCommand::Install { config } => {
-            st3::service::install(Config::load_with_fleet(config.as_deref())?)
+            st3::service::install_from_config_path(
+                Config::load_with_fleet(config.as_deref())?,
+                config.as_deref(),
+            )
         }
         ServiceCommand::Status => {
             let mut report = st3::service::status()?;
