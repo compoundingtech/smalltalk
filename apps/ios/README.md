@@ -46,6 +46,126 @@ First install the shared package's locked dependencies from the repository root:
 
 For an offline device build, run `npm run export:ios` and build Release with local Apple Development signing and provisioning for that device. The Release bundle is embedded and runs without Metro. No Expo account, EAS service, App Store, or Shareup signing is part of this path.
 
+### Automatic daily Release delivery
+
+`scripts/release_delivery.py` reconciles a tracked Git ref to the daily device
+app (`com.compoundingtech.smalltalk`), without Metro, EAS, or OTA. The tracked
+ref must support `APP_VARIANT=daily`; a ref without that variant is refused
+rather than replacing the separate Debug app. Run it every five minutes with
+a local scheduler while the Mac is awake and on the phone's LAN:
+
+```sh
+python3 apps/ios/scripts/release_delivery.py \
+  --repo "$SOURCE_REPO" --state "$DELIVERY_STATE" \
+  --device "$ST_IOS_DEVICE" --team "$ST_IOS_TEAM" \
+  --developer-dir "$DEVELOPER_DIR"
+```
+
+The default ref is `origin/main`. Set `--ref` or `ST_IOS_REF` to another
+`origin/<branch>` (including an integration branch for unmerged app changes),
+or to a local branch in the source repository. Remote branches are fetched
+directly from the source repository's `origin`; the source checkout is never
+changed. A private dedicated clone, signed artifacts, and retry state live
+under `--state`. Use a separate state directory for each device/team.
+Use `--build-only` or `ST_IOS_BUILD_ONLY=1` to prepare a signed artifact while
+phone access is held; remove the hold to install the same artifact without
+rebuilding. Before signing, the generated app's `Info.plist` receives the full
+Git revision as `StBuildCommit` and the revision's commit count as
+`CFBundleVersion`. The artifact's `success.json` records both. Compare its
+`build_version` with `devicectl device info apps --bundle-id
+com.compoundingtech.smalltalk --device "$ST_IOS_DEVICE" --json-output -` to
+verify the installed build independently of pairing or proof-only UI.
+The embedded `EXPO_PUBLIC_ST3_BUILD` revision also appears in connected-client
+diagnostics.
+
+Prerequisites are Python 3, Git, Node/npm, CocoaPods, Xcode, and `gate-slot`
+in the scheduler's PATH. The build takes a heavy admission slot, runs under
+`taskpolicy -c utility` and `nice -n 19`, and caps Xcode parallelism at four jobs.
+Utility QoS yields to interactive work without restricting a native build to
+efficiency cores as background QoS does. The scheduler itself must not inherit
+background QoS or low-priority I/O: `taskpolicy -c utility` is a clamp, not an
+elevation from background. Missing admission tooling refuses the build; it
+never silently bypasses host limits.
+An advisory lock makes scheduled and manual invocations single-flight.
+Locked npm installs follow the app's recursive `file:` runtime dependencies
+(currently `clients/typescript/st3-views` and `clients/typescript/st3-client`).
+Only changes under that closure or `apps/ios` cause a build, including changes
+to its configuration and lockfiles; server-only changes do not.
+
+The dedicated checkout retains npm installations and generated native inputs.
+`build-cache/` stores their input identities and shared Xcode DerivedData,
+including partial compilation from unsuccessful attempts. npm installs rerun
+only when their manifest/lock or Node path changes,
+or `node_modules` is missing. Native generation and CocoaPods rerun only when
+the package locks/manifests, evaluated app configuration, config plugins,
+native modules, assets, or immutable toolchain paths change, or their generated
+workspace/lock is missing. JS-only changes reuse the native cache. Metro
+inlines `EXPO_PUBLIC_*` values into each transformed module, so the build runs
+with a delivery-scoped `TMPDIR` under `build-cache/tmp` and resets that
+transform cache whenever the inlined values change; a successful build also
+fails if the bundle does not embed the current revision. Each
+successful signed app is copied to its own immutable commit artifact before
+it becomes eligible for installation, so another build cannot mutate a
+pending install. Clear `build-cache/` after an in-place upgrade of a mutable
+Node/CocoaPods/Xcode installation; versioned or Nix tool paths invalidate it
+automatically. Do not delete a pending commit artifact.
+
+Release signing uses `CODE_SIGN_STYLE=Automatic`, the supplied development
+team, `Apple Development`, and `-allowProvisioningUpdates`. Set up the Xcode
+account, development certificate/private key, unlocked keychain, and device
+provisioning once interactively. Then prove a complete build from the same
+unattended scheduler environment: a successful interactive Xcode build alone
+does not prove its keychain/account access. Device/team IDs and signing
+material belong in private environment/configuration, never in this repo.
+
+Delivery compares content, not commits. The observed head is the tracked ref
+from the last successful fetch, updated on every fetch, including reverts and
+app-irrelevant commits. Its content key hashes the Git trees of `apps/ios` and
+its local-package closure together with the inputs outside the revision: the
+Xcode directory, Node/npm/CocoaPods paths, inherited `EXPO_PUBLIC_*` values,
+and the pinned native environment. Builds always run with the daily Release
+values `APP_VARIANT=daily`, `ST3_FABRIC_PROOF=0` (read by `StFabric.podspec`),
+and `ST3_FABRIC_OFFLINE_DEBUG=0` (read by `metro.config.js`), so an inherited
+value never reaches prebuild, CocoaPods, Metro, or Xcode; the pins are also part
+of the native-generation cache key. A signed artifact is installed only if its
+key equals the observed head's key under the current inputs. A build runs only
+when no retained artifact or installed app has that key; a revert to retained
+content reuses its artifact if that does not lower the installed version.
+`CFBundleVersion` comes from a persisted counter, the larger of the commit
+count and the last assigned version plus one, so it never decreases across
+reverts, earlier refs, or branch switches. Every install checks it against the
+installed version; an artifact with a lower version is rebuilt instead.
+A pending artifact for other content is dropped, never installed.
+An unsuccessful build cannot be installed. A successful build is retained
+until installation and launch both succeed; an unreachable or locked phone
+is retried on the next tick without rebuilding. While the ref cannot be
+fetched, the last observed head is used, never an older revision, and is
+rebuilt from the local checkout if needed (deferred if it is missing there).
+Installation and launch set
+`AGENT_ACTION_APPROVAL=deploy`. Neither pairing nor the Debug bundle is touched.
+Xcode 27's process listing exposes executable paths and PIDs, not foreground
+state: the scheduler conservatively treats a running daily app as active and
+defers installation until 40 minutes after observing the change. After that,
+delivery takes priority even if the app is running. With five-minute polling,
+this leaves time within the one-hour delivery target for installation; build,
+admission, provisioning, and device failures remain visible rather than being
+reported as delivered. No launch uses `--terminate-existing`.
+Use `--max-deferral` or `ST_IOS_MAX_DEFERRAL` to configure that courtesy window;
+zero is appropriate for a coordinated proof when the phone is not being used.
+
+Every invocation records outcomes to `outcomes.jsonl` and stdout; each build
+has `artifacts/<commit>/build.log`. `state.json` records the observed head and
+its content key, the pending signed artifact, and the installed content.
+Optionally set both `--notify-from` and `--notify-to` (or
+`ST_IOS_NOTIFY_FROM`/`ST_IOS_NOTIFY_TO`) to send state changes with
+`st conversations send`: each newly installed commit, a new build failure,
+or device unavailability lasting over one hour (once until recovery).
+Unchanged ticks stay in the log only. Notification failures do not discard
+delivery state or stop installation.
+Keep all logs and state private: native tools include signing/device details.
+
+Focused scheduler tests: `python3 -m unittest discover -s apps/ios/scripts -p 'test_release_delivery.py'`.
+
 The Debug app accepts a short-lived pairing deep link for headless simulator checks: `com.compoundingtech.smalltalk.starter://pair?gateway=...&id=...&code=...`. The link opens the pairing form with the code prefilled; it does not submit the code until a separately supplied fingerprint or explicit unpinned override is chosen. The handler is disabled in Release. Treat the link as a temporary credential and do not commit or log its populated form.
 
 For connected Debug smoke tests, `com.compoundingtech.smalltalk.starter://tab/Fleet` opens a tab (the earlier names Now, Chat, and Control still work), `com.compoundingtech.smalltalk.starter://mission?id=mission/...` opens a mission, `com.compoundingtech.smalltalk.starter://agent?id=agent/...` opens an agent's conversation, and `com.compoundingtech.smalltalk.starter://session?id=session/...` opens an exact conversation. Add `&terminal=terminal/...` to the session link to inspect its live terminal screen. `com.compoundingtech.smalltalk.starter://tree?on=1` switches Agents to the tree, and `com.compoundingtech.smalltalk.starter://scroll?y=800` scrolls the visible list for screenshots. These links are disabled in Release and carry no authorization: the already-paired client still has to pass the gateway's normal checks.
