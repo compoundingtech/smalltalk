@@ -13,8 +13,18 @@ if (rootElement === null) {
   throw new Error('Root element not found')
 }
 
+const root = createRoot(rootElement)
+let disposed = false
+window.addEventListener('pagehide', (event) => {
+  if (event.persisted) return
+  disposed = true
+  // Stop registry consumers in the same event before asynchronous source teardown can rerender them.
+  root.unmount()
+})
+
 void live.ready.then(() => {
-  createRoot(rootElement).render(
+  if (disposed) return
+  root.render(
     <StrictMode>
       <App />
     </StrictMode>,
