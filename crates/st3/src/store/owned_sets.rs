@@ -7,6 +7,13 @@ use std::cell::RefCell;
 pub(super) const STAGED_SUBJECTS_QUERY: &str =
     "SELECT DISTINCT subject FROM claims WHERE json_extract(body,'$.owned_set') IS NOT NULL";
 
+// One statement proves both absences in a current SQLite snapshot. Any receipt, including a
+// repaired or malformed one, conservatively requires the existing full authority evaluation.
+const EMPTY_DESIRED_AUTHORITY_QUERY: &str =
+    "SELECT NOT EXISTS(SELECT 1 FROM claims WHERE kind='owned-set.revised')
+        AND NOT EXISTS(SELECT 1 FROM claims WHERE subject=?1
+                       AND json_extract(body,'$.owned_set') IS NOT NULL)";
+
 struct SnapshotRows {
     connection: usize,
     rows: BTreeMap<Option<u64>, Vec<View>>,
@@ -1277,6 +1284,9 @@ impl Store {
         if desired.is_empty() {
             return Ok(BTreeSet::new());
         }
+        for declaration in desired {
+            smallclaims::touched::note_read(|| declaration.subject.clone());
+        }
         self.read_snapshot(|_| {
             self.with_owned_set_snapshot_reads(|| {
                 let connection = self.readers.get();
@@ -1349,8 +1359,21 @@ impl Store {
     /// method to return before writing or performing the effect.
     pub fn owned_desired_guard(&self, desired: &DesiredSubject) -> Result<(), St3Error> {
         smallclaims::sqlite::debug_assert_no_pinned_read();
-        // Every invocation starts a current read snapshot. Reuse receipt rows only within
-        // this fence, so its several authority checks agree without refolding the history.
+        smallclaims::touched::note_read(|| "kind:owned-set.revised".into());
+        smallclaims::touched::note_read(|| desired.subject.clone());
+        let empty: bool = {
+            let connection = self.readers.get();
+            connection
+                .prepare_cached(EMPTY_DESIRED_AUTHORITY_QUERY)
+                .map_err(internal)?
+                .query_row([&desired.subject], |row| row.get(0))
+                .map_err(internal)?
+        };
+        if empty {
+            return Ok(());
+        }
+        // A negative probe is not authorization. Start another current snapshot for the full
+        // fence and reuse receipt rows only within it, never across invocations or effects.
         self.read_snapshot(|_| {
             Ok(self.with_owned_set_snapshot_reads(|| {
                 let connection = self.readers.get();
