@@ -24,6 +24,9 @@ Supported platforms are Linux x86_64 with glibc 2.35+ (Ubuntu 22.04+) and macOS 
 Silicon with macOS 15+. The installer needs `curl`, `tar` and a SHA256 checker; macOS
 also needs Python 3. Harness CLIs and their accounts are separate. If none is
 installed, `st` still opens; install a supported harness and run `st setup` later.
+For Claude, first complete its native welcome, account or API-key confirmation and
+permission-bypass consent as the same user and profile. Successful auth-status or
+print checks alone do not prove that the expert can authenticate.
 Neither GitHub nor `gh` is required. Native macOS build and installer tests run in CI;
 clean-machine app, launchd and permission setup still need a manual rehearsal.
 
