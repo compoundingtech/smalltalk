@@ -19,14 +19,15 @@ export const normalizePublicConversation = (conversation: PublicConversation): r
           _tag: 'Message', id: entry.id, messageId: entry.body.message_id,
           from: entry.body.from, to: entry.body.to, title: entry.body.title,
           ...(entry.body.reply_to === null ? {} : { replyTo: entry.body.reply_to }),
-          at: entry.timestamp, sender: operator,
+          at: entry.timestamp,
+          ...(entry.body.from === undefined ? {} : { sender: { kind: entry.body.from.startsWith('person/') ? 'human' : 'agent', label: entry.body.from } as Sender }),
         })
         break
       case 'content':
         items.push({
           _tag: 'Text', id: entry.id, role: entry.role === 'tool' ? 'system' : entry.role,
           text: entry.body.text, attachments: [], streaming: !entry.final, at: entry.timestamp,
-          sender: entry.role === 'user' ? operator : worker,
+          sender: entry.role === 'user' ? operator : entry.role === 'system' ? { kind: 'system', label: 'System' } : worker,
         })
         break
       case 'tool_call':

@@ -32,6 +32,25 @@ Stories:
 - **Fractal UI / Transcript**: the locked U2·F3·Y3 transcript in dark and light: settled/expanded work, streamed answers, failed/interrupted/unknown work, loading, retained-history synchronization, answer metadata, unavailable conversations, the older-history boundary with and without a load action, pending and failed sends (including Pending→Sent identity) and the read-only empty state.
 - **Fractal UI / Sidebar/Agent Row**: compact hover-card facts, omitted unreported fields, the known-vs-none time cohort and the quick Open hover action.
 
+### Scenario component stories
+
+**Fractal UI / Scenarios** renders the public sidebar agent row, conversation thread and sync line
+from `@smalltalk/st3-scenarios`. The Scenario toolbar selects `fleet-mid-refactor` or
+`failed-sync-socket-dropped`; slice controls override data independently of the `scheme` rendering
+control. `Pinned` stories keep their world fixed. Set the `scenarioNow` global to epoch milliseconds
+or an RFC 3339 instant for reproducible relative times.
+
+For example, the sync canvas supports
+`?id=fractal-ui-scenarios-sync-line--explore&globals=scenario:failed-sync-socket-dropped&args=sync:socket-dropped;scheme:dark`.
+The sync controls also include `reconnected` and `subscription-limit-local`.
+
+The projections use the same strict native codecs as the application. The conversation story
+uses the package's existing four-kind fold (message, content, tool call and tool result), not a
+copy of the app's timeline fold. Other present wire kinds are explicitly listed as **Not yet
+projected**; status, usage, error, redaction and truncation are not silently represented as prose.
+The existing visual-language and component-family stories keep their independent fixtures.
+
+
 ## Families
 
 `kit.tsx` exports these families. Each is labeled, keyboard-reachable and token-driven:

@@ -10,29 +10,29 @@ type Entry<TType extends string, TBody> = {
   readonly revision: number
   readonly final: boolean
   readonly timestamp: string
-  readonly role: 'user' | 'assistant' | 'tool'
+  readonly role: 'system' | 'user' | 'assistant' | 'tool'
   readonly type: TType
   readonly body: TBody
 }
 export type PublicTimelineEntry =
   | Entry<'message', {
       readonly message_id: string
-      readonly from: string
-      readonly to: string
-      readonly title: string
+      readonly from?: string
+      readonly to?: string
+      readonly title?: string
       readonly reply_to: string | null
     }>
   | Entry<'content', { readonly media_type: string; readonly text: string }>
   | Entry<'tool_call', {
       readonly call_id: string
       readonly name: string
-      readonly arguments: { readonly path: string }
+      readonly arguments: unknown
     }>
   | Entry<'tool_result', {
       readonly call_id: string
       readonly status: 'success' | 'error'
       readonly media_type: string
-      readonly content: { readonly rows: number } | { readonly error: string }
+      readonly content: unknown
     }>
 
 export type PublicConversation = {
