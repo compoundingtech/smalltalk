@@ -19,6 +19,7 @@ vi.mock('@stylexjs/stylex', () => ({
 import { liveSource, type LiveSource } from '../data/liveSource.ts'
 import { DataSourceProvider } from '../data/react.tsx'
 import { ConversationPane } from './ConversationPane.tsx'
+import { LiveAgentWorkspace } from './LiveAgentWorkspace.tsx'
 
 const snapshot: Snapshot = {
   id: 'snapshot/1',
@@ -39,16 +40,44 @@ const agent: Agent = {
   runtime_ids: [],
 }
 
-const entry = (sequence: number, text: string): TimelineEntry => ({
+const entry = (sequence: number, text: string, role: 'user' | 'assistant' = 'assistant'): TimelineEntry => ({
   id: `timeline-entry/${sequence}`,
   sequence,
   revision: 1,
   type: 'content',
-  role: 'assistant',
+  role,
   final: true,
   timestamp: snapshot.created_at,
   body: { text, media_type: 'text/markdown' },
 })
+
+/** The kit composition groups turns at user prompts, so scenarios pair prompts with replies. */
+const prompt = (sequence: number, text: string) => entry(sequence, text, 'user')
+
+/** A native scenario page as st delivers it: joined tool result, custom omp event, truncation. */
+const nativeScenario = (): TimelineEntry[] => [
+  prompt(1, 'Keep the row projection readable.'),
+  {
+    id: 'timeline-entry/2', sequence: 2, revision: 1, type: 'tool_call', role: 'assistant', final: true,
+    timestamp: snapshot.created_at, body: { call_id: 'c1', name: 'read', arguments: { path: 'src/rows.ts' } },
+  },
+  {
+    id: 'timeline-entry/3', sequence: 3, revision: 1, type: 'tool_result', role: 'tool', final: true,
+    timestamp: snapshot.created_at,
+    body: { call_id: 'c1', content: 'export const rows = []', media_type: 'text/typescript', status: 'success' },
+  },
+  entry(4, 'The projection keeps **visible rows** together.'),
+  {
+    id: 'timeline-entry/5', sequence: 5, revision: 1, type: 'content', role: 'system', final: true,
+    timestamp: snapshot.created_at,
+    body: { text: '[unrecognized omp entry `credential_pin`]\n{"kind":"credential_pin"}', media_type: 'text/plain' },
+  },
+  {
+    id: 'timeline-entry/6', sequence: 6, revision: 1, type: 'truncation', role: 'system', final: true,
+    timestamp: snapshot.created_at,
+    body: { reason: 'retained transcript', omitted_from_sequence: 0, omitted_to_sequence: 0 },
+  },
+]
 
 class Gateway {
   socket: CollectionSocket | undefined
@@ -119,7 +148,7 @@ class Gateway {
     this.socket?.onmessage?.({ data: JSON.stringify(frame) })
   }
 
-  conversationFrame(ref: string, rows: TimelineEntry[]) {
+  conversationFrame(ref: string, rows: TimelineEntry[], hasMore = false) {
     this.send({
       kind: 'conversation',
       id: this.conversationSubscription(ref).id,
@@ -127,7 +156,7 @@ class Gateway {
       session_id: `session/${ref}`,
       items: rows,
       replace: true,
-      has_more: false,
+      has_more: hasMore,
     })
   }
 }
@@ -198,7 +227,7 @@ const mountPane = (agentRef: string) => {
   flushSync(() => {
     root!.render(
       <DataSourceProvider source={live!.source} registry={live!.registry}>
-        <ConversationPane key={agentRef} agentRef={agentRef} />
+        <ConversationPane key={agentRef} agentRef={agentRef} agentName="Route" onOpenTool={() => {}} />
       </DataSourceProvider>,
     )
   })
@@ -212,10 +241,60 @@ describe('ConversationPane conversation demand', () => {
     expect(gateway!.subscribesFor('agent/route')).toBe(0)
     mountPane('agent/route')
     await until(() => gateway!.subscribesFor('agent/route') === 1)
-    gateway!.conversationFrame('agent/route', [entry(1, 'Cold route hello')])
+    // Before the first conversation observation the kit skeleton waits inside the lane.
+    expect(container.querySelector('[data-testid="transcript-placeholder"]')).not.toBeNull()
+    expect(paneText()).not.toContain('Waiting for the first conversation observation')
+    gateway!.conversationFrame('agent/route', [prompt(1, 'Cold route ask'), entry(2, 'Cold route hello')])
     await until(() => live!.registry.get(live!.source.sync!.conversation('agent/route')).sync.status._tag === 'Live')
     await until(() => paneText().includes('Cold route hello'))
     expect(gateway!.unsubscribedRefs()).toEqual([])
+  })
+
+  it('renders a native scenario page through the SDK fold into the kit composition', async () => {
+    open()
+    mountPane('agent/route')
+    await until(() => gateway!.subscribesFor('agent/route') === 1)
+    gateway!.conversationFrame('agent/route', nativeScenario(), true)
+    await until(() => paneText().includes('visible rows'))
+    expect(container.querySelectorAll('[data-testid="transcript-turn"]')).toHaveLength(1)
+    expect(container.querySelector('[data-testid="user-message"]')?.textContent).toContain('Keep the row projection readable')
+    expect(container.querySelector('[data-testid="agent-message"]')?.querySelector('strong')?.textContent).toBe('visible rows')
+    expect(container.querySelector('[data-testid="work-log"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="history-boundary"]')?.textContent).toContain('Earlier messages not loaded')
+    // The unsupported omp event and the truncation marker never become rows or internal wording.
+    expect(paneText()).not.toContain('credential_pin')
+    expect(paneText()).not.toContain('sequences')
+    expect(paneText()).not.toContain('Older history unavailable')
+  })
+
+  it('renders the live workspace transcript and opens and closes its sibling tool panel', async () => {
+    window.history.replaceState(null, '', '/w/agent/route')
+    open()
+    root = createRoot(container)
+    flushSync(() => {
+      root!.render(
+        <DataSourceProvider source={live!.source} registry={live!.registry}>
+          <LiveAgentWorkspace />
+        </DataSourceProvider>,
+      )
+    })
+    await until(() => gateway!.subscribesFor('agent/route') === 1)
+    gateway!.conversationFrame('agent/route', nativeScenario(), true)
+    await until(() => paneText().includes('visible rows'))
+    const workspace = container.querySelector('section[aria-label="Agent workspace"]')!
+    expect(workspace.querySelector('[data-testid="transcript-turn"]')).not.toBeNull()
+    expect(container.querySelector('aside[aria-label="Tool detail"]')).toBeNull()
+    const button = container.querySelector('button[aria-label="Open read tool detail"]') as HTMLButtonElement
+    expect(button).not.toBeNull()
+    flushSync(() => button.click())
+    const panel = container.querySelector('aside[aria-label="Tool detail"]')!
+    expect(panel.textContent).toContain('export const rows = []')
+    expect(panel.parentElement).toBe(workspace.parentElement)
+    expect(workspace.contains(panel)).toBe(false)
+    flushSync(() => (panel.querySelector('button[aria-label="Close tool detail"]') as HTMLButtonElement).click())
+    expect(container.querySelector('aside[aria-label="Tool detail"]')).toBeNull()
+    expect(workspace.querySelector('[data-testid="agent-message"]')).not.toBeNull()
+    window.history.replaceState(null, '', '/')
   })
 
   it('moves demand with the pane across back/forward agent switches', async () => {
@@ -224,19 +303,19 @@ describe('ConversationPane conversation demand', () => {
     open(1)
     mountPane('agent/route')
     await until(() => gateway!.subscribesFor('agent/route') === 1)
-    gateway!.conversationFrame('agent/route', [entry(1, 'First thread')])
+    gateway!.conversationFrame('agent/route', [prompt(1, 'First ask'), entry(2, 'First thread')])
     await until(() => paneText().includes('First thread'))
 
     mountPane('agent/other')
     await until(() => gateway!.subscribesFor('agent/other') === 1)
     expect(gateway!.unsubscribedRefs()).toEqual(['agent/route'])
-    gateway!.conversationFrame('agent/other', [entry(2, 'Second thread')])
+    gateway!.conversationFrame('agent/other', [prompt(2, 'Second ask'), entry(3, 'Second thread')])
     await until(() => paneText().includes('Second thread'))
     expect(paneText()).not.toContain('First thread')
 
     mountPane('agent/route')
     await until(() => gateway!.subscribesFor('agent/route') === 2)
-    gateway!.conversationFrame('agent/route', [entry(1, 'First thread')])
+    gateway!.conversationFrame('agent/route', [prompt(1, 'First ask'), entry(2, 'First thread')])
     await until(() => paneText().includes('First thread'))
   })
 
@@ -248,5 +327,22 @@ describe('ConversationPane conversation demand', () => {
     await settle()
     expect(gateway!.subscribesFor('agent/route')).toBe(1)
     expect(gateway!.unsubscribedRefs()).toEqual([])
+  })
+
+  it('classifies a not-found read by its code and shows one fixed reason', async () => {
+    open()
+    mountPane('agent/route')
+    await until(() => gateway!.subscribesFor('agent/route') === 1)
+    const sentinel = 'raw-read-diagnostic-sentinel'
+    gateway!.send({
+      kind: 'error', id: gateway!.conversationSubscription('agent/route').id, collection: 'conversation',
+      code: 'not-found', message: sentinel, retryable: false,
+    })
+    await until(() => container.querySelector('[data-wf-unavailable="not-found"]') !== null)
+    expect(container.querySelectorAll('[data-testid="transcript-unavailable"]')).toHaveLength(1)
+    expect(container.querySelector('[data-wf-unavailable-code="not-found"]')).not.toBeNull()
+    expect(paneText()).toContain('Conversation not found')
+    expect(container.innerHTML).not.toContain(sentinel)
+    expect(container.innerHTML).not.toContain('Unknown')
   })
 })

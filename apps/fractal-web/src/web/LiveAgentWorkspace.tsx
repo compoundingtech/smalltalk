@@ -10,6 +10,7 @@ import { useAtom } from '@effect/atom-react'
 import { Schema } from 'effect'
 import * as Atom from 'effect/reactivity/Atom'
 import { SidebarAgentRow, ThreadHeader, ResizableSplit, assistantDarkTheme, liveComposerDarkTheme, liveAccentTheme, compositionLightTheme } from '@smalltalk/fractal-ui/assistant-ui/shell'
+import type { WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
 import { useFleet, useSubjectList, useConnection, useNow } from '../data/react.tsx'
 import { persistedAtom } from '../state/persistence.ts'
 import { WorkbenchContextProvider, ResourcePanelProvider, MonitorDetailProvider, type OpenRequest } from '../shell/context.tsx'
@@ -71,6 +72,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
   const selectedPane = query.get('open') ?? 'thread'
   const [resourcePanel, setResourcePanel] = React.useState<ResourcePanelState>({ expanded: false, size: 288 })
   const [diffOpen, setDiffOpen] = React.useState(false)
+  const [openedTool, setOpenedTool] = React.useState<WorkLogCall | undefined>(undefined)
   const [panelFraction, setPanelFraction] = useAtom(panelRatio)
   const [dragWidth, setDragWidth] = React.useState<number | undefined>()
   const [dragPanel, setDragPanel] = React.useState<number | undefined>()
@@ -82,6 +84,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
   const select = (ref: string) => {
     if (ref !== current) onSelectConversation?.(ref)
     setDiffOpen(false)
+    setOpenedTool(undefined)
     navigate(ref)
   }
   const open = (request: OpenRequest) => {
@@ -110,6 +113,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
   const maxPanel = Math.max(240, viewport - (collapsed ? 40 : Math.min(width, Math.max(208, Math.min(440, viewport - 640)))) - 640)
   const panelSize = dragPanel ?? Math.min(maxPanel, Math.max(240, Math.round(panelFraction * viewport)))
   const maxSidebar = Math.max(208, Math.min(440, viewport - 640))
+  const agentName = agent?.name ?? current.split('/').at(-1) ?? 'Conversation'
   return (
     <WorkbenchContextProvider value={{ open, focusedRef: address.ref || null, subjects: byRef, platform: navigator.platform.includes('Mac') ? 'mac' : 'other' }}>
       <ResourcePanelProvider value={{ state: resourcePanel, onChange: (change) => setResourcePanel((value) => ({ ...value, ...change })) }}>
@@ -176,17 +180,29 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                   {current === '' ? (
                     <div {...stylex.props(styles.empty)}>Choose an agent to open its live thread.</div>
                   ) : (
-                    <ConversationPane key={current} agentRef={current} />
+                    <ConversationPane key={current} agentRef={current} agentName={agentName} onOpenTool={setOpenedTool} />
                   )}
                 </div>
               </section>
-              {diffOpen && current !== '' ? (
+              {diffOpen && openedTool === undefined && current !== '' ? (
                 <>
                   <ResizableSplit id="live-change-panel" reverse value={panelSize} min={240} max={maxPanel} collapsed={false} label="Change panel width" onChange={setDragPanel} onCommit={(value) => { setPanelFraction(value / viewport); setDragPanel(undefined) }} onToggle={() => setDiffOpen(false)} onReset={() => setPanelFraction(380 / viewport)} />
                   <aside aria-label="Changes" style={{ width: panelSize }} {...stylex.props(styles.changesPanel)}>
                     <p role="status" {...stylex.props(styles.notice)}>
                       Changes appear only after verified transcript observations.
                     </p>
+                  </aside>
+                </>
+              ) : null}
+              {openedTool !== undefined && current !== '' ? (
+                <>
+                  <ResizableSplit id="live-tool-panel" reverse value={panelSize} min={240} max={maxPanel} collapsed={false} label="Tool detail panel width" onChange={setDragPanel} onCommit={(value) => { setPanelFraction(value / viewport); setDragPanel(undefined) }} onToggle={() => setOpenedTool(undefined)} onReset={() => setPanelFraction(380 / viewport)} />
+                  <aside aria-label="Tool detail" style={{ width: panelSize }} {...stylex.props(styles.changesPanel)}>
+                    <header {...stylex.props(styles.toolDetailHeader)}>
+                      <strong {...stylex.props(styles.toolDetailTitle)}>{openedTool.title}{openedTool.argsSummary === undefined ? '' : ` ${openedTool.argsSummary}`}</strong>
+                      <Aria.Button aria-label="Close tool detail" onPress={() => setOpenedTool(undefined)} {...stylex.props(styles.iconButton)}>×</Aria.Button>
+                    </header>
+                    <pre {...stylex.props(styles.toolDetailOutput)}>{openedTool.detail ?? (openedTool.status === 'running' ? 'No output received yet.' : 'No output recorded.')}</pre>
                   </aside>
                 </>
               ) : null}
@@ -215,4 +231,7 @@ const styles = stylex.create({
   notice: { padding: s.lg, fontSize: t.metaSize, color: c.fgMuted },
   empty: { margin: 'auto', padding: s.section, color: c.fgMuted },
   changesPanel: { display: 'flex', flexDirection: 'column', flexShrink: 0, minWidth: 0, minHeight: 0, overflowY: 'auto', borderLeftWidth: 1, borderLeftStyle: 'solid', borderLeftColor: c.border },
+  toolDetailHeader: { height: 40, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: s.md, paddingInline: s.lg, flexShrink: 0, borderBottomWidth: 1, borderBottomStyle: 'solid', borderBottomColor: c.border },
+  toolDetailTitle: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: t.metaSize },
+  toolDetailOutput: { margin: 0, padding: s.lg, minHeight: 0, overflowY: 'auto', fontFamily: t.fontMono, fontSize: t.denseSize, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', color: c.fgMuted },
 })

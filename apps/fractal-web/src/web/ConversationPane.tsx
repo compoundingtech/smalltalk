@@ -1,30 +1,50 @@
 import * as React from 'react'
-import { EmptyState, Note } from '@smalltalk/fractal-ui'
-import { EmbraceRuntimeProvider, EmbraceThread as Transcript } from '@smalltalk/fractal-ui/assistant-ui'
-import { SyncLine } from '@smalltalk/fractal-ui/assistant-ui/sync'
+import { EmbraceRuntimeProvider, Transcript, type WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
 import { useConversation, useConversationSync, useDataSource, useFeedInterest, useNow } from '../data/react.tsx'
-import { mapConversationFeed, mapConversationSync, transcriptRuntimeOptions } from './conversationTranscript.ts'
+import { mapConversationFeed, transcriptObservedAt, transcriptRuntimeOptions, transcriptSyncStatus } from './conversationTranscript.ts'
 
-/** The selected follow owns content and sync; the kit owns every rendered element. */
-export const ConversationPane = ({ agentRef }: { readonly agentRef: string }) => {
+/** The selected follow owns content; the gated kit composition owns every rendered element,
+ * including the first-observation skeleton, the availability state and the older-history row. */
+export const ConversationPane = ({
+  agentRef,
+  agentName,
+  onOpenTool,
+}: {
+  readonly agentRef: string
+  /** Roster display name: the composition header and assistant sender captions. */
+  readonly agentName: string
+  /** Host-owned detail surface for a tool call opened from the transcript. */
+  readonly onOpenTool: (call: WorkLogCall) => void
+}) => {
   const source = useDataSource()
   // A cold or deep-linked route must follow on mount; the pane is keyed by agent ref, so
   // switching agents releases the previous conversation's demand with this component.
   const interest = React.useMemo(() => source.conversationInterest?.(agentRef), [source, agentRef])
   useFeedInterest({ interest, visible: true })
-  const feed = mapConversationFeed(useConversation(agentRef))
-  const sync = mapConversationSync(useConversationSync(agentRef), useNow())
-  return <>
-    {sync === undefined ? null : <SyncLine {...sync} />}
-    {feed._tag === 'Waiting' ? <Note>Waiting for the first conversation observation.</Note>
-      : feed._tag === 'Unavailable' ? <EmptyState title={feed.title} hint={feed.detail} />
-      : <>
-        {feed.notice === undefined ? null : <Note tone="warning">{feed.notice}</Note>}
-        {feed.hasOlder ? <Note>Earlier conversation entries are not included in this page.</Note> : null}
-        {feed.filteredEmpty ? <Note>This page contains no displayable conversation entries.</Note>
-          : <EmbraceRuntimeProvider key={agentRef} options={transcriptRuntimeOptions(feed.items)}>
-            <Transcript items={feed.items} composer={false} readingColumn />
-          </EmbraceRuntimeProvider>}
-      </>}
-  </>
+  const now = useNow()
+  const feed = useConversation(agentRef)
+  const observation = useConversationSync(agentRef)
+  const state = React.useMemo(() => mapConversationFeed(feed, { agentName }), [feed, agentName])
+  const options = React.useMemo(
+    () => transcriptRuntimeOptions(state._tag === 'Observed' ? state.items : [], state._tag === 'Observed' && state.isRunning),
+    [state],
+  )
+  return <div style={{ display: 'contents' }}
+    data-wf-unavailable={state._tag === 'Unavailable' ? state.classification : undefined}
+    data-wf-unavailable-code={state._tag === 'Unavailable' ? state.code : undefined}>
+    <EmbraceRuntimeProvider key={agentRef} options={options}>
+    <Transcript
+      turns={state._tag === 'Observed' ? state.turns : []}
+      title={agentName}
+      sync={transcriptSyncStatus(observation, feed, now)}
+      now={now}
+      observedAt={transcriptObservedAt(observation, now)}
+      onOpenTool={onOpenTool}
+
+      {...(state._tag === 'Unavailable' ? { availability: state.availability } : {})}
+      {...(state._tag === 'Observed' && state.history._tag === 'HasOlder' ? { history: state.history } : {})}
+      {...(state._tag === 'Observed' && state.emptyState !== undefined ? { emptyState: state.emptyState } : {})}
+    />
+    </EmbraceRuntimeProvider>
+  </div>
 }
