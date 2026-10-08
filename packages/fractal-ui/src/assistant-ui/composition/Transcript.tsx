@@ -10,7 +10,7 @@ import { SyncLine } from '../st3-views/SyncLine'
 import { syncLine } from '../st3-views/sync-line'
 import type { SyncStatus } from '../st3-views/sync-status'
 import { ErrorOverlay, ErrorOverlayHost } from './ErrorOverlay'
-import { HighlightedSource, Markdown, MarkdownImagePolicy, type MarkdownImageResolver } from './Markdown'
+import { HighlightedSource, Markdown, MarkdownImagePolicy, type MarkdownImageOpener, type MarkdownImageResolver } from './Markdown'
 import { ThinkingEntry } from './ThinkingEntry'
 import { SendFailure, TranscriptEmptyContent, type TranscriptEmptyState } from './TranscriptFeedback'
 import { Icon } from './Icons'
@@ -39,6 +39,8 @@ export interface TranscriptProps {
   readonly onRetryRun?: () => void
   readonly onRetrySend?: (itemId: string) => void
   readonly resolveImage?: MarkdownImageResolver
+  /** Opens a deferred image outside the page (for hosts whose CSP forbids inline remote images). */
+  readonly onLoadImage?: MarkdownImageOpener
   readonly availability?: TranscriptAvailability
   readonly history?: TranscriptHistory
   readonly emptyState?: React.ReactNode | TranscriptEmptyState
@@ -87,12 +89,23 @@ const PreparedTurn = React.memo(function PreparedTurn({ turn, onOpenTool, onRetr
   </section>
 })
 /** Locked U2·F3·Y3 presentation under the host's AssistantRuntimeProvider. */
-export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, onRetrySync, onRetryRun, onRetrySend, resolveImage, availability = { _tag: 'Available' }, history = { _tag: 'Complete' }, emptyState }: TranscriptProps) {
+export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, onRetrySync, onRetryRun, onRetrySend, resolveImage, onLoadImage, availability = { _tag: 'Available' }, history = { _tag: 'Complete' }, emptyState }: TranscriptProps) {
   const messages = useAuiState(state => state.thread.messages)
   const committed = React.useMemo(() => {
     const ids = new Set(messages.map(message => message.id))
-    return turns.filter(turn => (turn.prompt === undefined || ids.has(turn.prompt.id)) && turn.items.every(item => ids.has(item.id)))
+    return turns.flatMap(turn => {
+      if (turn.prompt !== undefined && !ids.has(turn.prompt.id)) return []
+      const pendingIndex = turn.items.findIndex(item => !ids.has(item.id))
+      if (pendingIndex === -1) return [turn]
+      // The runtime adopts appended items in an effect. Keep the existing turn
+      // mounted while waiting, and defer only its uncommitted suffix.
+      const items = turn.items.slice(0, pendingIndex)
+      if (turn.prompt === undefined && items.length === 0) return []
+      const itemIds = new Set(items.map(item => item.id))
+      return [{ ...turn, items, work: { ...turn.work, calls: turn.work.calls.filter(call => itemIds.has(call.id)) } }]
+    })
   }, [messages, turns])
+  const imageOptions = React.useMemo(() => ({ resolveImage, onLoadImage }), [resolveImage, onLoadImage])
   const running = [...committed].reverse().find(turn => turn.work.running)
   const progress = sync._tag === 'Progress' && sync.stage === 'reading' && sync.done !== undefined && sync.total !== undefined ? sync : undefined
   const failure = syncLine({ status: sync, label: 'conversation', now, observedAt })
@@ -101,7 +114,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
   const empty = committed.length === 0 && sync._tag === 'Live'
     ? <div aria-label="Empty conversation" data-testid="transcript-empty" {...stylex.props(styles.emptyBody)}><TranscriptEmptyContent emptyState={emptyState} /></div>
     : <div data-testid="transcript-placeholder" aria-label="Loading conversation" {...stylex.props(styles.placeholder)}><p role="status">Loading conversation…</p><SyncLine status={sync} label="conversation" now={now} observedAt={observedAt} onRetry={onRetrySync} /><div aria-hidden="true" {...stylex.props(styles.turn)}><div {...stylex.props(styles.skeletonPrompt)} /><div {...stylex.props(styles.skeletonWork)} /><div {...stylex.props(styles.skeletonAnswer)} /></div></div>
-  return <MarkdownImagePolicy.Provider value={resolveImage}><RetrySend.Provider value={onRetrySend}><ThreadPrimitive.Root aria-label="Transcript" {...stylex.props(styles.frame)}>
+  return <MarkdownImagePolicy.Provider value={imageOptions}><RetrySend.Provider value={onRetrySend}><ThreadPrimitive.Root aria-label="Transcript" {...stylex.props(styles.frame)}>
     <header data-testid="transcript-header" {...stylex.props(styles.header)}><strong {...stylex.props(styles.title)}>{title}</strong>
       {progress !== undefined && <ProgressBar aria-label="Thread synchronization" value={progress.done} maxValue={progress.total} {...stylex.props(styles.progress)}><div {...stylex.props(styles.track)}><div {...stylex.props(styles.fill(`${progress.total === 0 ? 0 : progress.done! / progress.total! * 100}%`))} /></div></ProgressBar>}
       {committed.length > 0 && <SyncLine status={sync} label="conversation" now={now} observedAt={observedAt} onRetry={onRetrySync} />}

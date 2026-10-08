@@ -14,7 +14,7 @@ import { committedWorkLogs, type WorkLogProjection } from './taste/work-log'
 import { EmbraceComposer, type EmbraceComposerProps } from './EmbraceComposer'
 import { EmbraceToolCall, EmbraceToolRegistrations, EmbraceToolRun, EmbraceToolVariantContext, type ToolVariant } from './EmbraceToolCall'
 import { EmbraceScrollViewport } from './EmbraceScrollViewport'
-import { Markdown, MarkdownImagePolicy, type MarkdownImageResolver } from './composition/Markdown'
+import { Markdown, MarkdownImagePolicy, type MarkdownImageOpener, type MarkdownImageResolver } from './composition/Markdown'
 import { ThinkingEntry } from './composition/ThinkingEntry'
 import { SendFailure, TranscriptEmptyContent, type TranscriptEmptyState } from './composition/TranscriptFeedback'
 
@@ -41,6 +41,8 @@ export interface EmbraceThreadProps {
   readonly onCommit?: React.ProfilerOnRenderCallback
   readonly onRetrySend?: (itemId: string) => void
   readonly resolveImage?: MarkdownImageResolver
+  /** Opens a deferred image outside the page (for hosts whose CSP forbids inline remote images). */
+  readonly onLoadImage?: MarkdownImageOpener
   /** Caller-owned workbench layout overrides the workshop's default frame. */
   readonly style?: stylex.StyleXStyles
   /** Copy for a thread with no messages; defaults to a neutral "No messages yet". */
@@ -117,7 +119,8 @@ function rowsFor(items: readonly ConversationItem[], tools: ToolVariant, workLog
 }
 const noWorkLogs: readonly WorkLogProjection[] = []
 /** Render under AssistantRuntimeProvider. The app keeps ownership of stores and callbacks. */
-export function EmbraceThread({ items: snapshot, workLogs, readingColumn = false, embrace = 'E1', tools = 'rows', senders = 'S2', composer = 'C1', history, targetLabel, disabledReason, threadList, toolbar, composerProps, onCommit, onRetrySend, resolveImage, emptyState, style }: EmbraceThreadProps) {
+export function EmbraceThread({ items: snapshot, workLogs, readingColumn = false, embrace = 'E1', tools = 'rows', senders = 'S2', composer = 'C1', history, targetLabel, disabledReason, threadList, toolbar, composerProps, onCommit, onRetrySend, resolveImage, onLoadImage, emptyState, style }: EmbraceThreadProps) {
+  const imageOptions = React.useMemo(() => ({ resolveImage, onLoadImage }), [resolveImage, onLoadImage])
   const messages = useAuiState(state => state.thread.messages)
   // The adapter commits after React renders its new input snapshot. Use the
   // runtime's committed identities and source references so RAC never measures
@@ -147,7 +150,7 @@ export function EmbraceThread({ items: snapshot, workLogs, readingColumn = false
   const transcript = embrace === 'E3'
     ? <EmbraceScrollViewport items={rows} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.viewport)}>{rows.map(row => <React.Fragment key={row.id}>{renderRow(row)}</React.Fragment>)}</EmbraceScrollViewport>
     : <EmbraceVirtualConversation items={rows} renderItem={renderRow} />
-  return <MarkdownImagePolicy.Provider value={resolveImage}><EmbraceToolVariantContext.Provider value={tools}>
+  return <MarkdownImagePolicy.Provider value={imageOptions}><EmbraceToolVariantContext.Provider value={tools}>
     <EmbraceToolRegistrations />
     <ThreadPrimitive.Root {...stylex.props(styles.root, readingColumn && styles.readingRoot, style)}>
       {embrace === 'E4' ? threadList : null}

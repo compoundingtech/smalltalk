@@ -1,6 +1,6 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
-import { Markdown, type MarkdownImageResolver } from './composition/Markdown'
+import { Markdown, type MarkdownImageOpener, type MarkdownImageResolver } from './composition/Markdown'
 import { accentTokens, tokens } from './embrace-tokens.stylex'
 import type { ToolDiff } from './embrace-tool-preview'
 
@@ -40,8 +40,8 @@ export const EmbraceDiffPreview = ({ diffs }: { readonly diffs: readonly ToolDif
 
 
 /** Shared consent-gated Markdown rendering for tool output. */
-export const EmbraceMarkdownPreview = ({ markdown, resolveImage }: { readonly markdown: string; readonly resolveImage?: MarkdownImageResolver }) => (
-  <Markdown text={markdown} resolveImage={resolveImage} />
+export const EmbraceMarkdownPreview = ({ markdown, resolveImage, onLoadImage }: { readonly markdown: string; readonly resolveImage?: MarkdownImageResolver; readonly onLoadImage?: MarkdownImageOpener }) => (
+  <Markdown text={markdown} resolveImage={resolveImage} onLoadImage={onLoadImage} />
 )
 
 const styles = stylex.create({
