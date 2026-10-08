@@ -115,6 +115,9 @@ export class Rejected extends Data.TaggedError('Rejected')<{
 /** The terminal could not be attached (no terminal, runtime gone, attach refused). */
 export class AttachFailure extends Data.TaggedError('Attach')<{
   readonly code?: string
+  readonly status?: number
+  /** Local dependent-read authorization loss, not a fabricated daemon error code. */
+  readonly authorizationRefused?: boolean
   readonly message: string
 }> {}
 
@@ -470,7 +473,12 @@ const make = (options: St3Options) =>
           setSync({ _tag: 'Connecting', attempt: 1, since: Date.now() })
           const applyFreshness = (event: FreshnessEvent) => {
             const next = transitionFreshness(freshness, event, Date.now())
-            if (next === freshness) return
+            if (next === freshness) {
+              // Window evidence advances even while the transport stays Live.
+              if (event._tag === 'Frame' && next._tag === 'Live' && snapshot !== undefined)
+                setSync({ _tag: 'Live', since: next.since, snapshot })
+              return
+            }
             freshness = next
             freshnessTable.set(key, next)
             publishFreshness()
@@ -713,7 +721,7 @@ const make = (options: St3Options) =>
         const read = yield* Effect.tryPromise({
           try: () => client.runtimesGet(runtimeRef),
           catch: (error) => error instanceof ClientError
-            ? new AttachFailure({ code: error.response.code, message: error.response.message })
+            ? new AttachFailure({ code: error.response.code, status: error.status, message: error.response.message })
             : new AttachFailure({ message: errorMessage(error) }),
         })
         const runtime = yield* Effect.try({
@@ -738,7 +746,7 @@ const make = (options: St3Options) =>
               parameters: { target_id: terminal },
             }),
           catch: (error) => error instanceof ClientError
-            ? new AttachFailure({ code: error.response.code, message: error.response.message })
+            ? new AttachFailure({ code: error.response.code, status: error.status, message: error.response.message })
             : new AttachFailure({ message: errorMessage(error) }),
         })
         const attachment = result.value.terminal_attachment

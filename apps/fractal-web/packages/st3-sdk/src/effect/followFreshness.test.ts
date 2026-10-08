@@ -695,4 +695,26 @@ describe('follow freshness', () => {
         })
       }),
     ))
+  effectIt.live('refreshes Live window snapshot evidence without restarting its since clock', () =>
+    runEffect({ maxFollows: 4 }, (gateway) =>
+      Effect.gen(function* () {
+        const st3 = yield* St3
+        const roster = yield* mountWindow('agents')
+        gateway.window('agents')
+        yield* settle
+        const first = roster.lastStatus()
+        expect(first).toMatchObject({ _tag: 'Live', snapshot })
+        const updated = { ...snapshot, id: 'snapshot/2', store_index: 2 }
+        gateway.send({
+          kind: 'changes', id: gateway.idOf('agents'), collection: 'agents',
+          upserts: [], removes: [], order: [], has_more: false, snapshot: updated,
+        })
+        yield* settle
+        expect(roster.events.at(-1)).toMatchObject({ _tag: 'Observed', value: { snapshot: updated } })
+        expect(roster.lastStatus()).toEqual({ ...first, snapshot: updated })
+        expect((yield* SubscriptionRef.get(st3.syncStatuses)).get(followKey(windowSpec('agents'))))
+          .toEqual({ ...first, snapshot: updated })
+      }),
+    ))
+
 })
