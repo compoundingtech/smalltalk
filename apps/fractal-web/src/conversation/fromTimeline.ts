@@ -426,7 +426,7 @@ export class LiveTimeline {
       if (isTurnHeader(entry)) continue
       if (entry.type === 'content' && (entry.role === 'user' || entry.role === 'system')) {
         const text = withoutShownDeliveries(entry.body.text ?? '', shown)
-        if (text !== entry.body.text) {
+        if (text !== (entry.body.text ?? '')) {
           if (text.length > 0)
             items.push(itemOf({ entry: { ...entry, body: { ...entry.body, text } }, sessionActive: true }))
           continue
