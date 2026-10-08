@@ -164,9 +164,11 @@ const verifyReplay = async (world: World) => {
       const initial = world.slices.conversation.state.threads.find((value) => value.agent === thread.agent)
       if (initial === undefined) continue
       let visible = new Set(initial.items.slice(-initial.page_size).map(({ id }) => id))
-      for (const event of world.slices.conversation.timeline) if (event.at_ms <= at && event.agent === thread.agent) {
-        if (event._tag === 'replace') visible = new Set(event.items.slice(-thread.page_size).map(({ id }) => id))
-        else for (const item of event.items) visible.add(item.id)
+      for (const event of world.slices.conversation.timeline) if (event.at_ms <= at) {
+        if (event._tag === 'thread-create' && event.thread.agent === thread.agent) visible = new Set(event.thread.items.slice(-event.thread.page_size).map(({ id }) => id))
+        else if (event._tag === 'replace' && event.agent === thread.agent) visible = new Set(event.items.slice(-thread.page_size).map(({ id }) => id))
+        else if (event._tag === 'entries' && event.agent === thread.agent) for (const item of event.items) visible.add(item.id)
+        else if (event._tag === 'thread-remove' && event.agent === thread.agent) visible.clear()
       }
       const received = conversations.get(id)
       // A sync hold deliberately withholds the first frame; it is not an empty conversation.

@@ -134,6 +134,14 @@ missions with steps; repositories with files. Every slice of the world reference
 the agent that is blocked in `roster` is the same agent whose `conversation` shows the failing
 typecheck and whose `attention` card asks for review.
 
+`CastSpec` supplies exactly one of `roles` (the role is also the stable key) or `agents`:
+`{ key, role, name?, workspace?, branch? }[]`. Keys are unique lowercase ASCII slugs;
+repeated semantic roles use distinct keys such as `builder-1` and `builder-2`. `CastAgent.key`
+drives identities, seeded forks, runtime/session/terminal IDs and factory entry/call IDs;
+`role` chooses semantic vocabulary. Thus scale casts do not alias agents. Explicit display
+names may contain Unicode. Workspace overrides remain beneath `~/src/<project>/` and cannot
+contain a `..` segment; branch overrides change display/worktree context, not identity.
+
 Text comes from curated vocabulary banks in `kit/vocabulary/`: task titles, commit messages, file
 paths, compiler errors, test names, review comments, shell commands and their output. The banks
 describe everyday engineering on invented projects ("rename `fetchUser` to `loadUser` across the
@@ -146,12 +154,12 @@ Every identity is invented and follows the repository's public conventions:
 
 | Family | Form | Example |
 | --- | --- | --- |
-| agent | `agent/example/<project>/<role>` | `agent/example/atlas/builder` |
+| agent | `agent/example/<project>/<role-key>` | `agent/example/atlas/builder-1` |
 | person | `person/<name>` from the reviewed invented list in `scripts/check-public-repo` | `person/ada` |
 | host | `host/<invented-word>` | `host/harbor` |
 | mission, run, step | `mission/example/<project>/<slug>`, `mission-run/…`, `step-run/…` | `mission/example/atlas/store-move` |
 | machine | `machine/<host word>` | `machine/harbor` |
-| per-agent runtime, session, terminal; fleet | `<family>/example-<project>-<role>`, `fleet/example-<project>` | `runtime/example-atlas-builder` |
+| per-agent runtime, session, terminal; fleet | `<family>/example-<project>-<role-key>`, `fleet/example-<project>` | `runtime/example-atlas-builder-1` |
 | others | `<family>/scenario-<world>-<n>` | `message/scenario-fleet-mid-refactor-12` |
 
 Paths start with `~/src/<project>`; no absolute home path appears. A display name is distinct
@@ -189,9 +197,24 @@ after it (see [Store versions](#store-versions)).
 | `roster` | `agents: Agent[]`, `runtimes: Runtime[]`, `machines: Machine[]`, `order: Id[]` | `changes {upserts, removes, order?}` |
 | `details` | `missions: Mission[]`, `work: Work[]` (joined as list reads return them) | `changes {upserts, removes, order?}` |
 | `attention` | `attention: Attention[]`, `messages: Message[]` (sources the cards load) | `changes {upserts, removes, order?}` |
-| `conversation` | per agent: `session_id`, `items: TimelineEntry[]`, `page_size`, `has_more` | `entries {agent, items}` (append or revise), `replace {agent, session_id, items, has_more}` |
-| `terminal` | per terminal: owner, its terminal `runtime` (the `Runtime` that `runtimesGet` returns before every attach), `incarnation`, `cast` (asciicast v2), `screens: { at_ms, screen }[]` | `screen`, `unavailable`, `end`, `incarnation` |
+| `conversation` | per agent: `session_id`, `items: TimelineEntry[]`, `page_size`, `has_more` | `thread-create {thread}`, `thread-remove {agent}`, `entries {agent, items}` (append or revise), `replace {agent, session_id, items, has_more}` |
+| `terminal` | per terminal: owner, its terminal `runtime` (the `Runtime` that `runtimesGet` returns before every attach), `incarnation`, `cast` (asciicast v2), `screens: { at_ms, screen }[]` | `terminal-create {record}`, `terminal-remove {terminal}`, `screen`, `unavailable`, `end`, `incarnation` |
 | `sync` | `capabilities` envelope, the [sync script](#sync-matrix) and the `expected` sync status per surface | see [Replay dispatch](#replay-dispatch) |
+
+Creation events carry the complete thread or terminal record, including pagination or runtime,
+cast and screens metadata. Resources are genuinely absent before creation, rather than hidden
+empty records. Creating an existing key replaces its record; removal deletes membership.
+All four membership events advance the store. `terminalRecord(ctx, member, run, startedMs)`
+builds a terminal runtime and retains only run screens at offsets at or before zero; authors
+put later screens in timeline events.
+
+Roster, details and attention may additionally hold `resources: RawResource[]`: future resource
+kinds, preserved as encoded `{id, kind, revision, updated_at, ...}` values outside known-kind
+dispatch. Unknown `changes.upserts` fold into this collection and `removes` deletes them by ID.
+Replay includes them in that slice's primary collection (`agents`, `missions`, `attention`),
+its bounded socket window and generic resources HTTP observations without dropping their fields.
+Known kinds still require their proper collection. Their schema-declared header timestamps
+participate in `times`; opaque future payload timestamps do not.
 
 `selector` names a subscription by its collection and filter, for example
 `{ collection: 'conversation', conversation: 'agent/example/atlas/builder' }`.
@@ -210,6 +233,13 @@ so an override never introduces strangers. Variants per slice:
 
 `world.with({ conversation: 'long' })` returns a new world with that variant. A world may also
 pass a slice value built by its own factories: `world.with({ sync: customSync })`.
+
+Generic tables live in `src/kit/variants/<slice>.ts`, each exporting
+`<slice>Variants: VariantTable['<slice>']`. `src/kit/variants.ts` only composes these tables and
+reexports sync helpers. Variants synthesize missing default records from the declared cast:
+an empty conversation variant can create cast-owned empty threads, and populated terminal
+variants can build a cast-owned terminal. A populated variant requires an appropriate cast
+member; it never invents a foreign identity or dereferences a missing first record.
 
 ### Terminal data
 
@@ -307,8 +337,17 @@ and the Swift reader in `St3Client` each run all vectors in their own tests.
 - `source` is `{ _tag: 'synthetic', seed }` or `{ _tag: 'recorded', recording }`.
 - `loading: true` marks a `loading` variant: replay withholds every first reply of the slice's
   subscriptions.
-- `decode` is `strict` except in the `unknown-fields` world, which declares `tolerant` and lists
-  each deliberately unknown path in `unknown: string[]` (JSON pointers).
+- `decode` is `strict` except in deliberately contaminated slices, which declare `tolerant`
+  and `unknown: { pointer: string, known_value?: unknown }[]`. Pointers are exact, unique,
+  nonoverlapping JSON pointers inside a wire value. `known_value` is a strict-valid repair
+  witness (a known enum, or a complete known resource/entry for a future kind); omit it only
+  to remove an extra object key. Witnesses are diagnostic metadata, never transport data.
+  The gate first decodes the original tolerantly, then strict-decodes the value with all
+  declarations repaired, rejecting undeclared contamination. It also strict-decodes each
+  declared path in isolation with all other declarations repaired and requires failure.
+  This isolates strict-enum root-only diagnostics without matching error strings. Invalid
+  paths, stale declarations and invalid witnesses fail the gate. Absent metadata is omitted
+  from emitted files, preserving the bytes of uncontaminated worlds.
 - `fixtures/scenarios/index.json` lists every world: id, title, narrative, slices, cast (names
   and ids) and seed. Clients build world pickers from it.
 - Files have sorted keys, two-space indentation and a trailing newline, so diffs stay readable.
@@ -446,18 +485,20 @@ over the event union (a `never` check), and each row has a test through the real
 | roster, details, attention | `changes` | Updates the state. For every open subscription whose filtered, limited window changes: one `changes` frame with `upserts`, `removes` (including rows leaving the window), the complete new `order`, `has_more` and a new fence. Unaffected subscriptions get nothing. |
 | conversation | `entries` | One `conversation` frame with `replace: false` and those entries, without `has_more`, to subscribers of that agent or session. |
 | conversation | `replace` | One `conversation` frame with `replace: true`, the newest page (`page_size`) and `has_more`. |
+| conversation | `thread-create {thread}` / `thread-remove {agent}` | Introduces / removes full thread membership. A new subscribe or timeline HTTP read sees the introduced metadata and newest page; held first replies are released when their policy allows. Removal sends `not-found` to existing subscribers and later reads. |
+| terminal | `terminal-create {record}` / `terminal-remove {terminal}` | Introduces / removes full terminal membership. Runtime reads, attaches and subscriptions see the new runtime/incarnation/screens. Removal sends `not-found` to existing subscribers and later reads/attaches. |
 | terminal | `screen` | One `screen` frame with the `TerminalScreen` to subscribers holding the current incarnation. |
 | terminal | `unavailable` | An `error` frame, code `terminal-unavailable`, `retryable: true`. A fresh `terminal.attach` returns the current incarnation and a capability, and a subscribe with it resumes with the current screen. A subscribe that reuses the earlier lease also resumes while the lease is valid (a separate protocol test; the SDK always attaches afresh). |
 | terminal | `end` | An `error` frame, code `terminal-ended`, `retryable: false`, to every subscriber. Later attaches and subscribes return `terminal-ended`. |
 | terminal | `incarnation` | Sets a new incarnation. Current subscribers get an `error` frame, code `stale-fence`. A subscribe with the old incarnation gets `stale-fence`; `terminal.attach` returns the new incarnation and a new capability. |
-| sync | `open-fail` | The next socket open fails as a browser observes it: `onerror`, then `onclose` with code 1006 and no body. |
-| sync | `http-raw {route, status, content_type, body}` | That route returns a response that is not a client-v0 envelope (for example a proxy's HTML page). The decode gate skips `body` because it is not client-v0 data; the privacy gate still scans it. |
+| sync | `open-fail {opens?}` / `open-ok` | Each failed open emits `onerror`, then `onclose` code 1006 and no body. Omitted `opens` fails one open; a positive integer fails that many opens; `'all'` fails every open until `open-ok` or a later `open-fail` replaces the policy. |
+| sync | `http-raw {route, when?, status, content_type, body}` | Matching requests return a non-client-v0 response (for example a proxy's HTML page). The decode gate skips `body`; the privacy gate still scans it. |
 | sync | `close {code, reason}` | Closes the open socket with that WebSocket close code. |
 | sync | `reopen {after_ms}` | Allows a new socket open again after `after_ms`; until then opens fail with close code 1006. |
-| sync | `http-error {route, status, envelope}` | That route returns the status and `ErrorEnvelope` until `http-ok {route}`. |
+| sync | `http-error {route, when?, status, envelope}` / `http-ok {route, when?}` | Matching requests return the fault until cleared. `when.cursor` is `'present'` or `'absent'`; every `when.query` string must equal the URL query value. An older-page-only fault therefore leaves the first page healthy. Exact pathname wins over route family, then generic `resources`; newest matching policy wins within a route. An unqualified `http-ok` clears all policies for that route; a qualified one clears only its matching condition. |
 | sync | `hold {selector}` / `release {selector}` | Withholds / then sends the selected subscription's first reply. |
 | sync | `resync {selector, code?, message?}` | A `resync` frame with `retryable: true`; `code` and `message` only when given (uncoded resync is the legacy shape). |
-| sync | `error {selector?, code?, message, retryable}` | An `error` frame. With no `selector`, it carries no `collection` (the legacy uncoded subscription-cap shape). |
+| sync | `error {selector?, code?, message, retryable, repeat?}` / `error-clear {selector?}` | Sends the error immediately. `repeat: true` also rejects every later matching subscribe until cleared; repeated rejection removes the attempted subscription. Without selector the frame has no id or collection, and without code it remains uncoded (the legacy subscription-cap shape). Selector-qualified policies affect only that surface. |
 | sync | `notice {peers}` / `notice-clear` | Sets / clears the `SyncNotice` that every subsequent page response (`Page`, `ArrangementPage`, `ResourcesPage`) carries in `sync`. No socket frame. |
 | sync | `progress {selector, stage, …}` | A `progress` frame. Active only when the world's capabilities advertise `sync-status.v1` and the frame is in the client-v0 schema. |
 | sync | `heartbeat` / `silence {ms}` | A `heartbeat` frame / no frame of any kind for `ms`. Same activation as `progress`. |
@@ -531,6 +572,15 @@ attempts, instants and issue texts the SDK chooses.
 Where an `expected` value depends on SDK details this document does not fix (the
 `capability-absent` failure, `attempt` numbering), the row starts as `shape`; the SDK's current
 behavior is recorded in the row on first adoption (`exact`) and changes only with the SDK contract.
+
+Capability advertisement is discovery, not an independent server admission rule. The client-v0
+server constructs registered capabilities with granted/ungranted/unavailable states
+(`crates/st3/src/api/client_v0.rs`, `capabilities`), checks action scopes in `action`, and opens
+terminal subscriptions through `open_terminal_subscription` and the attachment lease checks.
+It has no unsupported failure triggered solely by omission from that advertisement.
+Replay therefore imposes no new attach or subscribe restriction when an entry is omitted.
+The `capability-absent` SDK row remains `compare: 'shape'`; its consumer-side unsupported
+failure is pinned on first web adoption, not invented by the transport.
 
 **Replication divergence is not a sync failure.** A `SyncNotice` with state `diverged` says the
 host projects a different graph from the same envelopes; the transport is healthy. It has its own

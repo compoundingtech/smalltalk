@@ -35,15 +35,18 @@ export const wireValues = (slice: AnySlice): WireValue[] => {
   switch (slice.kind) {
     case 'roster':
       list('/state/agents', slice.state.agents, 'Agent')
+      list('/state/resources', slice.state.resources ?? [], 'Resource')
       list('/state/runtimes', slice.state.runtimes, 'Runtime')
       list('/state/machines', slice.state.machines, 'Machine')
       break
     case 'details':
       list('/state/missions', slice.state.missions, 'Mission')
+      list('/state/resources', slice.state.resources ?? [], 'Resource')
       list('/state/work', slice.state.work, 'Work')
       break
     case 'attention':
       list('/state/attention', slice.state.attention, 'Attention')
+      list('/state/resources', slice.state.resources ?? [], 'Resource')
       list('/state/messages', slice.state.messages, 'Message')
       break
     case 'conversation':
@@ -64,6 +67,14 @@ export const wireValues = (slice: AnySlice): WireValue[] => {
   slice.timeline.forEach((event, index) => {
     const base = `/timeline/${index}`
     switch (event._tag) {
+      case 'thread-create':
+        list(`${base}/thread/items`, event.thread.items, 'TimelineEntry')
+        break
+      case 'terminal-create':
+        out.push({ pointer: `${base}/record/runtime`, definition: 'Runtime', value: event.record.runtime })
+        event.record.screens.forEach((screen, at) =>
+          out.push({ pointer: `${base}/record/screens/${at}/screen`, definition: 'TerminalScreen', value: screen.screen }))
+        break
       case 'changes':
         list(`${base}/upserts`, event.upserts, 'Resource')
         break

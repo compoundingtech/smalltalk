@@ -5,7 +5,7 @@ import type { FactoryContext } from '../context.ts'
 import { int } from '../rng.ts'
 
 export interface AgentOptions {
-  readonly state: 'running' | 'waiting' | 'stopped' | 'failed' | 'starting' | 'suspended'
+  readonly state: 'desired' | 'running' | 'waiting' | 'stopped' | 'failed' | 'starting' | 'suspended'
   /** Offset of the last state change. */
   readonly sinceMs: number
   readonly lastActivityMs?: number
@@ -41,7 +41,7 @@ export const agent = (ctx: FactoryContext, member: CastAgent, options: AgentOpti
   }
   const current = options.step === undefined ? null : label(options.step, options.workState ?? 'claimed', options.sinceMs)
   const upcoming = (options.upcoming ?? []).flatMap((index) => label(index, 'ready', options.sinceMs) ?? [])
-  const hasRuntime = options.state !== 'stopped'
+  const hasRuntime = options.state !== 'stopped' && options.state !== 'desired'
   const value: Agent = {
     id: member.id,
     kind: 'agent',

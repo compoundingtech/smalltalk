@@ -18,10 +18,27 @@ import type {
 import type { Asciicast } from './asciicast.ts'
 import type { SyncStatus } from './syncStatus.ts'
 
+/** A future resource kept encoded, never disguised as a known resource kind. */
+export interface RawResource {
+  readonly id: Id
+  readonly kind: string
+  readonly revision: string
+  readonly updated_at: string
+  readonly [field: string]: unknown
+}
+export type WireResource = Resource | RawResource
+
+/** Exact contaminated pointer, with its strict-valid replacement; omission removes an extra key. */
+export interface UnknownPath {
+  readonly pointer: string
+  readonly known_value?: unknown
+}
+
 export const SLICE_KINDS = ['roster', 'details', 'attention', 'conversation', 'terminal', 'sync'] as const
 export type SliceKind = (typeof SLICE_KINDS)[number]
 
 export interface RosterState {
+  readonly resources?: RawResource[]
   readonly agents: Agent[]
   readonly runtimes: Runtime[]
   readonly machines: Machine[]
@@ -30,11 +47,13 @@ export interface RosterState {
 }
 
 export interface DetailsState {
+  readonly resources?: RawResource[]
   readonly missions: Mission[]
   readonly work: Work[]
 }
 
 export interface AttentionState {
+  readonly resources?: RawResource[]
   readonly attention: Attention[]
   readonly messages: Message[]
 }
@@ -91,7 +110,7 @@ export interface SyncState {
   /** The `GET capabilities` envelope's value. */
   readonly capabilities: Capabilities
   /** A local condition the consumer test must create; replay cannot. */
-  readonly local?: { readonly _tag: 'visible-follows'; readonly count: number }
+  readonly local?: { readonly _tag: 'visible-follows'; readonly count: number } | { readonly _tag: 'hidden-follow'; readonly hidden: string; readonly visible: string[] }
   readonly expected: SyncExpectation[]
 }
 
@@ -120,12 +139,14 @@ interface At {
 
 export type ChangesEvent = At & {
   readonly _tag: 'changes'
-  readonly upserts: Resource[]
+  readonly upserts: WireResource[]
   readonly removes: Id[]
   readonly order?: Id[]
 }
 
 export type ConversationEvent =
+  | (At & { readonly _tag: 'thread-create'; readonly thread: ConversationThread })
+  | (At & { readonly _tag: 'thread-remove'; readonly agent: Id })
   | (At & { readonly _tag: 'entries'; readonly agent: Id; readonly items: TimelineEntry[] })
   | (At & {
       readonly _tag: 'replace'
@@ -136,24 +157,34 @@ export type ConversationEvent =
     })
 
 export type TerminalEvent =
+  | (At & { readonly _tag: 'terminal-create'; readonly record: TerminalRecord })
+  | (At & { readonly _tag: 'terminal-remove'; readonly terminal: Id })
   | (At & { readonly _tag: 'screen'; readonly terminal: Id; readonly screen: TerminalScreen })
   | (At & { readonly _tag: 'unavailable'; readonly terminal: Id })
   | (At & { readonly _tag: 'end'; readonly terminal: Id })
   | (At & { readonly _tag: 'incarnation'; readonly terminal: Id; readonly incarnation: string })
 
+/** All named query keys must match; `cursor: 'present'` targets only older pages. */
+export interface HttpCondition {
+  readonly cursor?: 'present' | 'absent'
+  readonly query?: Readonly<Record<string, string>>
+}
+
 export type SyncEvent =
-  | (At & { readonly _tag: 'open-fail' })
+  | (At & { readonly _tag: 'open-fail'; readonly opens?: number | 'all' })
+  | (At & { readonly _tag: 'open-ok' })
   | (At & {
       readonly _tag: 'http-raw'
       readonly route: HttpRoute
+      readonly when?: HttpCondition
       readonly status: number
       readonly content_type: string
       readonly body: string
     })
   | (At & { readonly _tag: 'close'; readonly code: number; readonly reason: string })
   | (At & { readonly _tag: 'reopen'; readonly after_ms: number })
-  | (At & { readonly _tag: 'http-error'; readonly route: HttpRoute; readonly status: number; readonly envelope: ErrorEnvelope })
-  | (At & { readonly _tag: 'http-ok'; readonly route: HttpRoute })
+  | (At & { readonly _tag: 'http-error'; readonly route: HttpRoute; readonly when?: HttpCondition; readonly status: number; readonly envelope: ErrorEnvelope })
+  | (At & { readonly _tag: 'http-ok'; readonly route: HttpRoute; readonly when?: HttpCondition })
   | (At & { readonly _tag: 'hold'; readonly selector: Selector })
   | (At & { readonly _tag: 'release'; readonly selector: Selector })
   | (At & { readonly _tag: 'resync'; readonly selector: Selector; readonly code?: string; readonly message?: string })
@@ -163,8 +194,11 @@ export type SyncEvent =
       readonly code?: string
       readonly message: string
       readonly retryable: boolean
+      /** Reemit on each matching subscribe until `error-clear`. */
+      readonly repeat?: boolean
     })
   | (At & { readonly _tag: 'notice'; readonly peers: SyncPeer[] })
+  | (At & { readonly _tag: 'error-clear'; readonly selector?: Selector })
   | (At & { readonly _tag: 'notice-clear' })
 
 export interface SliceEvents {
@@ -186,6 +220,7 @@ export interface Slice<K extends SliceKind = SliceKind> {
   readonly variant: string
   readonly source: SliceSource
   readonly decode: 'strict' | 'tolerant'
+  readonly unknown?: readonly UnknownPath[]
   /** Every first reply for this slice's subscriptions is withheld (the `loading` variants). */
   readonly loading: boolean
   readonly state: SliceStates[K]

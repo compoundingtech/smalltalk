@@ -35,6 +35,34 @@ scenarioStoryCheck(Story, meta, { assert: true })
 Rust, Swift and other readers use the committed files in `fixtures/scenarios/` and shift the
 instants each file lists in `times` (vectors: `fixtures/scenarios/_vectors/rebase.json`).
 
+## Authoring contracts
+
+- Casts use either `roles` or `agents: { key, role, name?, workspace?, branch? }[]`.
+  Stable unique keys determine identities and seeded forks; semantic roles may repeat. Workspace
+  overrides stay under `~/src/<project>/`. `agent` also supports `state: 'desired'` without a runtime.
+- `thread-create {thread}` and `terminal-create {record}` introduce complete resources after
+  offset zero; `thread-remove {agent}` and `terminal-remove {terminal}` remove membership.
+  Use the shared `terminalRecord(ctx, member, run, startedMs)` factory, not a world-local helper.
+- Future resource kinds live in the roster/details/attention state's optional `resources`
+  array and in `changes.upserts`. Fold keeps them outside known-kind dispatch; replay sends
+  the original encoded values over primary collection sockets and generic resources HTTP.
+- Contaminated slices use `decode: 'tolerant'` and
+  `unknown: [{ pointer, known_value? }]`. Each exact pointer supplies a strict-valid repair
+  witness; omit `known_value` to remove an extra object key. The decode gate requires each
+  declared contamination to fail strict decoding independently, and rejects undeclared errors.
+- Socket `open-fail { opens: 'all' }` persists until `open-ok`; a positive integer fails that
+  many opens (omission means one). Subscription `error { repeat: true, ... }` rejects each
+  resubscribe until `error-clear`. HTTP faults accept
+  `when: { cursor: 'present' | 'absent', query?: Record<string, string> }`; use a present cursor
+  to expire older pages without breaking the first page. `http-ok` clears the matching policy.
+- Capability omission alone does not reject attach/subscribe on the server, so replay adds no
+  synthetic rejection. The capability-absent SDK expectation starts as `shape` and is pinned
+  when the web consumer adopts it.
+- Add variants in `src/kit/variants/<slice>.ts`, exporting
+  `<slice>Variants: VariantTable['<slice>']`; the central module composes them. Populated variants
+  synthesize from the cast when default records are absent. No paged/sharded fixture encoding
+  is defined here; the catalog's `huge` format remains a separate decision.
+
 | Command | Effect |
 | --- | --- |
 | `pnpm --filter @smalltalk/st3-scenarios emit` | rewrites `fixtures/scenarios` |
