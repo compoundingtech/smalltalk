@@ -1,7 +1,7 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { Button, Link, Tooltip, TooltipTrigger, VisuallyHidden } from 'react-aria-components'
-import ReactMarkdown from 'react-markdown'
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import type { Components, ExtraProps } from 'react-markdown'
 import type { Root, RootContent as SyntaxNode } from 'hast'
 import type { Syntax } from 'refractor/core'
@@ -10,7 +10,10 @@ import { surfaceVars as surface, textVars as textColor, borderVars as border, ac
 
 export interface InlineResource { readonly path: string; readonly added: number; readonly removed: number; readonly preview?: string }
 export type InlineReferenceRenderer = (path: string) => React.ReactNode | undefined
-export interface MarkdownProps { text: string; streaming?: boolean; resources?: readonly InlineResource[]; onOpenResource?: (path?: string) => void; renderInlineReference?: InlineReferenceRenderer }
+export type MarkdownImageResolution = { readonly _tag: 'Load'; readonly src: string } | { readonly _tag: 'Defer' }
+export type MarkdownImageResolver = (src: string) => MarkdownImageResolution
+export const MarkdownImagePolicy = React.createContext<MarkdownImageResolver | undefined>(undefined)
+export interface MarkdownProps { text: string; streaming?: boolean; resources?: readonly InlineResource[]; onOpenResource?: (path?: string) => void; renderInlineReference?: InlineReferenceRenderer; resolveImage?: MarkdownImageResolver }
 const EMPTY_RESOURCES: readonly InlineResource[] = []
 const REMARK_PLUGINS = [remarkGfm]
 const STREAMING_PLUGINS = [markStreamingTail]
@@ -33,11 +36,27 @@ function markStreamingTail() {
   }
 }
 
-export const Markdown = React.memo(function Markdown({ text, streaming = false, resources = EMPTY_RESOURCES, onOpenResource, renderInlineReference }: MarkdownProps) {
-  const references = React.useMemo(() => ({ resources, onOpenResource, renderInlineReference }), [resources, onOpenResource, renderInlineReference])
+export const Markdown = React.memo(function Markdown({ text, streaming = false, resources = EMPTY_RESOURCES, onOpenResource, renderInlineReference, resolveImage }: MarkdownProps) {
+  const inheritedImagePolicy = React.useContext(MarkdownImagePolicy)
+  const references = React.useMemo(() => ({ resources, onOpenResource, renderInlineReference, resolveImage: resolveImage ?? inheritedImagePolicy }), [resources, onOpenResource, renderInlineReference, resolveImage, inheritedImagePolicy])
   const source = React.useMemo(() => streaming ? completeStreamingTail(text) : text, [text, streaming])
-  return <ReferenceContext.Provider value={references}><div data-testid="markdown" {...stylex.props(styles.markdown)}><ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={streaming ? STREAMING_PLUGINS : undefined} components={MARKDOWN_COMPONENTS}>{source}</ReactMarkdown></div></ReferenceContext.Provider>
+  return <ReferenceContext.Provider value={references}><div data-testid="markdown" {...stylex.props(styles.markdown)}><ReactMarkdown skipHtml urlTransform={(url, key) => key === 'src' ? url : defaultUrlTransform(url)} remarkPlugins={REMARK_PLUGINS} rehypePlugins={streaming ? STREAMING_PLUGINS : undefined} components={MARKDOWN_COMPONENTS}>{source}</ReactMarkdown></div></ReferenceContext.Provider>
 })
+
+function DeferredImage({ src = '', alt = '' }: React.ComponentProps<'img'>) {
+  const { resolveImage } = React.useContext(ReferenceContext)
+  const [approvedSrc, setApprovedSrc] = React.useState<string | undefined>(undefined)
+  const policy = resolveImage?.(src) ?? { _tag: 'Defer' }
+  const loadedSrc = policy._tag === 'Load' ? policy.src : approvedSrc === src ? src : undefined
+  let host = 'image source'
+  try { const url = new URL(src); host = url.host || `${url.protocol} image` } catch { host = 'attachment' }
+  return loadedSrc !== undefined ? <img src={loadedSrc} alt={alt} referrerPolicy="no-referrer" {...stylex.props(styles.image)} /> : <span data-testid="deferred-image" data-image-src={src} {...stylex.props(styles.imagePlaceholder)}><span>{alt || 'Image'} · {host}</span><Button onPress={() => setApprovedSrc(src)} onClick={event => { event.preventDefault(); event.stopPropagation() }} {...stylex.props(styles.imageAction)}>Load image</Button></span>
+}
+
+function MarkdownLink({ children, href, title }: React.ComponentProps<'a'>) {
+  const { resolveImage } = React.useContext(ReferenceContext)
+  return <ReferenceContext.Provider value={{ resolveImage }}><Link href={href} target="_blank" rel="noopener noreferrer" render={props => <a {...props as React.ComponentPropsWithRef<'a'>} title={title} />} {...stylex.props(styles.link)}>{children}</Link></ReferenceContext.Provider>
+}
 
 function Paragraph({ children, node }: React.ComponentProps<'p'> & ExtraProps) {
   const live = node?.properties['data-streaming-tail'] === true
@@ -166,8 +185,9 @@ const MARKDOWN_COMPONENTS: Components = {
   ul: ({ children }) => <ul {...stylex.props(styles.list, styles.prose, styles.unorderedList)}>{children}</ul>,
   ol: ({ children, start }) => <ol start={start} {...stylex.props(styles.list, styles.prose, styles.orderedList)}>{children}</ol>,
   li: ({ children }) => <li {...stylex.props(styles.listItem)}><InlineText>{children}</InlineText></li>,
-  a: ({ children, href, title }) => <ReferenceContext.Provider value={EMPTY_REFERENCES}><Link href={href} render={props => <a {...props as React.ComponentPropsWithRef<'a'>} title={title} />} {...stylex.props(styles.link)}>{children}</Link></ReferenceContext.Provider>,
+  a: MarkdownLink,
   code: InlineCode,
+  img: DeferredImage,
   pre: CodeFence,
   blockquote: ({ children }) => <blockquote {...stylex.props(styles.blockquote)}>{children}</blockquote>,
   table: ({ children }) => <div role="region" aria-label="Markdown table" tabIndex={0} {...stylex.props(styles.tableScroll)}><table {...stylex.props(styles.table)}>{children}</table></div>,
@@ -272,6 +292,9 @@ export function completeStreamingTail(source: string): string {
 
 const styles = stylex.create({
   markdown: { display: 'flow-root', minWidth: 0, maxWidth: '100%' },
+  image: { maxWidth: '100%', height: 'auto' },
+  imagePlaceholder: { display: 'inline-flex', alignItems: 'center', gap: s.sm, padding: s.sm, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.border, borderRadius: r.sm, color: textColor.fgMuted, backgroundColor: surface.controlFill, fontSize: t.metaSize },
+  imageAction: { borderWidth: 0, padding: s.xs, backgroundColor: surface.transparent, color: accent.primary, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
   prose: { maxWidth: g.proseMax, fontSize: t.bodySize, lineHeight: t.bodyLeading },
   heading: { margin: 0, marginBlockStart: s.xxl, marginBlockEnd: s.md, fontSize: t.headingSize, lineHeight: t.headingLeading, fontWeight: t.weightSemibold, color: textColor.fg },
   list: { margin: 0, marginBlockEnd: s.proseGap, paddingInlineStart: s.xxl, listStylePosition: 'outside' },
