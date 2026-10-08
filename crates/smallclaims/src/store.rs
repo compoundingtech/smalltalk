@@ -3491,9 +3491,9 @@ fn load_compact_replication_inventory(
 /// the most identities one divergent exchange lists beyond its first differing range.
 pub const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 
-/// Leave half of the 64 MiB exchange cap for inventory identities, signatures, and JSON
-/// framing. A page stops before fetching the next payload once this wire-size budget is spent.
-const REPLICATION_EXCHANGE_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+/// Bound fetched payload memory while the complete response is fitted to the 64 MiB wire cap.
+/// Stored bytes are a lower bound on JSON bytes, so a single record larger than this cannot fit.
+const REPLICATION_EXCHANGE_STORED_PAYLOAD_BYTES: usize = crate::sync::MAX_EXCHANGE_BYTES;
 
 /// Count the exact uncompressed JSON bytes without constructing another copy of a page.
 /// The serializer stops at the transport cap, even for malformed legacy TEXT payloads.
@@ -5926,29 +5926,32 @@ impl Store {
         &self,
         missing: Vec<ReplicaEnvelopeId>,
     ) -> Result<Vec<ReplicaEnvelope>> {
-        self.replica_envelopes_with_wire_budget(missing, None)
+        self.replica_envelopes_with_stored_budget(missing, None)
     }
 
     fn replica_envelopes_for_exchange(
         &self,
         missing: Vec<ReplicaEnvelopeId>,
     ) -> Result<Vec<ReplicaEnvelope>> {
-        self.replica_envelopes_with_wire_budget(missing, Some(REPLICATION_EXCHANGE_PAYLOAD_BYTES))
+        self.replica_envelopes_with_stored_budget(
+            missing,
+            Some(REPLICATION_EXCHANGE_STORED_PAYLOAD_BYTES),
+        )
     }
 
-    fn replica_envelopes_with_wire_budget(
+    fn replica_envelopes_with_stored_budget(
         &self,
         missing: Vec<ReplicaEnvelopeId>,
-        wire_budget: Option<usize>,
+        stored_budget: Option<usize>,
     ) -> Result<Vec<ReplicaEnvelope>> {
         if missing.is_empty() {
             return Ok(Vec::new());
         }
         let connection = self.readers.get();
-        let mut payload_lengths = wire_budget
+        let mut payload_lengths = stored_budget
             .map(|_| {
                 connection.prepare_cached(
-                    "SELECT typeof(payload), octet_length(payload) FROM replica_envelopes
+                    "SELECT octet_length(payload) FROM replica_envelopes
                      WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
                 )
             })
@@ -5971,40 +5974,34 @@ impl Store {
         )?;
         // A byte-limited page may stop after one record even when the peer lacks thousands.
         let mut envelopes = Vec::with_capacity(missing.len().min(16));
-        let mut wire_bytes = 0usize;
+        let mut stored_bytes = 0usize;
         for identity in missing {
-            let mut next_wire_bytes = None;
-            if let Some(budget) = wire_budget {
-                let length: Option<(String, i64)> = payload_lengths
+            let mut next_stored_bytes = None;
+            if let Some(budget) = stored_budget {
+                let length: Option<i64> = payload_lengths
                     .as_mut()
-                    .expect("a wire budget prepares payload lengths")
+                    .expect("a stored byte budget prepares payload lengths")
                     .query_row(
                         params![identity.writer, identity.sequence, identity.hash],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
+                        |row| row.get(0),
                     )
                     .optional()?;
-                let Some((kind, length)) = length else {
+                let Some(length) = length else {
                     // The payload may have been trimmed after the inventory snapshot.
                     continue;
                 };
                 let length = usize::try_from(length)?;
-                // BLOB payloads serialize as base64. Legacy TEXT may contain JSON escapes;
-                // six bytes per input byte is a safe upper bound without loading the payload.
-                let serialized = if kind == "blob" {
-                    length.div_ceil(3).checked_mul(4)
-                } else {
-                    length.checked_mul(6)
-                }
-                .and_then(|length| length.checked_add(2))
-                .ok_or_else(|| anyhow::anyhow!("replication envelope payload size overflow"))?;
-                if serialized > budget.saturating_sub(wire_bytes) {
+                // A wire-size upper bound can reject a legacy TEXT payload whose actual
+                // escaping fits. Fetch at most the transport cap in stored bytes, then
+                // fit the exact JSON body before signing the response.
+                if length > budget.saturating_sub(stored_bytes) {
                     anyhow::ensure!(
                         !envelopes.is_empty(),
-                        "one replication envelope exceeds the exchange payload budget"
+                        "one replication envelope exceeds the exchange stored-byte budget"
                     );
                     break;
                 }
-                next_wire_bytes = Some(wire_bytes + serialized);
+                next_stored_bytes = Some(stored_bytes + length);
             }
             // A trim can delete the payload after the snapshot listed the identity. The
             // tombstone stays in the inventory and the peer never needs the envelope.
@@ -6030,8 +6027,8 @@ impl Store {
             };
             // The row can be trimmed between the length probe and payload fetch. Only
             // charge bytes for a payload actually included in this page.
-            if let Some(next) = next_wire_bytes {
-                wire_bytes = next;
+            if let Some(next) = next_stored_bytes {
+                stored_bytes = next;
             }
             envelopes.push(envelope);
         }

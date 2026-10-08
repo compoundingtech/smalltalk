@@ -38,34 +38,34 @@ fn page(source: &Store, target: &Store, count: usize) -> ReplicationExchange {
 }
 
 #[test]
-fn export_payload_budget_stops_before_fetching_the_next_envelope() {
+fn export_stored_payload_budget_stops_before_fetching_the_next_envelope() {
     let source = node("birch");
     let target = node("cedar");
     page(&source, &target, 3);
     let identities = source.replication_inventory().unwrap().envelopes;
     assert_eq!(identities.len(), 3);
     let all = source.replica_envelopes(identities.clone()).unwrap();
-    let first_wire = serde_json::to_vec(&all[0].payload).unwrap().len();
-    let second_wire = serde_json::to_vec(&all[1].payload).unwrap().len();
-    let budget = first_wire + second_wire - 1;
+    let first_stored = all[0].payload.bytes().unwrap().len();
+    let second_stored = all[1].payload.bytes().unwrap().len();
+    let budget = first_stored + second_stored - 1;
 
     let first_page = source
-        .replica_envelopes_with_wire_budget(identities.clone(), Some(budget))
+        .replica_envelopes_with_stored_budget(identities.clone(), Some(budget))
         .unwrap();
     assert_eq!(first_page.len(), 1);
     assert_eq!(first_page[0].hash, identities[0].hash);
     let next_page = source
-        .replica_envelopes_with_wire_budget(identities[1..].to_vec(), Some(budget))
+        .replica_envelopes_with_stored_budget(identities[1..].to_vec(), Some(budget))
         .unwrap();
     assert!(!next_page.is_empty());
     assert_eq!(next_page[0].hash, identities[1].hash);
     assert!(source
-        .replica_envelopes_with_wire_budget(identities, Some(first_wire - 1))
+        .replica_envelopes_with_stored_budget(identities, Some(first_stored - 1))
         .is_err());
 }
 
 #[test]
-fn export_payload_budget_counts_legacy_text_past_nul_and_utf8_escapes() {
+fn export_stored_payload_budget_counts_legacy_text_past_nul_and_utf8_escapes() {
     let source = node("birch");
     let target = node("cedar");
     page(&source, &target, 1);
@@ -94,11 +94,46 @@ fn export_payload_budget_counts_legacy_text_past_nul_and_utf8_escapes() {
         let actual = serde_json::to_vec(&source.replica_envelopes(identities.clone()).unwrap()[0].payload)
             .unwrap()
             .len();
-        assert!(usize::try_from(bytes).unwrap() * 6 + 2 >= actual);
+        let stored = usize::try_from(bytes).unwrap();
+        assert!(stored * 6 + 2 >= actual);
         assert!(source
-            .replica_envelopes_with_wire_budget(identities.clone(), Some(actual - 1))
+            .replica_envelopes_with_stored_budget(identities.clone(), Some(stored - 1))
             .is_err());
+        assert_eq!(
+            source
+                .replica_envelopes_with_stored_budget(identities.clone(), Some(stored))
+                .unwrap()
+                .len(),
+            1,
+            "a conservative JSON escape estimate must not reject a stored payload that fits"
+        );
     }
+}
+
+#[test]
+fn export_keeps_a_single_envelope_that_fits_the_full_signed_wire_cap() {
+    let source = node("birch");
+    let target = node("cedar");
+    page(&source, &target, 1);
+    // Exercise the export size path with a large stored BLOB. Admission validity is
+    // tested separately; this diagnostic row tests that the wire budget does not
+    // reject a response that the existing transport can carry.
+    source
+        .connection
+        .write()
+        .execute(
+            "UPDATE replica_envelopes SET payload=?1",
+            rusqlite::params![vec![7u8; 25 * 1024 * 1024]],
+        )
+        .unwrap();
+    let exchange = source
+        .export_replication_exchange(FLEET, &target.replication_inventory().unwrap())
+        .unwrap();
+    assert_eq!(exchange.envelopes.len(), 1);
+    let bytes = serialized_bytes_bounded(&exchange, crate::sync::MAX_EXCHANGE_BYTES)
+        .unwrap()
+        .expect("the complete exchange fits the transport cap");
+    assert!(bytes > 32 * 1024 * 1024);
 }
 
 #[test]
@@ -109,11 +144,14 @@ fn export_payload_page_sql_work_ignores_the_unfetched_tail() {
         page(&source, &target, count);
         let identities = source.replication_inventory().unwrap().envelopes;
         let first = source.replica_envelopes(identities[..2].to_vec()).unwrap();
-        let first_wire = serde_json::to_vec(&first[0].payload).unwrap().len();
-        let second_wire = serde_json::to_vec(&first[1].payload).unwrap().len();
+        let first_stored = first[0].payload.bytes().unwrap().len();
+        let second_stored = first[1].payload.bytes().unwrap().len();
         let before = crate::sqlite::work::total();
         let selected = source
-            .replica_envelopes_with_wire_budget(identities, Some(first_wire + second_wire - 1))
+            .replica_envelopes_with_stored_budget(
+                identities,
+                Some(first_stored + second_stored - 1),
+            )
             .unwrap();
         let work = crate::sqlite::work::total() - before;
         assert_eq!(selected.len(), 1);
