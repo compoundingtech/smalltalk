@@ -65,11 +65,39 @@ struct Sent {
 struct ReadReceipts {
     confirmed: HashSet<String>,
     pending: BTreeMap<String, Option<Instant>>,
+    /// How many times in a row each failed: the wait before the next try grows with it.
+    failures: BTreeMap<String, u32>,
+    /// Refused for good (st will not take this person's read of it): never asked again.
+    refused: HashSet<String>,
+}
+
+/// How a read receipt ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiptOutcome {
+    Done,
+    /// Try again later: the connection or the graph moved.
+    Retry,
+    /// st refused it and said it would refuse again.
+    Refused,
+}
+
+/// Whether a failed read receipt is worth trying again: a refusal st marks as not retryable
+/// (this identity may not read it) is final, except a stale fence, which a fresh one answers.
+fn receipt_outcome(error: &anyhow::Error) -> ReceiptOutcome {
+    use st3_client::{ClientError, ErrorCode};
+    match error.downcast_ref::<ClientError>() {
+        Some(ClientError::Api(code, _, envelope))
+            if !envelope.retryable && !matches!(code, ErrorCode::StaleFence) =>
+        {
+            ReceiptOutcome::Refused
+        }
+        _ => ReceiptOutcome::Retry,
+    }
 }
 
 impl ReadReceipts {
     fn displayed(&mut self, id: String, now: Instant) {
-        if !self.confirmed.contains(&id) {
+        if !self.confirmed.contains(&id) && !self.refused.contains(&id) {
             self.pending.entry(id).or_insert(Some(now));
         }
     }
@@ -85,15 +113,32 @@ impl ReadReceipts {
         self.pending.insert(id.clone(), None);
         Some(id)
     }
-    fn completed(&mut self, id: String, succeeded: bool, now: Instant) {
-        if succeeded {
-            self.pending.remove(&id);
-            if self.confirmed.len() >= 2048 {
-                self.confirmed.clear();
+    fn completed(&mut self, id: String, outcome: ReceiptOutcome, now: Instant) {
+        match outcome {
+            ReceiptOutcome::Done => {
+                self.pending.remove(&id);
+                self.failures.remove(&id);
+                if self.confirmed.len() >= 2048 {
+                    self.confirmed.clear();
+                }
+                self.confirmed.insert(id);
             }
-            self.confirmed.insert(id);
-        } else {
-            self.pending.insert(id, Some(now + Duration::from_secs(2)));
+            ReceiptOutcome::Refused => {
+                self.pending.remove(&id);
+                self.failures.remove(&id);
+                if self.refused.len() >= 2048 {
+                    self.refused.clear();
+                }
+                self.refused.insert(id);
+            }
+            ReceiptOutcome::Retry => {
+                let tries = self.failures.entry(id.clone()).or_insert(0);
+                *tries = tries.saturating_add(1);
+                // 2 s, 4 s, 8 s ... up to a minute: a message st keeps failing is not asked every
+                // few seconds.
+                let wait = Duration::from_secs((2_u64 << (*tries - 1).min(5)).min(60));
+                self.pending.insert(id, Some(now + wait));
+            }
         }
     }
 }
@@ -138,7 +183,7 @@ fn usage_error(error: &st3_client::ClientError) -> String {
 }
 
 enum Fetched {
-    Read(String, Result<(), String>),
+    Read(String, ReceiptOutcome),
     /// A page before the oldest entry of a conversation's session: its entries, whether st
     /// holds more before them, and the cursor for that next page; or why it could not be read.
     Older {
@@ -529,7 +574,7 @@ pub fn run(context: Context) -> Result<()> {
         while let Ok(result) = fetched.try_recv() {
             match result {
                 Fetched::Read(id, result) => {
-                    read_receipts.completed(id, result.is_ok(), Instant::now());
+                    read_receipts.completed(id, result, Instant::now());
                 }
                 Fetched::Sent(token, outcome) => {
                     if let Some(entry) = pending.iter_mut().find(|entry| entry.token == token) {
@@ -1258,10 +1303,11 @@ pub fn run(context: Context) -> Result<()> {
             let person = person.clone();
             let tx = fetched_tx.clone();
             runtime.spawn(async move {
-                let result = acknowledge_visible_message(&client, &person, &id)
-                    .await
-                    .map_err(|error| error.to_string());
-                let _ = tx.send(Fetched::Read(id, result));
+                let outcome = match acknowledge_visible_message(&client, &person, &id).await {
+                    Ok(()) => ReceiptOutcome::Done,
+                    Err(error) => receipt_outcome(&error),
+                };
+                let _ = tx.send(Fetched::Read(id, outcome));
             });
         }
         // A stream that dropped while the program ran attaches again, to the same incarnation,
@@ -1870,6 +1916,7 @@ async fn perform(
                 Vec::new(),
                 Vec::new(),
                 None,
+                latest_snapshot(model),
             )
             .await?;
             Ok(("Reply sent".into(), None))
@@ -1892,6 +1939,7 @@ async fn perform(
                 Vec::new(),
                 Vec::new(),
                 sent,
+                latest_snapshot(model),
             )
             .await?;
             Ok((
@@ -2062,11 +2110,21 @@ async fn perform(
                 tags,
                 attachments,
                 sent,
+                latest_snapshot(model),
             )
             .await?;
             Ok(("Message sent".into(), id))
         }
     }
+}
+
+/// The newest snapshot id any window frame brought, by store position.
+fn latest_snapshot(model: &Model) -> Option<String> {
+    [&model.now, &model.missions, &model.agents]
+        .into_iter()
+        .filter_map(|collection| collection.snapshot.as_ref())
+        .max_by_key(|snapshot| snapshot.store_index)
+        .map(|snapshot| snapshot.id.clone())
 }
 
 /// Send a message. `sent` keeps the exact request: when it already holds one, that request goes
@@ -2082,6 +2140,7 @@ async fn send_message(
     tags: Vec<String>,
     attachments: Vec<st3_client::AttachmentInput>,
     sent: Option<&Mutex<Option<Sent>>>,
+    snapshot_hint: Option<String>,
 ) -> Result<Option<String>> {
     let parameters = MessageSendParameters {
         to: to.to_owned(),
@@ -2124,9 +2183,16 @@ async fn send_message(
     }
     // A send only needs a current snapshot. Take a fresh one each time, and once more if the
     // graph moves between reading it and sending: a stale fence is not the person's problem.
+    // A message carries no subject revisions: st asks only that the snapshot be this host's and not
+    // ahead of its store, so the newest one a window frame already brought is as good as a fresh
+    // read and saves a round trip. Only if st calls it stale is a fresh one read.
+    let mut hint = snapshot_hint;
     let mut last = None;
     for _ in 0..2 {
-        let snapshot = client.capabilities().await?.snapshot.id;
+        let snapshot = match hint.take() {
+            Some(known) => known,
+            None => client.capabilities().await?.snapshot.id,
+        };
         let (id, idem) = crate::action_pair();
         if let Some(sent) = sent
             && let Ok(mut slot) = sent.lock()
@@ -2195,6 +2261,125 @@ mod tests {
     }
 
     use super::*;
+
+    fn refusal(code: st3_client::ErrorCode, retryable: bool) -> anyhow::Error {
+        anyhow::Error::new(st3_client::ClientError::Api(
+            code.clone(),
+            "refused".into(),
+            Box::new(st3_client::ErrorEnvelope {
+                api_version: "st3.client.v0".into(),
+                error_version: "st3.client.error.v0".into(),
+                request_id: "request/test".into(),
+                code,
+                message: "refused".into(),
+                retryable,
+                retry_after_ms: None,
+                details: Default::default(),
+            }),
+        ))
+    }
+
+    #[test]
+    fn a_read_receipt_st_refuses_for_good_is_dropped_and_never_asked_again() {
+        // Read-only identity: st says forbidden and not retryable.
+        assert_eq!(
+            receipt_outcome(&refusal(st3_client::ErrorCode::Forbidden, false)),
+            ReceiptOutcome::Refused
+        );
+        // A stale fence is answered by a fresh one, and a retryable refusal or a lost connection is retried.
+        assert_eq!(
+            receipt_outcome(&refusal(st3_client::ErrorCode::StaleFence, false)),
+            ReceiptOutcome::Retry
+        );
+        assert_eq!(
+            receipt_outcome(&refusal(st3_client::ErrorCode::Forbidden, true)),
+            ReceiptOutcome::Retry
+        );
+        assert_eq!(
+            receipt_outcome(&anyhow::anyhow!("the connection broke")),
+            ReceiptOutcome::Retry
+        );
+        let mut receipts = ReadReceipts::default();
+        let now = Instant::now();
+        receipts.displayed("message/a".into(), now);
+        assert_eq!(receipts.next(now).as_deref(), Some("message/a"));
+        receipts.completed("message/a".into(), ReceiptOutcome::Refused, now);
+        // Shown again, asked for nothing more.
+        receipts.displayed("message/a".into(), now);
+        assert!(receipts.next(now + Duration::from_secs(3600)).is_none());
+    }
+
+    #[test]
+    fn a_read_receipt_that_keeps_failing_waits_longer_each_time_up_to_a_minute() {
+        let mut receipts = ReadReceipts::default();
+        let start = Instant::now();
+        receipts.displayed("message/b".into(), start);
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            let at = receipts.pending["message/b"].unwrap();
+            assert_eq!(receipts.next(at).as_deref(), Some("message/b"));
+            receipts.completed("message/b".into(), ReceiptOutcome::Retry, start);
+            waits.push(receipts.pending["message/b"].unwrap().duration_since(start).as_secs());
+        }
+        assert_eq!(waits, [2, 4, 8, 16, 32, 60, 60, 60]);
+        // One success clears it.
+        let at = receipts.pending["message/b"].unwrap();
+        assert!(receipts.next(at).is_some());
+        receipts.completed("message/b".into(), ReceiptOutcome::Done, start);
+        assert!(receipts.next(start + Duration::from_secs(3600)).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_send_uses_the_snapshot_a_window_brought_and_reads_a_fresh_one_only_when_st_calls_it_stale() {
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("daemon.sock");
+        let store = Arc::new(st3::store::Store::open(&root.path().join("graph.db"), "ui-hint").unwrap());
+        let state = st3::api::AppState {
+            store: store.clone(),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: tokio::sync::watch::channel(0_u64).0,
+            node: "ui-hint".into(),
+            state_dir: root.path().into(),
+            pty_root: root.path().join("pty"),
+            pty_binary: "pty".into(),
+            fleet_id: None,
+            configured_peers: vec![],
+            client_relay: None,
+            native_session_home: None,
+            planner_default: Default::default(),
+        };
+        let path = socket.clone();
+        let server = tokio::spawn(async move {
+            st3::api::serve_unix(&path, st3::api::router(state)).await.unwrap();
+        });
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let client = Client::unix_as(&socket, "person/avery");
+        // The snapshot an earlier window frame brought: this host's, behind the store now.
+        let earlier = client.capabilities().await.unwrap().snapshot.id;
+        let first = send_message(&client, "agent/example/worker", "one".into(), None, None, None, vec![], vec![], None, Some(earlier.clone()))
+            .await
+            .unwrap();
+        assert!(first.is_some(), "a snapshot from before the store moved is accepted");
+        let count = |store: &st3::store::Store, text: &str| {
+            store.message(first.as_deref().unwrap()).unwrap().map(|m| m.content == text).unwrap_or(false)
+        };
+        assert!(count(&store, "one"));
+        // A snapshot st calls stale (another host's): a fresh one is read and the message goes once.
+        let other = "snapshot/another-host/1/0000000000000000".to_owned();
+        let second = send_message(&client, "agent/example/worker", "two".into(), None, None, None, vec![], vec![], None, Some(other))
+            .await
+            .unwrap()
+            .expect("the message went after a fresh snapshot");
+        assert_ne!(Some(second.as_str()), first.as_deref(), "a new message, once");
+        assert_eq!(store.message(&second).unwrap().unwrap().content, "two");
+        server.abort();
+    }
 
     #[tokio::test]
     async fn live_sends_retries_discussions_and_creation_survive_daemon_restarts() {
@@ -2287,6 +2472,7 @@ mod tests {
                 })
                 .collect(),
             Some(&sent),
+            None,
         )
         .await
         .unwrap();
@@ -2546,16 +2732,16 @@ mod tests {
             receipts.next(now).is_none(),
             "do not race the in-flight snapshot"
         );
-        receipts.completed("message/one".into(), false, now);
+        receipts.completed("message/one".into(), ReceiptOutcome::Retry, now);
         assert_eq!(receipts.next(now).as_deref(), Some("message/two"));
-        receipts.completed("message/two".into(), true, now);
+        receipts.completed("message/two".into(), ReceiptOutcome::Done, now);
         assert!(receipts.next(now).is_none(), "retry backs off");
         assert_eq!(
             receipts.next(now + Duration::from_secs(2)).as_deref(),
             Some("message/one"),
             "retry without another displayed frame"
         );
-        receipts.completed("message/one".into(), true, now);
+        receipts.completed("message/one".into(), ReceiptOutcome::Done, now);
         receipts.displayed("message/one".into(), now);
         assert!(
             receipts.next(now + Duration::from_secs(3)).is_none(),

@@ -12,6 +12,7 @@ import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, PRO
 import { listCollectionPages, mergedRows } from './collectionPages';
 import { rememberBounded } from './boundedCache';
 import { wantsScreenSequence, withFreshTerminalFence, type TerminalFence } from './terminalControls';
+import { sendFences } from './sendFence';
 import { Feed } from './feed';
 import { ForegroundGate } from './foreground';
 import type { FabricProfile } from './fabricProof';
@@ -403,13 +404,16 @@ function useAppStore(proof?: FabricProfile) {
         }
       }
       const began = performance.now();
+      // The first try goes on the snapshot a window frame already brought, with no capabilities read;
+      // each try after st said the last applied nothing reads a fresh one.
+      const fences = sendFences(lastSnapshot.current, fence);
       try {
-        // Each try is a new request on a fresh fence, made only after st said the last applied nothing.
+        // Each try is a new request, made only after st said the last applied nothing.
         await retryTransient(8, async () => {
           const id = actionId();
           const unsigned = { to, content, ...(sessionId ? { session_id: sessionId } : {}), ...(tags?.length ? { tags } : {}), ...(attachments.length ? { attachments } : {}) };
           const parameters = proof ? unsigned : await signMessage(id, unsigned);
-          const request = { id, idempotency_key: id, fence: await fence(), parameters };
+          const request = { id, idempotency_key: id, fence: await fences(), parameters };
           try {
             await client.messageSend(request);
           } catch (e) {
