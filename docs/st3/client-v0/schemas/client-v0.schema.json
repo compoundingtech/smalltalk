@@ -2377,10 +2377,25 @@
           "properties": {
             "kind": { "const": "subscribe" },
             "id": { "type": "string", "minLength": 1, "maxLength": 128 },
-            "collection": { "enum": ["missions", "attention", "agents", "work", "glasses"] },
+            "collection": { "enum": ["missions", "attention", "work", "glasses"] },
             "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
             "person": { "type": ["string", "null"] },
             "actor": { "type": ["string", "null"] },
+            "status": { "type": ["string", "null"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection"],
+          "properties": {
+            "kind": { "const": "subscribe" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "collection": { "const": "agents" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+            "person": { "type": ["string", "null"] },
+            "actor": { "type": ["string", "null"] },
+            "agent": { "oneOf": [{ "$ref": "#/$defs/AgentId" }, { "type": "null" }], "description": "Follow exactly this current agent rather than the bounded fleet window." },
             "status": { "type": ["string", "null"] }
           }
         },

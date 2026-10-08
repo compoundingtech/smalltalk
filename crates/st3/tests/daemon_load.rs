@@ -1243,8 +1243,7 @@ async fn roster_subscriber(
     let outcome = async {
         let subscription = Instant::now();
         let frame = tokio::time::timeout(Duration::from_secs(30), async {
-            stream
-                .subscribe(&id, "agents", ROSTER_LIMIT, None, None)
+            stream.subscribe(&id, "agents", ROSTER_LIMIT, None, None, None)
                 .await
                 .map_err(|error| error.to_string())?;
             stream

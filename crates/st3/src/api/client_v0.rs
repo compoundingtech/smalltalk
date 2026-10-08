@@ -38,6 +38,8 @@ struct CollectionSubscribe {
     /// Follow one arrangement instead of the owner's bounded prefix window.
     subject: Option<String>,
     actor: Option<String>,
+    /// Follow exactly one current agent instead of the fleet window.
+    agent: Option<String>,
     status: Option<String>,
     /// A terminal subscription names the terminal, the incarnation `terminal.attach` fenced,
     /// and the single-use stream capability that attach returned.
@@ -148,6 +150,7 @@ async fn collection_items_with_windows(
             "subject filters are supported for arrangements only",
         ));
     }
+    validate_agent_selector(&request.collection, request.agent.as_deref())?;
     let limit = request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS);
     if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
         return Err(validation("collection limit must be 1 through 200"));
@@ -208,6 +211,7 @@ async fn collection_items_with_windows(
     let session = session.clone();
     let request = request.clone();
     let actor = request.actor.clone();
+    let selected_agents = request.agent.as_ref().map(|agent| BTreeSet::from([agent.clone()]));
     let subject = request.subject.clone();
     let status = request.status.clone();
     let collection = request.collection.clone();
@@ -224,6 +228,7 @@ async fn collection_items_with_windows(
         let session = session.clone();
         let request = request.clone();
         let actor = actor.clone();
+        let selected_agents = selected_agents.clone();
         let subject = subject.clone();
         let status = status.clone();
         let collection = collection.clone();
@@ -267,7 +272,7 @@ async fn collection_items_with_windows(
                 let snapshot = client_snapshot_at(&state, index);
                 let at = snapshot.created_at.clone();
                 let cached_agents = if collection == "agents" && !admitted {
-                    let Some(cards) = store.agent_resources_cached_at(index, false, None)? else {
+                    let Some(cards) = store.agent_resources_cached_at(index, false, selected_agents.as_ref())? else {
                         return Ok(Ok(None));
                     };
                     Some(cards)
@@ -303,8 +308,10 @@ async fn collection_items_with_windows(
                             client_attention_resources_at(&store, person.as_deref(), false, now)?
                         }
                         "agents" => match &cached_agents {
-                            Some(cards) => (**cards).clone(),
-                            None => client_agent_resources_cached(&store, false, index)?,
+                            Some(cards) => cards.iter().filter(|card| selected_agents.as_ref().is_none_or(
+                                |selected| card["id"].as_str().is_some_and(|id| selected.contains(id)),
+                            )).cloned().collect(),
+                            None => client_agent_resources_for(&store, false, index, selected_agents.as_ref())?,
                         },
                         "work" => client_work_resources(
                             &store,
@@ -381,6 +388,20 @@ fn collection_window_label(collection: &str) -> &'static str {
         "arrangements" => "stream collection/arrangements",
         _ => "stream collection/invalid",
     }
+}
+
+fn validate_agent_selector(collection: &str, agent: Option<&str>) -> Result<(), ApiError> {
+    if let Some(agent) = agent {
+        if collection != "agents" {
+            return Err(validation("agent filters are supported for agents only"));
+        }
+        if !agent.starts_with("agent/") || agent.len() == "agent/".len()
+            || agent.chars().any(char::is_whitespace)
+        {
+            return Err(validation("agent must be a full agent ID"));
+        }
+    }
+    Ok(())
 }
 
 async fn send_collection(socket: &mut WebSocket, value: Value) -> bool {
@@ -979,6 +1000,12 @@ async fn collection_stream_socket_with_sources<F, Fut>(
                         subscriptions.remove(&request.id);
                         terminals.remove(&request.id);
                         conversations.stop(&request.id);
+                        if let Err(error) = validate_agent_selector(&request.collection, request.agent.as_deref()) {
+                            if let Some(presence) = &presence { presence.unfollow(&request.id); }
+                            if !send_collection(&mut socket, json!({"kind":"error", "id":request.id,
+                                "code":error.code, "message":error.message})).await { return; }
+                            break 'command;
+                        }
                         if request.collection == "conversation" {
                             let target = request.conversation.as_deref().unwrap_or_default();
                             let opened = crate::performance::task("conversation/admission", || {
@@ -10243,6 +10270,191 @@ mod tests {
         let mut bad_retry = frame.clone();
         bad_retry["retryable"] = json!("yes");
         assert!(!validator.is_valid(&bad_retry));
+    }
+
+    fn agent_selector_observe(state: &AppState, agent: &str, kind: &str, fields: Value) {
+        state.store.append_claim(&ClaimInput {
+            subject: agent.into(), kind: kind.into(), actor: None,
+            fields: serde_json::from_value(fields).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_agent_selector_isolates_cards_status_and_http_detail() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        for agent in ["agent/a", "agent/z"] {
+            agent_selector_observe(&state, agent, "runtime.observed",
+                json!({"status":"running","runtime_id":agent,"incarnation_id":"one"}));
+            agent_selector_observe(&state, agent, "harness.observed",
+                json!({"state":"idle","driver":"codex","incarnation_id":"one"}));
+        }
+        let session = ClientSession::local(None).unwrap();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let windows = collection_windows::Windows::attach(&state.store);
+        let mut request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe","id":"details","collection":"agents","agent":"agent/z","limit":1,
+        })).unwrap();
+        let before = state.store.agent_resources_refolded_cards_for_test();
+        let (_, selected, more) = collection_items_with_windows(&state, &session, &request,
+            slots.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0]["id"], "agent/z");
+        assert!(!more);
+        assert_eq!(state.store.agent_resources_refolded_cards_for_test(), before + 1);
+        let snapshot = new_client_snapshot(&state);
+        let Json(detail) = client_agents_detail(State(state.clone()), Extension(snapshot),
+            AxumPath("agent/z".into()), Query(ClientListQuery::default())).await.unwrap();
+        assert_eq!(detail, selected[0]);
+        assert_eq!(state.store.agent_resources_refolded_cards_for_test(), before + 1);
+        request.agent = Some("agent/a".into());
+        let (_, other, _) = collection_items_with_windows(&state, &session, &request,
+            slots.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
+        assert_eq!(other[0]["id"], "agent/a");
+        request.agent = None;
+        let (_, fleet, more) = collection_items_with_windows(&state, &session, &request,
+            slots.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
+        assert_eq!(fleet[0]["id"], "agent/a");
+        assert!(more);
+        let folded = state.store.agent_resources_refolded_cards_for_test();
+        let builds = state.store.agent_resources_builds_for_test();
+        agent_selector_observe(&state, "agent/a", "harness.observed",
+            json!({"state":"working","driver":"codex","incarnation_id":"one"}));
+        request.agent = Some("agent/z".into());
+        let (_, unchanged, more) = collection_items_with_windows(&state, &session, &request,
+            slots.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
+        assert_eq!(unchanged, selected);
+        assert!(!more);
+        assert_eq!(state.store.agent_resources_refolded_cards_for_test(), folded);
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds);
+        request.status = selected[0]["state"].as_str().map(str::to_owned);
+        let (_, matching, more) = collection_items_with_windows(&state, &session, &request,
+            slots.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
+        assert_eq!(matching, selected);
+        assert!(!more);
+        request.status = Some("stopped".into());
+        let (_, filtered, more) = collection_items_with_windows(&state, &session, &request,
+            slots.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
+        assert!(filtered.is_empty());
+        assert!(!more);
+        request.status = None;
+        request.agent = Some("agent/absent".into());
+        let (_, absent, more) = collection_items_with_windows(&state, &session, &request,
+            slots.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
+        assert!(absent.is_empty());
+        assert!(!more);
+        for agent in ["z", "person/z", "agent/", "agent/bad id"] {
+            request.agent = Some(agent.into());
+            let error = collection_items(&state, &session, &request,
+                slots.clone().acquire_owned().await.unwrap()).await.unwrap_err();
+            assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        request.agent = Some("agent/z".into());
+        for collection in ["work", "attention", "missions", "glasses", "arrangements"] {
+            request.collection = collection.into();
+            let error = collection_items(&state, &session, &request,
+                slots.clone().acquire_owned().await.unwrap()).await.unwrap_err();
+            assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_agent_selector_stream_ignores_other_agent_and_delivers_selected_changes() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        for agent in ["agent/a", "agent/z"] {
+            agent_selector_observe(&state, agent, "runtime.observed",
+                json!({"status":"running","runtime_id":agent,"incarnation_id":"one"}));
+            agent_selector_observe(&state, agent, "harness.observed",
+                json!({"state":"idle","driver":"codex","incarnation_id":"one"}));
+        }
+        let writer = state.clone();
+        let (completed, mut completions) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route("/stream", axum::routing::get(
+            move |upgrade: WebSocketUpgrade| {
+                let state = state.clone();
+                let completed = completed.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        let windows = collection_windows::Windows::attach(&state.store);
+                        collection_stream_socket_with_reader(socket, state,
+                            ClientSession::local(None).unwrap(), None,
+                            move |state, session, request, permit| {
+                                let windows = windows.clone();
+                                let completed = completed.clone();
+                                async move {
+                                    let result = collection_items_with_windows(
+                                        &state, &session, &request, permit, windows).await;
+                                    completed.send(()).unwrap();
+                                    result
+                                }
+                            })
+                    })
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        socket.send(Message::Text(json!({"kind":"subscribe","id":"details",
+            "collection":"agents","agent":"agent/z","limit":1}).to_string().into())).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let snapshot: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_collection_frame_conforms(&snapshot);
+        assert_eq!(snapshot["kind"], "snapshot");
+        assert_eq!(snapshot["order"], json!(["agent/z"]));
+        assert_eq!(snapshot["items"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["has_more"], false);
+        completions.recv().await.unwrap();
+        let folded = writer.store.agent_resources_refolded_cards_for_test();
+        let builds = writer.store.agent_resources_builds_for_test();
+        agent_selector_observe(&writer, "agent/a", "harness.observed",
+            json!({"state":"working","driver":"codex","incarnation_id":"one"}));
+        signal_changed(&writer);
+        tokio::time::timeout(Duration::from_secs(5), completions.recv()).await.unwrap().unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(200), socket.next()).await.is_err(),
+            "an unrelated agent change must not emit a frame");
+        assert_eq!(writer.store.agent_resources_refolded_cards_for_test(), folded);
+        assert_eq!(writer.store.agent_resources_builds_for_test(), builds);
+        agent_selector_observe(&writer, "agent/z", "harness.observed",
+            json!({"state":"working","driver":"codex","incarnation_id":"one"}));
+        signal_changed(&writer);
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let changes: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_collection_frame_conforms(&changes);
+        assert_eq!(changes["kind"], "changes");
+        assert_eq!(changes["upserts"].as_array().unwrap().len(), 1);
+        assert_eq!(changes["upserts"][0]["id"], "agent/z");
+        assert_eq!(changes["upserts"][0]["harness_state"], "working");
+        assert_eq!(changes["order"], json!(["agent/z"]));
+        assert_eq!(changes["has_more"], false);
+        assert_eq!(writer.store.agent_resources_refolded_cards_for_test(), folded + 1);
+        agent_selector_observe(&writer, "agent/z", "runtime.observed",
+            json!({"status":"stopped","runtime_id":"agent/z","incarnation_id":"one"}));
+        signal_changed(&writer);
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let removed: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_collection_frame_conforms(&removed);
+        assert_eq!(removed["kind"], "changes");
+        assert_eq!(removed["removes"], json!(["agent/z"]));
+        assert_eq!(removed["order"], json!([]));
+        assert_eq!(removed["has_more"], false);
+        agent_selector_observe(&writer, "agent/z", "runtime.observed",
+            json!({"status":"running","runtime_id":"agent/z","incarnation_id":"two"}));
+        signal_changed(&writer);
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let returned: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_collection_frame_conforms(&returned);
+        assert_eq!(returned["kind"], "changes");
+        assert_eq!(returned["upserts"][0]["id"], "agent/z");
+        assert_eq!(returned["order"], json!(["agent/z"]));
+        assert_eq!(returned["has_more"], false);
+        socket.close(None).await.unwrap();
+        server.abort();
     }
 
     #[tokio::test]

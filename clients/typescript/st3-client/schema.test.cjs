@@ -241,6 +241,23 @@ test('usage identity metadata is additive and independent of quota age', async (
     assert.throws(() => decode({ ...wire, identified: 'stale' }));
 });
 
+test('exact agent subscriptions preserve the selector and reject other collections', async () => {
+    const [{ Schema, Option }, Rich] = await modules;
+    const command = { kind: 'subscribe', id: 'details', collection: 'agents', agent: 'agent/example/worker', limit: 1 };
+    const decode = Rich.decodeUnknownSync(Rich.CollectionCommand, 'strict');
+    assert.deepEqual(Schema.encodeSync(Rich.CollectionCommand)(decode(command)), {
+        ...command, actor: null, person: null, status: null,
+    });
+    assert(Option.isNone(decode({ ...command, agent: null }).agent));
+    assert(Option.isNone(decode({ ...command, agent: undefined }).agent));
+    for (const agent of ['worker', 'person/worker', 'agent/', 'agent/bad id']) {
+        assert.throws(() => decode({ ...command, agent }));
+    }
+    for (const collection of ['missions', 'attention', 'work', 'glasses', 'arrangements']) {
+        assert.throws(() => decode({ ...command, collection }));
+    }
+});
+
 test('arrangement subscriptions require a concrete owner and placements preserve explicit root', async () => {
     const [{ Schema, Option }, Rich] = await modules;
     const command = { kind: 'subscribe', id: 'sidebar', collection: 'arrangements', person: 'person/ada', limit: 100 };

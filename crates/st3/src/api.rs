@@ -2189,7 +2189,22 @@ fn client_agent_resources_cached(
     history: bool,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    store.cached_agent_resources(snapshot_index, history, |changed| {
+    client_agent_resources_for(store, history, snapshot_index, None)
+}
+
+fn client_agent_resources_for(
+    store: &Store,
+    history: bool,
+    snapshot_index: u64,
+    selected: Option<&BTreeSet<String>>,
+) -> anyhow::Result<Vec<Value>> {
+    store.cached_agent_resources_for(snapshot_index, history, selected, |changed| {
+        // A selected cold card needs only its own queue metadata, never roster refs.
+        let metadata = changed.filter(|(_, previous)| previous.is_empty())
+            .map(|(subjects, _)| agent_queue_metadata(store, subjects)).transpose()?;
+        let changed = changed.map(|(subjects, previous)| {
+            (subjects, metadata.as_deref().unwrap_or(previous))
+        });
         let mut items = client_agent_resources_selected(store, history, snapshot_index, changed)?;
         add_agent_todos(store, &mut items, snapshot_index)?;
         Ok(items)
@@ -2408,8 +2423,19 @@ fn client_suspension(suspension: &crate::suspension::Suspension) -> Value {
 /// Each seat's running subagents: open, with a lease that runs past this read. A lease runs out
 /// without a claim, so this is read per request rather than cached with the agents.
 fn overlay_subagents(store: &Store, items: &mut [Value]) -> anyhow::Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let now = client_now_ms() as u64;
+    let subagents = if items.len() == 1 {
+        let mut subagents = store.open_subagents(items[0]["id"].as_str().unwrap_or_default())?;
+        subagents.retain(|subagent| !subagent.expired_at(now));
+        subagents
+    } else {
+        store.running_subagents(now)?
+    };
     let mut running = BTreeMap::<String, Vec<Value>>::new();
-    for subagent in store.running_subagents(client_now_ms() as u64)? {
+    for subagent in subagents {
         running
             .entry(subagent.agent.clone())
             .or_default()
@@ -2496,7 +2522,11 @@ pub(crate) fn agent_queue_metadata(
     store: &Store,
     subjects: &BTreeSet<String>,
 ) -> anyhow::Result<Vec<Value>> {
-    let queues = store.agent_work_queues()?;
+    let queues = if subjects.len() == 1 {
+        store.agent_work_queues_for(subjects.first().map(String::as_str))?
+    } else {
+        store.agent_work_queues()?
+    };
     let steps = queues.values().flat_map(|queue| {
         queue.current_work_ids.iter().chain(queue.next_work_id.iter())
             .chain(queue.upcoming_work_ids.iter()).cloned()
@@ -4323,13 +4353,9 @@ async fn client_agents_detail(
     let subject = client_detail_id("agent", &id);
     let items = blocking_store(move || {
         let selected = BTreeSet::from([subject]);
-        let mut items = client_agent_resources_selected(
-            &store,
-            history,
-            snapshot_index,
-            Some((&selected, &[])),
+        let mut items = client_agent_resources_for(
+            &store, history, snapshot_index, Some(&selected),
         )?;
-        add_agent_todos(&store, &mut items, snapshot_index)?;
         overlay_agent_resources(&store, &mut items, &created_at)?;
         Ok(items)
     })
@@ -15931,7 +15957,7 @@ mission "expiring-work" state="ready" {
         assert_eq!(claimed["items"][1]["current_work_ids"], json!([step]));
         let full = client_agent_resources_cached(store, false, index).unwrap();
         assert_eq!(full[1]["current_work_ids"], json!([step]));
-        assert_eq!(store.agent_roster_valid_until(index), Some(expires));
+        assert_eq!(store.agent_roster_valid_until(index, None), Some(expires));
         let (status, first) = get_request(router(state.clone()), "/v1/client/agents?limit=1").await;
         assert_eq!(status, StatusCode::OK, "{first}");
         assert_eq!(first["items"][0]["id"], "agent/node.amber");
@@ -15954,7 +15980,7 @@ mission "expiring-work" state="ready" {
         assert_eq!(status, StatusCode::OK, "{ready}");
         assert_eq!(ready["items"][1]["current_work_ids"], json!([]));
         assert_eq!(ready["items"][1]["next_work_id"], step.as_str());
-        assert_eq!(store.agent_roster_valid_until(index), None);
+        assert_eq!(store.agent_roster_valid_until(index, None), None);
     }
 
     #[test]
@@ -22547,7 +22573,7 @@ mission "wake" state="ready" {
             let card = cards.iter().find(|card| card["id"] == fixture.subjects[0]).unwrap();
             assert_eq!(card["current_work_ids"], json!([step]));
         }
-        assert_eq!(store.agent_roster_valid_until(index), Some(expires));
+        assert_eq!(store.agent_roster_valid_until(index, None), Some(expires));
         roster_fixture_expire_leases(&fixture);
         assert_eq!(store.index().unwrap(), index);
         for history in [false, true] {

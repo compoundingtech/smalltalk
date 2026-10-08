@@ -184,6 +184,21 @@ final class St3ClientTests: XCTestCase {
         guard case .error = timeline.items[9].body else { return XCTFail("error body lost") }
     }
 
+    func testExactAgentCollectionFramesDecodeRowsRemovalsAndRetryability() throws {
+        let json = #"{"kind":"snapshot","id":"details","collection":"agents","items":[{"id":"agent/example/worker","kind":"agent","revision":"r1","updated_at":"2026-10-04T08:00:00Z","name":"Worker","state":"idle","reachability":"up","runtime_ids":[],"under":[]}],"order":["agent/example/worker"],"has_more":false}"#
+        let frame = try JSONDecoder().decode(AgentCollectionFrame.self, from: Data(json.utf8))
+        XCTAssertEqual(frame.items?.map(\.id), ["agent/example/worker"])
+        XCTAssertEqual(frame.hasMore, false)
+        let removal = try JSONDecoder().decode(AgentCollectionFrame.self, from: Data(
+            #"{"kind":"changes","id":"details","collection":"agents","upserts":[],"removes":["agent/example/worker"],"order":[],"has_more":false}"#.utf8))
+        XCTAssertEqual(removal.removes, ["agent/example/worker"])
+        XCTAssertEqual(removal.order, [])
+        let resync = try JSONDecoder().decode(AgentCollectionFrame.self, from: Data(
+            #"{"kind":"resync","id":"details","retryable":true,"code":"internal","message":"Read unavailable"}"#.utf8))
+        XCTAssertEqual(resync.retryable, true)
+        XCTAssertNil(resync.items)
+    }
+
     func testAKindThisClientDoesNotKnowReadsAsUnknown() throws {
         let json = #"{"kind":"example-arrangement","id":"example-arrangement/person/avery/1","revision":"r1","updated_at":"2026-10-04T08:00:00Z","name":"Pinned"}"#
         let resource = try JSONDecoder().decode(Resource.self, from: Data(json.utf8))

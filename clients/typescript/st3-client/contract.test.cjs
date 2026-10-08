@@ -184,11 +184,15 @@ test('collection commands preserve omitted and nullable options and failure meta
     const stream = await client.collectionStream({ onFrame: frame => frames.push(frame), socket: () => socket });
     socket.onopen();
     stream.subscribe('agents', 'agents');
+    stream.subscribe('details', 'agents', 1, { agent: 'agent/example/worker', status: 'working' });
+    stream.subscribe('fleet', 'agents', 100, { agent: null });
     stream.subscribe('nullable', 'work', 100, { person: null, actor: null, status: null });
     stream.subscribeTerminal('current', 'terminal/example', undefined, 'capability-proof');
     stream.subscribeTerminal('nullable-terminal', 'terminal/example', null, 'capability-proof');
     assert.deepEqual(socket.sent, [
         { kind: 'subscribe', id: 'agents', collection: 'agents' },
+        { kind: 'subscribe', id: 'details', collection: 'agents', limit: 1, agent: 'agent/example/worker', status: 'working' },
+        { kind: 'subscribe', id: 'fleet', collection: 'agents', limit: 100, agent: null },
         { kind: 'subscribe', id: 'nullable', collection: 'work', limit: 100, person: null, actor: null, status: null },
         { kind: 'subscribe', id: 'current', collection: 'terminal', terminal: 'terminal/example', capability: 'capability-proof' },
         { kind: 'subscribe', id: 'nullable-terminal', collection: 'terminal', terminal: 'terminal/example', incarnation: null, capability: 'capability-proof' },

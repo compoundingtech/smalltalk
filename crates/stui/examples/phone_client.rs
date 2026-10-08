@@ -74,7 +74,7 @@ async fn main() {
     let client = Client::unix_as(&path, &person);
     let mut stream = client.collection_stream().await.expect("collections stream");
     for (id, collection) in [("attention", "attention"), ("missions", "missions"), ("agents", "agents")] {
-        stream.subscribe(id, collection, 200, None, None).await.expect("subscribe");
+        stream.subscribe(id, collection, 200, None, None, None).await.expect("subscribe");
     }
     println!("phone client up: label {label:?}, idle for {seconds}s");
     let end = Instant::now() + Duration::from_secs(seconds);

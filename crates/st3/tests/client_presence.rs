@@ -244,14 +244,13 @@ async fn an_observer_keeps_first_frame_timers_only_for_live_subscriptions() {
     }
     let client = Client::unix_as(&socket, "person/ada");
     let mut stream = client.collection_stream().await.unwrap();
-    stream.subscribe("a", "attention", 10, None, None).await.unwrap();
-    stream.subscribe("a", "attention", 10, None, None).await.unwrap();
+    stream.subscribe("a", "attention", 10, None, None, None).await.unwrap();
+    stream.subscribe("a", "attention", 10, None, None, None).await.unwrap();
     assert_eq!(stream.observed_pending(), 1, "a replacement restarts the timer");
     stream.unsubscribe("a").await.unwrap();
     assert_eq!(stream.observed_pending(), 0, "an unsubscribe drops it");
     for index in 0..20 {
-        stream
-            .subscribe(&format!("never-{index}"), "attention", 10, None, None)
+        stream.subscribe(&format!("never-{index}"), "attention", 10, None, None, None)
             .await
             .unwrap();
     }

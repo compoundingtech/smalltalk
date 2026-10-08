@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Let a web client follow one exact agent card without subscribing to the fleet roster",
+  "replay": {"status": "none", "detail": "No replay or projection rebuild. Existing current-agent card semantics and changed-agent dependency hints are reused."},
+  "schema": {"status": "changed", "detail": "The public client-v0 CollectionCommand schema adds an optional full agent ID selector to agents subscriptions. No database tables, columns, indexes or claim schemas change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules, digests and fleet coordination are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Agents subscriptions may select agent for a zero-or-one current-card window, intersected with status. Omitting agent preserves fleet windows. Rust CollectionStream::subscribe adds an optional agent argument; repository callers are migrated. Swift exposes agentsStream with an optional agent selector, and TypeScript collection filters and generated command models expose agent. Clients must use an upgraded daemon before relying on the selector: older daemons ignore unknown subscription fields."},
+  "downtime": {"status": "none", "detail": "No coordinated interruption is required; the selector becomes available when the upgraded daemon serves the connection. Existing connections retain their established behavior until reconnecting."},
+  "manual": {"status": "changed", "detail": "When upgrading the Rust client library, supply the new final optional agent argument to CollectionStream::subscribe (None for existing fleet windows). Upgrade the serving daemon before using an exact selector. No database or fleet-wide manual migration is required."},
+  "recovery": {"status": "none", "detail": "Rollback requires no data repair. A web client must omit the exact selector when connecting to a daemon without this feature, because older daemons may ignore it and return a fleet window."}
+}

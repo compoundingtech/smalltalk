@@ -378,8 +378,7 @@ async fn connected(
         .into_iter()
         .chain(granted.then_some(Window::Glasses))
     {
-        if let Err(error) = stream
-            .subscribe(window.id(), window.id(), window.limit(), None, None)
+        if let Err(error) = stream.subscribe(window.id(), window.id(), window.limit(), None, None, None)
             .await
         {
             return Ended::Dropped(error.to_string());
@@ -591,7 +590,7 @@ async fn connected(
             }
             () = tokio::time::sleep_until(window_at.unwrap_or_else(Instant::now)), if window_at.is_some() => {
                 for window in window_retries.due(Instant::now()) {
-                    if let Err(error) = stream.subscribe(window.id(), window.id(), window.limit(), None, None).await {
+                    if let Err(error) = stream.subscribe(window.id(), window.id(), window.limit(), None, None, None).await {
                         return Ended::Dropped(error.to_string());
                     }
                 }
