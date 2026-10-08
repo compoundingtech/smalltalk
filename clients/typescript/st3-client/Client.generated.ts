@@ -2,6 +2,7 @@
 import { API_VERSION } from './Models.generated.ts';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
+    ClientDiagnosticsBatch, ClientDiagnosticsAck,
     ResourcesFilter, ResourcesPage,
     Arrangement, ArrangementId, ArrangementPage,
     PublicationDefinition, SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
@@ -215,6 +216,11 @@ export class St3Client {
     async submitAction(request: ActionRequest): Promise<EnvelopeOf<ActionResult>> {
         await this.discover();
         return this.request<ActionResult>('POST', '/v1/client/actions', request);
+    }
+
+    /** Upload 1–32 bounded events (at most 128 KiB). Acknowledged IDs are durable, including duplicates. Requires write.client-diagnostics. */
+    diagnosticsSubmit(batch: ClientDiagnosticsBatch): Promise<EnvelopeOf<ClientDiagnosticsAck>> {
+        return this.request<ClientDiagnosticsAck>('POST', '/v1/client/diagnostics', batch);
     }
 
     async beginPairing(request: PairingBegin): Promise<EnvelopeOf<PairingChallenge>> {

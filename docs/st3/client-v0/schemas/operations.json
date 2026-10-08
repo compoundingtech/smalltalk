@@ -73,6 +73,7 @@
     {"id": "glasses.get", "method": "GET", "path": "/v1/client/glasses/{id}", "response": "Glass", "scope": "read.glasses"}
   ],
   "commands": [
+    { "id": "diagnostics.submit", "method": "POST", "path": "/v1/client/diagnostics", "request": "ClientDiagnosticsBatch", "response": "ClientDiagnosticsAck", "scope": "write.client-diagnostics", "max_request_bytes": 131072 },
     { "id": "action.submit", "method": "POST", "path": "/v1/client/actions", "request": "ActionRequest", "response": "ActionResult" },
     { "id": "pairing.begin", "method": "POST", "path": "/v1/client/pairings", "request": "PairingBegin", "response": "PairingChallenge", "local_only": true },
     { "id": "pairing.complete", "method": "POST", "path": "/v1/client/pairings/{id}/complete", "request": "PairingComplete", "response": "PairedSession" },
