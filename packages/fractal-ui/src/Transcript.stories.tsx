@@ -272,7 +272,11 @@ export const MidTurnHistoryLight: Story = { ...MidTurnHistory, args: { scheme: '
 
 export const ReadOnlyTools: Story = { render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><RuntimeTranscript data={cases.settled} onRetry={() => {}} /></main>, play: async ({ canvasElement }) => {
   const work = await within(canvasElement).findByTestId('work-log')
-  await expect(work.querySelector('button, [role="button"], [data-row-disclosure]')).toBeNull()
+  await expect(work.querySelector(':scope > button, :scope > [role="button"]')).toBeNull()
+  const rows = work.querySelectorAll('[data-tool-status]')
+  await expect(rows).toHaveLength(3)
+  for (const row of rows) await expect(row.querySelector('button, [role="button"], [data-row-disclosure]')).toBeNull()
+  await expect(within(work).getByRole('button', { name: 'Thinking' })).toBeVisible()
   await expect(work).toHaveTextContent('export const last = visibleRows.at(-1)')
   await expect(work).toHaveTextContent('selection retained')
   await expect(work.querySelectorAll('[data-testid="tool-preview-actions"]')).toHaveLength(0)
