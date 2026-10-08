@@ -22011,7 +22011,7 @@ mission "wake" state="ready" {
             assert!(appended);
             assert!(crate::store::local_observation_position(&response).is_some());
             assert_eq!(state.store.index().unwrap(), index);
-            let _ = finish_claim_publication(&state, &request.kind, response, appended)
+            let _ = finish_claim_publication(&state, &request.kind, response, appended, None)
                 .await.unwrap();
             for subscriber in &mut subscribers {
                 tokio::time::timeout(Duration::from_secs(1), subscriber.changed())
