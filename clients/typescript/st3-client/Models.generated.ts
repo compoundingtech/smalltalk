@@ -1521,6 +1521,7 @@ export type SubagentSummary = {
   cost_usd?: number;
   duration_ms?: number;
   id: string;
+  name?: string;
   requests?: number;
   status: string;
   task?: string;
@@ -1708,6 +1709,7 @@ export type TimelineAskQuestion = {
   id: string;
   multi: boolean;
   options: Array<{
+  description?: string;
   label: string;
 }>;
   question: string;
@@ -1852,7 +1854,7 @@ export type TimelineUsageBody = {
   turn_id?: string;
 };
 
-export type TimelineView = (TimelineViewBash | TimelineViewEdit | TimelineViewWrite | TimelineViewRead | TimelineViewSearch | TimelineViewTodo | TimelineViewAsk | TimelineViewTask | TimelineViewHub | TimelineViewEval | TimelineViewGeneric | TimelineViewIrc | TimelineViewJob | TimelineViewSkill | TimelineViewCompaction | TimelineViewModelChange | TimelineViewThinkingLevel | TimelineViewTitle | TimelineViewSessionExit | TimelineViewToolStart | TimelineViewResetBoundary | TimelineViewCredentialPin | {
+export type TimelineView = (TimelineViewBash | TimelineViewEdit | TimelineViewWrite | TimelineViewRead | TimelineViewSearch | TimelineViewTodo | TimelineViewAsk | TimelineViewTask | TimelineViewHub | TimelineViewEval | TimelineViewGeneric | TimelineViewIrc | TimelineViewJob | TimelineViewSkill | TimelineViewCompaction | TimelineViewAssistantError | TimelineViewModelChange | TimelineViewThinkingLevel | TimelineViewTitle | TimelineViewSessionExit | TimelineViewToolStart | TimelineViewResetBoundary | TimelineViewCredentialPin | {
   type: string;
 });
 
@@ -1864,6 +1866,34 @@ export type TimelineViewAsk = {
   questions?: Array<TimelineAskQuestion>;
   tool: string;
   type: "ask";
+};
+
+export type TimelineViewAssistantError = {
+  api?: string;
+  error_id?: number;
+  is_error: boolean;
+  label: string;
+  message: string;
+  model?: string;
+  presentation: "full" | "compact-recovered" | "none";
+  provider?: string;
+  retry?: {
+  attempt?: number;
+  kind?: string;
+  note?: string;
+  recovered_at?: Timestamp;
+  recovery?: string;
+  status?: string;
+  superseded_by?: {
+  model?: string;
+  provider?: string;
+  response_id?: string;
+  timestamp?: number;
+};
+};
+  status: "failed" | "recovered" | "superseded";
+  stop_reason?: string;
+  type: "assistant_error";
 };
 
 export type TimelineViewBash = {
@@ -1885,6 +1915,7 @@ export type TimelineViewBash = {
 export type TimelineViewCompaction = {
   method?: string;
   short_summary?: string;
+  summary?: string;
   tokens_after?: number;
   tokens_before?: number;
   type: "compaction";
@@ -1909,9 +1940,12 @@ export type TimelineViewEdit = {
 };
 
 export type TimelineViewEval = {
+  code?: string;
   code_bytes: number;
   intent?: string;
   language: string;
+  reset?: boolean;
+  timeout_s?: number;
   title?: string;
   tool: string;
   type: "eval";
@@ -1932,6 +1966,7 @@ export type TimelineViewHub = {
   intent?: string;
   is_error?: boolean;
   jobs?: Array<JobSummary>;
+  message?: string;
   name?: string;
   op: string;
   state?: string;
@@ -1975,13 +2010,26 @@ export type TimelineViewResetBoundary = {
 };
 
 export type TimelineViewSearch = {
+  call_id?: string;
+  case?: boolean;
   engine: "grep" | "glob" | "web";
+  file_count?: number;
+  file_limit_reached?: number;
+  gitignore?: boolean;
+  hidden?: boolean;
   intent?: string;
+  is_error?: boolean;
+  limit?: number;
+  match_count?: number;
   path?: string;
   pattern?: string;
+  per_file_limit_reached?: number;
   query?: string;
+  skip?: number;
   tool: string;
+  truncated?: boolean;
   type: "search";
+  warning?: string;
 };
 
 export type TimelineViewSessionExit = {
@@ -2001,6 +2049,7 @@ export type TimelineViewTask = {
   agents?: Array<SubagentSummary>;
   async?: boolean;
   call_id?: string;
+  context?: string;
   intent?: string;
   is_error?: boolean;
   tasks?: Array<{
@@ -2051,7 +2100,9 @@ export type TimelineViewToolStart = {
 
 export type TimelineViewWrite = {
   bytes: number;
+  content?: string;
   intent?: string;
+  line_count?: number;
   path: string;
   tool: string;
   type: "write";
