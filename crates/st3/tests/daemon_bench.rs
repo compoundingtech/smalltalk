@@ -1258,7 +1258,7 @@ fn store_origin(store: &Store) -> &str {
 
 /// Missions, their revisions, runs and their work, standing agents, documents, attention and
 /// event claims in the sampled proportions.
-fn generate(store: &Store, prefix: &str, scale: f64) {
+pub(crate) fn generate(store: &Store, prefix: &str, scale: f64) {
     let missions = scaled(SAMPLED.missions, scale);
     for mission in 0..missions {
         let name = format!("bench/{prefix}-mission-{mission}");
