@@ -11,6 +11,8 @@ pub fn create_schema(c: &Connection) -> Result<()> {
         "local_agent_card_source_work",
         "local_agent_authority_dirty",
         "local_agent_lifecycle_dirty",
+        "local_agent_launch_dirty",
+        "local_agent_card_source_local_cut",
         "local_agent_card_usage_dirty",
         "local_agent_queue_run_work",
         "local_agent_queue_join_work",
@@ -37,10 +39,24 @@ pub fn create_schema(c: &Connection) -> Result<()> {
             "local_agent_queue_rank_work",
             "NEW.cursor IS NOT OLD.cursor",
         ),
+        (
+            "local_agent_card_source_local_cut",
+            "NEW.after_index>OLD.after_index OR (NEW.after_index=OLD.after_index AND NEW.after_claim>OLD.after_claim)",
+        ),
+        (
+            "local_agent_card_source_clock",
+            "NEW.authority_agent>OLD.authority_agent OR (NEW.authority_agent=OLD.authority_agent AND NEW.authority_id>OLD.authority_id) OR NEW.lifecycle_after>OLD.lifecycle_after",
+        ),
+        (
+            "local_agent_card_source_cursor",
+            "NEW.after_key>OLD.after_key",
+        ),
     ] {
         c.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS st3_work_advance_{table} AFTER UPDATE ON {table} WHEN {condition} BEGIN
         INSERT INTO st3_agent_work_progress VALUES(NEW.namespace,1) ON CONFLICT(namespace) DO UPDATE SET counter=counter+1; END"))?;
     }
+    c.execute_batch("CREATE TRIGGER IF NOT EXISTS st3_work_begin_local_agent_card_source_cursor AFTER INSERT ON local_agent_card_source_cursor WHEN NEW.after_key<>'' BEGIN
+        INSERT INTO st3_agent_work_progress VALUES(NEW.namespace,1) ON CONFLICT(namespace) DO UPDATE SET counter=counter+1; END")?;
     Ok(())
 }
 
