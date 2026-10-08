@@ -28,5 +28,9 @@
   "recovery": {
     "status": "none",
     "detail": "Reverting the test change restores the roster-only workload; no production database state changes."
-  }
+  },
+  "commits": [
+    "5546adda6e903cc9090e7e63805505b487c14572",
+    "5b66010e3ab0a6064797b450a8ae6d309af821d8"
+  ]
 }
