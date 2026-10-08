@@ -4,6 +4,29 @@ const assert = require('node:assert/strict');
 // Node 24 loads the generated TypeScript directly, without a transpilation copy.
 const modules = Promise.all([import('effect'), import('./Schema.generated.ts')]);
 
+test('person-ask mission rows retain actor references through the generated decoder', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const wire = require('../../../docs/st3/client-v0/fixtures/person-ask-mission.json');
+    const decode = Rich.decodeUnknownSync(Rich.Mission, 'strict');
+    const roundTrip = Schema.encodeSync(Rich.Mission)(decode(wire));
+    assert.equal(roundTrip.run_details[0].current_steps[0].assignee, 'person/avery');
+    assert.equal(roundTrip.run_details[0].steps[0].assignee, 'person/avery');
+    assert.equal(roundTrip.run_details[0].steps[0].wake.assignee, 'person/avery');
+    assert.equal(roundTrip.run_details[0].steps[0].claimant, null);
+    for (const actor of ['agent/asker', 'daemon/reconciler', 'person/avery']) {
+        const row = structuredClone(wire);
+        row.run_details[0].current_steps[0].assignee = actor;
+        row.run_details[0].current_steps[0].claimant = actor;
+        row.run_details[0].steps[0].assignee = actor;
+        row.run_details[0].steps[0].claimant = actor;
+        row.run_details[0].steps[0].wake.assignee = actor;
+        assert.equal(Schema.encodeSync(Rich.Mission)(decode(row)).run_details[0].steps[0].claimant, actor);
+    }
+    const invalid = structuredClone(wire);
+    invalid.run_details[0].steps[0].assignee = 'mission/not-an-actor';
+    assert.throws(() => decode(invalid));
+});
+
 test('timestamp codecs reject normalized invalid calendar dates and preserve instants', async () => {
     const [{ DateTime, Schema }, Rich] = await modules;
     const decode = Rich.decodeUnknownSync(Rich.Timestamp);

@@ -17,6 +17,18 @@ fn decode<T: serde::de::DeserializeOwned>(name: &str) -> T {
 }
 
 #[test]
+fn person_ask_mission_preserves_person_assignees_in_both_step_views_and_wake() {
+    let mission: Mission = decode("person-ask-mission.json");
+    let run = &mission.run_details[0];
+    assert_eq!(run.current_steps[0]["assignee"], "person/avery");
+    assert!(run.current_steps[0]["claimant"].is_null());
+    let step = &run.steps.as_ref().unwrap()[0];
+    assert_eq!(step.assignee.as_deref(), Some("person/avery"));
+    assert!(step.claimant.is_none());
+    assert_eq!(step.wake.as_ref().unwrap().assignee, "person/avery");
+}
+
+#[test]
 fn search_fixture_preserves_result_targets_and_incomplete_history() {
     let search: Envelope<ConversationSearch> = decode("conversation-search.json");
     assert_eq!(search.value.items[0].entry_id, "timeline-entry/note");

@@ -43,6 +43,14 @@ run-detail endpoint. The detail uses the same enriched `Store::mission_run` read
 runs keep lightweight effective-step summaries. Headers and enrichment share one reader
 snapshot; mission lists retain their lightweight summary reads.
 
+Mission `run_details[].steps[]` and `run_details[].current_steps[]` expose nullable
+`assignee` and `claimant` actor references (`agent/...`, `daemon/...`, or `person/...`),
+not agent-only IDs. A person-ask mission therefore retains its assigned person in both
+step views. `steps[].wake.assignee` uses the same actor-reference contract, including a
+ready person's unavailable, zero-attempt wake observation. `requester` and `outcome.actor`
+also use `ActorRef`. Clients must preserve these mission rows and handle the actor family
+instead of assuming every assignee or claimant is an agent.
+
 `loop_round` and `loop_max_rounds` belong to the loop attached to that exact step in the current
 generation; they are null for a non-loop step. `loop_reason` is the observed loop-state reason.
 `next_wake_at` is the observed not-before time (earliest work eligibility), not a delivery promise
