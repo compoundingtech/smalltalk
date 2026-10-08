@@ -11689,7 +11689,7 @@ fn accept_message_receipt_with_upload_owner(
     };
     // A repeated key returns the first claim and says it appended nothing.
     let (record, appended) = match &device_signature {
-        Some(signature) => state.store.append_signed_claim(&input, signature),
+        Some(signature) => state.store.append_signed_message(&input, signature),
         None => state.store.append_claim_outcome(&input),
     }
     .map_err(ApiError::bad)?;
