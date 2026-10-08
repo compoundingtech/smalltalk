@@ -348,3 +348,38 @@ test('owner content chunk route encodes session identities and retains continuat
     assert.equal(calls.at(-1).init.headers['x-st3-features'], 'custom-subjects.v1, conversation-blocks.v1');
     assert.deepEqual(result.value, chunk);
 });
+
+test('field patches keep unchanged data and distinguish null from removal atomically', () => {
+    const base = { ...mission('mission/a', 'A'), nullable: 'before', removed: true, huge: 'x'.repeat(120_000) };
+    const initial = applyWindow(undefined, { kind: 'snapshot', id: 'm', collection: 'missions', snapshot, items: [base], order: ['mission/a'], has_more: false });
+    const frame = { kind: 'changes', id: 'm', collection: 'missions', snapshot, upserts: [], removes: [], order: ['mission/a'], has_more: false,
+        patches: [{ id: 'mission/a', fields: { title: 'Changed', nullable: null }, removed_fields: ['removed'] }] };
+    const changed = applyWindow(initial, frame);
+    assert.equal(changed.items[0].title, 'Changed');
+    assert.equal(changed.items[0].nullable, null);
+    assert.equal(Object.hasOwn(changed.items[0], 'removed'), false);
+    assert.equal(changed.items[0].huge, base.huge);
+    assert.equal(initial.items[0].title, 'A');
+    assert.equal(initial.items[0].removed, true);
+    for (const patch of [
+        { id: 'mission/missing', fields: {}, removed_fields: [] },
+        { id: 'mission/a', fields: { id: 'mission/changed' }, removed_fields: [] },
+        { id: 'mission/a', fields: {}, removed_fields: ['kind'] },
+        { id: 'mission/a', fields: { title: 'Conflicting' }, removed_fields: ['title'] },
+    ]) {
+        assert.equal(applyWindow(initial, { ...frame, patches: [frame.patches[0], patch] }), undefined);
+        assert.equal(initial.items[0].title, 'A');
+    }
+});
+
+test('field delta opt-in is explicit and omitted by ordinary subscriptions', async () => {
+    const socket = collectionSocket();
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const stream = await client.collectionStream({ onFrame: () => {}, socket: () => socket });
+    socket.onopen();
+    stream.subscribe('legacy', 'agents');
+    stream.subscribe('fields', 'agents', 100, { field_deltas: true });
+    assert.equal(Object.hasOwn(socket.sent[0], 'field_deltas'), false);
+    assert.equal(socket.sent[1].field_deltas, true);
+    stream.close();
+});

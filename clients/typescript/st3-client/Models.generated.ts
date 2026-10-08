@@ -530,6 +530,7 @@ export type ClientConnections = {
 export type CollectionCommand = ({
   actor?: string | null;
   collection: "missions" | "attention" | "agents" | "work" | "glasses" | "summary";
+  field_deltas?: boolean;
   id: string;
   kind: "subscribe";
   limit?: number;
@@ -573,6 +574,7 @@ export type CollectionFrame = ({
   id: string;
   kind: "changes";
   order: Array<Id>;
+  patches?: Array<CollectionPatch>;
   removes: Array<Id>;
   snapshot: Snapshot;
   upserts: Array<Resource>;
@@ -607,6 +609,14 @@ export type CollectionFrame = ({
 });
 
 export type CollectionName = "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements" | "summary";
+
+export type CollectionPatch = {
+  fields: {
+  [key: string]: unknown;
+};
+  id: Id;
+  removed_fields: Array<string>;
+};
 
 export type ConversationChanges = {
   items: Array<TimelineEntry>;

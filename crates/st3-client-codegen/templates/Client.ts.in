@@ -48,7 +48,7 @@ export type TerminalStreamOptions = {
 export type TerminalStream = { close(): void };
 
 /** `person` applies to attention, `actor` to work, and `status` to agents. */
-export type CollectionFilters = { person?: string | null; actor?: string | null; status?: string | null };
+export type CollectionFilters = { person?: string | null; actor?: string | null; status?: string | null; field_deltas?: boolean };
 /** The WebSocket surface the collections socket uses: a terminal socket that also sends. */
 export type CollectionSocket = TerminalSocket & {
     onopen: (() => void) | null;
@@ -85,6 +85,24 @@ export function applyWindow(window: CollectionWindow | undefined, frame: Collect
     const rows = new Map<string, Resource>(frame.kind === 'snapshot' ? [] : window!.items.map(item => [item.id, item]));
     if (frame.kind === 'changes') for (const id of frame.removes) rows.delete(id);
     for (const item of frame.kind === 'snapshot' ? frame.items : frame.upserts) rows.set(item.id, item);
+    if (frame.kind === 'changes') {
+        if ((frame.patches?.length ?? 0) > 200) return undefined;
+        const ids = new Set<string>();
+        for (const patch of frame.patches ?? []) {
+            const base = rows.get(patch.id);
+            if (!base || ids.has(patch.id) || Object.keys(patch.fields).length > 128 || patch.removed_fields.length > 128) return undefined;
+            ids.add(patch.id);
+            const removed = new Set<string>();
+            const next = { ...base, ...patch.fields } as Resource & Record<string, unknown>;
+            if ('id' in patch.fields || 'kind' in patch.fields) return undefined;
+            for (const name of patch.removed_fields) {
+                if (name === 'id' || name === 'kind' || Object.prototype.hasOwnProperty.call(patch.fields, name) || removed.has(name)) return undefined;
+                removed.add(name);
+                delete next[name];
+            }
+            rows.set(patch.id, next);
+        }
+    }
     const items = frame.order.flatMap(id => rows.get(id) ?? []);
     return { items, hasMore: frame.has_more, snapshot: frame.snapshot };
 }

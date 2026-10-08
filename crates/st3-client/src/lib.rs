@@ -2,7 +2,9 @@
 //! Typed `st3.client.v0` client. This crate never parses CLI or harness output.
 
 mod checkout;
+mod collection_patch;
 pub use checkout::{agent_branch, checkout_label};
+pub use collection_patch::{CollectionPatch, apply_collection_patches};
 mod contract;
 pub mod device;
 mod generated;
@@ -426,6 +428,18 @@ impl CollectionStream {
     ) -> Result<(), ClientError> {
         self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":collection, "limit":limit, "actor":actor, "status":status})).await
     }
+    /// Opt in to field patches on existing rows; older daemons still send full upserts.
+    /// Apply patches with `apply_collection_patches`, resubscribing if its base is missing.
+    pub async fn subscribe_field_deltas(
+        &mut self,
+        id: &str,
+        collection: &str,
+        limit: usize,
+        actor: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":collection, "limit":limit, "actor":actor, "status":status,"field_deltas":true})).await
+    }
     /// Follow a terminal on this socket. `terminal.attach` returns the incarnation and the
     /// single-use capability; screens then arrive as [`CollectionEvent::Screen`], the latest
     /// only, and a `stale-fence` error ends only this subscription.
@@ -579,6 +593,7 @@ pub enum CollectionEvent {
         id: String,
         snapshot: Snapshot,
         upserts: Vec<Resource>,
+        patches: Vec<CollectionPatch>,
         removes: Vec<String>,
         order: Vec<String>,
         has_more: bool,
@@ -637,6 +652,11 @@ impl CollectionEvent {
             Some("changes") => Ok(Self::Changes {
                 snapshot: field(&frame, "snapshot")?,
                 upserts: field(&frame, "upserts")?,
+                patches: if frame.get("patches").is_some() {
+                    field(&frame, "patches")?
+                } else {
+                    Vec::new()
+                },
                 removes: field(&frame, "removes")?,
                 order: field(&frame, "order")?,
                 has_more: field(&frame, "has_more")?,
