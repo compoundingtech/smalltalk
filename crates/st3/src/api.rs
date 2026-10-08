@@ -1287,6 +1287,12 @@ async fn response_envelope_unbounded(
     } else {
         crate::relay_trace::Outcome::Failed
     });
+    if let Some(server) = otel.as_ref()
+        && let Some(items) = envelope["value"]["items"].as_array()
+    {
+        server.record("st.page.rows", items.len() as i64);
+        server.record("st.page.bytes", body.len() as i64);
+    }
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     record_request_latency(
         &request_method,
@@ -1354,6 +1360,10 @@ fn request_trace(
         "st.admission.snapshot_ms" = tracing::field::Empty,
         "st.handler.queue_ms" = tracing::field::Empty,
         "st.handler.duration_ms" = tracing::field::Empty,
+        "st.roster.mode" = tracing::field::Empty,
+        "st.roster.cards" = tracing::field::Empty,
+        "st.page.rows" = tracing::field::Empty,
+        "st.page.bytes" = tracing::field::Empty,
     );
     let remote = crate::otel::extract_remote_context(headers);
     let parent = remote.span();

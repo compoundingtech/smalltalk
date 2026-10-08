@@ -443,6 +443,88 @@ impl ExportDaemon {
         );
     }
 
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        traceparent: &str,
+        key: Option<&str>,
+    ) -> (Value, usize) {
+        use http_body_util::BodyExt as _;
+        // Exercise the local API boundary; the separate fabric gateway requires pairing.
+        let socket = &self.socket;
+        let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(
+            hyper_util::rt::TokioIo::new(stream),
+        ).await.unwrap();
+        let connection = tokio::spawn(connection);
+        let mut request = hyper::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "localhost")
+            .header("x-st3-client", "fractal")
+            .header("traceparent", traceparent)
+            .header("content-type", "application/json");
+        if path.starts_with("/v1/client/") {
+            request = request.header("x-st3-person", "person/ada");
+        }
+        if let Some(key) = key {
+            request = request.header("idempotency-key", key);
+        }
+        let body = body.map(|body| serde_json::to_vec(&body).unwrap()).unwrap_or_default();
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_request(request.body(axum::body::Body::from(body)).unwrap()),
+        ).await.unwrap().unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        connection.abort();
+        assert_eq!(status, hyper::StatusCode::OK, "{}\n{}", String::from_utf8_lossy(&body), self.diagnostics());
+        (serde_json::from_slice(&body).unwrap(), body.len())
+    }
+
+    async fn websocket(
+        &self,
+        path: &str,
+        protocol: &str,
+        traceparent: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::UnixStream> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let stream = tokio::net::UnixStream::connect(&self.socket)
+            .await.unwrap();
+        let mut request = format!("ws://localhost{path}").into_client_request().unwrap();
+        request.headers_mut().insert("sec-websocket-protocol", protocol.parse().unwrap());
+        request.headers_mut().insert("traceparent", traceparent.parse().unwrap());
+        request.headers_mut().insert("x-st3-client", "fractal".parse().unwrap());
+        request.headers_mut().insert("x-st3-person", "person/ada".parse().unwrap());
+        let (socket, response) = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::client_async(request, stream),
+        ).await.unwrap().unwrap();
+        assert_eq!(response.status(), hyper::StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(response.headers()["sec-websocket-protocol"], protocol);
+        socket
+    }
+
+    fn await_span(&mut self, root: &Path, matches: impl Fn(&Value) -> bool) -> Value {
+        let request = self.await_export(&root.join("capture/traces.ndjson"), |request| {
+            exported_spans(request).any(&matches)
+        });
+        exported_spans(&request).find(|span| matches(span)).unwrap().clone()
+    }
+
+    fn captured_spans(&self, root: &Path) -> Vec<Value> {
+        std::fs::read_to_string(root.join("capture/traces.ndjson")).unwrap_or_default()
+            .split_inclusive('\n')
+            .filter(|line| line.ends_with('\n'))
+            .flat_map(|line| {
+                let request: Value = serde_json::from_str(line).unwrap();
+                exported_spans(&request).cloned().collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     fn await_export(&mut self, path: &Path, matches: impl Fn(&Value) -> bool) -> Value {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -713,3 +795,318 @@ fn daemon_normal_request_exports_no_log_stream() {
         );
     }
 }
+
+#[cfg(target_os = "linux")]
+fn exported_spans(request: &Value) -> impl Iterator<Item = &Value> {
+    request["resourceSpans"].as_array().into_iter().flatten()
+        .filter(|batch| string_attribute(&batch["resource"], "service.name") == Some("st-daemon"))
+        .flat_map(|batch| batch["scopeSpans"].as_array().into_iter().flatten())
+        .flat_map(|scope| scope["spans"].as_array().into_iter().flatten())
+}
+
+#[cfg(target_os = "linux")]
+fn assert_internal_root(span: &Value) {
+    assert!(
+        span["parentSpanId"].as_str().is_none_or(|id| id.is_empty() || id == "0000000000000000"),
+        "stage span must be parentless: {span}"
+    );
+    assert!(
+        span["kind"] == 1 || span["kind"] == "SPAN_KIND_INTERNAL",
+        "stage span must be INTERNAL: {span}"
+    );
+    assert!(!span["traceId"].as_str().unwrap().is_empty());
+    assert!(!span["spanId"].as_str().unwrap().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+fn assert_upgrade_link(stage: &Value, upgrade: &Value) {
+    assert_internal_root(stage);
+    assert_ne!(stage["traceId"], upgrade["traceId"], "the stage must not retain the server trace as parent");
+    let links = stage["links"].as_array().expect("linked root");
+    assert_eq!(links.len(), 1, "{stage}");
+    assert_eq!(links[0]["traceId"], upgrade["traceId"]);
+    assert_eq!(links[0]["spanId"], upgrade["spanId"]);
+}
+
+#[cfg(target_os = "linux")]
+const STAGE_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+#[cfg(target_os = "linux")]
+fn stage_replication_source(root: &Path) -> st3::store::Store {
+    let state = root.join("daemon-state");
+    std::fs::create_dir_all(&state).unwrap();
+    let target = st3::store::Store::open(&state.join("claims.sqlite3"), "otel-test").unwrap();
+    target.bind_fleet(STAGE_FLEET).unwrap();
+    target.project_replication_backlog().unwrap();
+    let source = st3::store::Store::open_memory("otel-source").unwrap();
+    source.bind_fleet(STAGE_FLEET).unwrap();
+    source
+}
+
+#[cfg(target_os = "linux")]
+async fn receive_stage_claims(daemon: &ExportDaemon, source: &st3::store::Store, traceparent: &str) {
+    let exchange = source.export_replication_exchange(
+        STAGE_FLEET, &st3::model::ReplicationInventory::default(),
+    ).unwrap();
+    let (response, _) = daemon.request("POST", "/v1/internal/replication/receive",
+        Some(serde_json::json!({"peer":"otel-source", "fleet_id":STAGE_FLEET, "exchange":exchange})),
+        traceparent, None).await;
+    assert!(response["value"]["receipt"]["received"].as_u64().is_some_and(|count| count > 0), "{response}");
+}
+
+#[cfg(target_os = "linux")]
+fn seed_roster(root: &Path, subject: &str) {
+    let state = root.join("daemon-state");
+    std::fs::create_dir_all(&state).unwrap();
+    let store = st3::store::Store::open(&state.join("claims.sqlite3"), "otel-test").unwrap();
+    store.append_claim(&st3::model::ClaimInput {
+        subject: subject.into(),
+        kind: "runtime.observed".into(),
+        actor: None,
+        fields: serde_json::from_value(serde_json::json!({
+            "status":"stopped", "runtime_id":"otel-observed", "host":"otel-test",
+            "incarnation_id":"otel-session"
+        })).unwrap(),
+        evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+    }).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+async fn next_json_frame(
+    socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
+) -> (Value, usize) {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let message = socket.next().await.expect("open websocket").unwrap();
+            match message {
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    return (serde_json::from_str(&text).unwrap(), text.len());
+                }
+                tokio_tungstenite::tungstenite::Message::Ping(_) => socket.flush().await.unwrap(),
+                other => panic!("unexpected websocket frame: {other:?}"),
+            }
+        }
+    }).await.expect("deterministic first/change frame")
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_request_id_and_roster_stages_match_response() {
+    const TRACE: &str = "31af7651916cd43dd8448eb211c80319";
+    const PARENT: &str = "b7ad6b7169203331";
+    const TRACEPARENT: &str = "00-31af7651916cd43dd8448eb211c80319-b7ad6b7169203331-01";
+    let Some(collector) = otelite("daemon_request_id_and_roster_stages_match_response") else { return };
+    let root = tempfile::tempdir().unwrap();
+    let actor = std::env::var("ST_AGENT").ok().filter(|actor| actor.starts_with("agent/"))
+        .unwrap_or_else(|| "agent/otel-test.observed".into());
+    seed_roster(root.path(), &actor);
+    let mut daemon = ExportDaemon::start(&collector, root.path());
+    const STARTUP_BARRIER: &str = "00-21af7651916cd43dd8448eb211c80319-b7ad6b7169203330-01";
+    daemon.health(Some(STARTUP_BARRIER));
+    daemon.await_span(root.path(), |span| span["traceId"] == "21af7651916cd43dd8448eb211c80319");
+    // The stopped fixture is visible only to history reads. Background current-roster
+    // rebuilds have zero cards and are unrelated detached roots.
+    let startup_rebuilds = daemon.captured_spans(root.path()).iter()
+        .filter(|span| span["name"] == "st.roster.rebuild"
+            && int_attribute(span, "st.roster.cards") == Some(1)).count();
+    // Independent daemon maintenance can invalidate even adjacent roster reads.
+    // Retry a bounded hit/incremental pair without sleeps, then prove every observed
+    // cold read owns one rebuild and that hit/incremental reads own none.
+    let mut responses = Vec::new();
+    let mut matched_pair = false;
+    for attempt in 0..16 {
+        let first = responses.len();
+        for advance in [false, true] {
+            if advance {
+                daemon.request("POST", "/v1/diagnostics/harness", Some(serde_json::json!({
+                    "actor":actor, "code":"otel-roster-advance", "reason":"stage fixture",
+                    "severity":"warning", "status":"healthy", "incarnation_id":"otel-session",
+                    "idempotency_key":format!("otel-roster-advance-{attempt}"),
+                })), TRACEPARENT, None).await;
+            }
+            // Historical reads exercise the complete cache, not selected-page coverage.
+            let (body, bytes) = daemon.request("GET",
+                "/v1/client/agents?history=true&status=stopped", None, TRACEPARENT, None).await;
+            responses.push((body, bytes));
+        }
+        matched_pair = responses[first..].iter().zip(["hit", "incremental"]).all(|((body, _), mode)| {
+            let request_id = body["request_id"].as_str().expect("response request_id");
+            let span = daemon.await_span(root.path(), |span| {
+                string_attribute(span, "st.request.id") == Some(request_id)
+            });
+            string_attribute(&span, "st.roster.mode") == Some(mode)
+        });
+        if matched_pair {
+            break;
+        }
+    }
+    assert!(matched_pair, "maintenance prevented a hit/incremental pair in 16 attempts");
+    let mut cold_reads = 0;
+    for (index, (body, bytes)) in responses.into_iter().enumerate() {
+        let request_id = body["request_id"].as_str().expect("response request_id");
+        assert!(request_id.starts_with("request/"), "{body}");
+        let rows = body["value"]["items"].as_array().expect("roster page").len();
+        assert_eq!(rows, 1, "{body}");
+        let span = daemon.await_span(root.path(), |span| {
+            string_attribute(span, "st.request.id") == Some(request_id)
+        });
+        assert_eq!(span["name"], "GET /v1/client/agents");
+        assert_eq!(span["traceId"], TRACE);
+        assert_eq!(span["parentSpanId"], PARENT);
+        let mode = string_attribute(&span, "st.roster.mode").expect("roster mode");
+        assert!(matches!(mode, "cold" | "hit" | "incremental"), "{span}");
+        if index == 0 {
+            assert_eq!(mode, "cold", "first historical read must rebuild: {span}");
+        }
+        assert_eq!(int_attribute(&span, "st.roster.cards"), Some(1), "{span}");
+        assert_eq!(int_attribute(&span, "st.page.rows"), Some(i64::try_from(rows).unwrap()));
+        assert_eq!(int_attribute(&span, "st.page.bytes"), Some(i64::try_from(bytes).unwrap()));
+        if mode == "cold" {
+            cold_reads += 1;
+            let request_start = span["startTimeUnixNano"].as_str().unwrap().parse::<u64>().unwrap();
+            let request_end = span["endTimeUnixNano"].as_str().unwrap().parse::<u64>().unwrap();
+            let rebuild = daemon.await_span(root.path(), |stage| {
+                stage["name"] == "st.roster.rebuild"
+                    && stage["startTimeUnixNano"].as_str().unwrap().parse::<u64>().unwrap() >= request_start
+                    && stage["endTimeUnixNano"].as_str().unwrap().parse::<u64>().unwrap() <= request_end
+                    && int_attribute(stage, "st.roster.cards") == Some(1)
+            });
+            assert_internal_root(&rebuild);
+            assert!(rebuild["links"].as_array().is_none_or(Vec::is_empty), "{rebuild}");
+            assert_ne!(rebuild["traceId"], span["traceId"]);
+            assert_eq!(string_attribute(&rebuild, "st.roster.mode"), Some("cold"));
+            assert_eq!(int_attribute(&rebuild, "st.roster.cards"), Some(1));
+        }
+    }
+    let spans = daemon.captured_spans(root.path());
+    assert_eq!(spans.iter().filter(|span| span["name"] == "st.roster.rebuild"
+        && int_attribute(span, "st.roster.cards") == Some(1)).count(), startup_rebuilds + cold_reads);
+    assert!(spans.iter().all(|span| span["parentSpanId"].as_str()
+        .is_none_or(|parent| !spans.iter().any(|server| server["traceId"] == TRACE
+            && server["spanId"].as_str() == Some(parent)))), "request stage children leaked: {spans:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn collection_first_frame_links_upgrade_and_changes_emit_no_extra_spans() {
+    use futures_util::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+    const TRACE: &str = "41af7651916cd43dd8448eb211c80319";
+    const TRACEPARENT: &str = "00-41af7651916cd43dd8448eb211c80319-b7ad6b7169203332-01";
+    const BARRIER: &str = "00-51af7651916cd43dd8448eb211c80319-b7ad6b7169203333-01";
+    let Some(collector) = otelite("collection_first_frame_links_upgrade_and_changes_emit_no_extra_spans") else { return };
+    let root = tempfile::tempdir().unwrap();
+    let source = stage_replication_source(root.path());
+    let mut daemon = ExportDaemon::start(&collector, root.path());
+    let mut socket = daemon.websocket("/v1/client/collections/stream",
+        "st3.client.collections.v0", TRACEPARENT).await;
+    let upgrade = daemon.await_span(root.path(), |span| {
+        span["traceId"] == TRACE && span["name"] == "GET /v1/client/collections/stream"
+    });
+    assert_eq!(upgrade["parentSpanId"], "b7ad6b7169203332");
+    assert_eq!(int_attribute(&upgrade, "http.response.status_code"), Some(101));
+    // Cover every ordinary collection with its real initial bounded window.
+    for collection in ["missions", "attention", "agents", "work", "glasses", "arrangements"] {
+        socket.send(Message::Text(serde_json::json!({
+            "kind":"subscribe", "id":collection, "collection":collection, "limit":2,
+            "person": if collection == "arrangements" { Some("person/ada") } else { None }
+        }).to_string().into())).await.unwrap();
+        let (frame, bytes) = next_json_frame(&mut socket).await;
+        assert_eq!(frame["kind"], "snapshot", "{frame}");
+        assert_eq!(frame["id"], collection);
+        let first = daemon.await_span(root.path(), |span| {
+            span["name"] == "st.subscription.first_frame"
+                && string_attribute(span, "st.subscription.id") == Some(collection)
+        });
+        assert_upgrade_link(&first, &upgrade);
+        assert_eq!(string_attribute(&first, "st.collection"), Some(collection));
+        assert!(string_attribute(&first, "span.label").is_some_and(|label| !label.is_empty()), "{first}");
+        assert_eq!(int_attribute(&first, "st.page.rows"),
+            Some(i64::try_from(frame["items"].as_array().unwrap().len()).unwrap()));
+        assert_eq!(int_attribute(&first, "st.page.bytes"), Some(i64::try_from(bytes).unwrap()));
+        if collection == "agents" {
+            assert!(first["attributes"].as_array().unwrap().iter().any(|attribute| {
+                matches!(attribute["key"].as_str(),
+                    Some("st.projection.hit" | "st.projection.cold" | "st.projection.incremental" | "st.projection.shared"))
+                    && attribute["value"]["boolValue"] == true
+            }), "{first}");
+        }
+    }
+    // Each acknowledged mutation is observed through an actual change frame: no sleep is
+    // standing in for N rereads. Other held windows are irrelevant to glass claims.
+    let mut revision = Value::Null;
+    for change in 0..3 {
+        let saved = source.append_claim(&st3::model::ClaimInput {
+            subject: "glass/person/ada/019a0000-0000-7000-8000-000000000002".into(),
+            kind: "glass.upserted".into(), actor: Some("person/ada".into()),
+            fields: serde_json::from_value(serde_json::json!({
+                "body":{"name":format!("Glass {change}"),"layout":{"tabs":[{"pane":"opaque:otel"}]}},
+                "base_revision":revision,
+            })).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        revision = serde_json::json!(saved.id);
+        receive_stage_claims(&daemon, &source, TRACEPARENT).await;
+        let (frame, _) = next_json_frame(&mut socket).await;
+        assert_eq!(frame["kind"], "changes", "{frame}");
+        assert_eq!(frame["id"], "glasses");
+        assert!(frame["upserts"].as_array().is_some_and(|items| !items.is_empty()), "{frame}");
+    }
+    socket.close(None).await.unwrap();
+    // The captured server marker closes the exporter FIFO after all observed frames.
+    daemon.health(Some(BARRIER));
+    daemon.await_span(root.path(), |span| span["traceId"] == "51af7651916cd43dd8448eb211c80319");
+    let spans = daemon.captured_spans(root.path());
+    let first: Vec<_> = spans.iter().filter(|span| span["name"] == "st.subscription.first_frame").collect();
+    assert_eq!(first.len(), 6, "changes must not start more first-frame spans: {first:?}");
+    for collection in ["missions", "attention", "agents", "work", "glasses", "arrangements"] {
+        assert_eq!(first.iter().filter(|span| string_attribute(span, "st.subscription.id") == Some(collection)).count(), 1);
+    }
+    assert!(spans.iter().all(|span| !matches!(span["name"].as_str(),
+        Some("st.subscription.reread" | "st.subscription.change" | "st.subscription.frame"))));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn conversation_first_frames_link_collection_and_dedicated_upgrades() {
+    use futures_util::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+    let Some(collector) = otelite("conversation_first_frames_link_collection_and_dedicated_upgrades") else { return };
+    let root = tempfile::tempdir().unwrap();
+    seed_roster(root.path(), "agent/otel-test.observed");
+    let mut daemon = ExportDaemon::start(&collector, root.path());
+    for (path, protocol, traceparent, trace, id) in [
+        ("/v1/client/collections/stream", "st3.client.collections.v0",
+            "00-61af7651916cd43dd8448eb211c80319-b7ad6b7169203334-01",
+            "61af7651916cd43dd8448eb211c80319", "conversation-held"),
+        ("/v1/client/conversations/agent%2Fotel-test.observed/stream", "st3.client.conversation.v0",
+            "00-71af7651916cd43dd8448eb211c80319-b7ad6b7169203335-01",
+            "71af7651916cd43dd8448eb211c80319", "conversation"),
+    ] {
+        let mut socket = daemon.websocket(path, protocol, traceparent).await;
+        if protocol == "st3.client.collections.v0" {
+            socket.send(Message::Text(serde_json::json!({
+                "kind":"subscribe", "id":id, "collection":"conversation",
+                "conversation":"agent/otel-test.observed"
+            }).to_string().into())).await.unwrap();
+        }
+        let (frame, bytes) = next_json_frame(&mut socket).await;
+        let page = frame.get("value").unwrap_or(&frame);
+        let rows = page["items"].as_array().unwrap_or_else(|| panic!("conversation first page: {frame}")).len();
+        let upgrade = daemon.await_span(root.path(), |span| {
+            span["traceId"] == trace && int_attribute(span, "http.response.status_code") == Some(101)
+        });
+        let first = daemon.await_span(root.path(), |span| {
+            span["name"] == "st.subscription.first_frame"
+                && string_attribute(span, "st.subscription.id") == Some(id)
+        });
+        assert_upgrade_link(&first, &upgrade);
+        assert_eq!(string_attribute(&first, "st.collection"), Some("conversation"));
+        assert!(string_attribute(&first, "span.label").is_some_and(|label| !label.is_empty()), "{first}");
+        assert_eq!(int_attribute(&first, "st.page.rows"), Some(i64::try_from(rows).unwrap()));
+        assert_eq!(int_attribute(&first, "st.page.bytes"), Some(i64::try_from(bytes).unwrap()));
+        socket.close(None).await.unwrap();
+    }
+}
+
