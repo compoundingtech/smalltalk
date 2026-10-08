@@ -429,6 +429,58 @@ fn link_note(target: &str) -> String {
     }
 }
 
+/// What clicking a web address did when it also opened the browser here.
+fn link_opened_note(target: &str) -> String {
+    format!("Opened {} in your browser · also copied", text::truncate(target, 60))
+}
+
+/// The program that opens a web address in the browser of the machine stui runs on, when that is
+/// where the person sits: not over SSH, and with a desktop (always on macOS). Anything but an
+/// http(s) address is only copied.
+fn browser_opener(url: &str, set: impl Fn(&str) -> bool, macos: bool) -> Option<&'static str> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return None;
+    }
+    if ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"].iter().any(|name| set(name)) {
+        return None;
+    }
+    if macos {
+        Some("open")
+    } else if set("DISPLAY") || set("WAYLAND_DISPLAY") {
+        Some("xdg-open")
+    } else {
+        None
+    }
+}
+
+/// Open `url` in the default browser here if this looks like the person's own machine. It never
+/// waits for the browser and never fails the click: the link is copied either way.
+fn open_in_browser(url: &str) -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    let set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    let Some(program) = browser_opener(url, set, cfg!(target_os = "macos")) else {
+        return false;
+    };
+    match std::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Reap it when it exits, so a click never leaves a zombie behind.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Whether `c` can be part of a written-out web address.
 fn is_address_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
@@ -5230,10 +5282,16 @@ impl Ui {
             Hit::Home if self.home_open() && !self.usage_open() => self.close_home(),
             Hit::Home => self.open_home(),
             // The terminal may be on another machine than stui (over SSH or fabric): the
-            // clipboard is the person's, so the link lands where their browser is.
+            // clipboard is the person's, so the link lands where their browser is. Run locally,
+            // the browser opens too.
             Hit::Link(url) => {
                 copy(&url);
-                self.flash(link_note(&url));
+                let opened = open_in_browser(&url);
+                self.flash(if opened {
+                    link_opened_note(&url)
+                } else {
+                    link_note(&url)
+                });
             }
             Hit::Split(right) => self.split(right),
             Hit::GlassTab(group, tab) => self.show_in(group, tab),
@@ -6267,6 +6325,24 @@ mod tests {
             "Copied /srv/repo/spec.md · a file on the writer's machine"
         );
         assert!(link_note("~/notes/a.md").contains("a file on the writer's machine"));
+    }
+
+    #[test]
+    fn a_web_address_opens_the_browser_only_on_the_persons_own_machine() {
+        let none = |_: &str| false;
+        let only = |wanted: &'static str| move |name: &str| name == wanted;
+        let url = "https://example.com/a";
+        // A Mac opens it; Linux needs a desktop; SSH never does; a path or other scheme never does.
+        assert_eq!(browser_opener(url, none, true), Some("open"));
+        assert_eq!(browser_opener(url, none, false), None);
+        assert_eq!(browser_opener(url, only("DISPLAY"), false), Some("xdg-open"));
+        assert_eq!(browser_opener(url, only("WAYLAND_DISPLAY"), false), Some("xdg-open"));
+        assert_eq!(browser_opener(url, |name| name == "SSH_CONNECTION" || name == "DISPLAY", false), None);
+        assert_eq!(browser_opener(url, only("SSH_TTY"), true), None);
+        assert_eq!(browser_opener("/srv/repo/spec.md", none, true), None);
+        assert_eq!(browser_opener("file:///etc/passwd", none, true), None);
+        assert_eq!(browser_opener("javascript:alert(1)", none, true), None);
+        assert!(link_opened_note(url).contains("also copied"));
     }
 
     #[test]
