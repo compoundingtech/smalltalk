@@ -83,8 +83,11 @@ fn reject_binding(
             "stale-mailbox-session"
         );
         // Forced raw owner displacement is foreign to the durable native lease.
-        // It fences the old wrapper, but does not authenticate this replacement token.
-        assert!(st3::test_support::check_fixture_mailbox(store, &successor).is_err());
+        // Linux custody fences this unqualified token. Other platforms retain legacy admission.
+        assert_eq!(
+            st3::test_support::check_fixture_mailbox(store, &successor).is_err(),
+            cfg!(target_os = "linux")
+        );
         successor
     } else {
         if rejection == "runtime" {
@@ -391,7 +394,10 @@ read -r _
             "pending"
         );
         if rejection == Some("token") {
-            assert!(st3::test_support::check_fixture_mailbox(&store, owner).is_err());
+            assert_eq!(
+                st3::test_support::check_fixture_mailbox(&store, owner).is_err(),
+                cfg!(target_os = "linux")
+            );
         }
         assert!(!barrier.join("provider-return.json").exists());
         std::fs::write(barrier.join("exit-provider"), b"go").unwrap();
@@ -435,7 +441,10 @@ read -r _
     if let Some(owner) = rejection_fence {
         assert!(shell.try_wait().unwrap().is_none());
         if rejection == Some("token") {
-            assert!(st3::test_support::check_fixture_mailbox(&store, &owner).is_err());
+            assert_eq!(
+                st3::test_support::check_fixture_mailbox(&store, &owner).is_err(),
+                cfg!(target_os = "linux")
+            );
         } else {
             assert_eq!(
                 st3::test_support::check_fixture_mailbox(&store, &owner)
