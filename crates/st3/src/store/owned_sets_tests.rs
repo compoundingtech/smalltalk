@@ -2,6 +2,8 @@ use super::owned_sets::{Options, Source};
 use super::*;
 use crate::parse_intent;
 
+mod empty_authority_guard;
+
 fn bundle(command: &str, meadow: bool) -> NormalizedIntent {
     parse_intent(
         &format!(
