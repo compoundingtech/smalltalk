@@ -393,6 +393,33 @@ fn canonical_stop_arrangement_tracks_rekeys_removals_rollback_and_isolated_names
         "{plan:?}"
     );
     tx.commit().unwrap();
+    let invalid_claim = "x".repeat(4097);
+    writer
+        .execute(
+            "INSERT INTO local_attention_stop_heads VALUES(?1,?2,'agent/asker',X'FF','[]')",
+            params![first.as_str(), invalid_claim],
+        )
+        .unwrap();
+    assert!(
+        stops::maximum(&writer, &first, "agent/asker")
+            .unwrap_err()
+            .to_string()
+            .contains("STOP maximum fact bound")
+    );
+    writer
+        .execute(
+            "DELETE FROM local_attention_stop_heads WHERE namespace=?1 AND claim=?2",
+            params![first.as_str(), invalid_claim],
+        )
+        .unwrap();
+    assert_head(&writer, &first, &inputs);
+    let tx = writer.transaction().unwrap();
+    let oversized = stops::Head {
+        requester: "agent/asker".into(),
+        key: (0, "x".repeat(4097), 0, "b".into(), 0, "oversized".into()),
+    };
+    assert!(stops::replace(&tx, &first, "oversized", Some(&oversized)).is_err());
+    assert_head(&tx, &first, &inputs);
 }
 
 #[test]

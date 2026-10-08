@@ -25,6 +25,10 @@ impl Head {
             !self.requester.is_empty() && self.requester.len() <= MAX_ID && self.key.5 == claim,
             "STOP requester or canonical claim identity"
         );
+        anyhow::ensure!(
+            self.key.1.len() <= MAX_ID && self.key.3.len() <= MAX_ID && self.key.5.len() <= MAX_ID,
+            "STOP canonical component bound"
+        );
         let key = canonical::sortable_key(&self.key);
         let fact = serde_json::to_string(&self.key)?;
         anyhow::ensure!(
@@ -106,26 +110,27 @@ pub(crate) fn replace(
 }
 
 /// Indexed maximum, including future STOP declarations exactly as the native oracle does.
+/// Caller supplies one short snapshot so both bounded statements observe the same row.
 pub(crate) fn maximum(c: &Connection, ns: &Namespace, requester: &str) -> Result<Option<Head>> {
     anyhow::ensure!(
         !requester.is_empty() && requester.len() <= MAX_ID,
         "STOP requester bound"
     );
-    let row: Option<(String,usize,usize)> = c.query_row(
-        "SELECT claim,length(canonical_key),length(CAST(fact AS BLOB)) FROM local_attention_stop_heads WHERE namespace=?1 AND requester=?2 ORDER BY canonical_key DESC,claim DESC LIMIT 1",
+    let row: Option<(usize,usize,usize)> = c.query_row(
+        "SELECT length(CAST(claim AS BLOB)),length(canonical_key),length(CAST(fact AS BLOB)) FROM local_attention_stop_heads WHERE namespace=?1 AND requester=?2 ORDER BY canonical_key DESC,claim DESC LIMIT 1",
         params![ns.as_str(),requester], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
     ).optional()?;
-    let Some((claim, key_bytes, fact_bytes)) = row else {
+    let Some((claim_bytes, key_bytes, fact_bytes)) = row else {
         return Ok(None);
     };
     anyhow::ensure!(
-        claim.len() <= MAX_ID && key_bytes <= MAX_FACT && fact_bytes <= MAX_FACT,
+        claim_bytes <= MAX_ID && key_bytes <= MAX_FACT && fact_bytes <= MAX_FACT,
         "STOP maximum fact bound"
     );
-    let (key, fact): (Vec<u8>, String) = c.query_row(
-        "SELECT canonical_key,fact FROM local_attention_stop_heads WHERE namespace=?1 AND claim=?2",
-        params![ns.as_str(), claim],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+    let (claim, key, fact): (String, Vec<u8>, String) = c.query_row(
+        "SELECT claim,canonical_key,fact FROM local_attention_stop_heads WHERE namespace=?1 AND requester=?2 ORDER BY canonical_key DESC,claim DESC LIMIT 1",
+        params![ns.as_str(), requester],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     let head = Head {
         requester: requester.into(),
