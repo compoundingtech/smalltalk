@@ -447,6 +447,16 @@ impl CollectionStream {
     ) -> Result<(), ClientError> {
         self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":"conversation", "conversation":conversation})).await
     }
+    /// Follow an agent's or a session's conversation showing at most `limit` of its newest
+    /// entries in the first frame; the server caps the request to its page ceiling.
+    pub async fn subscribe_conversation_with_limit(
+        &mut self,
+        id: &str,
+        conversation: &str,
+        limit: usize,
+    ) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":"conversation", "conversation":conversation, "limit":limit})).await
+    }
     pub async fn unsubscribe(&mut self, id: &str) -> Result<(), ClientError> {
         self.send(&serde_json::json!({"kind":"unsubscribe", "id":id}))
             .await

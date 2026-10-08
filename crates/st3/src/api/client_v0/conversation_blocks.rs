@@ -467,6 +467,29 @@ pub(super) fn prepare(
     Ok(items)
 }
 
+/// Test-only count of native bodies `prepare_one` has prepared. A first frame must prepare
+/// only its own page (plus the has-more probe), never a whole window it will discard.
+#[cfg(test)]
+static PREPARED_BODIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(super) fn reset_prepared_bodies() {
+    PREPARED_BODIES.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(super) fn prepared_bodies() -> usize {
+    PREPARED_BODIES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Serializes tests that measure or run native preparation, so a parallel test cannot
+/// move the shared count between their reads.
+#[cfg(test)]
+pub(super) fn prepared_counter_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(super) fn prepare_one(
     source: &ExternalSession,
     session: &ClientSession,
@@ -474,6 +497,8 @@ pub(super) fn prepare_one(
     basis: &str,
     item: &mut Value,
 ) -> Result<(), ApiError> {
+    #[cfg(test)]
+    PREPARED_BODIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let original = item.clone();
     let body = item["body"]
         .as_object_mut()
