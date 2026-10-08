@@ -2,7 +2,7 @@ import type { ReactNode } from 'react'
 import type { StoryContext } from '@storybook/react-vite'
 import * as stylex from '@stylexjs/stylex'
 import { lightTheme } from './composition-theme'
-import { lightTheme as embraceLightTheme } from './embrace-theme'
+import { darkTheme as embraceDarkTheme } from './embrace-theme'
 import { surfaceVars, textVars, spaceVars, typeVars } from './composition-tokens.stylex'
 
 export const scenarioTime = (context: StoryContext): { now: number; anchor: number } => {
@@ -12,7 +12,7 @@ export const scenarioTime = (context: StoryContext): { now: number; anchor: numb
 }
 
 export function ScenarioPresentation({ scheme, title, children }: { readonly scheme: 'light' | 'dark'; readonly title: string; readonly children: ReactNode }) {
-  return <main data-theme={scheme} {...stylex.props(scheme === 'light' && lightTheme, scheme === 'light' && embraceLightTheme, styles.page)}>
+  return <main data-theme={scheme} {...stylex.props(scheme === 'light' && lightTheme, scheme === 'dark' && embraceDarkTheme, styles.page)}>
     <h1 {...stylex.props(styles.heading)}>{title}</h1>
     <section {...stylex.props(styles.content)}>{children}</section>
   </main>
