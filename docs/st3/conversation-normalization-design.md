@@ -456,3 +456,31 @@ Existing request profiles distinguish `timeline/native-read`,
 can identify the path beneath the shared session-detail route label. The native
 incremental fold and bounded prepared pages remain #1665's scope. Session detail
 and session-list collection construction remain separate from timeline reads.
+
+### Local collection OPEN and idle rechecks
+
+The terminal UI (`st3-feed`) and phone (`apps/ios/feed.ts`) subscribe to a conversation on
+one existing collections socket. The first `replace:true` frame contains the newest 200
+entries, subject to the existing 1 MiB frame limit, with `has_more` when older content exists.
+Older content remains available through the existing 200-entry timeline pages and owner
+content chunks. Subsequent `replace:false` frames carry new or revised entries by ID.
+
+For a local owner, the first page supplies its own native replay boundary. The graph and
+local-observation frontiers are captured before that page, so a durable message committed
+during the read is replayed afterward. OPEN no longer builds a second full native timeline
+solely to obtain an empty baseline cursor. Remote owners retain the existing two-read relay
+protocol for mixed-build compatibility.
+
+Idle timer and graph wakes test indexed owner/endpoint/local-position metadata, without
+copying and decoding unrelated claim bodies. The query seeks both wrapped and legacy
+message endpoint indexes and the local subject/position index at captured frontiers.
+The CI work budgets pin one initial timeline build, an appended native record’s entries as a delta for
+short and long fixtures, concurrent-message replay, and fewer than 250 SQLite VM steps
+for an absent owner/endpoint wake at 100 and 10,000 unrelated sends.
+
+This cut adds no wire field, schema, index, payload class or retention rule. It does not
+establish a production latency percentile: request-to-first-full-frame and reactive-update
+measurements must disclose client, source, payload, window and observed population.
+The native incremental fold and selective entry preparation are the separate #1665 slice;
+a cold local OPEN here still builds the bounded native source once, and a relevant update
+still pays for the existing page read until that slice lands.

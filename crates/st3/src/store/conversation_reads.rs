@@ -28,7 +28,45 @@ const TIMELINE_OWNER_IDS: &str = "WITH owner_window AS (
                  'harness.usage', 'message.sent')
   ORDER BY store_index DESC";
 
+// Only indexed identity/position and endpoint metadata: an idle wake must not copy or decode
+// unrelated transcript/status/message payloads. Both wrapped and legacy endpoint indexes exist.
+const CONVERSATION_CHANGED: &str = "SELECT
+    EXISTS(SELECT 1 FROM claims INDEXED BY claims_subject_index
+      WHERE subject=?1 AND store_index>?2 AND store_index<=?3)
+    OR EXISTS(SELECT 1 FROM claims INDEXED BY claims_message_to_order_index
+      WHERE kind='message.sent' AND json_extract(body,'$.fields.to')=?1
+        AND store_index>?2 AND store_index<=?3)
+    OR EXISTS(SELECT 1 FROM claims INDEXED BY claims_message_from_index
+      WHERE kind='message.sent' AND json_extract(body,'$.fields.from')=?1
+        AND store_index>?2 AND store_index<=?3)
+    OR EXISTS(SELECT 1 FROM claims INDEXED BY claims_message_legacy_to_index
+      WHERE kind='message.sent' AND json_type(body,'$.fields') IS NULL
+        AND json_extract(body,'$.to')=?1 AND store_index>?2 AND store_index<=?3)
+    OR EXISTS(SELECT 1 FROM claims INDEXED BY claims_message_legacy_from_index
+      WHERE kind='message.sent' AND json_type(body,'$.fields') IS NULL
+        AND json_extract(body,'$.from')=?1 AND store_index>?2 AND store_index<=?3)
+    OR EXISTS(SELECT 1 FROM local_observations INDEXED BY local_observations_subject_id_index
+      WHERE subject=?1 AND id>?4 AND id<=?5)";
+
 impl Store {
+    pub(crate) fn conversation_local_position(&self) -> Result<u64> {
+        Ok(self.readers.get().prepare_cached(
+            "SELECT COALESCE(MAX(id),0) FROM local_observations",
+        )?.query_row([], |row| row.get(0))?)
+    }
+
+    /// Whether a fixed graph/local frontier contains a relevant change. No payload leaves SQL,
+    /// and no retained snapshot spans native reads, display preparation, or a long-poll wait.
+    pub(crate) fn conversation_changed_at(
+        &self, owner: &str, after: u64, through: u64, local_after: u64, local_through: u64,
+    ) -> Result<bool> {
+        if after == through && local_after == local_through {
+            return Ok(false);
+        }
+        Ok(self.readers.get().prepare_cached(CONVERSATION_CHANGED)?
+            .query_row(params![owner, after, through, local_after, local_through], |row| row.get(0))?)
+    }
+
     /// A volatile, rebuildable identity map at a logical claim frontier. Only changed agents
     /// are folded on subsequent reads. No lock or SQLite transaction spans the whole build,
     /// native transcript I/O, display preparation, or a long-poll wait.
@@ -412,6 +450,75 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn conversation_change_budget_seeks_metadata_through_large_unrelated_history() {
+        let store = Store::open_memory("node").unwrap();
+        let owner = "agent/change-budget";
+        append(&store, owner, "runtime.observed", json!({"status":"running"}));
+        let after = store.index().unwrap();
+        let mut costs = Vec::new();
+        // Insert retained, unrelated sends in one isolated transaction. Their bodies must not
+        // be decoded by a wake, and absent endpoints must stay indexed as history grows.
+        store.connection.batched(|tx| -> Result<()> {
+            for index in 0..10_000 {
+                append_claim_tx(tx, "node", &format!("message/unrelated-{index}"), "message.sent", None,
+                    &json!({"fields":{"from":"person/other", "to":"agent/other", "content":"x".repeat(512), "status":"sent"}}),
+                    &[], None)?;
+                if index == 99 || index == 9999 {
+                    let mut query = tx.prepare_cached(CONVERSATION_CHANGED)?;
+                    query.reset_status(rusqlite::StatementStatus::VmStep);
+                    assert!(!query.query_row(params![owner, after, i64::MAX, 0, i64::MAX], |row| row.get::<_, bool>(0))?);
+                    costs.push(query.get_status(rusqlite::StatementStatus::VmStep));
+                }
+            }
+            let plan = tx.prepare(&format!("EXPLAIN QUERY PLAN {CONVERSATION_CHANGED}"))?
+                .query_map(params![owner, after, i64::MAX, 0, i64::MAX], |row| row.get::<_, String>(3))?
+                .collect::<rusqlite::Result<Vec<_>>>()?.join("\n");
+            for index in ["claims_subject_index", "claims_message_to_order_index", "claims_message_from_index",
+                "claims_message_legacy_to_index", "claims_message_legacy_from_index", "local_observations_subject_id_index"] {
+                assert!(plan.contains(index), "{plan}");
+            }
+            assert!(!plan.contains("SCAN claims"), "{plan}");
+            Ok(())
+        }).unwrap().unwrap();
+        assert!(costs[0] > 0 && costs[1] <= costs[0] * 2 && costs[1] < 250,
+            "wake work must not scale with unrelated payloads: {costs:?}");
+        let through = store.index().unwrap();
+        assert!(!store.conversation_changed_at(owner, after, through, 0, 0).unwrap());
+        // Boundaries exclude changes beyond the captured frontier, including legacy endpoints.
+        store.connection.batched(|tx| -> Result<()> {
+            append_claim_tx(tx, "node", "message/legacy", "message.sent", None,
+                &json!({"from":owner, "to":"person/other", "content":"original legacy body", "status":"sent"}), &[], None)?;
+            Ok(())
+        }).unwrap().unwrap();
+        assert!(!store.conversation_changed_at(owner, after, through, 0, 0).unwrap());
+        assert!(store.conversation_changed_at(owner, through, store.index().unwrap(), 0, 0).unwrap());
+        for side in ["from", "to"] {
+            let before = store.index().unwrap();
+            let mut fields = json!({"from":"person/other", "to":"agent/other", "content":"hello", "status":"sent"});
+            fields[side] = json!(owner);
+            append(&store, &format!("message/wrapped-{side}"), "message.sent", fields);
+            assert!(store.conversation_changed_at(owner, before, store.index().unwrap(), 0, 0).unwrap());
+        }
+        let before = store.index().unwrap();
+        append(&store, owner, "runtime.observed", json!({"status":"idle"}));
+        assert!(store.conversation_changed_at(owner, before, store.index().unwrap(), 0, 0).unwrap());
+        assert_eq!(store.conversation_local_position().unwrap(), 0);
+        let index = store.index().unwrap();
+        store.connection.batched(|tx| -> Result<()> {
+            tx.execute("INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+                VALUES(?1,'agent/other','harness.timeline',?2,1)",
+                params![index, json!({"fields":{"body":{"text":"x".repeat(2 * 1024 * 1024)}}}).to_string()])?;
+            tx.execute("INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+                VALUES(?1,?2,'harness.timeline','{}',2)", params![index, owner])?;
+            Ok(())
+        }).unwrap().unwrap();
+        assert_eq!(store.conversation_local_position().unwrap(), 2);
+        assert!(!store.conversation_changed_at(owner, index, index, 0, 1).unwrap());
+        assert!(store.conversation_changed_at(owner, index, index, 1, 2).unwrap());
+        assert!(!store.conversation_changed_at(owner, index, index, 2, 2).unwrap());
     }
 
     #[test]
