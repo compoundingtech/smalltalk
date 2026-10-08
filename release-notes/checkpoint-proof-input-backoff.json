@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Remember failed checkpoint proof inputs instead of copying and replaying them on every daemon pass",
+  "replay": {
+    "status": "changed",
+    "detail": "Agreement skips scratch copying and proof replay for an input already proved unsafe. The failure identity covers the sealed envelope set, canonical admitted claim order, admission state, earlier tombstones, drop and retained digests, cut, rules, protocol and a once-per-process streamed SHA-256 of the running executable. Package-version-only build labels therefore cannot strand a failure after a reader/projection fix. Explicit checkpoint plan dry runs still run their proof."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Failed input identities and the last failure time use the existing node-local checkpoints.detail JSON. No schema migration or fleet claim protocol change is required."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Retention rules and proof safety requirements are unchanged. A changed genuine input or rule set may retry after a ten-minute failure backoff; the identical failed input never retries merely because time passed."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Public checkpoint method signatures and agreement claims are unchanged. Existing stores without recorded proof failures attempt once and then retain the result across daemon restarts."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Startup and live deployment timings have not been qualified. Deploy through the normal fleet lifecycle; this change performs no live restart or store mutation on another node."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No cache reset or manual retry is required when true proof inputs, rules or build semantics change."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Proof failure diagnostics remain visible and name the full input identity. Changed rule/input failures receive distinct diagnostic idempotency keys even when the drop digest alone is unchanged. Failed identity history is preserved through replacement seals, including a return to an earlier unsafe input."
+  }
+}
