@@ -15853,7 +15853,7 @@ impl Store {
     pub(crate) fn bind_argv_mailbox_checked(
         &self,
         request: &crate::mailbox::Fence,
-        member: &MemberSpec,
+        member: &crate::model::MemberSpec,
         validate: &dyn Fn() -> Result<(), St3Error>,
     ) -> Result<crate::mailbox::Fence, St3Error> {
         self.bind_mailbox_with_admission_checked(request, None, Some(member), validate)
@@ -15863,7 +15863,7 @@ impl Store {
         &self,
         request: &crate::mailbox::Fence,
         authority: Option<&crate::mailbox::Authority>,
-        argv_member: Option<&MemberSpec>,
+        argv_member: Option<&crate::model::MemberSpec>,
         validate: &dyn Fn() -> Result<(), St3Error>,
     ) -> Result<crate::mailbox::Fence, St3Error> {
         let mut connection = self.connection.write();

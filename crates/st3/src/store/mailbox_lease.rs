@@ -1,7 +1,7 @@
 //! A channel binding is a connection capability, not authority to replace a live session.
 use super::*;
 use crate::mailbox::{Authority, Fence};
-use crate::model::MemberSpec;
+use crate::model::{LaunchSpec, MemberKind, MemberSpec};
 
 fn lease(
     connection: &Connection,
