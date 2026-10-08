@@ -924,7 +924,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
 }
 
 async fn collection_stream_socket_with_sources<F, Fut>(
-    mut socket: WebSocket,
+    socket: WebSocket,
     state: AppState,
     session: ClientSession,
     presence: Option<super::client_presence::StreamGuard>,
@@ -938,7 +938,7 @@ async fn collection_stream_socket_with_sources<F, Fut>(
     Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
 {
     collection_stream_socket_with_admission(
-        socket, state, session, presence, read, open_conversation_subscription,
+        socket, state, session, presence, sources, read, open_conversation_subscription,
     ).await;
 }
 
@@ -947,6 +947,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     state: AppState,
     session: ClientSession,
     presence: Option<super::client_presence::StreamGuard>,
+    sources: Option<Arc<collection_ivm::Sources>>,
     read: F,
     admit: A,
 ) where
@@ -10546,7 +10547,7 @@ mod tests {
                 async move {
                     upgrade.on_upgrade(move |socket| {
                         collection_stream_socket_with_admission(
-                            socket, state, ClientSession::local(None).unwrap(), None,
+                            socket, state, ClientSession::local(None).unwrap(), None, None,
                             |state, session, request, permit| async move {
                                 collection_items(&state, &session, &request, permit).await
                             },
@@ -10623,7 +10624,7 @@ mod tests {
                 async move {
                     upgrade.on_upgrade(move |socket| {
                         collection_stream_socket_with_admission(
-                            socket, state, ClientSession::local(None).unwrap(), None,
+                            socket, state, ClientSession::local(None).unwrap(), None, None,
                             |state, session, request, permit| async move {
                                 collection_items(&state, &session, &request, permit).await
                             },
@@ -10705,7 +10706,7 @@ mod tests {
                     async move {
                         upgrade.on_upgrade(move |socket| {
                             collection_stream_socket_with_admission(
-                                socket, state, ClientSession::local(None).unwrap(), None,
+                                socket, state, ClientSession::local(None).unwrap(), None, None,
                                 |state, session, request, permit| async move {
                                     collection_items(&state, &session, &request, permit).await
                                 },
