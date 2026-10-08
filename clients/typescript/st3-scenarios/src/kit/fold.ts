@@ -33,6 +33,7 @@ const COLLECTION_OF_KIND: Record<Resource['kind'], string> = {
   glass: 'glasses',
   arrangement: 'arrangements',
   'owned-set': 'ownedSets',
+  summary: 'summary',
 }
 
 const applyChanges = <S extends object>(state: S, upserts: readonly WireResource[], removes: readonly string[], order: readonly string[] | undefined): S => {
