@@ -1490,7 +1490,8 @@ fn synthetic_fields(spec: &st3_schema::ClaimSpec, index: usize) -> BTreeMap<Stri
     for (name, field) in &spec.fields {
         // Delegation is opt-in and needs a real policy and instruction. These background
         // claims model ordinary writes; fabricated proof would only make them refused.
-        if matches!(name.as_str(), "delegation" | "acted_for") {
+        // Native turn receipts likewise need a complete typed source, not a generic value.
+        if matches!(name.as_str(), "delegation" | "acted_for" | "turn_obligation") {
             continue;
         }
         if !field.required && !index.is_multiple_of(3) {

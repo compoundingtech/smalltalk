@@ -51,9 +51,25 @@ fn probe_until(
     let sh = super::resolve_executable("sh")?;
     let message = json!({"type":"message","content":model.nonce,"meta":{"id":"admission_fixture"}})
         .to_string();
+    // This isolated protocol peer acknowledges fixture boundaries, not production
+    // storage or native continuation. Driver durability has separate owned controls.
     let script = format!(
-        "#!{}\nprintf '%s\\n' '{{\"type\":\"hello\",\"protocol\":1}}'\nwhile IFS= read -r frame; do\n printf '%s\\n' \"$frame\" >> \"$ST_ADMISSION_CHANNEL_TRACE\"\n case \"$frame\" in\n *'\"type\":\"ready\"'*) printf '%s\\n' '{message}';;\n esac\ndone\n",
-        sh.display()
+        r#"#!{shell}
+printf '%s\n' '{{"type":"hello","protocol":1,"capabilities":["durable-turn-receipts-v1"]}}'
+receipt_sequence=0
+while IFS= read -r frame; do
+ printf '%s\n' "$frame" >> "$ST_ADMISSION_CHANNEL_TRACE"
+ case "$frame" in
+ *'"type":"ready"'*) printf '%s\n' '{message}';;
+ *'"requestId":"receipt-'*)
+  request_id=${{frame##*'"requestId":"'}}
+  request_id=${{request_id%%'"'*}}
+  receipt_sequence=$((receipt_sequence+1))
+  printf '{{"type":"turn_recorded","requestId":"%s","receipt":{{"provider_incarnation":"fixture-omp-channel","ownership_sequence":1,"source_sequence":%s}}}}\n' "$request_id" "$receipt_sequence";;
+ esac
+done
+"#,
+        shell = sh.display(),
     );
     fs::write(scratch.path("channel"), script)?;
     fs::set_permissions(scratch.path("channel"), fs::Permissions::from_mode(0o700))?;

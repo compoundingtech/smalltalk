@@ -750,6 +750,23 @@ message "audit-declared" {
             .append_claim_outcome(&harness_state("agent/alder.worker", state, observed_at))
             .unwrap();
     }
+    // The shared selected-head table must participate in shuffled replay,
+    // column/digest mutation, rollback, reopen and checkpoint controls.
+    source.append_claim(&ClaimInput {
+        subject: "agent/audit/turn".into(), kind: "harness.observed".into(),
+        actor: Some("agent/audit/turn".into()),
+        fields: serde_json::from_value(json!({"state":"idle", "turn_obligation":{
+            "sequence":1, "unknown":false, "unknown_tool_outcome":false,
+            "terminal":[], "tool_results":[], "open":[{
+                "source_sequence":1, "provider_incarnation":"audit-provider",
+                "ownership_sequence":1, "runtime_incarnation":"audit-runtime",
+                "desired_revision":null, "native_session_id":"audit-session",
+                "native_turn_id":null, "started_at_ms":1, "pending_human":false,
+                "tool_outcome_unknown":false, "pending_tool_ids":[]
+            }]
+        }})).unwrap(),
+        evidence:vec![], expected_subject:None, idempotency_key:None,
+    }).unwrap();
     source.replay_replication_graph().unwrap();
     source
         .ask_person(&crate::model::PersonAskRequest {

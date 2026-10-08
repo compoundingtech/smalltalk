@@ -565,6 +565,33 @@ mod tests {
     }
 
     #[test]
+    fn first_durable_start_snapshot_is_active_and_replayed_start_preserves_human_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        harness_events::enable(temp.path(), "runtime-start").unwrap();
+        let mut producer = writer(temp.path(), "provider-start", "runtime-start");
+        producer.observe(hs::Observation::new(hs::Activity::Idle, hs::BlockedOn::None,
+            hs::InputBuffer::Empty)).unwrap();
+        producer.turn_started(Some("native-session"), Some("native-turn")).unwrap();
+        let snapshots = harness_events::pending(temp.path(), 128).unwrap();
+        let start = snapshots.iter().find(|event| event.kind == "harness-state"
+            && event.payload["turnObligation"]["open"].as_array().is_some_and(|open| !open.is_empty())).unwrap();
+        assert_eq!(start.payload["state"], "active",
+            "a published native start must not borrow the preceding idle state");
+        producer.observe(hs::Observation::new(hs::Activity::Active, hs::BlockedOn::Human,
+            hs::InputBuffer::Empty).with_ask(hs::Ask::Question)).unwrap();
+        producer.turn_started(Some("native-session"), Some("native-turn")).unwrap();
+        assert_eq!(observed(temp.path()).blocked_on, hs::BlockedOn::Human);
+        producer.turn_terminal(Some("native-session"), Some("native-turn"), "completed").unwrap();
+        producer.observe(hs::Observation::new(hs::Activity::Idle, hs::BlockedOn::None,
+            hs::InputBuffer::Empty)).unwrap();
+        producer.turn_started(Some("native-session"), Some("native-turn")).unwrap();
+        assert_eq!(observed(temp.path()).state, hs::Activity::Idle);
+        assert!(observed(temp.path()).turn_obligation.open.is_empty());
+        let _successor = writer(temp.path(), "provider-successor", "runtime-successor");
+        assert!(!observed(temp.path()).turn_obligation.unknown);
+    }
+
+    #[test]
     fn durable_outbox_keeps_clean_terminal_before_any_idle_publication() {
         let temp = tempfile::tempdir().unwrap();
         harness_events::enable(temp.path(), "runtime-old").unwrap();
@@ -578,6 +605,7 @@ mod tests {
         let _successor = writer(temp.path(), "new", "runtime-new");
         let debt = observed(temp.path()).turn_obligation;
         assert!(debt.open.is_empty());
+        assert!(!debt.unknown, "exact completion survives loss before the idle frame");
         assert_eq!(
             debt.terminal[0].obligation.native_turn_id.as_deref(),
             Some("native-turn")

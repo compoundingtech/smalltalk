@@ -659,13 +659,36 @@ impl Writer {
             self.retained_turn_start = None;
             return self.write_owned_record(&mut record);
         }
+        let previous_sequence = record.turn_obligation.sequence;
         let retained_start = record.turn_obligation.start(self.turn_source(
             record.seq,
             crate::message::now_ms(),
             session,
             turn,
         ));
+        let new_start = retained_start.is_some()
+            && record.turn_obligation.sequence != previous_sequence;
+        if new_start {
+            // The positive boundary and its activity commit together. Publishing an
+            // open receipt with the preceding idle state would invent an interruption.
+            // Replayed starts must preserve an existing human wait or terminal state.
+            let stamp = next_stamp(Some(&record), crate::message::now_ms());
+            if record.state != Activity::Active || record.blocked_on != BlockedOn::None
+                || record.ask != Ask::None || record.input_buffer != InputBuffer::Empty
+                || record.reason.is_some() || record.exit.is_some() {
+                record.since_ms = stamp;
+                record.transitions = record.transitions.saturating_add(1);
+            }
+            record.state = Activity::Active;
+            record.blocked_on = BlockedOn::None;
+            record.ask = Ask::None;
+            record.input_buffer = InputBuffer::Empty;
+            record.reason = None;
+            record.exit = None;
+            record.written_at_ms = stamp;
+        }
         self.write_owned_record(&mut record)?;
+        if new_start { self.interrupted = false; }
         self.retained_turn_start = retained_start;
         Ok(())
     }
@@ -752,7 +775,9 @@ impl Writer {
                 retained_start: self.retained_turn_start,
             },
             outcome,
-            crate::message::now_ms(),
+            // Receipt provenance follows its own start/heartbeat even for writes
+            // within one clock millisecond. Exact native identity selects settlement.
+            crate::message::now_ms().max(record.written_at_ms),
         ) {
             self.write_owned_record(&mut record)?;
             self.retained_turn_start = None;

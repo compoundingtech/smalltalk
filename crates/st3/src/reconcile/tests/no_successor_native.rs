@@ -187,6 +187,12 @@ fn isolated_native_missing_successor_fault_then_relaunch_admission_and_intention
     runtime
         .kill(&member.runtime_id, true, Some(first_incarnation))
         .unwrap();
+    // Signal acknowledgement does not prove that the private PTY has observed exit.
+    let exit_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while runtime.observed(&member.runtime_id).status == "running" {
+        assert!(std::time::Instant::now() < exit_deadline, "fixture PTY did not observe exit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     runtime.remove(&member.runtime_id, true).unwrap();
     reconciler
         .perform_start(&desired, member, "isolated explicit relaunch fixture")

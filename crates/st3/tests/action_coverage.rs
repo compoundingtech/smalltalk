@@ -19,6 +19,49 @@ const PERSON: &str = "person/avery";
 const WORKER: &str = "agent/example/worker";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_turn_evidence_and_acknowledgement_survive_restart() {
+    if st3::test_support::supervise_test() { return; }
+    use st_drivers::turn_obligation::{Ledger, Obligation};
+    let mut daemon = Daemon::new().await;
+    let subject = "agent/example/interrupted";
+    daemon.apply("version 2\nagent \"example/interrupted\" { workspace \"/tmp\"; command \"true\" }", "interrupted-cli-declaration");
+    daemon.claim(subject, "harness.observed", json!({"state":"idle", "turn_obligation":Ledger {
+        sequence: 1, open: vec![Obligation {
+            source_sequence: 1, provider_incarnation: "fixture-provider".into(), ownership_sequence: 1,
+            runtime_incarnation: Some("fixture-runtime".into()), desired_revision: None,
+            native_session_id: Some("fixture-session".into()), native_turn_id: None,
+            started_at_ms: 1, pending_human: false, tool_outcome_unknown: false, pending_tool_ids: vec![],
+        }], ..Ledger::default()
+    }}));
+    let before = cli_value(daemon.cli(PERSON, &["agents", "turn-obligation", subject]).await);
+    assert_eq!(before["evidence"]["owner_action_required"], true);
+    let receipt = before["evidence"]["selected_receipts"][0]["receipt"].as_str().unwrap();
+    let source = before["evidence"]["selected_receipts"][0]["source_claim"].clone();
+    daemon.restart().await;
+    let unchanged = cli_value(daemon.cli(PERSON, &["agents", "turn-obligation", subject]).await);
+    assert_eq!(unchanged["evidence"], before["evidence"]);
+    let index = daemon.store().index().unwrap();
+    let refused = daemon.cli(PERSON, &["agents", "acknowledge-turn", subject, "--as", PERSON,
+        "--receipt", "absent-fixture-receipt", "--reason", "Does not cite observed evidence"]).await;
+    assert!(!refused.status.success());
+    assert_eq!(daemon.store().index().unwrap(), index);
+    let acknowledgement = cli_value(daemon.cli(PERSON, &["agents", "acknowledge-turn", subject,
+        "--as", PERSON, "--receipt", receipt, "--reason", "Owner acknowledges unknown execution"]).await);
+    assert_eq!(acknowledgement["kind"], "harness.turn-acknowledged");
+    assert_eq!(acknowledgement["actor"], PERSON);
+    assert_eq!(acknowledgement["body"]["fields"]["receipts"][0]["source_claim"], source);
+    daemon.restart().await;
+    let after = cli_value(daemon.cli(PERSON, &["agents", "turn-obligation", subject]).await);
+    assert_eq!(after["evidence"]["owner_action_required"], false);
+    assert_eq!(after["evidence"]["unknown"], true);
+    assert_eq!(after["evidence"]["source_complete"], true);
+    assert_eq!(after["evidence"]["selected_receipts"][0]["receipt"], receipt);
+    assert_eq!(after["evidence"]["selected_receipts"][0]["acknowledgement"]["execution_outcome"], "unknown");
+    assert_eq!(after["evidence"]["selected_receipts"][0]["acknowledgement"]["actor"], PERSON);
+    assert_eq!(daemon.store().claims_for(subject, Some("harness.turn-acknowledged")).unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_owned_seat_rollout_captures_fences_and_survives_restart() {
     if st3::test_support::supervise_test() {
         return;

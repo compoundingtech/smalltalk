@@ -23250,6 +23250,9 @@ mission "agent-health" state="ready" {
             .unwrap();
         materialize_run_agents(&state, &run);
         let subject = format!("agent/{}/worker", run.id);
+        // This control isolates harness readiness from the independent delivery-poll
+        // fence; it must not depend on the process-wide daemon startup grace.
+        delivery_presence::record_legacy(&subject, "app-server", std::process::id());
         let queued = run.steps[0].subject.clone();
         store.set_step_state(&queued, "ready", None).unwrap();
         store

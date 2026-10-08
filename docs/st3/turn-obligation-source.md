@@ -131,10 +131,9 @@ test and exact source revision evidence before qualification or landing.
 
 ## Reversible acknowledgement/pure-seam checkpoint
 
-This checkpoint is an importable draft, not final native, source, card, merge, or
-activation qualification. The source owners retain unavailable production behavior.
-The late native tool-result publication and full owner-action lifecycle controls
-remain in progress; a later immutable pin is required before qualification.
+This importable helper contract is qualified by the owned native and source controls
+below. It is not Source21, card activation, or merge qualification. The source owners
+retain unavailable production behavior until their exact composition is qualified.
 
 The owned pure chain is `aggregate_receipts(Vec<CapturedReceipt>, action_overflow)`
 returning `Result<Option<(String, Value)>>`, followed by
@@ -213,13 +212,36 @@ The current owned reducer v3 contract fingerprint is
 `736b14059087d33443aad7d3c7fddb9d3a95499cbae414d0f589d962977c19d8`;
 the exact five-table schema fingerprint remains
 `9d651fe429bd759d16f120d124c37d7a74f64d74dc5c3c4740b02c9f50a763b3`.
-Owned source controls: 18 passed, including same-helper native authority, actionable
+Owned source controls: 19 passed, including same-helper native authority, actionable
 versus acknowledged unknown, normal in-flight work with retained audit, malformed
 capture, signed reordered terminal evidence, physical OLD/NEW and source bounds.
-Native receipt controls: 11 passed, including positive late invocation results and
+Native receipt controls: 12 passed, including positive late invocation results and
 isolated process loss. Both OMP assets pass strict type checking and their smoke
 controls cover capability absence, acknowledgement timeout and original-receipt
 correlation. All st3 targets compile. These are owned producer/helper controls;
 Source21 binding, public existing-field/native parity and activation remain separate
-owners' qualification. The overall PR remains draft pending curator corrections and
-ordinary required checks.
+owners' qualification. Core has separately qualified existing-field parity against
+immutable native checkpoint 2a0e7f; that proof does not certify Source21 or a later
+integration base. The overall PR remains draft pending curator review, ordinary
+required checks and the actual Source21 composition.
+
+Fresh positive start receipts commit the active categorical state in the same durable
+snapshot. They cannot publish the preceding idle state as interrupted work. Replayed
+starts preserve a current human wait, and a start whose exact terminal is already
+retained cannot reopen execution. Exact terminal receipt provenance remains after
+its own start even for same-millisecond writes; settlement still requires native
+identity. The native outbox prefix and loss-before-idle controls cover these cases.
+
+The legacy receipt drain fixes its queue as the outer loop, with indexed claim PK
+lookups. The unchanged cost budgets pass all 149 measured routes on 2,508 versus
+24,787 claims: the obligation read uses 157 VM steps at both sizes and acknowledgement
+uses 2,352 at both sizes, each with zero full scans. Generic claim, document and schema
+writes remain constant too. These controls were run on the owned native integration
+based on 0fd121; they do not certify a later base or Source21 activation.
+
+The continuation contract is agreed: a supported continuation may finish the same
+logical turn with a transcript marker, without injecting a prompt or replaying unknown
+tool outcomes. The [upstream response](https://github.com/can1357/oh-my-pi/issues/14898#issuecomment-6050451706)
+reports no supported no-input continuation API, durable logical-turn identity or
+server-side idempotency today. Inspection through session selection and entries does
+not establish that dispatch capability. No continuation is implemented here.

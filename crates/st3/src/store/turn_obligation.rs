@@ -629,7 +629,9 @@ pub(super) fn flush(tx: &Transaction<'_>) -> Result<()> {
     }
     loop {
         let ids = tx
-            .prepare("SELECT claim_id FROM local_turn_obligation_pending JOIN claims ON claims.id=claim_id ORDER BY claims.store_index LIMIT 128")?
+            // Keep the receipt queue outermost. Otherwise SQLite walks the entire
+            // claim log in arrival order even when there is no pending receipt.
+            .prepare("SELECT claim_id FROM local_turn_obligation_pending CROSS JOIN claims ON claims.id=claim_id ORDER BY claims.store_index LIMIT 128")?
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if ids.is_empty() {
