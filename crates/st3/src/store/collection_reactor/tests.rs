@@ -912,13 +912,13 @@ impl Source for CacheOnly {
     }
     fn coverage(&self, store: &Store, c: &Connection, cx: &Context, _: u64) -> Result<bool> {
         assert!(Arc::ptr_eq(&store.ivm_views().unwrap(), &cx.views));
-        let (fingerprint, epoch, available): (String, u64, bool) = c.query_row(
-            "SELECT fingerprint,epoch,available FROM ivm_install_sources WHERE name=?1",
+        let (fingerprint, epoch, available): (Option<Vec<u8>>, u64, bool) = c.query_row(
+            "SELECT CASE WHEN typeof(fingerprint)='text' AND octet_length(fingerprint)<=4096 THEN CAST(fingerprint AS BLOB) END,epoch,available FROM ivm_install_sources WHERE name=?1",
             [self.name()],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         Ok(available
-            && fingerprint == "fixture.cache-only.v1"
+            && fingerprint.as_deref() == Some(b"fixture.cache-only.v1".as_slice())
             && epoch == 1
             && *self.ready.lock().unwrap() == Some(smallclaims::store::current_index(c)?))
     }
@@ -988,10 +988,12 @@ impl AfterCommit for CacheMarker {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_source_identity_mismatch_keeps_store_open_without_rebinding() {
-    for (fingerprint, epoch) in [
-        ("fixture.cache-only.retired", 1_u64),
-        ("fixture.cache-only.v1", 2_u64),
-    ] {
+    let retained_identities: [(&[u8], u64); 3] = [
+        (b"fixture.cache-only.retired", 1),
+        (b"fixture.cache-only.v1", 2),
+        (&[0x80], 1),
+    ];
+    for (fingerprint, epoch) in retained_identities {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("retired-cache.db");
         let cache = Arc::new(CacheOnly {
@@ -1009,12 +1011,13 @@ async fn retained_source_identity_mismatch_keeps_store_open_without_rebinding() 
             vec![cache.clone(), sibling.clone()],
         )
         .unwrap();
-        // Persist the obsolete lifetime before reopening with the fixed configuration.
+        // Preserve malformed UTF-8 as SQLite TEXT too: it passes the metadata length/type
+        // checks and must refuse only this source, including at initial attachment.
         store
             .connection
             .batched(|tx| {
                 tx.execute(
-                    "UPDATE ivm_install_sources SET fingerprint=?2,epoch=?3 WHERE name=?1",
+                    "UPDATE ivm_install_sources SET fingerprint=CAST(?2 AS TEXT),epoch=?3 WHERE name=?1",
                     params![cache.name(), fingerprint, epoch],
                 )
             })
@@ -1109,16 +1112,16 @@ async fn retained_source_identity_mismatch_keeps_store_open_without_rebinding() 
                 .unwrap(),
             9
         );
-        let persisted: (String, u64) = reopened
+        let persisted: (Vec<u8>, u64) = reopened
             .readers
             .get()
             .query_row(
-                "SELECT fingerprint,epoch FROM ivm_install_sources WHERE name=?1",
+                "SELECT CAST(fingerprint AS BLOB),epoch FROM ivm_install_sources WHERE name=?1",
                 [cache.name()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(persisted, (fingerprint.into(), epoch));
+        assert_eq!(persisted, (fingerprint.to_vec(), epoch));
         assert_eq!(*cache.ready.lock().unwrap(), Some(index));
         assert_eq!(cache.publications.load(Ordering::SeqCst), 0);
     }
