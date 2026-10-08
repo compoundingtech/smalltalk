@@ -59,9 +59,15 @@ export type RunStatus = typeof RunStatus.Type
 export const NoticeKind = Schema.Literals(['error', 'redaction', 'truncation', 'event', 'unknown'])
 export type NoticeKind = typeof NoticeKind.Type
 
-/** Local send lifecycle, not a streaming revision or a server delivery acknowledgement. */
+/**
+ * Local send lifecycle, not a streaming revision or a server delivery acknowledgement.
+ * `Sent`: the gateway action completed authoritatively while the message's own mailbox
+ * echo is outside the loaded conversation window; it is kept (never duplicated) until
+ * the window shows it.
+ */
 export const SendState = Schema.TaggedUnion({
   Pending: {},
+  Sent: {},
   Failed: {
     reason: Schema.Literals(['rejected', 'ungranted', 'invalid', 'failed']),
     detail: Schema.String,

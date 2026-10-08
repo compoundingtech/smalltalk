@@ -574,16 +574,16 @@ export const liveSource = ({
           publishPending()
         }
         const result = await attachments.send({ ...request, idempotency_key: idempotencyKey })
-        if (result._tag === 'Success' && result.value.status !== 'rejected') {
+        if (result._tag === 'Success' && result.value.status === 'rejected') {
+          local.item = { ...local.item, sendState: { _tag: 'Failed', reason: 'rejected', detail: 'The message action was rejected.' } }
+        } else if (result._tag === 'Refused') {
+          local.item = { ...local.item, sendState: { _tag: 'Failed', reason: result.reason, detail: result.detail } }
+        } else if (result._tag === 'Success' && result.value.status === 'completed') {
           const affected = result.value.affected_ids.filter((affected) => affected.startsWith('message/'))
           if (affected.length > 0) local.messageIds = affected
-        } else {
-          local.item = {
-            ...local.item,
-            sendState: result._tag === 'Refused'
-              ? { _tag: 'Failed', reason: result.reason, detail: result.detail }
-              : { _tag: 'Failed', reason: 'rejected', detail: 'The message action was rejected.' },
-          }
+          // Terminal gateway success settles the outbox row even when the mailbox echo
+          // falls outside the newest window; an in-window echo still removes it.
+          local.item = { ...local.item, sendState: { _tag: 'Sent' } }
         }
         publishPending()
         return result
