@@ -82,7 +82,9 @@ fn reject_binding(
                 .code,
             "stale-mailbox-session"
         );
-        assert!(st3::test_support::check_fixture_mailbox(store, &successor).is_ok());
+        // Forced raw owner displacement is foreign to the durable native lease.
+        // It fences the old wrapper, but does not authenticate this replacement token.
+        assert!(st3::test_support::check_fixture_mailbox(store, &successor).is_err());
         successor
     } else {
         if rejection == "runtime" {
@@ -389,7 +391,7 @@ read -r _
             "pending"
         );
         if rejection == Some("token") {
-            assert!(st3::test_support::check_fixture_mailbox(&store, owner).is_ok());
+            assert!(st3::test_support::check_fixture_mailbox(&store, owner).is_err());
         }
         assert!(!barrier.join("provider-return.json").exists());
         std::fs::write(barrier.join("exit-provider"), b"go").unwrap();
@@ -433,7 +435,7 @@ read -r _
     if let Some(owner) = rejection_fence {
         assert!(shell.try_wait().unwrap().is_none());
         if rejection == Some("token") {
-            assert!(st3::test_support::check_fixture_mailbox(&store, &owner).is_ok());
+            assert!(st3::test_support::check_fixture_mailbox(&store, &owner).is_err());
         } else {
             assert_eq!(
                 st3::test_support::check_fixture_mailbox(&store, &owner)
