@@ -121,7 +121,7 @@ jobs:
         run: "scripts/release-smalltalk '${{ matrix.target }}' dist"
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
-        if: "!cancelled()"
+        if: "!cancelled() && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')"
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
