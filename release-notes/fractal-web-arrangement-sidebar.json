@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "fractal-web sidebar folders follow the owner's native arrangements: the lowest-UUIDv7 arrangement wins, and every owner-wide arrangements frame re-reads the complete list",
+  "summary": "fractal-web sidebar folders follow the owner's native arrangements: the live arrangement named exactly \"Sidebar\" with the lowest UUIDv7 wins, and every owner-wide arrangements frame re-reads the complete list",
   "replay": {"status": "none", "detail": "Read-only client projection; no runtime replay change."},
   "schema": {"status": "none", "detail": "No database schema change."},
   "rules": {"status": "none", "detail": "No checkpoint rules change."},
