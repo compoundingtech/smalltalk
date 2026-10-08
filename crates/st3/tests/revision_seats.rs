@@ -4,11 +4,11 @@
 fn isolated_revision_preserves_completed_builder_declarations_and_cleanup() {
     let output = tempfile::tempdir().unwrap();
     let evidence = output.path().join("evidence");
-    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = std::path::Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let result = st3::test_support::command("env")
         .args(["-u", "ST_AGENT", "-u", "ST3_SUBJECT", "python3"])
         .arg(repo.join("scripts/st3-revision-seat-eval/run"))
-        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
+        .arg(test_env!("CARGO_BIN_EXE_st3-fixture"))
         .arg(&evidence)
         .output()
         .unwrap();
