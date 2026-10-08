@@ -315,16 +315,15 @@ export interface TimelineProjection {
 export class LiveTimeline {
   private readonly entries = new Map<string, Entry>()
   private ordered: Array<Entry> = []
-  /** First position of each call identity: used only to invalidate its projected items. */
-  private readonly calls = new Map<string, number>()
-  /**
-   * Newest result per call identity (CAG.CLI.WEB.CNV-R04), even before its call is loaded.
-   * `firstAt` is the earliest orphan row to invalidate when that call arrives.
-   */
+  /** Call positions per reused identity, sorted by authoritative sequence, not delivery order. */
+  private readonly calls = new Map<string, Array<number>>()
+  /** All results per identity, including orphans awaiting an invocation with lower sequence. */
   private readonly results = new Map<
     string,
-    { readonly entry: ToolResultEntry; readonly firstAt: number }
+    Map<string, { readonly entry: ToolResultEntry; readonly at: number }>
   >()
+  /** Newest result within each invocation's sequence segment (CAG.CLI.WEB.CNV-R04). */
+  private readonly joined = new Map<number, ToolResultEntry>()
   /** Item count before each position in `ordered`, valid below `dirtyFrom`. */
   private itemsBefore: Array<number> = []
   private items: Array<ConversationItem> = []
@@ -381,13 +380,12 @@ export class LiveTimeline {
         }
       }
       this.dirtyFrom = Math.min(this.dirtyFrom, at)
-      // Re-pointed identities or result sequence changes invalidate identity/result selection.
+      // Re-pointed identities or sequence changes invalidate invocation/result segmentation.
       if (
         previous !== undefined &&
         (entry.type === 'tool_call' || entry.type === 'tool_result') &&
         previous.type === entry.type &&
-        (previous.body.call_id !== entry.body.call_id ||
-          (entry.type === 'tool_result' && previous.sequence !== entry.sequence))
+        (previous.body.call_id !== entry.body.call_id || previous.sequence !== entry.sequence)
       ) {
         this.reindex = true
       }
@@ -398,26 +396,67 @@ export class LiveTimeline {
     return changed
   }
 
-  /** Index a call by identity and remove any already-projected orphan results for it. */
+  /** Index an invocation and redistribute retained results if it splits a reused identity. */
   private indexCall(entry: Extract<Entry, { type: 'tool_call' }>, at: number): void {
-    if (!this.calls.has(entry.body.call_id)) this.calls.set(entry.body.call_id, at)
-    const result = this.results.get(entry.body.call_id)
-    if (result !== undefined) this.dirtyFrom = Math.min(this.dirtyFrom, result.firstAt)
+    const id = entry.body.call_id
+    let positions = this.calls.get(id)
+    if (positions === undefined) {
+      positions = []
+      this.calls.set(id, positions)
+    }
+    positions.splice(this.callSlot(positions, entry.sequence), 0, at)
+    const results = this.results.get(id)
+    if (results === undefined) return
+    for (const call of positions) {
+      this.joined.delete(call)
+      this.dirtyFrom = Math.min(this.dirtyFrom, call)
+    }
+    for (const result of results.values()) {
+      // An orphan previously rendered anywhere in the window may now belong to an invocation.
+      this.dirtyFrom = Math.min(this.dirtyFrom, result.at)
+      this.join(result.entry)
+    }
   }
 
-  /** Retain results independently of call arrival order; sequence selects the newest result. */
+  /** Retain every result so a later invocation can split a previously loaded sequence segment. */
   private indexResult(entry: ToolResultEntry, at: number): void {
     const id = entry.body.call_id
-    const current = this.results.get(id)
-    this.results.set(id, {
-      entry:
-        current === undefined || current.entry.id === entry.id || current.entry.sequence <= entry.sequence
-          ? entry
-          : current.entry,
-      firstAt: Math.min(at, current?.firstAt ?? at),
-    })
-    const call = this.calls.get(id)
-    if (call !== undefined) this.dirtyFrom = Math.min(this.dirtyFrom, call)
+    let results = this.results.get(id)
+    if (results === undefined) {
+      results = new Map()
+      this.results.set(id, results)
+    }
+    results.set(entry.id, { entry, at })
+    this.join(entry)
+  }
+
+  /** First invocation with sequence at least `sequence`; positions themselves are never compared. */
+  private callSlot(positions: ReadonlyArray<number>, sequence: number): number {
+    let low = 0
+    let high = positions.length
+    while (low < high) {
+      const mid = (low + high) >>> 1
+      if (this.ordered[positions[mid]!]!.sequence < sequence) low = mid + 1
+      else high = mid
+    }
+    return low
+  }
+
+  /** A result belongs to the latest same-identity invocation with strictly lower sequence. */
+  private callFor(entry: ToolResultEntry): number | undefined {
+    const positions = this.calls.get(entry.body.call_id)
+    if (positions === undefined) return undefined
+    return positions[this.callSlot(positions, entry.sequence) - 1]
+  }
+
+  private join(entry: ToolResultEntry): void {
+    const call = this.callFor(entry)
+    if (call === undefined) return
+    const current = this.joined.get(call)
+    if (current === undefined || current.id === entry.id || current.sequence <= entry.sequence) {
+      this.joined.set(call, entry)
+      this.dirtyFrom = Math.min(this.dirtyFrom, call)
+    }
   }
 
   /** Message identities the window currently shows, without consuming projection state. */
@@ -475,13 +514,13 @@ export class LiveTimeline {
         }
       }
       if (entry.type === 'tool_result') {
-        // A result is orphaned only when its call identity is absent, not when it arrived first.
-        if (!this.calls.has(entry.body.call_id))
+        // Only a result lacking a lower-sequence invocation is orphaned, regardless of arrival order.
+        if (this.callFor(entry) === undefined)
           items.push(this.cached({ entry, result: undefined, active: true }))
         continue
       }
       if (entry.type === 'tool_call')
-        items.push(this.cached({ entry, result: this.results.get(entry.body.call_id)?.entry, active: this.active }))
+        items.push(this.cached({ entry, result: this.joined.get(at), active: this.active }))
       else items.push(this.cached({ entry, result: undefined, active: true }))
     }
     this.items = items
@@ -497,6 +536,7 @@ export class LiveTimeline {
     this.items = []
     this.calls.clear()
     this.results.clear()
+    this.joined.clear()
     this.ordered.forEach((entry, at) => {
       if (entry.type === 'tool_call') this.indexCall(entry, at)
       else if (entry.type === 'tool_result') this.indexResult(entry, at)
