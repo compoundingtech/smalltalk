@@ -69,6 +69,18 @@ the development-channel flag and st handles its admission dialog. Provider or
 organization restrictions can still block the channel. Smalltalk never asks for or
 types a password; optional machine policy, GitHub login and `gh` do not block setup.
 
+Before expecting a Claude expert to be ready, run `claude` in a normal terminal as
+the same user and with the same profile (`CLAUDE_CONFIG_DIR`, if set) used by the
+daemon. Complete Claude's native welcome, text style/theme selection and account
+login or explicit API-key confirmation. Successful `claude auth status` or a print
+request alone does not establish that this interactive setup is complete. See
+[Claude's authentication instructions](https://code.claude.com/docs/en/authentication#authentication-precedence).
+
+If `agent/st/expert` is already waiting at those screens, complete native Claude
+setup first, then run `st agents restart agent/st/expert --as person/ada` to retry
+the existing seat (replace `ada` with your configured person). Keep its
+original onboarding run; do not use `st setup --onboarding` while that run is active.
+
 Your agents run without permission prompts inside their own workspaces. Choose the
 projects and tasks you give them accordingly.
 
