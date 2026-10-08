@@ -5,7 +5,7 @@
 //! The stamp is a `CLI_BUILD_STAMP` JSON blob, the same env var + shape the rest
 //! of the fleet uses (TS `@overeng/utils/node/cli-version`; the otel-scrape Rust
 //! reader). It reaches this crate at compile time via `option_env!`:
-//!   - `CLI_BUILD_STAMP` — a **NixStamp** the flake bakes from `self` (the flake
+//!   - `CLI_BUILD_STAMP` — a release stamp from the archive builder, or a **NixStamp** the flake bakes from `self` (the flake
 //!     rev, so a hermetic build still knows its identity). Authoritative.
 //!   - `ST_BUILD_STAMP_LOCAL` — a **LocalStamp** `build.rs` derives from `git`
 //!     for a plain `cargo build`. A private, second env var so it can never
@@ -15,7 +15,7 @@
 //! self-contained public flake), so this reimplements the contract. The
 //! `machineVersion` grammar is kept byte-identical to that reader.
 
-/// NixStamp baked by the flake (`{type:"nix",...}`); authoritative when present.
+/// NixStamp or clean release stamp baked by the package builder (`{type:"release"|"nix",...}`); authoritative when present.
 const NIX_STAMP: Option<&str> = option_env!("CLI_BUILD_STAMP");
 /// LocalStamp baked by `build.rs` from git (`{type:"local",...}`).
 const LOCAL_STAMP: Option<&str> = option_env!("ST_BUILD_STAMP_LOCAL");
@@ -25,6 +25,11 @@ const BASE: &str = env!("CARGO_PKG_VERSION");
 /// A parsed build stamp in the shared contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BuildStamp {
+    Release {
+        version: String,
+        rev: String,
+        commit_ts: i64,
+    },
     Nix {
         version: String,
         rev: String,
@@ -50,6 +55,7 @@ pub(crate) struct BuildIdentity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceKind {
+    Release,
     Nix,
     Local,
     Unknown,
@@ -70,6 +76,11 @@ fn parse_stamp(raw: &str) -> Option<BuildStamp> {
         .unwrap_or(false);
     let commit_ts = value.get("commitTs").and_then(|v| v.as_i64()).unwrap_or(0);
     match value.get("type").and_then(|v| v.as_str())? {
+        "release" if !dirty => Some(BuildStamp::Release {
+            version: value.get("version")?.as_str()?.to_owned(),
+            rev: value.get("rev")?.as_str()?.to_owned(),
+            commit_ts,
+        }),
         "nix" => Some(BuildStamp::Nix {
             version: value.get("version")?.as_str()?.to_owned(),
             rev: value.get("rev")?.as_str()?.to_owned(),
@@ -85,10 +96,12 @@ fn parse_stamp(raw: &str) -> Option<BuildStamp> {
     }
 }
 
-/// Resolve the effective stamp: the compile-time NixStamp wins (a hermetic
+/// Resolve the effective stamp: the compile-time release or Nix stamp wins (a hermetic
 /// build's own identity), else the compile-time LocalStamp from `build.rs`.
 fn resolve(nix: Option<&str>, local: Option<&str>) -> Option<BuildStamp> {
-    if let Some(s @ BuildStamp::Nix { .. }) = nix.and_then(parse_stamp) {
+    if let Some(s @ (BuildStamp::Nix { .. } | BuildStamp::Release { .. })) =
+        nix.and_then(parse_stamp)
+    {
         return Some(s);
     }
     local.and_then(parse_stamp)
@@ -96,6 +109,17 @@ fn resolve(nix: Option<&str>, local: Option<&str>) -> Option<BuildStamp> {
 
 fn identity(base: &str, stamp: Option<&BuildStamp>) -> BuildIdentity {
     match stamp {
+        Some(BuildStamp::Release {
+            version,
+            rev,
+            commit_ts,
+        }) => BuildIdentity {
+            version: version.clone(),
+            rev: rev.clone(),
+            commit_unix: (*commit_ts).try_into().unwrap_or(0),
+            dirty: false,
+            source_kind: SourceKind::Release,
+        },
         Some(BuildStamp::Nix {
             version,
             rev,
@@ -153,7 +177,9 @@ fn local_machine(base: &str, rev: &str, dirty: bool) -> String {
 
 fn machine(identity: &BuildIdentity) -> String {
     match identity.source_kind {
-        SourceKind::Nix => nix_machine(&identity.version, &identity.rev, identity.dirty),
+        SourceKind::Nix | SourceKind::Release => {
+            nix_machine(&identity.version, &identity.rev, identity.dirty)
+        }
         SourceKind::Local => local_machine(&identity.version, &identity.rev, identity.dirty),
         SourceKind::Unknown => format!("{}+dev", identity.version),
     }
@@ -184,6 +210,7 @@ pub fn display_version() -> &'static str {
 fn display(identity: &BuildIdentity, now: u64) -> String {
     let machine = machine(identity);
     match identity.source_kind {
+        SourceKind::Release => format!("{machine} (release)"),
         SourceKind::Nix => {
             let when = relative_time(identity.commit_unix, now);
             let mut s = format!("{machine} — committed");
@@ -274,6 +301,18 @@ mod tests {
                 dirty: false,
             })
         );
+    }
+
+    #[test]
+    fn release_stamp_identifies_the_archive_instead_of_a_local_checkout() {
+        let stamp = r#"{"type":"release","version":"0.3.18","rev":"abc1234","commitTs":1000000,"dirty":false}"#;
+        let selected = resolve(Some(stamp), Some(LOCAL));
+        let identity = identity("ignored", selected.as_ref());
+        assert_eq!(identity.source_kind, SourceKind::Release);
+        assert_eq!(machine(&identity), "0.3.18+abc1234");
+        assert_eq!(display(&identity, 2000000), "0.3.18+abc1234 (release)");
+        let dirty = stamp.replace("false", "true");
+        assert!(parse_stamp(&dirty).is_none());
     }
 
     #[test]

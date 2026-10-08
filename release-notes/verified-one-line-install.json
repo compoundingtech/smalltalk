@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Install verified Small Talk archives with one command and report source-pinned release versions.",
+  "replay": {
+    "status": "none",
+    "detail": "No projection or replay changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or migration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or fleet rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Release archives contain st3, st linked to st3, and pty as their command payload. st3-migrate remains a separate source tool. Native builds pin Rust1.97.0; Linux builds target glibc2.35 with pinned Zig0.15.2, avoiding newer weak-symbol version requirements. Native archives use a clean release stamp with a fixed12-character source revision; ordinary local and Nix stamps retain their prior formats."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "The archive installer replaces binaries without restarting services. The one-line installer then invokes st; existing setup behavior determines startup."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Use the root install.sh for platform detection, download, SHA256 verification, installation and opening st. --tag selects a release; --no-run only installs. Extracted archive installers also accept --quiet. No gh, Rust, Nix or password prompt is required to download and install."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "The payload installer preserves prior command files and restores them after a handled rename failure or signal on Linux. On macOS, once the helper creates its complete backup marker, any later failure leaves current app and command links intact and retains the app/launchd job, prior command files and transaction locks for recovery. The existing helper restore API cannot establish ownership atomically against historical/source installers, so the caller does not attempt late automatic restoration. Archive callers share an app lock across custom bin directories. Inspect any newer installation and repair from the retained material before removing locks. These file transactions do not change database rollback compatibility. Existing source-pinned upgrade impact requirements continue to apply; older archives remain recovery material only when their state contracts permit rollback."
+  }
+}

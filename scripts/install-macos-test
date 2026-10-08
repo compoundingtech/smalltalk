@@ -227,6 +227,7 @@ class Installer(unittest.TestCase):
         helper = fakebin / 'python3'
         helper.write_text('#!' + sys.executable + '\n' +
             'import os,pathlib,sys\n' +
+            'if sys.argv[1] == "-": os.execv(sys.executable, [sys.executable] + sys.argv[1:])\n' +
             'source=pathlib.Path(sys.argv[sys.argv.index("--from")+1])\n' +
             'destination=pathlib.Path(sys.argv[sys.argv.index("--bin-dir")+1])\n' +
             'for name in ["st3"]:\n' +
@@ -236,7 +237,8 @@ class Installer(unittest.TestCase):
         for name in ['st3', 'st3-migrate', 'pty']:
             path = self.source / name
             path.write_text('#!/bin/sh\nexit 0\n'); path.chmod(0o755)
-        env = dict(os.environ, PATH=str(fakebin) + os.pathsep + os.environ['PATH'])
+        env = dict(os.environ, PATH=str(fakebin) + os.pathsep + os.environ['PATH'],
+                   ST_MACOS_INSTALL_HOME=str(self.home))
         first = self.home / 'source-bin'
         subprocess.run([str(repo / 'scripts/install'), '--from', str(self.source), '--bin-dir', str(first)],
                        env=env, check=True, stdout=subprocess.PIPE)

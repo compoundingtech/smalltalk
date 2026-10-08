@@ -2,6 +2,9 @@ import { linuxActionlintConfig, linuxRunner, linuxRunnerProfile, macosRunnerProf
 import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
 import { auditCaches } from './cache-audit.ts'
 import { githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
+import { readFileSync } from 'node:fs'
+
+const releaseRustVersion = readFileSync(new URL('../../scripts/release-rust-version', import.meta.url), 'utf8').trim()
 
 // Preserve release triggers, source verification and publishing permissions. Every commit on main
 // also builds and verifies both archives and keeps them as short-lived artifacts, so release
@@ -26,6 +29,13 @@ export default githubWorkflow(auditCaches({
         ".gitignore",
         "build.rs",
         "crates/st-drivers/src/version.rs",
+        "install.sh",
+        "scripts/download-install-test",
+        "scripts/linux-release-cc",
+        "scripts/check-linux-release.py",
+        "scripts/release-build-stamp.py",
+        "scripts/release-rust-version",
+        "scripts/fixtures/install-release-v0.3.17",
         "scripts/release-smalltalk*",
         "scripts/release_notes*",
         "scripts/ci-build-snapshot*",
@@ -111,7 +121,8 @@ export default githubWorkflow(auditCaches({
           }
         },
         {
-          "uses": "dtolnay/rust-toolchain@stable"
+          "uses": "dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067",
+          "with": { "toolchain": releaseRustVersion }
         },
         { name: 'Name the pinned compiler cache', run: `printf 'CI_ZIG_CACHE_DIR=%s/zig/0.15.2\\n' \"$RUNNER_TOOL_CACHE\" >> \"$GITHUB_ENV\"` },
         buildSnapshotRestore,

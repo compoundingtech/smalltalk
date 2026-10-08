@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Exercise download integrity, quiet installation, platform selection and launch."""
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tarfile
+import tempfile
+
+repo = Path(__file__).resolve().parent.parent
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d)
+    tools = root / 'tools'; tools.mkdir()
+    payload = root / 'smalltalk-x86_64-unknown-linux-gnu'; (payload / 'bin').mkdir(parents=True)
+    for name in ['st3', 'pty']:
+        p = payload / 'bin' / name
+        p.write_text('#!/bin/sh\nprintf "' + name + '-fixture\\n"\n'); p.chmod(0o755)
+    (payload / 'bin/st').symlink_to('st3')
+    shutil.copy(repo / 'scripts/install-release', payload / 'install.sh')
+    archive = root / (payload.name + '.tar.gz')
+    with tarfile.open(archive, 'w:gz') as t: t.add(payload, arcname=payload.name)
+    checksum = Path(str(archive) + '.sha256')
+    correct = hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + archive.name + '\n'
+    checksum.write_text(correct)
+    curl = tools / 'curl'
+    curl.write_text('''#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "$RECEIPTS"
+url= out=
+while [ "$#" -gt 0 ]; do
+ case "$1" in --output) out=$2;shift 2;; https://*) url=$1;shift;; *) shift;; esac
+done
+cp "$FIXTURES/${url##*/}" "$out"
+'''); curl.chmod(0o755)
+    uname = tools / 'uname'
+    uname.write_text('#!/bin/sh\ncase "$1" in -s) echo "${PLATFORM:-Linux}";; -m) echo "${ARCH:-x86_64}";; esac\n'); uname.chmod(0o755)
+    env = dict(os.environ, PATH=str(tools) + ':' + os.environ['PATH'], HOME=str(root / 'home'),
+               FIXTURES=str(root), RECEIPTS=str(root / 'requests'))
+    def install(*args, extra=None):
+        return subprocess.run(['sh', str(repo / 'install.sh'), *args], env={**env, **(extra or {})},
+                              input='', text=True, capture_output=True, timeout=20)
+    result = install('--no-run')
+    assert result.returncode == 0 and result.stdout == '' and result.stderr == '', result
+    installed = root / 'home/.local/bin'
+    assert (installed / 'st').readlink() == Path('st3')
+    assert sorted(p.name for p in installed.iterdir()) == ['pty', 'st', 'st3']
+    result = install('--tag', 'v0.3.18')
+    assert result.returncode == 0 and result.stdout == 'st3-fixture\n' and result.stderr == '', result
+    requests = (root / 'requests').read_text()
+    assert '/latest/download/' in requests and '/download/v0.3.18/' in requests
+    original = (installed / 'st3').read_bytes()
+    checksum.write_text('0' * 64 + '  ' + archive.name + '\n')
+    result = install('--no-run')
+    assert result.returncode != 0 and 'checksum mismatch' in result.stderr, result
+    assert (installed / 'st3').read_bytes() == original
+    checksum.write_text(correct.replace(archive.name, 'other.tar.gz'))
+    result = install('--no-run')
+    assert result.returncode != 0 and 'invalid archive checksum' in result.stderr, result
+    result = install('--no-run', extra={'ARCH': 'aarch64'})
+    assert result.returncode != 0 and 'supported platforms' in result.stderr, result
+    result = install('--tag', '../other')
+    assert result.returncode != 0 and 'invalid release tag' in result.stderr, result
+    # Exact published v0.3.17 installer from source f4cec96e414fee2a780910730b019fe6bdbddc1d.
+    # It rejects --quiet and requires the historical four-command payload.
+    payload_installer = payload / 'install.sh'
+    published = repo / 'scripts/fixtures/install-release-v0.3.17'
+    assert hashlib.sha256(published.read_bytes()).hexdigest() == 'd6912ca3612d73b9e8c6645312698b656c9fc8b241bd9185d4b0334086742dea'
+    rejected = subprocess.run(['bash', str(published), '--quiet'], env=env,
+                              text=True, capture_output=True, timeout=10)
+    assert rejected.returncode == 2 and 'unknown option: --quiet' in rejected.stderr, rejected
+    shutil.copy(published, payload_installer); payload_installer.chmod(0o755)
+    for name in ['stui', 'st3-migrate']: shutil.copy(payload / 'bin/st3', payload / 'bin' / name)
+    with tarfile.open(archive, 'w:gz') as t: t.add(payload, arcname=payload.name)
+    checksum.write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + archive.name + '\n')
+    legacy_bin = root / 'legacy-bin'
+    result = install('--tag', 'v0.3.17', '--bin-dir', str(legacy_bin), '--no-run')
+    assert result.returncode == 0 and result.stdout == '' and result.stderr == '', result
+    assert sorted(p.name for p in legacy_bin.iterdir()) == ['pty', 'st', 'st3', 'st3-migrate', 'stui']
+print('Download installer integrity, quiet install, launch and platform controls passed')

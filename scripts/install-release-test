@@ -9,9 +9,10 @@ mkdir -p "$work/platform-bin"
 printf '#!/bin/sh\necho Linux\n' > "$work/platform-bin/uname"
 chmod +x "$work/platform-bin/uname"
 export PATH="$work/platform-bin:$PATH"
+export ST_MACOS_INSTALL_HOME="$work/macos-home"
 mkdir -p "$work/package/bin" "$work/installed"
-cp "$repo/scripts/install-release" "$work/package/install.sh"
-for binary in st3 st3-migrate pty; do
+cp "${INSTALL_RELEASE_TEST_SCRIPT:-$repo/scripts/install-release}" "$work/package/install.sh"
+for binary in st3 pty; do
   printf '#!/bin/sh\necho new-%s\n' "$binary" > "$work/package/bin/$binary"
   chmod +x "$work/package/bin/$binary"
   printf 'old\n' > "$work/installed/$binary"
@@ -21,7 +22,7 @@ ln -s /missing/old-ui "$work/installed/stui"
 "$work/package/install.sh" --bin-dir "$work/installed"
 test "$(readlink "$work/installed/st")" = st3
 test "$("$work/installed/st")" = new-st3
-for binary in st3 st3-migrate pty; do
+for binary in st3 pty; do
   test "$("$work/installed/$binary")" = "new-$binary"
 done
 test ! -e "$work/installed/stui"
@@ -34,4 +35,192 @@ cp "$work/package/bin/st3" "$work/package/bin/pty"
 mkdir -p "$work/blocked/st"
 if "$work/package/install.sh" --bin-dir "$work/blocked"; then exit 1; fi
 test ! -e "$work/blocked/st3"
+# A macOS helper receipt is a notice: quiet installs suppress it, errors survive.
+# This fixture checks the caller; real app transactions are tested separately.
+printf '#!/bin/sh\necho Darwin\n' > "$work/platform-bin/uname"
+cat > "$work/package/install-macos.py" <<'PY'
+import os
+import sys
+if os.environ.get('INSTALL_HELPER_FAIL'):
+    print('helper failure', file=sys.stderr)
+    raise SystemExit(1)
+print('app receipt')
+PY
+"$work/package/install.sh" --bin-dir "$work/installed" --quiet > "$work/quiet.out" 2> "$work/quiet.err"
+test ! -s "$work/quiet.out"
+test ! -s "$work/quiet.err"
+"$work/package/install.sh" --bin-dir "$work/installed" > "$work/notices.out"
+grep -q 'app receipt' "$work/notices.out"
+if INSTALL_HELPER_FAIL=1 "$work/package/install.sh" --bin-dir "$work/installed" --quiet > "$work/failure.out" 2> "$work/failure.err"; then exit 1; fi
+test ! -s "$work/failure.out"
+grep -q 'helper failure' "$work/failure.err"
+printf '#!/bin/sh\necho Linux\n' > "$work/platform-bin/uname"
+# Fail one rename after st3 was replaced, then allow real rollback renames.
+real_mv=$(command -v mv)
+cat > "$work/platform-bin/mv" <<'SH'
+#!/bin/bash
+set -eu
+if [[ ${!#} == "$INSTALL_FAIL_DEST" && ! -e $INSTALL_FAIL_MARKER ]]; then
+  : > "$INSTALL_FAIL_MARKER"
+  if [[ ${INSTALL_FAIL_MODE:-error} == signal ]]; then kill -TERM "$PPID"; fi
+  if [[ ${INSTALL_FAIL_MODE:-error} == foreign ]]; then
+    python3 - "$INSTALL_FOREIGN_APP" "$INSTALL_APP_FIXTURE" <<'PY'
+from pathlib import Path
+import sys
+app = Path(sys.argv[1])
+app.rename(str(app) + '.previous-owner')
+(app / 'Contents/MacOS').mkdir(parents=True)
+(app / 'Contents/MacOS/st3').write_text('newer app')
+Path(sys.argv[2]).write_text('newer app and launchd fixture')
+PY
+  fi
+  exit 1
+fi
+exec "$INSTALL_REAL_MV" "$@"
+SH
+chmod +x "$work/platform-bin/mv"
+export INSTALL_REAL_MV="$real_mv" INSTALL_FAIL_MARKER="$work/failed-once"
+mkdir "$work/prior"
+for name in st3 pty st stui; do
+  printf 'previous-%s\n' "$name" > "$work/prior/$name"
+done
+chmod 0700 "$work/prior/st3" "$work/prior/pty" "$work/prior/stui"
+rm "$work/prior/st"
+ln -s /previous/st3 "$work/prior/st"
+export INSTALL_FAIL_DEST="$work/prior/pty"
+if "$work/package/install.sh" --bin-dir "$work/prior" --quiet; then exit 1; fi
+for name in st3 pty stui; do
+  test "$(cat "$work/prior/$name")" = "previous-$name"
+  test -x "$work/prior/$name"
+done
+test "$(readlink "$work/prior/st")" = /previous/st3
+test ! -e "$work/prior/.smalltalk-install.lock"
+python3 -c 'import os,sys; assert sorted(os.listdir(sys.argv[1])) == ["pty", "st", "st3", "stui"]' "$work/prior"
+rm "$INSTALL_FAIL_MARKER"
+export INSTALL_FAIL_DEST="$work/fresh/pty"
+if "$work/package/install.sh" --bin-dir "$work/fresh" --quiet; then exit 1; fi
+test -z "$(ls -A "$work/fresh")"
+# An existing transaction lock is never removed by a second installer.
+mkdir -p "$work/locked/.smalltalk-install.lock"
+printf 'unchanged' > "$work/locked/st3"
+if "$work/package/install.sh" --bin-dir "$work/locked" --quiet > "$work/locked.out" 2> "$work/locked.err"; then exit 1; fi
+test -d "$work/locked/.smalltalk-install.lock"
+test "$(cat "$work/locked/st3")" = unchanged
+rm "$INSTALL_FAIL_MARKER"
+if INSTALL_FAIL_MODE=signal "$work/package/install.sh" --bin-dir "$work/fresh" --quiet; then exit 1; else test "$?" = 143; fi
+test -z "$(ls -A "$work/fresh")"
+# After the helper commits, late failures retain app/links/jobs without restore.
+printf '#!/bin/sh\necho Darwin\n' > "$work/platform-bin/uname"
+cat > "$work/package/install-macos.py" <<'PY'
+import argparse
+from pathlib import Path
+import os
+import signal
+p = argparse.ArgumentParser()
+p.add_argument('--from'); p.add_argument('--bin-dir'); p.add_argument('--job')
+p.add_argument('--home'); p.add_argument('--app')
+p.add_argument('--restore-app', action='store_true')
+a = p.parse_args()
+job = Path(a.job)
+state = Path(os.environ['INSTALL_APP_FIXTURE'])
+assert Path(a.home).resolve() == Path(os.environ['ST_MACOS_INSTALL_HOME']).resolve()
+assert Path(a.bin_dir).is_absolute() and Path(a.app).is_absolute()
+if os.environ.get('INSTALL_INCOMPLETE_SIGNAL'):
+    os.kill(os.getppid(), signal.SIGTERM)
+    raise SystemExit(0)
+if a.restore_app:
+    state.write_bytes((job / 'old-fixture').read_bytes())
+else:
+    (job / 'old-fixture').write_bytes(state.read_bytes())
+    (job / 'previous.json').write_text('{}')
+    state.write_text('new app and launchd fixture')
+    app = Path(a.app)
+    (app / 'Contents/MacOS').mkdir(parents=True, exist_ok=True)
+    (app / 'Contents/MacOS/st3').write_text('our app')
+print('app receipt')
+PY
+export INSTALL_APP_FIXTURE="$work/app-and-launchd"
+export INSTALL_FOREIGN_APP="$ST_MACOS_INSTALL_HOME/Applications/SmallTalk.app"
+# Reproduce the old check-then-act window: cat reads the saved witness after
+# the current snapshot, swaps in a foreign app, then returns the old witness.
+# The unchanged helper's restore would overwrite that foreign state. The safe
+# caller never attempts this ownership read or a late helper restore.
+real_cat=$(command -v cat)
+cat > "$work/platform-bin/cat" <<'SH'
+#!/bin/bash
+set -eu
+if [[ ${INSTALL_OWNER_READ_RACE:-} == 1 && $1 == */caller-owner.json ]]; then
+  owner=$("$INSTALL_REAL_CAT" "$@")
+  python3 - "$INSTALL_FOREIGN_APP" "$INSTALL_APP_FIXTURE" "$INSTALL_RACE_MARKER" <<'PYRACE'
+from pathlib import Path
+import sys
+app, state, marker = map(Path, sys.argv[1:])
+app.rename(str(app) + '.previous-owner')
+(app / 'Contents/MacOS').mkdir(parents=True)
+(app / 'Contents/MacOS/st3').write_text('foreign app during ownership read')
+state.write_text('foreign app and launchd during ownership read')
+marker.touch()
+PYRACE
+  printf '%s\n' "$owner"
+else
+  exec "$INSTALL_REAL_CAT" "$@"
+fi
+SH
+chmod +x "$work/platform-bin/cat"
+export INSTALL_REAL_CAT="$real_cat" INSTALL_RACE_MARKER="$work/owner-read-race"
+for mode in owner-read error signal foreign; do
+  # Isolated transaction for each late failure, including separate bin context.
+  export ST_MACOS_INSTALL_HOME="$work/macos-$mode"
+  export INSTALL_FOREIGN_APP="$ST_MACOS_INSTALL_HOME/Applications/SmallTalk.app"
+  export INSTALL_FAIL_DEST="$work/mac-$mode/pty"
+  mkdir -p "$work/mac-$mode"
+  cp -pP "$work/prior/"* "$work/mac-$mode/"
+  printf 'previous app and launchd fixture' > "$INSTALL_APP_FIXTURE"
+  rm -f "$INSTALL_FAIL_MARKER"
+  failure_mode=$mode
+  owner_read=0
+  if [[ $mode == owner-read ]]; then failure_mode=error; owner_read=1; fi
+  if INSTALL_OWNER_READ_RACE=$owner_read INSTALL_FAIL_MODE=$failure_mode \
+      "$work/package/install.sh" --bin-dir "$work/mac-$mode" --quiet \
+      > "$work/mac-$mode.out" 2> "$work/mac-$mode.err"; then exit 1; else test "$?" = 1; fi
+  test ! -s "$work/mac-$mode.out"
+  if [[ $mode == foreign ]]; then
+    test "$(cat "$INSTALL_APP_FIXTURE")" = 'newer app and launchd fixture'
+    test "$(cat "$INSTALL_FOREIGN_APP/Contents/MacOS/st3")" = 'newer app'
+  elif [[ -f $INSTALL_RACE_MARKER ]]; then
+    # Negative control with the old caller must fail here: restore overwrote it.
+    test "$(cat "$INSTALL_APP_FIXTURE")" = 'foreign app and launchd during ownership read'
+    test "$(cat "$INSTALL_FOREIGN_APP/Contents/MacOS/st3")" = 'foreign app during ownership read'
+  else
+    test "$(cat "$INSTALL_APP_FIXTURE")" = 'new app and launchd fixture'
+    test "$(cat "$INSTALL_FOREIGN_APP/Contents/MacOS/st3")" = 'our app'
+  fi
+  test -d "$work/mac-$mode/.smalltalk-install.lock"
+  test -d "$ST_MACOS_INSTALL_HOME/Applications/.SmallTalk.app.archive-install.lock"
+  grep -q 'ownership cannot be established atomically' "$work/mac-$mode.err"
+  python3 - "$work/mac-$mode" "$ST_MACOS_INSTALL_HOME" <<'PYRECOVERY'
+from pathlib import Path
+import sys
+backups = list(Path(sys.argv[1]).glob('.smalltalk-install.*/previous/st3'))
+assert len(backups) == 1 and backups[0].read_text() == 'previous-st3\n'
+jobs = list((Path(sys.argv[2]) / '.local/state/st3/macos-installs').glob('install-*'))
+assert len(jobs) == 1 and (jobs[0] / 'old-fixture').read_text() == 'previous app and launchd fixture'
+PYRECOVERY
+  if "$work/package/install.sh" --bin-dir "$work/another-$mode" --quiet \
+      > "$work/second.out" 2> "$work/second.err"; then exit 1; fi
+  test -z "$(ls -A "$work/another-$mode")"
+done
+# A signal before the backup marker neither invokes app restore nor loses files.
+export ST_MACOS_INSTALL_HOME="$work/macos-incomplete"
+printf 'previous app and launchd fixture' > "$INSTALL_APP_FIXTURE"
+if INSTALL_INCOMPLETE_SIGNAL=1 "$work/package/install.sh" --bin-dir "$work/prior" --quiet; then exit 1; else test "$?" = 143; fi
+test "$(cat "$INSTALL_APP_FIXTURE")" = 'previous app and launchd fixture'
+test ! -e "$work/prior/.smalltalk-install.lock"
+test ! -e "$ST_MACOS_INSTALL_HOME/Applications/.SmallTalk.app.archive-install.lock"
+rm "$work/platform-bin/cat"
+printf '#!/bin/sh\necho Linux\n' > "$work/platform-bin/uname"
+rm "$work/platform-bin/mv"
+unset INSTALL_REAL_MV INSTALL_FAIL_MARKER INSTALL_FAIL_DEST INSTALL_APP_FIXTURE INSTALL_FOREIGN_APP
 echo 'Release installer tests passed'
+
+"$repo/scripts/download-install-test"
