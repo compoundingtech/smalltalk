@@ -413,6 +413,19 @@ workflow-level path filters. `linux-gate` does not depend on them.
 `scripts/ci-fractal-web-test`, run by `genie-freshness`, covers detection, fail-closed
 paths, the gate truth table and generated job shape.
 
+Run SDK tests with their own `vitest.config.ts`, not the parent app's narrower test patterns.
+The rejected-mission diagnostic proof checks its fixture against the generated decoder:
+negative step attempts are rejected, while person assignees are valid actor references.
+
+The SDK unit lane uses an injected clock to guard task yielding and bounded decode/order
+work deterministically, including the >150KB roster burst. `SDK frame CPU budgets`
+runs separately with `apps/fractal-web/packages/st3-sdk/vitest.perf.config.ts`: after
+warming, seven fixed observations guard the median worst task below 16ms of calling-thread
+CPU, total burst CPU below 50ms, and a one-row delta below 16ms. These are not retries.
+Calling-thread CPU excludes host descheduling and unrelated Node worker-thread CPU.
+Each report includes all samples and host load averages; load never skips the lane or
+changes its thresholds.
+
 The web shell supplies pnpm 12.7.0, Node 24.20, Bun 1.4.2 and Buck2 from the pinned
 effect-utils input; the Rust shells are unchanged. An empty `.buckroot` marks the Buck
 root; Genie generates `.buckconfig`, root `BUCK` and `buck2/toolchains/BUCK` from `buck2/root.ts`,

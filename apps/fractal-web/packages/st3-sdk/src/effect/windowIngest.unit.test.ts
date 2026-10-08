@@ -1,36 +1,9 @@
-import type { Agent, CollectionFrame, Resource, Snapshot } from '@smalltalk/st3-client'
+import type { CollectionFrame, Resource } from '@smalltalk/st3-client'
 import { decodeUnknownSync, Resource as ResourceCodec } from '@smalltalk/st3-client/schema'
 import { describe, expect, it } from 'vitest'
 
 import { makeWindowIngest, type ProcessedWindow } from './windowIngest.ts'
-
-const snapshot: Snapshot = {
-  id: 'snapshot/roster-perf',
-  created_at: '2026-10-06T00:00:00Z',
-  host_id: 'host/build-a',
-  projection_version: 'client-projection.v0',
-  store_index: 1,
-}
-const agents: Agent[] = Array.from({ length: 200 }, (_, i) => ({
-  id: `agent/perf-${i}`,
-  kind: 'agent',
-  revision: '1',
-  updated_at: snapshot.created_at,
-  name: `Agent ${i}`,
-  state: 'running',
-  reachability: 'local',
-  runtime_ids: [],
-  description: 'Realistic retained roster description. '.repeat(16),
-}))
-const frame = (items: Resource[]): CollectionFrame => ({
-  kind: 'snapshot',
-  id: 'f1',
-  collection: 'agents',
-  items,
-  order: items.map((row) => row.id),
-  has_more: false,
-  snapshot,
-})
+import { agents, frame, snapshot } from './windowIngest.fixture.ts'
 
 describe('bounded ordered collection ingestion', () => {
   it('bounds rejected-row reporting to the present latest revision and clears departed/recovered rows', () => {
@@ -66,73 +39,47 @@ describe('bounded ordered collection ingestion', () => {
     expect(ingest.rejectedRowCount).toBe(1)
   })
 
-  it('processes a >150KB warmed decoded burst below a frame of CPU per task', () => {
+  it('yields between bounded decode and ordering slices for a >150KB burst', () => {
     const wire = JSON.stringify(frame(agents))
     expect(wire.length).toBeGreaterThan(150_000)
     const tasks: (() => void)[] = []
     const values: ProcessedWindow<unknown>[] = []
     const decode = decodeUnknownSync(ResourceCodec)
-    // Steady-state ingress excludes schema compilation; CPU accounting excludes host descheduling.
-    for (const row of agents) decode(row)
-    const ingest = makeWindowIngest({
-      decode,
-      publish: (value) => values.push(value),
-      schedule: (work) => {
-        tasks.push(work)
-        return () => tasks.splice(tasks.indexOf(work), 1)
-      },
-    })
-    ingest.accept(JSON.parse(wire))
-    expect(values).toHaveLength(0)
-    let longestMs = 0
-    let totalMs = 0
-    let slices = 0
-    while (tasks.length > 0) {
-      const work = tasks.shift()!
-      const started = process.cpuUsage()
-      work()
-      const cpu = process.cpuUsage(started)
-      const elapsed = (cpu.user + cpu.system) / 1000
-      longestMs = Math.max(longestMs, elapsed)
-      totalMs += elapsed
-      slices++
-    }
-    expect(values[0]?.items).toHaveLength(200)
-    expect(longestMs).toBeLessThan(16)
-    expect(totalMs).toBeLessThan(50)
-    console.log(
-      `[wf-roster-perf] ${JSON.stringify({ wireBytes: wire.length, longestCpuMs: longestMs, totalCpuMs: totalMs, slices })}`,
-    )
-  })
-
-  it('yields after four work units with the default four-millisecond slice budget', () => {
-    const tasks: (() => void)[] = []
-    const values: ProcessedWindow<Resource>[] = []
     let clock = 0
     let decoded = 0
     const ingest = makeWindowIngest({
       decode: (row) => {
         decoded++
-        return row
+        return decode(row)
       },
       publish: (value) => values.push(value),
+      // Each generator step costs one virtual millisecond, independent of host load.
       now: () => clock++,
       schedule: (work) => {
         tasks.push(work)
         return () => tasks.splice(tasks.indexOf(work), 1)
       },
     })
-    ingest.accept(frame(agents))
+    ingest.accept(JSON.parse(wire))
+    expect(decoded).toBe(0)
+    expect(values).toHaveLength(0)
     let slices = 0
     while (tasks.length > 0) {
+      // Exactly one continuation is pending; accept and each slice return to the task queue.
+      expect(tasks).toHaveLength(1)
       const before = decoded
       tasks.shift()!()
       expect(decoded - before).toBeLessThanOrEqual(4)
       slices++
+      if (tasks.length > 0) expect(values).toHaveLength(0)
     }
     expect(decoded).toBe(200)
-    expect(slices).toBeGreaterThanOrEqual(100)
+    // 200 decode yields + 200 ordering yields, four per task, then publication.
+    // Removing either phase's yields must fail, even if decoding remains bounded.
+    expect(slices).toBe(101)
+    expect(values).toHaveLength(1)
     expect(values[0]?.items).toHaveLength(200)
+    expect(values[0]?.rawItems.map((row) => row.id)).toEqual(agents.map((row) => row.id))
   })
 
   it('preserves unchanged references, orders queued deltas and publishes exact frame metadata', () => {
@@ -203,18 +150,12 @@ describe('bounded ordered collection ingestion', () => {
       has_more: false,
       snapshot: { ...snapshot, store_index: 2 },
     }
-    const started = performance.now()
     ingest.accept(delta)
     while (tasks.length > 0) tasks.shift()!()
-    const elapsedMs = performance.now() - started
-    expect(elapsedMs).toBeLessThan(16)
     expect(decoded).toBe(1)
     for (let i = 0; i < agents.length; i++)
       if (i === 17) expect(values[1]!.items[i]).not.toBe(values[0]!.items[i])
       else expect(values[1]!.items[i]).toBe(values[0]!.items[i])
-    console.log(
-      `[wf-roster-perf] ${JSON.stringify({ changedRows: decoded, retainedRows: agents.length - decoded, elapsedMs })}`,
-    )
     ingest.accept({ ...delta, snapshot: { ...snapshot, store_index: 3 } })
     while (tasks.length > 0) tasks.shift()!()
     expect(decoded).toBe(1)

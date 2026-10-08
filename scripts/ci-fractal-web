@@ -49,5 +49,7 @@ lane "Extension registry" node --experimental-strip-types --test apps/fractal-we
 lane "Folders core" node --test apps/fractal-web/src/folders/core.node-test.mjs
 lane "App typecheck" pnpm --filter fractal-web typecheck
 lane "App unit tests" pnpm --filter fractal-web test
+lane "SDK unit tests" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.config.ts
+lane "SDK frame CPU budgets" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.perf.config.ts
 lane "UI kit typecheck" pnpm --filter @smalltalk/fractal-ui typecheck
 lane "UI kit Storybook" pnpm --filter @smalltalk/fractal-ui build-storybook
