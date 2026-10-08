@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "stui tabs close on a middle-button release over the tab that was pressed",
+  "replay": { "status": "none", "detail": "No replay changes." },
+  "schema": { "status": "none", "detail": "No schema changes." },
+  "rules": { "status": "none", "detail": "No rule changes." },
+  "compatibility": { "status": "changed", "detail": "Middle-clicking a stui tab invokes its existing close action; other middle clicks are unchanged." },
+  "downtime": { "status": "none", "detail": "No downtime required." },
+  "manual": { "status": "none", "detail": "No manual migration required." },
+  "recovery": { "status": "none", "detail": "No recovery changes." }
+}

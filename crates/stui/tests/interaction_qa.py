@@ -124,7 +124,18 @@ def main(binary: str, name: str) -> None:
         drag(session, column + 1, row + 1, column + 12)
         wait_screen(session, lambda value: "Copied 1 line" in value, "drag to copy")
         assert FIRST_FRAME in screen(session), "a drag must not leave the conversation"
-        print("Interaction QA passed: open from Ctrl+K, wheel, drag to copy")
+        # The tab strip contains the opened agent and the new-tab control.
+        value = screen(session)
+        tabs = next((row, line) for row, line in enumerate(value.splitlines())
+                    if "+" in line and name.lower() in line.lower())
+        row, line = tabs
+        column = line.lower().index(name.lower()) + 1
+        send(session, f"\x1b[<1;{column};{row + 1}M")
+        assert name.lower() in screen(session).splitlines()[row].lower(), "press must not close"
+        send(session, f"\x1b[<1;{column};{row + 1}m")
+        wait_screen(session, lambda frame: name.lower() not in frame.splitlines()[row].lower(),
+                    "middle-click tab close")
+        print("Interaction QA passed: open from Ctrl+K, wheel, drag to copy, middle-click close")
     finally:
         stop(session)
 

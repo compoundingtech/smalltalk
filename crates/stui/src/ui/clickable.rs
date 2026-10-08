@@ -77,7 +77,7 @@ impl Ui {
             Hit::Link(_) => "copy link".into(),
             Hit::Split(true) => "split right [Ctrl+V]".into(),
             Hit::Split(false) => "split below [Ctrl+X]".into(),
-            Hit::GlassTab(..) => "show tab; drag to move/split".into(),
+            Hit::GlassTab(..) => "show tab; drag to move/split; middle-click closes".into(),
             Hit::GlassAdd(_) => "new tab [Ctrl+T]".into(),
             Hit::PaletteChoice(_) => format!("open {label}"),
         };
@@ -275,6 +275,33 @@ mod tests {
                 assert!(ui.flash.as_ref().unwrap().0.contains("Start"));
             }
         }
+    }
+
+    #[test]
+    fn middle_click_closes_only_on_release_over_the_pressed_tab() {
+        let mut ui = Ui::new(demo::world());
+        ui.glasses = Some(glass::Glasses::open(None, None));
+        let agent = ui.world.agents.items()[0].id.clone();
+        ui.open(&agent);
+        let other = ui.world.agents.items()[1].id.clone();
+        ui.open(&other);
+        draw(&ui);
+        let tab = target(&ui, |hit| matches!(hit, Hit::GlassTab(0, 1)));
+        let home = target(&ui, |hit| matches!(hit, Hit::GlassTab(0, 0)));
+        pointer(&mut ui, MouseEventKind::Down(MouseButton::Middle), tab.x, tab.y);
+        draw(&ui);
+        assert_eq!(target(&ui, |hit| matches!(hit, Hit::GlassTab(0, 1))), tab);
+        pointer(&mut ui, MouseEventKind::Up(MouseButton::Middle), home.x, home.y);
+        draw(&ui);
+        assert_eq!(target(&ui, |hit| matches!(hit, Hit::GlassTab(0, 1))), tab);
+        pointer(&mut ui, MouseEventKind::Up(MouseButton::Middle), tab.x, tab.y);
+        draw(&ui);
+        assert_eq!(target(&ui, |hit| matches!(hit, Hit::GlassTab(0, 1))), tab);
+        pointer(&mut ui, MouseEventKind::Down(MouseButton::Middle), tab.x, tab.y);
+        pointer(&mut ui, MouseEventKind::Up(MouseButton::Middle), tab.x, tab.y);
+        draw(&ui);
+        assert!(!ui.frame.borrow().hits.iter()
+            .any(|(_, hit)| matches!(hit, Hit::GlassTab(0, 1))));
     }
 
     #[test]
