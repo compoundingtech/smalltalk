@@ -11,6 +11,7 @@ struct Fixture {
     source: &'static str,
     view: &'static str,
     gate: Option<Arc<Gate>>,
+    repeat_gate: Arc<AtomicBool>,
     fail: bool,
     captures: Arc<AtomicUsize>,
     storage_failure: Arc<AtomicBool>,
@@ -156,6 +157,7 @@ impl Source for Fixture {
                     source: self.source,
                     value,
                     gate: self.gate.clone(),
+                    repeat_gate: self.repeat_gate.clone(),
                     fail: self.fail,
                     storage_failure: self.storage_failure.clone(),
                     fail_fence: self.fail_fence.clone(),
@@ -176,6 +178,7 @@ struct Facts {
     source: &'static str,
     value: i64,
     gate: Option<Arc<Gate>>,
+    repeat_gate: Arc<AtomicBool>,
     fail: bool,
     storage_failure: Arc<AtomicBool>,
     fail_fence: Arc<AtomicBool>,
@@ -186,11 +189,12 @@ struct Facts {
 impl Captured for Facts {
     fn prepare(self: Box<Self>, _: &Context) -> Result<Box<dyn Page>> {
         if let Some(gate) = &self.gate
-            && !gate.once.swap(true, Ordering::SeqCst)
+            && (self.repeat_gate.load(Ordering::SeqCst) || !gate.once.swap(true, Ordering::SeqCst))
         {
+            let mut released = gate.release.0.lock().unwrap();
+            *released = false;
             // Positive signal after capture's snapshot has ended.
             gate.entered.notify_one();
-            let released = gate.release.0.lock().unwrap();
             let (released, _) = gate
                 .release
                 .1
@@ -219,7 +223,7 @@ impl Page for Facts {
             )
             .optional()?;
         if current != Some(self.value) {
-            return Ok(true.into());
+            return Ok(Publication::stale());
         }
         tx.execute("INSERT INTO local_fixture_reactor_output VALUES(?1,?2) ON CONFLICT(source) DO UPDATE SET value=excluded.value", params![self.source,self.value])?;
         if self.storage_failure.load(Ordering::SeqCst) {
@@ -244,6 +248,7 @@ impl Page for Facts {
         let fault = self.after_commit_failure.load(Ordering::SeqCst);
         Ok(Publication {
             more: false,
+            stale: false,
             after_commit: (fault != 0)
                 .then(|| Box::new(AfterCommitFault(fault)) as Box<dyn AfterCommit>),
         })
@@ -268,6 +273,7 @@ fn source(
         source,
         view,
         gate,
+        repeat_gate: Arc::new(AtomicBool::new(false)),
         fail,
         captures: Arc::new(AtomicUsize::new(0)),
         storage_failure: Arc::new(AtomicBool::new(false)),
@@ -873,10 +879,11 @@ impl Page for CacheMarker {
         assert!(Arc::ptr_eq(&store.ivm_views().unwrap(), &cx.views));
         self.publications.fetch_add(1, Ordering::SeqCst);
         if smallclaims::store::current_index(tx)? != self.index {
-            return Ok(true.into());
+            return Ok(Publication::stale());
         }
         Ok(Publication {
             more: false,
+            stale: false,
             after_commit: Some(self),
         })
     }
@@ -1069,4 +1076,58 @@ async fn after_commit_failures_refuse_committed_source_and_preserve_sibling() {
         replace(&store, sibling.source, 32);
         wait_for(|| output(&store, sibling.source) == Some(32)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continuous_cut_changes_back_off_stale_pages_without_delaying_sibling() {
+    let root = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Gate {
+        entered: Notify::new(),
+        release: (Mutex::new(false), std::sync::Condvar::new()),
+        once: AtomicBool::new(false),
+    });
+    let moving = source(
+        "fixture.moving",
+        "fixture.moving.rows",
+        Some(gate.clone()),
+        false,
+    );
+    moving.repeat_gate.store(true, Ordering::SeqCst);
+    let sibling = source("fixture.steady", "fixture.steady.rows", None, false);
+    let store = Arc::new(
+        Store::open_with_collection_sources(
+            &root.path().join("moving.db"),
+            "alder",
+            vec![moving.clone(), sibling.clone()],
+        )
+        .unwrap(),
+    );
+    let registry = store.collection_sources().unwrap();
+    replace(&store, moving.source, 0);
+    store.start_collection_reactor().unwrap();
+    for round in 0..4u64 {
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        // A real committed write invalidates each captured page while preparation owns
+        // no DB lease. Native commit notifications must not bypass that source's delay.
+        replace(&store, moving.source, round as i64 + 1);
+        if round == 3 {
+            moving.repeat_gate.store(false, Ordering::SeqCst);
+            gate.once.store(true, Ordering::SeqCst);
+        }
+        *gate.release.0.lock().unwrap() = true;
+        gate.release.1.notify_one();
+        wait_for(|| registry.stale_publications(moving.source).unwrap() == round + 1).await;
+        if round < 3 {
+            assert_eq!(output(&store, moving.source), None);
+        }
+        replace(&store, sibling.source, round as i64 + 10);
+        for _ in 0..8 {
+            registry.wake();
+        }
+    }
+    wait_for(|| output(&store, sibling.source) == Some(13)).await;
+    wait_for(|| output(&store, moving.source) == Some(4)).await;
+    assert_eq!(registry.stale_publications(moving.source).unwrap(), 4);
 }

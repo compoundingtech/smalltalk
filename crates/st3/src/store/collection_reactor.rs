@@ -114,13 +114,26 @@ pub(crate) trait Page: Send {
 
 pub(crate) struct Publication {
     pub more: bool,
+    pub stale: bool,
     pub after_commit: Option<Box<dyn AfterCommit>>,
+}
+
+impl Publication {
+    /// No precommit output was applied because the owned page's cut no longer matches.
+    pub fn stale() -> Self {
+        Self {
+            more: true,
+            stale: true,
+            after_commit: None,
+        }
+    }
 }
 
 impl From<bool> for Publication {
     fn from(more: bool) -> Self {
         Self {
             more,
+            stale: false,
             after_commit: None,
         }
     }
@@ -149,6 +162,7 @@ pub(crate) struct Registry {
     names: Vec<Vec<&'static str>>,
     retries: Vec<AtomicU64>,
     unavailable: Vec<AtomicBool>,
+    stale_publications: Vec<AtomicU64>,
     wake: Arc<Notify>,
 }
 
@@ -203,6 +217,7 @@ impl Registry {
             },
             retries: sources.iter().map(|_| AtomicU64::new(0)).collect(),
             unavailable: sources.iter().map(|_| AtomicBool::new(false)).collect(),
+            stale_publications: sources.iter().map(|_| AtomicU64::new(0)).collect(),
             sources,
             names,
             wake: Arc::new(Notify::new()),
@@ -276,6 +291,15 @@ impl Registry {
 
     pub fn wake(&self) {
         self.wake.notify_one();
+    }
+
+    pub fn stale_publications(&self, source: &str) -> Result<u64> {
+        let index = self
+            .sources
+            .iter()
+            .position(|s| s.name() == source)
+            .context("unknown collection source")?;
+        Ok(self.stale_publications[index].load(Ordering::Relaxed))
     }
 
     /// The source owner calls this after explicit repair/recovery. Ordinary commits and
@@ -359,12 +383,22 @@ impl Reactor {
 async fn run(store: Weak<Store>, registry: Arc<Registry>, stopped: Arc<AtomicBool>) {
     let mut first = 0;
     let mut failed = BTreeMap::<usize, u64>::new();
+    let mut backoffs = BTreeMap::<usize, StaleBackoff>::new();
     loop {
         let mut more = false;
         let mut deadline = None::<u64>;
         for offset in 0..registry.sources.len() {
             let index = (first + offset) % registry.sources.len();
             let retry = registry.retries[index].load(Ordering::Acquire);
+            if let Some(backoff) = backoffs.get(&index) {
+                if backoff.retry != retry {
+                    backoffs.remove(&index);
+                } else if backoff.until_ms > clock_ms() {
+                    deadline =
+                        Some(deadline.map_or(backoff.until_ms, |old| old.min(backoff.until_ms)));
+                    continue;
+                }
+            }
             if failed.get(&index) == Some(&retry) {
                 continue;
             }
@@ -373,89 +407,114 @@ async fn run(store: Weak<Store>, registry: Arc<Registry>, stopped: Arc<AtomicBoo
             };
             let worker = registry.clone();
             let stop = stopped.clone();
-            let result = tokio::task::spawn_blocking(move || -> Result<(bool, Option<u64>)> {
-                if stop.load(Ordering::Acquire) {
-                    return Ok((false, None));
-                }
-                let source = &worker.sources[index];
-                let mut committed = false;
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let capture = reader.read_snapshot(|_| {
-                        source.capture(
-                            &reader,
-                            &reader.readers.get(),
-                            &worker.cx,
-                            clock_ms(),
-                            BUDGET,
-                        )
-                    })?;
-                    // The source snapshot has ended before preparation or writer admission.
-                    let page = capture
-                        .work
-                        .map(|facts| facts.prepare(&worker.cx))
-                        .transpose()?;
-                    let Some(page) = page else {
-                        return Ok((false, capture.wake_at_unix_ms));
-                    };
+            let result =
+                tokio::task::spawn_blocking(move || -> Result<(bool, Option<u64>, bool)> {
                     if stop.load(Ordering::Acquire) {
-                        return Ok((false, None));
+                        return Ok((false, None, false));
                     }
-                    let mut writer = reader.connection.write_background();
-                    if stop.load(Ordering::Acquire) {
-                        return Ok((false, None));
-                    }
-                    let tx = writer.transaction()?;
-                    let publication = page.publish(&reader, &tx, &worker.cx, clock_ms())?;
-                    tx.commit()?;
-                    committed = true;
-                    // Guard return completes commit observers before any cache is exposed.
-                    // A refused/rolled-back commit drops the action without executing it.
-                    drop(writer);
-                    let stale = if let Some(action) = publication.after_commit {
+                    let source = &worker.sources[index];
+                    let mut committed = false;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let capture = reader.read_snapshot(|_| {
+                            source.capture(
+                                &reader,
+                                &reader.readers.get(),
+                                &worker.cx,
+                                clock_ms(),
+                                BUDGET,
+                            )
+                        })?;
+                        // The source snapshot has ended before preparation or writer admission.
+                        let page = capture
+                            .work
+                            .map(|facts| facts.prepare(&worker.cx))
+                            .transpose()?;
+                        let Some(page) = page else {
+                            return Ok((false, capture.wake_at_unix_ms, false));
+                        };
                         if stop.load(Ordering::Acquire) {
-                            return Ok((false, None));
+                            return Ok((false, None, false));
                         }
-                        reader.read_snapshot(|_| {
-                            anyhow::ensure!(
-                                !worker.unavailable[index].load(Ordering::Acquire),
-                                "collection source unavailable after commit"
-                            );
-                            action.publish(&reader, &reader.readers.get(), &worker.cx, clock_ms())
-                        })?
-                    } else {
-                        false
-                    };
-                    Ok((publication.more || stale, capture.wake_at_unix_ms))
-                }))
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("collection source callback panicked")));
-                if let Err(error) = &result {
-                    // A storage failure is not evidence of missing native capture. Preserve
-                    // the rolled-back source lifetime and retry through the same queue.
-                    if !committed && storage_failure(error) {
-                        return result;
+                        let mut writer = reader.connection.write_background();
+                        if stop.load(Ordering::Acquire) {
+                            return Ok((false, None, false));
+                        }
+                        let tx = writer.transaction()?;
+                        let publication = page.publish(&reader, &tx, &worker.cx, clock_ms())?;
+                        tx.commit()?;
+                        committed = true;
+                        // Guard return completes commit observers before any cache is exposed.
+                        // A refused/rolled-back commit drops the action without executing it.
+                        drop(writer);
+                        let stale = if let Some(action) = publication.after_commit {
+                            if stop.load(Ordering::Acquire) {
+                                return Ok((false, None, false));
+                            }
+                            reader.read_snapshot(|_| {
+                                anyhow::ensure!(
+                                    !worker.unavailable[index].load(Ordering::Acquire),
+                                    "collection source unavailable after commit"
+                                );
+                                action.publish(
+                                    &reader,
+                                    &reader.readers.get(),
+                                    &worker.cx,
+                                    clock_ms(),
+                                )
+                            })?
+                        } else {
+                            false
+                        };
+                        let stale = publication.stale || stale;
+                        Ok((publication.more || stale, capture.wake_at_unix_ms, stale))
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!("collection source callback panicked"))
+                    });
+                    if let Err(error) = &result {
+                        // A storage failure is not evidence of missing native capture. Preserve
+                        // the rolled-back source lifetime and retry through the same queue.
+                        if !committed && storage_failure(error) {
+                            return result;
+                        }
+                        // Refuse reads immediately, including when writer admission or the
+                        // durable fence itself fails. Source factories use Registry::coverage.
+                        worker.unavailable[index].store(true, Ordering::Release);
+                        // Fence separately: precommit errors rolled back the page; postcommit
+                        // action errors cannot undo it and must refuse the committed state too.
+                        if stop.load(Ordering::Acquire) {
+                            return result;
+                        }
+                        let mut writer = reader.connection.write_background();
+                        if stop.load(Ordering::Acquire) {
+                            return result;
+                        }
+                        let tx = writer.transaction()?;
+                        worker.fence(&tx, index, &format!("collection reactor: {error:#}"))?;
+                        tx.commit()?;
                     }
-                    // Refuse reads immediately, including when writer admission or the
-                    // durable fence itself fails. Source factories use Registry::coverage.
-                    worker.unavailable[index].store(true, Ordering::Release);
-                    // Fence separately: precommit errors rolled back the page; postcommit
-                    // action errors cannot undo it and must refuse the committed state too.
-                    if stop.load(Ordering::Acquire) {
-                        return result;
-                    }
-                    let mut writer = reader.connection.write_background();
-                    if stop.load(Ordering::Acquire) {
-                        return result;
-                    }
-                    let tx = writer.transaction()?;
-                    worker.fence(&tx, index, &format!("collection reactor: {error:#}"))?;
-                    tx.commit()?;
-                }
-                result
-            })
-            .await;
+                    result
+                })
+                .await;
             match result {
-                Ok(Ok((pending, wake))) => {
-                    more |= pending;
+                Ok(Ok((pending, wake, stale))) => {
+                    if stale {
+                        registry.stale_publications[index].fetch_add(1, Ordering::Relaxed);
+                        let backoff = backoffs.entry(index).or_insert(StaleBackoff {
+                            retry,
+                            failures: 0,
+                            until_ms: 0,
+                        });
+                        backoff.failures = backoff.failures.saturating_add(1);
+                        let delay = (25u64 << backoff.failures.saturating_sub(1).min(7)).min(2000);
+                        backoff.until_ms = clock_ms().saturating_add(delay);
+                        deadline = Some(
+                            deadline.map_or(backoff.until_ms, |old| old.min(backoff.until_ms)),
+                        );
+                    } else {
+                        backoffs.remove(&index);
+                        more |= pending;
+                    }
                     if let Some(wake) = wake {
                         deadline = Some(deadline.map_or(wake, |old| old.min(wake)));
                     }
@@ -493,6 +552,12 @@ async fn run(store: Weak<Store>, registry: Arc<Registry>, stopped: Arc<AtomicBoo
             tokio::select! { _ = registry.wake.notified() => {}, _ = due => {} }
         }
     }
+}
+
+struct StaleBackoff {
+    retry: u64,
+    failures: u32,
+    until_ms: u64,
 }
 
 fn storage_failure(error: &anyhow::Error) -> bool {
