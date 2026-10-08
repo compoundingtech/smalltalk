@@ -3232,12 +3232,14 @@ impl Store {
         &self, index: u64, max_age: std::time::Duration,
     ) -> Result<Option<runtime::AgentResourcesEntry>> {
         let now = now_ms();
+        let local = roster_local_frontier(&self.readers.get(), index)?;
         let entry = self.smalltalk.agent_resources_cache.lock()
-            .expect("agent resources cache poisoned").iter().rev()
-            .find(|entry| !entry.history && entry.covered.is_none() && entry.index <= index
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| !entry.history && entry.covered.is_none() && entry.index <= index
+                && entry.local <= local
                 && entry.published_at.elapsed() < max_age
                 && entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry))
-            .cloned();
+            .max_by_key(|entry| (entry.index, entry.local, entry.published_at)).cloned();
         let Some(entry) = entry else { return Ok(None) };
         if entry.index != index {
             let Some(delta) = self.changed_agent_resources(entry.index, index, &entry.items)? else {

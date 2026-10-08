@@ -4304,7 +4304,9 @@ fn recent_agent_page(
     let expires = client_now_ms().saturating_add(
         AGENT_ROSTER_MAX_STALE.saturating_sub(age).as_millis(),
     );
-    for card in &mut cards {
+    let refreshing = state.store.agent_resources_cached_at(index, false, None)
+        .map_err(ApiError::internal)?.is_none();
+    for card in cards.iter_mut().filter(|_| refreshing) {
         card["roster_cache"] = json!({
             "state":"refreshing", "age_ms":age.as_millis(),
             "max_age_ms":AGENT_ROSTER_MAX_STALE.as_millis(),
@@ -22876,13 +22878,38 @@ mission "wake" state="ready" {
                     let intent = crate::graph::parse_test_intent(source, "node").unwrap();
                     roster_fixture_apply(&store, &intent, "stale-owner-guard");
                 }
-                "unknown" => roster_fixture_append(&store, "custom/stale", "custom.stale", json!({"value":1})),
+                "unknown" => roster_fixture_append(&store, "custom/roster/stale", "custom.roster.note", json!({"value":1})),
                 "replay" => store.forget_current_views(),
                 _ => unreachable!(),
             }
             assert!(store.recent_agent_roster(store.index().unwrap(), AGENT_ROSTER_MAX_STALE).unwrap().is_none(),
                 "{change} must require a fresh roster");
         }
+    }
+
+    #[test]
+    fn agent_roster_stale_never_borrows_future_local_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = "version 2\nagent \"amber\" { command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        roster_fixture_apply(&state.store, &intent, "stale-local-cut");
+        let old_index = state.store.index().unwrap();
+        checked_agent_cache(&state.store, false, old_index);
+        state.store.read_snapshot(|index| {
+            std::thread::scope(|scope| {
+                let store = state.store.clone();
+                scope.spawn(move || {
+                    store.append_local_observations_for_test(&[roster_local_timeline()]);
+                    checked_agent_cache(&store, false, index);
+                }).join().unwrap();
+            });
+            let old = state.store.recent_agent_roster(index, AGENT_ROSTER_MAX_STALE)?.unwrap();
+            assert_eq!(old.local, 0, "the pinned earlier snapshot cannot borrow a later local frontier");
+            Ok(())
+        }).unwrap();
+        let current = state.store.recent_agent_roster(old_index, AGENT_ROSTER_MAX_STALE).unwrap().unwrap();
+        assert!(current.local > 0, "the later snapshot must capture its actual local frontier");
     }
 
     #[test]
