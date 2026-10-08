@@ -80,7 +80,7 @@ the source. `.qualification-started` prevents another attempt after interruption
 `qualification.json` records exact pins, limits, cut, namespace, job progress,
 sixteen counts and measurements on success. Private bounded stdout/stderr stay
 beside it; publish only metadata receipts, never source contents. Setup and
-Installer job refusals retain their phase and at most2048 UTF-8 bytes of cause
+Installer job refusals retain their phase and at most 2048 UTF-8 bytes of cause
 in private child stderr. Public child stdout remains the generic unavailable
 result. A failure before child execution records a null child exit code and the
 named resource setup phase (nice or RLIMIT_AS/FSIZE/CPU/NOFILE) when available;

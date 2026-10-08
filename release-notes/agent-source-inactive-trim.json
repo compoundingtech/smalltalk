@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "Keep ordinary observation retention on its existing autocommit path",
+  "summary": "Restore native autocommit observation retention when the agent source is inactive",
   "replay": {
     "status": "none",
     "detail": "No replay, backfill or source extraction change."
@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "none",
-    "detail": "Only an explicitly enabled agent collection source uses managed bounded trim transactions; ordinary Store retention executes the original SQL in autocommit."
+    "detail": "Restores main's original autocommit retention on an ordinary Store, correcting the explicit transactions introduced by the prior unmerged branch. An explicitly installed agent collection source still uses bounded managed capture transactions."
   },
   "downtime": {
     "status": "none",
