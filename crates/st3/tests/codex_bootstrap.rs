@@ -99,12 +99,14 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
             .map(|dir| dir.join(name))
             .find(|p| p.is_file())
     };
-    let (Some(pty), Some(python)) = (on_path("pty"), on_path("python3")) else {
+    let (Some(pty), Some(python), Some(bash)) =
+        (on_path("pty"), on_path("python3"), on_path("bash"))
+    else {
         assert!(
             std::env::var_os("CI").is_none(),
-            "CI must provide pty and python3"
+            "CI must provide pty, python3 and bash"
         );
-        eprintln!("skipped: the delayed delivery proof needs pty and python3");
+        eprintln!("skipped: the delayed delivery proof needs pty, python3 and bash");
         return;
     };
     let root_path = tempfile::tempdir().unwrap().keep();
@@ -282,7 +284,7 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
             command.arg("--env").arg(format!("{key}={value}"));
         }
         if bound_shell {
-            command.args(["--", "bash", "--noprofile", "--norc", "-c",
+            command.args(["--", bash.to_str().unwrap(), "--noprofile", "--norc", "-c",
                 "while [ ! -e \"$HOME/launch-bound-codex\" ]; do sleep 0.02; done; \"$ST3_BIN\" driver codex --subject \"$ST_AGENT\" -- \"$HOME/provider\"; printf '%s' \"$?\" > \"$HOME/driver-returned\"; while :; do sleep 1; done"]);
         } else {
             command.arg("--").arg(binary).args(["driver", "codex", "--subject", SUBJECT, "--"]).arg(provider);
@@ -321,7 +323,24 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
         observation.pid.unwrap(),
         observation.created_at.unwrap()
     );
-    let shell_generation = st_runtime::process_start_token(observation.pid.unwrap()).unwrap();
+    let shell_pid = if bound_shell {
+        let stats: Value = serde_json::from_str(
+            &pty_core::registry::with_root(&root.join("pty"), || {
+                pty_client::query_status_json(RUNTIME, pty_client::STATS_TIMEOUT)
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stats["daemon"]["pid"].as_u64(),
+            observation.pid.map(u64::from)
+        );
+        assert_eq!(stats["process"]["alive"], true);
+        stats["process"]["pid"].as_u64().unwrap() as u32
+    } else {
+        observation.pid.unwrap()
+    };
+    let shell_generation = st_runtime::process_start_token(shell_pid).unwrap();
     let incarnation = if bound_shell {
         let invocation = "019a0000-0000-7000-8000-000000000004";
         let source = format!(
@@ -363,7 +382,13 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
             .get(&format!("/v1/client/agents/{SUBJECT}"))
             .await
             .unwrap();
-        if agent["delivery"]["state"] == "outdated" {
+        if agent["delivery"]["state"] == "outdated"
+            && lease_evidence(root)["sequence"].as_u64().unwrap() > 0
+            && matches!(
+                agent["harness_state"].as_str(),
+                Some("ready" | "idle" | "working")
+            )
+        {
             break agent;
         }
         assert!(
@@ -655,7 +680,7 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
             "0"
         );
         assert_eq!(
-            st_runtime::process_start_token(observation.pid.unwrap()).unwrap(),
+            st_runtime::process_start_token(shell_pid).unwrap(),
             shell_generation
         );
         assert_eq!(
