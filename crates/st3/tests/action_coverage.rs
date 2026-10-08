@@ -2880,6 +2880,9 @@ def start():
     child = subprocess.Popen([os.environ['ST3_COVERAGE_BINARY'], 'up', '--config', str(root / 'config/st3/config.toml'), '--pty-binary', str(root / 'bin/pty')], stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     pid_file.write_text(str(child.pid))
 if 'show' in args:
+    if 'st3-replication.service' in args and not (root / 'config/systemd/user/st3-replication.service').exists():
+        print('LoadState=not-found\nActiveState=inactive\nSubState=dead')
+        sys.exit(4)
     print('LoadState=loaded\nActiveState=active\nSubState=running')
 elif 'st3-replication.service' in args and not (root / 'config/systemd/user/st3-replication.service').exists():
     print('Failed to stop st3-replication.service: Unit not loaded.', file=sys.stderr)

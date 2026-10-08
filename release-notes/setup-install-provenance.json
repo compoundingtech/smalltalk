@@ -7,5 +7,5 @@
   "compatibility": {"status": "changed", "detail": "When setup copies st3, st and pty into ~/.local/bin, it records their absolute paths in the user's st3 data directory. Managed executables kept in place and --install false are not adopted."},
   "downtime": {"status": "none", "detail": "No automatic daemon restart or fleet downtime is added."},
   "manual": {"status": "changed", "detail": "st uninstall can remove files recorded by future setup installs. Earlier unrecorded installs still require manual binary removal."},
-  "recovery": {"status": "changed", "detail": "The install record follows XDG_DATA_HOME or ~/.local/share and is saved atomically. Missing replication service files are skipped during stop, restart and uninstall; failures stopping installed units are reported."}
+  "recovery": {"status": "changed", "detail": "The install record follows XDG_DATA_HOME or ~/.local/share and is saved atomically. Failed optional stop/disable operations are quiet only when the user manager confirms the unit is absent and inactive. Loaded-unit failures, even with a missing unit file, are reported before cleanup."}
 }

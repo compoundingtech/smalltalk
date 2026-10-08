@@ -259,7 +259,25 @@ fn removing_services_skips_absent_replication_but_preserves_installed_unit_error
         return;
     }
     let fixture = Fixture::new();
-    fs::write(fixture.path("bin/systemctl"), "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/manager.log\"\ncase \"$*\" in *st3-replication.service*) echo 'replication unit denied' >&2; exit 7;; esac\n").unwrap();
+    fs::write(
+        fixture.path("bin/systemctl"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/manager.log"
+if [ "$2" = show ]; then
+    if [ -f "$HOME/.config/systemd/user/$3" ] || [ -f "$HOME/loaded-replication" ]; then
+        printf 'LoadState=loaded\nActiveState=active\nSubState=running\n'
+        exit 0
+    fi
+    printf 'LoadState=not-found\nActiveState=inactive\nSubState=dead\n'
+    exit 4
+fi
+case "$*" in
+    *st3-replication.service*) echo 'replication unit denied' >&2; exit 7;;
+    *st3.service*) echo 'Unit not loaded' >&2; exit 5;;
+esac
+"#,
+    )
+    .unwrap();
     fs::set_permissions(
         fixture.path("bin/systemctl"),
         fs::Permissions::from_mode(0o755),
@@ -273,26 +291,30 @@ fn removing_services_skips_absent_replication_but_preserves_installed_unit_error
     success(&output);
     assert!(output.stderr.is_empty());
     let log = fixture.path("home/manager.log");
-    assert_eq!(fs::read_to_string(&log).unwrap(), "--user daemon-reload\n");
+    assert!(
+        fs::read_to_string(&log)
+            .unwrap()
+            .ends_with("--user daemon-reload\n")
+    );
     fs::write(&log, "").unwrap();
     let unit = fixture.path("home/.config/systemd/user/st3-replication.service");
     fs::create_dir_all(unit.parent().unwrap()).unwrap();
     fs::write(&unit, "installed replication unit").unwrap();
-    let output = fixture
-        .cli()
-        .args(["service", "uninstall"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("replication unit denied"));
-    assert!(
-        unit.exists(),
-        "a failed disable must preserve the installed unit"
-    );
-    assert_eq!(
-        fs::read_to_string(&log).unwrap(),
-        "--user disable --now st3-replication.service\n"
-    );
+    for file_present in [true, false] {
+        if !file_present {
+            fs::remove_file(&unit).unwrap();
+            fs::write(fixture.path("home/loaded-replication"), "loaded service").unwrap();
+        }
+        let output = fixture
+            .cli()
+            .args(["service", "uninstall"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("replication unit denied"));
+        assert_eq!(unit.exists(), file_present);
+        assert!(!fs::read_to_string(&log).unwrap().contains("daemon-reload"));
+    }
 }
 
 #[test]
