@@ -6510,6 +6510,27 @@ mod tests {
     }
 
     #[test]
+    fn initial_subject_waits_for_a_restored_glass_then_opens_its_conversation_tab() {
+        let mut ui = glass();
+        let agent = ui.world.agents.items()[0].id.clone();
+        let before = tabs(&ui);
+        let mut subject = Some(agent.clone());
+        super::super::live::focus_initial_subject(&mut ui, &mut subject, true, false);
+        assert_eq!(tabs(&ui), before);
+        assert!(subject.is_some());
+        let world = ui.world.clone();
+        ui.glasses_from_graph(vec![graph_glass("0190-main", "r1", "main", &[WEEKLY])]);
+        ui.set_world(world);
+        super::super::live::focus_initial_subject(&mut ui, &mut subject, true, true);
+        assert_eq!(tabs(&ui).2, vec![vec![WEEKLY.to_owned(), format!("agent:{agent}")]]);
+        assert_eq!(ui.focus(), (1, Some(agent.clone())));
+        assert_eq!(ui.live_conversations()[0], agent);
+        assert!(!ui.editing);
+        assert!(ui.terminal.is_none());
+        assert!(subject.is_none());
+    }
+
+    #[test]
     fn a_device_with_no_glasses_shows_sts_glass_of_that_name_instead_of_making_another() {
         let mut ui = glass();
         assert_eq!(ui.glasses.as_ref().unwrap().glass().name, "main");
