@@ -170,7 +170,7 @@ scripts/onboarding-content-eval --archive /tmp/content-candidate.tar.gz \
 The first two authorized paid attempts on content500 each made one successful
 native model request, then failed the fixture's next token-count preflight with
 HTTP400. Their usage-derived total was $0.070646. All semantic gates remain
-untested; neither run reached a person question. The failed receipts are retained.
+untested; neither run reached a person question. The failed receipts, cleanup and exact offline source/script hashes are retained in the [native evaluation evidence](../scripts/onboarding-evidence/2026-10-08/content-native-claude.json).
 The offline correction follows the [official beta `countTokens` implementation](https://github.com/anthropics/anthropic-sdk-typescript/blob/main/src/resources/beta/messages/messages.ts) endpoint/header
 and preserves native tool-result/context fields. Its sanitized native-shape and
 HTTPS first-error guard tests pass, but the correction has not been rerun against

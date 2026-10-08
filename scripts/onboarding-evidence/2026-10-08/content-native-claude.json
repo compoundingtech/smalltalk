@@ -1,0 +1,122 @@
+{
+  "classification": "Plain enabled-plugin MCP PASS. Two paid native semantic attempts FAILED in the fixture. All nine semantic gates UNTESTED.",
+  "refs": {
+    "paid-1": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-native-failed-1@90b658e1af33f453ce220a95e991e24e0fbcec384a529e430f83f0fcd1e84e6e",
+    "paid-2": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-native-failed-2@d09dbc8b2bbbb9b5f4af1c79fff151371a63e2f6b58cbddc73259ff29465a672",
+    "execution-summary": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-native-execution-summary@ba140222229916f81ddfa35843016439dd35e20c77c0afc03b7e7405264c8bc5",
+    "preparation": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-native-preparation@9cb1f37b2ed0814aafa3091f3a26c5643da5b4444eb94ea6a72dc66c3c25c510"
+  },
+  "plain_proof": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-plain-proof@efb398a096ff9e74b6039eddb8fc76dc8af59d7f795fc424133658927a760abc",
+  "candidate_source": "500159eb2f487e87e074efb0740b9579dde12ac5",
+  "archive_sha256": "ecaaaa9f88ff33ff5bd0c4e71dcbded6b8711d1029c97780c0092b4e7d56f500",
+  "native_claude_version": "2.1.293",
+  "native_claude_sha256": "8968405e26db478af44eabc4635ab5ca557057b702a54460a59c13e1b253e978",
+  "offline_source": "457640dd035a9d66e109d033d8a9d2979e9480b7",
+  "offline_scripts_sha256": {
+    "scripts/onboarding-content-eval": "67e281d8060c009434ba8224f0f6738de5a7bab6221531257b03889803b3f8c8",
+    "scripts/onboarding-plain-claude": "9376254dd6b720bc9ce0fbd6b1dc3592b889c7ca8d73e4b86e64efc89a1ff240",
+    "scripts/onboarding-fixtures/claude_eval_broker.py": "90cc814bf418c7dfa27bbea0f3e67fc579875ddcaf2c8304f89c26acd07afda3",
+    "scripts/onboarding-fixtures/claude_welcome.py": "2a8333ff970c46e84809e33d1baff052b8a0e928c8d0f6bc4f159f7994c5858b",
+    "scripts/onboarding-fixtures/content_persona.py": "e4053cf8288222a00120e299b9c72939227cfa1fcc51b4252db98eec40325dcb",
+    "scripts/onboarding-fixtures/count-native-tool-result.json": "92568a8ce1876b493f1d83f1b532ed04d4445c891d9ddf18dde3e9470e4871bc",
+    "scripts/onboarding-fixtures/test_content_eval.py": "aa8c6a5cd6a181b73b79e69570cf3db0327b56f7c83407958fa2b0d7731727a6"
+  },
+  "paid_attempts": 2,
+  "actual_model_calls": 2,
+  "actual_upstream_calls": 58,
+  "upstream_breakdown": {
+    "metadata": 52,
+    "count_preflights": 4,
+    "paid_messages": 2
+  },
+  "actual_usage": {
+    "input_tokens": 6,
+    "ephemeral_5m_cache_creation_input_tokens": 55612,
+    "ephemeral_1h_cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 225
+  },
+  "usage_cost_usd": 0.070646,
+  "per_variant_cost_usd": [
+    0.03101175,
+    0.03963425
+  ],
+  "cost_formula": "(6 * 1 + 55612 * 1.25 + 225 * 5) / 1000000 USD; published Haiku4.5 rates times actual provider usage, not an invoice",
+  "semantics": {
+    "hello": "UNTESTED",
+    "tour": "UNTESTED",
+    "first-mission": "UNTESTED",
+    "your-project": "UNTESTED",
+    "keep-running": "UNTESTED",
+    "phone": "UNTESTED",
+    "second-machine": "UNTESTED",
+    "github": "UNTESTED",
+    "wrap-up": "UNTESTED"
+  },
+  "failure": "Each genuine native model response was HTTP200 and claimed hello. The next fixture count preflight was HTTP400, so no second paid message was sent in either attempt. No person Home question or content gate was reached. The original guard did not retain the 400 error body: exact rejected field is unknown. Later local synthetic 401 came from the stopped fixture, not provider authentication.",
+  "endpoint_difference": "Initial zero-model loopback ANTHROPIC_BASE_URL preparation disabled channels. Final paid attempts retained the native Anthropic endpoint via guest-only HTTPS proxy and temporary NODE_EXTRA_CA_CERTS. Credential route guarded loader/private apiKeyHelper differs from the original omp-wrapper suggestion; no key stored in images/files/argv/environment/receipts.",
+  "offline_fix": "Beta count_tokens?beta=true, native betas plus token-counting-2024-11-01, preservation of native caller/tool_result/context fields. Retains sanitized count failure type/message and classifies local stopped responses as invalid_request_error rather than auth failure. Matches primary SDK contract; no provider retest.",
+  "tests": {
+    "command": "python3 -m unittest discover -s scripts/onboarding-fixtures -p 'test*.py'",
+    "passed": 28,
+    "real_provider_calls": 0,
+    "release_impact": "PASS effective source fa03d8df40f1a819b36d738afe1622cc0287e202 based on f2d25d9ce473ba0a1ae759576fffc610a17da38f; manual tooling classification"
+  },
+  "provenance_limit": "Exact candidate, native binary, raw receipt and current offline script hashes are pinned. A hash of the pre-fix uncommitted execution scripts was not captured before editing; current source is the offline correction, not a claim of byte-identical original execution tooling.",
+  "sources": {
+    "count_sdk": "https://github.com/anthropics/anthropic-sdk-typescript/blob/main/src/resources/beta/messages/messages.ts",
+    "pricing": "https://platform.claude.com/docs/en/models/haiku-4-5/overview",
+    "proxy": "https://code.claude.com/docs/en/network-config"
+  },
+  "rerun_proposal": {
+    "state": "NOT authorized or executed; original two-attempt authorization exhausted",
+    "attempts_requested": 2,
+    "candidate": "same exact content500 archive and native 2.1.293 binary pinned above",
+    "runner": "offline_source/scripts hashes above; fresh sequential Ubuntu24 systemd UID42420 2 CPU/3 GiB no host mounts",
+    "limits": "$2/600 seconds/60 message requests per evaluation; Haiku4.5 main and small-fast model; output2048; no native subagent/web tools; first actual auth/rate error stops pair, no retry",
+    "variants": [
+      "current Home answers + separate optional skips + actual sample review/project approval",
+      "tour-help then fresh tour confirmation; first garden-plan decline then fresh acceptance; separate optional skips"
+    ],
+    "credential": "same specifically authorized guarded private helper only; no credential persistence, daemon env or publication",
+    "failure_policy": "No extra provider diagnostic/model calls. Preserve first failed result and usage; successful wrap-up requires actual current run plus all nine production gates."
+  },
+  "other_limits": [
+    "No paid Codex auth or evaluations",
+    "No semantic content pass",
+    "No real VM or Darwin claim",
+    "Native all-found integration matrix on hold for core passive-doctor artifact",
+    "No third paid attempt or provider debugging call"
+  ],
+  "cleanup": {
+    "paid_guest_names": [
+      "st-onboarding-49f2bfd707d5",
+      "st-onboarding-3347ce5b9d98"
+    ],
+    "seat_stop_exit_codes": [
+      0,
+      0
+    ],
+    "run_cancel_exit_codes": [
+      0,
+      0
+    ],
+    "container_absence": {
+      "argv": [
+        "docker",
+        "ps",
+        "-a",
+        "--filter",
+        "name=st-onboarding",
+        "--format",
+        "{{.Names}} {{.Status}}"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": "",
+      "slot_release": "message/132e0e92a7bf9eab"
+    },
+    "privacy_before_and_after": "PASS for both actual paid guests"
+  },
+  "summary_ref": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-native-failed-summary@192ccfc2defa4bc4546e1a31165a51524d152c8190d55008b7b6c90a89232fbc"
+}
