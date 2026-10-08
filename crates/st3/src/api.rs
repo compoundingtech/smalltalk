@@ -4236,7 +4236,8 @@ async fn client_agents(
     for admitted in [false, true] {
         // Serve the previous complete roster at its own cut while one reader refreshes.
         // Filtered/history requests retain the ordinary fresh path.
-        if admitted && query.cursor.is_none() && !query.history && query.status.is_none() {
+        if admitted && query.cursor.is_none() && !query.history
+            && client_page_filters("agents", &query).is_empty() {
             let reader = state.clone();
             let query = query.clone();
             let stale = blocking_store(move || {
@@ -22861,6 +22862,29 @@ mission "wake" state="ready" {
         assert_ne!(fresh.items, original.items, "the single background refresh must publish the changed card");
         assert!(recent_agent_continuation(&state, &snapshot, &cursor_query).is_err(),
             "a stale continuation cannot silently switch to the refreshed cut");
+    }
+
+    #[tokio::test]
+    async fn agent_roster_stale_does_not_satisfy_filtered_or_history_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.store = Arc::new(roster_followup_store());
+        checked_agent_cache(&state.store, false, state.store.index().unwrap());
+        let admission = state.store.admit_agent_resources().await;
+        state.store.append_claim(&roster_local_observation("harness.observed", json!({
+            "state":"working", "driver":"codex", "incarnation_id":"amber-1"
+        }))).unwrap();
+        for query in [
+            ClientListQuery { status: Some("running".into()), ..Default::default() },
+            ClientListQuery { actor: Some("person/test".into()), ..Default::default() },
+            ClientListQuery { person: Some("person/test".into()), ..Default::default() },
+            ClientListQuery { history: true, ..Default::default() },
+        ] {
+            assert!(tokio::time::timeout(Duration::from_millis(25),
+                client_agents(State(state.clone()), Extension(new_client_snapshot(&state)), Query(query)))
+                .await.is_err(), "filtered/history reads must await the fresh admission, never return old rows");
+        }
+        drop(admission);
     }
 
     #[test]
