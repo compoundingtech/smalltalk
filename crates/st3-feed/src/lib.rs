@@ -60,6 +60,9 @@ pub enum Window {
     Agents,
     /// The person's glasses, followed when requested and granted by st.
     Glasses,
+    /// A handful of counts (needs you, working agents, active missions, machines), followed when
+    /// st grants it: what the top bar says without following the whole missions window.
+    Summary,
 }
 
 impl Window {
@@ -71,13 +74,14 @@ impl Window {
             Self::Missions => "missions",
             Self::Agents => "agents",
             Self::Glasses => "glasses",
+            Self::Summary => "summary",
         }
     }
 
     fn from_id(id: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
-            .chain([Self::Glasses])
+            .chain([Self::Glasses, Self::Summary])
             .find(|window| window.id() == id)
     }
 
@@ -114,6 +118,9 @@ pub enum Update {
     },
     /// st refused a window; its last items stay.
     WindowFailed(Window, String),
+    /// st's window is no longer followed (a Missions list left the screen): the rows held for it
+    /// are out of date and must not be shown as current.
+    WindowStopped(Window),
     Terminal(TerminalUpdate),
     /// The open conversation's entries. `replace` means these are its newest page and every
     /// earlier entry is gone; otherwise they are new or revised entries, matched by ID.
@@ -163,6 +170,11 @@ pub enum Command {
         runtime_ids: Vec<String>,
     },
     Unfollow,
+    /// Follow the missions window or leave it: the whole window is large, so it is followed only while
+    /// a Missions list is on screen. A feed started with `run_members` follows it from the start.
+    Missions {
+        follow: bool,
+    },
     /// Keep exactly these agents' or sessions' conversations live, at most
     /// `MAX_CONVERSATIONS`: the first is the focused one. An empty list follows none.
     Converse {
@@ -219,11 +231,25 @@ pub async fn run_members(
     remote: bool,
     glasses: bool,
     updates: mpsc::Sender<Update>,
+    commands: channel::UnboundedReceiver<Command>,
+) {
+    run_members_with(clients, remote, glasses, true, updates, commands).await;
+}
+
+/// `run_members`, choosing whether the missions window is followed from the start. A UI that shows
+/// missions only sometimes starts without it and sends `Command::Missions`.
+pub async fn run_members_with(
+    clients: Vec<Client>,
+    remote: bool,
+    glasses: bool,
+    missions: bool,
+    updates: mpsc::Sender<Update>,
     mut commands: channel::UnboundedReceiver<Command>,
 ) {
     if clients.is_empty() {
         return;
     }
+    let mut missions = missions;
     let mut failures = 0_usize;
     let mut member = 0;
     let mut following: Option<Following> = None;
@@ -260,6 +286,7 @@ pub async fn run_members(
                 &mut commands,
                 &mut following,
                 &mut conversing,
+                &mut missions,
                 &mut failures,
             )
             .await
@@ -301,6 +328,7 @@ pub async fn run_members(
                     None => return,
                     Some(Command::Reconnect) => { failures = 0; break; }
                     Some(Command::Unfollow) => following = None,
+                    Some(Command::Missions { follow }) => missions = follow,
                     Some(Command::Converse { targets }) => {
                         conversing = targets.into_iter().take(MAX_CONVERSATIONS).map(Conversing::new).collect();
                     }
@@ -340,6 +368,7 @@ async fn connected(
     commands: &mut channel::UnboundedReceiver<Command>,
     following: &mut Option<Following>,
     conversing: &mut Vec<Conversing>,
+    missions: &mut bool,
     failures: &mut usize,
 ) -> Ended {
     // A blackholed network, or a wedged daemon, can leave a socket open and silent while the
@@ -354,8 +383,9 @@ async fn connected(
     // Glasses are followed only where st grants them in the shape this stui reads (splits of
     // tab groups, version 1); elsewhere stui keeps them on the device. A member still on the
     // earlier shape would send glasses this stui cannot decode, and that drops the connection.
+    let capabilities = client.capabilities().await.ok();
     let version = if glasses {
-        client.capabilities().await.ok().and_then(|capabilities| {
+        capabilities.as_ref().and_then(|capabilities| {
             capabilities
                 .value
                 .capabilities
@@ -370,6 +400,14 @@ async fn connected(
     } else {
         None
     };
+    // The summary exists only where st grants it; an older member has no such collection.
+    let summary = capabilities.as_ref().is_some_and(|capabilities| {
+        capabilities.value.capabilities.iter().any(|capability| {
+            capability.id == "summary"
+                && capability.version >= 1
+                && capability.state == CapabilityState::Granted
+        })
+    });
     // From version 2 a glass's splits keep their sizes in st.
     if let Some(version) = version
         && updates.send(Update::GlassesVersion(version)).is_err()
@@ -379,7 +417,9 @@ async fn connected(
     let granted = version.is_some();
     for window in Window::ALL
         .into_iter()
+        .filter(|window| *window != Window::Missions || *missions)
         .chain(granted.then_some(Window::Glasses))
+        .chain(summary.then_some(Window::Summary))
     {
         if let Err(error) = stream
             .subscribe(window.id(), window.id(), window.limit(), None, None)
@@ -550,6 +590,25 @@ async fn connected(
                     return Ended::Closed;
                 }
                 Some(Command::Unfollow) => stop_following(client, stream, following).await,
+                Some(Command::Missions { follow }) => {
+                    if follow == *missions {
+                        continue;
+                    }
+                    *missions = follow;
+                    if follow {
+                        if let Err(error) = stream.subscribe(Window::Missions.id(), Window::Missions.id(), Window::Missions.limit(), None, None).await {
+                            return Ended::Dropped(error.to_string());
+                        }
+                    } else {
+                        let _ = stream.unsubscribe(Window::Missions.id()).await;
+                        windows.remove(&Window::Missions);
+                        window_retries.loaded(Window::Missions);
+                        pending_reports.retain(|(pending, _, _)| *pending != Window::Missions);
+                        if updates.send(Update::WindowStopped(Window::Missions)).is_err() {
+                            return Ended::Closed;
+                        }
+                    }
+                }
                 Some(Command::Converse { targets }) => {
                     let targets = targets.into_iter().take(MAX_CONVERSATIONS).collect::<Vec<_>>();
                     // Leave what is no longer shown; keep what still is, subscribed as it is.
@@ -624,6 +683,9 @@ async fn connected(
             }
             () = tokio::time::sleep_until(window_at.unwrap_or_else(Instant::now)), if window_at.is_some() => {
                 for window in window_retries.due(Instant::now()) {
+                    if window == Window::Missions && !*missions {
+                        continue;
+                    }
                     if let Err(error) = stream.subscribe(window.id(), window.id(), window.limit(), None, None).await {
                         return Ended::Dropped(error.to_string());
                     }
@@ -1297,6 +1359,76 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn the_missions_window_is_followed_only_when_asked_and_left_when_not_wanted() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let app = st3::api::router(test_state(root.path()));
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !socket.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (commands, command_receiver) = channel::unbounded_channel();
+        let feed = tokio::spawn(run_members_with(
+            vec![Client::unix_as(&socket, "person/avery")],
+            false,
+            false,
+            false,
+            tx,
+            command_receiver,
+        ));
+        // Started without missions: attention and agents arrive, missions never do.
+        let mut seen = std::collections::BTreeSet::new();
+        let wait = |want: Box<dyn Fn(&Update) -> bool>| {
+            let rx = &rx;
+            async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        match rx.try_recv() {
+                            Ok(update) if want(&update) => return update,
+                            Ok(_) => {}
+                            Err(mpsc::TryRecvError::Empty) => {
+                                tokio::time::sleep(Duration::from_millis(10)).await
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => panic!("the feed stopped"),
+                        }
+                    }
+                })
+                .await
+                .expect("the update arrives")
+            }
+        };
+        while seen.len() < 2 {
+            if let Update::Window { window, .. } =
+                wait(Box::new(|update| matches!(update, Update::Window { .. }))).await
+            {
+                assert_ne!(window, Window::Missions, "missions are not followed yet");
+                seen.insert(window);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        while let Ok(update) = rx.try_recv() {
+            assert!(
+                !matches!(update, Update::Window { window: Window::Missions, .. }),
+                "no missions window while not followed"
+            );
+        }
+        // Asked for, the window arrives; left, it is stopped and no longer current.
+        commands.send(Command::Missions { follow: true }).unwrap();
+        wait(Box::new(|update| matches!(update, Update::Window { window: Window::Missions, .. }))).await;
+        commands.send(Command::Missions { follow: false }).unwrap();
+        wait(Box::new(|update| matches!(update, Update::WindowStopped(Window::Missions)))).await;
+        drop(commands);
+        tokio::time::timeout(Duration::from_secs(5), feed).await.unwrap().unwrap();
         server.abort();
     }
 
