@@ -80,9 +80,13 @@ without blocking command admission or unrelated ready frames.
 An `error` frame reports a permanent refusal and ends that subscription. A
 `resync` frame with `retryable: true` reports a temporary read failure; the server
 keeps the subscription and retries after its reread interval, including when the
-first snapshot failed. A followed conversation's `resync` also carries the failure's
-`code` and `message`, such as `remote-unavailable` while the owner's host cannot be
-reached, so a client still showing its last copy can say that copy is stale. Clients may resubscribe with the same ID to request a
+first snapshot failed. Once admitted, an opening remote conversation subscription
+starts retries for `remote-unavailable` failures for up to three seconds, with 250 ms
+between attempts. An admitted read keeps the normal peer RPC deadline, so a slow
+successful page is not canceled by the retry-start window. A persistent outage still
+reports `resync`. Other refusals and established conversations do not use this grace.
+A followed conversation's `resync` also carries the failure's `code` and `message`,
+so a client still showing its last copy can say that copy is stale. Clients may resubscribe with the same ID to request a
 fresh snapshot. If the socket closes, including during a daemon
 restart, open a new socket and subscribe again; the new snapshot is authoritative.
 Each socket subscribes to store changes before taking its first snapshot, so a
@@ -126,8 +130,9 @@ joined in. The first `conversation` frame carries `id`, `collection` (`conversat
 carry `replace: false` and the entries that changed since; an entry revised in place arrives
 again with its new revision. When too much changed for one frame, or a change can no longer be
 replayed, the newest page arrives again with `replace: true`. An `error` frame ends that
-subscription only, for example while the owning host is unreachable. After a dropped socket,
-subscribe again on the new one.
+subscription only, for example when a session is absent or access is forbidden.
+When an owner read fails, retryable `resync` retains the admitted subscription.
+After a dropped socket, subscribe again on the new one.
 
 `has_more` describes history before the replacement window, not whether a delta has more
 changes. Delta frames omit it: absence means preserve the last known availability, never

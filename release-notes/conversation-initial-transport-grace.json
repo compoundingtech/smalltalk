@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep an opening conversation subscription through brief owner transport failures",
+  "replay": { "status": "none", "detail": "No claim or replay changes. Initial retries capture a fresh page and replay boundary together." },
+  "schema": { "status": "none", "detail": "No database schema or migration changes." },
+  "rules": { "status": "none", "detail": "No checkpoint rule or coordinated fleet upgrade changes." },
+  "compatibility": { "status": "none", "detail": "The collections protocol is unchanged. An admitted remote conversation subscription starts retries for remote-unavailable for up to three seconds before its first frame, with admitted reads retaining existing peer RPC deadlines. Persistent outages still report resync. Other refusals and established subscriptions keep their existing behavior." },
+  "downtime": { "status": "none", "detail": "No additional interruption beyond a normal daemon upgrade." },
+  "manual": { "status": "none", "detail": "No configuration or migration steps required." },
+  "recovery": { "status": "none", "detail": "No persistent changes are introduced; existing binary swap-back behavior is unchanged." }
+}
