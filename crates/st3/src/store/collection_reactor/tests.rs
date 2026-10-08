@@ -21,6 +21,7 @@ struct Fixture {
     fence_failures: AtomicUsize,
     arm_fence_failure: Arc<AtomicBool>,
     panic_publish: Arc<AtomicBool>,
+    after_commit_failure: Arc<AtomicUsize>,
 }
 
 struct Gate {
@@ -160,6 +161,7 @@ impl Source for Fixture {
                     fail_fence: self.fail_fence.clone(),
                     arm_fence_failure: self.arm_fence_failure.clone(),
                     panic_publish: self.panic_publish.clone(),
+                    after_commit_failure: self.after_commit_failure.clone(),
                 }) as Box<dyn Captured>
             }),
             wake_at_unix_ms: None,
@@ -179,6 +181,7 @@ struct Facts {
     fail_fence: Arc<AtomicBool>,
     arm_fence_failure: Arc<AtomicBool>,
     panic_publish: Arc<AtomicBool>,
+    after_commit_failure: Arc<AtomicUsize>,
 }
 impl Captured for Facts {
     fn prepare(self: Box<Self>, _: &Context) -> Result<Box<dyn Page>> {
@@ -207,7 +210,7 @@ impl Page for Facts {
         tx: &Transaction<'_>,
         _: &Context,
         _: u64,
-    ) -> Result<bool> {
+    ) -> Result<Publication> {
         let current = tx
             .query_row(
                 "SELECT value FROM local_fixture_reactor_pending WHERE source=?1",
@@ -216,7 +219,7 @@ impl Page for Facts {
             )
             .optional()?;
         if current != Some(self.value) {
-            return Ok(true);
+            return Ok(true.into());
         }
         tx.execute("INSERT INTO local_fixture_reactor_output VALUES(?1,?2) ON CONFLICT(source) DO UPDATE SET value=excluded.value", params![self.source,self.value])?;
         if self.storage_failure.load(Ordering::SeqCst) {
@@ -238,6 +241,19 @@ impl Page for Facts {
             "DELETE FROM local_fixture_reactor_pending WHERE source=?1",
             [self.source],
         )?;
+        let fault = self.after_commit_failure.load(Ordering::SeqCst);
+        Ok(Publication {
+            more: false,
+            after_commit: (fault != 0)
+                .then(|| Box::new(AfterCommitFault(fault)) as Box<dyn AfterCommit>),
+        })
+    }
+}
+
+struct AfterCommitFault(usize);
+impl AfterCommit for AfterCommitFault {
+    fn publish(self: Box<Self>, _: &Store, _: &Connection, _: &Context, _: u64) -> Result<bool> {
+        hook_fault(self.0)?;
         Ok(false)
     }
 }
@@ -262,6 +278,7 @@ fn source(
         fence_failures: AtomicUsize::new(0),
         arm_fence_failure: Arc::new(AtomicBool::new(false)),
         panic_publish: Arc::new(AtomicBool::new(false)),
+        after_commit_failure: Arc::new(AtomicUsize::new(0)),
     })
 }
 
@@ -772,6 +789,9 @@ async fn an_idle_siblings_capture_hook_failure_does_not_fence_valid_publication(
 struct CacheOnly {
     ready: Arc<Mutex<Option<u64>>>,
     fail: AtomicBool,
+    commit_failure: AtomicUsize,
+    publications: Arc<AtomicUsize>,
+    refused_commits: AtomicUsize,
 }
 impl Source for CacheOnly {
     fn name(&self) -> &'static str {
@@ -789,6 +809,13 @@ impl Source for CacheOnly {
     fn open(&self, tx: &Transaction<'_>, cx: &Context) -> Result<()> {
         cx.installer
             .register_source(tx, self.name(), "fixture.cache-only.v1", 1)
+    }
+    fn commit(&self, _: &Transaction<'_>, _: &Context) -> Result<()> {
+        let fault = self.commit_failure.load(Ordering::SeqCst);
+        if fault != 0 {
+            self.refused_commits.fetch_add(1, Ordering::SeqCst);
+        }
+        hook_fault(fault)
     }
     fn capture(
         &self,
@@ -809,6 +836,7 @@ impl Source for CacheOnly {
                 Box::new(CacheMarker {
                     index,
                     ready: self.ready.clone(),
+                    publications: self.publications.clone(),
                 }) as Box<dyn Captured>
             }),
             wake_at_unix_ms: None,
@@ -816,12 +844,18 @@ impl Source for CacheOnly {
     }
     fn coverage(&self, store: &Store, c: &Connection, cx: &Context, _: u64) -> Result<bool> {
         assert!(Arc::ptr_eq(&store.ivm_views().unwrap(), &cx.views));
-        Ok(*self.ready.lock().unwrap() == Some(smallclaims::store::current_index(c)?))
+        let available: bool = c.query_row(
+            "SELECT available FROM ivm_install_sources WHERE name=?1",
+            [self.name()],
+            |r| r.get(0),
+        )?;
+        Ok(available && *self.ready.lock().unwrap() == Some(smallclaims::store::current_index(c)?))
     }
 }
 struct CacheMarker {
     index: u64,
     ready: Arc<Mutex<Option<u64>>>,
+    publications: Arc<AtomicUsize>,
 }
 impl Captured for CacheMarker {
     fn prepare(self: Box<Self>, _: &Context) -> Result<Box<dyn Page>> {
@@ -835,12 +869,32 @@ impl Page for CacheMarker {
         tx: &Transaction<'_>,
         cx: &Context,
         _: u64,
+    ) -> Result<Publication> {
+        assert!(Arc::ptr_eq(&store.ivm_views().unwrap(), &cx.views));
+        self.publications.fetch_add(1, Ordering::SeqCst);
+        if smallclaims::store::current_index(tx)? != self.index {
+            return Ok(true.into());
+        }
+        Ok(Publication {
+            more: false,
+            after_commit: Some(self),
+        })
+    }
+}
+impl AfterCommit for CacheMarker {
+    fn publish(
+        self: Box<Self>,
+        store: &Store,
+        c: &Connection,
+        cx: &Context,
+        _: u64,
     ) -> Result<bool> {
         assert!(Arc::ptr_eq(&store.ivm_views().unwrap(), &cx.views));
-        if smallclaims::store::current_index(tx)? != self.index {
+        cx.installer.position(c, "fixture.cache-only")?;
+        if smallclaims::store::current_index(c)? != self.index {
             return Ok(true);
         }
-        // No DML and no strong Store retained: the stable native cut is the sole marker.
+        // No DML and no retained Store; this is a committed toy marker, not a full cut.
         *self.ready.lock().unwrap() = Some(self.index);
         Ok(false)
     }
@@ -852,6 +906,9 @@ async fn cache_only_source_uses_borrowed_owner_and_guarded_shared_lifecycle() {
     let source = Arc::new(CacheOnly {
         ready: Arc::new(Mutex::new(None)),
         fail: AtomicBool::new(false),
+        commit_failure: AtomicUsize::new(0),
+        publications: Arc::new(AtomicUsize::new(0)),
+        refused_commits: AtomicUsize::new(0),
     });
     let store = Arc::new(
         Store::open_with_collection_sources(
@@ -900,9 +957,10 @@ async fn cache_only_source_uses_borrowed_owner_and_guarded_shared_lifecycle() {
             ))
             .unwrap()
     );
-    // The factory guard refuses even though this fixture's raw cache marker still matches.
+    // Persisted availability independently refuses this matching old cache marker too.
+    assert!(source.ready.lock().unwrap().is_some());
     assert!(
-        store
+        !store
             .read_snapshot(|_| source.coverage(
                 &store,
                 &store.readers.get(),
@@ -914,4 +972,101 @@ async fn cache_only_source_uses_borrowed_owner_and_guarded_shared_lifecycle() {
     let weak = Arc::downgrade(&store);
     drop(store);
     wait_for(|| weak.upgrade().is_none()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_commit_never_exposes_cache_and_recovery_uses_same_reactor() {
+    let root = tempfile::tempdir().unwrap();
+    let source = Arc::new(CacheOnly {
+        ready: Arc::new(Mutex::new(None)),
+        fail: AtomicBool::new(false),
+        commit_failure: AtomicUsize::new(0),
+        publications: Arc::new(AtomicUsize::new(0)),
+        refused_commits: AtomicUsize::new(0),
+    });
+    let store = Arc::new(
+        Store::open_with_collection_sources(
+            &root.path().join("refused-cache.db"),
+            "alder",
+            vec![source.clone()],
+        )
+        .unwrap(),
+    );
+    let registry = store.collection_sources().unwrap();
+    // Arm after startup, before starting the producer. The page returns its owned action,
+    // then the managed finalizer refuses COMMIT; no cache swap can have happened.
+    source.commit_failure.store(2, Ordering::SeqCst);
+    store.start_collection_reactor().unwrap();
+    wait_for(|| source.refused_commits.load(Ordering::SeqCst) > 0).await;
+    assert!(source.publications.load(Ordering::SeqCst) > 0);
+    assert_eq!(*source.ready.lock().unwrap(), None);
+    assert!(
+        !store
+            .read_snapshot(|_| registry.coverage(
+                source.name(),
+                &store,
+                &store.readers.get(),
+                clock_ms()
+            ))
+            .unwrap()
+    );
+    source.commit_failure.store(0, Ordering::SeqCst);
+    registry.retry_source(source.name()).unwrap();
+    wait_for(|| source.ready.lock().unwrap().is_some()).await;
+    assert!(
+        store
+            .read_snapshot(|_| registry.coverage(
+                source.name(),
+                &store,
+                &store.readers.get(),
+                clock_ms()
+            ))
+            .unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn after_commit_failures_refuse_committed_source_and_preserve_sibling() {
+    for fault in [1, 2, 3] {
+        let root = tempfile::tempdir().unwrap();
+        let broken = source(
+            "fixture.after-fault",
+            "fixture.after-fault.view",
+            None,
+            false,
+        );
+        let sibling = source(
+            "fixture.after-sibling",
+            "fixture.after-sibling.view",
+            None,
+            false,
+        );
+        let store = Arc::new(
+            Store::open_with_collection_sources(
+                &root.path().join("after-fault.db"),
+                "alder",
+                vec![broken.clone(), sibling.clone()],
+            )
+            .unwrap(),
+        );
+        let registry = store.collection_sources().unwrap();
+        broken.after_commit_failure.store(fault, Ordering::SeqCst);
+        replace(&store, broken.source, 31);
+        store.start_collection_reactor().unwrap();
+        wait_for(|| registry.unavailable[0].load(Ordering::Acquire)).await;
+        // The action ran after COMMIT: its error or panic cannot roll back this output.
+        assert_eq!(output(&store, broken.source), Some(31));
+        assert!(
+            !store
+                .read_snapshot(|_| registry.coverage(
+                    broken.source,
+                    &store,
+                    &store.readers.get(),
+                    clock_ms()
+                ))
+                .unwrap()
+        );
+        replace(&store, sibling.source, 32);
+        wait_for(|| output(&store, sibling.source) == Some(32)).await;
+    }
 }

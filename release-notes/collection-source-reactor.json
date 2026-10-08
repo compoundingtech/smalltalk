@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "New crate-internal source lifecycle and scheduler API, including named cache-only sources with no views/operators and borrowed Store access for bounded capture/cut checks; explicitly registered Stores attach their shared publisher before exposure and consumer getters only clone prepared state. Collection adapters must independently check native coverage even on silent pages. No production source is registered or selected by this change."
+    "detail": "New crate-internal source lifecycle and scheduler API, including named cache-only sources with no views/operators, borrowed Store access for bounded capture/cut checks, and owned cache actions after successful managed commit and writer return. Explicitly registered Stores attach their shared publisher before exposure; consumer getters only clone prepared state. Source owners certify immutable publications and current lifetime/authority guards even on silent pages. No production source is registered or selected by this change."
   },
   "downtime": {
     "status": "none",
@@ -27,6 +27,6 @@
   },
   "recovery": {
     "status": "changed",
-    "detail": "Logical source callback failures roll back their page or hook bookkeeping and fence only that source and its views; ordinary commits never repair a fenced source. SQLite storage failures propagate and roll back, with background writer contention retried. Default Store recovery is unchanged."
+    "detail": "Logical source callback failures roll back their page or hook bookkeeping and fence only that source and its views. Post-commit action failures cannot undo committed pages; they refuse reads and fence the source. Ordinary commits never repair a fenced source. Precommit SQLite storage failures propagate and roll back, with background writer contention retried. Default Store recovery is unchanged."
   }
 }

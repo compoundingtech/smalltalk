@@ -68,7 +68,10 @@ pub(crate) trait Source: Send + Sync {
         now_ms: u64,
         budget: Budget,
     ) -> Result<Capture>;
-    /// Independently prove coverage at this read cut, even for a silent collection page.
+    /// Independently prove the selected completed publication may serve at this read cut,
+    /// even for a silent collection page. Retained immutable rows keep their original full
+    /// cut/evaluation clock; incomplete newer work must not relabel or invalidate that root.
+    /// Current receiver/lifetime/source-gap/authority guards must still qualify it.
     /// Neither registration, a queue revision nor MAX claim index proves coverage.
     /// Borrowed Store access is prepared state/metadata only, never lazy repair/build.
     /// Check persisted lifetime availability plus the source's complete native cut.
@@ -95,16 +98,46 @@ pub(crate) trait Captured: Send {
 pub(crate) trait Page: Send {
     /// Apply precomputed bounded writes, rechecking native identity, source position and
     /// captured rows. Recheck independent coverage before publishing through Views.
-    /// Return true when more work remains, including a stale page with no output applied.
+    /// Return more=true when work remains, including a stale page with no output applied.
     /// Logical source gaps fence source/views; storage errors propagate and roll back.
     /// Cache-only publication may perform no DML, but uses this same writer admission
     /// to recheck its native cut. Store is borrowed, never retained by a page/source.
-    /// A cache exposed before commit must independently refuse a rolled-back cursor or
-    /// generation; publication must not make uncommitted evidence appear ready.
+    /// Memory/cache publication belongs in Publication::after_commit, never this callback.
     fn publish(
         self: Box<Self>,
         store: &Store,
         tx: &Transaction<'_>,
+        cx: &Context,
+        now_ms: u64,
+    ) -> Result<Publication>;
+}
+
+pub(crate) struct Publication {
+    pub more: bool,
+    pub after_commit: Option<Box<dyn AfterCommit>>,
+}
+
+impl From<bool> for Publication {
+    fn from(more: bool) -> Self {
+        Self {
+            more,
+            after_commit: None,
+        }
+    }
+}
+
+/// Owned cache action, executed only after successful managed commit and writer return.
+/// The reactor supplies one fresh short committed snapshot. Use only this connection and
+/// accessor-only Store methods; no writer acquisition, nested snapshot, reduction or repair.
+/// Recheck the full captured cut, source lifetime/availability and publication generation
+/// before swapping immutable prepared state. Return true to recapture stale work.
+/// This action cannot undo the committed page. Errors/panics refuse reads and fence the
+/// source; adapters must retain independent cut/lifetime checks and Registry::coverage.
+pub(crate) trait AfterCommit: Send {
+    fn publish(
+        self: Box<Self>,
+        store: &Store,
+        connection: &Connection,
         cx: &Context,
         now_ms: u64,
     ) -> Result<bool>;
@@ -345,6 +378,7 @@ async fn run(store: Weak<Store>, registry: Arc<Registry>, stopped: Arc<AtomicBoo
                     return Ok((false, None));
                 }
                 let source = &worker.sources[index];
+                let mut committed = false;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let capture = reader.read_snapshot(|_| {
                         source.capture(
@@ -371,21 +405,40 @@ async fn run(store: Weak<Store>, registry: Arc<Registry>, stopped: Arc<AtomicBoo
                         return Ok((false, None));
                     }
                     let tx = writer.transaction()?;
-                    let more = page.publish(&reader, &tx, &worker.cx, clock_ms())?;
+                    let publication = page.publish(&reader, &tx, &worker.cx, clock_ms())?;
                     tx.commit()?;
-                    Ok((more, capture.wake_at_unix_ms))
+                    committed = true;
+                    // Guard return completes commit observers before any cache is exposed.
+                    // A refused/rolled-back commit drops the action without executing it.
+                    drop(writer);
+                    let stale = if let Some(action) = publication.after_commit {
+                        if stop.load(Ordering::Acquire) {
+                            return Ok((false, None));
+                        }
+                        reader.read_snapshot(|_| {
+                            anyhow::ensure!(
+                                !worker.unavailable[index].load(Ordering::Acquire),
+                                "collection source unavailable after commit"
+                            );
+                            action.publish(&reader, &reader.readers.get(), &worker.cx, clock_ms())
+                        })?
+                    } else {
+                        false
+                    };
+                    Ok((publication.more || stale, capture.wake_at_unix_ms))
                 }))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("collection source callback panicked")));
                 if let Err(error) = &result {
                     // A storage failure is not evidence of missing native capture. Preserve
                     // the rolled-back source lifetime and retry through the same queue.
-                    if storage_failure(error) {
+                    if !committed && storage_failure(error) {
                         return result;
                     }
                     // Refuse reads immediately, including when writer admission or the
                     // durable fence itself fails. Source factories use Registry::coverage.
                     worker.unavailable[index].store(true, Ordering::Release);
-                    // Fence derived state in a separate transaction after rolling back the page.
+                    // Fence separately: precommit errors rolled back the page; postcommit
+                    // action errors cannot undo it and must refuse the committed state too.
                     if stop.load(Ordering::Acquire) {
                         return result;
                     }
