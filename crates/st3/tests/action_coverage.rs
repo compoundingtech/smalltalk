@@ -4181,8 +4181,12 @@ async fn cli_agent_and_shell_declarations_survive_restart() {
     let events = daemon.state.event_notify.clone();
     let owner = tokio::spawn(async move {
         for _ in 0..300 {
-            if store.selected_desired_token(SEAT).unwrap().is_some() {
+            if let Some(token) = store.selected_desired_token(SEAT).unwrap() {
                 for (kind, fields) in [
+                    (
+                        "runtime.action.succeeded",
+                        json!({"action":"start", "desired_token":token, "incarnation_id":"4243:fixture"}),
+                    ),
                     (
                         "runtime.observed",
                         json!({"status": "running", "runtime_id": "cli-seat", "incarnation_id": "4243:fixture"}),

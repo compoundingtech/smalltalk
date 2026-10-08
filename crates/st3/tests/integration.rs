@@ -9,6 +9,7 @@ mod ci_test_paths;
 
 mod action_coverage;
 mod adhoc_work;
+mod agent_launch;
 mod agents_restart;
 mod authored_resume;
 mod backup;

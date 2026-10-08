@@ -165,6 +165,7 @@ fn forwarded_deadline(operation: &crate::peer::ClientReadOperation) -> Option<Du
         | ClientReadOperation::TerminalScreen { .. }
         | ClientReadOperation::SeatSnapshot { .. }
         | ClientReadOperation::AgentWorkspace { .. }
+        | ClientReadOperation::AgentLaunch { .. }
         | ClientReadOperation::Blob { .. }
         | ClientReadOperation::Messages { .. } => Some(ORDINARY),
     }

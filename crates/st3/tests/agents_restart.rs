@@ -329,6 +329,32 @@ async fn cli(socket: &Path, subject: &str, actor: &str, timeout: &str) -> std::p
     .await
     .unwrap()
 }
+// Cross the recorded retry deadline with the fixture's real clock, so later async
+// person requests and native-session writes never see time move backwards.
+async fn run_due_restart(fixture: &Fixture, subject: &str) {
+    let Some(due) = fixture
+        .store
+        .latest_observation(subject, "runtime.reconcile-decision")
+        .unwrap()
+        .and_then(|claim| {
+            claim.body["fields"]["restart_at_unix_ms"]
+                .as_str()
+                .and_then(|due| due.parse::<u128>().ok())
+        })
+    else {
+        return;
+    };
+    let delay = due.saturating_sub(smallclaims::store::now_ms());
+    assert!(
+        delay <= 6_000,
+        "fresh fixture retry exceeded the first crash delay"
+    );
+    tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+    for _ in 0..3 {
+        fixture.reconciler.reconcile_once().unwrap();
+    }
+}
+
 async fn restarts_preserving_declaration(mission: bool) {
     let (fixture, subject) = Fixture::new(mission).await;
     let before = fixture
@@ -437,8 +463,20 @@ async fn restart_reports_timeout_and_launch_failure() {
     let _ = driver.await;
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("fixture rejected launch"),
+        String::from_utf8_lossy(&output.stderr).contains("the requested runtime could not start"),
         "{output:?}"
+    );
+    assert!(
+        fixture
+            .store
+            .observations_for(&subject, "runtime.action.failed")
+            .unwrap()
+            .iter()
+            .any(|claim| claim.actor.is_none()
+                && claim.body["fields"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("fixture rejected launch"))),
+        "the exact launcher error must remain in the host-local receipt"
     );
 }
 
@@ -838,6 +876,7 @@ async fn seats_without_one_shot_keep_their_exit_and_restart_behaviour() {
             for _ in 0..3 {
                 fixture.reconciler.reconcile_once().unwrap();
             }
+            run_due_restart(&fixture, &subject).await;
             assert!(
                 fixture
                     .store
@@ -1541,6 +1580,7 @@ async fn every_restart_continues_the_seats_last_native_session() {
     for _ in 0..3 {
         fixture.reconciler.reconcile_once().unwrap();
     }
+    run_due_restart(&fixture, &subject).await;
     let starts = fixture.runtime.starts.lock().unwrap().clone();
     assert_eq!(starts.len(), 2);
     assert_eq!(continued(&starts[1]), Some("session-one"));
@@ -1655,6 +1695,7 @@ async fn a_session_the_driver_could_not_continue_is_not_tried_again() {
     for _ in 0..3 {
         fixture.reconciler.reconcile_once().unwrap();
     }
+    run_due_restart(&fixture, &subject).await;
     let starts = fixture.runtime.starts.lock().unwrap().clone();
     assert_eq!(starts.len(), 2);
     assert_eq!(continued(&starts[1]), None);
@@ -1841,7 +1882,8 @@ async fn a_failed_explicit_retry_is_completed_parked_and_visible_until_a_new_req
         assert_eq!(result.body["evidence"][0], request.id);
         let reason = result.body["fields"]["reason"].as_str().unwrap();
         assert!(
-            reason.contains("parked again") && reason.contains("fixture rejected launch"),
+            reason.contains("parked again")
+                && reason.contains("the requested runtime could not start"),
             "{reason}"
         );
         // `st agents show` and clients consume the same agents read, including this fault.
@@ -1859,7 +1901,23 @@ async fn a_failed_explicit_retry_is_completed_parked_and_visible_until_a_new_req
             &["agents", "show", &subject],
         )
         .await;
-        assert!(succeeded(&show).contains("fixture rejected launch"));
+        assert!(succeeded(&show).contains("the requested runtime could not start"));
+        assert!(
+            !reason.contains("fixture rejected launch"),
+            "starter output must not replicate in the control result"
+        );
+        assert!(
+            fixture
+                .store
+                .observations_for(&subject, "runtime.action.failed")
+                .unwrap()
+                .iter()
+                .any(|claim| claim.actor.is_none()
+                    && claim.body["fields"]["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("fixture rejected launch"))),
+            "the launcher detail must remain available locally"
+        );
         assert_eq!(fixture.request(&subject, key).await.id, request.id);
     }
     // Restoring the launcher alone cannot reattempt a completed failure.

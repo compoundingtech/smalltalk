@@ -26,3 +26,5 @@ pub use process::{ExecGeneration, ExecObservation, ExecRuntime, process_start_to
 pub use pty::{
     Launch, PtyObservation, PtyRuntime, PtySpawnTimeout, PtySpawnTimeoutPhase, TerminalSize,
 };
+
+pub mod launch_diagnostic;

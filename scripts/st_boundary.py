@@ -88,6 +88,7 @@ def sqlite_findings(path):
 def output_findings(root):
     # Fixtures use only neutral invented labels. Check actual generated paths and text/SQLite
     # records, including nested schemas, plus logs. Never scan source or predecessor fixtures.
+    inspected_databases = set()
     for directory in (root / "state", root / "home", root / "pty"):
         for path in sorted(directory.rglob("*")):
             relative = path.relative_to(root)
@@ -98,10 +99,19 @@ def output_findings(root):
                 continue
             if not path.is_file():
                 continue
-            with path.open("rb") as stream:
-                header = stream.read(16)
+            try:
+                with path.open("rb") as stream:
+                    header = stream.read(16)
+            except FileNotFoundError:
+                # SQLite may remove a sidecar between discovery and this open. Its database
+                # records must already have been inspected; other missing outputs still fail.
+                if (path.name.endswith(("-wal", "-shm"))
+                        and path.with_name(path.name[:-4]) in inspected_databases):
+                    continue
+                raise
             if header == b"SQLite format 3\x00":
                 yield from sqlite_findings(path)
+                inspected_databases.add(path)
             elif not path.name.endswith(("-wal", "-shm")):
                 yield from record_findings(f"record/log {relative}", path.read_bytes())
     log = root / "daemon.log"

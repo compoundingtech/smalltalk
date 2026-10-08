@@ -4534,6 +4534,18 @@ enum CompletionShell {
 }
 
 #[derive(Debug)]
+struct AgentLaunchExit {
+    code: u8,
+    reason: String,
+}
+impl std::fmt::Display for AgentLaunchExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+impl std::error::Error for AgentLaunchExit {}
+
+#[derive(Debug)]
 struct CommandExit(u8);
 
 impl std::fmt::Display for CommandExit {
@@ -4777,6 +4789,10 @@ async fn run_cli(cli: Cli) -> ExitCode {
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            if let Some(exit) = error.downcast_ref::<AgentLaunchExit>() {
+                eprintln!("st: {}", exit.reason);
+                return ExitCode::from(exit.code);
+            }
             if let Some(exit) = error.downcast_ref::<CommandExit>() {
                 return ExitCode::from(exit.0);
             }
@@ -12901,10 +12917,23 @@ async fn run_agent_new(
         Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => {}
         Err(error) => return Err(error.into()),
     }
-    if actor.starts_with("person/") {
+    let health: Value = client.get("/v1/health").await?;
+    let local_host = health["node"]
+        .as_str()
+        .context("the daemon health response has no node")?;
+    let host = args
+        .host
+        .as_deref()
+        .unwrap_or(local_host)
+        .trim_start_matches("host/");
+    let host = if host == "local" { local_host } else { host }.to_owned();
+    let started = std::time::Instant::now();
+    let mut stages = Vec::new();
+    let token = if actor.starts_with("person/") {
         let generated = generated_client(endpoint, Some(&actor))?;
         let capabilities = generated.capabilities().await?;
         let nonce = uuid::Uuid::now_v7().simple().to_string();
+        let creation_key = hex::encode(Sha256::digest(format!("{actor}:agent-new:{nonce}")));
         generated
             .agent_create(
                 format!("action/{nonce}"),
@@ -12929,12 +12958,65 @@ async fn run_agent_new(
                 },
             )
             .await?;
+        // Pin the immutable creation declaration, even if another writer replaces it before
+        // the first read. A current card or post-publication cursor cannot prove this source.
+        let claims: ClaimsPage = client
+            .get(&format!(
+                "/v1/claims?subject={}&after_index={}&limit=64",
+                urlencoding::encode(&subject),
+                health["store_index"]
+                    .as_u64()
+                    .context("health has no store index")?
+            ))
+            .await?;
+        claims
+            .claims
+            .into_iter()
+            .find(|claim| {
+                claim.kind == "intent.desired"
+                    && claim
+                        .body
+                        .pointer("/member/tags/st3.client.create-key")
+                        .and_then(Value::as_str)
+                        == Some(creation_key.as_str())
+            })
+            .context("the requested creation declaration was not retained; retry explicitly")?
+            .id
     } else {
-        publish_text(&client, kdl, source_name, actor.clone()).await?;
+        let published = publish_text(&client, kdl, source_name, actor.clone()).await?;
+        published
+            .subject_tokens
+            .get(&subject)
+            .and_then(|tokens| tokens.first())
+            .context("publication returned no agent source token")?
+            .clone()
+    };
+    launch_progress(
+        &subject,
+        &host,
+        "declared",
+        "completed",
+        "declaration accepted",
+        started,
+        json_output,
+        &mut stages,
+    );
+    if host == local_host {
+        launch_progress(
+            &subject,
+            &host,
+            "replicated",
+            "skipped",
+            "local launch; replication skipped",
+            started,
+            json_output,
+            &mut stages,
+        );
     }
-    if !json_output {
-        eprintln!("Created {subject} in {workspace}; waiting for the agent to start.");
-    }
+    let launch_client = match endpoint {
+        Endpoint::Unix(socket) => Client::unix_as(socket.clone(), &actor)?,
+        _ => client.clone(),
+    };
     let mut latest = None;
     let waiting = tokio::time::timeout(
         timeout,
@@ -12945,36 +13027,71 @@ async fn run_agent_new(
             args.attach,
             json_output,
             &mut latest,
+            &launch_client,
+            &host,
+            &token,
+            started,
+            &mut stages,
         ),
     )
     .await;
     let agent = match waiting {
         Ok(Ok(agent)) => agent,
         other => {
-            if !json_output {
-                let state = latest.as_ref().map_or_else(
-                    || cli_help::agent_state("starting", None, None, "unknown"),
-                    |agent: &st3_client::Agent| {
-                        cli_help::agent_state(
-                            &agent.state,
-                            agent.harness_state.as_deref(),
-                            agent.fault.as_deref(),
-                            &agent.reachability,
-                        )
-                    },
-                );
-                println!("{}", cli_help::agent_next_steps(&subject, &actor, &state));
-            }
-            return match other {
-                Ok(Err(error)) => Err(error),
-                Err(_) => anyhow::bail!(
-                    "`{subject}` was created, but was not ready after {}; see `st agents show {subject}`",
-                    args.timeout
+            let error = match other {
+                Ok(Err(error)) => error,
+                Err(_) => anyhow::anyhow!(
+                    "`{subject}` on {host} timed out after {} at stage {}; see `st agents show {subject}`",
+                    args.timeout,
+                    stages
+                        .last()
+                        .and_then(|stage| stage["stage"].as_str())
+                        .unwrap_or("declared")
                 ),
                 Ok(Ok(_)) => unreachable!(),
             };
+            if json_output {
+                print_value(
+                    &json!({"subject":subject, "host_id":format!("host/{host}"), "workspace":workspace, "stages":stages, "error":{"reason":error.to_string(), "exit_code":error.downcast_ref::<AgentLaunchExit>().map(|exit| exit.code)}}),
+                    true,
+                )?;
+            } else {
+                let state = if error.downcast_ref::<AgentLaunchExit>().is_some() {
+                    stages
+                        .last()
+                        .and_then(|stage| stage["reason"].as_str())
+                        .unwrap_or("requested launch exited")
+                        .to_owned()
+                } else {
+                    latest.as_ref().map_or_else(
+                        || cli_help::agent_state("starting", None, None, "unknown"),
+                        |agent: &st3_client::Agent| {
+                            cli_help::agent_state(
+                                &agent.state,
+                                agent.harness_state.as_deref(),
+                                agent.fault.as_deref(),
+                                &agent.reachability,
+                            )
+                        },
+                    )
+                };
+                eprintln!("{}", cli_help::agent_next_steps(&subject, &actor, &state));
+            }
+            return Err(error);
         }
     };
+    if args.attach {
+        launch_progress(
+            &subject,
+            &host,
+            "attaching",
+            "started",
+            "attaching to requested incarnation",
+            started,
+            json_output,
+            &mut stages,
+        );
+    }
     if json_output {
         print_value(
             &json!({
@@ -12983,6 +13100,7 @@ async fn run_agent_new(
                 "workspace": workspace,
                 "state": agent.state,
                 "harness_state": agent.harness_state,
+                "stages": stages,
             }),
             true,
         )?;
@@ -12997,7 +13115,29 @@ async fn run_agent_new(
     }
     if args.attach {
         // The daemon has just answered for the new agent, so there is no registry fallback to name.
-        attach_terminal(&client, endpoint, None, person, &subject, false, None).await?;
+        let expected = agent
+            .incarnation_id
+            .as_deref()
+            .context("ready agent has no incarnation")?;
+        if let Err(error) = attach_new_agent(&client, endpoint, person, &subject, expected).await {
+            // Prefer retained launch evidence if the process died between readiness and attach.
+            let path = format!(
+                "/v1/hosts/{}/agent-launch?subject={}&token={}",
+                urlencoding::encode(&host),
+                urlencoding::encode(&subject),
+                urlencoding::encode(&token)
+            );
+            if let Ok(Ok(status)) = tokio::time::timeout(
+                LOCAL_ATTACH_CONSULT,
+                launch_client.get::<st3::agent_launch::LaunchStatus>(&path),
+            )
+            .await
+                && status.stage == "exited"
+            {
+                return Err(agent_launch_exit(&subject, &status));
+            }
+            return Err(error).context("attaching to the requested launch");
+        }
     }
     Ok(())
 }
@@ -13075,6 +13215,60 @@ async fn agent_new_workspace(
 
 /// Wait until the agent's current harness is ready. A harness that waits on a person, such as at
 /// a login prompt, is ready enough to attach to, so `attach` accepts it.
+#[allow(clippy::too_many_arguments)]
+fn launch_progress(
+    subject: &str,
+    host: &str,
+    stage: &str,
+    state: &str,
+    reason: &str,
+    started: std::time::Instant,
+    json_output: bool,
+    stages: &mut Vec<Value>,
+) {
+    let entry = json!({"stage":stage, "state":state, "host":host, "elapsed_ms":started.elapsed().as_millis(), "reason":reason});
+    if let Some(last) = stages
+        .last_mut()
+        .filter(|last| last["stage"] == stage && last["state"] == state && last["reason"] == reason)
+    {
+        *last = entry;
+    } else {
+        if stages.len() >= 256 {
+            stages.remove(2);
+        }
+        stages.push(entry);
+    }
+    if !json_output {
+        eprintln!(
+            "{subject}: {stage} ({state}) on {host} after {:.1}s — {reason}",
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
+
+fn agent_launch_exit(subject: &str, status: &st3::agent_launch::LaunchStatus) -> anyhow::Error {
+    let tail = status
+        .output_tail
+        .as_deref()
+        .filter(|tail| !tail.is_empty())
+        .map(|tail| format!("\nStartup output (combined stdout/stderr):\n{tail}"))
+        .unwrap_or_default();
+    AgentLaunchExit {
+        code: status.exit_code.unwrap_or(2).clamp(0, 255) as u8,
+        reason: format!(
+            "`{subject}` on {}: {} (incarnation {}, exit code {}){tail}",
+            status.host,
+            status.reason.as_deref().unwrap_or("launch exited"),
+            status.incarnation_id.as_deref().unwrap_or("unavailable"),
+            status
+                .exit_code
+                .map_or_else(|| "unavailable".into(), |code| code.to_string())
+        ),
+    }
+    .into()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_agent_harness(
     client: &Client,
     gateway: &GeneratedClient,
@@ -13082,49 +13276,267 @@ async fn wait_for_agent_harness(
     attach: bool,
     json_output: bool,
     latest: &mut Option<st3_client::Agent>,
+    launch_client: &Client,
+    host: &str,
+    token: &str,
+    started: std::time::Instant,
+    stages: &mut Vec<Value>,
+) -> Result<st3_client::Agent> {
+    let path = format!(
+        "/v1/hosts/{}/agent-launch?subject={}&token={}",
+        urlencoding::encode(host),
+        urlencoding::encode(subject),
+        urlencoding::encode(token)
+    );
+    let mut reported = String::new();
+    let mut last_report = std::time::Instant::now();
+    let mut replicated = stages.iter().any(|stage| stage["stage"] == "replicated");
+    let mut requested_incarnation = None;
+    loop {
+        let status: st3::agent_launch::LaunchStatus = match launch_client.get(&path).await {
+            Ok(status) => status,
+            Err(error) if matches!(st3::client::http_status(&error), Some(404 | 503)) => {
+                launch_progress(
+                    subject,
+                    host,
+                    "launched",
+                    "unavailable",
+                    "launch status unavailable; using compatibility readiness observations",
+                    started,
+                    json_output,
+                    stages,
+                );
+                return wait_for_agent_compatibility(
+                    client,
+                    gateway,
+                    subject,
+                    attach,
+                    json_output,
+                    latest,
+                    host,
+                    token,
+                    started,
+                    stages,
+                    requested_incarnation,
+                )
+                .await;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("observing requested launch on {host}"));
+            }
+        };
+        if requested_incarnation.is_none() {
+            requested_incarnation = status.incarnation_id.clone();
+        }
+        if !replicated
+            && matches!(
+                status.stage.as_str(),
+                "replicated" | "launched" | "harness-ready" | "exited" | "launch-failed"
+            )
+        {
+            launch_progress(
+                subject,
+                host,
+                "replicated",
+                "completed",
+                "requested declaration observed by destination host",
+                started,
+                json_output,
+                stages,
+            );
+            replicated = true;
+        }
+        if status.incarnation_id.is_some()
+            && !stages
+                .iter()
+                .any(|stage| stage["stage"] == "launched" && stage["state"] == "completed")
+        {
+            launch_progress(
+                subject,
+                host,
+                "launched",
+                "completed",
+                "requested process incarnation observed",
+                started,
+                json_output,
+                stages,
+            );
+        }
+        let reason = status
+            .reason
+            .as_deref()
+            .unwrap_or(match status.stage.as_str() {
+                "replicating" => {
+                    "waiting for destination host to receive the requested declaration"
+                }
+                "replicated" => "waiting for destination host to launch the harness",
+                "launched" => "requested process launched; waiting for harness readiness",
+                "harness-ready" => "requested incarnation reports harness readiness",
+                _ => "observing requested launch",
+            });
+        if reported != status.stage || last_report.elapsed() >= Duration::from_secs(5) {
+            let local_launch_pending = status.stage == "replicated"
+                && stages
+                    .iter()
+                    .any(|stage| stage["stage"] == "replicated" && stage["state"] == "skipped");
+            launch_progress(
+                subject,
+                host,
+                if local_launch_pending {
+                    "launched"
+                } else {
+                    &status.stage
+                },
+                if local_launch_pending {
+                    "pending"
+                } else {
+                    "observed"
+                },
+                reason,
+                started,
+                json_output,
+                stages,
+            );
+            reported = status.stage.clone();
+            last_report = std::time::Instant::now();
+        }
+        match status.stage.as_str() {
+            "exited" => return Err(agent_launch_exit(subject, &status)),
+            "launch-failed" | "superseded" => {
+                anyhow::bail!("`{subject}` on {host} at {}: {reason}", status.stage)
+            }
+            _ => {}
+        }
+        match gateway.agents_get(subject).await {
+            Ok(response) => {
+                if let ClientResource::Agent(agent) = response.value {
+                    *latest = Some(agent.clone());
+                    if agent.incarnation_id == status.incarnation_id
+                        && status.incarnation_id.is_some()
+                    {
+                        if status.stage == "harness-ready" && agent.reachability == "reachable" {
+                            return Ok(agent);
+                        }
+                        if agent.state == "waiting" && agent.reachability == "reachable" {
+                            if attach {
+                                return Ok(agent);
+                            }
+                            anyhow::bail!(
+                                "`{subject}` started and is waiting for your input; attach with `st terminals attach {subject}`"
+                            );
+                        }
+                        if agent.state == "failed" {
+                            anyhow::bail!(
+                                "`{subject}` failed to start: {}",
+                                agent.fault.as_deref().unwrap_or(reason)
+                            );
+                        }
+                    }
+                }
+            }
+            Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Owner-local receipts are deliberately not replicated events. Pace bounded reads;
+        // the outer timeout bounds remote requests and every stage of this wait.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_agent_compatibility(
+    client: &Client,
+    gateway: &GeneratedClient,
+    subject: &str,
+    attach: bool,
+    json_output: bool,
+    latest: &mut Option<st3_client::Agent>,
+    host: &str,
+    token: &str,
+    started: std::time::Instant,
+    stages: &mut Vec<Value>,
+    mut incarnation: Option<String>,
 ) -> Result<st3_client::Agent> {
     let health: Value = client.get("/v1/health").await?;
     let mut cursor = health["store_index"]
         .as_u64()
-        .context("the daemon health response has no store index")?;
+        .context("health has no store index")?;
+    let mut events = LocalEventFeed::default();
     let mut reported = String::new();
-    let mut event_feed = LocalEventFeed::default();
     loop {
-        let agent = match gateway.agents_get(subject).await {
-            Ok(response) => match response.value {
-                ClientResource::Agent(agent) => Some(agent),
-                _ => None,
-            },
-            Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => None,
+        let status: StatusResponse = client
+            .get(&format!(
+                "/v1/status?subject={}",
+                urlencoding::encode(subject),
+            ))
+            .await?;
+        anyhow::ensure!(status.subjects.iter().any(|item|
+            item.subject == subject && item.desired_token.as_deref() == Some(token)
+        ), "the requested declaration was replaced; retry explicitly");
+        match gateway.agents_get(subject).await {
+            Ok(response) => {
+                if let ClientResource::Agent(agent) = response.value {
+                    *latest = Some(agent.clone());
+                    if incarnation.is_none() {
+                        incarnation = agent.incarnation_id.clone();
+                    }
+                    anyhow::ensure!(
+                        incarnation.is_none() || agent.incarnation_id == incarnation,
+                        "the requested observed incarnation was replaced; retry explicitly"
+                    );
+                    let reason = cli_help::agent_state(
+                        &agent.state,
+                        agent.harness_state.as_deref(),
+                        agent.fault.as_deref(),
+                        &agent.reachability,
+                    );
+                    if reason != reported {
+                        launch_progress(
+                            subject,
+                            host,
+                            "launched",
+                            "compatibility",
+                            &reason,
+                            started,
+                            json_output,
+                            stages,
+                        );
+                        reported = reason;
+                    }
+                    match agent.state.as_str() {
+                        "running" if incarnation.is_some() && agent.reachability == "reachable" => {
+                            launch_progress(
+                                subject,
+                                host,
+                                "harness-ready",
+                                "compatibility",
+                                "the compatibility card reports this observed incarnation ready",
+                                started,
+                                json_output,
+                                stages,
+                            );
+                            return Ok(agent);
+                        }
+                        "waiting" if incarnation.is_some() && agent.reachability == "reachable" => {
+                            if attach {
+                                return Ok(agent);
+                            }
+                            anyhow::bail!(
+                                "`{subject}` started and is waiting for your input; attach with `st terminals attach {subject}`"
+                            );
+                        }
+                        "failed" | "stopped" | "ended" => anyhow::bail!(
+                            "`{subject}` failed to start: {}",
+                            agent.fault.as_deref().unwrap_or(&reported)
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+            Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => {}
             Err(error) => return Err(error.into()),
-        };
-        if let Some(agent) = agent {
-            *latest = Some(agent.clone());
-            let harness = agent.harness_state.as_deref().unwrap_or("not ready");
-            match agent.state.as_str() {
-                "running" => return Ok(agent),
-                "waiting" if attach && agent.reachability == "reachable" => return Ok(agent),
-                "waiting" if agent.reachability == "reachable" => anyhow::bail!(
-                    "`{subject}` started and is waiting for your input; attach with `st terminals attach {subject}`"
-                ),
-                "failed" => anyhow::bail!(
-                    "`{subject}` failed to start: {}",
-                    agent.fault.as_deref().unwrap_or(harness)
-                ),
-                _ => {}
-            }
-            let progress = cli_help::agent_state(
-                &agent.state,
-                agent.harness_state.as_deref(),
-                agent.fault.as_deref(),
-                &agent.reachability,
-            );
-            if !json_output && progress != reported {
-                eprintln!("{subject}: {progress}");
-                reported = progress;
-            }
         }
-        let page = event_feed
+        let page = events
             .read(
                 client,
                 &format!(
@@ -13136,6 +13548,68 @@ async fn wait_for_agent_harness(
         if let Some(scanned) = page.next_after {
             cursor = cursor.max(scanned);
         }
+    }
+}
+
+async fn attach_new_agent(
+    client: &Client,
+    endpoint: &Endpoint,
+    person: Option<&str>,
+    subject: &str,
+    expected: &str,
+) -> Result<()> {
+    if let Ok(outer) = std::env::var("PTY_SESSION")
+        && !outer.is_empty()
+    {
+        anyhow::bail!(
+            "st terminals attach: already inside PTY session `{outer}`. Detach first with Ctrl+\\, or pass --force."
+        );
+    }
+    match tokio::time::timeout(LOCAL_ATTACH_CONSULT, consult_attach(client, subject))
+        .await
+        .context("timed out at attaching while consulting the requested launch")?
+    {
+        Ok(AttachAnswer::Local(terminal)) => {
+            anyhow::ensure!(
+                terminal.incarnation_id == expected,
+                "the requested launch changed incarnation before attaching"
+            );
+            terminal_exit(st3::client::attach_local_terminal(&terminal).await?)
+        }
+        Ok(AttachAnswer::Bridge(attachment)) => {
+            anyhow::ensure!(
+                attachment.incarnation_id.as_deref() == Some(expected),
+                "the requested launch changed incarnation before attaching"
+            );
+            terminal_exit(
+                client
+                    .proxy_terminal_resilient(subject, &attachment)
+                    .await?,
+            )
+        }
+        Err(error) if st3::client::api_error_code(&error) == Some("runtime-not-local") => {
+            let actor = person.context("remote attachment needs a concrete actor")?;
+            let gateway = generated_client(endpoint, Some(actor))?;
+            let (target, request) = fabric_route(client, &gateway, subject).await?;
+            anyhow::ensure!(
+                request.incarnation == expected,
+                "the requested launch changed incarnation before attaching"
+            );
+            match st3::terminal_fabric::attach(&target, &request).await? {
+                Ok(code) => terminal_exit(code),
+                Err(st3::terminal_fabric::RouteError::Unreachable(error)) => {
+                    eprintln!("st terminals attach: {error}; attaching through the client gateway");
+                    terminal_exit(
+                        st3::remote_terminal::attach_expected(&gateway, subject, subject, expected)
+                            .await?,
+                    )
+                }
+                Err(error) => Err(anyhow::anyhow!(
+                    "attaching to requested incarnation: {error}"
+                )),
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 

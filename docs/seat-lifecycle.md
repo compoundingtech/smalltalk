@@ -261,7 +261,27 @@ After creating a seat, st explains whether it is ready or still starting and pri
 commands to attach, send it a message, inspect it, and stop it. These commands are also printed
 when startup times out or the agent needs your input. Attaching stays opt-in with `--attach`.
 Mission starts, launches, device pairing, and fleet creation or joining also finish with their
-next steps. JSON output keeps its existing shape.
+next steps. While `agents new` waits, stderr reports the host, elapsed time and declaration,
+replication, launch, readiness and attachment stages. A same-host launch explicitly skips
+replication. With `--json`, the result adds a `stages` array and startup failures add `error`.
+
+If the requested process exits before readiness, creation promptly returns that process's exit
+status, including zero, and a bounded startup output tail served from the requested host.
+Startup text stays in local runtime receipts. Replicated diagnostics, step failures and crash-loop
+faults contain fixed failure text, and telemetry exports omit startup detail. Reads use the same
+signed fleet-peer transport as terminal screens, without a separate per-agent ownership check.
+Credential and structured transcript markers withhold the captured local output window. A later retry cannot turn that failed creation into success or redirect its
+attachment. Missing executables and setup errors identify the launch stage that failed.
+If the launch read is unavailable on an older daemon or relay (404/503), creation uses the
+prior readiness/event wait within the same timeout and retains the declaration and first
+observed incarnation. This compatibility path cannot recover an exit that was never observed
+or its startup output, and does not claim remote replication from a local card.
+
+Automatic restarts after short-lived agent exits wait at least five seconds, increasing to a
+maximum of two minutes including jitter. A sixty-second process lifetime clears this consecutive
+failure delay. An explicit person retry or changed launch configuration starts a fresh attempt;
+intentional stops remain stopped. Existing restart intensity limits can still park repeated
+failures. Inspect the fault and retry deadline before retrying after a setup correction.
 
 ## Open a shell
 

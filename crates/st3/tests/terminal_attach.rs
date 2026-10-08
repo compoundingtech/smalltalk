@@ -895,3 +895,101 @@ async fn a_terminal_another_host_owns_falls_back_to_the_client_gateway_without_f
     );
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_ready_agent_attaches_to_its_requested_incarnation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    state.store =
+        Arc::new(Store::open(&root.path().join("claims.sqlite3"), "attach-node").unwrap());
+    let store = state.store.clone();
+    let socket = root.path().join("st3.sock");
+    let server = serve_unix(state, &socket).await;
+    let mut command = st3::test_support::async_command(test_env!("CARGO_BIN_EXE_st3-fixture"));
+    command
+        .env_clear()
+        .env("HOME", root.path())
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .stdin(Stdio::null());
+    command.args([
+        "--endpoint",
+        socket.to_str().unwrap(),
+        "--daemon-wait",
+        "0",
+        "agents",
+        "new",
+        "example/worker",
+        "--host",
+        "attach-node",
+        "--workspace",
+        root.path().to_str().unwrap(),
+        "--harness",
+        "pi",
+        "--model",
+        "invented-model",
+        "--timeout",
+        "5s",
+        "--as",
+        "person/avery",
+        "--attach",
+    ]);
+    let output = tokio::spawn(async move { command.output().await.unwrap() });
+    let desired = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some((desired, _)) = store.desired_subject_with_writer(SUBJECT).unwrap() {
+                break desired;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let member = desired.member.unwrap();
+    let session = serve_pty_session(
+        &root.path().join("pty"),
+        &member.runtime_id,
+        json!({"createdAt": CREATED_AT}),
+    );
+    let token = store.selected_desired_token(SUBJECT).unwrap().unwrap();
+    for (kind, fields) in [
+        (
+            "runtime.action.succeeded",
+            json!({"action":"start", "desired_token":token, "incarnation_id":incarnation(CREATED_AT)}),
+        ),
+        (
+            "runtime.observed",
+            json!({"runtime_id":member.runtime_id, "status":"running", "terminal":true, "incarnation_id":incarnation(CREATED_AT)}),
+        ),
+        (
+            "harness.observed",
+            json!({"driver":"pi", "state":"ready", "incarnation_id":incarnation(CREATED_AT)}),
+        ),
+    ] {
+        store
+            .append_claim(&ClaimInput {
+                subject: SUBJECT.into(),
+                kind: kind.into(),
+                actor: Some(SUBJECT.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let output = tokio::time::timeout(Duration::from_secs(8), output)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_attached(&output);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("harness-ready") && stderr.contains("attaching"),
+        "{stderr}"
+    );
+    assert!(session.join().unwrap().is_some());
+    server.abort();
+}

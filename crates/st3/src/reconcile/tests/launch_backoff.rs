@@ -1,0 +1,377 @@
+use super::*;
+pub(super) struct Clock;
+impl Drop for Clock {
+    fn drop(&mut self) {
+        smallclaims::store::set_thread_clock(None);
+    }
+}
+pub(super) fn at(store: &Store, now: u128) {
+    smallclaims::store::set_thread_clock(Some(now));
+    store.set_write_clock_at(now).unwrap();
+}
+fn fixture(now: u128) -> (Arc<Store>, Reconciler<FakeRuntime>, DesiredSubject) {
+    let store = Arc::new(Store::open_memory("node").unwrap());
+    at(&store, now);
+    apply_source(
+        &store,
+        "version 2\nagent \"example/worker\" { workspace \"/tmp\"; command \"true\"; restart always; }",
+        "launch-backoff",
+    );
+    let desired = store
+        .desired_subject_with_writer("agent/example/worker")
+        .unwrap()
+        .unwrap()
+        .0;
+    let reconciler = Reconciler::new(
+        store.clone(),
+        Arc::new(FakeRuntime::default()),
+        "node".into(),
+        Arc::new(Notify::new()),
+    );
+    (store, reconciler, desired)
+}
+fn launch(
+    store: &Store,
+    reconciler: &Reconciler<FakeRuntime>,
+    desired: &DesiredSubject,
+    incarnation: &str,
+) {
+    store
+        .append_claim(&ClaimInput {
+            subject: desired.subject.clone(),
+            kind: "runtime.action.succeeded".into(),
+            actor: Some(desired.subject.clone()),
+            fields: BTreeMap::from([
+                ("action".into(), Value::String("start".into())),
+                (
+                    "desired_token".into(),
+                    Value::String(reconciler.launch_token(&desired.subject).unwrap()),
+                ),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+            ]),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+}
+
+#[test]
+fn quiet_ready_passes_do_not_enqueue_duplicate_local_receipts() {
+    let _clock = Clock;
+    let now = 1_800_000_000_000;
+    let (store, reconciler, desired) = fixture(now);
+    let mut member = desired.member.clone().unwrap();
+    member.driver = Some("pi".into());
+    let observed = RuntimeObservation {
+        runtime_id: member.runtime_id.clone(),
+        terminal: true,
+        status: "running".into(),
+        exit_code: None,
+        incarnation_id: Some("quiet-ready".into()),
+    };
+    reconciler
+        .record_member(&desired, &observed, false)
+        .unwrap();
+    store
+        .append_claim(&ClaimInput {
+            subject: desired.subject.clone(),
+            kind: "harness.observed".into(),
+            actor: Some(desired.subject.clone()),
+            fields: serde_json::from_value(serde_json::json!({
+                "state":"ready", "driver":"pi", "incarnation_id":"quiet-ready",
+            }))
+            .unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    assert!(
+        store
+            .current_harness(&desired.subject)
+            .unwrap()
+            .unwrap()
+            .is_ready()
+    );
+    reconciler
+        .reconcile_driver_readiness(&desired, &member, &observed, now)
+        .unwrap();
+    let key = format!("launch-ready:{}:quiet-ready", desired.subject);
+    assert!(
+        store.operation_claim(&key).unwrap().is_none(),
+        "the receipt is local"
+    );
+    assert!(
+        store
+            .local_observation_for_key(&desired.subject, "runtime.action.succeeded", &key)
+            .unwrap()
+            .is_some()
+    );
+    let queued = store
+        .connection
+        .batches
+        .1
+        .load(std::sync::atomic::Ordering::Relaxed);
+    for pass in 0..100 {
+        reconciler
+            .reconcile_driver_readiness(&desired, &member, &observed, now + pass)
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .connection
+            .batches
+            .1
+            .load(std::sync::atomic::Ordering::Relaxed),
+        queued,
+        "quiet ready passes entered the writer queue even if local dedupe avoided row inserts"
+    );
+}
+#[test]
+fn crash_backoff_caps_total_delay_and_keeps_absolute_due_across_accounting_windows() {
+    let _clock = Clock;
+    let mut now = 1_800_000_000_000;
+    let (store, reconciler, desired) = fixture(now);
+    let mut member = desired.member.clone().unwrap();
+    member.restart_intensity.attempts = 1000;
+    for attempt in 1..=8 {
+        let incarnation = format!("fake-{attempt}");
+        launch(&store, &reconciler, &desired, &incarnation);
+        now += 100;
+        at(&store, now);
+        let observed = RuntimeObservation {
+            runtime_id: member.runtime_id.clone(),
+            terminal: true,
+            status: "exited".into(),
+            exit_code: Some(1),
+            incarnation_id: Some(incarnation),
+        };
+        reconciler
+            .record_member(&desired, &observed, false)
+            .unwrap();
+        let RestartDecision::Wait { until, .. } = reconciler
+            .restart_decision(&desired, &member, &observed)
+            .unwrap()
+        else {
+            panic!(
+                "failure {attempt} did not back off: now={} subject={} lifecycle={:?} launches={:?} exit={:?}",
+                now_ms(),
+                desired.kind,
+                member.lifecycle,
+                store
+                    .observations_for(&desired.subject, "runtime.action.succeeded")
+                    .unwrap(),
+                store
+                    .latest_observation(&desired.subject, "runtime.observed")
+                    .unwrap()
+            )
+        };
+        let minimum = (5000u128 << (attempt - 1).min(6)).min(120000);
+        assert!(
+            (minimum..=minimum.saturating_add(1000).min(120000))
+                .contains(&until.saturating_sub(now))
+        );
+        let index = store.index().unwrap();
+        assert!(
+            matches!(reconciler.restart_decision(&desired,&member,&observed).unwrap(),RestartDecision::Wait {until:again,..} if again==until)
+        );
+        assert_eq!(
+            store.index().unwrap(),
+            index,
+            "unchanged failure rewrote history"
+        );
+        at(&store, until - 1);
+        assert!(
+            matches!(reconciler.restart_decision(&desired,&member,&observed).unwrap(),RestartDecision::Wait {until:again,..} if again==until)
+        );
+        at(&store, until);
+        assert!(matches!(
+            reconciler
+                .restart_decision(&desired, &member, &observed)
+                .unwrap(),
+            RestartDecision::Start
+        ));
+        now = until;
+    }
+}
+#[test]
+fn healthy_lifetime_resets_consecutive_crash_delay() {
+    let _clock = Clock;
+    let now = 1_800_000_000_000;
+    let (store, reconciler, desired) = fixture(now);
+    let member = desired.member.as_ref().unwrap();
+    let token = reconciler.launch_token(&desired.subject).unwrap();
+    reconciler
+        .record_once(
+            &desired.subject,
+            "runtime.reconcile-decision",
+            BTreeMap::from([
+                ("decision".into(), Value::String("wait".into())),
+                (
+                    "key".into(),
+                    Value::String(format!("crash-backoff:{token}:old:6")),
+                ),
+            ]),
+        )
+        .unwrap();
+    launch(&store, &reconciler, &desired, "healthy");
+    at(&store, now + 60001);
+    let mut observed = RuntimeObservation {
+        runtime_id: member.runtime_id.clone(),
+        terminal: true,
+        status: "exited".into(),
+        exit_code: Some(1),
+        incarnation_id: Some("healthy".into()),
+    };
+    reconciler
+        .record_member(&desired, &observed, false)
+        .unwrap();
+    assert!(matches!(
+        reconciler
+            .restart_decision(&desired, member, &observed)
+            .unwrap(),
+        RestartDecision::Start
+    ));
+    launch(&store, &reconciler, &desired, "fresh");
+    at(&store, now + 60101);
+    observed.incarnation_id = Some("fresh".into());
+    reconciler
+        .record_member(&desired, &observed, false)
+        .unwrap();
+    assert!(
+        matches!(reconciler.restart_decision(&desired,member,&observed).unwrap(),RestartDecision::Wait {until,..} if until-(now+60101)<=6000)
+    );
+}
+
+#[test]
+fn automatic_crash_delay_preserves_a_longer_declared_restart_delay() {
+    let _clock = Clock;
+    let now = 1_800_000_000_000;
+    let (store, reconciler, desired) = fixture(now);
+    let mut member = desired.member.clone().unwrap();
+    member.restart_intensity.delay_ms = 20_000;
+    launch(&store, &reconciler, &desired, "delayed");
+    at(&store, now + 100);
+    let observation = RuntimeObservation {
+        runtime_id: member.runtime_id.clone(),
+        terminal: true,
+        status: "exited".into(),
+        exit_code: Some(1),
+        incarnation_id: Some("delayed".into()),
+    };
+    reconciler
+        .record_member(&desired, &observation, false)
+        .unwrap();
+    assert!(
+        matches!(reconciler.restart_decision(&desired, &member, &observation).unwrap(), RestartDecision::Wait {until,..} if until == now + 20_100)
+    );
+}
+
+#[test]
+fn another_runtime_state_does_not_move_the_first_observed_exit_deadline() {
+    let _clock = Clock;
+    let now = 1_800_000_000_000;
+    let (store, reconciler, desired) = fixture(now);
+    let member = desired.member.as_ref().unwrap();
+    launch(&store, &reconciler, &desired, "first-exit");
+    at(&store, now + 100);
+    let observation = RuntimeObservation {
+        runtime_id: member.runtime_id.clone(),
+        terminal: true,
+        status: "exited".into(),
+        exit_code: Some(1),
+        incarnation_id: Some("first-exit".into()),
+    };
+    reconciler
+        .record_member(&desired, &observation, false)
+        .unwrap();
+    let RestartDecision::Wait { until, .. } = reconciler
+        .restart_decision(&desired, member, &observation)
+        .unwrap()
+    else {
+        panic!("missing initial delay")
+    };
+    at(&store, now + 1_100);
+    reconciler
+        .record_once(
+            &desired.subject,
+            "runtime.observed",
+            BTreeMap::from([("status".into(), Value::String("unknown".into()))]),
+        )
+        .unwrap();
+    reconciler
+        .record_member(&desired, &observation, false)
+        .unwrap();
+    assert!(
+        matches!(reconciler.restart_decision(&desired, member, &observation).unwrap(), RestartDecision::Wait {until:again,..} if again == until)
+    );
+}
+
+#[test]
+fn repeated_launcher_failures_keep_detail_local_when_parking() {
+    let _clock = Clock;
+    for codex in [false, true] {
+        let now = now_ms();
+        let (store, reconciler, desired) = fixture(now);
+        let token = reconciler.launch_token(&desired.subject).unwrap();
+        let marker = "local-fixture-launch-detail-must-stay-on-node";
+        for attempt in 1..=3 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: desired.subject.clone(),
+                    kind: "runtime.action.failed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("action".into(), Value::String("start".into())),
+                        ("reason".into(), Value::String(marker.into())),
+                        ("desired_token".into(), Value::String(token.clone())),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(format!(
+                        "start-failed:{}:{token}:{attempt}",
+                        desired.subject
+                    )),
+                })
+                .unwrap();
+        }
+        if codex {
+            let mut member = desired.member.clone().unwrap();
+            member.driver = Some("codex".into());
+            assert!(
+                !reconciler
+                    .perform_start_for_request(&desired, &member, "test", None)
+                    .unwrap()
+            );
+        } else {
+            assert!(reconciler.defer_or_park_failed_start(&desired).unwrap());
+        }
+        let decision = store
+            .latest_claim(&desired.subject, Some("runtime.reconcile-decision"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.body["fields"]["decision"], "raise");
+        assert!(
+            decision.body["fields"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("three times")
+        );
+        assert!(
+            !serde_json::to_string(&store.claims_for(&desired.subject, None).unwrap())
+                .unwrap()
+                .contains(marker)
+        );
+        assert!(reconciler.runtime.starts.lock().unwrap().is_empty());
+        assert_eq!(
+            store
+                .observations_for(&desired.subject, "runtime.action.failed")
+                .unwrap()
+                .iter()
+                .filter(|claim| claim.body["fields"]["reason"] == marker)
+                .count(),
+            3
+        );
+    }
+}

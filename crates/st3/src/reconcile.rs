@@ -348,6 +348,9 @@ pub trait RuntimeControl: Send + Sync + 'static {
     fn screen(&self, runtime_id: &str) -> Result<String>;
     fn send_key(&self, runtime_id: &str, key: &str) -> Result<()>;
     fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>>;
+    fn exit_tail(&self, _observation: &RuntimeObservation) -> Result<Option<String>> {
+        Ok(None)
+    }
     /// Ends, without waiting, what a runtime that is not running left in its work scope: a build
     /// or test its harness started that outlived it.
     fn end_leftovers(&self, _runtime_id: &str, _terminal: bool) {}
@@ -602,6 +605,35 @@ impl RuntimeControl for NativeRuntime {
 
     fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>> {
         self.exec.read_log(runtime_id)
+    }
+
+    fn exit_tail(&self, observation: &RuntimeObservation) -> Result<Option<String>> {
+        let Some(incarnation) = observation.incarnation_id.as_deref() else {
+            return Ok(None);
+        };
+        if observation.terminal {
+            self.pty()?.exit_tail(&observation.runtime_id, incarnation)
+        } else if self
+            .observe_exec(&observation.runtime_id)?
+            .is_some_and(|current| {
+                current.status == "exited" && current.incarnation_id.as_deref() == Some(incarnation)
+            })
+        {
+            let tail = self.exec.read_log_tail(&observation.runtime_id)?;
+            if self
+                .observe_exec(&observation.runtime_id)?
+                .is_some_and(|current| {
+                    current.status == "exited"
+                        && current.incarnation_id.as_deref() == Some(incarnation)
+                })
+            {
+                Ok(tail)
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     fn end_leftovers(&self, runtime_id: &str, terminal: bool) {
@@ -3081,6 +3113,25 @@ impl<R: RuntimeControl> Reconciler<R> {
             .current_harness(&subject.subject)?
             .is_some_and(|harness| harness.incarnation_id == incarnation && harness.is_ready());
         if harness_ready {
+            let key = format!("launch-ready:{}:{incarnation}", subject.subject);
+            if self
+                .store
+                .local_observation_for_key(&subject.subject, "runtime.action.succeeded", &key)?
+                .is_none()
+            {
+                self.store.append_claim(&ClaimInput {
+                    subject: subject.subject.clone(),
+                    kind: "runtime.action.succeeded".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("action".into(), Value::String("harness-ready".into())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key),
+                })?;
+            }
             self.resolve_superseded_harness_auth_attention(&subject.subject, incarnation)?;
             self.resolve_recovered_seat_attention(&subject.subject, incarnation)?;
             self.resolve_pending_alert(
@@ -5088,17 +5139,34 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })
                 .collect::<Vec<_>>();
             if recent_failures.len() >= CODEX_CRASH_LOOP_ATTEMPTS {
-                let detail = recent_failures
-                    .last()
-                    .and_then(|claim| claim.body.pointer("/fields/reason"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("the runtime start failed");
                 self.raise_codex_crash_loop(
                     &subject.subject,
                     &token,
-                    &format!("Codex failed to launch three times: {detail}"),
+                    "Codex failed to launch three times; inspect its host's launch status",
                 )?;
                 return Ok(false);
+            }
+            if let Some(last) = recent_failures.last() {
+                let until = last.accepted_at_unix_ms.saturating_add(5_000);
+                if until > now_ms() {
+                    self.record_once(
+                        &subject.subject,
+                        "runtime.reconcile-decision",
+                        BTreeMap::from([
+                            ("decision".into(), Value::String("wait".into())),
+                            (
+                                "reason".into(),
+                                Value::String("failed launcher; retry after 5000ms".into()),
+                            ),
+                            (
+                                "restart_at_unix_ms".into(),
+                                Value::String(until.to_string()),
+                            ),
+                        ]),
+                    )?;
+                    self.arm_restart(&subject.subject, until);
+                    return Ok(false);
+                }
             }
         }
         let workspace = Path::new(&member.workspace);
@@ -5276,6 +5344,23 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             Ok(())
         };
+        if explicit_person {
+            self.record_once(
+                &subject.subject,
+                "runtime.reconcile-decision",
+                BTreeMap::from([
+                    ("decision".into(), Value::String("retry".into())),
+                    (
+                        "key".into(),
+                        Value::String(format!("crash-backoff:{desired_token}:explicit:0")),
+                    ),
+                    (
+                        "reason".into(),
+                        Value::String("explicit retry resets the automatic crash delay".into()),
+                    ),
+                ]),
+            )?;
+        }
         if let Some(request) = request {
             // Persist before the side effect. An interrupted attempt is never launched twice,
             // including when the owner daemon loses its in-memory state between passes.
@@ -5298,7 +5383,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         if let Err(error) = self.runtime.start_guarded(&launch_member, &guard) {
-            let reason = error.to_string();
+            let reason = st_runtime::launch_diagnostic::safe_tail(
+                &error.to_string(),
+                &launch_member.environment,
+            );
             let prior_failures = self.start_failures(&subject.subject, &desired_token)?;
             self.store.append_claim(&ClaimInput {
                 subject: subject.subject.clone(),
@@ -5307,7 +5395,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 fields: BTreeMap::from([
                     ("action".into(), Value::String("start".into())),
                     ("operation".into(), Value::String(operation)),
-                    ("reason".into(), Value::String(reason)),
+                    ("reason".into(), Value::String(reason.clone())),
                     ("desired_token".into(), Value::String(desired_token.clone())),
                 ]),
                 evidence: Vec::new(),
@@ -5323,20 +5411,27 @@ impl<R: RuntimeControl> Reconciler<R> {
                 "runtime.observed",
                 member_fields(member, "absent", None, false),
             )?;
-            return Err(error).context("start member runtime");
+            anyhow::bail!(
+                "the requested runtime could not start; inspect its host's launch status"
+            );
         }
-        let incarnation = if member.terminal {
+        let launched = if member.terminal {
             self.runtime.snapshot_ptys().ok().and_then(|items| {
                 items.into_iter().find(|item| item.runtime_id == member.runtime_id)
             })
         } else {
             self.runtime.observe_exec(&member.runtime_id).ok().flatten()
-        }
-        .and_then(|item| item.incarnation_id);
+        };
+        let incarnation = launched
+            .as_ref()
+            .and_then(|item| item.incarnation_id.clone());
         let mut fields = BTreeMap::from([
             ("action".into(), Value::String("start".into())),
             ("desired_token".into(), Value::String(desired_token)),
-            ("runtime_id".into(), Value::String(member.runtime_id.clone())),
+            (
+                "runtime_id".into(),
+                Value::String(member.runtime_id.clone()),
+            ),
             ("reason".into(), Value::String(reason.into())),
         ]);
         if let Some(operation) = member.environment.get(crate::rollout::OPERATION_ENV) {
@@ -5360,17 +5455,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             member_fields(member, "starting", None, false),
             placement_evidence,
         )?;
-        self.record_once(
-            &subject.subject,
-            "runtime.action.succeeded",
-            BTreeMap::from([
-                ("reason".into(), Value::String(reason.into())),
-                (
-                    "runtime_id".into(),
-                    Value::String(member.runtime_id.clone()),
-                ),
-            ]),
-        )?;
+        if let Some(observation) = launched
+            .as_ref()
+            .filter(|item| matches!(item.status.as_str(), "exited" | "vanished"))
+        {
+            self.record_member(subject, observation, false)?;
+        }
         self.signal_changed();
         Ok(true)
     }
@@ -6167,6 +6257,20 @@ impl<R: RuntimeControl> Reconciler<R> {
                 self.perform_start(subject, member, "the prior generation exited")
             }
             RestartDecision::Wait { until, reason } => {
+                if self
+                    .store
+                    .latest_observation(&subject.subject, "runtime.reconcile-decision")?
+                    .is_some_and(|c| {
+                        c.body["fields"]["key"]
+                            .as_str()
+                            .is_some_and(|k| k.starts_with("crash-backoff:"))
+                            && c.body["fields"]["restart_at_unix_ms"].as_str()
+                                == Some(until.to_string().as_str())
+                    })
+                {
+                    self.arm_restart(&subject.subject, until);
+                    return Ok(());
+                }
                 self.record_once(
                     &subject.subject,
                     "runtime.reconcile-decision",
@@ -6288,15 +6392,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             })
             .collect::<Vec<_>>();
         if recent.len() >= CODEX_CRASH_LOOP_ATTEMPTS {
-            let detail = recent
-                .last()
-                .and_then(|claim| claim.body.pointer("/fields/reason"))
-                .and_then(Value::as_str)
-                .unwrap_or("the runtime start failed");
             self.raise_runtime_crash_loop(
                 &subject.subject,
                 &token,
-                &format!("the runtime failed to start three times: {detail}"),
+                "the runtime failed to start three times; inspect its host's launch status",
             )?;
             return Ok(true);
         }
@@ -6504,6 +6603,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             .map(|claim| claim.store_index)
             .max()
             .unwrap_or(0);
+        let current_launch = launches
+            .iter()
+            .rev()
+            .find(|claim| claim_incarnation(claim) == observation.incarnation_id.as_deref())
+            .cloned();
         launches.retain(|claim| {
             launch_in_restart_window(
                 claim.store_index,
@@ -6552,6 +6656,88 @@ impl<R: RuntimeControl> Reconciler<R> {
 
         let mut wait_until = now;
         let mut reasons = Vec::new();
+        let mut crash_backoff = None;
+        if subject.kind == "agent"
+            && member.lifecycle == MemberLifecycle::Service
+            && !self.claude_trust_recovery_stopped(&subject.subject, observation)?
+            && !self.fresh_context_recovery_stopped(&subject.subject, observation)?
+            && let Some(last) = current_launch.as_ref()
+        {
+            // A minute of stable process lifetime resets the consecutive-failure delay.
+            // Explicit restart and revision replacement bypass this automatic path.
+            let exits = self
+                .store
+                .launch_observations(&subject.subject, "runtime.observed")?
+                .0;
+            let observed_at = exits
+                .iter()
+                .find(|claim| {
+                    claim_incarnation(claim) == Some(incarnation)
+                        && matches!(
+                            claim.body["fields"]["status"].as_str(),
+                            Some("exited" | "vanished")
+                        )
+                })
+                .map_or(now, |claim| claim.accepted_at_unix_ms);
+            if observed_at.saturating_sub(last.accepted_at_unix_ms) >= 60_000 {
+                self.record_once(
+                    &subject.subject,
+                    "runtime.reconcile-decision",
+                    BTreeMap::from([
+                        ("decision".into(), Value::String("restart".into())),
+                        (
+                            "key".into(),
+                            Value::String(format!("crash-backoff:{desired_token}:{incarnation}:0")),
+                        ),
+                        (
+                            "reason".into(),
+                            Value::String(
+                                "a stable 60000ms lifetime resets the automatic crash delay".into(),
+                            ),
+                        ),
+                    ]),
+                )?;
+            } else {
+                let prefix = format!("crash-backoff:{desired_token}:");
+                let prior = self
+                    .store
+                    .launch_observations(&subject.subject, "runtime.reconcile-decision")?
+                    .0
+                    .into_iter()
+                    .rev()
+                    .find(|claim| {
+                        claim.body["fields"]["key"]
+                            .as_str()
+                            .is_some_and(|key| key.starts_with(&prefix))
+                    });
+                let previous = prior
+                    .as_ref()
+                    .and_then(|claim| claim.body["fields"]["key"].as_str())
+                    .filter(|key| key.starts_with(&prefix));
+                let count = previous
+                    .and_then(|key| key.rsplit(':').next()?.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let same =
+                    previous.is_some_and(|key| key == format!("{prefix}{incarnation}:{count}"));
+                let attempt = if same {
+                    count
+                } else {
+                    count.saturating_add(1).min(6)
+                };
+                let delay = (5_000u128 << attempt.saturating_sub(1).min(6)).min(120_000);
+                // Stable per incarnation: evaluating another pass must not move its due time.
+                let hash = incarnation.bytes().fold(0u64, |hash, byte| {
+                    hash.wrapping_mul(31).wrapping_add(u64::from(byte))
+                });
+                let jitter = u128::from(hash % 1001).min(120_000 - delay);
+                let until = observed_at.saturating_add(delay).saturating_add(jitter);
+                if until > now {
+                    wait_until = until;
+                    crash_backoff = Some(format!("{prefix}{incarnation}:{attempt}"));
+                    reasons.push(format!("short-lived launch; automatic retry {attempt} after {}ms including capped jitter", delay + jitter));
+                }
+            }
+        }
         if intensity.delay_ms > 0 {
             let observed_at = self
                 .store
@@ -6601,6 +6787,22 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         if wait_until > now {
+            if let Some(key) = crash_backoff {
+                self.record_once(
+                    &subject.subject,
+                    "runtime.reconcile-decision",
+                    BTreeMap::from([
+                        ("decision".into(), Value::String("wait".into())),
+                        ("reachability".into(), Value::String("reachable".into())),
+                        ("key".into(), Value::String(key)),
+                        ("reason".into(), Value::String(reasons.join("; "))),
+                        (
+                            "restart_at_unix_ms".into(),
+                            Value::String(wait_until.to_string()),
+                        ),
+                    ]),
+                )?;
+            }
             Ok(RestartDecision::Wait {
                 until: wait_until,
                 reason: reasons.join("; "),
@@ -6629,10 +6831,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         handle.spawn(async move {
             let delay = until.saturating_sub(now_ms()).min(u64::MAX as u128) as u64;
             tokio::time::sleep(Duration::from_millis(delay)).await;
-            delayed
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&subject);
+            let mut armed = delayed.lock().unwrap_or_else(PoisonError::into_inner);
+            if armed.get(&subject) != Some(&until) {
+                return;
+            }
+            armed.remove(&subject);
+            drop(armed);
             crate::performance::record_wake("timer restart", Some(restart_wake_kind(&subject)));
             notify.notify_one();
         });
@@ -6705,7 +6909,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             fields.insert("exit_code".into(), Value::from(exit_code));
         }
         let mut evidence = Vec::new();
-        if member.kind == MemberKind::Exec {
+        if matches!(member.kind, MemberKind::Exec | MemberKind::Agent) {
             // Launch receipts stay on the runtime's node. Carry the launched declaration as
             // evidence on its durable observation so predicates read the same proof everywhere.
             if let Some(token) = self
@@ -6726,7 +6930,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                     fields["desired_token"].as_str().map(str::to_owned)
                 })
             {
-                evidence.push(token);
+                if self.store.claim_by_id(&token)?.is_some_and(|claim| {
+                    claim.kind == "intent.desired" && claim.subject == subject.subject
+                }) {
+                    evidence.push(token);
+                }
             } else if let Some(prior) = self
                 .store
                 .latest_claim(&subject.subject, Some("runtime.observed"))?
@@ -6742,6 +6950,91 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .map(str::to_owned)
                     .collect();
             }
+        }
+        if member.kind == MemberKind::Agent
+            && matches!(observation.status.as_str(), "exited" | "vanished")
+            && let Some(incarnation) = observation.incarnation_id.as_deref()
+            && self
+                .store
+                .local_observation_for_key(
+                    &subject.subject,
+                    "runtime.action.succeeded",
+                    &format!("launch-ready:{}:{incarnation}", subject.subject),
+                )?
+                .is_none()
+            && !self
+                .store
+                .current_harness(&subject.subject)?
+                .is_some_and(|h| h.incarnation_id == incarnation && h.is_ready())
+            && !self
+                .store
+                .claims_for(&subject.subject, Some("harness.observed"))?
+                .iter()
+                .any(|c| {
+                    claim_incarnation(c) == Some(incarnation)
+                        && matches!(
+                            c.body["fields"]["state"].as_str(),
+                            Some("ready" | "idle" | "working")
+                        )
+                })
+        {
+            let output_key = format!("launch-output:{}:{incarnation}", subject.subject);
+            if self
+                .store
+                .local_observation_for_key(&subject.subject, "runtime.action.failed", &output_key)?
+                .is_none()
+            {
+                let tail = self
+                    .runtime
+                    .exit_tail(observation)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let tail = st_runtime::launch_diagnostic::safe_tail(&tail, &member.environment);
+                // Runtime action receipts with no actor have SystemLocal retention. Startup
+                // output stays on this host; the durable diagnostic contains only fixed text.
+                self.store.append_claim(&ClaimInput {
+                    subject: subject.subject.clone(),
+                    kind: "runtime.action.failed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("action".into(), Value::String("startup-output".into())),
+                        (
+                            "code".into(),
+                            Value::String("launch-exited-before-ready".into()),
+                        ),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                        ("reason".into(), Value::String(tail)),
+                    ]),
+                    evidence: evidence.clone(),
+                    expected_subject: None,
+                    idempotency_key: Some(output_key),
+                })?;
+            }
+            let exit = observation.exit_code.map_or_else(
+                || "exit code unavailable".into(),
+                |code| format!("exit code {code}"),
+            );
+            self.record_once_with_evidence(
+                &subject.subject,
+                "harness.diagnostic",
+                BTreeMap::from([
+                    (
+                        "code".into(),
+                        Value::String("launch-exited-before-ready".into()),
+                    ),
+                    ("severity".into(), Value::String("error".into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    (
+                        "reason".into(),
+                        Value::String(format!(
+                            "the requested launch {} before harness readiness ({exit})",
+                            observation.status
+                        )),
+                    ),
+                ]),
+                evidence.clone(),
+            )?;
         }
         self.record_once_with_evidence(&subject.subject, "runtime.observed", fields, evidence)
     }
@@ -10707,12 +11000,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             let action_failure = self
                 .store
                 .latest_observation(&subject.subject, "runtime.action.failed")?
-                .and_then(|claim| {
-                    claim
-                        .body
-                        .pointer("/fields/reason")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
+                .filter(|claim| {
+                    claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("start")
+                })
+                // Local launcher output must not become a replicated step failure reason.
+                .map(|_| {
+                    "the runtime could not start; inspect its host's launch status".to_owned()
                 });
             let raised_reason = raised.and_then(|claim| {
                 claim
@@ -15646,6 +15939,7 @@ mod tests {
     mod differential;
     mod first_readiness_tests;
     mod incremental_deadlines;
+    mod launch_backoff;
     mod ownership_guard_tests;
     mod pull_request_run_tests;
     mod ready_idle_wake;
@@ -19378,6 +19672,16 @@ agent "good" { workspace "/tmp"; command "true" }
                 .member_reconcile_fault("agent/node.bad", None)
                 .unwrap()
                 .unwrap()
+                .contains("the requested runtime could not start")
+        );
+        assert!(
+            store
+                .latest_observation("agent/node.bad", "runtime.action.failed")
+                .unwrap()
+                .unwrap()
+                .body["fields"]["reason"]
+                .as_str()
+                .unwrap()
                 .contains("fake runtime rejected")
         );
         assert!(
@@ -19669,6 +19973,17 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
 
     #[test]
     fn a_mission_step_fails_when_its_non_restarting_driver_exits_before_readiness() {
+        assert_non_restarting_driver_failure(None);
+    }
+
+    #[test]
+    fn a_mission_step_failure_never_copies_local_startup_output() {
+        for action in ["startup-output", "start"] {
+            assert_non_restarting_driver_failure(Some(action));
+        }
+    }
+
+    fn assert_non_restarting_driver_failure(local_action: Option<&str>) {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         let source = r#"
@@ -19711,6 +20026,28 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
         for _ in 0..3 {
             reconciler.reconcile_once().unwrap();
         }
+        let agent_subject = format!("agent/{}/worker", run.id);
+        let marker = "local-fixture-launch-detail-must-stay-on-node";
+        if let Some(action) = local_action {
+            store
+                .append_claim(&ClaimInput {
+                    subject: agent_subject.clone(),
+                    kind: "runtime.action.failed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("action".into(), Value::String(action.into())),
+                        ("reason".into(), Value::String(marker.into())),
+                        (
+                            "incarnation_id".into(),
+                            Value::String("failed-start".into()),
+                        ),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("launch-output:{agent_subject}:failed-start")),
+                })
+                .unwrap();
+        }
         runtime.ptys.lock().unwrap().push(RuntimeObservation {
             runtime_id,
             terminal: true,
@@ -19727,12 +20064,32 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
             .find(|step| step.step == "start-agent")
             .unwrap();
         assert_eq!(step.status, "failed");
-        assert!(
-            step.blocked_reason
-                .as_deref()
-                .unwrap()
-                .contains("could not become ready: runtime status was exited with exit code 2")
-        );
+        let reason = step.blocked_reason.as_deref().unwrap();
+        if local_action == Some("start") {
+            assert!(reason.contains("could not become ready: the runtime could not start"));
+        } else {
+            assert!(
+                reason
+                    .contains("could not become ready: runtime status was exited with exit code 2")
+            );
+        }
+        assert!(!reason.contains(marker));
+        for subject in [&agent_subject, &step.subject] {
+            assert!(
+                !serde_json::to_string(&store.claims_for(subject, None).unwrap())
+                    .unwrap()
+                    .contains(marker)
+            );
+        }
+        if local_action.is_some() {
+            assert!(
+                store
+                    .observations_for(&agent_subject, "runtime.action.failed")
+                    .unwrap()
+                    .iter()
+                    .any(|claim| claim.body["fields"]["reason"] == marker)
+            );
+        }
     }
 
     #[test]
@@ -21473,7 +21830,10 @@ agent "worker" {
             "node".into(),
             Arc::new(Notify::new()),
         );
-        for _ in 0..6 {
+        let _clock = launch_backoff::Clock;
+        let start = now_ms();
+        for attempt in 0..6 {
+            launch_backoff::at(&store, start + attempt * 6_000);
             reconciler.reconcile_once().unwrap();
         }
         assert_eq!(runtime.starts.lock().unwrap().len(), 3);
@@ -21487,7 +21847,16 @@ agent "worker" {
         assert!(
             attention[0]
                 .detail
-                .contains("the fake runtime rejected the start")
+                .contains("Codex failed to launch three times")
+        );
+        assert!(
+            store
+                .observations_for("agent/node.worker", "runtime.action.failed")
+                .unwrap()
+                .iter()
+                .any(
+                    |claim| claim.body["fields"]["reason"] == "the fake runtime rejected the start"
+                )
         );
         let decisions = store
             .claims_for("agent/node.worker", Some("runtime.reconcile-decision"))
@@ -21534,7 +21903,19 @@ agent "worker" {
             exit_code: Some(17),
             incarnation_id: Some("bad-seat".into()),
         });
-        for _ in 0..5 {
+        let _clock = launch_backoff::Clock;
+        let start = now_ms();
+        for attempt in 0..5 {
+            launch_backoff::at(&store, start + attempt * 6_000);
+            if runtime.ptys.lock().unwrap().is_empty() {
+                runtime.ptys.lock().unwrap().push(RuntimeObservation {
+                    runtime_id: "node.worker".into(),
+                    terminal: true,
+                    status: "exited".into(),
+                    exit_code: Some(17),
+                    incarnation_id: Some(format!("bad-seat-{attempt}")),
+                });
+            }
             reconciler.reconcile_once().unwrap();
         }
         assert_eq!(runtime.starts.lock().unwrap().len(), 3);

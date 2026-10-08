@@ -58,6 +58,7 @@ use crate::model::{
 use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
+mod agent_launch;
 mod client_blobs;
 mod client_adapters;
 mod client_presence;
@@ -623,6 +624,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/sets/preview", post(owned_sets::preview))
         .route("/v1/sets/apply", post(owned_sets::apply))
         .route("/v1/intent/apply", post(apply_with_bound))
+        .route("/v1/hosts/{host}/agent-launch", get(agent_launch::get))
         .route("/v1/agents/rename", post(rename_agent))
         .route("/v1/agents/restart", post(restart_agent))
         .route("/v1/agents/rollout", post(rollout_agent))

@@ -802,6 +802,10 @@ const PROBES: &[Probe] = &[
         "GET /v1/hosts/{host}/agent-workspace",
         "/v1/hosts/bench-host/agent-workspace?identity=bench/seat-0",
     ),
+    get(
+        "GET /v1/hosts/{host}/agent-launch",
+        "/v1/hosts/bench-host/agent-launch?subject={launch_subject}&token={launch_token}",
+    ),
     // Writes, each with a new idempotency key.
     post("POST /v1/claims", "/v1/claims", |fixture, attempt| {
         let seat = &fixture.subjects.seats[0];
@@ -1736,6 +1740,29 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         store.append_claim(&running).unwrap();
     }
     let mut fixture = fixture(&person, &client, subjects).await;
+    let launch_subject = "agent/bench/cost/launch";
+    let launch_intent = st3::parse_intent(
+        "version 2\nagent \"bench/cost/launch\" { workspace \"/tmp\"; argv \"/usr/bin/true\"; restart \"never\" }\n",
+        NODE,
+    ).unwrap();
+    store
+        .apply_internal(&launch_intent, "cost-launch-source")
+        .unwrap();
+    let launch_token = store
+        .selected_desired_token(launch_subject)
+        .unwrap()
+        .expect("the launch probe must name the seat's selected declaration");
+    let mut launched = claim_input("runtime.action.succeeded", "cost-seat-0-launch", 0, "");
+    launched.subject = launch_subject.into();
+    launched.fields = serde_json::from_value(json!({
+        "action":"start", "desired_token":launch_token, "incarnation_id":SEAT_RUNTIME,
+    }))
+    .unwrap();
+    store.append_claim(&launched).unwrap();
+    fixture
+        .items
+        .insert("launch_subject", launch_subject.into());
+    fixture.items.insert("launch_token", launch_token);
     fixture.items.insert(
         "event_after",
         store.event_bounds().unwrap().0.saturating_sub(1).to_string(),
@@ -1847,6 +1874,15 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         !event_page["items"].as_array().unwrap().is_empty(),
         "measure a populated event page, not a refused or empty traversal"
     );
+    let launch: Value = client
+        .get(&fixture.fill(
+            "/v1/hosts/bench-host/agent-launch?subject={launch_subject}&token={launch_token}",
+            0,
+        ))
+        .await
+        .expect("the launch cost probe must read a successful owned launch");
+    assert_eq!(launch["incarnation_id"], SEAT_RUNTIME);
+    assert_eq!(launch["desired_token"], fixture.items["launch_token"]);
 
     let mut costs = BTreeMap::new();
     for probe in PROBES {

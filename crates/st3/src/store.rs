@@ -54452,3 +54452,51 @@ mod harness_event_tests {
         assert!(store.append_harness_event(&input).is_err());
     }
 }
+
+impl Store {
+    /// Read an owner-local idempotent observation without entering the writer queue.
+    pub(crate) fn local_observation_for_key(
+        &self,
+        subject: &str,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<ClaimRecord>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                &format!(
+                    "{LOCAL_OBSERVATION_COLUMNS} WHERE dedupe_key=?1 AND subject=?2 AND kind=?3"
+                ),
+                params![local_observation_dedupe_key(kind, key), subject, kind],
+                |row| local_observation_from_row(&self.origin, row),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Bounded recent evidence for launch waits, merging owner-local receipts and claims.
+    pub fn launch_observations(
+        &self,
+        subject: &str,
+        kind: &str,
+    ) -> Result<(Vec<ClaimRecord>, bool)> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let page = self.claims_for_subject_kind_at(subject, kind, None, true, 64)?;
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(&format!(
+            "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 ORDER BY id DESC LIMIT 65"
+        ))?;
+        let rows = statement.query_map(params![subject, kind], |row| {
+            local_observation_from_row(&self.origin, row)
+        })?;
+        let mut records = page.claims;
+        records.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        let truncated = page.next_cursor.is_some() || records.len() > 64;
+        records.sort_by_key(claim_log_order);
+        if records.len() > 64 {
+            records.drain(..records.len() - 64);
+        }
+        Ok((records, truncated))
+    }
+}
