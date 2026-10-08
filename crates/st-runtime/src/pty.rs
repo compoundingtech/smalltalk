@@ -461,7 +461,7 @@ impl PtyRuntime {
             last_error = crate::launch_diagnostic::safe_tail(&combined, env)
                 .trim()
                 .to_string();
-            if !last_error.contains("already in use") || attempt + 1 == ATTEMPTS {
+            if !combined.contains("already in use") || attempt + 1 == ATTEMPTS {
                 break;
             }
             if self
@@ -1718,6 +1718,7 @@ exit 0
             "fake-pty-retry",
             r#"  if [ "$count" -eq 1 ]; then
     printf '%s\n' 'Session id "work" is already in use.' >&2
+    printf '%s\n' 'token: fake-retry-window' >&2
     exit 1
   fi
   test ! -f "$PTY_ROOT/work.json" || touch "$0.stale"

@@ -5139,15 +5139,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })
                 .collect::<Vec<_>>();
             if recent_failures.len() >= CODEX_CRASH_LOOP_ATTEMPTS {
-                let detail = recent_failures
-                    .last()
-                    .and_then(|claim| claim.body.pointer("/fields/reason"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("the runtime start failed");
                 self.raise_codex_crash_loop(
                     &subject.subject,
                     &token,
-                    &format!("Codex failed to launch three times: {detail}"),
+                    "Codex failed to launch three times; inspect its host's launch status",
                 )?;
                 return Ok(false);
             }
@@ -6397,15 +6392,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             })
             .collect::<Vec<_>>();
         if recent.len() >= CODEX_CRASH_LOOP_ATTEMPTS {
-            let detail = recent
-                .last()
-                .and_then(|claim| claim.body.pointer("/fields/reason"))
-                .and_then(Value::as_str)
-                .unwrap_or("the runtime start failed");
             self.raise_runtime_crash_loop(
                 &subject.subject,
                 &token,
-                &format!("the runtime failed to start three times: {detail}"),
+                "the runtime failed to start three times; inspect its host's launch status",
             )?;
             return Ok(true);
         }
@@ -11010,12 +11000,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             let action_failure = self
                 .store
                 .latest_observation(&subject.subject, "runtime.action.failed")?
-                .and_then(|claim| {
-                    claim
-                        .body
-                        .pointer("/fields/reason")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
+                .filter(|claim| {
+                    claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("start")
+                })
+                // Local launcher output must not become a replicated step failure reason.
+                .map(|_| {
+                    "the runtime could not start; inspect its host's launch status".to_owned()
                 });
             let raised_reason = raised.and_then(|claim| {
                 claim
@@ -19574,6 +19564,16 @@ agent "good" { workspace "/tmp"; command "true" }
                 .member_reconcile_fault("agent/node.bad", None)
                 .unwrap()
                 .unwrap()
+                .contains("the requested runtime could not start")
+        );
+        assert!(
+            store
+                .latest_observation("agent/node.bad", "runtime.action.failed")
+                .unwrap()
+                .unwrap()
+                .body["fields"]["reason"]
+                .as_str()
+                .unwrap()
                 .contains("fake runtime rejected")
         );
         assert!(
@@ -19865,6 +19865,17 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
 
     #[test]
     fn a_mission_step_fails_when_its_non_restarting_driver_exits_before_readiness() {
+        assert_non_restarting_driver_failure(None);
+    }
+
+    #[test]
+    fn a_mission_step_failure_never_copies_local_startup_output() {
+        for action in ["startup-output", "start"] {
+            assert_non_restarting_driver_failure(Some(action));
+        }
+    }
+
+    fn assert_non_restarting_driver_failure(local_action: Option<&str>) {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         let source = r#"
@@ -19907,6 +19918,28 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
         for _ in 0..3 {
             reconciler.reconcile_once().unwrap();
         }
+        let agent_subject = format!("agent/{}/worker", run.id);
+        let marker = "local-fixture-launch-detail-must-stay-on-node";
+        if let Some(action) = local_action {
+            store
+                .append_claim(&ClaimInput {
+                    subject: agent_subject.clone(),
+                    kind: "runtime.action.failed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("action".into(), Value::String(action.into())),
+                        ("reason".into(), Value::String(marker.into())),
+                        (
+                            "incarnation_id".into(),
+                            Value::String("failed-start".into()),
+                        ),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("launch-output:{agent_subject}:failed-start")),
+                })
+                .unwrap();
+        }
         runtime.ptys.lock().unwrap().push(RuntimeObservation {
             runtime_id,
             terminal: true,
@@ -19923,12 +19956,32 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
             .find(|step| step.step == "start-agent")
             .unwrap();
         assert_eq!(step.status, "failed");
-        assert!(
-            step.blocked_reason
-                .as_deref()
-                .unwrap()
-                .contains("could not become ready: runtime status was exited with exit code 2")
-        );
+        let reason = step.blocked_reason.as_deref().unwrap();
+        if local_action == Some("start") {
+            assert!(reason.contains("could not become ready: the runtime could not start"));
+        } else {
+            assert!(
+                reason
+                    .contains("could not become ready: runtime status was exited with exit code 2")
+            );
+        }
+        assert!(!reason.contains(marker));
+        for subject in [&agent_subject, &step.subject] {
+            assert!(
+                !serde_json::to_string(&store.claims_for(subject, None).unwrap())
+                    .unwrap()
+                    .contains(marker)
+            );
+        }
+        if local_action.is_some() {
+            assert!(
+                store
+                    .observations_for(&agent_subject, "runtime.action.failed")
+                    .unwrap()
+                    .iter()
+                    .any(|claim| claim.body["fields"]["reason"] == marker)
+            );
+        }
     }
 
     #[test]
@@ -21686,7 +21739,16 @@ agent "worker" {
         assert!(
             attention[0]
                 .detail
-                .contains("the fake runtime rejected the start")
+                .contains("Codex failed to launch three times")
+        );
+        assert!(
+            store
+                .observations_for("agent/node.worker", "runtime.action.failed")
+                .unwrap()
+                .iter()
+                .any(
+                    |claim| claim.body["fields"]["reason"] == "the fake runtime rejected the start"
+                )
         );
         let decisions = store
             .claims_for("agent/node.worker", Some("runtime.reconcile-decision"))

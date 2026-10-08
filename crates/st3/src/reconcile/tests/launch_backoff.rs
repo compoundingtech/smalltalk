@@ -307,3 +307,71 @@ fn another_runtime_state_does_not_move_the_first_observed_exit_deadline() {
         matches!(reconciler.restart_decision(&desired, member, &observation).unwrap(), RestartDecision::Wait {until:again,..} if again == until)
     );
 }
+
+#[test]
+fn repeated_launcher_failures_keep_detail_local_when_parking() {
+    let _clock = Clock;
+    for codex in [false, true] {
+        let now = now_ms();
+        let (store, reconciler, desired) = fixture(now);
+        let token = reconciler.launch_token(&desired.subject).unwrap();
+        let marker = "local-fixture-launch-detail-must-stay-on-node";
+        for attempt in 1..=3 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: desired.subject.clone(),
+                    kind: "runtime.action.failed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("action".into(), Value::String("start".into())),
+                        ("reason".into(), Value::String(marker.into())),
+                        ("desired_token".into(), Value::String(token.clone())),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(format!(
+                        "start-failed:{}:{token}:{attempt}",
+                        desired.subject
+                    )),
+                })
+                .unwrap();
+        }
+        if codex {
+            let mut member = desired.member.clone().unwrap();
+            member.driver = Some("codex".into());
+            assert!(
+                !reconciler
+                    .perform_start_for_request(&desired, &member, "test", None)
+                    .unwrap()
+            );
+        } else {
+            assert!(reconciler.defer_or_park_failed_start(&desired).unwrap());
+        }
+        let decision = store
+            .latest_claim(&desired.subject, Some("runtime.reconcile-decision"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.body["fields"]["decision"], "raise");
+        assert!(
+            decision.body["fields"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("three times")
+        );
+        assert!(
+            !serde_json::to_string(&store.claims_for(&desired.subject, None).unwrap())
+                .unwrap()
+                .contains(marker)
+        );
+        assert!(reconciler.runtime.starts.lock().unwrap().is_empty());
+        assert_eq!(
+            store
+                .observations_for(&desired.subject, "runtime.action.failed")
+                .unwrap()
+                .iter()
+                .filter(|claim| claim.body["fields"]["reason"] == marker)
+                .count(),
+            3
+        );
+    }
+}

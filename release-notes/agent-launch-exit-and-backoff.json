@@ -3,7 +3,7 @@
   "summary": "Report the requested harness launch exit promptly and pace short-lived automatic restarts",
   "replay": {
     "status": "none",
-    "detail": "No canonical replay change or new replay trigger. Launch waits read owner-local receipts and existing durable observations."
+    "detail": "No canonical replay change or new replay trigger. Existing durable runtime.observed claims retain declaration evidence, and harness.diagnostic claims add fixed early-exit diagnostics. Launch waits read runtime-host-local receipts and those durable observations."
   },
   "schema": {
     "status": "none",
@@ -27,6 +27,6 @@
   },
   "recovery": {
     "status": "none",
-    "detail": "No forward-only migration. Binary swap-back remains supported with existing graph state; older binaries reject the added peer operation, while unknown JSON CLI fields are additive. Startup output uses bounded owner-local SystemLocal runtime receipts and is served from the requested host; durable replicated diagnostics contain fixed exit text only. Credential and transcript markers withhold the captured local output window."
+    "detail": "No forward-only migration. Binary swap-back remains supported with existing graph state; older binaries reject the added peer operation, while unknown JSON CLI fields are additive. Startup output uses bounded runtime-host-local SystemLocal receipts, served through signed fleet-peer transport without a separate per-agent ownership check. Replicated diagnostics, step failures and crash-loop faults contain fixed failure text; OTLP logs omit local startup detail. Credential and transcript markers withhold the captured local output window."
   }
 }

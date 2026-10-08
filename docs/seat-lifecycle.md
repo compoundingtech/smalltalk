@@ -267,8 +267,10 @@ replication. With `--json`, the result adds a `stages` array and startup failure
 
 If the requested process exits before readiness, creation promptly returns that process's exit
 status, including zero, and a bounded startup output tail served from the requested host.
-Startup text stays in local runtime receipts; replicated diagnostics contain fixed exit text only. Credential and structured transcript
-lines are withheld. A later retry cannot turn that failed creation into success or redirect its
+Startup text stays in local runtime receipts. Replicated diagnostics, step failures and crash-loop
+faults contain fixed failure text, and telemetry exports omit startup detail. Reads use the same
+signed fleet-peer transport as terminal screens, without a separate per-agent ownership check.
+Credential and structured transcript markers withhold the captured local output window. A later retry cannot turn that failed creation into success or redirect its
 attachment. Missing executables and setup errors identify the launch stage that failed.
 If the launch read is unavailable on an older daemon or relay (404/503), creation uses the
 prior readiness/event wait within the same timeout and retains the declaration and first
