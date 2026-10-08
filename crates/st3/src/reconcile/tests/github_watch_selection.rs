@@ -103,7 +103,7 @@ async fn a_pass_selects_projection_only_seat_removal_without_a_feed_record() {
         reconciler.reconcile_once().unwrap();
     }
     assert!(fixture.running(&watch));
-    let before = fixture.store.changes_since(u64::MAX, i64::MAX).unwrap();
+    let before = fixture.store.changes_since(0, 0).unwrap();
     // Reader-side projection fixture: the production discard_desired_owned_by API performs
     // this DELETE for retired run members. Its native integration control is also retained.
     fixture
