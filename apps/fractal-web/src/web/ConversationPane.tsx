@@ -1,4 +1,6 @@
 import * as React from 'react'
+import { useAtomValue } from '@effect/atom-react'
+import { systemEventsPreference } from './conversationPreferences.ts'
 import { EmbraceRuntimeProvider, Transcript, type WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
 import { useConversation, useConversationSync, useDataSource, useFeedInterest, useNow } from '../data/react.tsx'
 import { mapConversationFeed, openableImageUrl, transcriptObservedAt, transcriptRuntimeOptions, transcriptSyncStatus } from './conversationTranscript.ts'
@@ -17,6 +19,7 @@ export const ConversationPane = ({
   readonly onOpenTool: (call: WorkLogCall) => void
 }) => {
   const source = useDataSource()
+  const showSystemEvents = useAtomValue(systemEventsPreference)
   // A cold or deep-linked route must follow on mount; the pane is keyed by agent ref, so
   // switching agents releases the previous conversation's demand with this component.
   const interest = React.useMemo(() => source.conversationInterest?.(agentRef), [source, agentRef])
@@ -24,7 +27,7 @@ export const ConversationPane = ({
   const now = useNow()
   const feed = useConversation(agentRef)
   const observation = useConversationSync(agentRef)
-  const state = React.useMemo(() => mapConversationFeed(feed, { agentName }), [feed, agentName])
+  const state = React.useMemo(() => mapConversationFeed(feed, { agentName, showSystemEvents }), [feed, agentName, showSystemEvents])
   const options = React.useMemo(
     () => transcriptRuntimeOptions(state._tag === 'Observed' ? state.items : [], state._tag === 'Observed' && state.isRunning),
     [state],

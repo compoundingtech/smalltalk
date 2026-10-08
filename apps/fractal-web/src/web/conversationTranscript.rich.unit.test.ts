@@ -37,7 +37,7 @@ describe('rich page decode, fold and transcript mapping', () => {
     ['developer', "'", true],
     ['system-reminder', '`', true],
     ['system-reminder', "'", true],
-    ['future-role', '`', false],
+    ['future-role', '`', true],
   ] as const)('handles native role %s with %s markers without exposing protocol JSON', (role, quote, omitted) => {
     const timeline = new LiveTimeline()
     const page: Extract<CollectionFrame, { kind: 'conversation' }> = {
@@ -77,9 +77,7 @@ describe('rich page decode, fold and transcript mapping', () => {
     expect(kept.filter(item => item._tag === 'Reasoning')).toHaveLength(12)
     expect(kept.filter(item => item._tag === 'Text').some(item => item.text.includes('[reasoning]'))).toBe(false)
     expect(kept.filter(item => item._tag === 'UnknownEvent')).toHaveLength(0)
-    expect(kept.filter(item => item._tag === 'Notice')).toEqual([
-      { _tag: 'Notice', id: 'timeline-entry/profile-89', kind: 'event', text: 'An event this view cannot show yet.', at: '2026-10-03T00:00:00.000Z' },
-    ])
+    expect(kept.filter(item => item._tag === 'Notice')).toEqual([])
     expect(JSON.stringify(kept)).not.toContain('session_exit')
     expect(JSON.stringify(kept)).not.toContain('tool_execution_start')
     expect(kept.some(item => item._tag === 'Notice' && item.kind === 'truncation')).toBe(false)

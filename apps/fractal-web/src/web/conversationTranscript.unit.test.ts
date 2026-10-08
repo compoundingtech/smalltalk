@@ -60,6 +60,16 @@ describe('kit transcript turn mapping', () => {
     expect(turns[0]!.work.calls[0]).toMatchObject({ kind: 'run', title: 'Checking generated output', argsSummary: undefined })
     expect(turns[0]!.items[0]).toMatchObject({ input: { command: 'echo /srv/example/private\npwd' } })
   })
+  it('hides unfamiliar events after answers by default while allowing explicit event inspection', () => {
+    const event: ConversationItem = { _tag: 'UnknownEvent', id: 'event', eventType: 'future', data: { payload: 'private-event' } }
+    const items = [scenario[0]!, scenario[3]!, event, { ...event, id: 'event-2' }]
+    const turns = transcriptTurnsForItems(items, { firstTurnComplete: true })
+    expect(turns[0]!.items).toEqual([scenario[3]])
+    expect(JSON.stringify(turns)).not.toContain('An event this view cannot show yet.')
+    const inspected = transcriptTurnsForItems(items, { firstTurnComplete: true, showSystemEvents: true })
+    expect(inspected[0]!.items.filter(item => item._tag === 'Notice')).toHaveLength(2)
+    expect(JSON.stringify(inspected)).not.toContain('private-event')
+  })
   it('prepares the leading assistant tail as a prompt-less turn without losing its work', () => {
     const leading = [scenario[1]!, scenario[2]!, scenario[3]!]
     const prepared = prepareTranscriptTurns([...leading, ...scenario], { firstTurnComplete: false })
@@ -86,7 +96,7 @@ describe('kit transcript turn mapping', () => {
     expect(turns[0]!.items).toEqual([])
   })
 
-  it('omits internal model usage while preserving native usage and unrecognized accounting kinds', () => {
+  it('omits protocol accounting while preserving native usage', () => {
     const usage: ConversationItem = { _tag: 'Usage', id: 'usage', semantics: 'response', inputTokens: 10, outputTokens: 2, at: at(2) }
     const future: ConversationItem = { _tag: 'UnknownEvent', id: 'future-usage', eventType: 'future_usage', data: {}, at: at(3) }
     const turns = transcriptTurnsForItems([
@@ -94,7 +104,7 @@ describe('kit transcript turn mapping', () => {
       { _tag: 'UnknownEvent', id: 'model-usage', eventType: 'model_usage', data: { raw: { type: 'model_usage', inputTokens: 10 } }, at: at(1) },
       usage, future,
     ], { firstTurnComplete: true })
-    expect(turns[0]!.items).toEqual([usage, { _tag: 'Notice', id: future.id, kind: 'event', text: 'An event this view cannot show yet.', at: at(3) }])
+    expect(turns[0]!.items).toEqual([usage])
     const empty = mapConversationFeed({
       _tag: 'Observed', freshness: 'live',
       value: { items: [{ _tag: 'UnknownEvent', id: 'model-usage', eventType: 'model_usage', data: {} }], hasOlder: false, observation: { empty: false } },
@@ -112,13 +122,13 @@ describe('kit transcript turn mapping', () => {
     expect(state).toMatchObject({ _tag: 'Observed', items: [], turns: [], filteredEmpty: true })
   })
 
-  it('renders unfamiliar protocol as one neutral line without a kind or payload dump', () => {
+  it('renders explicitly requested unfamiliar protocol without a kind or payload dump', () => {
     const state = mapConversationFeed({
       _tag: 'Observed', freshness: 'live', value: {
         items: [{ _tag: 'UnknownEvent', id: 'unknown', eventType: 'unfamiliar_kind', data: { raw: { payload: 'synthetic-payload-sentinel' } }, at: at(1) }],
         hasOlder: false, observation: { empty: false },
       },
-    }, {})
+    }, { showSystemEvents: true })
     expect(state._tag === 'Observed' && state.items).toEqual([
       { _tag: 'Notice', id: 'unknown', kind: 'event', text: 'An event this view cannot show yet.', at: at(1) },
     ])
@@ -126,7 +136,7 @@ describe('kit transcript turn mapping', () => {
     expect(JSON.stringify(state)).not.toContain('unfamiliar_kind')
   })
 
-  it('omits custom tool execution bookkeeping by structural sub-kind, never the custom bucket', () => {
+  it('omits unknown protocol buckets while preserving meaningful notices', () => {
     const turns = transcriptTurnsForItems([
       prompt('p', 'Hello', 0),
       scenario[5]!,
@@ -136,7 +146,7 @@ describe('kit transcript turn mapping', () => {
       { _tag: 'UnknownEvent', id: 'exit', eventType: 'custom', data: { raw: { customType: 'session_exit' } }, at: at(4) },
       { _tag: 'Notice', id: 'redaction', kind: 'redaction', text: 'Withheld 4 bytes', at: at(5) },
     ], { firstTurnComplete: true })
-    expect(turns[0]!.items.map(item => item.id)).toEqual(['future-custom', 'missing-subkind', 'future', 'exit', 'redaction'])
+    expect(turns[0]!.items.map(item => item.id)).toEqual(['redaction'])
     expect(turns[0]!.items.every(item => item._tag === 'Notice')).toBe(true)
     expect(JSON.stringify(turns)).not.toContain('future_kind')
     expect(JSON.stringify(turns)).not.toContain('session_exit')

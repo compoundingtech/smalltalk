@@ -10,9 +10,8 @@ import type { SyncStatus } from '@smalltalk/fractal-ui/assistant-ui/sync'
 import type { ConversationItem, RunStatus, SendState } from '../conversation/model.ts'
 import type { FeedSyncObservation } from '../data/feedSync.ts'
 import type { ConversationPage, Feed } from '../data/source.ts'
-import { fieldsOf } from '../conversation/semantics.ts'
 
-/** The internal-event omit policy lives only here; unlisted kinds get a payload-free neutral row. */
+/** Unknown protocol events are hidden by default; explicit inspection uses payload-free notices. */
 type KitConversationItem = NonNullable<ConversationRuntimeOptions['messages']>[number]
 type KitTextItem = Extract<KitConversationItem, { _tag: 'Text' }>
 
@@ -41,32 +40,8 @@ const hasKitSendState = (item: ConversationItem): item is ConversationItem & Kit
 const isPrompt = (item: KitConversationItem): item is KitTextItem & { readonly role: 'user' } =>
   item._tag === 'Text' && item.role === 'user'
 
-// Native source preserves raw omp records (`external_sessions.rs` push_unrecognized); the
-// converter decodes their JSON envelope (`fromTimeline.ts` unrecognizedOmpItem). `custom` is
-// a bucket, not a kind: its raw.customType distinguishes redundant tool-start bookkeeping.
-// Model/thinking changes are native status metadata (external_sessions.rs push_unrecognized).
-// model_usage is raw harness accounting, not an unsupported conversation event. Native `usage`
-// entries already have the typed Usage projection and remain available to the kit.
-const internalEventKinds: Record<string, true | undefined> = {
-  credential_pin: true,
-  title_change: true,
-  model_change: true,
-  thinking_level_change: true,
-  model_usage: true,
-  'custom/model_usage': true,
-  'message-role/developer': true,
-  'message-role/system-reminder': true,
-  'custom/tool_execution_start': true,
-}
 
-const isOmittedItem = (item: ConversationItem): boolean => {
-  if (item._tag !== 'UnknownEvent') return false
-  const raw = fieldsOf(fieldsOf(item.data)['raw'])
-  const customType = raw['customType']
-  const kind = item.eventType === 'custom' && typeof customType === 'string'
-    ? `custom/${customType}` : item.eventType
-  return Object.hasOwn(internalEventKinds, kind)
-}
+const isOmittedItem = (item: ConversationItem): boolean => item._tag === 'UnknownEvent'
 
 /** The host owns work-log classification: how a tool reads, runs or edits. */
 const toolKindFor = (name: string): WorkKind => {
@@ -124,6 +99,8 @@ export interface TranscriptTurnOptions {
   readonly agentName?: string
   /** A page with older history may have cut its first turn's earlier entries. */
   readonly firstTurnComplete: boolean
+  /** A view preference; known internal entries become payload-free notices when enabled. */
+  readonly showSystemEvents?: boolean
 }
 
 /** Prepared turns preserve the leading native tail without synthesizing a human prompt. */
@@ -170,7 +147,7 @@ export const prepareTranscriptTurns = (
     turnItems = []
   }
   for (const sourceItem of items) {
-    if (isOmittedItem(sourceItem)) continue
+    if (!options.showSystemEvents && isOmittedItem(sourceItem)) continue
     // The runtime must not receive unknown protocol payloads either: its converter and fallback
     // rows render the same short notice, never a raw JSON envelope or producer-specific kind.
     const item: KitConversationItem = sourceItem._tag === 'UnknownEvent'
@@ -234,7 +211,7 @@ const diagnosticCode = /^[a-z][a-z0-9-]{0,39}$/
 
 export const mapConversationFeed = (
   feed: Feed<ConversationPage>,
-  options: { readonly agentName?: string },
+  options: { readonly agentName?: string; readonly showSystemEvents?: boolean },
 ): ConversationTranscriptState => {
   switch (feed._tag) {
     case 'Waiting':
@@ -246,11 +223,11 @@ export const mapConversationFeed = (
     }
     case 'Observed': {
       const hasOlder = feed.value.hasOlder
-      const turns = transcriptTurnsForItems(feed.value.items, { agentName: options.agentName, firstTurnComplete: !hasOlder })
+      const turns = transcriptTurnsForItems(feed.value.items, { agentName: options.agentName, firstTurnComplete: !hasOlder, showSystemEvents: options.showSystemEvents })
       // Native page provenance decides emptiness: a non-empty page whose rows are all omitted
       // (or that arrived with none) is filtered, not an empty conversation.
       const filteredEmpty = feed.value.observation?.empty === false
-        && (feed.value.items.length === 0 || feed.value.items.every(isOmittedItem))
+        && (feed.value.items.length === 0 || (!options.showSystemEvents && feed.value.items.every(isOmittedItem)))
       return {
         _tag: 'Observed',
         turns,
@@ -263,6 +240,7 @@ export const mapConversationFeed = (
     }
   }
 }
+
 
 
 /**

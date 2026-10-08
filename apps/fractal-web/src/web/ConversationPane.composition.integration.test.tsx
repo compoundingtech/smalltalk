@@ -171,12 +171,12 @@ describe('ConversationPane composition activation', () => {
     } }
     source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
     await mount()
-    expect(text()).toContain('An event this view cannot show yet.')
+    expect(text()).not.toContain('An event this view cannot show yet.')
     expect(text()).not.toContain('Unsupported event')
     expect(text()).not.toContain('custom/model_usage')
     expect(text()).not.toContain('unfamiliar_kind')
     expect(text()).not.toContain('synthetic-payload-sentinel')
-    expect(container.querySelectorAll('[data-testid="transcript-message"]')).toHaveLength(1)
+    expect(container.querySelectorAll('[data-testid="transcript-message"]')).toHaveLength(0)
   })
   it('waits for the first observation inside the lane with the kit skeleton', async () => {
     source.feed = { _tag: 'Waiting' }
