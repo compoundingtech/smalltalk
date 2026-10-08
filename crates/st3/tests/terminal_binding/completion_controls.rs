@@ -157,8 +157,11 @@ import json, os, subprocess, sys, time
 from pathlib import Path
 # These completion/fence controls exercise a healthy native session. Channel
 # initialization alone is deliberately no longer a native-state publication.
-subprocess.run([os.environ['ST3_BIN'], 'driver-hook', 'claude-observe', 'SessionStart'],
-    input=json.dumps({'session_id': '019a0000-0000-7000-8000-000000000004'}), text=True, check=True)
+hook = subprocess.run([os.environ['ST3_BIN'], 'driver-hook', 'claude-observe', 'SessionStart'],
+    input=json.dumps({'session_id': '019a0000-0000-7000-8000-000000000004'}), text=True, capture_output=True)
+Path(os.environ['FIXTURE_NATIVE_IDLE'] + '.hook-result').write_text(json.dumps({
+    'exit': hook.returncode, 'stderr': hook.stderr, 'stdout': hook.stdout}))
+hook.check_returncode()
 while not Path(os.environ['FIXTURE_NATIVE_IDLE']).exists():
     time.sleep(0.005)
 channel = subprocess.Popen([os.environ['ST3_BIN'], 'driver', 'claude-mcp', '--subject', os.environ['ST_AGENT']],
@@ -282,7 +285,13 @@ read -r _
         }
     })
     .await
-    .expect("the actual SessionStart must publish native idle for this incarnation");
+    .unwrap_or_else(|error| {
+        panic!(
+            "the actual SessionStart must publish native idle: {error}; graph={:?}; hook={:?}",
+            store.current_harness(SEAT).unwrap(),
+            std::fs::read_to_string(native_idle.with_extension("hook-result")),
+        )
+    });
     std::fs::write(&native_idle, b"go").unwrap();
     let sent: MessageView = client
         .post(
