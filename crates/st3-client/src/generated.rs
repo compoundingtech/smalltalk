@@ -1999,6 +1999,7 @@ pub enum TimelineStatus {
     Running,
     Waiting,
     Completed,
+    Stopped,
     Failed,
     Cancelled,
     #[serde(other)]

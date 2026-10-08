@@ -3278,7 +3278,7 @@ fn push_omp_stop(items: &mut Vec<Value>, sequence: u64, timestamp: &str, message
 }
 
 fn push_omp_exit(items: &mut Vec<Value>, sequence: u64, timestamp: &str, data: &Value) {
-    // Process completion says nothing about the turn or pending tools. Unknown exits
+    // A stopped process says nothing about the turn or pending tools. Unknown exits
     // must not look successful; keep the complete checkpoint in either body shape.
     let kind = data.get("kind").and_then(Value::as_str).unwrap_or_default();
     let reason = data.get("reason").and_then(Value::as_str).unwrap_or_default();
@@ -3321,7 +3321,7 @@ fn push_omp_exit(items: &mut Vec<Value>, sequence: u64, timestamp: &str, data: &
         (
             "status",
             json!({
-                "status":"completed",
+                "status":"stopped",
                 "detail":serde_json::to_string(data).expect("native exit metadata serializes"),
             }),
         )
@@ -4201,7 +4201,7 @@ mod tests {
                 .any(|item| item["body"]["code"] == "native_process_exit")
         );
         let status = items.iter().find(|item| item["type"] == "status").unwrap();
-        assert_eq!(status["body"]["status"], "completed");
+        assert_eq!(status["body"]["status"], "stopped");
         let details: Value =
             serde_json::from_str(status["body"]["detail"].as_str().unwrap()).unwrap();
         assert_eq!(details, checkpoint);
@@ -4293,7 +4293,7 @@ mod tests {
                 assert_eq!(block["kind"], "error", "{data}");
             } else {
                 assert_eq!(entry["type"], "status", "{data}");
-                assert_eq!(entry["body"]["status"], "completed", "{data}");
+                assert_eq!(entry["body"]["status"], "stopped", "{data}");
                 let detail: Value =
                     serde_json::from_str(entry["body"]["detail"].as_str().unwrap()).unwrap();
                 assert_eq!(detail, data);

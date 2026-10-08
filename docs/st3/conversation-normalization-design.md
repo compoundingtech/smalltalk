@@ -378,13 +378,16 @@ bounded native read path. It claims no cold-read or incremental-append performan
 proof. Integrate with #1487's owner before the subsequent read-model slice; do not
 add an independent cache or persist conversation bytes to meet that dependency.
 
-#1478 (native stop/retry/abort/process exit) and #1458 (native tool-result timing)
-will rebase onto this implementation's final head. The former currently proposes
-withholding free-form stop/provider prose; that policy must be removed or kept
-strictly as a UI presentation choice on rebase. Native source records here retain
-all those fields. The latter's optional timing extraction can use open block
-metadata; arbitrary native result details remain available in `source_record`,
-without copying its numeric whitelist into this normalizer.
+#1478 (native stop/retry/abort/process exit) now preserves the provider's exact
+`errorMessage`, `retryRecovery`, `errorStatus` and `errorId`, and the complete exit
+record, including `pendingToolCalls`, arguments/intent and unknown fields. Only
+transport size and paging limits apply, with visible truncation markers and
+owner continuations for exact full values. Outcomes are read from the owner
+machine per request, not stored in the database; presentation filters remain
+in shared renderers. Recognized exits use `status: stopped`, not turn completion.
+#1458's native tool-result timing uses open block metadata; arbitrary native
+result details remain available in `source_record`, without copying its numeric
+whitelist into this normalizer.
 
 ## Graph reads for conversation changes
 
@@ -424,6 +427,6 @@ remain separate costs; the incremental native-window/page slice is #1665.
 The two legacy indexes add no payload class, claim kind, retention rule, client
 contract or projection digest. Their first builds on the isolated store took
 17.08 seconds and 0.34 seconds (the second reused warmed pages); subsequent opens
-reuse them. This startup cost belongs in rollout planning. Older builds ignore
-the additional indexes. The routing cache is cleared with projection repairs and
-rebuilds after restart.
+reuse them. This startup cost belongs in rollout planning. Older builds ignore the
+additional indexes. The routing cache is cleared with projection repairs and
+rebuilt after restart.

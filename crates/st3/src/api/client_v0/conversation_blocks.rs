@@ -1111,7 +1111,7 @@ mod tests {
                     }
                     assert_eq!(body["details"]["errorStatus"], 429);
                 } else {
-                    assert_eq!(body["status"], "completed");
+                    assert_eq!(body["status"], "stopped");
                     let detail = &body["detail"];
                     assert!(detail.as_str().unwrap().contains("size limit"));
                     assert!(detail.as_str().unwrap().contains("[st truncated"));
@@ -1129,8 +1129,16 @@ mod tests {
                 }
                 outcomes.push(item);
             }
-            let _: Vec<st3_client::TimelineEntry> =
+            let decoded: Vec<st3_client::TimelineEntry> =
                 serde_json::from_value(json!(items)).unwrap();
+            let status = decoded
+                .iter()
+                .find_map(|entry| match &entry.body {
+                    st3_client::TimelineBody::Status(body) => Some(body),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(status.status, st3_client::TimelineStatus::Stopped);
             outcomes
         }
 

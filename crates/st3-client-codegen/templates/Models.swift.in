@@ -377,7 +377,7 @@ public struct SyncPeer: Codable, Sendable { public let hostID: String; public le
 public enum TimelineRole: String, Codable, Sendable { case system, user, assistant, tool }
 public enum TimelineType: String, Codable, Sendable { case message, content, toolCall = "tool_call", toolResult = "tool_result", status, error, usage, redaction, truncation }
 public enum TimelineToolStatus: String, Codable, Sendable { case success, error }
-public enum TimelineStatus: String, Codable, Sendable { case queued, running, waiting, completed, failed, cancelled }
+public enum TimelineStatus: String, Codable, Sendable { case queued, running, waiting, completed, stopped, failed, cancelled }
 public enum TimelineUsageSemantics: String, Codable, Sendable { case contextOccupancy = "context_occupancy", sessionCumulative = "session_cumulative", response }
 public struct MessageProvenance: Codable, Sendable { public let verdict: String; public let reason, signer, key, device: String? }
 public struct TimelineMessageBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let messageID: String; public let replyTo, from, to, title: String?; public let tags: [String]?; public let attachments: [Attachment]?; public let provenance: MessageProvenance?; enum CodingKeys: String, CodingKey { case blocks; case messageID = "message_id", replyTo = "reply_to", from, to, title, tags, attachments, provenance } }

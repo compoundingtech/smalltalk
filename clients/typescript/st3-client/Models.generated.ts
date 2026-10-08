@@ -1723,7 +1723,7 @@ export type TimelineRedactionBody = {
   withheld_items?: number;
 };
 
-export type TimelineStatus = ("queued" | "running" | "waiting" | "completed" | "failed" | "cancelled" | string);
+export type TimelineStatus = ("queued" | "running" | "waiting" | "completed" | "stopped" | "failed" | "cancelled" | string);
 
 export type TimelineStatusBody = {
   blocks?: Array<TimelineBlock>;

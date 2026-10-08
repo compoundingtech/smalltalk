@@ -80,8 +80,8 @@ Native `custom/session_exit` checkpoints are classified from their `data.kind` a
 
 | Native exit | Timeline entry |
 | --- | --- |
-| `normal` (including `dispose` and `manual`); `signal` with `sigterm`, `sigint` or `sighup` | `status: completed` |
-| `process_exit` or `exit` with explicit numeric `exitCode` (or `code`) zero | `status: completed` |
+| `normal` (including `dispose` and `manual`); `signal` with `sigterm`, `sigint` or `sighup` | `status: stopped` |
+| `process_exit` or `exit` with explicit numeric `exitCode` (or `code`) zero | `status: stopped` |
 | `fatal`, `crash`, `uncaughtException` / `uncaught_exception`, or `unhandledRejection` / `unhandled_rejection` | `error`, code `native_session_exit_fatal` |
 | Recognized normal/signal/process-exit kinds with a fatal reason or a nonzero exit code | `error`, code `native_session_exit_fatal` |
 | Unknown/missing kinds, unfamiliar signals, or process exits without a known exit code | `error`, code `native_session_exit_unknown` |
@@ -93,18 +93,21 @@ outcome stays unknown unless a numeric code is supplied. Unknown kinds remain un
 even if their reason looks like a normal signal.
 
 Recognized stops use the existing status entry and `status` block with `{body_ref:true}`;
-the body has `status: completed` and `detail` containing the complete native `data` serialized
+the body has `status: stopped` and `detail` containing the complete native `data` serialized
 as JSON. Fatal and unknown stops use a system error entry and `error` block with
 `{body_ref:true}`, `retryable: false` and the complete native `data` in `details`.
 Both retain exact kind, reason, pending-tool arguments/intent and future fields.
 A process exit proves neither user cancellation, tool completion nor the outcome of
 the next process.
 
-The normalizer does not withhold or truncate diagnostics or pending-tool values. Parsed records
-also retain the complete native record in an internal `source_record` block; malformed input
-retains its original bytes as `raw_text`. Transport size limits and owner continuations bound
-responses, not native values. Content filtering belongs to shared renderers' explicit default
-presentation filters; show-everything mode exposes the unchanged normalized data.
+The normalizer passes through the provider's outcome without withholding or truncating
+diagnostics, pending-tool arguments/intent or unknown fields. Parsed records also retain the
+complete native record in an internal `source_record` block; malformed input retains its
+original bytes as `raw_text`. Only transport size and paging limits bound responses; size
+truncation is visibly marked, and owner continuations recover the exact full values.
+These outcomes are read from the owner machine per request, not stored in the database.
+Presentation filters belong to shared renderers; show-everything mode exposes the unchanged
+normalized data. A `stopped` status describes process lifecycle, not a successfully finished turn.
 
 ## Interrupted ask bridge
 
