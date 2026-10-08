@@ -764,7 +764,9 @@ mod tests {
         let (started, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, mut release_rx) = tokio::sync::watch::channel(false);
         let holder = store.clone();
-        let first = tokio::spawn(store_read(&holder, move || {
+        let first = tokio::spawn(async move {
+            let admission_store = holder.clone();
+            store_read(&admission_store, move || {
             started.send(()).unwrap();
             tokio::runtime::Handle::current()
                 .block_on(release_rx.wait_for(|released| *released))
@@ -776,16 +778,18 @@ mod tests {
             assert_eq!(nested, 5);
             assert_eq!(holder.readers.usage().open, 1);
             7
-        }));
+            }).await
+        });
         started_rx.await.unwrap();
         assert_eq!(store.readers.usage().open, 1);
-        let queued = tokio::spawn(store_read(&store, || 9));
+        let queued_store = store.clone();
+        let queued = tokio::spawn(async move { store_read(&queued_store, || 9).await });
         tokio::task::yield_now().await;
         // The queued read holds no reader while waiting for admission.
         assert_eq!(store.readers.usage().open, 1);
         release_tx.send(true).unwrap();
         let results = tokio::time::timeout(Duration::from_secs(5), async {
-            (first.await.unwrap(), queued.await.unwrap())
+            (first.await.unwrap().unwrap(), queued.await.unwrap().unwrap())
         })
         .await
         .expect("upgraded-socket reads did not finish");
@@ -803,10 +807,10 @@ mod tests {
         let state = bounded_state(root.path(), 1);
         let store = state.store.clone();
         let (entered_tx, mut entered) = tokio::sync::mpsc::unbounded_channel();
-        let (release_tx, mut release_rx) = tokio::sync::watch::channel(false);
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
         let app = Router::new()
             .route("/v1/client/ordinary", get(move || {
-                let (store, entered_tx, release_rx) = (store.clone(), entered_tx.clone(), release_rx.clone());
+                let (store, entered_tx, mut release_rx) = (store.clone(), entered_tx.clone(), release_rx.clone());
                 async move {
                     assert!(IN_HANDLER.with(Cell::get));
                     assert!(store.readers.has_request_reader());

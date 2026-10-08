@@ -10706,12 +10706,13 @@ mod tests {
                 let request: CollectionSubscribe = serde_json::from_value(json!({
                     "kind":"subscribe", "id":"contended-roster", "collection":"agents", "limit":200,
                 })).unwrap();
+                let windows = collection_windows::Windows::attach(&state.store);
                 (
                     state,
                     ClientSession::local(None).unwrap(),
                     request,
                     Arc::new(tokio::sync::Semaphore::new(1)),
-                    collection_windows::Windows::attach(&state.store),
+                    windows,
                 )
             });
         let (_, expected, _) = collection_items_with_windows(&state, &session, &request,
