@@ -1845,7 +1845,7 @@ async fn a_failed_explicit_retry_is_completed_parked_and_visible_until_a_new_req
             "{reason}"
         );
         // `st agents show` and clients consume the same agents read, including this fault.
-        let agents: Value = fixture.client().get("/v1/client/agents").await.unwrap();
+        let agents: Value = fixture.client().get("/v1/client/agents?fresh=true").await.unwrap();
         let agent = agents["items"]
             .as_array()
             .unwrap()
