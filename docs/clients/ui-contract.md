@@ -2,11 +2,11 @@
 
 For package choices and a runnable client, see [Build your own client](build-your-own.md).
 
-What every Smalltalk client shows and does. stui (the terminal client, `crates/stui/src/ui`) is
+What every Smalltalk client shows and does. The terminal UI (the terminal client, `crates/stui/src/ui`) is
 the reference; the iOS app (`apps/ios`) implements the same contract the Expo way. When the two
 disagree, fix the one that breaks this document, or change this document first.
 
-The machine-checked half of the contract lives in `fixtures/clients/`. stui writes it
+The machine-checked half of the contract lives in `fixtures/clients/`. The terminal UI writes it
 (`STUI_UPDATE_CONTRACT=1 cargo test -p stui contract`) and fails its tests when it drifts; the
 iOS app must test against the same files.
 
@@ -136,7 +136,7 @@ An agent with a live terminal can be opened in place from its conversation: the 
 with its colours and styles (never polled), follows the terminal's size, and says so when the
 terminal restarts. With the `terminal.input` capability the person can send a line and the keys
 Enter, Tab, Esc, Up, Down, and a confirmed Ctrl-C; every input takes a fresh terminal fence and
-refuses a changed runtime incarnation. Leaving the view detaches. stui: Enter on an agent opens
+refuses a changed runtime incarnation. Leaving the view detaches. Terminal UI: Enter on an agent opens
 it and Ctrl+\ returns; iOS: a Terminal button on the agent screen.
 
 ### Starting a mission
@@ -180,7 +180,7 @@ Rules both clients follow; `transcripts/*.expected.json` checks the cleaning.
 
 Same capabilities, native idioms:
 
-| stui | iOS |
+| terminal UI | iOS |
 |---|---|
 | Tabs `1`–`5` | Bottom tab bar with the same five tabs and the Home badge |
 | Sidebar list + detail pane | List screen pushing a detail screen (stack navigation); iPad may use a split view |
@@ -205,7 +205,7 @@ The demo mode (invented data, nothing sent) must exist on iOS too, reading `demo
 ## Next reuse step: derive the view once, in st
 
 Today each client derives the view from raw projections: who must act on a mission, an agent's
-state, a step's queue position, a cleaned conversation, an attention card. stui does it in Rust
+state, a step's queue position, a cleaned conversation, an attention card. The terminal UI does it in Rust
 (`ui/adapt.rs`) and the iOS app will do it again in TypeScript, held together only by the shared
 fixtures. The larger saving is to move that derivation into st's client API: a presentation
 projection per mission (its word, the stuck step and why, what a person can do), per agent (state,

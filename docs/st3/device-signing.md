@@ -11,7 +11,7 @@ Every client's tests check against that file.
 - Each device makes a P-256 key pair and keeps the private half on the device:
   - iOS: in the Secure Enclave, with a software key in the Keychain on the simulator.
   - Browser: as a non-extractable WebCrypto key.
-  - CLI or stui: in a key file.
+  - CLI or terminal UI: in a key file.
 - A device's public key is written `p256:` followed by the base64url (no padding) of the
   uncompressed SEC1 point (65 bytes). CryptoKit's `x963Representation` gives those bytes.
 - A signature is ECDSA over SHA-256, as the fixed 64-byte `r || s`, in base64url without padding.
@@ -49,7 +49,7 @@ Every client's tests check against that file.
    Anything that key signs after the revocation is invalid on every member. What it signed
    before stays verified.
 
-## CLI and stui pairing
+## CLI and terminal client pairing
 
 On the trusted machine, begin a pairing as the person:
 
@@ -69,7 +69,7 @@ Tailscale's `100.64.0.0/10` range. Hostnames must resolve entirely to those addr
 **An HTTP address must already be an encrypted path**, such as Tailscale/WireGuard or an SSH
 tunnel: the pairing code and bearer credentials cross it. Both commands print this notice when
 using HTTP. Other HTTP addresses are refused by default. On an already encrypted path, use
-`--allow-public-http` with `st devices complete` or `stui pair` to override that restriction.
+`--allow-public-http` with `st devices complete` to override that restriction.
 The override is saved as `allow_public_http: true` on that device in the private profile;
 existing profiles can set that field explicitly. The override also permits ambient HTTP proxies;
 ensure that the proxy path is encrypted and trusted too. HTTPS requires no override.
@@ -96,8 +96,7 @@ If a connection fails before an answer arrives, inspect the trusted device list 
 client cannot know whether the member consumed the code.
 Neither ordinary output nor `--json` prints the bearer or private key.
 
-`stui pair https://member.example pairing/PAIRING_ID --fingerprint sha256:FINGERPRINT` uses the same key generation and
-persistence, and paired stui messages are signed using the saved key and chain. Existing legacy
+Paired terminal UI messages are signed using the saved key and chain. Existing legacy
 profiles remain readable. A pairing without `control.messages`, including `--read-only`,
 enrolls no signing key and persists no private signing material.
 
@@ -212,5 +211,5 @@ in.
 
 ## Scope of version 1
 
-Only paired clients sign. A local stui or CLI on the Unix socket acts as the configured person,
+Only paired clients sign. A local terminal UI or CLI on the Unix socket acts as the configured person,
 and the daemon signs for it with that person's key for the machine.

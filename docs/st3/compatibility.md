@@ -36,11 +36,11 @@ fresh writer; it is not a downgrade or permission to overwrite a running member.
 | Client API | `st3.client.v0`, projection versions and capability versions are distinct from release tags and database schema. Discover capabilities first; unknown required capability versions stop the client, while unknown optional capabilities may be ignored. See the [client contract](client-v0/README.md#discovery-lists-and-details). |
 | Native harness and driver resume | Provider APIs, managed extensions and saved resume state have their own contracts. See [seats across deploys](seat-deploys.md); rolling back across the push-delivery boundary can require coordinated seat restarts. |
 
-Use CLI and stui from the same release source. Current client version scope is:
+Use CLI and the terminal UI from the same release source. Current client version scope is:
 
 | Client | Version/evidence boundary |
 | --- | --- |
-| CLI and stui | v0.3.16 archives embed source `5c0a151e`; native release CI checks both tools. This is not a cross-version client guarantee. |
+| CLI and the terminal UI | v0.3.16 archives embed source `5c0a151e`; native release CI checks both tools. This is not a cross-version client guarantee. |
 | TypeScript `@smalltalk/st3-client` | Repository-private package version `0.1.0`; CI contract/schema tests run against its source revision. The package number does not identify the daemon source. |
 | Swift `St3Client` / iOS app | In-tree client source and client-v0 capability contract; no separate released client-version compatibility matrix is claimed. Fresh-device app onboarding is separate evidence. |
 

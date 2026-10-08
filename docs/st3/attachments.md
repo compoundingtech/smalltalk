@@ -1,6 +1,6 @@
 # Attachments
 
-A message can carry up to four images, so a screenshot pasted into stui on one machine reaches a
+A message can carry up to four images, so a screenshot pasted into the terminal UI on one machine reaches a
 seat on another. This page defines what is stored, where, and how it moves.
 
 ## What travels, and what does not

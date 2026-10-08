@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail CI if st/stui import or depend on the independently maintained st2 crate."""
+"""Fail CI if st and its UI library import or depend on the independently maintained st2 crate."""
 import argparse
 import json
 from pathlib import Path
@@ -20,7 +20,7 @@ def main():
         print(finding, file=sys.stderr)
     if findings:
         return 1
-    print("st/stui source and dependency boundary passed")
+    print("st and UI library source and dependency boundary passed")
     return 0
 
 

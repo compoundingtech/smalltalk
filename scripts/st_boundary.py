@@ -24,7 +24,7 @@ def dependency_findings(metadata):
     # features and target/dev/build dependencies. Traverse neutral crates too: an alias or
     # indirect workspace dependency must not let st2 back into either current product.
     packages = {package["name"]: package for package in metadata["packages"]}
-    for product in ("st3", "stui"):
+    for product in ("st3",):
         pending = [(product, [product])]
         seen = set()
         while pending:

@@ -19,16 +19,16 @@ while (($#)); do
   esac
 done
 
-binaries=(st3 st3-migrate stui)
+binaries=(st3 st3-migrate)
 
 if [[ -z $from ]]; then
   repo=$(cd "$(dirname "$0")/.." && pwd)
   cargo build --release --locked --manifest-path "$repo/Cargo.toml" \
-    -p st3 -p st3-migrate -p stui
+    -p st3 -p st3-migrate
   from=${CARGO_TARGET_DIR:-$repo/target}/release
-  # stui's speech helper, on a Mac whose Swift has the macOS 26 SDK; SmallTalk.app takes it in.
+  # The terminal client's speech helper, on a Mac whose Swift has the macOS 26 SDK; SmallTalk.app takes it in.
   if [[ $(uname -s) == Darwin ]] && ! "$repo/apps/macos/listen/build.sh" "$from" >/dev/null; then
-    echo "install: the speech helper did not build here; stui will have no voice" >&2
+    echo "install: the speech helper did not build here; the terminal interface will have no voice" >&2
     rm -rf "$from/StListen.app"
   fi
 fi
@@ -40,7 +40,7 @@ for binary in "${binaries[@]}"; do
   }
 done
 # `mv` onto a directory (or a link to one) would move the file inside it instead of replacing it.
-for name in "${binaries[@]}" st; do
+for name in "${binaries[@]}" st stui; do
   [[ ! -d $bin_dir/$name ]] || {
     echo "install: $bin_dir/$name is a directory; refusing to replace it" >&2
     exit 1
@@ -56,7 +56,7 @@ fi
 # Each name is replaced by rename, so a running process keeps its old inode and a concurrent
 # caller sees either the old or the new file, never a partial copy.
 for binary in "${binaries[@]}"; do
-  if [[ $macos == true && ($binary == st3 || $binary == stui) ]]; then continue; fi
+  if [[ $macos == true && $binary == st3 ]]; then continue; fi
   staged=$(mktemp "$bin_dir/.$binary.install.XXXXXX")
   cp "$from/$binary" "$staged"
   chmod 0755 "$staged"
@@ -70,4 +70,6 @@ mv -f "$link" "$bin_dir/st"
   echo "install: $bin_dir/st does not link to st3" >&2
   exit 1
 }
+# Retire the old executable; no alias or shim remains.
+rm -f -- "$bin_dir/stui"
 printf 'installed %s and st -> st3 in %s\n' "${binaries[*]}" "$bin_dir"

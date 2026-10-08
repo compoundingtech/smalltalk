@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Remove the stui executable; use plain st or st ui. Existing Mac users must regrant microphone permission once.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay, projection rebuild or store recovery changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, columns, indexes, triggers or schema transitions."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or coordinated fleet-upgrade changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Archives, source installs and macOS bundles no longer ship a stui executable. Installers remove an old stui file or link in the chosen bin directory. Use plain st or st ui for the terminal client and st devices complete for pairing. The stui library package, client identity, paired-device profiles and cache paths remain unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon lifecycle changes or additional service restart requirement."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Existing Mac users must regrant microphone permission once for the terminal interface in st after installing this release."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persisted-state transition. Reinstalling the previous archive restores its executables; macOS installer transaction rollback restores old app contents and links."
+  }
+}

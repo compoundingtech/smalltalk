@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build StListen.app (st-listen, stui's speech helper) into OUT (default ./build), signed with
+# Build StListen.app (st-listen, the terminal client's speech helper) into OUT (default ./build), signed with
 # ST_MACOS_SIGNING_IDENTITY or ad hoc. macOS 26 or later, with Xcode's Swift.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)

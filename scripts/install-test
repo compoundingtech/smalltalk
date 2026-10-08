@@ -20,7 +20,7 @@ fail() {
 build() {
   local dir=$1 version=$2 binary
   mkdir -p "$dir"
-  for binary in st3 st3-migrate stui; do
+  for binary in st3 st3-migrate; do
     printf '#!/bin/sh\necho "%s %s"\n' "$binary" "$version" > "$dir/$binary"
     chmod 0755 "$dir/$binary"
   done
@@ -30,10 +30,11 @@ check() {
   local bin=$1 version=$2 binary
   [[ -L $bin/st && $(readlink "$bin/st") == st3 ]] || fail "$bin/st is not a symlink to st3"
   [[ $("$bin/st") == "st3 $version" ]] || fail "st does not run st3 $version"
-  for binary in st3 st3-migrate stui; do
+  for binary in st3 st3-migrate; do
     [[ -f $bin/$binary && ! -L $bin/$binary ]] || fail "$bin/$binary is not a regular file"
     [[ $("$bin/$binary") == "$binary $version" ]] || fail "$bin/$binary is not version $version"
   done
+  [[ ! -e $bin/stui && ! -L $bin/stui ]] || fail "retired UI executable survived installation"
   [[ -z $(find "$bin" -name '.*.install.*') ]] || fail "staged files were left in $bin"
 }
 
@@ -47,6 +48,7 @@ check "$work/fresh" 1
 # A stale `st` copied from an older st3 build is replaced by the link.
 mkdir -p "$work/stale"
 cp "$work/one/st3" "$work/stale/st"
+cp "$work/one/st3" "$work/stale/stui"
 bash "$install" --from "$work/two" --bin-dir "$work/stale" > /dev/null
 check "$work/stale" 2
 
@@ -63,9 +65,9 @@ fi
 [[ ! -e $work/blocked/st3 ]] || fail "a refused install still replaced st3"
 
 # Missing binaries are refused.
-rm "$work/two/stui"
+rm "$work/two/st3-migrate"
 if bash "$install" --from "$work/two" --bin-dir "$work/fresh" 2> /dev/null; then
-  fail "installing without stui succeeded"
+  fail "installing without st3-migrate succeeded"
 fi
 check "$work/fresh" 1
 

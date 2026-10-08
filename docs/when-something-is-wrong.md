@@ -122,7 +122,7 @@ reset state, delete the database or downgrade across a migration to get a reacha
 ## PATH, PTY and harness login
 
 ```sh
-command -v st st3 stui pty
+command -v st st3 pty
 st --version --json
 st doctor
 ```
