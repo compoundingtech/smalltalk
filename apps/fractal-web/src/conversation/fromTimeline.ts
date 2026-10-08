@@ -31,6 +31,7 @@ export type FixtureConversationChunk = Omit<ConversationChunk, 'entries'> & {
 
 type Entry = TimelineEntry | ProposedReasoningEntry | UnrecognizedEntry
 type ToolResultEntry = Extract<Entry, { type: 'tool_result' }>
+type PositionedResult = { readonly entry: ToolResultEntry; readonly at: number }
 
 const entryTimestamp = (entry: Exclude<Entry, UnrecognizedEntry>): string =>
   DateTime.formatIso(entry.timestamp)
@@ -317,11 +318,8 @@ export class LiveTimeline {
   private ordered: Array<Entry> = []
   /** Call positions per reused identity, sorted by authoritative sequence, not delivery order. */
   private readonly calls = new Map<string, Array<number>>()
-  /** All results per identity, including orphans awaiting an invocation with lower sequence. */
-  private readonly results = new Map<
-    string,
-    Map<string, { readonly entry: ToolResultEntry; readonly at: number }>
-  >()
+  /** Results per identity, sequence-sorted for segment-local redistribution and orphan lookup. */
+  private readonly results = new Map<string, Array<PositionedResult>>()
   /** Newest result within each invocation's sequence segment (CAG.CLI.WEB.CNV-R04). */
   private readonly joined = new Map<number, ToolResultEntry>()
   /** Item count before each position in `ordered`, valid below `dirtyFrom`. */
@@ -336,6 +334,9 @@ export class LiveTimeline {
   /** Native replace-page evidence, never an empty filtered projection. */
   observation: { readonly empty: boolean } | undefined
 
+  /** Optional operation counter for deterministic join-complexity tests. */
+  constructor(private readonly onJoin?: () => void) {}
+
   get size(): number {
     return this.entries.size
   }
@@ -343,6 +344,8 @@ export class LiveTimeline {
   /** Applies one follow frame (CAG.CLI.WEB.CNV-R01/R02); returns whether anything changed. */
   apply(frame: FixtureConversationChunk): boolean {
     let changed = frame.replace
+    let newCalls: Map<string, Array<number>> | undefined
+    let newResults: Map<string, Map<string, PositionedResult>> | undefined
     if (frame.replace) {
       this.entries.clear()
       this.ordered = []
@@ -390,50 +393,149 @@ export class LiveTimeline {
         this.reindex = true
       }
       if (this.reindex) continue
-      if (entry.type === 'tool_call' && previous === undefined) this.indexCall(entry, at)
-      if (entry.type === 'tool_result') this.indexResult(entry, at)
+      if (entry.type === 'tool_call' && previous === undefined) {
+        newCalls ??= new Map()
+        const calls = newCalls.get(entry.body.call_id)
+        if (calls === undefined) newCalls.set(entry.body.call_id, [at])
+        else calls.push(at)
+      } else if (entry.type === 'tool_result') {
+        newResults ??= new Map()
+        let results = newResults.get(entry.body.call_id)
+        if (results === undefined) {
+          results = new Map()
+          newResults.set(entry.body.call_id, results)
+        }
+        results.set(entry.id, { entry, at })
+      }
+    }
+    if (!this.reindex) {
+      // Install all invocations before new results: one frame cannot repeatedly repartition
+      // its own results or transiently assign them to an invocation it is about to supersede.
+      if (newCalls !== undefined)
+        for (const [id, calls] of newCalls) this.indexCalls(id, calls)
+      if (newResults !== undefined)
+        for (const [id, results] of newResults) this.indexResults(id, Array.from(results.values()))
     }
     return changed
   }
 
-  /** Index an invocation and redistribute retained results if it splits a reused identity. */
-  private indexCall(entry: Extract<Entry, { type: 'tool_call' }>, at: number): void {
-    const id = entry.body.call_id
-    let positions = this.calls.get(id)
-    if (positions === undefined) {
+  /** Merge a frame's invocations once, avoiding quadratic shifts for reverse-arriving calls. */
+  private indexCalls(id: string, added: Array<number>): void {
+    added.sort((a, b) => this.ordered[a]!.sequence - this.ordered[b]!.sequence)
+    const before = this.calls.get(id)
+    const beforeLength = before?.length ?? 0
+    const slots: Array<number> = []
+    let positions: Array<number>
+    if (before === undefined) {
+      positions = added
+      for (let index = 0; index < added.length; index += 1) slots.push(index)
+    } else if (this.ordered[added[0]!]!.sequence >= this.ordered[before.at(-1)!]!.sequence) {
+      positions = before
+      for (const at of added) {
+        slots.push(positions.length)
+        positions.push(at)
+      }
+    } else {
       positions = []
-      this.calls.set(id, positions)
+      let old = 0
+      for (const at of added) {
+        while (old < beforeLength && this.ordered[before[old]!]!.sequence <= this.ordered[at]!.sequence) {
+          positions.push(before[old]!)
+          old += 1
+        }
+        slots.push(positions.length)
+        positions.push(at)
+      }
+      while (old < beforeLength) {
+        positions.push(before[old]!)
+        old += 1
+      }
     }
-    positions.splice(this.callSlot(positions, entry.sequence), 0, at)
+    this.calls.set(id, positions)
     const results = this.results.get(id)
     if (results === undefined) return
-    for (const call of positions) {
-      this.joined.delete(call)
-      this.dirtyFrom = Math.min(this.dirtyFrom, call)
-    }
-    for (const result of results.values()) {
-      // An orphan previously rendered anywhere in the window may now belong to an invocation.
-      this.dirtyFrom = Math.min(this.dirtyFrom, result.at)
-      this.join(result.entry)
+    for (const slot of slots) {
+      const at = positions[slot]!
+      const sequence = this.ordered[at]!.sequence
+      const next = positions[slot + 1]
+      const start = this.resultSlot(results, sequence)
+      const end = next === undefined ? results.length : this.resultSlot(results, this.ordered[next]!.sequence)
+      if (start === end) continue
+      this.joined.set(at, results[end - 1]!.entry)
+      // Find ownership before this frame's additions, not an intervening new invocation.
+      const oldSlot = before === undefined ? 0 : this.callSlot(before, results[end - 1]!.entry.sequence, beforeLength)
+      const previous = oldSlot === 0 ? undefined : before?.[oldSlot - 1]
+      for (let index = start; index < end; index += 1) {
+        this.onJoin?.()
+        if (previous === undefined) this.dirtyFrom = Math.min(this.dirtyFrom, results[index]!.at)
+      }
+      if (previous === undefined) continue
+      const priorResult = this.joined.get(previous)
+      if (priorResult === undefined || priorResult.sequence <= sequence ||
+        (next !== undefined && priorResult.sequence > this.ordered[next]!.sequence)) continue
+      // Only its winning result moved. Recover the final preceding segment once.
+      const priorSequence = this.ordered[previous]!.sequence
+      let priorSlot = this.callSlot(positions, priorSequence)
+      while (positions[priorSlot] !== previous) priorSlot += 1
+      const priorNext = positions[priorSlot + 1]
+      const priorEnd = priorNext === undefined
+        ? results.length
+        : this.resultSlot(results, this.ordered[priorNext]!.sequence)
+      const remaining = results[priorEnd - 1]?.entry
+      if (remaining !== undefined && remaining.sequence > priorSequence)
+        this.joined.set(previous, remaining)
+      else this.joined.delete(previous)
+      this.dirtyFrom = Math.min(this.dirtyFrom, previous)
     }
   }
 
-  /** Retain every result so a later invocation can split a previously loaded sequence segment. */
-  private indexResult(entry: ToolResultEntry, at: number): void {
-    const id = entry.body.call_id
-    let results = this.results.get(id)
-    if (results === undefined) {
-      results = new Map()
-      this.results.set(id, results)
+  /** Sort and merge a frame's results once; revisions replace their existing sequence slots. */
+  private indexResults(id: string, added: Array<PositionedResult>): void {
+    added.sort((a, b) => a.entry.sequence - b.entry.sequence || a.at - b.at)
+    const before = this.results.get(id)
+    if (before === undefined) {
+      this.results.set(id, added)
+    } else if (added[0]!.entry.sequence > before.at(-1)!.entry.sequence ||
+      (added[0]!.entry.sequence === before.at(-1)!.entry.sequence && added[0]!.at > before.at(-1)!.at)) {
+      for (const result of added) before.push(result)
+    } else {
+      const merged: Array<PositionedResult> = []
+      let old = 0
+      for (const result of added) {
+        while (old < before.length &&
+          (before[old]!.entry.sequence < result.entry.sequence ||
+            (before[old]!.entry.sequence === result.entry.sequence && before[old]!.at < result.at))) {
+          merged.push(before[old]!)
+          old += 1
+        }
+        if (before[old]?.at === result.at) old += 1
+        merged.push(result)
+      }
+      while (old < before.length) {
+        merged.push(before[old]!)
+        old += 1
+      }
+      this.results.set(id, merged)
     }
-    results.set(entry.id, { entry, at })
-    this.join(entry)
+    for (const result of added) this.join(result.entry)
+  }
+
+  /** First result strictly after `sequence`: a result at a call's sequence belongs to its predecessor. */
+  private resultSlot(results: ReadonlyArray<PositionedResult>, sequence: number): number {
+    let low = 0
+    let high = results.length
+    while (low < high) {
+      const mid = (low + high) >>> 1
+      if (results[mid]!.entry.sequence <= sequence) low = mid + 1
+      else high = mid
+    }
+    return low
   }
 
   /** First invocation with sequence at least `sequence`; positions themselves are never compared. */
-  private callSlot(positions: ReadonlyArray<number>, sequence: number): number {
+  private callSlot(positions: ReadonlyArray<number>, sequence: number, length = positions.length): number {
     let low = 0
-    let high = positions.length
+    let high = length
     while (low < high) {
       const mid = (low + high) >>> 1
       if (this.ordered[positions[mid]!]!.sequence < sequence) low = mid + 1
@@ -450,6 +552,7 @@ export class LiveTimeline {
   }
 
   private join(entry: ToolResultEntry): void {
+    this.onJoin?.()
     const call = this.callFor(entry)
     if (call === undefined) return
     const current = this.joined.get(call)
@@ -528,7 +631,7 @@ export class LiveTimeline {
     return { items, changedFrom }
   }
 
-  /** Rebuild identity joins after history is replaced or an entry changes type/call identity. */
+  /** Sort each identity once, then merge-walk its calls/results without incremental redistribution. */
   private rebuildIndex(): void {
     this.reindex = false
     this.dirtyFrom = 0
@@ -538,9 +641,33 @@ export class LiveTimeline {
     this.results.clear()
     this.joined.clear()
     this.ordered.forEach((entry, at) => {
-      if (entry.type === 'tool_call') this.indexCall(entry, at)
-      else if (entry.type === 'tool_result') this.indexResult(entry, at)
+      if (entry.type === 'tool_call') {
+        const calls = this.calls.get(entry.body.call_id)
+        if (calls === undefined) this.calls.set(entry.body.call_id, [at])
+        else calls.push(at)
+      } else if (entry.type === 'tool_result') {
+        const results = this.results.get(entry.body.call_id)
+        if (results === undefined) this.results.set(entry.body.call_id, [{ entry, at }])
+        else results.push({ entry, at })
+      }
     })
+    for (const calls of this.calls.values())
+      calls.sort((a, b) => this.ordered[a]!.sequence - this.ordered[b]!.sequence)
+    for (const [id, results] of this.results) {
+      results.sort((a, b) => a.entry.sequence - b.entry.sequence)
+      const calls = this.calls.get(id)
+      let next = 0
+      let call: number | undefined
+      for (const result of results) {
+        this.onJoin?.()
+        if (calls === undefined) continue
+        while (next < calls.length && this.ordered[calls[next]!]!.sequence < result.entry.sequence) {
+          call = calls[next]!
+          next += 1
+        }
+        if (call !== undefined) this.joined.set(call, result.entry)
+      }
+    }
   }
 
   private cached({

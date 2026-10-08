@@ -290,6 +290,117 @@ The person reads replies in st, not in the agent's session.`,
     expect(projected.changedFrom).toBe(0)
   })
 
+  it.each([true, false])('joins 2000 reused-id pairs with a linear number of result visits (replace: %s)', (replace) => {
+    let joins = 0
+    const timeline = new LiveTimeline(() => { joins += 1 })
+    const count = 2000
+    const pairs = Array.from({ length: count }, (_, index) => [
+      entry(`timeline-entry/call-${index}`, index * 4, 'tool_call', {
+        call_id: 'native-call', name: 'shell', arguments: { command: 'true' },
+      }, 'assistant'),
+      entry(`timeline-entry/result-${index}`, index * 4 + 1, 'tool_result', {
+        call_id: 'native-call', status: 'success', media_type: 'text/plain', content: `${index}`,
+      }, 'tool'),
+    ]).flat()
+    timeline.apply({ replace: true, hasMore: false, entries: [] })
+    timeline.project()
+    joins = 0
+    timeline.apply({ replace, hasMore: false, entries: pairs })
+    const projected = timeline.project()
+    expect(projected.items).toHaveLength(count)
+    expect(projected.items.at(-1)).toMatchObject({
+      id: `timeline-entry/call-${count - 1}`, status: 'success', result: { content: `${count - 1}` },
+    })
+    expect(joins).toBeGreaterThan(0)
+    expect(joins).toBeLessThanOrEqual(4 * count)
+    // A tail invocation cannot revisit or dirty the completed historical invocations.
+    joins = 0
+    timeline.apply({
+      replace: false, hasMore: false,
+      entries: [entry('timeline-entry/tail-call', count * 4, 'tool_call', {
+        call_id: 'native-call', name: 'shell', arguments: { command: 'next' },
+      }, 'assistant')],
+    })
+    const tail = timeline.project()
+    expect(tail.changedFrom).toBe(count)
+    expect(tail.items[0]).toBe(projected.items[0])
+    expect(joins).toBe(0)
+  })
+
+  it.each([false, true])('batches reverse-arriving invocations without revisiting results (retained results: %s)', (retained) => {
+    let joins = 0
+    const timeline = new LiveTimeline(() => { joins += 1 })
+    const count = 2000
+    const calls = Array.from({ length: count }, (_, index) =>
+      entry(`timeline-entry/call-${index}`, index * 4 + 4, 'tool_call', {
+        call_id: 'native-call', name: 'shell', arguments: { command: 'true' },
+      }, 'assistant'))
+    const results = Array.from({ length: count }, (_, index) =>
+      entry(`timeline-entry/result-${index}`, index * 4 + 5, 'tool_result', {
+        call_id: 'native-call', status: 'success', media_type: 'text/plain', content: `${index}`,
+      }, 'tool'))
+    // One old invocation initially owns all retained results. Each added invocation must
+    // split only its own final segment, even though they arrive in reverse sequence order.
+    timeline.apply({
+      replace: true, hasMore: false,
+      entries: retained
+        ? [entry('timeline-entry/old-call', 0, 'tool_call', {
+            call_id: 'native-call', name: 'shell', arguments: { command: 'old' },
+          }, 'assistant'), ...results.toReversed()]
+        : [],
+    })
+    timeline.project()
+    joins = 0
+    timeline.apply({
+      replace: false, hasMore: false,
+      entries: retained ? calls.toReversed() : [...results.toReversed(), ...calls.toReversed()],
+    })
+    const items = timeline.project().items
+    expect(items).toHaveLength(count + (retained ? 1 : 0))
+    if (retained) {
+      expect(items[0]).toMatchObject({ id: 'timeline-entry/old-call', status: 'running' })
+      expect(items[0]).not.toHaveProperty('result')
+    }
+    expect(items.at(-1)).toMatchObject({
+      id: 'timeline-entry/call-0', status: 'success', result: { content: '0' },
+    })
+    expect(joins).toBeGreaterThan(0)
+    expect(joins).toBeLessThanOrEqual(4 * count)
+  })
+
+  it('visits only the result segment split by one late invocation', () => {
+    let joins = 0
+    const timeline = new LiveTimeline(() => { joins += 1 })
+    const count = 2000
+    const missing = 1000
+    const frames = Array.from({ length: count }, (_, index) => {
+      const call = entry(`timeline-entry/call-${index}`, index * 4, 'tool_call', {
+        call_id: 'native-call', name: 'shell', arguments: { command: 'true' },
+      }, 'assistant')
+      const result = entry(`timeline-entry/result-${index}`, index * 4 + 1, 'tool_result', {
+        call_id: 'native-call', status: 'success', media_type: 'text/plain', content: `${index}`,
+      }, 'tool')
+      return index === missing ? [result] : [call, result]
+    }).flat()
+    timeline.apply({ replace: true, hasMore: false, entries: frames })
+    const before = timeline.project().items
+    joins = 0
+    timeline.apply({
+      replace: false, hasMore: false,
+      entries: [entry(`timeline-entry/call-${missing}`, missing * 4, 'tool_call', {
+        call_id: 'native-call', name: 'shell', arguments: { command: 'true' },
+      }, 'assistant')],
+    })
+    const after = timeline.project()
+    expect(joins).toBe(1)
+    expect(after.changedFrom).toBe(missing - 1)
+    expect(after.items[0]).toBe(before[0])
+    expect(after.items[missing]).toBe(before[missing])
+    expect(after.items.at(-1)).toMatchObject({
+      id: `timeline-entry/call-${missing}`, status: 'success', result: { content: `${missing}` },
+    })
+  })
+
   it('keeps invocation results separate when a call identity is reused', () => {
     const timeline = new LiveTimeline()
     const callA = entry('timeline-entry/call-a', 4, 'tool_call', {
