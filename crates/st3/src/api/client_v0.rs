@@ -4715,7 +4715,7 @@ fn timeline_value_with_native_sequence(
         })));
     }
     crate::performance::task("conversation/first-page", || {
-        timeline_first_page(state, snapshot, session, session_id, query)
+        timeline_first_page(state, snapshot, session, session_id, query, native_sequence)
     })
 }
 
@@ -4725,6 +4725,7 @@ fn timeline_first_page(
     session: &ClientSession,
     session_id: String,
     query: &ClientListQuery,
+    native_sequence: &mut u64,
 ) -> Result<Json<Value>, ApiError> {
     let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
         .map_err(ApiError::internal)?;
