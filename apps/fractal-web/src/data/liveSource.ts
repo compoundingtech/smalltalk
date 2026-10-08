@@ -76,6 +76,8 @@ interface RetainedConversation extends RetainedFeed<ConversationPage> {
 interface PendingSend {
   item: TextItem
   messageIds: readonly string[]
+  /** Newest subscribe serial at Sent settle; a later subscription's replace page may retire the row. */
+  settledUnder?: number
 }
 
 /** Connect retained workbench projections through one SDK runtime and frame writer. */
@@ -489,6 +491,7 @@ export const liveSource = ({
     const timeline = new LiveTimeline()
     // This is a local outbox, not a cache: entries disappear only on authoritative identity echo.
     const pending = new Map<string, PendingSend>()
+    let subscribeSerialNow: (() => number | undefined) | undefined
     let painted = false
     let publishedItems: ConversationPage['items'] = []
     let changedFrom = Infinity
@@ -507,6 +510,23 @@ export const liveSource = ({
         ...(timeline.observation === undefined ? {} : { observation: timeline.observation }),
       }
     }
+    /**
+     * A replace page from a subscription opened after a send settled retires its outbox
+     * row when the authoritative window does not contain the identity (an in-window echo
+     * retires it in `projectPage`; a page from the subscription the row settled under may
+     * simply lag the send, so it never retires anything).
+     */
+    const retireSettled = (subscription: number | undefined) => {
+      if (subscription === undefined) return
+      const shown = shownMessageIds()
+      for (const [id, send] of pending)
+        if (
+          send.settledUnder !== undefined &&
+          subscription > send.settledUnder &&
+          !send.messageIds.some((messageId) => shown.has(messageId))
+        )
+          pending.delete(id)
+    }
     const retained = retain<ConversationPage, Extract<FollowSpec, { _tag: 'Conversation' }>>({
       keepAlive: false,
       explicitInterest: true,
@@ -521,17 +541,20 @@ export const liveSource = ({
         if (visible) visibleConversations.set(ref, painted)
         else visibleConversations.delete(ref)
       },
-      follow: ({ st3, spec }) =>
-        st3.followConversation(spec).pipe(
+      follow: ({ st3, spec }) => {
+        subscribeSerialNow = () => st3.subscribeSerial(spec)
+        return st3.followConversation(spec).pipe(
           Stream.map((event) => {
             if (event._tag !== 'Observed') return event
             const previousSize = timeline.size
             timeline.apply(event.value)
             // Entries are identity-deduplicated by the retained timeline, not counted per chunk.
             incrDebug('Wf.conversationEntries', timeline.size - previousSize)
+            if (event.value.replace) retireSettled(event.value.subscription)
             return { _tag: 'Observed' as const, value: projectPage() }
           }),
-        ),
+        )
+      },
     })
     const publishPending = () => {
       changedFrom = Math.min(changedFrom, timeline.project().items.length)
@@ -593,6 +616,7 @@ export const liveSource = ({
           if (affected.length > 0) local.messageIds = affected
           // Terminal gateway success settles the outbox row even when the mailbox echo
           // falls outside the newest window; an in-window echo still removes it.
+          local.settledUnder = subscribeSerialNow?.()
           local.item = { ...local.item, sendState: { _tag: 'Sent' } }
         }
         publishPending()

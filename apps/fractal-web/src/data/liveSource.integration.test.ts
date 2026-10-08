@@ -757,4 +757,64 @@ describe('optimistic conversation sends', () => {
       }),
     ),
   )
+
+  it.live('retires a settled send when a fresh subscription replaces the window without it', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        const conversation = live.source.conversation(agent.id)
+        live.registry.mount(conversation)
+        yield* settle
+        gateway.sendGate = Promise.resolve()
+        yield* Effect.promise(() => live.source.attachments!.send(request))
+        yield* settle
+        expect(live.registry.get(conversation)).toMatchObject({
+          _tag: 'Observed', value: { items: [
+            { _tag: 'Text', text: 'hello', sendState: { _tag: 'Sent' } },
+          ] },
+        })
+        // The socket drops; the SDK reopens and subscribes afresh after the send completed.
+        gateway.socket?.onclose?.({ code: 1006, reason: 'socket dropped' })
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(500))
+        yield* settle
+        gateway.send({
+          kind: 'conversation', id: gateway.subscription('conversation').id,
+          collection: 'conversation', session_id: 'session/example',
+          replace: true, has_more: false, items: [],
+        })
+        yield* settle
+        // The first page of a subscription opened after completion is authoritative for
+        // the window: an identity it does not contain retires the settled outbox row.
+        expect(live.registry.get(conversation)).toMatchObject({
+          _tag: 'Observed', value: { items: [] },
+        })
+      }),
+    ),
+  )
+
+  it.live('keeps a settled send whose replace page predates its completion', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        const conversation = live.source.conversation(agent.id)
+        live.registry.mount(conversation)
+        yield* settle
+        gateway.sendGate = Promise.resolve()
+        yield* Effect.promise(() => live.source.attachments!.send(request))
+        yield* settle
+        // Same subscription the row settled under: the page may lag the send, so the row stays.
+        gateway.send({
+          kind: 'conversation', id: gateway.subscription('conversation').id,
+          collection: 'conversation', session_id: 'session/example',
+          replace: true, has_more: false, items: [],
+        })
+        yield* settle
+        expect(live.registry.get(conversation)).toMatchObject({
+          _tag: 'Observed', value: { items: [
+            { _tag: 'Text', text: 'hello', sendState: { _tag: 'Sent' } },
+          ] },
+        })
+      }),
+    ),
+  )
 })
