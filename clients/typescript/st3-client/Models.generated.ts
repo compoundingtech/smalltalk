@@ -542,6 +542,7 @@ export type CollectionCommand = ({
   limit?: number;
   person?: string | null;
   status?: string | null;
+  trace?: SubscribeTraceContext;
 } | {
   collection: "arrangements";
   id: string;
@@ -549,6 +550,7 @@ export type CollectionCommand = ({
   limit?: number;
   person: ArrangementPerson;
   subject?: ArrangementId;
+  trace?: SubscribeTraceContext;
 } | {
   capability: string;
   collection: "terminal";
@@ -556,11 +558,13 @@ export type CollectionCommand = ({
   incarnation?: string | null;
   kind: "subscribe";
   terminal: Id;
+  trace?: SubscribeTraceContext;
 } | {
   collection: "conversation";
   conversation: Id;
   id: string;
   kind: "subscribe";
+  trace?: SubscribeTraceContext;
 } | {
   id: string;
   kind: "unsubscribe";
@@ -1505,6 +1509,8 @@ export type SubjectDefinition = {
   kind: "subject-definition";
   subject: string;
 };
+
+export type SubscribeTraceContext = unknown;
 
 export type Subscription = ResourceHeader & {
   kind: "subscription";

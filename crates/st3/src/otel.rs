@@ -314,6 +314,49 @@ pub fn extract_remote_context(headers: &axum::http::HeaderMap) -> opentelemetry:
     })
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct FrameTraceContext {
+    pub traceparent: Option<String>,
+    pub tracestate: Option<String>,
+}
+
+impl opentelemetry::propagation::Extractor for FrameTraceContext {
+    fn get(&self, key: &str) -> Option<&str> {
+        match key {
+            "traceparent" => self.traceparent.as_deref(),
+            "tracestate" => self.tracestate.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        ["traceparent", "tracestate"].into_iter()
+            .filter(|key| self.get(key).is_some()).collect()
+    }
+}
+
+/// Subscribe telemetry is best-effort: only a valid W3C parent is used.
+pub(crate) fn extract_frame_context(value: Option<&FrameTraceContext>) -> Option<opentelemetry::Context> {
+    use opentelemetry::trace::TraceContextExt as _;
+    let value = value?;
+    let remote = opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract_with_context(&opentelemetry::Context::new(), value)
+    });
+    remote.span().span_context().is_valid().then_some(remote)
+}
+
+/// Keep HTTP and frame SERVER spans on the same remote-parent sampling policy.
+pub fn set_remote_parent(span: &tracing::Span, remote: opentelemetry::Context) {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let parent = remote.span();
+    let context = parent.span_context();
+    if context.is_valid() {
+        span.record("st.parent.sampled", context.is_sampled());
+    }
+    span.set_parent(remote);
+}
+
 static HTTP_DURATION: OnceLock<opentelemetry::metrics::Histogram<f64>> = OnceLock::new();
 
 /// The five status classes the request-duration histogram labels; 101 WebSocket upgrades

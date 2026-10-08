@@ -1,0 +1,6 @@
+{
+  "kind": "subscribe",
+  "id": "roster",
+  "collection": "agents",
+  "limit": 50
+}

@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
-/// Socket ownership ends this root only after the first data frame reaches the client.
+/// Socket ownership ends this span only after the first data frame reaches the client.
 struct FirstFrame {
     span: tracing::Span,
     read_pending: bool,
@@ -16,10 +16,12 @@ fn subscription_first_frame(
     collection: &str,
     id: &str,
     upgrade: Option<&opentelemetry::trace::SpanContext>,
+    frame_trace: Option<&crate::otel::FrameTraceContext>,
 ) -> Option<FirstFrame> {
     if !crate::otel::export_enabled() {
         return None;
     }
+    let remote = crate::otel::extract_frame_context(frame_trace);
     let collection = match collection {
         "missions" => "missions",
         "attention" => "attention",
@@ -34,9 +36,10 @@ fn subscription_first_frame(
     let span = tracing::info_span!(
         parent: None,
         "st.subscription.first_frame",
-        otel.kind = "internal",
+        otel.kind = if remote.is_some() { "server" } else { "internal" },
         st.collection = collection,
         st.subscription.id = id,
+        st.parent.sampled = tracing::field::Empty,
         st.projection.hit = false,
         st.projection.cold = false,
         st.projection.incremental = false,
@@ -45,7 +48,7 @@ fn subscription_first_frame(
         st.page.bytes = tracing::field::Empty,
         span.label = collection,
     );
-    span.set_parent(opentelemetry::Context::new());
+    crate::otel::set_remote_parent(&span, remote.unwrap_or_default());
     if let Some(upgrade) = upgrade.filter(|context| context.is_valid()) {
         span.add_link(upgrade.clone());
     }
@@ -136,6 +139,88 @@ struct CollectionSubscribe {
     capability: Option<String>,
     /// A conversation subscription names an agent or a session.
     conversation: Option<String>,
+    /// Proposed frame context, pending #1910. Malformed telemetry never rejects a frame.
+    // Duplicate top-level trace keys remain a serde error: clients must send one key.
+    #[serde(rename = "trace", default, deserialize_with = "deserialize_frame_trace")]
+    frame_trace: Option<crate::otel::FrameTraceContext>,
+}
+
+fn deserialize_frame_trace<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::otel::FrameTraceContext>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // deserialize_any would parse 1e999 before a Visitor can ignore it. RawValue uses
+    // the ignored-value scanner instead, preserving the old unknown-field behavior.
+    let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+    if !raw.get().trim_start().starts_with('{') {
+        return Ok(None);
+    }
+    struct TraceFields(crate::otel::FrameTraceContext);
+    impl<'de> Deserialize<'de> for TraceFields {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct FieldsVisitor;
+            impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+                type Value = TraceFields;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a trace context object")
+                }
+
+                fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                    let mut fields = crate::otel::FrameTraceContext::default();
+                    while let Some(key) = map.next_key::<String>()? {
+                        match key.as_str() {
+                            "traceparent" | "tracestate" => {
+                                let raw = map.next_value::<&serde_json::value::RawValue>()?;
+                                let value = serde_json::from_str::<String>(raw.get()).ok();
+                                if key == "traceparent" {
+                                    fields.traceparent = value;
+                                } else {
+                                    fields.tracestate = value;
+                                }
+                            }
+                            _ => { map.next_value::<serde::de::IgnoredAny>()?; }
+                        }
+                    }
+                    Ok(TraceFields(fields))
+                }
+            }
+            deserializer.deserialize_map(FieldsVisitor)
+        }
+    }
+    serde_json::from_str::<TraceFields>(raw.get())
+        .map(|fields| Some(fields.0)).map_err(serde::de::Error::custom)
+}
+
+#[cfg(test)]
+mod frame_trace_tests {
+    use super::*;
+
+    #[test]
+    fn otel_frame_trace_preserves_ignored_json_decoding() {
+        let deeply_nested = format!("{}0{}", "[".repeat(256), "]".repeat(256));
+        for trace in [
+            "1e999".to_owned(), deeply_nested.clone(), "null".to_owned(),
+            r#"{"traceparent":1e999}"#.to_owned(),
+            r#"{"traceparent":42,"tracestate":{}}"#.to_owned(),
+            format!(r#"{{"traceparent":{deeply_nested},"tracestate":{deeply_nested},"unknown":{deeply_nested}}}"#),
+        ] {
+            let frame = format!(r#"{{"kind":"subscribe","id":"x","collection":"missions","trace":{trace}}}"#);
+            let decoded: CollectionSubscribe = serde_json::from_str(&frame).unwrap();
+            assert_eq!(decoded.kind, "subscribe");
+            assert_eq!(decoded.collection, "missions");
+            assert!(decoded.frame_trace.as_ref().is_none_or(|context|
+                context.traceparent.is_none() && context.tracestate.is_none()), "{trace}");
+        }
+        let decoded: CollectionSubscribe = serde_json::from_str(
+            r#"{"kind":"subscribe","id":"x","collection":"missions","trace":{"traceparent":"valid-string","tracestate":{}}}"#
+        ).unwrap();
+        let context = decoded.frame_trace.unwrap();
+        assert_eq!(context.traceparent.as_deref(), Some("valid-string"));
+        assert!(context.tracestate.is_none());
+    }
 }
 
 /// A collection's name, with `alerts` read as `attention`: the same rows under the name a person
@@ -1476,7 +1561,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                             { return; }
                             break 'command;
                         };
-                        let Ok(request) = serde_json::from_str::<CollectionSubscribe>(&payload) else {
+                        let Ok(mut request) = serde_json::from_str::<CollectionSubscribe>(&payload) else {
                             if !send_collection(&mut socket, json!({"kind":"error", "message":"invalid collection command"})).await { return; }
                             break 'command;
                         };
@@ -1513,7 +1598,8 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         // replacements, so queued collection/conversation results cannot reuse it.
                         generation += 1;
                         first_frames.remove(&request.id);
-                        if let Some(first_frame) = subscription_first_frame(&request.collection, &request.id, upgrade.as_ref()) {
+                        // Initial telemetry must not be retained or cloned on later rereads.
+                        if let Some(first_frame) = subscription_first_frame(&request.collection, &request.id, upgrade.as_ref(), request.frame_trace.take().as_ref()) {
                             first_frames.insert(request.id.clone(), first_frame);
                         }
                         if request.collection == "conversation" {
@@ -6877,7 +6963,7 @@ pub(super) async fn conversation_stream(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let upgrade = upgrade.and_then(|Extension(context)| context.0);
-    let first_frame = subscription_first_frame("conversation", "conversation", upgrade.as_ref());
+    let first_frame = subscription_first_frame("conversation", "conversation", upgrade.as_ref(), None);
     require_scope(&session, "read.projections")?;
     let protocols = headers
         .get_all(SEC_WEBSOCKET_PROTOCOL)
@@ -8164,7 +8250,7 @@ pub(super) async fn terminal_stream(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let upgrade = upgrade.and_then(|Extension(context)| context.0);
-    let first_frame = subscription_first_frame("terminal", "terminal", upgrade.as_ref());
+    let first_frame = subscription_first_frame("terminal", "terminal", upgrade.as_ref(), None);
     require_scope(&session, "terminal.read")?;
     let protocols = headers
         .get_all(SEC_WEBSOCKET_PROTOCOL)

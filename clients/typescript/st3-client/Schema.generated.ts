@@ -1199,12 +1199,17 @@ export const ClientConnections = /*#__PURE__*/ (() => Schema.Struct({
 export type ClientConnections = typeof ClientConnections.Type
 export type ClientConnectionsEncoded = typeof ClientConnections.Encoded
 
+/** Proposed in #1910; pending decision. {traceparent: string, tracestate?: string}. Any JSON value is accepted; absent, null, non-object, missing/non-string traceparent or invalid W3C traceparent is ignored. The daemon validates with the W3C propagator, not this schema. */
+export const SubscribeTraceContext = /*#__PURE__*/ (() => Schema.Unknown.annotate({ identifier: "SubscribeTraceContext", description: "Proposed in #1910; pending decision. {traceparent: string, tracestate?: string}. Any JSON value is accepted; absent, null, non-object, missing/non-string traceparent or invalid W3C traceparent is ignored. The daemon validates with the W3C propagator, not this schema." }))()
+export type SubscribeTraceContext = typeof SubscribeTraceContext.Type
+export type SubscribeTraceContextEncoded = typeof SubscribeTraceContext.Encoded
+
 export const CollectionCommand = /*#__PURE__*/ (() => Schema.Union([
-  Schema.Struct({ "actor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "collection": Schema.Literals(["missions","attention","agents","work","glasses","summary"]), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "status": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }),
+  Schema.Struct({ "actor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "collection": Schema.Literals(["missions","attention","agents","work","glasses","summary"]), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "status": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "trace": optionalKey(SubscribeTraceContext) }),
   Schema.Struct({ "collection": Schema.Literal("arrangements"), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": ArrangementPerson, /** Follow only this arrangement; its owner must equal person. */
-"subject": optionalKey(ArrangementId) }),
-  Schema.Struct({ "capability": Schema.String, "collection": Schema.Literal("terminal"), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "incarnation": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "kind": Schema.Literal("subscribe"), "terminal": Id }),
-  Schema.Struct({ "collection": Schema.Literal("conversation"), "conversation": Id, "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe") }),
+"subject": optionalKey(ArrangementId), "trace": optionalKey(SubscribeTraceContext) }),
+  Schema.Struct({ "capability": Schema.String, "collection": Schema.Literal("terminal"), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "incarnation": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "kind": Schema.Literal("subscribe"), "terminal": Id, "trace": optionalKey(SubscribeTraceContext) }),
+  Schema.Struct({ "collection": Schema.Literal("conversation"), "conversation": Id, "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "trace": optionalKey(SubscribeTraceContext) }),
   Schema.Struct({ "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("unsubscribe") })
 ], { mode: "oneOf" }).annotate({ identifier: "CollectionCommand" }))()
 export type CollectionCommand = typeof CollectionCommand.Type

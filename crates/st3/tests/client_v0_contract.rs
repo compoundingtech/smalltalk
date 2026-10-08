@@ -1097,6 +1097,64 @@ fn test_state(root: &Path) -> AppState {
     }
 }
 
+#[test]
+fn old_shape_subscribe_and_proposed_trace_preserve_collection_contract() {
+    let validator = contract_validator("CollectionCommand");
+    let old = fixture("collection-subscribe.json");
+    assert_conforms(&validator, "old-shape subscribe without trace", &old);
+    assert!(old.get("trace").is_none());
+    let mut proposed = fixture("collection-subscribe-trace-proposed.json");
+    assert_conforms(&validator, "proposed subscribe trace", &proposed);
+    proposed.as_object_mut().unwrap().remove("trace");
+    assert_eq!(proposed, old, "trace does not change subscription fields");
+    for malformed in [
+        Value::Null, serde_json::json!(42), serde_json::json!([]),
+        serde_json::json!({"traceparent":"not-a-traceparent"}),
+    ] {
+        proposed["trace"] = malformed;
+        assert_conforms(&validator, "malformed telemetry preserves frame contract", &proposed);
+    }
+}
+
+#[tokio::test]
+async fn collection_socket_accepts_out_of_range_ignored_trace() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("client.sock");
+    let state = test_state(root.path());
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, st3::api::router(state)).await.unwrap();
+    });
+    for _ in 0..100 {
+        if socket.exists() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut request = "ws://localhost/v1/client/collections/stream".into_client_request().unwrap();
+    request.headers_mut().insert("sec-websocket-protocol", "st3.client.collections.v0".parse().unwrap());
+    request.headers_mut().insert("x-st3-person", "person/ada".parse().unwrap());
+    let (mut stream, _) = tokio_tungstenite::client_async(
+        request, tokio::net::UnixStream::connect(&socket).await.unwrap(),
+    ).await.unwrap();
+    stream.send(Message::Text(
+        r#"{"kind":"subscribe","id":"ignored-trace","collection":"missions","trace":1e999}"#.into()
+    )).await.unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = stream.next().await.unwrap().unwrap();
+            if let Message::Text(text) = message {
+                break serde_json::from_str::<Value>(&text).unwrap();
+            }
+        }
+    }).await.unwrap();
+    assert_eq!(frame["kind"], "snapshot", "{frame}");
+    assert_eq!(frame["id"], "ignored-trace");
+    assert_conforms(&contract_validator("CollectionFrame"), "ignored out-of-range trace", &frame);
+    stream.close(None).await.unwrap();
+    server.abort();
+}
+
 #[tokio::test]
 async fn collection_socket_multiplexes_snapshot_then_changes_and_resubscribes() {
     let validator = contract_validator("CollectionFrame");
