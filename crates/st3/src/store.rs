@@ -105,6 +105,8 @@ mod adhoc_work;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod attention_human_runs;
 #[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod attention_stop_heads;
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod attention_capture;
 mod attention_snapshot;
 // Registration stays opt-in until the shared installer certifies every source family.

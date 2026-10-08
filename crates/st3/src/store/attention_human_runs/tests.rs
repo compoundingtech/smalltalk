@@ -280,3 +280,117 @@ fn replacements_preserve_old_and_new_keys_rollback_namespace_isolation_and_clock
     assert!(super::selected(&tx, &two, &[new], u128::MAX).unwrap()[0].waiting);
     tx.commit().unwrap();
 }
+
+#[test]
+fn canonical_stop_arrangement_tracks_rekeys_removals_rollback_and_isolated_namespaces() {
+    use crate::store::attention_stop_heads as stops;
+    let store = Store::open_memory("alder").unwrap();
+    let first = namespace(&store, "fixture/human-stops-one");
+    let second = namespace(&store, "fixture/human-stops-two");
+    let mut writer = store.connection.write();
+    stops::create_schema(&writer).unwrap();
+    let mut inputs = BTreeMap::from([
+        (
+            "old",
+            stops::Head {
+                requester: "agent/asker".into(),
+                key: (9, "writer-z".into(), 9, "b".into(), 4, "old".into()),
+            },
+        ),
+        (
+            "new",
+            stops::Head {
+                requester: "agent/asker".into(),
+                key: (10, "writer-a".into(), 1, "a".into(), 1, "new".into()),
+            },
+        ),
+        (
+            "tie",
+            stops::Head {
+                requester: "agent/asker".into(),
+                key: (10, "writer-b".into(), 1, "b".into(), 0, "tie".into()),
+            },
+        ),
+    ]);
+    let tx = writer.transaction().unwrap();
+    for (claim, head) in &inputs {
+        let changed = stops::replace(&tx, &first, claim, Some(head)).unwrap();
+        assert_eq!(changed.writes, 1);
+        assert_eq!(
+            changed.affected_requesters,
+            BTreeSet::from(["agent/asker".into()])
+        );
+    }
+    let unchanged = stops::replace(&tx, &first, "new", inputs.get("new")).unwrap();
+    assert_eq!(unchanged.writes, 0);
+    assert!(unchanged.affected_requesters.is_empty());
+    tx.commit().unwrap();
+    fn assert_head(c: &Connection, ns: &Namespace, inputs: &BTreeMap<&str, stops::Head>) {
+        let oracle = inputs
+            .values()
+            .filter(|head| head.requester == "agent/asker")
+            .max_by(|left, right| left.key.cmp(&right.key))
+            .cloned();
+        assert_eq!(stops::maximum(c, ns, "agent/asker").unwrap(), oracle);
+    }
+    assert_head(&writer, &first, &inputs);
+    assert!(
+        stops::maximum(&writer, &second, "agent/asker")
+            .unwrap()
+            .is_none()
+    );
+    {
+        let tx = writer.transaction().unwrap();
+        let mut correction = inputs["new"].clone();
+        correction.key.1 = "writer-z".into();
+        stops::replace(&tx, &first, "new", Some(&correction)).unwrap();
+        assert_eq!(
+            stops::maximum(&tx, &first, "agent/asker").unwrap(),
+            Some(correction)
+        );
+        // Rollback restores the original canonical maximum without replaying declarations.
+    }
+    assert_head(&writer, &first, &inputs);
+    let tx = writer.transaction().unwrap();
+    let mut moved = inputs["tie"].clone();
+    moved.requester = "agent/other".into();
+    let changed = stops::replace(&tx, &first, "tie", Some(&moved)).unwrap();
+    assert_eq!(
+        changed.affected_requesters,
+        BTreeSet::from(["agent/asker".into(), "agent/other".into()])
+    );
+    inputs.insert("tie", moved);
+    assert_head(&tx, &first, &inputs);
+    let future = stops::Head {
+        requester: "agent/asker".into(),
+        key: (
+            u128::MAX,
+            "writer".into(),
+            0,
+            "b".into(),
+            0,
+            "future".into(),
+        ),
+    };
+    stops::replace(&tx, &first, "future", Some(&future)).unwrap();
+    inputs.insert("future", future);
+    assert_head(&tx, &first, &inputs);
+    assert_eq!(
+        stops::replace(&tx, &first, "future", None).unwrap().writes,
+        1
+    );
+    inputs.remove("future");
+    assert_head(&tx, &first, &inputs);
+    let plan: Vec<String> = tx.prepare("EXPLAIN QUERY PLAN SELECT claim FROM local_attention_stop_heads WHERE namespace=?1 AND requester=?2 ORDER BY canonical_key DESC,claim DESC LIMIT 1").unwrap()
+        .query_map(params![first.as_str(),"agent/asker"], |r| r.get(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("attention_stop_head_by_requester"))
+    );
+    assert!(
+        plan.iter()
+            .all(|line| !line.contains("TEMP B-TREE") && !line.starts_with("SCAN")),
+        "{plan:?}"
+    );
+    tx.commit().unwrap();
+}
