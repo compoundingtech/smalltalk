@@ -27,7 +27,13 @@ fn lease(
                     session: row.get(4)?,
                     sequence: row.get(5)?,
                     pid: row.get(6)?,
-                    process_token: row.get::<_, String>(7)?.parse().unwrap_or(0),
+                    process_token: row.get::<_, String>(7)?.parse().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            7,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
                 },
                 row.get(8)?,
             ))
@@ -156,6 +162,35 @@ mod tests {
             );
         }
         store.check_mailbox(&bound).unwrap();
+    }
+
+    #[test]
+    fn malformed_persisted_process_birth_cannot_prove_a_dead_canonical_owner() {
+        let store = fixture();
+        let owner = authority(1);
+        let bound = store
+            .bind_mailbox_with_lease(&request(), Some(&owner))
+            .unwrap();
+        store.connection.write().execute(
+            "UPDATE local_mailbox_leases SET process_token='malformed' WHERE subject=?1 AND component=?2",
+            params![bound.subject,bound.component],
+        ).unwrap();
+        assert!(
+            store
+                .bind_mailbox_with_lease(&request(), Some(&owner))
+                .is_err()
+        );
+        assert!(store.repair_mailbox(&bound, &owner).is_err());
+        let held: (String, u64) = store
+            .readers
+            .get()
+            .query_row(
+                "SELECT token,epoch FROM local_mailbox_leases WHERE subject=?1 AND component=?2",
+                params![bound.subject, bound.component],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(held, (bound.token, bound.epoch));
     }
 
     #[test]
