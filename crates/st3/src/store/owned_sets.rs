@@ -1345,6 +1345,8 @@ impl Store {
         .map_err(internal)
     }
     /// Fence an external effect prepared from a declaration against the selected set.
+    /// Effect callers must enter outside an enclosing read snapshot and wait for this
+    /// method to return before writing or performing the effect.
     pub fn owned_desired_guard(&self, desired: &DesiredSubject) -> Result<(), St3Error> {
         smallclaims::sqlite::debug_assert_no_pinned_read();
         // Every invocation starts a current read snapshot. Reuse receipt rows only within

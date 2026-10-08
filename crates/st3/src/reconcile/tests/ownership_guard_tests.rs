@@ -893,7 +893,7 @@ fn an_ownership_change_after_pass_selection_skips_without_a_member_fault() {
         let count = claims_after_publication.clone();
         let path = workspace.path().to_path_buf();
         *runtime.before_observe_exec.lock().unwrap() = Some(Box::new(move || {
-            // Exec polling is after pass eligibility/workspace/render and before member/away.
+            // Exec polling follows pass eligibility and precedes member preparation/evaluation.
             assert!(
                 updated
                     .owned_desired_subjects(&old)
