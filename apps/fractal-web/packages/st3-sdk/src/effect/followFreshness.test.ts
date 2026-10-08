@@ -274,11 +274,12 @@ describe('follow freshness', () => {
         yield* settle
         expect(gateway.commands.filter(command => command.kind === 'subscribe' && command.conversation === ref)).toEqual([
           { kind: 'subscribe', id, collection: 'conversation', conversation: ref },
-          { kind: 'subscribe', id, collection: 'conversation', conversation: ref },
+          { kind: 'subscribe', id: `${id}.2`, collection: 'conversation', conversation: ref },
         ])
+        expect(gateway.unsubscribed()).toEqual([id])
         expect(gateway.socket).toBe(socket)
         expect(conversation.ended()).toBe(false)
-        gateway.send(frame)
+        gateway.send({ ...frame, id: `${id}.2` })
         yield* settle
         expect(conversation.lastFreshness()).toMatchObject({ _tag: 'Live' })
         expect(conversation.events.map(event => event._tag)).toEqual(['Observed', 'Stale', 'Observed'])
@@ -750,6 +751,53 @@ describe('follow freshness', () => {
       }),
     ))
 
+  it('binds a conversation chunk to the subscribe generation that delivered it', () =>
+    run({ maxFollows: 4 }, (gateway) =>
+      Effect.gen(function* () {
+        const ref = 'agent/generation'
+        const follow = yield* mountConversation(ref)
+        const page = (id: string) =>
+          gateway.send({
+            kind: 'conversation', id, collection: 'conversation',
+            session_id: 'session/1', replace: true, has_more: false, items: [],
+          })
+        // A transient resync schedules a resubscribe one second out.
+        gateway.send({
+          kind: 'resync', id: gateway.conversationId(ref), collection: 'conversation', retryable: true,
+          code: 'cursor-gap', message: 'The conversation cursor is no longer retained',
+        })
+        yield* settle
+        // The socket drops and reopens before that retry: the reopen subscribes at once.
+        gateway.end()
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(500))
+        yield* settle
+        const reopened = gateway.conversationId(ref)
+        // The still-pending retry then subscribes the conversation once more.
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(500))
+        yield* settle
+        const subscribes = gateway.commands.filter(
+          (command) => command.kind === 'subscribe' && command.conversation === ref,
+        )
+        expect(subscribes).toHaveLength(3)
+        const current = gateway.conversationId(ref)
+        // The superseded subscription is released, so the gateway stops its follower.
+        expect(gateway.unsubscribed()).toContain(reopened)
+        // A page the reopened subscription read before the retry replaced it arrives late:
+        // it must never claim the newer generation's serial.
+        page(reopened)
+        yield* settle
+        expect(
+          follow.events.filter((event) => event._tag === 'Observed' && event.value.subscription === 3),
+        ).toEqual([])
+        page(current)
+        yield* settle
+        expect(follow.events.at(-1)).toMatchObject({
+          _tag: 'Observed',
+          value: { id: current, subscription: 3 },
+        })
+        yield* follow.interrupt
+      }),
+    ))
 
   it('forgets a follow subscribe serial when its run ends', () =>
     run({ maxFollows: 4 }, () =>

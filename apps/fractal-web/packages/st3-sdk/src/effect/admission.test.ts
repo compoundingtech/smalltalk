@@ -201,9 +201,10 @@ describe('follow admission', () => {
         yield* settle
         const subscribeIds = gateway.sentSubscribeIds
         expect(subscribeIds).toHaveLength(2)
+        // The reconnect subscribes a fresh generation under a fresh wire id.
         expect(gateway.sentFollowSubscribes).toEqual([
           { id: firstId, key: followKey(spec) },
-          { id: firstId, key: followKey(spec) },
+          { id: `${firstId}.2`, key: followKey(spec) },
         ])
 
         yield* Fiber.interrupt(consumer.fiber)
@@ -307,7 +308,8 @@ describe('follow admission', () => {
         yield* Effect.promise(() => vi.advanceTimersByTimeAsync(1000))
         yield* settle
         expect(gateway.subscribes('agents')).toBe(2)
-        expect(gateway.sentSubscribeIds).toEqual([followId, followId])
+        expect(gateway.sentSubscribeIds).toEqual([followId, `${followId}.2`])
+        expect(gateway.commands).toContainEqual({ kind: 'unsubscribe', id: followId })
         gateway.window('agents', false)
         yield* settle
         expect(agents.events.at(-1)).toEqual({

@@ -53,11 +53,14 @@ export type St3Diagnostic =
   /** Synchronous protocol decoding/projection of the last routed data frame. */
   | { readonly _tag: 'Decode'; readonly elapsedMs: number }
 
-/** One subscription on the socket, keyed by its subscription id. */
+/** One subscription on the socket, keyed by its registration id. */
 export interface Subscriber {
-  /** Send the subscribe command on `stream`; runs on register and after every reconnect. */
-  readonly subscribe: (stream: CollectionStream) => Effect.Effect<void>
-  /** A frame carrying this subscription's id. */
+  /**
+   * Send the subscribe command on `stream` under wire id `id`; runs on register, after every
+   * reconnect and on every resubscribe. Each run gets a fresh wire id (its generation).
+   */
+  readonly subscribe: (args: { readonly stream: CollectionStream; readonly id: string }) => Effect.Effect<void>
+  /** A frame addressed to this subscription's current generation. */
   readonly onFrame: (frame: CollectionFrame) => void
   /** The socket ended; a fresh subscribe follows once a new one is live. */
   readonly onDrop: () => void
@@ -78,7 +81,7 @@ export interface Channel {
   }) => Effect.Effect<void>
   /** Unsubscribe on the live socket (if any) and stop routing frames to `id`. */
   readonly unregister: (id: string) => void
-  /** Subscribe `id` again on the live socket (a fresh terminal attach, say). */
+  /** Subscribe `id` again on the live socket under a fresh generation (a fresh terminal attach, say). */
   readonly resubscribe: (id: string) => Effect.Effect<void>
 }
 
@@ -99,7 +102,8 @@ export const makeChannel = ({
   readonly client: St3Client
   readonly socket?: CollectionSocketFactory
   readonly onDiagnostics?: (event: St3Diagnostic) => void
-  readonly onSubscribeSent?: (id: string) => void
+  /** A subscribe command for registration `id` went out under generation wire id `wire`. */
+  readonly onSubscribeSent?: (sent: { readonly id: string; readonly wire: string }) => void
   /** The connect probe's capabilities response envelope, before the socket is opened. */
   readonly onCapabilities?: (envelope: EnvelopeOf<Capabilities>) => void
   /** A completed failed probe (including permanent 401/403), before rejection/backoff. */
@@ -154,8 +158,19 @@ export const makeChannel = ({
       )
     const subscribers = new Map<
       string,
-      { readonly subscriber: Subscriber; fiber: Fiber.Fiber<void> | undefined }
+      {
+        readonly subscriber: Subscriber
+        fiber: Fiber.Fiber<void> | undefined
+        generation: number
+        /** The current generation's wire id and the socket it was issued on. */
+        wire: { readonly id: string; readonly stream: CollectionStream } | undefined
+      }
     >()
+    /**
+     * Registration id per current-generation wire id. Resubscribes reuse no wire id, so a frame
+     * the gateway queued for a superseded generation can never be read as the current one's.
+     */
+    const wires = new Map<string, string>()
     let live: CollectionStream | undefined
 
     const subscribe = (id: string) =>
@@ -163,7 +178,16 @@ export const makeChannel = ({
         const entry = subscribers.get(id)
         if (entry === undefined || live === undefined) return
         entry.fiber?.interruptUnsafe()
-        entry.fiber = yield* Effect.forkIn(entry.subscriber.subscribe(live), scope)
+        if (entry.wire !== undefined) {
+          wires.delete(entry.wire.id)
+          // Release the superseded generation on its own socket; a dead socket held nothing.
+          if (entry.wire.stream === live) live.unsubscribe(entry.wire.id)
+        }
+        entry.generation += 1
+        const wire = entry.generation === 1 ? id : `${id}.${entry.generation}`
+        entry.wire = { id: wire, stream: live }
+        wires.set(wire, id)
+        entry.fiber = yield* Effect.forkIn(entry.subscriber.subscribe({ stream: live, id: wire }), scope)
       })
 
     const dispatch = (frame: CollectionFrame) => {
@@ -174,7 +198,8 @@ export const makeChannel = ({
         if (frame.kind === 'error') console.warn(`st collections socket: ${frame.message}`)
         return
       }
-      subscribers.get(id)?.subscriber.onFrame(frame)
+      const owner = wires.get(id)
+      if (owner !== undefined) subscribers.get(owner)?.subscriber.onFrame(frame)
     }
 
     /** One socket's life: resolves with the reason it ended. */
@@ -187,7 +212,9 @@ export const makeChannel = ({
           onFrame: dispatch,
           onOpen: () => { Deferred.doneUnsafe(opened, Exit.succeed(true)) },
           onCommandSent: (command) => {
-            if (command.kind === 'subscribe') onSubscribeSent?.(command.id)
+            if (command.kind !== 'subscribe') return
+            const owner = wires.get(command.id)
+            if (owner !== undefined) onSubscribeSent?.({ id: owner, wire: command.id })
           },
           onEnd: (error) => {
             socketEnded = true
@@ -277,6 +304,7 @@ export const makeChannel = ({
         live = undefined
         for (const entry of subscribers.values()) entry.fiber?.interruptUnsafe()
         subscribers.clear()
+        wires.clear()
         yield* setConnection({ _tag: 'Closed' })
       }),
     )
@@ -296,7 +324,7 @@ export const makeChannel = ({
             subscriber.onRejected(state.message, state.code)
             return
           }
-          subscribers.set(id, { subscriber, fiber: undefined })
+          subscribers.set(id, { subscriber, fiber: undefined, generation: 0, wire: undefined })
           yield* subscribe(id)
         }),
       unregister: (id) => {
@@ -305,7 +333,9 @@ export const makeChannel = ({
         subscribers.delete(id)
         // This synchronous callback must cancel before an HTTP attach can send a subscribe.
         entry.fiber?.interruptUnsafe()
-        live?.unsubscribe(id)
+        if (entry.wire === undefined) return
+        wires.delete(entry.wire.id)
+        if (entry.wire.stream === live) live.unsubscribe(entry.wire.id)
       },
       resubscribe: (id) =>
         Effect.suspend(() => {
