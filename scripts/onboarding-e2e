@@ -473,7 +473,7 @@ class Run:
         if self.m.scenario=="small-machine-512m":
             self.check("small-machine-cache-reduced",self.cache_target<default,"512 MiB control selects a strictly smaller cache")
         original=self.cache_checks("Initial small-machine daemon","small-machine-cache-selected",self.cache_override,self.cache_target)
-        page=self.json_cli("Small-machine daemon serves machine API","machines","ls")
+        page=self.json_cli("Small-machine daemon serves machine API","machines")
         self.check("small-machine-daemon-serving",isinstance(page,dict) and isinstance(page.get("items"),list) and any(x.get("id")=="machine/studio" for x in page["items"]),"live daemon API serves the configured machine")
         r=self.cli("Restart small-machine daemon service","service","restart")
         current=self.cache_checks("Restarted small-machine daemon","small-machine-restart-cache",self.cache_override,self.cache_target)
