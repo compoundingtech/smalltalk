@@ -16,7 +16,7 @@ import { EmbraceToolCall, EmbraceToolRegistrations, EmbraceToolRun, EmbraceToolV
 import { EmbraceScrollViewport } from './EmbraceScrollViewport'
 import { Markdown } from './composition/Markdown'
 import { ThinkingEntry } from './composition/ThinkingEntry'
-import { SendFailure, TranscriptEmptyContent, type TranscriptEmptyState } from './composition/Transcript'
+import { SendFailure, TranscriptEmptyContent, type TranscriptEmptyState } from './composition/TranscriptFeedback'
 
 export type EmbraceLevel = 'E1' | 'E2' | 'E3' | 'E4'
 export type SenderVariant = 'S1' | 'S2' | 'S3'
@@ -69,8 +69,8 @@ export function EmbraceMessage() {
   const sender = custom.sender as { label?: string; kind?: string } | undefined
   const label = options.senders === 'S1' ? role : sender?.label ?? sender?.kind ?? role
   return <MessagePrimitive.Root data-testid="transcript-message" data-item-id={item?.id} data-send-state={item?._tag === 'Text' && item.role === 'user' ? (item.sendState?._tag ?? 'Sent').toLowerCase() : undefined} {...stylex.props(styles.message, role === 'user' && styles.userMessage, item?._tag === 'Text' && item.role === 'user' && item.sendState?._tag === 'Pending' && styles.userPending)}>
-    {options.showSender ? <header {...stylex.props(styles.sender)}>
-      {options.senders === 'S1' ? null : <span aria-hidden="true" {...stylex.props(styles.avatar)}>{label.slice(0, 2).toUpperCase()}</span>}
+    {options.showSender ? <header data-testid="sender-header" {...stylex.props(styles.sender)}>
+      {options.senders === 'S1' ? null : <span aria-hidden="true" data-testid="sender-avatar" {...stylex.props(styles.avatar)}>{label.slice(0, 2).toUpperCase()}</span>}
       <strong {...stylex.props(styles.senderName)}>{label}</strong>
     </header> : null}
     {editing ? <ComposerPrimitive.Root {...stylex.props(styles.edit)}><ComposerPrimitive.Input aria-label="Edit message" {...stylex.props(styles.input)} /><ComposerPrimitive.Send {...stylex.props(styles.button)}>Save edit</ComposerPrimitive.Send><ComposerPrimitive.Cancel {...stylex.props(styles.button)}>Cancel edit</ComposerPrimitive.Cancel></ComposerPrimitive.Root> : <><MessagePrimitive.Parts components={{ Text: TextPart, Reasoning: ReasoningPart, tools: { Fallback: EmbraceToolCall } }} />{item?._tag === 'Text' && item.role === 'user' && item.sendState?._tag === 'Failed' && <SendFailure state={item.sendState} />}</>}
