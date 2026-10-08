@@ -4224,7 +4224,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 ("severity".into(), Value::String("error".into())),
                                 ("status".into(), Value::String("failed".into())),
                                 ("code".into(), Value::String("work-wake-exhausted".into())),
-                                ("reason".into(), Value::String(reason)),
+                                ("reason".into(), Value::String(reason.clone())),
                                 ("incarnation_id".into(), Value::String(incarnation.into())),
                                 ("step_run".into(), Value::String(step.subject.clone())),
                                 ("wake_attempts".into(), Value::from(attempt_count)),
@@ -4233,8 +4233,37 @@ impl<R: RuntimeControl> Reconciler<R> {
                             ]),
                             evidence,
                             expected_subject: None,
-                            idempotency_key: Some(diagnostic_key),
+                            idempotency_key: Some(diagnostic_key.clone()),
                         })?;
+                        self.signal_changed();
+                    }
+                    // Exhaustion is a fault for an owner to inspect, not permission to resend
+                    // or bypass the queue head. One episode covers this ready epoch/incarnation,
+                    // even if the number of attempts changes. Existing diagnostics are eligible
+                    // too, so a restart between diagnostic and notice cannot lose the notice.
+                    let episode = format!("work-wake-notice:{agent}:{tag_value}");
+                    if self
+                        .store
+                        .operation_claim(&format!("{episode}:first"))?
+                        .is_none()
+                    {
+                        let diagnostic = self
+                            .store
+                            .operation_claim(&diagnostic_key)?
+                            .context("the exhausted wake diagnostic was not recorded")?;
+                        self.store.record_runtime_failure(
+                            &episode,
+                            &AttentionRequest {
+                                reviewer: agent.into(),
+                                title: "Ready work remains unclaimed after its wake".into(),
+                                reason: format!("{reason}. Inspect `{}` and [diagnostic `{}`](/v1/claims/by-id/{}); retry, revise or cancel the work.", step.subject, diagnostic.id, diagnostic.id),
+                                severity: "error".into(),
+                                targets: vec![agent.into(), step.subject.clone(), diagnostic.id],
+                                actor: "agent/st3/reconciler".into(),
+                                idempotency_key: episode.clone(),
+                            },
+                            "work-wake-exhausted",
+                        )?;
                         self.signal_changed();
                     }
                 }
@@ -36616,6 +36645,8 @@ mission "gated" state="ready" {
   }
 }
 "#;
+
+    mod ready_wake_fault_notice;
 
     struct SeatQueueFixture {
         store: Arc<Store>,
