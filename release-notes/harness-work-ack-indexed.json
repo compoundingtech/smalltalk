@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Bound work acknowledgement hierarchy reads and remove unused harness acknowledgement dispatch",
+  "replay": {
+    "status": "none",
+    "detail": "No source, projection, retention or replay changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Uses the existing desired primary key and named-subject lookup. No new tables or indexes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Lease, incarnation, ownership, admission and idempotency checks remain unchanged; acknowledgements follow durable commit."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Work and harness response shapes, core list/filter/get semantics and timeline usage rollup publication including retries remain unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal binary rollout; no migration or startup backfill."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No new persisted state; ordinary rollback to prior binary remains available."
+  }
+}
