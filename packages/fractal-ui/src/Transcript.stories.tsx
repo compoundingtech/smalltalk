@@ -1,7 +1,7 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import type { Meta, StoryObj } from '@storybook/react-vite'
-import { expect, fn, userEvent, waitFor, within } from 'storybook/test'
+import { expect, fn, spyOn, userEvent, waitFor, within } from 'storybook/test'
 import { Transcript, type TranscriptAvailability, type TranscriptHistory, type TranscriptTurn } from './assistant-ui/composition/Transcript'
 import type { TranscriptEmptyState } from './assistant-ui/composition/TranscriptFeedback'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
@@ -40,8 +40,9 @@ function fixture(state: State, prefix: string): TranscriptStoryData {
 const cases: Readonly<Record<State, TranscriptStoryData>> = {
   settled: fixture('settled', 'settled'), expanded: fixture('expanded', 'expanded'), streaming: fixture('streaming', 'streaming'), failed: fixture('failed', 'failed'), interrupted: fixture('interrupted', 'interrupted'), unknown: fixture('unknown', 'unknown'), loading: fixture('loading', 'loading'), 'catching-up': fixture('catching-up', 'catching-up'), reconnecting: fixture('reconnecting', 'reconnecting'), 'sync-failed': fixture('sync-failed', 'sync-failed'), 'pending-send': fixture('pending-send', 'pending-send'), 'failed-send': fixture('failed-send', 'failed-send'), empty: fixture('empty', 'empty'),
 }
-function RuntimeTranscript({ data, onOpenTool, onRetry, onRetrySend, availability, history, emptyState }: { data: TranscriptStoryData; onOpenTool?: (call: WorkLogCall) => void; onRetry: () => void; onRetrySend?: (itemId: string) => void; availability?: TranscriptAvailability; history?: TranscriptHistory; emptyState?: React.ReactNode | TranscriptEmptyState }) {
-  const messages = React.useMemo(() => data.turns.flatMap(turn => turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]), [data])
+/** `drop` withholds ids from the runtime adapter, standing in for an adapter that never adopts them. */
+function RuntimeTranscript({ data, drop, onOpenTool, onRetry, onRetrySend, availability, history, emptyState }: { data: TranscriptStoryData; drop?: readonly string[]; onOpenTool?: (call: WorkLogCall) => void; onRetry: () => void; onRetrySend?: (itemId: string) => void; availability?: TranscriptAvailability; history?: TranscriptHistory; emptyState?: React.ReactNode | TranscriptEmptyState }) {
+  const messages = React.useMemo(() => data.turns.flatMap(turn => turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]).filter(item => !drop?.includes(item.id)), [data, drop])
   const options = React.useMemo(() => ({ messages, isRunning: data.turns.some(turn => turn.work.running), onNew: async () => {} }), [messages, data])
   return <EmbraceRuntimeProvider options={options}><Transcript title="Row projection" turns={data.turns} sync={data.sync} now={now} observedAt={now - 8000} onOpenTool={onOpenTool} onRetryRun={onRetry} onRetrySync={onRetry} onRetrySend={onRetrySend} availability={availability} history={history} emptyState={emptyState} /></EmbraceRuntimeProvider>
 }
@@ -268,9 +269,12 @@ export const AppendedItems: Story = { render: args => <AppendedItemsStory scheme
   await expect(scrollTop).toBeGreaterThan(0)
   const retained = [turn, prompt, answerRow, work, tool, thinking]
   const removed: Node[] = []
+  // A transient append must stay pending; a fallback row appearing even briefly means it was treated as stranded.
+  const fallbacks: Node[] = []
   const recordRemovals = (records: MutationRecord[]) => {
-    for (const record of records) for (const node of record.removedNodes) {
-      if (retained.some(element => node === element || node.contains(element))) removed.push(node)
+    for (const record of records) {
+      for (const node of record.removedNodes) if (retained.some(element => node === element || node.contains(element))) removed.push(node)
+      for (const node of record.addedNodes) if (node instanceof Element && (node.matches('[data-testid="transcript-stranded"]') || node.querySelector('[data-testid="transcript-stranded"]') !== null)) fallbacks.push(node)
     }
   }
   const observer = new MutationObserver(recordRemovals)
@@ -281,6 +285,7 @@ export const AppendedItems: Story = { render: args => <AppendedItemsStory scheme
       await waitFor(() => expect(index === 0 ? work.querySelector('[data-tool-status="running"]') : index === 1 ? within(work).queryAllByTestId('thinking-entry').length === 2 : within(turn).queryByText('New answer content follows the retained rows.')).toBeTruthy())
       recordRemovals(observer.takeRecords())
       await expect(removed).toHaveLength(0)
+      await expect(fallbacks).toHaveLength(0)
       await expect(canvas.getByTestId('transcript-turn')).toBe(turn)
       await expect(canvas.getByTestId('user-message')).toBe(prompt)
       await expect(canvasElement.querySelector('[data-item-id="append/answer"]')).toBe(answerRow)
@@ -294,6 +299,63 @@ export const AppendedItems: Story = { render: args => <AppendedItemsStory scheme
   } finally { observer.disconnect() }
 } }
 export const AppendedItemsLight: Story = { ...AppendedItems, args: { scheme: 'light' } }
+
+const strandedPrompt: TextItem = { _tag: 'Text', id: 'stranded/prompt', role: 'user', text: 'Summarize the retained rows.', attachments: [], streaming: false, at }
+const strandedItems: readonly ConversationItem[] = [
+  { _tag: 'Text', id: 'stranded/lost-answer', role: 'assistant', text: 'This answer never reached the runtime.', attachments: [], streaming: false, at },
+  { _tag: 'UnknownEvent', id: 'stranded/lost-event', eventType: 'opaque', data: {}, at },
+  { _tag: 'Text', id: 'stranded/answer', role: 'assistant', text: 'A later answer stays in order.', attachments: [], streaming: false, at },
+]
+const strandedAppend: readonly ConversationItem[] = [
+  { _tag: 'Notice', id: 'stranded/lost-notice', kind: 'event', text: 'An appended entry the runtime drops.', at },
+  { _tag: 'Text', id: 'stranded/late-answer', role: 'assistant', text: 'The appended answer follows it.', attachments: [], streaming: false, at },
+]
+const strandedSecondPrompt: TextItem = { _tag: 'Text', id: 'stranded/lost-prompt', role: 'user', text: 'A prompt the runtime never adopted.', attachments: [], streaming: false, at }
+const strandedSecondItems: readonly ConversationItem[] = [{ _tag: 'Text', id: 'stranded/second-answer', role: 'assistant', text: 'Its answer still renders after it.', attachments: [], streaming: false, at }]
+const strandedDrop = ['stranded/lost-answer', 'stranded/lost-event', 'stranded/lost-notice', 'stranded/lost-prompt']
+const settledWork = (items: readonly ConversationItem[]) => workLogTurnFromItems(items, { kindFor: () => 'read', running: false, failed: false, interrupted: false, completeHistory: true })
+function StrandedItemStory({ scheme = 'dark' }: { scheme?: Scheme }) {
+  const [appended, setAppended] = React.useState(false)
+  const data = React.useMemo<TranscriptStoryData>(() => {
+    const items = appended ? [...strandedItems, ...strandedAppend] : strandedItems
+    return { sync: { _tag: 'Live', since: now }, turns: [
+      { id: 'stranded', prompt: { ...strandedPrompt, role: 'user' }, items, work: settledWork(items) },
+      { id: 'stranded-second', prompt: { ...strandedSecondPrompt, role: 'user' }, items: strandedSecondItems, work: settledWork(strandedSecondItems) },
+    ] }
+  }, [appended])
+  return <main data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><button type="button" disabled={appended} onClick={() => setAppended(true)}>Append dropped entry</button><div {...stylex.props(styles.frame)}><RuntimeTranscript data={data} drop={strandedDrop} onRetry={() => {}} /></div></main>
+}
+const itemOrder = (turn: Element) => Array.from(turn.querySelectorAll('[data-item-id]'), element => element.getAttribute('data-item-id'))
+export const StrandedItem: Story = { render: args => <StrandedItemStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const lost = await canvas.findByText('This answer never reached the runtime.')
+  const lostRow = lost.closest('[data-testid="transcript-stranded"]')
+  await expect(lostRow).toHaveAttribute('data-item-id', 'stranded/lost-answer')
+  const eventRow = canvasElement.querySelector('[data-testid="transcript-stranded"][data-item-id="stranded/lost-event"]')
+  await expect(eventRow).toHaveTextContent('Couldn\u2019t display this entry')
+  const [first, second] = canvas.getAllByTestId('transcript-turn')
+  await expect(itemOrder(first!)).toEqual(['stranded/prompt', 'stranded/lost-answer', 'stranded/lost-event', 'stranded/answer'])
+  await expect(itemOrder(second!)).toEqual(['stranded/lost-prompt', 'stranded/second-answer'])
+  await expect(within(second!).getByTestId('transcript-stranded')).toHaveTextContent('A prompt the runtime never adopted.')
+  const retained = [first!, lostRow!, eventRow!, second!]
+  const removed: Node[] = []
+  const observer = new MutationObserver(records => { for (const record of records) for (const node of record.removedNodes) if (retained.some(element => node === element || node.contains(element))) removed.push(node) })
+  observer.observe(canvasElement, { subtree: true, childList: true })
+  const warn = spyOn(console, 'warn').mockImplementation(() => {})
+  try {
+    await userEvent.click(canvas.getByRole('button', { name: 'Append dropped entry' }))
+    await waitFor(() => expect(canvasElement.querySelector('[data-testid="transcript-stranded"][data-item-id="stranded/lost-notice"]')).toHaveTextContent('An appended entry the runtime drops.'))
+    await expect(itemOrder(first!)).toEqual(['stranded/prompt', 'stranded/lost-answer', 'stranded/lost-event', 'stranded/answer', 'stranded/lost-notice', 'stranded/late-answer'])
+    await expect(warn).toHaveBeenCalledWith(expect.stringContaining('stranded/lost-notice'))
+    observer.takeRecords().forEach(record => record.removedNodes.forEach(node => { if (retained.some(element => node === element || node.contains(element))) removed.push(node) }))
+    await expect(removed).toHaveLength(0)
+    const turns = canvas.getAllByTestId('transcript-turn')
+    await expect(turns).toHaveLength(2)
+    await expect(turns[0]).toBe(first)
+    await expect(turns[1]).toBe(second)
+  } finally { observer.disconnect(); warn.mockRestore() }
+} }
+export const StrandedItemLight: Story = { ...StrandedItem, args: { scheme: 'light' } }
 
 const retrySend = fn<(itemId: string) => void>()
 function FailedRetryStory({ scheme = 'dark' }: { scheme?: Scheme }) {
