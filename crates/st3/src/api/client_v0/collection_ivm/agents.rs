@@ -8,7 +8,7 @@ use crate::store::{
     agent_card_ivm as cards, agent_card_source,
     collection_ivm::{agent_source, scope},
 };
-use anyhow::{Context as _, ensure};
+use anyhow::ensure;
 use rusqlite::{Connection, OptionalExtension as _};
 use smallclaims::ivm::{
     SourceCut, Views,
@@ -654,3 +654,7 @@ mod tests {
 #[cfg(test)]
 #[path = "agents/kernel_parity.rs"]
 mod kernel_parity;
+
+#[cfg(test)]
+#[path = "agents/provider_parity.rs"]
+mod provider_parity;
