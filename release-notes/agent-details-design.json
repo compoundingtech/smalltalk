@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Document a proposed selected-agent details collection for a web client",
+  "replay": {"status": "none", "detail": "Documentation only. No claim replay, source admission, or recovery behavior changes."},
+  "schema": {"status": "none", "detail": "The proposal describes possible future resource and observation fields but adds no stored schema, wire schema, endpoint, or generated client."},
+  "rules": {"status": "none", "detail": "No checkpoint rules, digests, retention policy, or coordinated upgrade requirements change."},
+  "compatibility": {"status": "none", "detail": "Existing client v0 reads and subscriptions are unchanged. The design proposes an opt-in exact-agent collection joining bounded sections under one snapshot fence, with explicit observation freshness, authorization, and continuation semantics. It is not an implemented contract."},
+  "downtime": {"status": "none", "detail": "No runtime change or deployment is required for this documentation proposal."},
+  "manual": {"status": "none", "detail": "No installation, configuration, state conversion, or client migration steps are required."},
+  "recovery": {"status": "none", "detail": "No stored state changes. Removing the documentation does not require rollback conversion."}
+}
