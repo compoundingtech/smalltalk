@@ -8,6 +8,7 @@ pub(super) mod resources;
 pub(super) mod search;
 pub(super) mod arrangements;
 pub(super) mod conversation_blocks;
+mod conversation_rows;
 mod collection_windows;
 mod collection_patches;
 mod collection_ivm;
@@ -786,9 +787,12 @@ async fn follow_conversation(
             items.drain(..drop);
             frame["has_more"] = Value::Bool(true);
         }
+        let mut delivered = conversation_rows::Delivered::new(CLIENT_MAX_RESPONSE_BYTES);
+        let initial = frame["items"].as_array().cloned().unwrap_or_default();
         if outbox.send((id.clone(), frame)).is_err() {
             return;
         }
+        delivered.remember(&initial);
         let mut after = start["next_cursor"].as_str().map(str::to_owned);
         loop {
             match conversation_changes_value(
@@ -802,11 +806,9 @@ async fn follow_conversation(
             .await
             {
                 Ok(changes) => {
-                    if changes["items"]
-                        .as_array()
-                        .is_some_and(|items| !items.is_empty())
-                    {
-                        let frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":false, "items":changes["items"]});
+                    let items = changes["items"].as_array().map(|items| delivered.changes(items)).unwrap_or_default();
+                    if !items.is_empty() {
+                        let frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":false, "items":items});
                         // Too much changed for one frame: send the newest page instead.
                         if frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
                             break;
@@ -814,6 +816,7 @@ async fn follow_conversation(
                         if outbox.send((id.clone(), frame)).is_err() {
                             return;
                         }
+                        delivered.remember(&items);
                     }
                     after = changes["next_cursor"].as_str().map(str::to_owned);
                 }
