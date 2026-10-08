@@ -2276,12 +2276,18 @@ fn client_agent_cards_for_page(
         .filter_map(|r| r["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
     let cards = store.cached_agent_resources_for(index, history, Some(&selected), |changed| {
-        let (subjects, _) = changed.expect("a selected page always names its missing cards");
-        // Pagination refs are frozen response metadata, never shared projection inputs.
-        // Reuse the independently time-fenced current refs to avoid a second fleet queue scan.
-        let metadata = client_agent_page_refs(store, history, index)?;
+        let (subjects, previous) = changed.expect("a selected page always names its missing cards");
+        // Delta metadata is current and already diffed; only cold pages need shallow refs.
+        // Frozen continuation refs remain response metadata, never shared cache inputs.
+        let metadata = if previous.is_empty() {
+            Some(if index < store.index()? {
+                agent_queue_metadata(store, subjects)?
+            } else {
+                client_agent_page_refs(store, history, index)?
+            })
+        } else { None };
         let mut cards = client_agent_resources_selected(
-            store, history, index, Some((subjects, &metadata)),
+            store, history, index, Some((subjects, metadata.as_deref().unwrap_or(previous))),
         )?;
         add_agent_todos(store, &mut cards, index)?;
         Ok(cards)
@@ -2457,6 +2463,52 @@ fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
     item["delivery"] = assessment.to_value();
 }
 
+pub(crate) const AGENT_QUEUE_FIELDS: [&str; 8] = [
+    "current_work_ids", "active_work_count", "next_work_id", "upcoming_work_ids",
+    "queued_work_count", "current_work", "next_work", "upcoming_work",
+];
+
+fn agent_queue_fields(
+    queue: &crate::store::AgentWorkQueue,
+    labels: &BTreeMap<String, crate::store::StepLabel>,
+) -> Value {
+    let label = |id: &String| labels.get(id).map(|step| json!({
+        "id": id, "mission_id": step.mission, "mission_run_id": step.run,
+        "path": step.path, "title": step.title, "goal": step.goal,
+        "state": client_work_state(&step.status),
+        "since": client_timestamp(step.updated_at_unix_ms),
+    }));
+    json!({
+        "current_work_ids": queue.current_work_ids,
+        "active_work_count": queue.active_work_count,
+        "next_work_id": queue.next_work_id,
+        "upcoming_work_ids": queue.upcoming_work_ids,
+        "queued_work_count": queue.queued_work_count,
+        "current_work": queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
+        "next_work": queue.next_work_id.as_ref().and_then(label),
+        "upcoming_work": queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
+    })
+}
+
+/// Refresh queue selection and presentation once, without folding any agent cards.
+pub(crate) fn agent_queue_metadata(
+    store: &Store,
+    subjects: &BTreeSet<String>,
+) -> anyhow::Result<Vec<Value>> {
+    let queues = store.agent_work_queues()?;
+    let steps = queues.values().flat_map(|queue| {
+        queue.current_work_ids.iter().chain(queue.next_work_id.iter())
+            .chain(queue.upcoming_work_ids.iter()).cloned()
+    }).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+    let labels = store.step_labels(&steps)?;
+    let empty = crate::store::AgentWorkQueue::default();
+    Ok(subjects.iter().map(|subject| {
+        let mut fields = agent_queue_fields(queues.get(subject).unwrap_or(&empty), &labels);
+        fields["id"] = json!(subject);
+        fields
+    }).collect())
+}
+
 #[cfg(test)]
 fn client_agent_resources_uncached(
     store: &Store,
@@ -2486,8 +2538,8 @@ fn client_agent_resources_from_status(
     changed: Option<(&BTreeSet<String>, &[Value])>,
     status: StatusResponse,
 ) -> anyhow::Result<Vec<Value>> {
-    // Local harness/runtime observations do not change queues or their labels. Retain those
-    // fields from the previous cards rather than scanning the fleet's work again.
+    // The delta builder supplies either unchanged cards or freshly diffed queue metadata.
+    // Both let the card fold reuse queues without a second fleet scan.
     let retain_queues = changed.is_some_and(|(subjects, previous)| {
         subjects.iter().all(|subject| {
             previous
@@ -2546,20 +2598,6 @@ fn client_agent_resources_from_status(
         .into_iter()
         .collect::<Vec<_>>();
     let step_labels = store.step_labels(&queued_steps)?;
-    let label = |id: &String| {
-        step_labels.get(id).map(|step| {
-            json!({
-                "id": id,
-                "mission_id": step.mission,
-                "mission_run_id": step.run,
-                "path": step.path,
-                "title": step.title,
-                "goal": step.goal,
-                "state": client_work_state(&step.status),
-                "since": client_timestamp(step.updated_at_unix_ms),
-            })
-        })
-    };
     let mut agents = status
         .subjects
         .into_iter()
@@ -2745,14 +2783,6 @@ fn client_agent_resources_from_status(
                 "fault": fault,
                 "incarnation_id": incarnation_id,
                 "current_session_id": current_session_id,
-                "current_work_ids": queue.current_work_ids,
-                "active_work_count": queue.active_work_count,
-                "next_work_id": queue.next_work_id,
-                "upcoming_work_ids": queue.upcoming_work_ids,
-                "queued_work_count": queue.queued_work_count,
-                "current_work": queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
-                "next_work": queue.next_work_id.as_ref().and_then(label),
-                "upcoming_work": queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
                 "usage": usage,
                 "under": subject.under.into_iter().map(|relationship| json!({
                     "agent_id": relationship.agent,
@@ -2765,10 +2795,11 @@ fn client_agent_resources_from_status(
             });
             if let Some((_, previous)) = changed.filter(|_| retain_queues)
                 && let Some(old) = previous.iter().find(|item| item["id"] == value["id"]) {
-                for field in ["current_work_ids", "active_work_count", "next_work_id",
-                    "upcoming_work_ids", "queued_work_count", "current_work", "next_work", "upcoming_work"] {
+                for field in AGENT_QUEUE_FIELDS {
                     value[field] = old[field].clone();
                 }
+            } else if let Value::Object(fields) = agent_queue_fields(&queue, &step_labels) {
+                value.as_object_mut().unwrap().extend(fields);
             }
             Ok((name, value))
         })
@@ -21826,6 +21857,500 @@ mission "wake" state="ready" {
         add_agent_todos(store, &mut direct, index).unwrap();
         assert_eq!(cached, direct);
         cached
+    }
+
+    struct RosterClaimsFixture {
+        store: Store,
+        intent: crate::model::NormalizedIntent,
+        subjects: Vec<String>,
+        runs: Vec<crate::model::MissionRunView>,
+    }
+
+    struct RosterFixtureClock;
+
+    impl RosterFixtureClock {
+        fn at(time: u128) -> Self {
+            smallclaims::store::set_thread_clock(Some(time));
+            Self
+        }
+    }
+
+    impl Drop for RosterFixtureClock {
+        fn drop(&mut self) {
+            smallclaims::store::set_thread_clock(None);
+        }
+    }
+
+    fn roster_fixture_expire_leases(fixture: &RosterClaimsFixture) {
+        let now = smallclaims::store::now_ms();
+        let expires = fixture.runs.iter().flat_map(|run| &run.steps)
+            .filter_map(|step| fixture.store.step_run(&step.subject).unwrap().unwrap()
+                .claim_expires_at_unix_ms)
+            .max().unwrap_or(now);
+        let after = expires.max(now) + 1;
+        smallclaims::store::set_thread_clock(Some(after));
+        fixture.store.set_write_clock_at(after).unwrap();
+    }
+
+    fn roster_fixture_has_live_claim(step: &crate::model::StepRunView) -> bool {
+        step.claimant.is_some() && step.claim_expires_at_unix_ms
+            .is_some_and(|expires| expires > smallclaims::store::now_ms())
+    }
+
+    fn roster_fixture_append(store: &Store, subject: &str, kind: &str, fields: Value) {
+        store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+            fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
+            expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    }
+
+    fn roster_fixture_apply(store: &Store, intent: &crate::model::NormalizedIntent, key: &str) {
+        let plan = store.mission(intent, IntentInput {
+            kdl: String::new(), source_name: Some("roster claims fixture".into()),
+        }).unwrap();
+        store.apply(intent, &plan.subject_tokens, key).unwrap();
+    }
+
+    fn roster_fixture_work(fixture: &RosterClaimsFixture, agent: usize, action: &str, key: &str) {
+        fixture.store.work_action(&fixture.runs[agent / 10].steps[agent % 10].subject,
+            action, &WorkRequest {
+                actor: Some(fixture.subjects[agent].clone()),
+                incarnation: Some(format!("roster-session-{agent}")),
+                summary: Some(format!("Fixture {action}.")), reason: None,
+                evidence: Vec::new(), idempotency_key: key.into(),
+            }).unwrap();
+    }
+
+    fn roster_fixture_todo(agent: usize, revision: usize) -> Value {
+        json!({
+            "harness":"omp", "session_id":format!("roster-native-{agent}"),
+            "incarnation_id":format!("roster-session-{agent}"),
+            "observed_at":"2026-10-03T09:00:00Z", "source_op":"update",
+            "phases":[{"name":"Work","tasks":[{"content":format!("Task {revision}"),
+                "status":"in_progress"}]}],
+            "totals":{"pending":0,"in_progress":1,"completed":0,"blocked":0,"abandoned":0},
+            "truncated":false,
+        })
+    }
+
+    fn roster_claims_fixture() -> RosterClaimsFixture {
+        let store = Store::open_memory("node").unwrap();
+        let subjects = (0..60).map(|n| format!("agent/node.roster-{n:02}")).collect::<Vec<_>>();
+        store.set_write_clock_at(smallclaims::store::now_ms()).unwrap();
+        let mut source = String::from("version 2\n");
+        for n in 0..60 {
+            source.push_str(&format!("agent \"roster-{n:02}\" {{ command \"true\" }}\n"));
+        }
+        for mission in 0..6 {
+            source.push_str(&format!("mission \"roster-mission-{mission}\" state=\"ready\" {{\n\
+                goal \"Exercise roster claim dependencies.\"\n"));
+            for step in 0..10 {
+                source.push_str(&format!("step \"work-{step:02}\" {{ assigned-to \"{}\" }}\n",
+                    subjects[mission * 10 + step]));
+            }
+            source.push_str("}\n");
+        }
+        let mut intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        roster_fixture_apply(&store, &intent, "roster-claims-initial");
+        let runs = (0..6).map(|mission| {
+            store.create_mission_run(&MissionRunRequest {
+                mission: format!("roster-mission-{mission}"), revision: None, workspace: "/tmp".into(),
+                requester: Some("person/test".into()), mode: Some("run".into()),
+                inputs: BTreeMap::new(), idempotency_key: format!("roster-claims-run-{mission}"),
+            }).unwrap()
+        }).collect::<Vec<_>>();
+        for (agent, subject) in subjects.iter().enumerate() {
+            let run = &runs[agent / 10];
+            let step = &run.steps[agent % 10];
+            let desired = intent.subjects.get_mut(subject).unwrap();
+            desired.owner_run = Some(run.subject.clone());
+            desired.owner_generation = Some(run.generation.clone());
+            desired.owner_step = Some(step.subject.clone());
+            store.set_step_state(&step.subject, "ready", None).unwrap();
+            for (kind, fields) in [
+                ("runtime.observed", json!({"status":"running","runtime_id":subject,
+                    "incarnation_id":format!("roster-session-{agent}")})),
+                ("harness.observed", json!({"state":"idle","driver":"omp",
+                    "incarnation_id":format!("roster-session-{agent}")})),
+                ("harness.session-file", json!({"harness":"omp","agent":subject,
+                    "session_id":format!("roster-native-{agent}"),"path":"/tmp/roster-session"})),
+                ("harness.todo.observed", roster_fixture_todo(agent, 0)),
+                ("harness.usage", json!({"semantics":"response","driver":"omp",
+                    "incarnation_id":format!("roster-session-{agent}"),"model":"fixture",
+                    "input_tokens":10,"output_tokens":5,"total_tokens":15})),
+            ] {
+                roster_fixture_append(&store, subject, kind, fields);
+            }
+        }
+        roster_fixture_apply(&store, &intent, "roster-claims-owners");
+        let fixture = RosterClaimsFixture { store, intent, subjects, runs };
+        for agent in (0..60).step_by(2) {
+            roster_fixture_work(&fixture, agent, "claim", &format!("roster-initial-claim-{agent}"));
+        }
+        fixture
+    }
+
+    // Freeze the old policy here so the same measurement remains meaningful after cutover.
+    fn roster_old_cold_fallback(subject: &str, kind: &str) -> bool {
+        kind != "daemon.diagnostic" && !(subject.starts_with("agent/") && matches!(kind,
+            "runtime.observed" | "harness.observed" | "harness.diagnostic" |
+            "harness.timeline" | "harness.todo.observed" | "harness.session-file" | "harness.usage"))
+    }
+
+    #[test]
+    fn agent_roster_typical_claim_kind_baseline() {
+        let fixture = roster_claims_fixture();
+        let store = &fixture.store;
+        let before = store.index().unwrap();
+        let local_before = store.connection.lock().expect("fixture writer").query_row(
+            "SELECT COALESCE(MAX(id),0) FROM local_observations", [],
+            |row| row.get::<_, u64>(0),
+        ).unwrap();
+        checked_agent_cache(store, false, before);
+        let mut actual_cold_builds = 0_usize;
+        let mut actual_selected_builds = 0_usize;
+        for agent in 0..12 {
+            roster_fixture_append(store, &fixture.subjects[agent], "harness.todo.observed",
+                roster_fixture_todo(agent, 1));
+            roster_fixture_append(store, &fixture.subjects[agent], "harness.usage",
+                json!({"semantics":"response","driver":"omp",
+                    "incarnation_id":format!("roster-session-{agent}"),"model":"fixture",
+                    "input_tokens":20,"output_tokens":10,"total_tokens":30}));
+            roster_fixture_work(&fixture, agent, if agent % 2 == 0 { "progress" } else { "claim" },
+                &format!("roster-baseline-work-{agent}"));
+            roster_fixture_append(store, "daemon/fixture", "daemon.diagnostic",
+                json!({"code":"fixture","severity":"warning","reason":"Roster measurement."}));
+            store.read_snapshot(|index| {
+                let cached = store.cached_agent_resources(index, false, |changed| {
+                    if changed.is_some() { actual_selected_builds += 1; }
+                    else { actual_cold_builds += 1; }
+                    let mut rows = client_agent_resources_selected(store, false, index, changed)?;
+                    add_agent_todos(store, &mut rows, index)?;
+                    Ok(rows)
+                })?;
+                let mut cold = client_agent_resources_uncached(store, false, index)?;
+                add_agent_todos(store, &mut cold, index)?;
+                assert_eq!(cached, cold);
+                Ok(())
+            }).unwrap();
+        }
+        let connection = store.connection.lock().expect("fixture writer");
+        let mut statement = connection.prepare(
+            "SELECT subject,kind,COUNT(*) FROM claims WHERE store_index>?1 GROUP BY subject,kind",
+        ).unwrap();
+        let mut breakdown = BTreeMap::<String, (usize, usize)>::new();
+        for row in statement.query_map([before], |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, usize>(2)?,
+        ))).unwrap() {
+            let (subject, kind, count) = row.unwrap();
+            let old_cold = roster_old_cold_fallback(&subject, &kind);
+            let entry = breakdown.entry(kind).or_default();
+            entry.0 += count;
+            entry.1 += if old_cold { count } else { 0 };
+        }
+        // Latest-retention samples are real local observations even when the publisher
+        // coalesces them instead of emitting another durable claim inside its interval.
+        let mut local_statement = connection.prepare(
+            "SELECT kind,COUNT(*) FROM local_observations WHERE id>?1 GROUP BY kind",
+        ).unwrap();
+        let local_breakdown = local_statement.query_map([local_before], |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, usize>(1)?,
+        ))).unwrap().collect::<rusqlite::Result<BTreeMap<_, _>>>().unwrap();
+        let claims = breakdown.values().map(|(count, _)| count).sum::<usize>();
+        let old_cold = breakdown.values().map(|(_, count)| count).sum::<usize>();
+        println!("roster claim baseline: agents=60 missions=6 steps=60 initial_leases=30 \
+            claims={claims} old_cold_fallback_claims={old_cold} \
+            actual_cold_builds={actual_cold_builds} actual_selected_builds={actual_selected_builds}");
+        for (kind, (count, cold)) in &breakdown {
+            println!("roster claim kind: kind={kind} claims={count} old_cold_fallback={cold}");
+        }
+        for (kind, count) in &local_breakdown {
+            println!("roster local observation kind: kind={kind} samples={count} old_cold_fallback=0");
+        }
+        assert_eq!(breakdown["work.claimed"], (6, 6));
+        assert_eq!(breakdown["work.progress"], (6, 6));
+        assert_eq!(breakdown["harness.todo.observed"], (12, 0));
+        assert_eq!(local_breakdown["harness.usage"], 12);
+        assert_eq!(old_cold, 12);
+    }
+
+    fn roster_fixture_person_claim(store: &Store, subject: &str, kind: &str, fields: Value) {
+        store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: kind.into(), actor: Some("person/test".into()),
+            fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
+            expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    }
+
+    fn roster_fixture_checked_cut(fixture: &RosterClaimsFixture, index: u64, seed: u64, turn: usize) {
+        let store = &fixture.store;
+        store.read_snapshot(|_| {
+            for history in [false, true] {
+                let mut cold = client_agent_resources_uncached(store, history, index)?;
+                add_agent_todos(store, &mut cold, index)?;
+                // Probe two disjoint pages before the complete roster: selected cache coverage
+                // must grow without leaking other rows or seeding frozen pagination metadata.
+                for remainder in [turn % 3, (turn + 1) % 3] {
+                    let selected = fixture.subjects.iter().enumerate()
+                        .filter(|(agent, _)| agent % 3 == remainder)
+                        .map(|(_, subject)| subject.clone()).collect::<BTreeSet<_>>();
+                    let cached = store.cached_agent_resources_for(index, history, Some(&selected), |changed| {
+                        let mut rows = client_agent_resources_selected(store, history, index, changed)?;
+                        add_agent_todos(store, &mut rows, index)?;
+                        Ok(rows)
+                    })?;
+                    let expected = cold.iter().filter(|row|
+                        selected.contains(row["id"].as_str().unwrap())).cloned().collect::<Vec<_>>();
+                    assert_eq!(cached, expected, "selected seed={seed:#x} turn={turn} history={history}");
+                }
+                let cached = client_agent_resources_cached(store, history, index)?;
+                assert_eq!(cached, cold, "full seed={seed:#x} turn={turn} history={history}");
+            }
+            Ok(())
+        }).unwrap();
+    }
+
+    fn roster_fixture_random(state: &mut u64) -> u64 {
+        // A fixed PRNG makes every failing interleaving reproducible without a new dependency.
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 4,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x51a7_2026),
+            ..proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn agent_roster_seeded_claim_sequences_match_cold_json(seed in 1u64..u64::MAX) {
+            let _clock = RosterFixtureClock::at(1_900_000_000_000);
+            let mut fixture = roster_claims_fixture();
+            let initial = fixture.store.index().unwrap();
+            roster_fixture_checked_cut(&fixture, initial, seed, 0);
+            let mut random = seed;
+            let mut turn = 0;
+            let mut exercised = BTreeSet::new();
+            for round in 0..2 {
+                // Shuffle a complete operation deck, rather than relying on chance to cover
+                // a dependency. The seed chooses order, subjects and selected-page coverage.
+                let mut operations = (0..23).collect::<Vec<_>>();
+                for position in (1..operations.len()).rev() {
+                    let swap = (roster_fixture_random(&mut random) % (position + 1) as u64) as usize;
+                    operations.swap(position, swap);
+                }
+                for operation in operations {
+                    let agent = (roster_fixture_random(&mut random) % 60) as usize;
+                    let subject = fixture.subjects[agent].clone();
+                    let store = &fixture.store;
+                    let key = format!("roster-seed-{seed}-{turn}");
+                    let step = fixture.runs[agent / 10].steps[agent % 10].subject.clone();
+                    let incarnation = format!("roster-session-{agent}");
+                    exercised.insert(operation);
+                    match operation {
+                        0 => roster_fixture_append(store, &subject, "harness.todo.observed",
+                            roster_fixture_todo(agent, turn + 1)),
+                        1 => roster_fixture_append(store, &subject, "harness.usage", json!({
+                            "semantics":"response","driver":"omp","incarnation_id":incarnation,
+                            "model":"fixture","input_tokens":turn + 1,"output_tokens":2,
+                            "total_tokens":turn + 3})),
+                        2 => roster_fixture_append(store, &subject, "harness.observed", json!({
+                            "state":if round == 0 { "working" } else { "idle" },
+                            "driver":"omp","incarnation_id":incarnation,"observed_at_ms":turn + 1})),
+                        3 => roster_fixture_append(store, &subject, "runtime.observed", json!({
+                            "status":"running","runtime_id":subject,"incarnation_id":incarnation})),
+                        4 => {
+                            let current = store.step_run(&step).unwrap().unwrap();
+                            roster_fixture_work(&fixture, agent,
+                                if roster_fixture_has_live_claim(&current) { "progress" } else { "claim" }, &key);
+                        }
+                        5 => {
+                            let current = store.step_run(&step).unwrap().unwrap();
+                            roster_fixture_work(&fixture, agent,
+                                if roster_fixture_has_live_claim(&current) { "release" } else { "claim" }, &key);
+                        }
+                        6 => {
+                            let desired = fixture.intent.subjects.get_mut(&subject).unwrap();
+                            desired.set_display_name(Some(&format!("Declared {turn:03}"))).unwrap();
+                            roster_fixture_apply(store, &fixture.intent, &key);
+                        }
+                        7 => {
+                            store.rename_agent(&subject, Some(&format!("Seat {turn:03}")), &key).unwrap();
+                        }
+                        8 => {
+                            // An undeclared agent crosses current/history membership boundaries.
+                            roster_fixture_append(store, "agent/roster-extra", "runtime.observed",
+                                json!({"status":if round == 0 { "running" } else { "stopped" },
+                                    "runtime_id":"roster-extra","incarnation_id":"extra-session"}));
+                        }
+                        9 => {
+                            let run = &fixture.runs[agent / 10];
+                            store.set_mission_run_state(&run.id, "running",
+                                if round == 0 { "active" } else { "running" },
+                                Some("Fixture owner state transition.")).unwrap();
+                        }
+                        10 => {
+                            let run = &fixture.runs[agent / 10];
+                            let generation = if run.generation.starts_with("run-generation/") {
+                                run.generation.clone()
+                            } else { format!("run-generation/{}", run.generation) };
+                            roster_fixture_append(store, &generation, "run-generation.state",
+                                json!({"status":"active","reason":format!("Fixture generation {turn}")}));
+                        }
+                        11 => {
+                            let current = store.step_run(&step).unwrap().unwrap();
+                            if roster_fixture_has_live_claim(&current) {
+                                roster_fixture_work(&fixture, agent, "release", &format!("{key}-release"));
+                            }
+                            store.set_step_state(&step, "blocked", Some("Fixture readiness change.")).unwrap();
+                            store.set_step_state(&step, "ready", None).unwrap();
+                        }
+                        12 => roster_fixture_append(store, "daemon/fixture", "daemon.diagnostic",
+                            json!({"code":"fixture","severity":"warning","reason":format!("Diagnostic {turn}")})),
+                        13 => roster_fixture_person_claim(store, &format!("message/roster-{seed}-{turn}"),
+                            "message.sent", json!({"from":"person/test","to":subject,"status":"sent",
+                                "content":format!("Fixture message {turn}")})),
+                        14 => roster_fixture_person_claim(store,
+                            &format!("glass/person/test/019a0000-0000-7000-8000-{turn:012x}"),
+                            "glass.upserted", json!({"body":{"name":format!("Glass {turn}"),
+                                "layout":{"tabs":[{"pane":"opaque:fixture"}]}},"base_revision":null})),
+                        15 => roster_fixture_person_claim(store,
+                            &format!("arrangement/person/test/019a0000-0000-7000-8000-{turn:012x}"),
+                            "arrangement.edited", json!({"owner":"person/test",
+                                "operations":[{"op":"create","name":format!("Arrangement {turn}")}]})),
+                        16 => roster_fixture_append(store, "host/roster-peer", "fleet.member-endpoints",
+                            json!({"member_key":"fixture-member","mode":"dial-out","endpoints":[]})),
+                        17 => roster_fixture_append(store, &format!("custom/roster/{turn}"),
+                            "custom.roster.note", json!({"value":turn})),
+                        18 => {
+                            let mut timeline = roster_local_timeline();
+                            timeline.subject = subject.clone();
+                            timeline.actor = Some(subject);
+                            timeline.fields.insert("entry_id".into(), json!(key));
+                            timeline.fields.insert("sequence".into(), json!(turn + 1));
+                            timeline.fields.insert("observed_at_unix_ms".into(),
+                                json!(1_900_000_000_000_u64 + turn as u64));
+                            timeline.fields.insert("incarnation_id".into(), json!(incarnation));
+                            let before = store.index().unwrap();
+                            store.append_local_observations_for_test(&[timeline]);
+                            assert_eq!(store.index().unwrap(), before);
+                        }
+                        19 => roster_fixture_append(store, &subject, "harness.diagnostic",
+                            json!({"code":"fixture","severity":"warning","reason":format!("Harness diagnostic {turn}"),
+                                "driver":"omp","incarnation_id":incarnation})),
+                        20 => {
+                            store.move_seat_queue_run(&crate::model::SeatQueueMoveRequest {
+                                agent: subject, run: fixture.runs[agent / 10].id.clone(),
+                                placement: if round == 0 { "top" } else { "bottom" }.into(),
+                                anchor: None, reason: Some("Fixture queue move.".into()),
+                                actor: "person/test".into(), idempotency_key: key,
+                            }).unwrap();
+                        }
+                        21 => roster_fixture_expire_leases(&fixture),
+                        22 => {
+                            let mut timeline = roster_local_timeline();
+                            timeline.subject = subject.clone();
+                            timeline.actor = Some(subject);
+                            timeline.fields.insert("entry_id".into(), json!(key));
+                            timeline.fields.insert("incarnation_id".into(), json!(incarnation));
+                            timeline.fields.insert("sequence".into(), json!(turn + 1));
+                            timeline.fields.insert("observed_at_unix_ms".into(),
+                                json!(smallclaims::store::now_ms() as u64));
+                            store.append_claim(&timeline).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    turn += 1;
+                    roster_fixture_checked_cut(&fixture, fixture.store.index().unwrap(), seed, turn);
+                    if turn % 10 == 0 {
+                        // The oracle and cache read the identical historical graph cut and
+                        // eligible local frontier, not an oracle silently advanced to "now".
+                        roster_fixture_checked_cut(&fixture, initial, seed, turn);
+                    }
+                }
+            }
+            assert_eq!(exercised.len(), 23);
+            let cards = checked_agent_cache(&fixture.store, true, fixture.store.index().unwrap());
+            assert!(cards.iter().any(|card| !card["todo"].is_null()),
+                "fixture must compare actual todo snapshots, not absent fields");
+            assert!(cards.iter().any(|card| !card["usage"].is_null()),
+                "fixture must compare actual usage summaries, not absent fields");
+            // End owners only after the shuffled work operations. The two history modes
+            // must agree with their own oracle when declared seats leave the current layer.
+            fixture.store.set_mission_run_state(&fixture.runs[0].id, "cancelled", "terminal",
+                Some("Fixture run retirement.")).unwrap();
+            roster_fixture_checked_cut(&fixture, fixture.store.index().unwrap(), seed, turn + 1);
+            let generation = &fixture.runs[1].generation;
+            let generation = if generation.starts_with("run-generation/") {
+                generation.clone()
+            } else { format!("run-generation/{generation}") };
+            roster_fixture_append(&fixture.store, &generation, "run-generation.state",
+                json!({"status":"superseded","reason":"Fixture generation retirement."}));
+            roster_fixture_checked_cut(&fixture, fixture.store.index().unwrap(), seed, turn + 2);
+            roster_fixture_checked_cut(&fixture, initial, seed, turn + 3);
+        }
+    }
+
+    #[test]
+    #[ignore = "focused step-claim roster timing; run explicitly with --ignored --nocapture"]
+    fn agent_roster_one_step_claim_fixture_timing() {
+        for history in [false, true] {
+            let fixture = roster_claims_fixture();
+            let store = &fixture.store;
+            let before = store.index().unwrap();
+            checked_agent_cache(store, history, before);
+            roster_fixture_work(&fixture, 1, "claim", "roster-timing-one-step");
+            store.read_snapshot(|index| {
+                let before_refolds = store.agent_resources_refolded_cards_for_test();
+                let start = Instant::now();
+                let incremental = client_agent_resources_cached(store, history, index)?;
+                let incremental_time = start.elapsed();
+                let refolded_cards = store.agent_resources_refolded_cards_for_test() - before_refolds;
+                let start = Instant::now();
+                let mut cold = client_agent_resources_uncached(store, history, index)?;
+                add_agent_todos(store, &mut cold, index)?;
+                let cold_time = start.elapsed();
+                assert_eq!(incremental, cold);
+                println!("roster step-claim timing: agents=60 missions=6 steps=60 history={history} \
+                    cold_ms={:.3} incremental_ms={:.3} refolded_cards={refolded_cards}",
+                    cold_time.as_secs_f64() * 1000.0, incremental_time.as_secs_f64() * 1000.0);
+                assert_eq!(refolded_cards, 1, "one step claim must refold only its assigned agent");
+                Ok(())
+            }).unwrap();
+        }
+    }
+
+    #[test]
+    fn agent_roster_claim_fixture_refreshes_at_lease_expiry_without_new_claims() {
+        let _clock = RosterFixtureClock::at(1_900_000_000_000);
+        let fixture = roster_claims_fixture();
+        let store = &fixture.store;
+        let step = &fixture.runs[0].steps[0].subject;
+        let expires = store.step_run(step).unwrap().unwrap().claim_expires_at_unix_ms.unwrap();
+        let index = store.index().unwrap();
+        for history in [false, true] {
+            let cards = checked_agent_cache(store, history, index);
+            let card = cards.iter().find(|card| card["id"] == fixture.subjects[0]).unwrap();
+            assert_eq!(card["current_work_ids"], json!([step]));
+        }
+        assert_eq!(store.agent_roster_valid_until(index), Some(expires));
+        roster_fixture_expire_leases(&fixture);
+        assert_eq!(store.index().unwrap(), index);
+        for history in [false, true] {
+            assert!(store.agent_resources_cached_at(index, history, None).unwrap().is_none(),
+                "the expired queue deadline must invalidate a warm roster at the same cut");
+            let refolds = store.agent_resources_refolded_cards_for_test();
+            let cards = checked_agent_cache(store, history, index);
+            assert_eq!(store.agent_resources_refolded_cards_for_test() - refolds, 30,
+                "expiry must refold the 30 leased cards, not all 60 agents");
+            let card = cards.iter().find(|card| card["id"] == fixture.subjects[0]).unwrap();
+            assert_eq!(card["current_work_ids"], json!([]));
+            assert_eq!(card["next_work_id"], step.as_str());
+        }
     }
 
     fn roster_followup_store() -> Store {
