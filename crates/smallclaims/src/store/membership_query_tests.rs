@@ -187,3 +187,54 @@ fn membership_signer_lookup_uses_two_statements_independent_of_claim_count() {
         });
     }
 }
+
+#[test]
+fn membership_signers_do_not_multiply_claim_rows_or_scan_unrelated_signatures() {
+    use rusqlite::StatementStatus;
+    let connection = fixture();
+    let anchor = admitted("anchor", "birch", "anchor-key", "anchor", "birch", 3);
+    insert_claim(&connection, &anchor);
+    envelope(&connection, &anchor, "anchor", &["anchor-key"]);
+    for index in 0..128 {
+        connection
+            .execute(
+                "INSERT INTO replica_envelope_signatures VALUES('birch',3,'anchor',?1)",
+                [format!("other-key-{index}")],
+            )
+            .unwrap();
+    }
+    let measure = || {
+        let mut statement = connection
+            .prepare(&fleet_claims_with_signers_query())
+            .unwrap();
+        let mut rows = statement.query([]).unwrap();
+        let mut count = 0;
+        while let Some(row) = rows.next().unwrap() {
+            count += 1;
+            let signers: BTreeSet<String> =
+                serde_json::from_str(&row.get::<_, String>(7).unwrap()).unwrap();
+            assert_eq!(signers.len(), 129);
+        }
+        drop(rows);
+        assert_eq!(count, 1, "signature count must not multiply claim bodies");
+        statement.get_status(StatementStatus::VmStep)
+    };
+    let before = measure();
+    for index in 0..4096 {
+        connection
+            .execute(
+                "INSERT INTO replica_envelope_signatures VALUES('elm',?1,'unrelated','other-key')",
+                [index],
+            )
+            .unwrap();
+    }
+    let after = measure();
+    assert!(
+        before < 2_000,
+        "signer aggregation exceeded its bounded fixture VM budget: {before}"
+    );
+    assert!(
+        after <= before + 32,
+        "unrelated signatures increased fold VM work: {before} -> {after}"
+    );
+}

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "Read fleet membership envelope signers in one joined query instead of one query per claim",
+  "summary": "Read fleet membership envelope signers in one indexed query instead of one query per claim",
   "replay": {
     "status": "none",
     "detail": "No startup or heal replay is added."
