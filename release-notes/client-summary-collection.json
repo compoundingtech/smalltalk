@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "Serve tiny current-client summary counts on the existing collection protocol",
+  "replay": {
+    "status": "none",
+    "detail": "Existing graph admission, projection and recovery behavior is unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or projection version changes. Native summary reads existing projections and caches."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Existing graph admission, projection and recovery behavior is unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Add optional summary capability version 1 and one summary/current resource on the existing WebSocket collection protocol. Generated Rust, TypeScript and Swift models accept the new kind. Core lists, filters and get routes retain their behavior; older clients preserve unknown kinds."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal daemon binary replacement is needed to advertise summary; no source backfill or IVM activation is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Clients use the summary capability and retain compatibility behavior on older daemons."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Existing graph admission, projection and recovery behavior is unchanged."
+  },
+  "commits": [
+    "5f2bd144bf34e683b9e5229cb20d2ad68e288fca"
+  ]
+}
