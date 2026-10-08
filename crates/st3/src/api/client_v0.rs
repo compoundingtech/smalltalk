@@ -9,6 +9,7 @@ pub(super) mod search;
 pub(super) mod arrangements;
 pub(super) mod conversation_blocks;
 mod collection_windows;
+mod collection_patches;
 mod collection_ivm;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
@@ -34,6 +35,9 @@ struct CollectionSubscribe {
     #[serde(default)]
     collection: String,
     limit: Option<usize>,
+    /// Replacements of changed fields after the complete first snapshot.
+    #[serde(default)]
+    field_deltas: bool,
     person: Option<String>,
     /// Follow one arrangement instead of the owner's bounded prefix window.
     subject: Option<String>,
@@ -451,11 +455,9 @@ async fn deliver_collection(
     let sent = if !subscription.delivered {
         send_collection(socket, json!({"kind":"snapshot", "id":request.id, "collection":request.collection, "snapshot":snapshot, "items":items, "order":order, "has_more":has_more})).await
     } else {
-        let upserts = current
-            .iter()
-            .filter(|(id, value)| subscription.previous.get(*id) != Some(*value))
-            .map(|(_, value)| value.clone())
-            .collect::<Vec<_>>();
+        let (upserts, patches) = collection_patches::changed_rows(
+            &subscription.previous, &current, request.field_deltas,
+        );
         let removes = subscription
             .previous
             .keys()
@@ -463,13 +465,16 @@ async fn deliver_collection(
             .cloned()
             .collect::<Vec<_>>();
         if upserts.is_empty()
+            && patches.is_empty()
             && removes.is_empty()
             && order == subscription.order
             && has_more == subscription.has_more
         {
             true
         } else {
-            send_collection(socket, json!({"kind":"changes", "id":request.id, "collection":request.collection, "snapshot":snapshot, "upserts":upserts, "removes":removes, "order":order, "has_more":has_more})).await
+            let mut frame = json!({"kind":"changes", "id":request.id, "collection":request.collection, "snapshot":snapshot, "upserts":upserts, "removes":removes, "order":order, "has_more":has_more});
+            if !patches.is_empty() { frame["patches"] = json!(patches); }
+            send_collection(socket, frame).await
         }
     };
     if !sent {

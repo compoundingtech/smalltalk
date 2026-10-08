@@ -35,6 +35,7 @@ const KEYWORDS: &[&str] = &[
     "contains",
     "propertyNames",
     "maxItems",
+    "maxProperties",
     "uniqueItems",
     "x-st-ref",
     "x-st-brand",
@@ -775,6 +776,12 @@ fn emit_object(object: &Map<String, Value>, cx: &mut Cx, indent: &str) -> Result
         Some(schema) => Some(emit(schema, cx)?),
     };
     let mut checks = vec![];
+    if let Some(max) = object.get("maxProperties") {
+        let max = max
+            .as_u64()
+            .context("maxProperties must be a nonnegative integer")?;
+        checks.push(format!("Schema.makeFilter((o: object) => Object.keys(o).length <= {max}, {{ expected: \"at most {max} properties\" }})"));
+    }
     if let Some(names) = object.get("propertyNames") {
         let mut key = names.as_object().context("propertyNames")?.clone();
         // Property names are always strings; references already name a string schema.

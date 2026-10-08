@@ -1175,7 +1175,8 @@ export type ClientConnections = typeof ClientConnections.Type
 export type ClientConnectionsEncoded = typeof ClientConnections.Encoded
 
 export const CollectionCommand = /*#__PURE__*/ (() => Schema.Union([
-  Schema.Struct({ "actor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "collection": Schema.Literals(["missions","attention","agents","work","glasses","summary"]), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "status": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }),
+  Schema.Struct({ "actor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "collection": Schema.Literals(["missions","attention","agents","work","glasses","summary"]), /** Opt in to field patches after the full snapshot; omitted defaults to full row upserts. */
+"field_deltas": optionalKey(Schema.Boolean).annotate({ description: "Opt in to field patches after the full snapshot; omitted defaults to full row upserts." }), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "status": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }),
   Schema.Struct({ "collection": Schema.Literal("arrangements"), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": ArrangementPerson, /** Follow only this arrangement; its owner must equal person. */
 "subject": optionalKey(ArrangementId) }),
   Schema.Struct({ "capability": Schema.String, "collection": Schema.Literal("terminal"), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "incarnation": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "kind": Schema.Literal("subscribe"), "terminal": Id }),
@@ -1188,6 +1189,14 @@ export type CollectionCommandEncoded = typeof CollectionCommand.Encoded
 export const CollectionName = /*#__PURE__*/ (() => Schema.Literals(["missions","attention","agents","work","glasses","arrangements","summary"]).annotate({ identifier: "CollectionName" }))()
 export type CollectionName = typeof CollectionName.Type
 export type CollectionNameEncoded = typeof CollectionName.Encoded
+
+export const CollectionPatch = /*#__PURE__*/ (() => Schema.Struct({
+  "fields": Schema.Record(Schema.String, Schema.Unknown).check(Schema.makeFilter((o: object) => Object.keys(o).length <= 128, { expected: "at most 128 properties" })),
+  "id": Id,
+  "removed_fields": Schema.Array(Schema.String).check(Schema.isMaxLength(128)).check(Schema.isUnique())
+}).annotate({ identifier: "CollectionPatch" }))()
+export type CollectionPatch = typeof CollectionPatch.Type
+export type CollectionPatchEncoded = typeof CollectionPatch.Encoded
 
 export const Device = /*#__PURE__*/ (() => Schema.Struct({
   "expires_at": Timestamp,
@@ -2177,7 +2186,7 @@ export type TimelineEntryEncoded = typeof TimelineEntry.Encoded
 
 export const CollectionFrame = /*#__PURE__*/ (() => Schema.Union([
   Schema.Struct({ "collection": CollectionName, "has_more": Schema.Boolean, "id": Schema.String, "items": Schema.Array(Resource), "kind": Schema.Literal("snapshot"), "order": Schema.Array(Id), "snapshot": Snapshot }),
-  Schema.Struct({ "collection": CollectionName, "has_more": Schema.Boolean, "id": Schema.String, "kind": Schema.Literal("changes"), "order": Schema.Array(Id), "removes": Schema.Array(Id), "snapshot": Snapshot, "upserts": Schema.Array(Resource) }),
+  Schema.Struct({ "collection": CollectionName, "has_more": Schema.Boolean, "id": Schema.String, "kind": Schema.Literal("changes"), "order": Schema.Array(Id), "patches": optionalKey(Schema.Array(CollectionPatch).check(Schema.isMaxLength(200))), "removes": Schema.Array(Id), "snapshot": Snapshot, "upserts": Schema.Array(Resource) }),
   Schema.Struct({ "collection": Schema.Literal("terminal"), "id": Schema.String, "kind": Schema.Literal("screen"), "snapshot": Snapshot, "value": TerminalScreen }),
   Schema.Struct({ "collection": Schema.Literal("conversation"), "has_more": optionalKey(Schema.Boolean), "id": Schema.String, "items": Schema.Array(TimelineEntry), "kind": Schema.Literal("conversation"), "replace": Schema.Boolean, "session_id": Id }),
   Schema.Struct({ "code": optionalKey(Schema.String), "collection": optionalKey(Schema.String), "id": Schema.String, "kind": Schema.Literal("resync"), "message": optionalKey(Schema.String), "retryable": optionalKey(Schema.Boolean) }),

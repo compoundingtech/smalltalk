@@ -284,3 +284,12 @@ test('normalized conversation fallbacks and open block payloads survive schema r
     const decoded = Rich.decodeUnknownSync(Rich.TimelineBlock, 'strict')(block);
     assert.deepEqual(Schema.encodeSync(Rich.TimelineBlock)(decoded), block);
 });
+
+test('field patch schema bounds fields and treats null as an explicit value', async () => {
+    const [, Rich] = await modules;
+    const decode = Rich.decodeUnknownSync(Rich.CollectionPatch, 'strict');
+    assert.deepEqual(decode({ id: 'agent/a', fields: { state: null }, removed_fields: [] }), { id: 'agent/a', fields: { state: null }, removed_fields: [] });
+    const fields = Object.fromEntries(Array.from({ length: 129 }, (_, i) => [`field${i}`, i]));
+    assert.throws(() => decode({ id: 'agent/a', fields, removed_fields: [] }));
+    assert.throws(() => decode({ id: 'agent/a', fields: {}, removed_fields: ['x', 'x'] }));
+});
