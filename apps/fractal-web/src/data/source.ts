@@ -82,11 +82,19 @@ export interface Host {
 /** A missing native observation remains unknown, never zero or an inferred fact. */
 export type Known<T> = { readonly _tag: 'Known'; readonly value: T } | { readonly _tag: 'Unknown' }
 
+/** Declared seat intent only; absence carries no lifecycle glyph. */
+export type SeatLifecycle =
+  | { readonly _tag: 'Standing' }
+  | { readonly _tag: 'Owner' }
+  | { readonly _tag: 'Bounded' }
+  | { readonly _tag: 'Unknown' }
+
 /** One agent session as the fleet projection lists it, keyed by `ref` with its terminal ref beside it. */
 export interface Agent {
   readonly ref: string
   readonly terminal: string
   readonly name: string
+  readonly lifecycle: SeatLifecycle
   readonly host: string
   readonly connected: boolean
   readonly harness?: 'omp' | 'claude' | 'codex'

@@ -233,6 +233,24 @@ checks Retry reuses the key, and prints build revision, seat and timings. The ne
 removes the submit binding and proves the send criterion rejects it without issuing mail.
 Both commands skip all live activity when the one-minute `/proc/loadavg` value is 32 or higher.
 
+## Fractal web roster lifecycle
+
+The generated client-v0 `Agent` schema accepts only the optional declared lifecycle literals
+`standing`, `owner` and `bounded`; an unrecognized value fails decoding. The app projects them
+to `Standing`, `Owner` and `Bounded` tags on `data/source.ts`'s `Agent.lifecycle`. An absent
+declaration is `Unknown`, including when the agent name sounds standing-like. Names, observed
+activity and runtime state never supply lifecycle intent.
+
+The sidebar already receives this projected agent from `useFleet` and passes it to `sidebarRow`. Kit C can wire its future
+row prop from that lifecycle field; `Unknown` must render no glyph. No kit prop is added here.
+The temporary `trial: smalltalk#1991 client roster lifecycle` commit carries only the upstream
+generated client/schema diff and should be dropped once #1991 merges into the base.
+
+```sh
+pnpm --dir apps/fractal-web exec vitest run src/data/projections.unit.test.ts
+pnpm exec tsc --noEmit -p apps/fractal-web
+```
+
 ## Continuous integration
 
 Workspace CI runs on pull requests and merge groups. The five required checks are `linux-gate`,

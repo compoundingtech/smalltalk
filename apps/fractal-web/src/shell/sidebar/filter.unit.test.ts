@@ -16,6 +16,7 @@ const row = (
   agent: {
     ref: id,
     name: title,
+    lifecycle: { _tag: 'Unknown' },
     host,
     terminal: `terminal/${id}`,
     connected: true,

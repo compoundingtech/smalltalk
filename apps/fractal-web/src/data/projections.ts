@@ -66,6 +66,15 @@ const unknown = { _tag: 'Unknown' } as const
 const fromOption = <T>(value: Option.Option<T>): Known<T> =>
   Option.match(value, { onNone: () => unknown, onSome: (value) => ({ _tag: 'Known', value }) })
 
+const lifecycleOf = (row: St3.Agent): Agent['lifecycle'] => {
+  switch (row.lifecycle) {
+    case 'standing': return { _tag: 'Standing' }
+    case 'owner': return { _tag: 'Owner' }
+    case 'bounded': return { _tag: 'Bounded' }
+    case undefined: return unknown
+  }
+}
+
 const agentFromRow = (row: St3.Agent): Agent => {
   const driver = Option.getOrUndefined(row.driver)
   const harness = harnesses.find((candidate) => candidate === driver)
@@ -82,6 +91,7 @@ const agentFromRow = (row: St3.Agent): Agent => {
     ref: row.id,
     terminal: terminalSubjectForAgent(row.id),
     name: row.name,
+    lifecycle: lifecycleOf(row),
     host: hostName(row),
     ...(harness === undefined ? {} : { harness }),
     activity: activityOf(row),
@@ -224,6 +234,7 @@ const sameAgent = (a: Agent, b: Agent): boolean =>
   a.ref === b.ref &&
   a.terminal === b.terminal &&
   a.name === b.name &&
+  a.lifecycle._tag === b.lifecycle._tag &&
   a.host === b.host &&
   a.harness === b.harness &&
   a.activity === b.activity &&

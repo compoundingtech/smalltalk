@@ -24,7 +24,7 @@ const header = {
   onTogglePanel() {}, onToggleDrawer() {},
   nativeActions: createElement('button', { 'data-native-action': 'existing' }, 'Bound action'),
 }
-const agent: Agent = { ref: 'agent/fixture/readonly', terminal: '', name: 'Reported name', host: 'Reported host', connected: true, activity: 'idle', status: 'idle', usage: unknown, checkout: unknown, workspace: unknown, startedAt: unknown, endedAt: unknown, blockedOn: unknown, ask: unknown, lastActivityAt: unknown }
+const agent: Agent = { ref: 'agent/fixture/readonly', terminal: '', name: 'Reported name', lifecycle: unknown, host: 'Reported host', connected: true, activity: 'idle', status: 'idle', usage: unknown, checkout: unknown, workspace: unknown, startedAt: unknown, endedAt: unknown, blockedOn: unknown, ask: unknown, lastActivityAt: unknown }
 
 describe('resource card seam', () => {
   it('keeps unknown counts explicit instead of rendering zero', () => {

@@ -76,6 +76,49 @@ test.each(['example-seat', 'team/seat', 'terminal/example', '', 'agent/', 'agent
     expect(terminalSubjectForAgent(id)).toBeUndefined()
   },
 )
+
+test.each([
+  { name: 'Declared standing', declaration: { lifecycle: 'standing' }, expected: 'Standing' },
+  { name: 'Declared owner', declaration: { lifecycle: 'owner' }, expected: 'Owner' },
+  { name: 'Declared bounded', declaration: { lifecycle: 'bounded' }, expected: 'Bounded' },
+  { name: 'Absent declaration', declaration: {}, expected: 'Unknown' },
+  { name: 'Standing maintenance agent', declaration: {}, expected: 'Unknown' },
+] as const)('roster lifecycle decodes $name as $expected', ({ name, declaration, expected }) => {
+  const decoded = decodeUnknownSync(Agent, 'strict')({
+    kind: 'agent',
+    id: 'agent/lifecycle',
+    name,
+    runtime_ids: [],
+    reachability: 'reachable',
+    state: 'running',
+    revision: '1',
+    updated_at: '2026-10-04T12:00:00.000Z',
+    ...declaration,
+  } satisfies AgentEncoded)
+  expect(fleetFromAgents([decoded]).agents[0]).toHaveProperty('lifecycle', { _tag: expected })
+})
+
+test('roster lifecycle rejects values outside the generated literal set', () => {
+  expect(() => decodeUnknownSync(Agent, 'strict')({
+    kind: 'agent', id: 'agent/lifecycle', name: 'Unknown declaration', runtime_ids: [],
+    reachability: 'reachable', state: 'running', revision: '1',
+    updated_at: '2026-10-04T12:00:00.000Z', lifecycle: 'permanent',
+  })).toThrow()
+})
+
+test('incremental roster lifecycle changes invalidate the retained sidebar row', () => {
+  const project = createProjections()
+  const first = project.fleetFromAgents([row])
+  const standing = { ...row, lifecycle: 'standing' as const }
+  const changed = project.fleetFromAgents([standing])
+  expect(changed).not.toBe(first)
+  expect(changed.agents[0]).toHaveProperty('lifecycle', { _tag: 'Standing' })
+  expect(project.fleetFromAgents([{ ...standing }])).toBe(changed)
+  expect(project.fleetFromAgents([{ ...row, lifecycle: 'owner' }]).agents[0])
+    .toHaveProperty('lifecycle', { _tag: 'Owner' })
+  expect(project.fleetFromAgents([row]).agents[0])
+    .toHaveProperty('lifecycle', { _tag: 'Unknown' })
+})
 test('incremental fleet projection retains unchanged rows, hosts and collection identity', () => {
   const project = createProjections()
   const second: Agent = { ...row, id: 'agent/second', name: 'Second' }
