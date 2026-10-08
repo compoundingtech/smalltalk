@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep terminal attachments connected during large replay and distinguish connection loss from child exit.",
+  "replay": { "status": "none", "detail": "No stored claim replay or projection recovery change." },
+  "schema": { "status": "none", "detail": "No schema or index change." },
+  "rules": { "status": "none", "detail": "No checkpoint or digest rule change." },
+  "compatibility": { "status": "changed", "detail": "An attachment socket closing without an EXIT frame now reports connection loss and exits 1 instead of claiming that the session ended successfully. Successful detach and received child exit statuses are unchanged. The bundled server bounds outbound memory rather than packet count and can send a best-effort rejection reason understood by the embedded client." },
+  "manual": { "status": "changed", "detail": "Installing binaries does not upgrade already-running terminal server processes. Apply the server correction only through a separately coordinated handoff that preserves running sessions; do not restart a live session solely to acquire this update." },
+  "recovery": { "status": "none", "detail": "No persisted migration or store repair. Binary rollback restores the older attachment behavior." },
+  "downtime": { "status": "unknown", "detail": "Any required process handoff is separately coordinated. Its duration and interruption behavior have not been measured by this change." }
+}
