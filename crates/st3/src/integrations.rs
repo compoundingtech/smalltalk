@@ -9,7 +9,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 
 use crate::model::DoctorCheck;
 
@@ -192,26 +194,35 @@ fn check_idle_mcp(executable: &Path, environment: &Environment) -> Result<()> {
     Ok(())
 }
 
-/// Verify the assets each installed harness will use. Missing optional installations warn;
-/// corrupted skill/extension bytes fail. These checks do not claim provider authentication or
-/// model consumption; live channel delivery remains observable in the ordinary seat checks.
-pub fn doctor_checks(
+fn assets(harness: &str, state_dir: &Path, environment: &Environment) -> Result<bool> {
+    let skill = skill_path(harness, environment)?;
+    if !skill.try_exists()? {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        fs::read(&skill)? == crate::skill::SKILL.as_bytes(),
+        "st skill differs from this binary at {}",
+        skill.display()
+    );
+    if matches!(harness, "pi" | "omp") {
+        crate::hooks::verify(&crate::hooks::set_dir(&crate::hooks::root(state_dir)))?;
+    }
+    Ok(true)
+}
+
+fn checks_for(
     executable: &Path,
     state_dir: &Path,
     environment: &Environment,
+    probe: bool,
 ) -> Vec<DoctorCheck> {
     crate::environment::HARNESSES.iter()
         .filter(|h| st_runtime::resolve_executable(h, environment).is_ok())
         .map(|harness| {
             let result = (|| -> Result<Option<String>> {
-                let skill = skill_path(harness, environment)?;
-                if !skill.try_exists()? { return Ok(None); }
-                anyhow::ensure!(fs::read(&skill)? == crate::skill::SKILL.as_bytes(),
-                    "st skill differs from this binary at {}", skill.display());
-                if matches!(*harness, "pi" | "omp") {
-                    crate::hooks::verify(&crate::hooks::set_dir(&crate::hooks::root(state_dir)))?;
-                }
+                if !assets(harness, state_dir, environment)? { return Ok(None); }
                 if *harness == "claude" {
+                    if !probe { return Ok(Some("native registration and idle MCP evidence incomplete; run st setup to check integrations".into())); }
                     check_idle_mcp(executable, environment)?;
                     if capture(command(executable, environment, &["claude-channel", "status"]), None,
                         Duration::from_secs(5)).is_err() {
@@ -229,6 +240,173 @@ pub fn doctor_checks(
             };
             DoctorCheck { name: format!("integration/{harness}"), status: status.into(), message }
         }).collect()
+}
+
+#[derive(Deserialize, Serialize, PartialEq)]
+struct BinaryStamp {
+    device: u64,
+    inode: u64,
+    len: u64,
+    modified_ns: u128,
+}
+
+fn binary_stamp(executable: &Path) -> Result<BinaryStamp> {
+    use std::os::unix::fs::MetadataExt as _;
+    let m = fs::metadata(executable)?;
+    Ok(BinaryStamp {
+        device: m.dev(),
+        inode: m.ino(),
+        len: m.len(),
+        modified_ns: m
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos(),
+    })
+}
+
+#[derive(Deserialize, Serialize)]
+struct TrackedFile {
+    path: PathBuf,
+    digest: Option<String>,
+}
+
+fn file_digest(path: &Path) -> Result<Option<String>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(1_048_577).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= 1_048_576,
+        "integration metadata exceeds 1 MiB"
+    );
+    Ok(Some(hex::encode(Sha256::digest(bytes))))
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Receipt {
+    version: u32,
+    binary: BinaryStamp,
+    locations: Environment,
+    checks: Vec<DoctorCheck>,
+    claude_files: Vec<TrackedFile>,
+}
+
+fn receipt_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("harness-integrations.json")
+}
+
+/// Explicit setup owns native probes. Retain only asset locations, never a login environment
+/// containing provider credentials. Registration files fence the cached Claude result.
+pub fn refresh_checks(
+    executable: &Path,
+    state_dir: &Path,
+    environment: &Environment,
+    probe: bool,
+) -> Result<Vec<DoctorCheck>> {
+    let checks = checks_for(executable, state_dir, environment, probe);
+    let locations: Environment = environment
+        .iter()
+        .filter(|(key, _)| matches!(key.as_str(), "HOME" | "CLAUDE_CONFIG_DIR" | "XDG_DATA_HOME"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut claude_files = Vec::new();
+    if checks.iter().any(|c| c.name == "integration/claude") {
+        let home = PathBuf::from(locations.get("HOME").context("integration needs HOME")?);
+        let profile = locations
+            .get("CLAUDE_CONFIG_DIR")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".claude"));
+        let data = locations
+            .get("XDG_DATA_HOME")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"));
+        let marketplace = data.join("st/plugins/claude/marketplace");
+        for path in [
+            profile.join("plugins/known_marketplaces.json"),
+            profile.join("plugins/installed_plugins.json"),
+            profile.join("settings.json"),
+            marketplace.join(".claude-plugin/marketplace.json"),
+            marketplace.join("st-channel/.claude-plugin/plugin.json"),
+            marketplace.join("st-channel/.mcp.json"),
+        ] {
+            claude_files.push(TrackedFile {
+                digest: file_digest(&path)?,
+                path,
+            });
+        }
+    }
+    let receipt = Receipt {
+        version: 1,
+        binary: binary_stamp(executable)?,
+        locations,
+        checks: checks.clone(),
+        claude_files,
+    };
+    fs::create_dir_all(state_dir)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(state_dir)?;
+    serde_json::to_writer(&mut temporary, &receipt)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(receipt_path(state_dir))?;
+    Ok(checks)
+}
+
+/// Read-only doctor: compare local assets and setup's bounded native evidence. No shell,
+/// provider CLI, credential helper or MCP child is started by this read.
+pub fn doctor_checks(executable: &Path, state_dir: &Path) -> Vec<DoctorCheck> {
+    let result = (|| -> Result<Vec<DoctorCheck>> {
+        let mut bytes = Vec::new();
+        fs::File::open(receipt_path(state_dir))?
+            .take(65_537)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(bytes.len() <= 65_536, "integration receipt exceeds 64 KiB");
+        let receipt: Receipt = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(receipt.version == 1, "unknown integration receipt version");
+        let same_binary = receipt.binary == binary_stamp(executable)?;
+        let mut checks = Vec::new();
+        for mut check in receipt.checks {
+            let harness = check
+                .name
+                .strip_prefix("integration/")
+                .context("invalid integration receipt name")?;
+            anyhow::ensure!(
+                crate::environment::HARNESSES.contains(&harness),
+                "unknown integration receipt harness"
+            );
+            match assets(harness, state_dir, &receipt.locations) {
+                Ok(false) => {
+                    check.status = "warn".into();
+                    check.message = "st integration is not installed; run st setup".into();
+                }
+                Err(error) => {
+                    check.status = "fail".into();
+                    check.message = format!("st integration needs repair: {error:#}; run st setup");
+                }
+                Ok(true) => {
+                    let same_registration = if harness == "claude" {
+                        receipt.claude_files.iter().try_fold(true, |same, f| {
+                            Ok::<_, anyhow::Error>(same && file_digest(&f.path)? == f.digest)
+                        })?
+                    } else {
+                        true
+                    };
+                    if !same_binary || !same_registration {
+                        check.status = "warn".into();
+                        check.message = "integration evidence is stale after a binary or registration change; run st setup to refresh it".into();
+                    }
+                }
+            }
+            checks.push(check);
+        }
+        Ok(checks)
+    })();
+    result.unwrap_or_else(|error| vec![DoctorCheck { name: "integration-evidence".into(), status: "warn".into(),
+        message: format!("integration evidence incomplete: {error}; run st setup; this read starts no platform probe") }])
 }
 
 #[cfg(test)]
@@ -275,18 +453,29 @@ mod tests {
             ("HOME".into(), root.path().display().to_string()),
             ("PATH".into(), bin.display().to_string()),
         ]);
-        let executable = Path::new("/unused");
+        let executable_path = std::env::current_exe().unwrap();
+        let executable = executable_path.as_path();
         let state = root.path().join("state");
         assert!(
-            doctor_checks(executable, &state, &environment)
+            refresh_checks(executable, &state, &environment, true)
+                .unwrap()
                 .iter()
                 .all(|c| c.status == "warn")
         );
         for name in ["codex", "omp", "pi", "opencode"] {
             install(name, false, executable, &state, &environment).unwrap();
         }
+        let mut private_environment = environment.clone();
+        private_environment.insert("ANTHROPIC_API_KEY".into(), "private-fixture-marker".into());
+        refresh_checks(executable, &state, &private_environment, true).unwrap();
         assert!(
-            doctor_checks(executable, &state, &environment)
+            !fs::read_to_string(receipt_path(&state))
+                .unwrap()
+                .contains("private-fixture-marker")
+        );
+        assert!(
+            refresh_checks(executable, &state, &environment, true)
+                .unwrap()
                 .iter()
                 .all(|c| c.status == "pass")
         );
@@ -295,7 +484,7 @@ mod tests {
             "broken",
         )
         .unwrap();
-        let checks = doctor_checks(executable, &state, &environment);
+        let checks = doctor_checks(executable, &state);
         assert_eq!(
             checks
                 .iter()
@@ -315,13 +504,15 @@ mod tests {
         install("pi", false, executable, &state, &environment).unwrap();
         fs::write(skill_path("codex", &environment).unwrap(), "stale").unwrap();
         assert!(
-            doctor_checks(executable, &state, &environment)
+            refresh_checks(executable, &state, &environment, true)
+                .unwrap()
                 .iter()
                 .all(|c| c.status == "fail")
         );
         install("codex", false, executable, &state, &environment).unwrap();
         assert!(
-            doctor_checks(executable, &state, &environment)
+            refresh_checks(executable, &state, &environment, true)
+                .unwrap()
                 .iter()
                 .all(|c| c.status == "pass")
         );

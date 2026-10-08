@@ -330,6 +330,15 @@ async fn prepare_harness(
     } else {
         println!("Integrations: skipped");
     }
+    let environment = crate::environment::snapshot()?;
+    let checks =
+        crate::integrations::refresh_checks(executable, &config.state_dir, &environment, consent)?;
+    if consent {
+        anyhow::ensure!(
+            !checks.iter().any(|check| check.status == "fail"),
+            "st integration verification failed; inspect st doctor and rerun st setup after repair"
+        );
+    }
     if chosen == "claude" {
         if !consent || !claude_channel {
             println!(

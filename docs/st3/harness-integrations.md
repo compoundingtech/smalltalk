@@ -36,9 +36,12 @@ st doctor --json
 ```
 
 Doctor reports `integration/claude`, `integration/codex`, `integration/omp`,
-`integration/pi` and `integration/opencode` for detected harnesses. It checks exact installed
-skill bytes and managed extension assets. The Claude check also verifies user plugin
-registration and exercises the no-subject MCP initialize, tools-list and ping path.
+`integration/pi` and `integration/opencode` for harnesses found by the latest setup. It checks exact installed
+skill bytes and managed extension assets. Explicit setup verifies Claude user plugin
+registration and exercises the no-subject MCP initialize, tools-list and ping path, then
+records evidence without saving the login environment or provider credentials. Doctor reads
+that evidence without launching a shell, provider CLI, credential helper or MCP child.
+Binary or registration changes make the recorded native evidence stale; rerun setup to refresh it.
 Missing optional installations warn; damaged assets fail. Rerun `st setup` to repair them.
 These installation checks are separate from provider login, organization restrictions and
 the live seat delivery observations already in doctor.

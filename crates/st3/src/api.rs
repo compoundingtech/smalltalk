@@ -5612,12 +5612,10 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
     let build_tools = environment.as_ref().ok().cloned().map(|environment| {
         crate::api::read_deadline::spawn_blocking(move || crate::environment::check_build_tools(&environment))
     });
-    let integration_checks = environment.as_ref().ok().cloned().map(|environment| {
-        let state_dir = state.state_dir.clone();
-        crate::api::read_deadline::spawn_blocking(move || {
-            let executable = std::env::current_exe().map_err(ApiError::internal)?;
-            Ok::<_, ApiError>(crate::integrations::doctor_checks(&executable, &state_dir, &environment))
-        })
+    let integration_state = state.state_dir.clone();
+    let integration_checks = crate::api::read_deadline::spawn_blocking(move || {
+        let executable = std::env::current_exe().map_err(ApiError::internal)?;
+        Ok::<_, ApiError>(crate::integrations::doctor_checks(&executable, &integration_state))
     });
     let pty_root = state.pty_root.clone();
     let priority = crate::api::read_deadline::spawn_blocking(move || {
@@ -5641,9 +5639,7 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
             &build_tools.await.map_err(ApiError::internal)?,
         ));
     }
-    if let Some(checks) = integration_checks {
-        report.checks.extend(checks.await.map_err(ApiError::internal)??);
-    }
+    report.checks.extend(integration_checks.await.map_err(ApiError::internal)??);
     report.checks.push(match environment {
         Ok(environment) => DoctorCheck {
             name: "daemon-environment".into(),
