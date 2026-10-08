@@ -380,10 +380,10 @@ mod tests {
         wrong_birth.process_token += 1;
         assert!(
             store
-                .promote_mailbox_bootstrap(&bound, &wrong_birth)
+                .promote_current_mailbox_ownership(&bound, &wrong_birth)
                 .is_err()
         );
-        store.promote_mailbox_bootstrap(&bound, &provider).unwrap();
+        store.promote_current_mailbox_ownership(&bound, &provider).unwrap();
         assert_eq!(
             store.mailbox_lease_authority(&bound).unwrap(),
             Some(provider.clone())
@@ -410,12 +410,48 @@ mod tests {
                 .bind_mailbox_with_lease(&bound, Some(&provider))
                 .is_err()
         );
-        store.promote_mailbox_bootstrap(&bound, &provider).unwrap();
+        store.promote_current_mailbox_ownership(&bound, &provider).unwrap();
         assert_eq!(
             store.mailbox_lease_authority(&new).unwrap(),
             Some(successor)
         );
         store.check_mailbox(&new).unwrap();
+    }
+
+    #[test]
+    fn same_process_session_reexec_advances_ownership_without_reissuing_capability() {
+        let store = fixture();
+        let owner = authority(1);
+        let bound = store.bind_mailbox_with_lease(&request(), Some(&owner)).unwrap();
+        let mut advanced = owner.clone();
+        advanced.sequence += 1;
+        for foreign in [
+            Authority { pid: owner.pid + 1, ..advanced.clone() },
+            Authority { process_token: owner.process_token + 1, ..advanced.clone() },
+            Authority { provider: "codex".into(), ..advanced.clone() },
+        ] {
+            assert!(store.promote_current_mailbox_ownership(&bound, &foreign).is_err());
+            assert_eq!(store.mailbox_lease_authority(&bound).unwrap(), Some(owner.clone()));
+        }
+        let different_session = Authority { session: "different-session".into(), ..advanced.clone() };
+        store.promote_current_mailbox_ownership(&bound, &different_session).unwrap();
+        assert!(!store.owns_mailbox_lease(&bound, &different_session).unwrap());
+        assert_eq!(store.mailbox_lease_authority(&bound).unwrap(), Some(owner.clone()));
+        store.promote_current_mailbox_ownership(&bound, &advanced).unwrap();
+        assert_eq!(store.mailbox_lease_authority(&bound).unwrap(), Some(advanced.clone()));
+        let reconnected = store.bind_mailbox_with_lease(&bound, Some(&advanced)).unwrap();
+        assert_eq!(
+            (reconnected.token, reconnected.epoch, reconnected.incarnation),
+            (bound.token.clone(), bound.epoch, bound.incarnation.clone()),
+        );
+        assert!(store.bind_mailbox_with_lease(&request(), Some(&advanced)).is_err());
+        store.promote_current_mailbox_ownership(&bound, &owner).unwrap();
+        assert_eq!(store.mailbox_lease_authority(&bound).unwrap(), Some(advanced));
+        let successor = authority(3);
+        let replacement = store.bind_mailbox_with_lease(&request(), Some(&successor)).unwrap();
+        store.promote_current_mailbox_ownership(&bound, &successor).unwrap();
+        assert_eq!(store.mailbox_lease_authority(&replacement).unwrap(), Some(successor));
+        assert!(store.check_mailbox(&bound).is_err());
     }
 
     #[test]
@@ -815,9 +851,10 @@ impl Store {
         append_claim_with_admission(&self.graph, input, None, None, None, None, Some(&admission))
             .map(|(claim, _)| claim)
     }
-    /// The Codex wrapper binds before launching its provider. Promote only its exact
-    /// physical bootstrap custody, under the caller's current provider ownership lock.
-    pub(crate) fn promote_mailbox_bootstrap(
+    /// Promote physical Codex bootstrap custody, or advance a surviving process's
+    /// same-session ownership after re-exec, under the caller's provider ownership lock.
+    /// Both retain only the still-current capability and exact process generation.
+    pub(crate) fn promote_current_mailbox_ownership(
         &self,
         fence: &Fence,
         authority: &Authority,
@@ -827,7 +864,12 @@ impl Store {
         let Some((held, prior, revoked)) = lease(&tx, fence)? else {
             return Ok(());
         };
-        if prior.sequence != 0 || authority.sequence == 0 {
+        // Re-exec can claim a newer sequence for the surviving provider session.
+        // Only that exact process and current capability may retain its lease.
+        let advancing_session = prior.sequence > 0
+            && authority.sequence > prior.sequence
+            && authority.session == prior.session;
+        if authority.sequence == 0 || (prior.sequence != 0 && !advancing_session) {
             return Ok(());
         }
         if held.incarnation != fence.incarnation
@@ -842,7 +884,7 @@ impl Store {
             || prior.provider != authority.provider
         {
             return Err(refused(
-                "bootstrap custody belongs to another physical process",
+                "current custody belongs to another physical process",
             ));
         }
         check_mailbox_incarnation(&tx, fence)?;

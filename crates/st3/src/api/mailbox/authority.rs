@@ -116,7 +116,7 @@ pub(super) fn admit_report(
         return Err(refused("the admitted process generation disappeared"));
     }
     let agent_dir = source_agent_dir(state, fence);
-    st_drivers::harness_state::with_current_ownership(
+    let result = st_drivers::harness_state::with_current_ownership(
         &agent_dir,
         &owner.session,
         owner.sequence,
@@ -135,7 +135,31 @@ pub(super) fn admit_report(
         error
             .downcast::<St3Error>()
             .unwrap_or_else(|error| refused(error.to_string()))
-    })
+    });
+    if result.is_ok() {
+        return result;
+    }
+    let current = st_drivers::harness_events::read_runtime_state(&agent_dir, &fence.incarnation)
+        .map_err(internal)?
+        .ok_or_else(|| refused("the provider source disappeared"))?;
+    let observed = provider_authority(&current)?;
+    if observed.harness.as_deref() == Some(&owner.provider)
+        && observed.evidence_incarnation.as_deref() == Some(&owner.session)
+        && observed.ownership_sequence.is_some_and(|sequence| sequence > owner.sequence)
+    {
+        // A surviving wrapper reclaims its provider record during re-exec. Re-admit
+        // this exact capability under physical/provider and writer fences once, rather
+        // than treating the ownership transition as a new channel or fresh token.
+        return with_authority(state, fence, peer, |current_owner, validate| {
+            validate()?;
+            state.store.check_mailbox(fence)?;
+            if !state.store.owns_mailbox_lease(fence, current_owner)? {
+                return Err(refused("the report lease was superseded"));
+            }
+            Ok(())
+        });
+    }
+    result
 }
 
 pub(super) fn loss_if_current(
@@ -625,7 +649,7 @@ pub(super) fn with_authority<T>(
             // Terminal state may be written without changing session/sequence. Recheck
             // it while holding the record lock rather than admitting a completion race.
             current_provider(state, fence, &agent_dir, &authority)?;
-            state.store.promote_mailbox_bootstrap(fence, &authority)?;
+            state.store.promote_current_mailbox_ownership(fence, &authority)?;
             action(&authority, &|| Ok(())).map_err(anyhow::Error::new)
         },
     )
