@@ -76,7 +76,8 @@ export const browserSocket: CollectionSocketFactory = (url, protocols) => {
     onclose: null,
     onerror: null,
     send: (data) => socket.send(data),
-    close: (code, reason) => socket.close(code, reason),
+    // Native browsers prohibit application close code 1001; no-argument close is synchronous.
+    close: (code, reason) => code === 1001 ? socket.close() : socket.close(code, reason),
   }
   socket.onopen = () => wrapped.onopen?.()
   socket.onmessage = (event) => wrapped.onmessage?.({ data: event.data })

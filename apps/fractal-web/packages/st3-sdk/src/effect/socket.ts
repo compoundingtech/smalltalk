@@ -27,7 +27,7 @@ import * as Result from 'effect/Result'
 import type * as Scope from 'effect/Scope'
 import * as SubscriptionRef from 'effect/SubscriptionRef'
 import * as Tracer from 'effect/Tracer'
-import { traceContextOf } from './trace.ts'
+import { traceContextOf, type TraceContext } from './trace.ts'
 import type { SyncStatus } from './sync-status.ts'
 
 /** The gateway connection as the UI shows it. */
@@ -111,6 +111,7 @@ export const makeChannel = ({
   client,
   socket,
   parentSpan,
+  commandTraceContext,
   onDiagnostics,
   onSubscribeSent,
   onCapabilities,
@@ -119,6 +120,7 @@ export const makeChannel = ({
   readonly client: St3Client
   readonly socket?: CollectionSocketFactory
   readonly parentSpan?: () => Tracer.Span | undefined
+  readonly commandTraceContext?: () => TraceContext | undefined
   readonly onDiagnostics?: (event: St3Diagnostic) => void
   /** A subscribe command for registration `id` went out under generation wire id `wire`. */
   readonly onSubscribeSent?: (sent: { readonly id: string; readonly wire: string }) => void
@@ -235,7 +237,7 @@ export const makeChannel = ({
       const stream = yield* Effect.currentSpan.pipe(
         Effect.orDie,
         Effect.flatMap((span) => Effect.tryPromise(() =>
-        client.withTraceContext(() => traceContextOf(span)).collectionStream({
+        client.withTraceContext(() => commandTraceContext?.() ?? traceContextOf(span)).collectionStream({
           onFrame: dispatch,
           onOpen: () => { Deferred.doneUnsafe(opened, Exit.succeed(true)) },
           onCommandSent: (command) => {

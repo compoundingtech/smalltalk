@@ -67,7 +67,7 @@
           if (ended) return
           detach()
           handle.frames = []
-          socket.close(1001)
+          socket.close()
         }
         handle.take = () => {
           if (ended) return undefined

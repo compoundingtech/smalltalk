@@ -181,7 +181,9 @@ const makeEarlySocket = (
     socket.onmessage = null
     socket.onclose = null
     socket.onerror = null
-    socket.close(code)
+    // Browser WebSocket.close cannot send reserved code 1001 from application JavaScript.
+    if (code === 1001) socket.close()
+    else socket.close(code)
   }
   const sendEarly = () => {
     socket.send(JSON.stringify({ ...taken.command, trace: { traceparent: taken.traceparent } }))
