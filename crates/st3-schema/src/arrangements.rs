@@ -31,6 +31,9 @@ pub enum Operation {
     FolderDelete { id: String },
     #[serde(rename = "subject.place")]
     SubjectPlace { subject: String, folder: Option<String>, key: String },
+    /// Atomically activate ordered memberships on this existing arrangement identity.
+    #[serde(rename = "membership.migrate")]
+    MembershipMigrate {},
     #[serde(rename = "retire")]
     Retire {},
 }
@@ -168,6 +171,7 @@ enum Touched<'a> {
     FolderTombstone(&'a str),
     Placement(&'a str),
     Retired,
+    MembershipAuthority,
 }
 
 type OperationRegisters<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>, [Option<Touched<'a>>; 2]);
@@ -211,6 +215,7 @@ pub fn operations(subject: &str, fields: &BTreeMap<String, Value>) -> Result<Vec
                 (None, None, folder.as_deref(), Some(key), [Some(Touched::Placement(subject)), None])
             }
             Operation::Retire {} => (None, None, None, None, [Some(Touched::Retired), None]),
+            Operation::MembershipMigrate {} => (None, None, None, None, [Some(Touched::MembershipAuthority), None]),
         };
         if id.is_some_and(|id| !valid_uuid(id)) || target.is_some_and(|id| !valid_uuid(id)) {
             return Err(error("invalid-arrangement-folder", "folder IDs must be lowercase UUIDv7"));
@@ -223,6 +228,9 @@ pub fn operations(subject: &str, fields: &BTreeMap<String, Value>) -> Result<Vec
     }
     if operations.iter().any(|op| matches!(op, Operation::Retire {})) && operations.len() != 1 {
         return Err(error("invalid-arrangement-operations", "retirement must be the only operation"));
+    }
+    if operations.iter().any(|op| matches!(op, Operation::MembershipMigrate {})) && operations.len() != 1 {
+        return Err(error("invalid-arrangement-operations", "membership migration must be the only operation"));
     }
     if version == 2 && operations.iter().any(|op| matches!(op, Operation::SubjectPlace { .. })) {
         return Err(error("invalid-arrangement-operations", "version 2 arrangements place subjects through ordered memberships"));

@@ -345,6 +345,8 @@ export type ArrangementOperation = ({
   op: "subject.place";
   subject: ArrangementSubject;
 } | {
+  op: "membership.migrate";
+} | {
   op: "retire";
 });
 

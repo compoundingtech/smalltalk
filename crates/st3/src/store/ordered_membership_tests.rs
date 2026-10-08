@@ -901,3 +901,195 @@ fn replay_rebuild_replication_and_checkpoint_retain_raw_hidden_and_absent_author
     assert_eq!(head(&store, SEAT_B), retained[1]);
     assert_eq!(head(&store, SEAT_C), retained[2]);
 }
+
+fn legacy_migration_fixture(store: &Store) -> ClaimRecord {
+    declare(store, SEAT_A, "true", "migration-declare-a");
+    declare(store, SEAT_B, "true", "migration-declare-b");
+    retire(store, SEAT_B, "migration-retire-b");
+    let mut input = arrangement_input(json!([
+        {"op":"create","name":"Sidebar"},
+        {"op":"folder.create","id":FOLDER_A,"name":"Parent","parent":null,"key":"a0"},
+        {"op":"folder.create","id":FOLDER_B,"name":"Child","parent":FOLDER_A,"key":"a1"},
+        {"op":"subject.place","subject":SEAT_A,"folder":FOLDER_B,"key":"a2"},
+        {"op":"subject.place","subject":SEAT_B,"folder":FOLDER_A,"key":"a0"},
+        {"op":"subject.place","subject":SEAT_C,"folder":null,"key":"a1"}
+    ]));
+    input.actor = Some("agent/fleet/fixture-migration/seat".into());
+    let placement = store.edit_arrangement(&input, &BTreeMap::new()).unwrap();
+    folder_edit(store, json!([{"op":"folder.delete","id":FOLDER_B}]));
+    placement
+}
+
+fn migrate_placements(store: &Store) -> ClaimRecord {
+    let mut input = arrangement_input(json!([{"op":"membership.migrate"}]));
+    input.actor = Some("agent/fleet/fixture-migration/seat".into());
+    store.edit_arrangement(&input, &BTreeMap::new()).unwrap()
+}
+
+#[test]
+fn placement_migration_preserves_identity_folders_winners_and_real_actor() {
+    let store = Store::open_memory("migration-fixture").unwrap();
+    let original = legacy_migration_fixture(&store);
+    let before = store.arrangement(CONTAINER, u64::MAX).unwrap().unwrap();
+    let source: Vec<_> = [SEAT_A, SEAT_B, SEAT_C].iter().map(|member| {
+        store.readers.get().query_row("SELECT revision,quote(winner) FROM arrangement_registers WHERE subject=?1 AND register=?2",
+            params![CONTAINER,format!("placement/{member}")], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?))).unwrap()
+    }).collect();
+    let marker = migrate_placements(&store);
+    let after = store.arrangement(CONTAINER, u64::MAX).unwrap().unwrap();
+    assert_eq!(after["id"], before["id"]);
+    assert_eq!(after["owner"], before["owner"]);
+    assert_eq!(after["body"]["name"], before["body"]["name"]);
+    assert_eq!(after["body"]["folders"], before["body"]["folders"]);
+    assert_eq!(after["resolved"]["parents"], before["resolved"]["parents"]);
+    assert_eq!(after["body"]["version"], 2);
+    assert!(after["body"].get("placements").is_none());
+    assert_eq!(after["resolved"]["folders"], json!({}));
+    assert!(serde_json::from_value::<st3_schema::arrangements::Body>(after["body"].clone()).is_err());
+    assert!(st3_schema::arrangements::body_for_read(&after["body"]).is_ok());
+    for ((member, expected), source) in [SEAT_A, SEAT_B, SEAT_C].iter()
+        .zip([Some(FOLDER_B),Some(FOLDER_A),None]).zip(source) {
+        let migrated = head(&store, member);
+        assert_eq!(migrated.0.unwrap()["bucket"], json!(expected));
+        assert_eq!((migrated.1,migrated.2), source);
+    }
+    assert_eq!(members(&store), [SEAT_A]);
+    assert_eq!(rows(&store)[0]["position"]["bucket"], FOLDER_A);
+    assert_eq!(store.ordered_membership_count(CONTAINER).unwrap(), 1);
+    assert_eq!(marker.actor, original.actor);
+    assert_eq!(store.claim_by_id(&original.id).unwrap().unwrap(), original);
+    declare(&store, SEAT_B, "true", "migration-restore-b");
+    declare(&store, SEAT_C, "true", "migration-restore-c");
+    assert_eq!(store.ordered_membership_count(CONTAINER).unwrap(), 3);
+}
+
+#[test]
+fn placement_migration_rerun_keeps_pair_winners_and_accepts_only_new_placement_actions() {
+    let store = Store::open_memory("migration-rerun").unwrap();
+    legacy_migration_fixture(&store);
+    migrate_placements(&store);
+    edit(&store, json!([place(SEAT_A, None, "a9"),{"op":"remove","member":SEAT_B}]));
+    let before: Vec<_> = [SEAT_A,SEAT_B,SEAT_C].iter().map(|member| head(&store, member)).collect();
+    migrate_placements(&store);
+    for (member, expected) in [SEAT_A,SEAT_B,SEAT_C].iter().zip(before) {
+        assert_eq!(head(&store, member), expected);
+    }
+    let index = store.index().unwrap();
+    let refused = store.edit_arrangement(&arrangement_input(json!([
+        {"op":"subject.place","subject":SEAT_A,"folder":null,"key":"a0"}
+    ])), &BTreeMap::new()).unwrap_err();
+    assert_eq!(refused.code, "invalid-arrangement-operations");
+    assert_eq!(store.index().unwrap(), index);
+}
+
+#[test]
+fn placement_migration_concurrent_legacy_writer_is_included_or_refused_atomically() {
+    for round in 0..8 {
+        let store = Arc::new(Store::open_memory(&format!("migration-race-{round}")).unwrap());
+        legacy_migration_fixture(&store);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writer = store.clone();
+        let writer_barrier = barrier.clone();
+        let task = std::thread::spawn(move || {
+            writer_barrier.wait();
+            writer.edit_arrangement(&arrangement_input(json!([
+                {"op":"subject.place","subject":SEAT_A,"folder":null,"key":"a9"}
+            ])), &BTreeMap::new())
+        });
+        barrier.wait();
+        migrate_placements(&store);
+        match task.join().unwrap() {
+            Ok(claim) => {
+                assert_eq!(head(&store, SEAT_A).1, claim.id);
+                assert_eq!(head(&store, SEAT_A).0.unwrap()["key"], "a9");
+            }
+            Err(error) => assert_eq!(error.code, "invalid-arrangement-operations"),
+        }
+        assert_eq!(store.arrangement(CONTAINER, u64::MAX).unwrap().unwrap()["body"]["version"], 2);
+    }
+}
+
+#[test]
+fn placement_migration_replication_routes_offline_v1_writes_without_reverting_authority() {
+    let source = Store::open_memory("migration-modern").unwrap();
+    legacy_migration_fixture(&source);
+    let offline = Store::open_memory("migration-offline").unwrap();
+    sync(&source, &offline);
+    migrate_placements(&source);
+    let legacy = folder_edit(&offline, json!([
+        {"op":"subject.place","subject":SEAT_A,"folder":null,"key":"a8"},
+        {"op":"subject.place","subject":SEAT_C,"folder":FOLDER_A,"key":"a7"}
+    ]));
+    sync(&offline, &source);
+    assert_eq!(head(&source, SEAT_A).1, legacy.id);
+    assert_eq!(head(&source, SEAT_C).1, legacy.id);
+    assert_eq!(source.arrangement(CONTAINER, u64::MAX).unwrap().unwrap()["body"]["version"], 2);
+    sync(&source, &offline);
+    assert_eq!(layout_digests(&source), layout_digests(&offline));
+    let fresh = Store::open_memory("migration-fresh-peer").unwrap();
+    sync(&source, &fresh);
+    assert_eq!(layout_digests(&source), layout_digests(&fresh));
+    for store in [&source,&offline,&fresh] {
+        let before = layout_digests(store);
+        store.rebuild_claim_projections().unwrap();
+        assert_eq!(layout_digests(store), before);
+        assert!(store.replay_graph_for_heal().unwrap());
+        assert_eq!(layout_digests(store), before);
+    }
+}
+
+#[test]
+fn placement_migration_checkpoint_and_replay_preserve_hidden_original_winners() {
+    let store = Store::open_memory("migration-checkpoint").unwrap();
+    let original = legacy_migration_fixture(&store);
+    let marker = migrate_placements(&store);
+    for number in 0..5 {
+        let mut noise = claim("daemon/migration-noise", "daemon.diagnostic",
+            json!({"severity":"warning","code":"migration-noise","reason":format!("sample {number}")}));
+        noise.actor = None;
+        store.append_claim(&noise).unwrap();
+    }
+    let before = layout_digests(&store);
+    let directory = tempfile::tempdir().unwrap();
+    let (plan, proof) = store.plan_checkpoint(now_ms()+1, directory.path()).unwrap();
+    assert!(proof.passed);
+    assert!(plan.claims.iter().any(|claim| claim.kind == "daemon.diagnostic"));
+    assert!(plan.claims.iter().all(|claim| !matches!(claim.kind.as_str(), "arrangement.edited" | "ordered-membership.edited")));
+    store.apply_checkpoint_drop("checkpoint/migration", &plan.envelopes, &plan.claims).unwrap();
+    assert_eq!(layout_digests(&store), before);
+    store.rebuild_claim_projections().unwrap();
+    assert_eq!(layout_digests(&store), before);
+    assert!(store.claim_by_id(&original.id).unwrap().is_some());
+    assert!(store.claim_by_id(&marker.id).unwrap().is_some());
+    assert_eq!(head(&store, SEAT_C).1, original.id);
+}
+
+#[test]
+fn placement_migration_failed_backfill_rolls_back_and_retry_survives_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("migration.sqlite");
+    let store = Store::open(&path, "migration-restart").unwrap();
+    legacy_migration_fixture(&store);
+    let before = layout_digests(&store);
+    store.connection.write().execute_batch(
+        "CREATE TRIGGER migration_failure BEFORE INSERT ON ordered_membership_heads
+         WHEN NEW.member='agent/ada/seat-c' BEGIN SELECT RAISE(ABORT,'interrupted migration'); END;"
+    ).unwrap();
+    assert!(store.edit_arrangement(&arrangement_input(json!([{"op":"membership.migrate"}])),
+        &BTreeMap::new()).is_err());
+    assert_eq!(layout_digests(&store), before);
+    assert_eq!(store.arrangement(CONTAINER, u64::MAX).unwrap().unwrap()["body"]["version"], 1);
+    store.connection.write().execute_batch("DROP TRIGGER migration_failure").unwrap();
+    drop(store);
+    let store = Store::open(&path, "migration-restart").unwrap();
+    assert_eq!(layout_digests(&store), before);
+    migrate_placements(&store);
+    let migrated = layout_digests(&store);
+    let retained = head(&store, SEAT_C);
+    drop(store);
+    let store = Store::open(&path, "migration-restart").unwrap();
+    assert_eq!(layout_digests(&store), migrated);
+    assert_eq!(head(&store, SEAT_C), retained);
+    migrate_placements(&store);
+    assert_eq!(head(&store, SEAT_C), retained);
+}

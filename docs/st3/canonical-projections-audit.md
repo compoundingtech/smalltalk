@@ -151,14 +151,18 @@ filtering. Admission limits count live entries only; replication retains converg
 Claim history, absent winners, hidden edges and folder tombstones have no new drop rule.
 
 Version-2 arrangements have folder-only bodies and consume ordered memberships.
-Version-1 placements remain intact and are not treated as empty membership pages or
-implicitly converted. Canonical-winner-preserving migration of existing placements is
-separate from this primitive. The combined layout identity is
-`st3.shared-projections.ordered-membership.v1`; older layouts continue exchanging claims
-but do not compare incompatible projection maps.
-Concurrent v1/v2 creates preserve any unrepaired v1 creation or placement authority.
-Projection caches that effective layout in an existing explicit-version register; pure
-legacy layouts gain no synthetic register, and reads/admission use an indexed lookup.
+Unmigrated version-1 placements remain intact and refuse membership pages rather than
+pretending to be empty. Explicit `membership.migrate` retains an authority marker and
+backfills original placement winner bytes/revisions into ordered pair heads atomically.
+Historical placement registers remain replay-boundary sources, not active v2 placements.
+Late replicated legacy placements feed the same ordered LWW pair reducer; local legacy
+placement writes refuse after cutover. Rebuild uses the identical conversion.
+The combined layout identity is
+`st3.shared-projections.arrangement-placement-migration.v1`; older layouts continue exchanging
+claims but do not compare incompatible projection maps.
+Concurrent v1/v2 creates preserve unrepaired v1 authority unless explicit migration activates
+membership authority. Reads/admission consult the indexed retained marker/version registers;
+pure legacy layouts gain no synthetic register.
 Repairing a retained arrangement or membership original rebuilds both dependent projections,
 including the container revision and reverse edges, so operations omitted by a replacement
 cannot remain visible. Incremental projection and rebuild both exclude repaired originals.
