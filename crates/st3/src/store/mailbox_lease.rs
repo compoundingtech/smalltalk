@@ -973,6 +973,7 @@ impl Store {
 
     /// Repair only the exact canonical lease. Never mint a token or advance an epoch.
     /// Deleting/revoking a binding is terminal; only displacement of its owner is repairable.
+    #[cfg(test)]
     pub(crate) fn repair_mailbox(
         &self,
         fence: &Fence,
