@@ -1,7 +1,8 @@
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
 import type { CollectionSocket } from '@smalltalk/st3-client'
-import { createTestGateway, testArrangement, testSelection, testSnapshot } from './testGateway.ts'
+import { createTestGateway, testSelection, testSnapshot } from './testGateway.ts'
 import { selectionParts } from './client.ts'
+import { followArrangementInventory, type InventoryEvent } from '../data/arrangements.ts'
 
 it('uses real generated SDK arrangements routes, explicit owner and action request shape', async () => {
   const gateway = await createTestGateway()
@@ -27,24 +28,27 @@ it('refuses a mismatched owner or non-UUIDv7 subject', () => {
   expect(() => selectionParts({ ...testSelection, owner: 'person/other' })).toThrow()
   expect(() => selectionParts({ ...testSelection, subject: 'arrangement/person/example/not-a-uuid' })).toThrow()
 })
-it('subscribes to the selected arrangement and applies authoritative snapshot, changes and retirement', async () => {
+it('follows the owner-wide window and re-reads the complete list through the generated SDK routes', async () => {
   const gateway = await createTestGateway()
   const sent: unknown[] = []
-  const values: (string | undefined)[] = []
+  const events: InventoryEvent[] = []
   const socket: CollectionSocket = { onopen: null, onmessage: null, onclose: null, onerror: null, close: () => undefined, send: (body) => sent.push(JSON.parse(body)) }
+  const follow = followArrangementInventory({ gateway: gateway.sdk, owner: testSelection.owner, socket: () => socket, onEvent: (event) => events.push(event) })
   try {
-    const stream = await gateway.client.watch((value) => values.push(value?.body.name.value), { socket: () => socket })
+    await vi.waitFor(() => expect(socket.onopen).not.toBeNull())
     socket.onopen?.()
-    expect(sent).toContainEqual({ kind: 'subscribe', id: 'folders', collection: 'arrangements', person: testSelection.owner, limit: 100, subject: testSelection.subject })
+    await vi.waitFor(() => expect(sent).toEqual([{ kind: 'subscribe', id: 'arrangements-inventory', collection: 'arrangements', person: testSelection.owner, limit: 1 }]))
     const send = (frame: unknown): void => socket.onmessage?.({ data: JSON.stringify(frame) })
-    send({ kind: 'snapshot', id: 'folders', collection: 'arrangements', has_more: false, items: [testArrangement()], order: [testSelection.subject], snapshot: testSnapshot })
-    const renamed = testArrangement()
-    renamed.body.name.value = 'Concurrent rename'
-    send({ kind: 'changes', id: 'folders', collection: 'arrangements', has_more: false, upserts: [renamed], removes: [], order: [testSelection.subject], snapshot: testSnapshot })
-    send({ kind: 'changes', id: 'folders', collection: 'arrangements', has_more: false, upserts: [], removes: [testSelection.subject], order: [], snapshot: testSnapshot })
-    expect(values).toEqual(['Sidebar', 'Concurrent rename', undefined])
-    stream.close()
-  } finally { await gateway.close() }
+    send({ kind: 'snapshot', id: 'arrangements-inventory', collection: 'arrangements', has_more: true, items: [], order: [], snapshot: testSnapshot })
+    await vi.waitFor(() => expect(events).toHaveLength(1))
+    gateway.state.current.body.name.value = 'Renamed outside the window'
+    send({ kind: 'changes', id: 'arrangements-inventory', collection: 'arrangements', has_more: true, upserts: [], removes: [], order: [], snapshot: testSnapshot })
+    await vi.waitFor(() => expect(events).toHaveLength(2))
+    expect(events.map((event) => event._tag === 'Complete' ? event.inventory.items.map((item) => item.body.name.value) : event._tag))
+      .toEqual([['Sidebar'], ['Renamed outside the window']])
+    expect(gateway.calls.filter((call) => call.url.startsWith('/v1/client/arrangements?')).map((call) => call.url))
+      .toEqual(['/v1/client/arrangements?person=person%2Fexample', '/v1/client/arrangements?person=person%2Fexample'])
+  } finally { follow.close(); await gateway.close() }
 })
 it('validates generated resource shapes rather than trusting compile-time SDK types', async () => {
   const gateway = await createTestGateway()
@@ -56,18 +60,19 @@ it('validates generated resource shapes rather than trusting compile-time SDK ty
     await expect(gateway.client.read()).rejects.toThrow('Arrangement response')
   } finally { await gateway.close() }
 })
-it('terminates malformed selected collection frames once without publishing invalid rows', async () => {
+it('ends malformed owner-wide frames once without reading or publishing their rows', async () => {
   const gateway = await createTestGateway()
   let closed = 0
-  let errors = 0
-  let values = 0
+  const events: InventoryEvent[] = []
   const socket: CollectionSocket = { onopen: null, onmessage: null, onclose: null, onerror: null, close: () => { closed++ }, send: () => undefined }
+  const follow = followArrangementInventory({ gateway: gateway.sdk, owner: testSelection.owner, socket: () => socket, onEvent: (event) => events.push(event) })
   try {
-    await gateway.client.watch(() => { values++ }, { socket: () => socket, onEnd: () => { errors++ } })
-    socket.onmessage?.({ data: JSON.stringify({ kind: 'changes', id: 'folders', collection: 'arrangements' }) })
-    socket.onmessage?.({ data: '{}' })
-    expect(closed).toBe(1)
-    expect(errors).toBe(1)
-    expect(values).toBe(0)
-  } finally { await gateway.close() }
+    await vi.waitFor(() => expect(socket.onmessage).not.toBeNull())
+    const onmessage = socket.onmessage
+    onmessage?.({ data: JSON.stringify({ kind: 'changes', id: 7, collection: 'arrangements' }) })
+    onmessage?.({ data: JSON.stringify({ kind: 'changes', id: 'arrangements-inventory', collection: 'arrangements' }) })
+    await vi.waitFor(() => expect(closed).toBe(1))
+    expect(events.map((event) => event._tag)).toEqual(['Interrupted'])
+    expect(gateway.calls.some((call) => call.url.startsWith('/v1/client/arrangements'))).toBe(false)
+  } finally { follow.close(); await gateway.close() }
 })
