@@ -53,9 +53,11 @@ function DeferredImage({ src = '', alt = '' }: React.ComponentProps<'img'>) {
   return loadedSrc !== undefined ? <img src={loadedSrc} alt={alt} referrerPolicy="no-referrer" {...stylex.props(styles.image)} /> : <span data-testid="deferred-image" data-image-src={src} {...stylex.props(styles.imagePlaceholder)}><span>{alt || 'Image'} · {host}</span><Button onPress={() => setApprovedSrc(src)} onClick={event => { event.preventDefault(); event.stopPropagation() }} {...stylex.props(styles.imageAction)}>Load image</Button></span>
 }
 
-function MarkdownLink({ children, href, title }: React.ComponentProps<'a'>) {
+function MarkdownLink({ children, href, title, node }: React.ComponentProps<'a'> & ExtraProps) {
   const { resolveImage } = React.useContext(ReferenceContext)
-  return <ReferenceContext.Provider value={{ resolveImage }}><Link href={href} target="_blank" rel="noopener noreferrer" render={props => <a {...props as React.ComponentPropsWithRef<'a'>} title={title} />} {...stylex.props(styles.link)}>{children}</Link></ReferenceContext.Provider>
+  const imageLink = node?.children.some(child => child.type === 'element' && child.tagName === 'img') ?? false
+  const link = <Link href={href} target="_blank" rel="noopener noreferrer" render={props => <a {...props as React.ComponentPropsWithRef<'a'>} title={title} />} {...stylex.props(styles.link)}>{imageLink ? 'Open link' : children}</Link>
+  return <ReferenceContext.Provider value={{ resolveImage }}>{imageLink ? <span>{children}{' '}{link}</span> : link}</ReferenceContext.Provider>
 }
 
 function Paragraph({ children, node }: React.ComponentProps<'p'> & ExtraProps) {
