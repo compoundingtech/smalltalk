@@ -26,7 +26,7 @@ describe('portable sync presentation', () => {
   expect(syncLine({status:{_tag:'Stale',reason:{_tag:'Evicted'}},label:'conversation',now:6000,observedAt:5000})).toBeUndefined()
  })
  it('preserves a reported failure rather than announcing synchronization', () => {
-  expect(syncLine({status:{_tag:'Failed',code:'forbidden',message:'Denied'},label:'conversation',now:6000,observedAt:5000})).toMatchObject({text:'No access to conversation · ask the gateway owner',tone:'error',animate:false})
-  expect(syncLine({status:{_tag:'Failed',code:'reported-code',message:'Actual reported detail'},label:'conversation',now:6000,observedAt:5000})).toMatchObject({text:"Couldn't load conversation: Actual reported detail",tone:'error'})
+  expect(syncLine({status:{_tag:'Failed',cause:{_tag:'Server',code:'forbidden',message:'Denied'}},label:'conversation',now:6000,observedAt:5000})).toMatchObject({text:'No access to conversation · ask the gateway owner',tone:'error',animate:false})
+  expect(syncLine({status:{_tag:'Failed',cause:{_tag:'Server',code:'reported-code',message:'Actual reported detail'}},label:'conversation',now:6000,observedAt:5000})).toMatchObject({text:"Couldn't load conversation: Actual reported detail",tone:'error'})
  })
 })
