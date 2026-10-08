@@ -208,6 +208,14 @@
       "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
     },
     {
+      "action": "prompt.respond",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::prompt_response_survives_stale_revisions_and_daemon_restarts_once",
+        "crates/st3/src/api/client_v0.rs::prompt_response_round_trip_uses_native_socket_and_keeps_content_private"
+      ],
+      "behavior": "owner-only native answer: stale card revision refused without writes; accepted after daemon restart; exact replay after restart preserves one native decision; recorded closure survives restart"
+    },
+    {
       "action": "review.approve",
       "tests": [
         "crates/st3/tests/action_coverage.rs::human_review_actions_survive_stale_fences_and_restarts"
@@ -523,7 +531,9 @@
     {
       "command": "st agents rollout",
       "description": "Retry a published owned-seat cutover with fresh desired and incarnation fences.",
-      "tests": ["crates/st3/tests/action_coverage.rs::cli_owned_seat_rollout_captures_fences_and_survives_restart"],
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_owned_seat_rollout_captures_fences_and_survives_restart"
+      ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {

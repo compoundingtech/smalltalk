@@ -1046,8 +1046,21 @@ impl Store {
             })
             .await
             {
-                Ok(Ok(work)) if work.more => Duration::from_millis(100),
-                Ok(Ok(_)) => Duration::from_secs(1),
+                Ok(Ok(work)) => {
+                    if work.examined > 0 || work.processed > 0 {
+                        tracing::trace!(
+                            examined = work.examined,
+                            processed = work.processed,
+                            more = work.more,
+                            "attention history maintenance completed"
+                        );
+                    }
+                    if work.more {
+                        Duration::from_millis(100)
+                    } else {
+                        Duration::from_secs(1)
+                    }
+                }
                 result => {
                     tracing::warn!(?result, "attention history maintenance failed");
                     Duration::from_secs(5)

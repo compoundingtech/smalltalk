@@ -4078,6 +4078,7 @@ mod tests {
                 "harness.diagnostic",
                 "harness.limits",
                 "harness.observed",
+                "harness.prompt",
                 "harness.session-file",
                 "harness.telemetry",
                 "harness.timeline",

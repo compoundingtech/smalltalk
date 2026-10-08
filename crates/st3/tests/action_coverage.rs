@@ -465,6 +465,7 @@ async fn dispatch(
         "mission.approve-revision" => mission_approve_revision, "mission.cancel" => mission_cancel,
         "mission.cancel-revision" => mission_cancel_revision, "mission.revise" => mission_revise,
         "mission.start" => mission_start, "pairing.revoke" => pairing_revoke,
+        "prompt.respond" => prompt_respond,
         "review.approve" => review_approve, "review.reject" => review_reject, "review.request-changes" => review_request_changes,
         "runtime.context-clear" => runtime_context_clear, "runtime.reset" => runtime_reset,
         "runtime.restart" => runtime_restart, "runtime.signal" => runtime_signal, "runtime.stop" => runtime_stop,
@@ -477,6 +478,105 @@ async fn dispatch(
         "work.publish-mission" => work_publish_mission, "work.release" => work_release,
         "work.renew" => work_renew, "work.retry" => work_retry,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_response_survives_stale_revisions_and_daemon_restarts_once() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let mut daemon = Daemon::new().await;
+    daemon.worker();
+    let native = tempfile::tempdir().unwrap();
+    st_drivers::harness_events::enable(native.path(), "4242:fixture").unwrap();
+    st_drivers::harness_events::write_snapshot(
+        native.path(),
+        "harness-state",
+        &serde_json::to_vec(&json!({"incarnation":"provider-a","harness":"claude"})).unwrap(),
+    )
+    .unwrap();
+    let path = native.path().to_owned();
+    let hook = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        st_drivers::prompts::run_claude(
+            &path,
+            "provider-a",
+            &json!({"session_id":"session-a","tool_name":"Bash","tool_input":{"command":"printf restart-fixture"}}),
+            Duration::from_secs(20),
+            &mut output,
+            &|| false,
+        )
+        .unwrap();
+        output
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let prompt = loop {
+        if let Some(prompt) = st_drivers::harness_events::live_prompts(native.path(), "4242:fixture")
+            .unwrap()
+            .into_iter()
+            .next()
+        {
+            break prompt;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let publish = |daemon: &Daemon, prompt: &st_drivers::prompts::Prompt, sequence| {
+        daemon.store().append_harness_event(&st3::harness_events::Publication {
+            runtime_incarnation: prompt.runtime_incarnation.clone(),
+            sequence,
+            claim: ClaimInput {
+                subject: WORKER.into(),
+                kind: "harness.prompt".into(),
+                actor: Some(WORKER.into()),
+                fields: BTreeMap::from([
+                    ("incarnation_id".into(), json!(prompt.runtime_incarnation)),
+                    ("prompt".into(), json!(prompt)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("restart-prompt:{sequence}")),
+            },
+        }).unwrap();
+    };
+    publish(&daemon, &prompt, 1);
+    let attention: Value = daemon.transport().get("/v1/client/attention").await.unwrap();
+    let card = attention["items"].as_array().unwrap().iter()
+        .find(|card| card["episode"] == prompt.episode).unwrap();
+    let mut fence = daemon.fence(PERSON).await;
+    fence.subject_revisions.insert(
+        card["id"].as_str().unwrap().into(),
+        card["revision"].as_str().unwrap().into(),
+    );
+    fence.runtime_incarnation = Some(prompt.runtime_incarnation.clone());
+    daemon.exercise(PERSON, "prompt.respond", json!({
+        "target_id":card["source_id"], "episode":prompt.episode,
+        "prompt_id":prompt.prompt_id, "answer_id":"approve"
+    }), fence).await;
+    let output: Value = serde_json::from_slice(&hook.join().unwrap()).unwrap();
+    assert_eq!(output["hookSpecificOutput"]["decision"]["behavior"], "allow");
+    assert!(st_drivers::prompts::send_answer(
+        prompt.endpoint.as_deref().unwrap(),
+        &st_drivers::prompts::Answer {
+            episode: prompt.episode.clone(),
+            prompt_id: prompt.prompt_id.clone(),
+            runtime_incarnation: prompt.runtime_incarnation.clone(),
+            answer_id: "approve".into(),
+        },
+    ).is_err());
+    let mut final_event = st_drivers::harness_events::pending(native.path(), 32).unwrap()
+        .into_iter().rev().find(|event| event.kind == "harness-prompt").unwrap().payload;
+    final_event.as_object_mut().unwrap().remove("account_ref");
+    publish(&daemon, &serde_json::from_value(final_event).unwrap(), 2);
+    daemon.restart().await;
+    let attention: Value = daemon.transport().get("/v1/client/attention").await.unwrap();
+    assert!(!attention["items"].as_array().unwrap().iter()
+        .any(|card| card["episode"] == prompt.episode));
+    let history: Value = daemon.transport().get("/v1/client/attention?history=true").await.unwrap();
+    let closed = history["items"].as_array().unwrap().iter()
+        .find(|card| card["episode"] == prompt.episode).unwrap();
+    assert_eq!(closed["prompt"]["state"], "answered");
+    assert_eq!(closed["actions"], json!([]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

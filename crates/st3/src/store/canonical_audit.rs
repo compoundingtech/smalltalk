@@ -78,6 +78,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_attention_history_state",
         "local_attention_history_dirty",
         "local_attention_history_errors",
+        "local_harness_prompts",
         "graph_generation",
         "fleet_generation",
         "projection_digest_state",
