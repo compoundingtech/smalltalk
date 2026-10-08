@@ -35,7 +35,7 @@ Both production wrappers passed these real-manager controls:
 | Control | Result |
 | --- | --- |
 | Literal `%n:$HOME:${UNSET}:$$:%%` followed by a non-UTF-8 `ff` byte, empty argument, and `two words` | Exact argument bytes preserved. |
-| Working directory `/home/ada/ws%$literal` | Inherited exactly. |
+| Working directory `~/ws%$literal` | Inherited exactly. |
 | Environment value `%n:$HOME:${UNSET}:$$:%%` | Inherited exactly. |
 | Standard input containing a NUL, percent and dollar bytes | Preserved; stdout captured and stderr marker received. |
 | Child exit code 37 | Propagated through the scope wrapper. |
@@ -57,7 +57,7 @@ removed that interpretation boundary; the same raw argument then passed.
 ## Service and seat
 
 `st service install` installed the daemon's ordinary user service.
-`st agents new scope-recheck --harness codex --workspace '/home/ada/ws%$literal'
+`st agents new scope-recheck --harness codex --workspace "$HOME"/'ws%$literal'
 --timeout 90s` returned ready. The real native Codex driver and PTY launched a
 provider stand-in speaking the app-server protocol. The stand-in received a
 message and replied through the real `st conversations reply` CLI. It did not
