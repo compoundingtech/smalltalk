@@ -29,6 +29,7 @@ Stories:
 - **Fractal UI / Markdown**: CommonMark + GFM coverage with streamed fences and inline markup; language fences assert lazy grammar loading and stable wrap/copy state.
 - **Fractal UI / Thinking Entry**: the muted reasoning disclosure, settled and streaming.
 - **Fractal UI / Sync Line**: every observation across both schemes; `TransitionSequence` asserts fixed-height slots and CLS 0 across all transitions.
+- **Fractal UI / Transcript**: the locked U2·F3·Y3 transcript in dark and light: settled/expanded work, streamed answers, failed/interrupted/unknown work, loading, retained-history synchronization, answer metadata, unavailable conversations, the older-history boundary with and without a load action, pending and failed sends (including Pending→Sent identity) and the read-only empty state.
 - **Fractal UI / Sidebar/Agent Row**: compact hover-card facts, omitted unreported fields, the known-vs-none time cohort and the quick Open hover action.
 
 ## Families
@@ -70,6 +71,19 @@ Stories:
 Every foreground/background pair used for text meets WCAG AA (≥ 4.5:1) in all six palettes. The minimum, 4.59:1, is in Relay dark. Under `prefers-reduced-motion`, durations are zero and spinner and pulse animations stop. Fonts come from system stacks only; no font or image assets are distributed.
 
 ## Assistant-ui surfaces
+
+### Gated transcript and work log
+
+`Transcript` is the locked U2·F3·Y3 presentation: left-aligned prompts with an accent rule, four-line highlighted tool previews with a host-owned Open action, and a thin synchronization/run progress rail above the header status. Render it under `EmbraceRuntimeProvider` with the same source references used by the runtime. The host supplies `TranscriptTurn` boundaries, work/lifecycle facts, sender captions, retry actions, output navigation and the observation clock. The kit never creates a transport, split-pane controller or turn state machine.
+
+Only committed runtime source references render. Settled work folds; running, failed, interrupted and explicitly incomplete work stays expanded. Tool rows identify state and observed duration, use non-interactive rows for absent output, highlight commands, and retain an expanded-work divider. Counts appear only when the host reports them or marks the helper's source history complete. A settled answer keeps its copy action and known completion time below the prose; invalid timestamps are omitted and streamed answers have no settled footer. The one response-in-progress status stays at the turn's live edge.
+
+The host also states what it knows about the conversation itself. `availability` (`Available` or `Unavailable` with host-supplied `reason`/`detail`) swaps the thread for a calm inline state. `history` (`Complete` or `HasOlder`) adds an "Earlier messages not loaded" boundary; "Load earlier messages" appears only when the host passes `onLoadEarlier`. A user `TextItem` may carry `sendState` (`Sent`, `Pending`, or `Failed` with `reason`/`detail`): pending prompts render muted, failed prompts show the reason as a danger line with detail on disclosure, and the item keeps its id from Pending to Sent so the server echo replaces the row in place. `emptyState` (a node or `{ title, body }`) replaces the neutral "No messages yet" once the conversation is live; `EmbraceThread` accepts the same prop. The kit never invents reason copy.
+
+`EmbraceScrollViewport` follows the latest messages until the reader scrolls, focuses or navigates within history. It preserves the visible row anchor through content growth and width changes without invalidating the message subtree. New content while detached reveals a docked **New messages ↓** button; activating it resumes following. `EmbraceThread` uses the same viewport for its non-virtual E3 lane.
+
+The shared Markdown boundary keeps exactly one streaming caret on the final paragraph line, or immediately after another terminal block. Tool output uses the exported `HighlightedSource` boundary. Failure banners optionally expose a host-owned **Open output** action without clearing or reflowing history.
+
 
 ### Portable sync seam
 

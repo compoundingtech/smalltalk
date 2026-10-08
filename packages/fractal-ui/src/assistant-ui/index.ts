@@ -1,18 +1,21 @@
 /** Shared assistant-ui presentation and external-store boundary. Applications own transport and state. */
 export * from './EmbraceRuntime.tsx'
 export * from './EmbraceThread.tsx'
+export * from './EmbraceScrollViewport.tsx'
+export * from './composition/Transcript.tsx'
 export * from './EmbraceComposer.tsx'
 export * from './EmbraceToolCall.tsx'
 export * from './EmbraceToolPreview.tsx'
 export * from './EmbraceVirtualConversation.tsx'
 export * from './embrace-converter.ts'
+export type { SendState, TextItem } from './embrace-data/model.ts'
 export type { Draft, DraftToken, MentionToken, CommandToken, SerializedDraft, SlashCommand, SlashCommandId } from './embrace-composer/draft.ts'
 
 /** Reusable round-2 live composition primitives; transport stays application-owned. */
 export { AgentRow, StatusGlyph } from './composition/Sidebar.tsx'
 export { ThreadHeader, ResizableSplit } from './composition/Shell.tsx'
 export { DiffPanel } from './composition/DiffPanel.tsx'
-export { Markdown, ResourceChip, completeStreamingTail } from './composition/Markdown.tsx'
+export { Markdown, ResourceChip, HighlightedSource, completeStreamingTail } from './composition/Markdown.tsx'
 export type { MarkdownProps, InlineResource, InlineReferenceRenderer } from './composition/Markdown.tsx'
 export { ThinkingEntry } from './composition/ThinkingEntry.tsx'
 export { ErrorOverlay, ErrorOverlayHost, useErrorOverlaySurface } from './composition/ErrorOverlay.tsx'

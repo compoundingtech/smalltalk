@@ -2,7 +2,7 @@ import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import {
   ActionBarPrimitive, AttachmentPrimitive, BranchPickerPrimitive,
-  ComposerPrimitive, ErrorPrimitive, MessagePrimitive, MessagePartPrimitive,
+  ComposerPrimitive, ErrorPrimitive, MessagePrimitive,
   ThreadPrimitive, useAuiState,
 } from '@assistant-ui/react'
 import { readingColumnStyles } from './reading-column.stylex'
@@ -13,6 +13,10 @@ import { WorkLogV1 } from './taste/WorkLogV1'
 import { committedWorkLogs, type WorkLogProjection } from './taste/work-log'
 import { EmbraceComposer, type EmbraceComposerProps } from './EmbraceComposer'
 import { EmbraceToolCall, EmbraceToolRegistrations, EmbraceToolRun, EmbraceToolVariantContext, type ToolVariant } from './EmbraceToolCall'
+import { EmbraceScrollViewport } from './EmbraceScrollViewport'
+import { Markdown } from './composition/Markdown'
+import { ThinkingEntry } from './composition/ThinkingEntry'
+import { SendFailure, TranscriptEmptyContent, type TranscriptEmptyState } from './composition/Transcript'
 
 export type EmbraceLevel = 'E1' | 'E2' | 'E3' | 'E4'
 export type SenderVariant = 'S1' | 'S2' | 'S3'
@@ -37,6 +41,8 @@ export interface EmbraceThreadProps {
   readonly onCommit?: React.ProfilerOnRenderCallback
   /** Caller-owned workbench layout overrides the workshop's default frame. */
   readonly style?: stylex.StyleXStyles
+  /** Copy for a thread with no messages; defaults to a neutral "No messages yet". */
+  readonly emptyState?: React.ReactNode | TranscriptEmptyState
 }
 interface DisplayOptions { embrace: EmbraceLevel; senders: SenderVariant; showSender: boolean }
 const DisplayContext = React.createContext<DisplayOptions>({ embrace: 'E1', senders: 'S2', showSender: true })
@@ -46,11 +52,13 @@ function Attachment() {
     <AttachmentPrimitive.Name />
   </AttachmentPrimitive.Root>
 }
-function TextPart() {
-  return <p {...stylex.props(styles.text)}><MessagePartPrimitive.Text /></p>
+function TextPart({ text }: { text: string }) {
+  const item = useAuiState(state => state.message.metadata.custom.item) as ConversationItem | undefined
+  return <Markdown text={text} streaming={item?._tag === 'Text' && item.streaming} />
 }
-function ReasoningPart() {
-  return <details {...stylex.props(styles.reasoning)}><summary>Reasoning</summary><MessagePartPrimitive.Text /></details>
+function ReasoningPart({ text }: { text: string }) {
+  const item = useAuiState(state => state.message.metadata.custom.item) as ConversationItem | undefined
+  return <ThinkingEntry text={text} streaming={item?._tag === 'Reasoning' && item.streaming} />
 }
 export function EmbraceMessage() {
   const options = React.useContext(DisplayContext)
@@ -60,12 +68,12 @@ export function EmbraceMessage() {
   const item = custom.item as ConversationItem | undefined
   const sender = custom.sender as { label?: string; kind?: string } | undefined
   const label = options.senders === 'S1' ? role : sender?.label ?? sender?.kind ?? role
-  return <MessagePrimitive.Root data-testid="transcript-message" data-item-id={item?.id} {...stylex.props(styles.message, role === 'user' && styles.userMessage)}>
+  return <MessagePrimitive.Root data-testid="transcript-message" data-item-id={item?.id} data-send-state={item?._tag === 'Text' && item.role === 'user' ? (item.sendState?._tag ?? 'Sent').toLowerCase() : undefined} {...stylex.props(styles.message, role === 'user' && styles.userMessage, item?._tag === 'Text' && item.role === 'user' && item.sendState?._tag === 'Pending' && styles.userPending)}>
     {options.showSender ? <header {...stylex.props(styles.sender)}>
       {options.senders === 'S1' ? null : <span aria-hidden="true" {...stylex.props(styles.avatar)}>{label.slice(0, 2).toUpperCase()}</span>}
       <strong {...stylex.props(styles.senderName)}>{label}</strong>
     </header> : null}
-    {editing ? <ComposerPrimitive.Root {...stylex.props(styles.edit)}><ComposerPrimitive.Input aria-label="Edit message" {...stylex.props(styles.input)} /><ComposerPrimitive.Send {...stylex.props(styles.button)}>Save edit</ComposerPrimitive.Send><ComposerPrimitive.Cancel {...stylex.props(styles.button)}>Cancel edit</ComposerPrimitive.Cancel></ComposerPrimitive.Root> : <MessagePrimitive.Parts components={{ Text: TextPart, Reasoning: ReasoningPart, tools: { Fallback: EmbraceToolCall } }} />}
+    {editing ? <ComposerPrimitive.Root {...stylex.props(styles.edit)}><ComposerPrimitive.Input aria-label="Edit message" {...stylex.props(styles.input)} /><ComposerPrimitive.Send {...stylex.props(styles.button)}>Save edit</ComposerPrimitive.Send><ComposerPrimitive.Cancel {...stylex.props(styles.button)}>Cancel edit</ComposerPrimitive.Cancel></ComposerPrimitive.Root> : <><MessagePrimitive.Parts components={{ Text: TextPart, Reasoning: ReasoningPart, tools: { Fallback: EmbraceToolCall } }} />{item?._tag === 'Text' && item.role === 'user' && item.sendState?._tag === 'Failed' && <SendFailure state={item.sendState} />}</>}
     {options.embrace !== 'E1' ? <>
       <MessagePrimitive.Attachments components={{ Attachment }} />
       <MessagePrimitive.Error><ErrorPrimitive.Root {...stylex.props(styles.error)}><ErrorPrimitive.Message /></ErrorPrimitive.Root></MessagePrimitive.Error>
@@ -107,7 +115,7 @@ function rowsFor(items: readonly ConversationItem[], tools: ToolVariant, workLog
 }
 const noWorkLogs: readonly WorkLogProjection[] = []
 /** Render under AssistantRuntimeProvider. The app keeps ownership of stores and callbacks. */
-export function EmbraceThread({ items: snapshot, workLogs, readingColumn = false, embrace = 'E1', tools = 'rows', senders = 'S2', composer = 'C1', history, targetLabel, disabledReason, threadList, toolbar, composerProps, onCommit, style }: EmbraceThreadProps) {
+export function EmbraceThread({ items: snapshot, workLogs, readingColumn = false, embrace = 'E1', tools = 'rows', senders = 'S2', composer = 'C1', history, targetLabel, disabledReason, threadList, toolbar, composerProps, onCommit, emptyState, style }: EmbraceThreadProps) {
   const messages = useAuiState(state => state.thread.messages)
   // The adapter commits after React renders its new input snapshot. Use the
   // runtime's committed identities and source references so RAC never measures
@@ -135,7 +143,7 @@ export function EmbraceThread({ items: snapshot, workLogs, readingColumn = false
     : <>{row.liveWork ? <WorkLogV1 key={row.liveWork.id} turn={row.liveWork.turn} /> : null}{row.toolItems ? <EmbraceToolRun forceExpanded={workLogs !== undefined} items={row.toolItems} renderItem={item => renderMessage(row.indices.find(index => items[index]!.id === item.id)!)} /> : renderMessage(row.indices[0]!)}</>
   const renderRow = (row: TranscriptRow) => readingColumn ? <div data-testid="transcript-reading-column" {...stylex.props(readingColumnStyles.column)}>{renderRowContent(row)}</div> : renderRowContent(row)
   const transcript = embrace === 'E3'
-    ? <ThreadPrimitive.Viewport data-testid="transcript-scroll" autoScroll={false} scrollToBottomOnInitialize={false} {...stylex.props(styles.viewport)}>{rows.map(row => <React.Fragment key={row.id}>{renderRow(row)}</React.Fragment>)}</ThreadPrimitive.Viewport>
+    ? <EmbraceScrollViewport items={rows} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.viewport)}>{rows.map(row => <React.Fragment key={row.id}>{renderRow(row)}</React.Fragment>)}</EmbraceScrollViewport>
     : <EmbraceVirtualConversation items={rows} renderItem={renderRow} />
   return <EmbraceToolVariantContext.Provider value={tools}>
     <EmbraceToolRegistrations />
@@ -143,7 +151,7 @@ export function EmbraceThread({ items: snapshot, workLogs, readingColumn = false
       {embrace === 'E4' ? threadList : null}
       <section aria-label="Conversation" {...stylex.props(styles.conversation)}>
         <React.Profiler id="embrace-transcript" onRender={onCommit ?? (() => {})}>{transcript}</React.Profiler>
-        <ThreadPrimitive.Empty><p {...stylex.props(styles.empty)}>No messages yet. Send a message to begin.</p></ThreadPrimitive.Empty>
+        <ThreadPrimitive.Empty><div {...stylex.props(styles.empty)}><TranscriptEmptyContent emptyState={emptyState} /></div></ThreadPrimitive.Empty>
         {embrace !== 'E1' ? <ThreadPrimitive.Suggestion prompt="Review the latest change" {...stylex.props(styles.button)}>Review the latest change</ThreadPrimitive.Suggestion> : null}
         {composer === false ? null : <EmbraceComposer history={history} targetLabel={targetLabel} disabledReason={disabledReason} toolbar={toolbar} {...composerProps} variant={composer} />}
       </section>
@@ -162,8 +170,6 @@ const styles = stylex.create({
   senderName: { fontWeight: geometry.senderWeight, letterSpacing: geometry.senderTracking, textTransform: geometry.senderTransform },
   avatar: { display: geometry.avatarDisplay, placeItems: 'center', width: density.avatarSize, height: density.avatarSize, backgroundColor: tokens.recess, borderRadius: geometry.avatarRadius, color: tokens.muted, fontSize: '10px' },
   muted: { color: tokens.muted },
-  text: { whiteSpace: 'pre-wrap', margin: 0, lineHeight: density.bodyLeading, overflowWrap: 'anywhere' },
-  reasoning: { color: tokens.muted, fontSize: '12px', paddingBlock: '4px' },
   actions: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px', marginTop: '6px', fontSize: '11px' },
   button: { backgroundColor: tokens.recess, color: tokens.ink, borderWidth: '1px', borderStyle: 'solid', borderColor: tokens.line, borderRadius: '4px', paddingBlock: '4px', paddingInline: '8px', fontSize: '11px', cursor: 'pointer', ':focus-visible': { outline: `2px solid ${accentTokens.accent}`, outlineOffset: '2px' }, ':disabled': { opacity: 0.45, cursor: 'not-allowed' } },
   attachment: { display: 'inline-flex', padding: '6px', borderWidth: '1px', borderStyle: 'solid', borderColor: tokens.line, borderRadius: '4px' },
@@ -171,4 +177,5 @@ const styles = stylex.create({
   edit: { display: 'flex', flexDirection: 'column', gap: '6px' },
   input: { backgroundColor: tokens.panel, color: tokens.ink, borderColor: tokens.line, padding: '8px' },
   empty: { color: tokens.muted, padding: '20px', margin: 0 },
+  userPending: { color: tokens.muted },
 })

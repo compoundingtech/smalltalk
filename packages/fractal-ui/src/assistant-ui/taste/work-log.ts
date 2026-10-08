@@ -10,6 +10,9 @@ export interface WorkLogCall {
   readonly startedAt: string
   readonly endedAt?: string
   readonly detail?: string
+  readonly outputLanguage?: string
+  /** Observed edit/write path, not a guessed title. */
+  readonly changedPath?: string
 }
 export interface WorkLogTurn {
   readonly calls: readonly WorkLogCall[]
@@ -19,6 +22,11 @@ export interface WorkLogTurn {
   readonly failed: boolean
   readonly interrupted: boolean
   readonly failureNote?: string
+  readonly startedAt?: string
+  /** False keeps incomplete or multi-participant history expanded. */
+  readonly foldable?: boolean
+  readonly commands?: number
+  readonly changedFiles?: number
 }
 export interface WorkLogProjection {
   readonly id: string
@@ -44,16 +52,33 @@ export function workLogTurnFromItems(items: readonly ConversationItem[], facts: 
   readonly interrupted: boolean
   readonly durationMs?: number
   readonly failureNote?: string
+  readonly startedAt?: string
+  readonly completeHistory?: boolean
 }): WorkLogTurn {
+  const calls: WorkLogCall[] = items.flatMap(call => {
+    if (call._tag !== 'ToolCall') return []
+    const kind = facts.kindFor(call.name)
+    const input = typeof call.input === 'object' && call.input !== null ? call.input as Record<string, unknown> : undefined
+    const path = [input?.['path'], input?.['file_path'], input?.['filePath']].find((value): value is string => typeof value === 'string' && value.length > 0)
+    const media = call.result?.mediaType?.split(';')[0]?.trim().toLowerCase()
+    return [{
+      id: call.id, kind, title: call.name, argsSummary: summarizeArgs(call.input),
+      status: call.status, startedAt: call.at, endedAt: call.result?.at,
+      detail: typeof call.result?.content === 'string' ? call.result.content : undefined,
+      outputLanguage: media === undefined ? kind === 'run' ? 'bash' : kind === 'read' ? path?.split('.').at(-1) : undefined : outputMediaLanguages[media],
+      changedPath: kind === 'edit' && call.callSeen && call.status === 'success' ? path : undefined,
+    }]
+  })
+  const complete = facts.completeHistory === true
+  const edits = calls.filter(call => call.kind === 'edit' && call.status === 'success')
   return {
-    calls: items.flatMap(call => call._tag !== 'ToolCall' ? [] : [{
-      id: call.id, kind: facts.kindFor(call.name), title: call.name,
-      argsSummary: summarizeArgs(call.input), status: call.status, startedAt: call.at,
-      endedAt: call.result?.at, detail: typeof call.result?.content === 'string' ? call.result.content : undefined,
-    }]),
+    calls,
     durationMs: facts.durationMs !== undefined && Number.isFinite(facts.durationMs) && facts.durationMs >= 0 ? facts.durationMs : undefined,
     running: facts.running, failed: facts.failed, interrupted: facts.interrupted,
-    failureNote: facts.failureNote,
+    failureNote: facts.failureNote, startedAt: facts.startedAt,
+    foldable: facts.completeHistory === undefined ? undefined : complete,
+    commands: complete ? items.filter(item => item._tag === 'ToolCall' && item.callSeen && facts.kindFor(item.name) === 'run').length : undefined,
+    changedFiles: complete && edits.every(call => call.changedPath !== undefined) ? new Set(edits.map(call => call.changedPath)).size : undefined,
   }
 }
 export function formatWorkDuration(milliseconds: number | undefined): string {
@@ -64,6 +89,15 @@ export function formatWorkDuration(milliseconds: number | undefined): string {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m${seconds % 60 === 0 ? '' : ` ${seconds % 60}s`}`
   return `${Math.floor(seconds / 3600)}h${Math.floor(seconds / 60) % 60 === 0 ? '' : ` ${Math.floor(seconds / 60) % 60}m`}`
 }
+const outputMediaLanguages: Readonly<Record<string, string>> = {
+  'application/json': 'json', 'text/json': 'json', 'text/markdown': 'markdown',
+  'text/x-diff': 'diff', 'text/x-patch': 'diff', 'text/typescript': 'typescript',
+  'application/typescript': 'typescript', 'text/javascript': 'javascript',
+  'application/javascript': 'javascript', 'text/css': 'css', 'text/x-shellscript': 'bash',
+  'application/x-sh': 'bash', 'text/x-python': 'python', 'text/x-rust': 'rust',
+  'application/yaml': 'yaml', 'text/yaml': 'yaml', 'application/x-yaml': 'yaml',
+}
+export const workLogOutputLanguage = (call: WorkLogCall): string => call.outputLanguage ?? (call.kind === 'run' ? 'bash' : '')
 /** Never let a newer caller projection fold an older committed message snapshot. */
 export function committedWorkLogs(items: readonly ConversationItem[], projections: readonly WorkLogProjection[]): ReadonlyMap<number, WorkLogProjection> {
   const positions = new Map(items.map((item, index) => [item.id, index]))
