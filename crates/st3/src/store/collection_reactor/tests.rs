@@ -16,6 +16,11 @@ struct Fixture {
     storage_failure: Arc<AtomicBool>,
     begin_failure: AtomicUsize,
     commit_failure: AtomicUsize,
+    covered: AtomicBool,
+    fail_fence: Arc<AtomicBool>,
+    fence_failures: AtomicUsize,
+    arm_fence_failure: Arc<AtomicBool>,
+    panic_publish: Arc<AtomicBool>,
 }
 
 struct Gate {
@@ -113,7 +118,12 @@ impl Source for Fixture {
     }
     fn begin(&self, tx: &Transaction<'_>, _: &Context) -> Result<()> {
         tx.execute("INSERT INTO local_fixture_reactor_scope VALUES(?1,0,1) ON CONFLICT(source) DO UPDATE SET scoped=1", [self.source])?;
-        hook_fault(self.begin_failure.load(Ordering::SeqCst))
+        hook_fault(if self.fail_fence.load(Ordering::SeqCst) {
+            self.fence_failures.fetch_add(1, Ordering::SeqCst);
+            2
+        } else {
+            self.begin_failure.load(Ordering::SeqCst)
+        })
     }
     fn commit(&self, tx: &Transaction<'_>, _: &Context) -> Result<()> {
         tx.execute(
@@ -140,13 +150,16 @@ impl Source for Fixture {
                     gate: self.gate.clone(),
                     fail: self.fail,
                     storage_failure: self.storage_failure.clone(),
+                    fail_fence: self.fail_fence.clone(),
+                    arm_fence_failure: self.arm_fence_failure.clone(),
+                    panic_publish: self.panic_publish.clone(),
                 }) as Box<dyn Captured>
             }),
             wake_at_unix_ms: None,
         })
     }
     fn coverage(&self, _: &Connection, _: &Context, _: u64) -> Result<bool> {
-        Ok(false)
+        Ok(self.covered.load(Ordering::SeqCst))
     }
 }
 
@@ -156,6 +169,9 @@ struct Facts {
     gate: Option<Arc<Gate>>,
     fail: bool,
     storage_failure: Arc<AtomicBool>,
+    fail_fence: Arc<AtomicBool>,
+    arm_fence_failure: Arc<AtomicBool>,
+    panic_publish: Arc<AtomicBool>,
 }
 impl Captured for Facts {
     fn prepare(self: Box<Self>, _: &Context) -> Result<Box<dyn Page>> {
@@ -197,6 +213,13 @@ impl Page for Facts {
             )
             .into());
         }
+        assert!(
+            !self.panic_publish.load(Ordering::SeqCst),
+            "fixture page panic"
+        );
+        if self.fail && self.arm_fence_failure.load(Ordering::SeqCst) {
+            self.fail_fence.store(true, Ordering::SeqCst);
+        }
         anyhow::ensure!(!self.fail, "fixture publication failure");
         tx.execute(
             "DELETE FROM local_fixture_reactor_pending WHERE source=?1",
@@ -221,6 +244,11 @@ fn source(
         storage_failure: Arc::new(AtomicBool::new(false)),
         begin_failure: AtomicUsize::new(0),
         commit_failure: AtomicUsize::new(0),
+        covered: AtomicBool::new(false),
+        fail_fence: Arc::new(AtomicBool::new(false)),
+        fence_failures: AtomicUsize::new(0),
+        arm_fence_failure: Arc::new(AtomicBool::new(false)),
+        panic_publish: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -569,4 +597,72 @@ fn storage_failure_in_either_capture_hook_rolls_back_the_native_transaction() {
                 .is_ok()
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_durable_fence_refuses_reads_even_if_native_coverage_claims_ready() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = source("fixture.alpha", "fixture.alpha.rows", None, true);
+    fixture.covered.store(true, Ordering::SeqCst);
+    fixture.arm_fence_failure.store(true, Ordering::SeqCst);
+    let store = Arc::new(
+        Store::open_with_collection_sources(
+            &root.path().join("graph.db"),
+            "alder",
+            vec![fixture.clone()],
+        )
+        .unwrap(),
+    );
+    let registry = store.collection_sources().unwrap();
+    assert!(
+        store
+            .read_snapshot(|_| registry.coverage(fixture.source, &store.readers.get(), clock_ms()))
+            .unwrap()
+    );
+    replace(&store, fixture.source, 17);
+    store.start_collection_reactor().unwrap();
+    wait_for(|| fixture.fence_failures.load(Ordering::SeqCst) > 0).await;
+    assert!(registry.unavailable[0].load(Ordering::Acquire));
+    // The armed hook makes the separate durable fencing transaction fail at begin.
+    assert!(
+        registry
+            .cx
+            .installer
+            .position(&store.readers.get(), fixture.source)
+            .is_ok()
+    );
+    assert!(
+        fixture
+            .coverage(&store.readers.get(), &registry.cx, clock_ms())
+            .unwrap()
+    );
+    assert!(
+        !store
+            .read_snapshot(|_| registry.coverage(fixture.source, &store.readers.get(), clock_ms()))
+            .unwrap()
+    );
+    assert_eq!(output(&store, fixture.source), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publication_panic_returns_the_writer_and_preserves_later_native_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let bad = source("fixture.bad", "fixture.bad.rows", None, false);
+    let good = source("fixture.good", "fixture.good.rows", None, false);
+    bad.panic_publish.store(true, Ordering::SeqCst);
+    let store = Arc::new(
+        Store::open_with_collection_sources(
+            &root.path().join("graph.db"),
+            "alder",
+            vec![bad.clone(), good.clone()],
+        )
+        .unwrap(),
+    );
+    replace(&store, bad.source, 1);
+    replace(&store, good.source, 2);
+    store.start_collection_reactor().unwrap();
+    wait_for(|| output(&store, good.source) == Some(2)).await;
+    assert_eq!(output(&store, bad.source), None);
+    replace(&store, good.source, 3);
+    wait_for(|| output(&store, good.source) == Some(3)).await;
 }

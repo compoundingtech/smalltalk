@@ -91,6 +91,7 @@ pub(crate) struct Registry {
     sources: Vec<Arc<dyn Source>>,
     names: Vec<Vec<&'static str>>,
     retries: Vec<AtomicU64>,
+    unavailable: Vec<AtomicBool>,
     wake: Arc<Notify>,
 }
 
@@ -144,6 +145,7 @@ impl Registry {
                 installer: Arc::new(Installer::new(operators)?),
             },
             retries: sources.iter().map(|_| AtomicU64::new(0)).collect(),
+            unavailable: sources.iter().map(|_| AtomicBool::new(false)).collect(),
             sources,
             names,
             wake: Arc::new(Notify::new()),
@@ -227,20 +229,31 @@ impl Registry {
             .iter()
             .position(|s| s.name() == source)
             .context("unknown collection source")?;
+        // The caller has explicitly repaired the source; this clears only the process
+        // guard. Its independent native/Installer coverage must still qualify every read.
+        self.unavailable[index].store(false, Ordering::Release);
         self.retries[index].fetch_add(1, Ordering::AcqRel);
         self.wake();
         Ok(())
     }
 
+    /// Source factories must use this guard for adapter reads, including silent pages.
+    /// A failed durable fence cannot leave that Store's old namespace served.
     pub fn coverage(&self, source: &str, connection: &Connection, now_ms: u64) -> Result<bool> {
-        self.sources
+        let index = self
+            .sources
             .iter()
-            .find(|s| s.name() == source)
-            .context("unknown collection source")?
-            .coverage(connection, &self.cx, now_ms)
+            .position(|s| s.name() == source)
+            .context("unknown collection source")?;
+        if self.unavailable[index].load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let covered = self.sources[index].coverage(connection, &self.cx, now_ms)?;
+        Ok(covered && !self.unavailable[index].load(Ordering::Acquire))
     }
 
     fn fence(&self, tx: &Transaction<'_>, index: usize, error: &str) -> Result<()> {
+        self.unavailable[index].store(true, Ordering::Release);
         self.cx
             .installer
             .source_gap(tx, self.sources[index].name(), error)?;
@@ -333,6 +346,9 @@ async fn run(store: Weak<Store>, registry: Arc<Registry>, stopped: Arc<AtomicBoo
                     if storage_failure(error) {
                         return result;
                     }
+                    // Refuse reads immediately, including when writer admission or the
+                    // durable fence itself fails. Source factories use Registry::coverage.
+                    worker.unavailable[index].store(true, Ordering::Release);
                     // Fence derived state in a separate transaction after rolling back the page.
                     if stop.load(Ordering::Acquire) {
                         return result;
