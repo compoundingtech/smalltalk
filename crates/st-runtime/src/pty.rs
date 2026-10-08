@@ -1540,7 +1540,8 @@ exit 0
             ("PTY_ROOT".into(), declared.to_string_lossy().into_owned()),
             ("ST_AGENT".into(), "synthetic-agent".into()),
             ("ST3_BIN".into(), "/synthetic/runtime-bin".into()),
-            ("PATH".into(), "/usr/bin:/bin".into()),
+            // Include the NixOS system tools as well as conventional Unix locations.
+            ("PATH".into(), "/run/current-system/sw/bin:/usr/bin:/bin".into()),
             ("ST3_ROLLOUT_OPERATION".into(), "synthetic-operation".into()),
             ("ST3_ROLLOUT_PREDECESSOR".into(), "synthetic-predecessor".into()),
             ("TERM".into(), "screen-256color".into()),
