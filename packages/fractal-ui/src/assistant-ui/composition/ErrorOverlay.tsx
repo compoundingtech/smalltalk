@@ -18,6 +18,7 @@ export interface ErrorOverlayNotice {
   readonly title: string
   readonly detail?: string
   readonly onRetry?: () => void
+  readonly onOpenOutput?: () => void
 }
 
 interface ErrorOverlayHostState {
@@ -51,7 +52,7 @@ export function ErrorOverlayHost({ children }: { readonly children: React.ReactN
   </div>
 }
 
-export function ErrorOverlay({ id, title, detail, onRetry }: ErrorOverlayNotice) {
+export function ErrorOverlay({ id, title, detail, onRetry, onOpenOutput }: ErrorOverlayNotice) {
   const host = React.useContext(ErrorOverlaySurface)
   const [dismissedId, setDismissedId] = React.useState<string | null>(null)
   if (dismissedId === id || host?.dismissedIds.includes(id)) return null
@@ -60,6 +61,7 @@ export function ErrorOverlay({ id, title, detail, onRetry }: ErrorOverlayNotice)
     <Icon name="alert" size={14} />
     <span {...stylex.props(styles.text)}><strong {...stylex.props(styles.title)}>{title}</strong>{detail !== undefined && <span {...stylex.props(styles.detail)}>{detail}</span>}</span>
     {onRetry !== undefined && <Button onPress={onRetry} {...stylex.props(styles.action)}>Retry</Button>}
+    {onOpenOutput !== undefined && <Button onPress={onOpenOutput} {...stylex.props(styles.action)}>Open output</Button>}
     <Button aria-label={`Dismiss: ${title}`} onPress={() => setDismissedId(id)} {...stylex.props(styles.close)}><Icon name="x" size={12} /></Button>
   </div>
   return host === null || host.layer === null ? banner : createPortal(banner, host.layer)

@@ -29,20 +29,44 @@ function StoryRender(args: SyncArgs) {
   const [, updateArgs] = useArgs<SyncArgs>()
   return <TransitionStory args={args} updateArgs={updateArgs} />
 }
-function ObservationRow({ observation }: { observation: typeof syncObservations[number] }) {
+function ObservationRow({ observation, label }: { observation: typeof syncObservations[number]; label?: string }) {
   const [retried, setRetried] = React.useState(false)
   const retry = React.useCallback(() => setRetried(true), [])
   const status = retried ? requestedAfterRetry : observation.status
-  return <div data-testid="sync-observation" {...stylex.props(styles.observation)}><span {...stylex.props(styles.stateLabel)}>{observation.id}</span><SyncLine status={status} label="conversation" now={syncNow} observedAt={retried ? syncNow - 1000 : observation.observedAt} onRetry={retry} /></div>
+  return <div data-testid="sync-observation" data-sync-surface={label ?? 'conversation'} {...stylex.props(styles.observation)}><span {...stylex.props(styles.stateLabel)}>{label ?? observation.id}</span><SyncLine status={status} label={label ?? 'conversation'} now={syncNow} observedAt={retried ? syncNow - 1000 : observation.observedAt} onRetry={retry} /></div>
 }
 const requestedAfterRetry = { _tag: 'Requested', since: syncNow - 1000 } as const
 function AllStatesStory() {
   return <main data-testid="sync-all-states" {...stylex.props(styles.allRoot, ...baselineTheme)}><h1 {...stylex.props(styles.title)}>Sync line · all observations</h1><div {...stylex.props(styles.schemes)}>{(['dark', 'light'] as const).map(scheme => <section key={scheme} aria-label={`${scheme} sync observations`} {...stylex.props(styles.themeColumn, ...baselineTheme, scheme === 'light' && lightTheme)}><ThemePortal><h2 {...stylex.props(styles.title)}>{scheme}</h2>{syncObservations.map(observation => <ObservationRow key={observation.id} observation={observation} />)}</ThemePortal></section>)}</div></main>
 }
+const subscriptionLimitObservations = syncObservations.filter(({ status }) => status._tag === 'Failed' && ((status.cause._tag === 'Server' && status.cause.code === 'subscription-limit') || (status.cause._tag === 'Local' && status.cause.kind === 'subscription-limit')))
+function SubscriptionLimitsStory({ scheme }: SyncArgs) {
+  return <main data-testid="sync-subscription-limits" {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><ThemePortal>
+    <h1 {...stylex.props(styles.title)}>Subscription limits</h1>
+    <p>Local and Server limits use the same plain message; only a reported cap is shown. Usage is an HTTP read and does not consume subscription slots.</p>
+    {subscriptionLimitObservations.map(observation => <section key={observation.id} data-testid="sync-limit-case" {...stylex.props(styles.surface)}>
+      <header {...stylex.props(styles.band)}><h2 {...stylex.props(styles.title)}>{observation.id}</h2></header>
+      <ObservationRow observation={observation} label="conversation" />
+      <ObservationRow observation={observation} label="usage" />
+      <div {...stylex.props(styles.retained)}>Last-known content stays in place.</div>
+    </section>)}
+  </ThemePortal></main>
+}
+const subscriptionLimitPlay: NonNullable<StoryObj<SyncArgs>['play']> = async ({ canvasElement }) => {
+  const cases = canvasElement.querySelectorAll('[data-testid="sync-limit-case"]')
+  if (cases.length !== 4) throw new Error('Subscription limit stories must include Server and Local failures with absent, zero, and positive caps')
+  for (const element of cases) {
+    const conversation = element.querySelector('[data-sync-surface="conversation"] [data-testid="sync-line"]')
+    const usage = element.querySelector('[data-sync-surface="usage"] [data-testid="sync-line"]')
+    if (conversation?.getAttribute('data-sync-visible') !== 'true') throw new Error('Subscription resource failures must remain visible')
+    if (usage === null || usage.getAttribute('data-sync-visible') !== 'false') throw new Error('Usage must exclude subscription limit failures')
+    if (usage.querySelector('button:not(:disabled)') !== null) throw new Error('Excluded Usage failures must not expose retry or details actions')
+  }
+}
 const meta = {
   title: 'Fractal UI/Sync Line',
   render: StoryRender,
-  parameters: { layout: 'fullscreen', docs: { description: { component: 'Portable SyncStatus tagged union with epoch-ms timestamps and the syncLine vocabulary. Every status/stage, derived stalled observations, both themes, and fixed-height existing header/status slots. Last-known content remains present. No byte-progress or invented stage is shown.' } } },
+  parameters: { layout: 'fullscreen', docs: { description: { component: 'Portable SyncStatus tagged union with epoch-ms timestamps and the syncLine vocabulary. Every status/stage, derived stalled observations, both themes, and fixed-height existing header/status slots. Last-known content remains present. Local and Server subscription-limit failures share plain vocabulary; only reported caps appear, including zero. HTTP Usage reads exclude subscription-limit failures and their actions. Dedicated dark/light stories cover those exclusions and the full transition sequence. No byte-progress or invented stage is shown.' } } },
   args: { scheme: 'dark', sequence: 0 }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' }, sequence: { control: { type: 'number', min: 0, max: syncObservations.length - 1 } } },
 } satisfies Meta<SyncArgs>
 export default meta
@@ -56,6 +80,8 @@ export const LocalFailureZeroCap: Story = { args: { sequence: syncObservations.f
 export const UnknownFailure: Story = { args: { sequence: syncObservations.findIndex(observation => observation.id === 'Failed · Unknown') } }
 export const ServerFailure: Story = { args: { sequence: syncObservations.findIndex(observation => observation.id === 'Failed') } }
 export const ServerFailureSubscriptionLimit: Story = { args: { sequence: syncObservations.findIndex(observation => observation.id === 'Failed · Server · subscription limit') } }
+export const SubscriptionLimitsDark: Story = { render: SubscriptionLimitsStory, args: { scheme: 'dark' }, argTypes: { sequence: { control: false } }, play: subscriptionLimitPlay }
+export const SubscriptionLimitsLight: Story = { render: SubscriptionLimitsStory, args: { scheme: 'light' }, argTypes: { sequence: { control: false } }, play: subscriptionLimitPlay }
 export const TransitionSequence: Story = {
   render: StoryRender,
   play: async ({ canvasElement }) => {
@@ -114,6 +140,7 @@ export const TransitionSequence: Story = {
     } finally { observer.disconnect() }
   },
 }
+export const TransitionSequenceLight: Story = { args: { scheme: 'light' }, play: TransitionSequence.play }
 const styles = stylex.create({
   root: { height: '100vh', overflow: 'auto', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', gap: s.md, padding: s.md, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading }, allRoot: { height: '100vh', overflow: 'auto', boxSizing: 'border-box', padding: s.md, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading }, title: { margin: 0, fontSize: t.headingSize, lineHeight: t.headingLeading }, heading: { display: 'flex', alignItems: 'center', gap: s.lg, minHeight: g.band, flexShrink: 0 },
   stateName: { width: g.tooltipMax, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
