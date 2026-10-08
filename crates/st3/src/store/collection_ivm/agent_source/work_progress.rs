@@ -2,6 +2,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use smallclaims::ivm::install::Namespace;
+use std::collections::BTreeMap;
 
 pub fn create_schema(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS st3_agent_work_progress(namespace TEXT PRIMARY KEY,counter INTEGER NOT NULL)")?;
@@ -43,20 +44,15 @@ pub fn create_schema(c: &Connection) -> Result<()> {
             "local_agent_card_source_local_cut",
             "NEW.after_index>OLD.after_index OR (NEW.after_index=OLD.after_index AND NEW.after_claim>OLD.after_claim)",
         ),
-        (
-            "local_agent_card_source_clock",
-            "NEW.authority_agent>OLD.authority_agent OR (NEW.authority_agent=OLD.authority_agent AND NEW.authority_id>OLD.authority_id) OR NEW.lifecycle_after>OLD.lifecycle_after",
-        ),
-        (
-            "local_agent_card_source_cursor",
-            "NEW.after_key>OLD.after_key",
-        ),
     ] {
         c.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS st3_work_advance_{table} AFTER UPDATE ON {table} WHEN {condition} BEGIN
         INSERT INTO st3_agent_work_progress VALUES(NEW.namespace,1) ON CONFLICT(namespace) DO UPDATE SET counter=counter+1; END"))?;
     }
-    c.execute_batch("CREATE TRIGGER IF NOT EXISTS st3_work_begin_local_agent_card_source_cursor AFTER INSERT ON local_agent_card_source_cursor WHEN NEW.after_key<>'' BEGIN
-        INSERT INTO st3_agent_work_progress VALUES(NEW.namespace,1) ON CONFLICT(namespace) DO UPDATE SET counter=counter+1; END")?;
+    c.execute_batch(
+        "DROP TRIGGER IF EXISTS st3_work_advance_local_agent_card_source_clock;
+        DROP TRIGGER IF EXISTS st3_work_advance_local_agent_card_source_cursor;
+        DROP TRIGGER IF EXISTS st3_work_begin_local_agent_card_source_cursor;",
+    )?;
     Ok(())
 }
 
@@ -68,6 +64,37 @@ pub fn counter(c: &Connection, ns: &Namespace) -> Result<u64> {
     )
     .optional()?
     .unwrap_or(0))
+}
+
+pub struct Seeks {
+    authority: (String, String),
+    lifecycle: String,
+    stages: BTreeMap<String, String>,
+}
+
+/// Read only the fixed set of indexed maintenance cursors. A pending family can advance
+/// and wrap within one callback; only net forward movement justifies another immediate page.
+pub fn seeks(c: &Connection, ns: &Namespace) -> Result<Seeks> {
+    let (agent, id, lifecycle) = c.query_row(
+        "SELECT authority_agent,authority_id,lifecycle_after FROM local_agent_card_source_clock WHERE namespace=?1",
+        [ns.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    )?;
+    let stages = c.prepare_cached("SELECT kind,after_key FROM local_agent_card_source_cursor WHERE namespace=?1 AND kind IN ('normalize','physical','select','operation','owned-reference','card','launch') ORDER BY kind")?
+        .query_map([ns.as_str()], |r| Ok((r.get(0)?,r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Seeks {
+        authority: (agent, id),
+        lifecycle,
+        stages,
+    })
+}
+
+pub fn advanced(before: &Seeks, after: &Seeks) -> bool {
+    after.authority > before.authority
+        || after.lifecycle > before.lifecycle
+        || after.stages.iter().any(|(kind, key)| {
+            key.as_str() > before.stages.get(kind).map(String::as_str).unwrap_or("")
+        })
 }
 
 /// Share the caller's aggregate deletion budget with Kernel reclamation. These private

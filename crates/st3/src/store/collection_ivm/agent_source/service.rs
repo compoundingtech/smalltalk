@@ -689,9 +689,11 @@ impl Service {
             }
         }
         let before = super::work_progress::counter(&store.readers.get(), ns)?;
+        let seeks = super::work_progress::seeks(&store.readers.get(), ns)?;
         self.tick(store, clock::Reason::Kernel)?;
         let c = store.readers.get();
-        let progressed = super::work_progress::counter(&c, ns)? > before;
+        let progressed = super::work_progress::counter(&c, ns)? > before
+            || super::work_progress::advanced(&seeks, &super::work_progress::seeks(&c, ns)?);
         *self
             .waiting
             .lock()
