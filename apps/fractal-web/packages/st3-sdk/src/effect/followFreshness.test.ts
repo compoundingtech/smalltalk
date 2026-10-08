@@ -717,4 +717,37 @@ describe('follow freshness', () => {
       }),
     ))
 
+  it('numbers conversation subscriptions so a later replace page is distinguishable', () =>
+    run({ maxFollows: 4 }, (gateway) =>
+      Effect.gen(function* () {
+        const st3 = yield* St3
+        const ref = 'agent/serial'
+        const follow = yield* mountConversation(ref)
+        const page = () =>
+          gateway.send({
+            kind: 'conversation', id: gateway.conversationId(ref), collection: 'conversation',
+            session_id: 'session/1', replace: true, has_more: false, items: [],
+          })
+        page()
+        yield* settle
+        expect(follow.events.at(-1)).toMatchObject({
+          _tag: 'Observed',
+          value: { id: gateway.conversationId(ref), subscription: 1 },
+        })
+        expect(st3.subscribeSerial({ _tag: 'Conversation', ref })).toBe(1)
+        // The socket drops; the reopen resubscribes under a fresh serial.
+        gateway.end()
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(500))
+        yield* settle
+        expect(st3.subscribeSerial({ _tag: 'Conversation', ref })).toBe(2)
+        page()
+        yield* settle
+        expect(follow.events.at(-1)).toMatchObject({
+          _tag: 'Observed',
+          value: { subscription: 2 },
+        })
+        yield* follow.interrupt
+      }),
+    ))
+
 })

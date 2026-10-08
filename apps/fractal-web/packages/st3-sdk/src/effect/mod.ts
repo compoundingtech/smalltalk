@@ -207,11 +207,18 @@ export interface UnrecognizedEntry {
 
 /** One conversation frame: `replace` resets the timeline, otherwise `entries` revise it. */
 export interface ConversationChunk {
+  /** The follow subscription id the gateway addressed this chunk to. */
+  readonly id?: string
   readonly replace: boolean
   readonly hasMore: boolean
   readonly entries: readonly (TimelineEntry | UnrecognizedEntry)[]
   /** Raw page evidence before decoding/filtering; only explicit has_more=false proves emptiness. */
   readonly observation?: { readonly empty: boolean }
+  /**
+   * Serial of the subscribe command that opened the subscription delivering this chunk;
+   * serials increase per (re)subscribe, so a chunk from a later subscription is distinguishable.
+   */
+  readonly subscription?: number
 }
 
 /** Scoped collection follows and gateway state carried by one shared socket. */
@@ -245,6 +252,8 @@ export class St3 extends Context.Service<
     readonly followSyncStatus: (key: string) => Stream.Stream<SyncStatus>
     /** Socket reachability is not Live: only a successfully decoded data frame establishes it. */
     readonly gatewaySyncStatus: Stream.Stream<SyncStatus>
+    /** The newest subscribe serial sent for a follow; undefined before its first subscribe. */
+    readonly subscribeSerial: (spec: FollowSpec) => number | undefined
   }
 >()('@st3/sdk/St3') {}
 
@@ -311,6 +320,7 @@ const unrecognized = (raw: unknown): UnrecognizedEntry | undefined => {
 export const decodeConversationChunk = (
   frame: Extract<CollectionFrame, { kind: 'conversation' }>,
 ): ConversationChunk => ({
+  id: frame.id,
   replace: frame.replace,
   hasMore: frame.has_more ?? false,
   ...(frame.replace || frame.items.length > 0
@@ -351,6 +361,17 @@ const make = (options: St3Options) =>
       fetchImpl: options.fetch ?? globalThis.fetch.bind(globalThis),
     })
     const followKeys = new Map<string, string>()
+    /** Serial of each sent subscribe command, keyed by follow id; increases per (re)subscribe. */
+    const sentSerials = new Map<string, number>()
+    let subscribeCount = 0
+    /** The newest subscribe serial sent for a follow spec; undefined before its first subscribe. */
+    const subscribeSerial = (spec: FollowSpec): number | undefined => {
+      const key = followKey(spec)
+      let latest: number | undefined
+      for (const [id, serial] of sentSerials)
+        if (followKeys.get(id) === key && (latest === undefined || serial > latest)) latest = serial
+      return latest
+    }
     /** Per-follow freshness keyed by followKey while the follow's stream runs. */
     const freshnessTable = new Map<string, FollowFreshness>()
     const freshnessRef = yield* SubscriptionRef.make<ReadonlyMap<string, FollowFreshness>>(
@@ -424,6 +445,7 @@ const make = (options: St3Options) =>
         : {}),
       onSubscribeSent: (id: string) => {
         options.onSubscribeSent?.(id)
+        sentSerials.set(id, (subscribeCount += 1))
         fresheners.get(id)?.({ _tag: 'SubscribeSent' })
         const key = followKeys.get(id)
         if (key !== undefined) options.onFollowSubscribeSent?.({ id, key })
@@ -709,7 +731,9 @@ const make = (options: St3Options) =>
             Effect.sync(() => stream.subscribeConversation(id, spec.ref)),
           onData: (frame) => {
             if (frame.kind !== 'conversation') return undefined
-            return decodeConversationChunk(frame)
+            const chunk = decodeConversationChunk(frame)
+            const subscription = sentSerials.get(frame.id)
+            return subscription === undefined ? chunk : { ...chunk, subscription }
           },
           reset: () => {},
         }),
@@ -865,6 +889,7 @@ const make = (options: St3Options) =>
       followWindow,
       followConversation,
       followTerminal,
+      subscribeSerial,
       setVisible: (spec, visible) =>
         Effect.sync(() => {
           const lane = spec._tag === 'Conversation' ? 'conversation' : 'shared'
