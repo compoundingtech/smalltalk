@@ -161,7 +161,7 @@ mod tests {
         store.readers.idle.lock().unwrap().extend(held);
         store.readers.returned.notify_all();
         worker.join().unwrap();
-        assert_eq!(result.unwrap(), true, "failed acquisition must refuse promptly");
+        assert!(result.unwrap(), "failed acquisition must refuse promptly");
     }
 
     #[test]
