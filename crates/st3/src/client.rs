@@ -1600,6 +1600,16 @@ mod tests {
     }
 
     #[test]
+    fn response_decoding_rejects_duplicate_envelope_keys() {
+        for bytes in [
+            br#"{"api_version":"st3.v1","value":1,"value":2}"#.as_slice(),
+            br#"{"api_version":"st3.v1","api_version":"st3.client.v0","value":1}"#.as_slice(),
+        ] {
+            assert!(decode_api_response::<Value>(bytes).is_err());
+        }
+    }
+
+    #[test]
     fn response_decoding_rejects_unknown_versions_and_missing_values() {
         let unknown = serde_json::to_vec(&json!({
             "api_version": "st3.future.v9",

@@ -2748,3 +2748,63 @@ async fn concurrent_slow_exports_refuse_more_work_with_authenticated_overload() 
         request.abort();
     }
 }
+
+#[tokio::test]
+async fn an_oversize_answer_is_a_request_bound_failure_at_the_signed_client() {
+    let auth = FleetAuth::test("fleet/byte-limit-fixture", &[7; 32]);
+    let state = PeerState::new(
+        Local(Arc::new(plain_memory("cedar").unwrap())),
+        "cedar".into(),
+        auth.clone(),
+        FleetContext::legacy(BTreeSet::from(["birch".into()])),
+    );
+    // Use the production answer/error path with a small byte cap: no huge CI allocation.
+    let app = Router::new().route(
+        EXCHANGE_PATH,
+        post(move |body: Bytes| {
+            let state = state.clone();
+            async move {
+                signed_response_with_limit(
+                    &state,
+                    &FleetAuth::body_digest(&body),
+                    42,
+                    "a".repeat(1024),
+                    256,
+                )
+                .unwrap()
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = PeerConfig {
+        name: "cedar".into(),
+        url: format!("http://{}", listener.local_addr().unwrap()),
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .into_future(),
+    );
+    let fleet = FleetContext::legacy(BTreeSet::from(["cedar".into()]));
+    let result = post_signed_to::<_, Value>(
+        &replication_http_client(),
+        &peer,
+        "birch",
+        &auth,
+        &fleet,
+        EXCHANGE_PATH,
+        &serde_json::json!({"fixture": true}),
+        false,
+    )
+    .await;
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    let error = result.unwrap_err().to_string();
+    // The client verifies response/request binding before reporting this peer error.
+    assert!(error.contains("422"), "{error}");
+    assert!(error.contains("replication-request-failed"), "{error}");
+    assert!(error.contains("exceeds its byte limit"), "{error}");
+}

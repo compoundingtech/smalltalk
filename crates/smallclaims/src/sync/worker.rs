@@ -1647,6 +1647,9 @@ async fn receive_exchange<B: Backend>(
                     Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
                 };
             drop(export);
+            if !response.status().is_success() {
+                return response;
+            }
             state
                 .fleet
                 .inbound_authority
@@ -2033,13 +2036,47 @@ fn signed_refusal<B: Backend>(
     Ok(response)
 }
 
-fn signed_response<B, T: Serialize>(
+fn signed_response<B: Backend, T: Serialize>(
     state: &PeerState<B>,
     request_digest: &str,
     store_index: u64,
     value: T,
 ) -> Result<Response> {
-    signed_response_for(state, EXCHANGE_PATH, request_digest, store_index, value)
+    signed_response_with_limit(
+        state,
+        request_digest,
+        store_index,
+        value,
+        MAX_EXCHANGE_BYTES,
+    )
+}
+
+fn signed_response_with_limit<B: Backend, T: Serialize>(
+    state: &PeerState<B>,
+    request_digest: &str,
+    store_index: u64,
+    value: T,
+    limit: usize,
+) -> Result<Response> {
+    signed_response_for_with_limit(
+        state,
+        EXCHANGE_PATH,
+        request_digest,
+        store_index,
+        value,
+        limit,
+    )
+    .or_else(|error| {
+        // Receipt may already have committed. Refuse this answer with an authenticated
+        // failure, never a success ACK or an unsigned response; retries remain idempotent.
+        signed_error_response(
+            state,
+            request_digest,
+            store_index,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("replication answer encoding failed: {error:#}"),
+        )
+    })
 }
 
 pub fn signed_response_for<B, T: Serialize>(
@@ -2049,8 +2086,26 @@ pub fn signed_response_for<B, T: Serialize>(
     store_index: u64,
     value: T,
 ) -> Result<Response> {
+    signed_response_for_with_limit(
+        state,
+        path,
+        request_digest,
+        store_index,
+        value,
+        MAX_EXCHANGE_BYTES,
+    )
+}
+
+fn signed_response_for_with_limit<B, T: Serialize>(
+    state: &PeerState<B>,
+    path: &str,
+    request_digest: &str,
+    store_index: u64,
+    value: T,
+    limit: usize,
+) -> Result<Response> {
     let envelope = PeerResponse::new(&state.node, store_index, value);
-    let body = super::body::encode(&envelope, MAX_EXCHANGE_BYTES)?;
+    let body = super::body::encode(&envelope, limit)?;
     let headers = state
         .auth
         .response_headers_for(path, &state.node, &body, request_digest)?;

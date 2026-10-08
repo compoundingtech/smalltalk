@@ -1,11 +1,32 @@
 {
   "version": 1,
   "summary": "Bound replication transport buffers and checkpoint assembly; share retry answers without copying payloads",
-  "replay": {"status": "none", "detail": "No full replay or derived-data rebuild is introduced."},
-  "schema": {"status": "none", "detail": "No database, index or persisted format changes."},
-  "rules": {"status": "none", "detail": "Complete checkpoint certificates, dropped payload exclusion, admission, idempotency and frontier authority remain unchanged. A failed or incomplete fetch is never adopted."},
-  "compatibility": {"status": "changed", "detail": "Wire fields, signing bytes and receipt acknowledgements are unchanged. Worker signed encoders and response readers enforce the existing 64 MiB exchange cap before allocating a whole body. Checkpoint assembly enforces the existing 1 GiB daemon adoption cap before accumulating more rows, rejects non-advancing cursors, and still requires certificate verification after complete fetch. Retry waiters share one immutable answer; receive IPC serializes a borrowed exchange and decodes the value from borrowed JSON instead of building an intermediate generic tree."},
-  "downtime": {"status": "none", "detail": "Normal binary restart only; no migration or startup phase is added. Worker RSS, local API fairness and throughput require the existing post-deploy measurement route."},
-  "manual": {"status": "none", "detail": "No resource-limit increase, live repair or configuration change is needed."},
-  "recovery": {"status": "none", "detail": "Binary swap-back uses the unchanged store. Refused oversized bodies or invalid manifest pages commit no partial adoption."}
+  "replay": {
+    "status": "none",
+    "detail": "No full replay or derived-data rebuild is introduced."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database, index or persisted format changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Complete checkpoint certificates, dropped payload exclusion, admission, idempotency and frontier authority remain unchanged. A failed or incomplete fetch is never adopted."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Wire fields, signing bytes and receipt acknowledgements are unchanged. Worker encoders and response readers now enforce the 64 MiB cap on plain responses too; previously only inflation had a response cap, so oversized plain responses could pass. Oversized exchange answers produce a signed request-bound failure, never a success acknowledgement. Checkpoint assembly enforces the existing 1 GiB daemon adoption cap before accumulating rows and rejects non-advancing cursors; complete certificate verification remains required. Duplicate API value/api_version keys now fail instead of taking the last value. Retry answers and receive IPC avoid deep copies; the API value is decoded directly from borrowed JSON."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal binary restart only; no migration or startup phase is added. Worker RSS, local API fairness and throughput require the existing post-deploy measurement route."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No resource-limit increase, live repair or configuration change is needed."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Binary swap-back uses the unchanged store. Refused oversized bodies or invalid manifest pages commit no partial adoption."
+  }
 }
