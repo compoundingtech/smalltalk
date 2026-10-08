@@ -276,3 +276,52 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
 assert.equal(shouldProbe(1_000, 5_000), false);
 assert.equal(shouldProbe(1_000, 10_999), false);
 assert.equal(shouldProbe(1_000, 11_000), true);
+
+{
+  // The missions window is followed only when asked: not subscribed at the start, subscribed when a
+  // missions screen shows, and left (its rows dropped) when none does.
+  const { client, sockets } = fakeClient();
+  const { handlers } = watch();
+  const stopped = [];
+  const feed = new Feed(client, { ...handlers, onWindowStopped: name => stopped.push(name) }, new ForegroundGate('active'), () => 'action/test', [100], 1000, false);
+  await settle();
+  const socket = sockets[0];
+  assert.ok(!subscribed(socket).includes('missions'), 'not followed at the start');
+  assert.ok(subscribed(socket).includes('agents') && subscribed(socket).includes('attention'));
+  feed.setMissions(true);
+  assert.ok(subscribed(socket).includes('missions'), 'followed once a missions screen shows');
+  feed.setMissions(false);
+  assert.ok(socket.sent.some(command => command.kind === 'unsubscribe' && command.id === 'missions'), 'left when none shows');
+  assert.deepEqual(stopped, ['missions']);
+  feed.setMissions(false);
+  assert.deepEqual(stopped, ['missions'], 'leaving twice says nothing more');
+  feed.close();
+}
+
+{
+  // Screens ask and give back; the window stays for a grace period after the last one leaves.
+  const { client, sockets } = fakeClient();
+  const { handlers } = watch();
+  const stopped = [];
+  const feed = new Feed(client, { ...handlers, onWindowStopped: name => stopped.push(name) }, new ForegroundGate('active'), () => 'action/test', [100], 1000, false, 40);
+  await settle();
+  const socket = sockets[0];
+  const first = feed.watchMissions();
+  const second = feed.watchMissions();
+  assert.equal(subscribed(socket).filter(id => id === 'missions').length, 1, 'subscribed once for two screens');
+  first();
+  first();
+  await settle(80);
+  assert.deepEqual(stopped, [], 'one screen still shows missions');
+  second();
+  await settle(10);
+  assert.deepEqual(stopped, [], 'kept through the grace period');
+  const again = feed.watchMissions();
+  await settle(80);
+  assert.deepEqual(stopped, [], 'asked again within the grace: still followed');
+  again();
+  await settle(80);
+  assert.deepEqual(stopped, ['missions'], 'left once the grace ended');
+  feed.close();
+}
+
