@@ -113,7 +113,7 @@ fn signed_send_commits_once_and_retries_keep_the_original_signature() {
             .append_signed_message(&conflict, &signed(&conflict))
             .unwrap_err()
             .code,
-        "idempotency-conflict"
+        "idempotency-mismatch"
     );
     assert_eq!(
         store
