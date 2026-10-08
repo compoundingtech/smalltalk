@@ -2,7 +2,8 @@ import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import type { Meta, StoryObj } from '@storybook/react-vite'
 import { expect, fn, userEvent, waitFor, within } from 'storybook/test'
-import { Transcript, type TranscriptAvailability, type TranscriptEmptyState, type TranscriptHistory, type TranscriptTurn } from './assistant-ui/composition/Transcript'
+import { Transcript, type TranscriptAvailability, type TranscriptHistory, type TranscriptTurn } from './assistant-ui/composition/Transcript'
+import type { TranscriptEmptyState } from './assistant-ui/composition/TranscriptFeedback'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
 import type { ConversationItem, TextItem } from './assistant-ui/embrace-data/model'
 import { workLogTurnFromItems, type WorkLogCall } from './assistant-ui/taste/work-log'
@@ -228,7 +229,10 @@ export const SendIdentityLight: Story = { ...SendIdentity, args: { scheme: 'ligh
 const semanticItems: readonly ConversationItem[] = [
   { _tag: 'Text', id: 'semantic/system', role: 'system', text: 'System context retained.', attachments: [], streaming: false, at },
   { _tag: 'Notice', id: 'semantic/notice', kind: 'redaction', text: 'Notice content retained.', at },
-  { _tag: 'Message', id: 'semantic/message', messageId: 'handoff', title: 'Message handoff retained.', at },
+  { _tag: 'Notice', id: 'semantic/error-notice', kind: 'error', text: 'Error notice retained.', detail: 'Error detail retained.', at },
+  { _tag: 'Message', id: 'semantic/message', messageId: 'handoff', title: 'Message handoff retained.', sender: { kind: 'harness', label: 'Host' }, at },
+  { _tag: 'Message', id: 'semantic/subagent', messageId: 'subagent-result', title: 'Subagent **message** retained.', sender: { kind: 'subagent', label: 'Row reviewer' }, at },
+  { _tag: 'Message', id: 'semantic/untitled', messageId: 'untitled-handoff', sender: { kind: 'harness', label: 'Host' }, at },
   { _tag: 'Event', id: 'semantic/event', kind: 'harness-message', title: 'Event title retained.', text: 'Event body retained.', sender: { kind: 'harness', label: 'Host' }, data: {}, at },
   { _tag: 'UnknownEvent', id: 'semantic/unknown', eventType: 'future.semantic.event', data: {}, at },
   { _tag: 'Status', id: 'semantic/status', status: 'completed', detail: 'Status detail retained.', at },
@@ -243,6 +247,7 @@ const semanticData: TranscriptStoryData = {
     id: 'semantic',
     prompt: { _tag: 'Text', id: 'semantic/prompt', role: 'user', text: 'User content retained.', attachments: [], streaming: false, at },
     items: semanticItems,
+    senderCaptions: { 'semantic/subagent': 'Review delegate' },
     work: workLogTurnFromItems(semanticItems, { kindFor: () => 'read', running: false, failed: false, interrupted: false, durationMs: 24000, completeHistory: true }),
   }],
 }
@@ -252,9 +257,28 @@ export const SemanticItems: Story = { render: args => <main {...stylex.props(sty
   await userEvent.click(canvas.getByRole('button', { name: 'Thinking' }))
   await expect(canvas.getByTestId('tool-detail-preview')).toBeVisible()
   await expect(canvas.getByTestId('tool-detail-preview')).toHaveTextContent('export const semantic = true')
-  for (const text of ['User content retained.', 'System context retained.', 'Notice content retained.', 'Message handoff retained.', 'Event title retained.', 'Event body retained.', 'future.semantic.event', 'Status detail retained.', 'Usage · response · 123 input · 45 output', 'Reasoning content retained.', 'Assistant content retained.']) {
+  for (const text of ['User content retained.', 'System context retained.', 'Notice content retained.', 'Error notice retained.', 'Error detail retained.', 'Message handoff retained.', 'Message untitled-handoff', 'Event title retained.', 'Event body retained.', 'future.semantic.event', 'Status detail retained.', 'Usage · response · 123 input · 45 output', 'Reasoning content retained.', 'Assistant content retained.']) {
     await expect(canvas.getByText(text, { exact: false })).toBeVisible()
   }
+  const lane = canvas.getByTestId('transcript-scroll')
+  await expect(within(lane).queryByTestId('sender-avatar')).not.toBeInTheDocument()
+  await expect(within(lane).queryByTestId('sender-header')).not.toBeInTheDocument()
+  await expect(lane.querySelector('header')).toBeNull()
+  for (const id of ['system', 'notice', 'error-notice', 'event', 'unknown', 'status', 'usage']) {
+    const row = lane.querySelector(`[data-item-id="semantic/${id}"]`)
+    await expect(row).toHaveAttribute('data-testid', 'transcript-message')
+    await expect(row).toBeVisible()
+  }
+  for (const id of ['message', 'subagent', 'untitled']) {
+    await expect(lane.querySelector(`[data-item-id="semantic/${id}"]`)).toHaveAttribute('data-testid', 'agent-message')
+  }
+  await expect(within(lane.querySelector('[data-item-id="semantic/message"]') as HTMLElement).getByRole('heading', { name: 'Host' })).toBeVisible()
+  const subagent = lane.querySelector('[data-item-id="semantic/subagent"]') as HTMLElement
+  await expect(within(subagent).getByRole('heading', { name: 'Review delegate' })).toBeVisible()
+  await expect(subagent.querySelector('strong')).toHaveTextContent('message')
+  await expect(subagent).toBeVisible()
+  await expect(subagent).toHaveTextContent('Subagent message retained.')
+  await expect(within(subagent).queryByText('Row reviewer')).not.toBeInTheDocument()
 } }
 export const SemanticItemsLight: Story = { ...SemanticItems, args: { scheme: 'light' } }
 export const ReadableEmpty: Story = { args: { state: 'empty', emptyState: { title: 'No messages in this conversation', body: 'Send a message to start working with the agent.' } }, play: async ({ canvasElement }) => {
