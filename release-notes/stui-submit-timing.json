@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "stui records what each send cost on this device (to pending draw, to st's answer, to delivered) in a local file of milliseconds and ids",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, columns, indexes or triggers."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No wire or product behavior change: a bounded local diagnostic file, never sent anywhere, no message text and no person or agent names."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Delete the file to clear it."
+  }
+}
