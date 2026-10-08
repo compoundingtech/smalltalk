@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Measure mission, work and attention collection snapshots on the existing daemon_load subscribers",
+  "replay": {
+    "status": "none",
+    "detail": "Test workload only; production graph replay and startup are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No production or checkpoint schema changes; generated load fixture schema is unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, admission policy, writer behavior or fleet coordination changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client protocol changes. Load report JSON gains optional per-collection counts; legacy reports deserialize with empty counts."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No serving code changes or deployment restart required by this measurement change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Run the existing opt-in release daemon_load command to measure all four held collections. Subsequent view changes compare against the expanded workload baseline."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reverting the test change restores the roster-only workload; no production database state changes."
+  }
+}
