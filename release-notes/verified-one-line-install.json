@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Release archives contain st3, st linked to st3, and pty as their command payload. st3-migrate remains a separate source tool. Linux builds target glibc2.35 with pinned Zig0.15.2, avoiding newer weak-symbol version requirements. Native archive builds use a clean release stamp; ordinary local and Nix stamps retain their prior formats."
+    "detail": "Release archives contain st3, st linked to st3, and pty as their command payload. st3-migrate remains a separate source tool. Native builds pin Rust1.97.0; Linux builds target glibc2.35 with pinned Zig0.15.2, avoiding newer weak-symbol version requirements. Native archives use a clean release stamp with a fixed12-character source revision; ordinary local and Nix stamps retain their prior formats."
   },
   "downtime": {
     "status": "none",
@@ -26,7 +26,7 @@
     "detail": "Use the root install.sh for platform detection, download, SHA256 verification, installation and opening st. --tag selects a release; --no-run only installs. Extracted archive installers also accept --quiet. No gh, Rust, Nix or password prompt is required to download and install."
   },
   "recovery": {
-    "status": "none",
-    "detail": "No new persistent state changes. Existing source-pinned upgrade impact and rollback compatibility requirements continue to apply; retained older archives remain recovery material only when their state contracts permit rollback."
+    "status": "changed",
+    "detail": "The payload installer preserves prior command files and restores them after a handled rename failure or signal; macOS app/launchd rollback reuses the retained helper job with the same destination context. Archive transactions share an app lock across custom bin directories. A late rollback refuses to overwrite a changed or unconfirmed app/launchd generation. If restoration fails or ownership is lost, the error identifies preserved files and the macOS job; locks remain. Inspect any newer installation and repair from the retained material before removing the locks. These file transactions do not change database rollback compatibility. Existing source-pinned upgrade impact requirements continue to apply; older archives remain recovery material only when their state contracts permit rollback."
   }
 }

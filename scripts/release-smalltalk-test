@@ -29,6 +29,7 @@ with tempfile.TemporaryDirectory() as temporary:
     stamp_binary = root / 'build-stamp'
     run('rustc', '--edition=2024', str(checkout / 'build.rs'), '-o', str(stamp_binary), cwd=root)
     revision = run('git', 'rev-parse', '--short', 'HEAD', cwd=checkout)
+    release_revision = run('git', 'rev-parse', 'HEAD', cwd=checkout)[:12]
 
     def stamp():
         output = run(str(stamp_binary), cwd=checkout)
@@ -46,8 +47,11 @@ with tempfile.TemporaryDirectory() as temporary:
     release = release_stamp()
     assert release.returncode == 0, release.stderr
     assert json.loads(release.stdout) == {
-        'type': 'release', 'version': '0.1.0', 'rev': revision,
+        'type': 'release', 'version': '0.1.0', 'rev': release_revision,
         'commitTs': json.loads(release.stdout)['commitTs'], 'dirty': False}
+    run('git', 'config', 'core.abbrev', '5', cwd=checkout)
+    assert json.loads(release_stamp().stdout)['rev'] == release_revision
+    run('git', 'config', '--unset', 'core.abbrev', cwd=checkout)
     assert json.loads(release_stamp('v0.3.18').stdout)['version'] == '0.3.18'
     assert release_stamp('../bad').returncode != 0
     # setup-zig restores this before Cargo runs. A previous archive or Cargo cache

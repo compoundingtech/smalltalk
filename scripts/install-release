@@ -22,28 +22,142 @@ for name in "${binaries[@]}" st stui; do
   [[ ! -d $bin_dir/$name ]] || { echo "refusing to replace directory: $name" >&2; exit 1; }
 done
 mkdir -p "$bin_dir"
+bin_dir=$(cd "$bin_dir" && pwd)
+stage=
+locked=false
+rollback_ready=false
+committed=false
 macos=false
-if [[ $(uname -s) == Darwin ]]; then
-  if $quiet; then
-    python3 "$(cd "$(dirname "$0")" && pwd)/install-macos.py" --from "$source_dir" --bin-dir "$bin_dir" >/dev/null
-  else
-    python3 "$(cd "$(dirname "$0")" && pwd)/install-macos.py" --from "$source_dir" --bin-dir "$bin_dir"
+macos_job=
+macos_locked=false
+macos_lock=
+macos_home=
+macos_app=
+macos_helper="$(cd "$(dirname "$0")" && pwd)/install-macos.py"
+macos_snapshot() {
+  python3 - "$macos_home" "$macos_app" "$bin_dir" <<'PY'
+import json
+from pathlib import Path
+import sys
+home, app, bin_dir = map(Path, sys.argv[1:])
+paths = [app, app / 'Contents/MacOS/st3']
+paths += [home / 'Library/LaunchAgents' / (s + '.plist') for s in
+          ['com.compoundingtech.st3', 'com.compoundingtech.st3.replication']]
+def generation(path):
+    try:
+        s = path.lstat()
+        return [s.st_dev, s.st_ino, s.st_mtime_ns, s.st_size]
+    except FileNotFoundError:
+        return None
+print(json.dumps({'home': str(home), 'app': str(app), 'bin_dir': str(bin_dir),
+                  'files': {str(p): generation(p) for p in paths}}, sort_keys=True))
+PY
+}
+cleanup() {
+  status=$?
+  trap - EXIT
+  set +e
+  restored=true
+  restore_bins=true
+  if $rollback_ready && ! $committed; then
+    if [[ -n $macos_job && -f $macos_job/previous.json ]]; then
+      # Only a completed helper call supplies a generation witness. Never use a
+      # late restore to overwrite another install or an unconfirmed partial app.
+      if [[ -f $macos_job/caller-owner.json ]] && \
+          [[ $(macos_snapshot) == "$(cat "$macos_job/caller-owner.json")" ]]; then
+        python3 "$macos_helper" --restore-app --job "$macos_job" \
+          --home "$macos_home" --app "$macos_app" --bin-dir "$bin_dir" >/dev/null || restored=false
+      else
+        printf 'install: macOS transaction ownership changed or is unconfirmed; current app and links left intact\n' >&2
+        restored=false
+        restore_bins=false
+      fi
+    fi
+    if $restore_bins; then
+      mkdir -p "$stage/restore" || restored=false
+      for name in "${binaries[@]}" st stui; do
+        if [[ -e $stage/previous/$name || -L $stage/previous/$name ]]; then
+          # Keep backups intact; hard links need no executable-sized allocation.
+          ln -P "$stage/previous/$name" "$stage/restore/$name" && \
+            mv -f "$stage/restore/$name" "$bin_dir/$name" || restored=false
+        else
+          rm -f -- "$bin_dir/$name" || restored=false
+        fi
+      done
+    fi
   fi
-  macos=true
-fi
+  if $restored; then
+    [[ -z $stage ]] || rm -rf "$stage"
+    if $locked; then rmdir "$bin_dir/.smalltalk-install.lock"; fi
+    if $macos_locked; then rmdir "$macos_lock"; fi
+  else
+    printf 'install: rollback failed; prior files remain in %s/previous; the install lock is retained\n' "$stage" >&2
+    if [[ -n $macos_job ]]; then printf 'install: retained macOS app/launchd job: %s\n' "$macos_job" >&2; fi
+    status=1
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# Serialize command-file transactions as well as the helper's existing app lock.
+mkdir "$bin_dir/.smalltalk-install.lock"
+locked=true
 stage=$(mktemp -d "$bin_dir/.smalltalk-install.XXXXXX")
-trap 'rm -rf "$stage"' EXIT
+mkdir "$stage/previous"
+for name in "${binaries[@]}" st stui; do
+  if [[ -e $bin_dir/$name || -L $bin_dir/$name ]]; then
+    cp -pP "$bin_dir/$name" "$stage/previous/$name"
+  fi
+done
 for binary in "${binaries[@]}"; do
   cp "$source_dir/$binary" "$stage/$binary"
   chmod 0755 "$stage/$binary"
 done
 ln -s st3 "$stage/st"
+if [[ $(uname -s) == Darwin ]]; then
+  macos_home="${ST_MACOS_INSTALL_HOME:-$HOME}"
+  mkdir -p "$macos_home"
+  macos_home=$(cd "$macos_home" && pwd)
+  macos_app=$(python3 - "$macos_home" <<'PY'
+import os
+from pathlib import Path
+import sys
+app = os.environ.get('ST_MACOS_APP_PATH')
+print(Path(app).expanduser().absolute() if app else Path(sys.argv[1]) / 'Applications/SmallTalk.app')
+PY
+)
+  macos_lock="$(dirname "$macos_app")/.${macos_app##*/}.archive-install.lock"
+  mkdir -p "$(dirname "$macos_app")"
+  # Different bin directories can still install the same app. This is separate
+  # from the helper's flock, so invoking the helper cannot deadlock on its own lock.
+  mkdir "$macos_lock"
+  macos_locked=true
+  macos_state="$macos_home/.local/state/st3/macos-installs"
+  mkdir -p "$macos_state"
+  # Retain this job just as the helper's default installation does. It holds the
+  # signed previous app, command links and launchd files for the existing restore API.
+  macos_job=$(mktemp -d "$macos_state/install-XXXXXXXX")
+  rollback_ready=true
+  if $quiet; then
+    python3 "$macos_helper" --from "$source_dir" --bin-dir "$bin_dir" --job "$macos_job" \
+      --home "$macos_home" --app "$macos_app" >/dev/null
+  else
+    python3 "$macos_helper" --from "$source_dir" --bin-dir "$bin_dir" --job "$macos_job" \
+      --home "$macos_home" --app "$macos_app"
+  fi
+  macos_snapshot > "$macos_job/caller-owner.json"
+  macos=true
+fi
+rollback_ready=true
 for name in "${binaries[@]}" st; do
   if [[ $macos == true && $name == st3 ]]; then continue; fi
   mv -f "$stage/$name" "$bin_dir/$name"
 done
 # Retire the old executable; no alias or shim remains.
 rm -f -- "$bin_dir/stui"
+committed=true
 if ! $quiet; then
   printf 'Installed st3, st -> st3, and pty in %s\n' "$bin_dir"
   echo 'Running services were not restarted.'

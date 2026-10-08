@@ -61,11 +61,20 @@ cp "$FIXTURES/${url##*/}" "$out"
     assert result.returncode != 0 and 'supported platforms' in result.stderr, result
     result = install('--tag', '../other')
     assert result.returncode != 0 and 'invalid release tag' in result.stderr, result
-    # Retained releases predate --quiet. Their notices stay out of the root installer's output.
+    # Exact published v0.3.17 installer from source f4cec96e414fee2a780910730b019fe6bdbddc1d.
+    # It rejects --quiet and requires the historical four-command payload.
     payload_installer = payload / 'install.sh'
-    payload_installer.write_text(payload_installer.read_text().replace('    --quiet) quiet=true; shift ;;\n', ''))
+    published = repo / 'scripts/fixtures/install-release-v0.3.17'
+    assert hashlib.sha256(published.read_bytes()).hexdigest() == 'd6912ca3612d73b9e8c6645312698b656c9fc8b241bd9185d4b0334086742dea'
+    rejected = subprocess.run(['bash', str(published), '--quiet'], env=env,
+                              text=True, capture_output=True, timeout=10)
+    assert rejected.returncode == 2 and 'unknown option: --quiet' in rejected.stderr, rejected
+    shutil.copy(published, payload_installer); payload_installer.chmod(0o755)
+    for name in ['stui', 'st3-migrate']: shutil.copy(payload / 'bin/st3', payload / 'bin' / name)
     with tarfile.open(archive, 'w:gz') as t: t.add(payload, arcname=payload.name)
     checksum.write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + archive.name + '\n')
-    result = install('--no-run')
+    legacy_bin = root / 'legacy-bin'
+    result = install('--tag', 'v0.3.17', '--bin-dir', str(legacy_bin), '--no-run')
     assert result.returncode == 0 and result.stdout == '' and result.stderr == '', result
+    assert sorted(p.name for p in legacy_bin.iterdir()) == ['pty', 'st', 'st3', 'st3-migrate', 'stui']
 print('Download installer integrity, quiet install, launch and platform controls passed')

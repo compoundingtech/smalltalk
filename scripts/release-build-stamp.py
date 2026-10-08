@@ -20,5 +20,6 @@ if tag:
     if not match:
         raise SystemExit('release tag must name a semantic version')
     base = match.group(1)
-print(json.dumps({'type': 'release', 'version': base, 'rev': git('rev-parse', '--short', 'HEAD'),
+# A fixed prefix does not depend on a clone's object count or core.abbrev setting.
+print(json.dumps({'type': 'release', 'version': base, 'rev': git('rev-parse', 'HEAD')[:12],
                   'commitTs': int(git('log', '-1', '--format=%ct')), 'dirty': False}))

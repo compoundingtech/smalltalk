@@ -25,6 +25,11 @@ if $dry_run; then
   printf 'verify manifest, install in isolated destination, run st ui PTY smoke\n'
   exit 0
 fi
+rust_version=$(cat scripts/release-rust-version)
+case "$(rustc --version)" in
+  "rustc $rust_version "*) ;;
+  *) echo "release-smalltalk: expected Rust $rust_version" >&2; exit 1 ;;
+esac
 test -z "$(git status --porcelain --untracked-files=no)"
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
