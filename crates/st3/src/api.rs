@@ -4348,13 +4348,27 @@ fn warm_agent_roster(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Publish the complete roster at a new cut. When the newest complete roster tells which cards
-/// changed since, one short snapshot refolds only those. Otherwise the cards fold in short
-/// snapshots of at most [`AGENT_ROSTER_WARM_CHUNK`]: each folds the next agents at its own cut
-/// and refolds the already folded cards whose claims changed, so the last step completes a
-/// roster coherent at its cut. Readers keep the previous complete roster meanwhile.
+/// How many times a refresh folds the roster in chunks before it gives up on a roster that
+/// keeps changing in ways it cannot follow card by card.
+const AGENT_ROSTER_ASSEMBLY_ROUNDS: usize = 3;
+
+/// Publish the complete roster at a new cut, never folding more than
+/// [`AGENT_ROSTER_WARM_CHUNK`] cards in one snapshot. A snapshot completes the roster only once
+/// the newest rows say which cards changed and at most that many are changed or missing.
+/// Otherwise the cards fold in chunks, each at its own cut, refolding the already folded cards
+/// whose claims changed, and completion is tried again. Readers keep the previous complete
+/// roster meanwhile; if it cannot be assembled, they keep it until its requests are overdue.
 fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
-    if !store.read_snapshot(|index| store.agent_roster_delta_known(index, history))? {
+    let complete = |store: &Store| store.read_snapshot(|index| {
+        if !store.agent_roster_completion_bounded(index, history, AGENT_ROSTER_WARM_CHUNK)? {
+            return Ok(false);
+        }
+        client_agent_resources_cached(store, history, index).map(|_| true)
+    });
+    for _ in 0..AGENT_ROSTER_ASSEMBLY_ROUNDS {
+        if complete(store)? {
+            return Ok(());
+        }
         let order = store.read_snapshot(|index| {
             Ok(client_agent_page_refs(store, history, index)?.iter()
                 .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
@@ -4367,7 +4381,10 @@ fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
             })?;
         }
     }
-    store.read_snapshot(|index| client_agent_resources_cached(store, history, index).map(drop))
+    if complete(store)? {
+        return Ok(());
+    }
+    anyhow::bail!("the agents roster kept changing in ways no short fold can follow; keeping the previous one")
 }
 
 /// Every current agent's refs, and the cards of as many as the largest window or page shows.

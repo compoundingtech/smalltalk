@@ -2940,16 +2940,40 @@ impl Store {
         Some(wake)
     }
 
-    /// Whether a fold at `index` can start from the newest complete roster and refold only the
-    /// cards whose claims changed since, rather than every card.
-    pub(crate) fn agent_roster_delta_known(&self, index: u64, history: bool) -> Result<bool> {
+    /// Whether a complete roster at `index` takes folding at most `bound` cards: the newest
+    /// rows, complete or partial, say which cards changed since, and together with the agents
+    /// they do not cover yet those are no more than `bound`. Read in the snapshot that folds.
+    pub(crate) fn agent_roster_completion_bounded(
+        &self,
+        index: u64,
+        history: bool,
+        bound: usize,
+    ) -> Result<bool> {
         let previous = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
-            .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
+            .filter(|entry| entry.history == history && entry.index <= index)
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
         let Some(previous) = previous else { return Ok(false) };
-        Ok(previous.index == index
-            || self.changed_agent_resources(previous.index, index, &previous.items)?.is_some())
+        let changed = if previous.index == index {
+            0
+        } else {
+            match self.changed_agent_resources(previous.index, index, &previous.items)? {
+                Some(delta) => delta.subjects.len(),
+                None => return Ok(false),
+            }
+        };
+        let connection = self.readers.get();
+        let names = connection.prepare_cached(RANGE_SUBJECTS)?
+            .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        let names = if history { names } else {
+            self.current_view_candidates(&connection, names, index, true)?
+        };
+        drop(connection);
+        let folded = previous.items.iter().filter_map(|item| item["id"].as_str())
+            .collect::<HashSet<_>>();
+        let missing = names.iter().filter(|name| !folded.contains(name.as_str())).count();
+        Ok(changed.saturating_add(missing) <= bound)
     }
 
     /// Whether a refresher keeps the roster published, so readers must never fold it.
