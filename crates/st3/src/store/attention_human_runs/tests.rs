@@ -282,6 +282,133 @@ fn replacements_preserve_old_and_new_keys_rollback_namespace_isolation_and_clock
 }
 
 #[test]
+fn human_and_stop_arrangements_ignore_temp_shadows_for_reads_and_mutations() {
+    use crate::store::attention_stop_heads as stops;
+    let store = Store::open_memory("alder").unwrap();
+    let ns = namespace(&store, "fixture/human-main-storage");
+    let mut writer = store.connection.write();
+    stops::create_schema(&writer).unwrap();
+    let old_run = "mission-run/main-old".to_owned();
+    let new_run = "mission-run/main-new".to_owned();
+    let head = stops::Head {
+        requester: "agent/asker".into(),
+        key: (10, "writer".into(), 1, "batch".into(), 0, "stop".into()),
+    };
+    {
+        let tx = writer.transaction().unwrap();
+        replace(
+            &tx,
+            &ns,
+            &Input {
+                family: Family::Person,
+                source: "step-run/main".into(),
+                runs: vec![Membership {
+                    run: old_run.clone(),
+                    eligible: 1,
+                }],
+            },
+        )
+        .unwrap();
+        stops::replace(&tx, &ns, "stop", Some(&head)).unwrap();
+        tx.commit().unwrap();
+    }
+    writer
+        .execute_batch(
+            "CREATE TEMP TABLE local_attention_human_membership AS
+           SELECT * FROM main.local_attention_human_membership;
+         CREATE TEMP TABLE local_attention_stop_heads AS
+           SELECT * FROM main.local_attention_stop_heads;
+         UPDATE temp.local_attention_stop_heads SET fact='[]';",
+        )
+        .unwrap();
+    writer
+        .execute(
+            "UPDATE temp.local_attention_human_membership SET eligible=?1",
+            [u128::MAX.to_be_bytes().to_vec()],
+        )
+        .unwrap();
+    // Explicit setup and both readers keep main as their physical storage even
+    // though the TEMP tables disagree and lack the required keys and indexes.
+    create_schema(&writer).unwrap();
+    stops::create_schema(&writer).unwrap();
+    assert!(selected(&writer, &ns, std::slice::from_ref(&old_run), 1).unwrap()[0].waiting);
+    assert_eq!(
+        stops::maximum(&writer, &ns, "agent/asker").unwrap(),
+        Some(head)
+    );
+    let tx = writer.transaction().unwrap();
+    let changes = replace(
+        &tx,
+        &ns,
+        &Input {
+            family: Family::Person,
+            source: "step-run/main".into(),
+            runs: vec![Membership {
+                run: new_run.clone(),
+                eligible: 2,
+            }],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        changes.affected_runs,
+        BTreeSet::from([old_run.clone(), new_run.clone()])
+    );
+    assert_eq!(changes.writes, 2);
+    let rows = selected(&tx, &ns, &[old_run, new_run.clone()], 1).unwrap();
+    assert!(!rows[0].waiting);
+    assert!(!rows[1].waiting);
+    assert_eq!(rows[1].next_deadline, Some(2));
+    assert!(reclaim(&tx, &ns, 1).unwrap());
+    assert!(!selected(&tx, &ns, &[new_run], u128::MAX).unwrap()[0].waiting);
+    assert_eq!(stops::replace(&tx, &ns, "stop", None).unwrap().writes, 1);
+    assert!(stops::maximum(&tx, &ns, "agent/asker").unwrap().is_none());
+    let shadow_eligible: Vec<u8> = tx
+        .query_row(
+            "SELECT eligible FROM temp.local_attention_human_membership",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(shadow_eligible, u128::MAX.to_be_bytes());
+    let shadow_fact: String = tx
+        .query_row(
+            "SELECT fact FROM temp.local_attention_stop_heads",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(shadow_fact, "[]");
+    tx.commit().unwrap();
+}
+
+#[test]
+fn missing_arrangement_indexes_refuse_without_scan_or_read_repair() {
+    use crate::store::attention_stop_heads as stops;
+    let store = Store::open_memory("alder").unwrap();
+    let ns = namespace(&store, "fixture/human-missing-index");
+    let writer = store.connection.write();
+    stops::create_schema(&writer).unwrap();
+    writer
+        .execute_batch(
+            "DROP INDEX main.attention_human_membership_run;
+         DROP INDEX main.attention_stop_head_by_requester;",
+        )
+        .unwrap();
+    assert!(selected(&writer, &ns, &["mission-run/missing".into()], 0).is_err());
+    assert!(stops::maximum(&writer, &ns, "agent/asker").is_err());
+    let indexes: usize = writer
+        .query_row(
+            "SELECT count(*) FROM main.sqlite_schema WHERE type='index'
+         AND name IN ('attention_human_membership_run','attention_stop_head_by_requester')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexes, 0);
+}
+
+#[test]
 fn canonical_stop_arrangement_tracks_rekeys_removals_rollback_and_isolated_namespaces() {
     use crate::store::attention_stop_heads as stops;
     let store = Store::open_memory("alder").unwrap();

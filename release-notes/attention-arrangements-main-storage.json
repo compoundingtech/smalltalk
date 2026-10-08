@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Bind inactive human attention and canonical STOP arrangements to main storage",
+  "replay": {
+    "status": "none",
+    "detail": "No production source is registered and no scan, replay or backfill is added. Existing native attention reads remain in use."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Table and index definitions are unchanged. Explicit inactive helper setup now selects main rather than a TEMP shadow. Selected human runs and STOP maxima require their existing named main index; physical schema and index eligibility remains source-owned."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No admission, projection, checkpoint or fleet rule changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No public protocol, native attention predicate or actor visibility changes. The helpers refuse a missing read index instead of allowing a scan fallback."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No production registration, startup work or service interruption is introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No action is required for existing installations. Complete native capture, lifecycle and source coverage remain prerequisites for future activation."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Native production readers are unchanged. A missing inactive arrangement index returns an error without rebuilding from a read. Main qualification does not certify replaced schemas, triggers or lifetime continuity."
+  }
+}

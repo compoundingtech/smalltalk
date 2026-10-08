@@ -3,20 +3,22 @@
 //! The source owner supplies complete per-source replacements in a certified namespace.
 //! This component does not qualify a source or switch production reads. Missions consume
 //! its indexed run dependency, independently of public attention and login availability.
+//! All storage binds to main. The owner must validate the physical table and index
+//! definitions at its cut; requiring the run index only prevents a missing-index fallback.
 use super::*;
 use serde::{Deserialize, Serialize};
 use smallclaims::ivm::install::Namespace;
 
 const PAGE: usize = 128;
 const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS local_attention_human_membership (
+CREATE TABLE IF NOT EXISTS main.local_attention_human_membership (
  namespace TEXT NOT NULL, family TEXT NOT NULL, source TEXT NOT NULL,
  run TEXT NOT NULL, eligible BLOB NOT NULL,
  PRIMARY KEY(namespace,family,source,run)
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS attention_human_membership_run
+CREATE INDEX IF NOT EXISTS main.attention_human_membership_run
  ON local_attention_human_membership(namespace,run,eligible,family,source);
-CREATE INDEX IF NOT EXISTS attention_human_membership_clock
+CREATE INDEX IF NOT EXISTS main.attention_human_membership_clock
  ON local_attention_human_membership(namespace,eligible,run,family,source);
 "#;
 
@@ -163,7 +165,7 @@ pub(crate) fn replace(
 ) -> Result<Changes> {
     input.validate()?;
     let old: BTreeMap<String, Vec<u8>> = tx.prepare_cached(
-        "SELECT run,eligible FROM local_attention_human_membership WHERE namespace=?1 AND family=?2 AND source=?3 ORDER BY run LIMIT 129"
+        "SELECT run,eligible FROM main.local_attention_human_membership WHERE namespace=?1 AND family=?2 AND source=?3 ORDER BY run LIMIT 129"
     )?.query_map(params![namespace.as_str(),input.family.name(),input.source], |row| Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     anyhow::ensure!(
         old.len() <= PAGE,
@@ -186,9 +188,9 @@ pub(crate) fn replace(
     );
     for run in &affected_runs {
         if let Some(eligible) = next.get(run) {
-            tx.execute("INSERT INTO local_attention_human_membership VALUES(?1,?2,?3,?4,?5) ON CONFLICT(namespace,family,source,run) DO UPDATE SET eligible=excluded.eligible",params![namespace.as_str(),input.family.name(),input.source,run,eligible])?;
+            tx.execute("INSERT INTO main.local_attention_human_membership VALUES(?1,?2,?3,?4,?5) ON CONFLICT(namespace,family,source,run) DO UPDATE SET eligible=excluded.eligible",params![namespace.as_str(),input.family.name(),input.source,run,eligible])?;
         } else {
-            tx.execute("DELETE FROM local_attention_human_membership WHERE namespace=?1 AND family=?2 AND source=?3 AND run=?4",params![namespace.as_str(),input.family.name(),input.source,run])?;
+            tx.execute("DELETE FROM main.local_attention_human_membership WHERE namespace=?1 AND family=?2 AND source=?3 AND run=?4",params![namespace.as_str(),input.family.name(),input.source,run])?;
         }
     }
     Ok(Changes {
@@ -221,8 +223,8 @@ pub(crate) fn selected(
             run.starts_with("mission-run/") && run.len() <= 4096,
             "human selected run identity"
         );
-        let waiting = connection.query_row("SELECT EXISTS(SELECT 1 FROM local_attention_human_membership WHERE namespace=?1 AND run=?2 AND eligible<=?3)",params![namespace.as_str(),run,at],|row|row.get(0))?;
-        let next: Option<Vec<u8>> = connection.query_row("SELECT eligible FROM local_attention_human_membership WHERE namespace=?1 AND run=?2 AND eligible>?3 ORDER BY eligible LIMIT 1",params![namespace.as_str(),run,at],|row|row.get(0)).optional()?;
+        let waiting = connection.query_row("SELECT EXISTS(SELECT 1 FROM main.local_attention_human_membership INDEXED BY attention_human_membership_run WHERE namespace=?1 AND run=?2 AND eligible<=?3)",params![namespace.as_str(),run,at],|row|row.get(0))?;
+        let next: Option<Vec<u8>> = connection.query_row("SELECT eligible FROM main.local_attention_human_membership INDEXED BY attention_human_membership_run WHERE namespace=?1 AND run=?2 AND eligible>?3 ORDER BY eligible LIMIT 1",params![namespace.as_str(),run,at],|row|row.get(0)).optional()?;
         let next_deadline = next
             .map(|bytes| {
                 Ok::<_, anyhow::Error>(u128::from_be_bytes(
@@ -248,9 +250,9 @@ pub(crate) fn reclaim(tx: &Transaction<'_>, namespace: &Namespace, limit: usize)
         (1..=PAGE).contains(&limit),
         "human namespace cleanup page exceeds 128"
     );
-    tx.execute("DELETE FROM local_attention_human_membership WHERE (namespace,family,source,run) IN (SELECT namespace,family,source,run FROM local_attention_human_membership WHERE namespace=?1 ORDER BY family,source,run LIMIT ?2)",params![namespace.as_str(),limit])?;
+    tx.execute("DELETE FROM main.local_attention_human_membership WHERE (namespace,family,source,run) IN (SELECT namespace,family,source,run FROM main.local_attention_human_membership WHERE namespace=?1 ORDER BY family,source,run LIMIT ?2)",params![namespace.as_str(),limit])?;
     Ok(!tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM local_attention_human_membership WHERE namespace=?1)",
+        "SELECT EXISTS(SELECT 1 FROM main.local_attention_human_membership WHERE namespace=?1)",
         [namespace.as_str()],
         |row| row.get::<_, bool>(0),
     )?)

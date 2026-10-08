@@ -1,17 +1,19 @@
 //! Source-owned canonical STOP arrangement. Source producers certify complete OLD/NEW
 //! declarations and canonical batch/record corrections at the same native cut.
 //! This indexed component supplies no capture coverage or production read authority.
+//! Main-qualified storage ignores TEMP shadows. The owner still validates physical
+//! schema/index eligibility; a missing maximum index refuses instead of scanning.
 use super::*;
 use smallclaims::ivm::install::Namespace;
 
 const MAX_ID: usize = 4096;
 const MAX_FACT: usize = 16 * 1024;
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS local_attention_stop_heads(
+CREATE TABLE IF NOT EXISTS main.local_attention_stop_heads(
  namespace TEXT NOT NULL,claim TEXT NOT NULL,requester TEXT NOT NULL,
  canonical_key BLOB NOT NULL CHECK(typeof(canonical_key)='blob'),fact TEXT NOT NULL,
  PRIMARY KEY(namespace,claim)) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS attention_stop_head_by_requester
+CREATE INDEX IF NOT EXISTS main.attention_stop_head_by_requester
  ON local_attention_stop_heads(namespace,requester,canonical_key DESC,claim DESC);";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,7 +72,7 @@ pub(crate) fn replace(
         .transpose()?;
     // Read lengths before materializing potentially corrupted local facts.
     let lengths: Option<(usize,usize,usize)> = tx.query_row(
-        "SELECT length(CAST(requester AS BLOB)),length(canonical_key),length(CAST(fact AS BLOB)) FROM local_attention_stop_heads WHERE namespace=?1 AND claim=?2",
+        "SELECT length(CAST(requester AS BLOB)),length(canonical_key),length(CAST(fact AS BLOB)) FROM main.local_attention_stop_heads WHERE namespace=?1 AND claim=?2",
         params![ns.as_str(),claim], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
     ).optional()?;
     if let Some((requester, key, fact)) = lengths {
@@ -80,7 +82,7 @@ pub(crate) fn replace(
         );
     }
     let old: Option<(String,Vec<u8>,String)> = tx.query_row(
-        "SELECT requester,canonical_key,fact FROM local_attention_stop_heads WHERE namespace=?1 AND claim=?2",
+        "SELECT requester,canonical_key,fact FROM main.local_attention_stop_heads WHERE namespace=?1 AND claim=?2",
         params![ns.as_str(),claim], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
     ).optional()?;
     if old == next {
@@ -95,11 +97,11 @@ pub(crate) fn replace(
         .map(|row| row.0.clone())
         .collect();
     let writes = if let Some((requester, key, fact)) = next {
-        tx.execute("INSERT INTO local_attention_stop_heads VALUES(?1,?2,?3,?4,?5) ON CONFLICT(namespace,claim) DO UPDATE SET requester=excluded.requester,canonical_key=excluded.canonical_key,fact=excluded.fact",
+        tx.execute("INSERT INTO main.local_attention_stop_heads VALUES(?1,?2,?3,?4,?5) ON CONFLICT(namespace,claim) DO UPDATE SET requester=excluded.requester,canonical_key=excluded.canonical_key,fact=excluded.fact",
             params![ns.as_str(),claim,requester,key,fact])?
     } else {
         tx.execute(
-            "DELETE FROM local_attention_stop_heads WHERE namespace=?1 AND claim=?2",
+            "DELETE FROM main.local_attention_stop_heads WHERE namespace=?1 AND claim=?2",
             params![ns.as_str(), claim],
         )?
     };
@@ -117,7 +119,7 @@ pub(crate) fn maximum(c: &Connection, ns: &Namespace, requester: &str) -> Result
         "STOP requester bound"
     );
     let row: Option<(usize,usize,usize)> = c.query_row(
-        "SELECT length(CAST(claim AS BLOB)),length(canonical_key),length(CAST(fact AS BLOB)) FROM local_attention_stop_heads WHERE namespace=?1 AND requester=?2 ORDER BY canonical_key DESC,claim DESC LIMIT 1",
+        "SELECT length(CAST(claim AS BLOB)),length(canonical_key),length(CAST(fact AS BLOB)) FROM main.local_attention_stop_heads INDEXED BY attention_stop_head_by_requester WHERE namespace=?1 AND requester=?2 ORDER BY canonical_key DESC,claim DESC LIMIT 1",
         params![ns.as_str(),requester], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
     ).optional()?;
     let Some((claim_bytes, key_bytes, fact_bytes)) = row else {
@@ -128,7 +130,7 @@ pub(crate) fn maximum(c: &Connection, ns: &Namespace, requester: &str) -> Result
         "STOP maximum fact bound"
     );
     let (claim, key, fact): (String, Vec<u8>, String) = c.query_row(
-        "SELECT claim,canonical_key,fact FROM local_attention_stop_heads WHERE namespace=?1 AND requester=?2 ORDER BY canonical_key DESC,claim DESC LIMIT 1",
+        "SELECT claim,canonical_key,fact FROM main.local_attention_stop_heads INDEXED BY attention_stop_head_by_requester WHERE namespace=?1 AND requester=?2 ORDER BY canonical_key DESC,claim DESC LIMIT 1",
         params![ns.as_str(), requester],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
