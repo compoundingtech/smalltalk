@@ -44,6 +44,14 @@ Every screen is judged by these.
 
 Mauve (`person`) means a person is needed. Nothing else may use it.
 
+### Web client cold selection
+
+The selected conversation owns its cold first-page request. Background follows require
+explicit pointer or keyboard-focus intent, and are admitted only after every visible
+conversation has committed a native first page through the frame writer. Reading a
+hidden snapshot does not acquire a follow. Observations survive warm switches in memory;
+reloads do not restore cached roster or transcript claims from browser storage.
+
 ## Header
 
 The header's right side names the host and person, led by the connection: `● live`, a spinner
