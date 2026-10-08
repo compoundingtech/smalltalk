@@ -531,7 +531,8 @@ pub(super) fn prepare_one(
                         reference(source, basis, session_id, &original, &pointer),
                         "application/json",
                         Some(
-                            if let Some(size) = original["_oversized_payload_bytes"][index].as_u64() {
+                            if let Some(size) = original["_oversized_payload_bytes"][index].as_u64()
+                            {
                                 size as usize
                             } else if body_ref || images_replaced {
                                 // body_ref previews omit the blocks array, and image refs
@@ -1138,12 +1139,20 @@ mod tests {
         let mut session = ClientSession::local(None).unwrap();
         session.conversation_blocks = true;
         let page = read(&native, &session, &native.id).unwrap();
-        let item = page.iter().find(|item| item["type"] == "tool_result").unwrap();
+        let item = page
+            .iter()
+            .find(|item| item["type"] == "tool_result")
+            .unwrap();
         let block = &item["body"]["blocks"][0];
         assert_eq!(block["kind"], "tool_output");
         assert_eq!(block["continuation"]["reason"], "size-limit");
         assert_eq!(block["continuation"]["media_type"], "application/json");
-        assert!(item["body"]["content"].as_str().unwrap().contains("truncated"));
+        assert!(
+            item["body"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("truncated")
+        );
         let token = block["continuation"]["ref"].as_str().unwrap();
         let location = locator(token, &native.id).unwrap();
         let original = located_value(&native, &location).unwrap();
