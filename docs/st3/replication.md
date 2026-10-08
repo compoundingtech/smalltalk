@@ -556,7 +556,9 @@ statement that is still stepping. A claim that fails to project is quarantined w
 the replay.
 
 The base fold selects only `intent.desired`, `doc.bound` and `mission.published`, copying at most
-256 bodies before each canonical fold page. Event positions are inserted separately without
+256 bodies before each fold page. The selected canonical ID order is sorted once in a temporary
+SQLite table; ordinal lookups then fetch body pages without sorting the remaining history
+again. Event positions are inserted separately without
 decoding message, work or observation bodies; repaired originals and the case-sensitive `glass/`
 prefix remain excluded. Base-stage progress counts those selected bodies, not the whole claim
 log. This bounds copied body count, not body bytes, SQLite work or the full replay transaction.

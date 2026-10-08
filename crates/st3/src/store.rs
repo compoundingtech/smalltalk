@@ -27427,38 +27427,51 @@ fn project_replicated_base_claims_with_progress(
                  WHERE replica_records.claim_id=claims.id
                    AND replica_records.state='repaired'
              )";
-    let total: u64 = transaction
-        .query_row(&format!("SELECT COUNT(*) {selection}"), [], |row| {
-            row.get(0)
-        })
+    // Sort selected IDs once. Re-evaluating the canonical key for every body page
+    // would scan/sort the remaining selected history once per page. This temporary
+    // order contains no bodies and lives only on this serialized writer connection.
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS heal_replay_base_order(
+             ordinal INTEGER PRIMARY KEY, claim_id TEXT NOT NULL);
+         DELETE FROM temp.heal_replay_base_order;",
+        )
         .map_err(internal)?;
-    let after = format!(
-        "({}) > (SELECT {} FROM claims cursor WHERE cursor.id=?1)",
-        canonical::components("claims").join(", "),
-        canonical::components("cursor").join(", ")
-    );
-    let query = canonical_sql(&format!(
-        "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
-                    claims.origin, claims.actor, claims.body, claims.predecessors,
-                    claims.accepted_at_unix_ms
-             {selection} AND (?1 IS NULL OR {after})
-             ORDER BY CANONICAL_ASC(claims) LIMIT ?2"
-    ));
+    transaction
+        .execute(
+            &canonical_sql(&format!(
+                "INSERT INTO temp.heal_replay_base_order(claim_id)
+             SELECT claims.id {selection} ORDER BY CANONICAL_ASC(claims)"
+            )),
+            [],
+        )
+        .map_err(internal)?;
+    let total: u64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(ordinal),0) FROM temp.heal_replay_base_order",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(internal)?;
     clear_quarantined_claims_tx(transaction, "projection:base")?;
     progress(ReplayProgress {
         phase: "full-replay/base-claims",
         processed: Some(0),
         total: Some(total),
     });
-    let mut cursor: Option<String> = None;
+    let mut cursor: u64 = 0;
     let mut processed = 0;
     loop {
         // Finish/drop the read before any per-claim savepoint can roll back. Bound retained
         // bodies, and use the same total canonical key as the full fold, including ties.
         let claims = {
-            let mut statement = transaction.prepare_cached(&query).map_err(internal)?;
+            let mut statement = transaction
+                .prepare_cached(BASE_REPLAY_PAGE_SQL)
+                .map_err(internal)?;
             statement
-                .query_map(params![cursor, BATCH as i64], claim_from_row)
+                .query_map(params![cursor, BATCH as i64], |row| {
+                    Ok((claim_from_row(row)?, row.get::<_, u64>(10)?))
+                })
                 .map_err(internal)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(internal)?
@@ -27466,8 +27479,8 @@ fn project_replicated_base_claims_with_progress(
         if claims.is_empty() {
             break;
         }
-        cursor = claims.last().map(|claim| claim.id.clone());
-        for claim in claims {
+        cursor = claims.last().expect("nonempty replay page").1;
+        for (claim, _) in claims {
             project_claim_isolated_tx(transaction, "projection:base", &claim, || {
                 match claim.kind.as_str() {
                     "intent.desired" => {
@@ -27493,8 +27506,19 @@ fn project_replicated_base_claims_with_progress(
             total: Some(total),
         });
     }
+    transaction
+        .execute("DELETE FROM temp.heal_replay_base_order", [])
+        .map_err(internal)?;
     owned_sets::project_tx(transaction)
 }
+
+const BASE_REPLAY_PAGE_SQL: &str =
+    "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
+            claims.origin, claims.actor, claims.body, claims.predecessors,
+            claims.accepted_at_unix_ms, ordering.ordinal
+     FROM temp.heal_replay_base_order ordering
+     JOIN claims ON claims.id=ordering.claim_id
+     WHERE ordering.ordinal>?1 ORDER BY ordering.ordinal LIMIT ?2";
 
 /// Project one replicated claim on its own. A claim whose projection fails is rolled back alone
 /// and recorded as an unhealthy projection that names it, so one claim a build cannot project
@@ -34263,6 +34287,66 @@ agent "test/empty" { command "true" }
             expected.len()
         );
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn base_replay_body_page_work_does_not_grow_with_selected_order_size() {
+        let store = Store::open_memory("node").unwrap();
+        let mut connection = store.connection.write();
+        let tx = connection.transaction().unwrap();
+        tx.execute_batch(
+            "CREATE TEMP TABLE heal_replay_base_order(
+            ordinal INTEGER PRIMARY KEY, claim_id TEXT NOT NULL)",
+        )
+        .unwrap();
+        let mut costs = Vec::new();
+        for (start, end) in [(0, 512), (512, 4096)] {
+            for number in start..end {
+                let subject = format!("exec/page-{number}");
+                let claim = append_claim_record_tx(
+                    &tx,
+                    "node",
+                    &subject,
+                    "intent.desired",
+                    None,
+                    &json!({"subject":subject,"kind":"exec","desired":{}}),
+                    &[],
+                    None,
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO temp.heal_replay_base_order(claim_id) VALUES (?1)",
+                    [&claim.id],
+                )
+                .unwrap();
+            }
+            let mut statement = tx.prepare(BASE_REPLAY_PAGE_SQL).unwrap();
+            let page = statement
+                .query_map(params![0, 256], claim_from_row)
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(page.len(), 256);
+            assert_eq!(page[0].subject, "exec/page-0");
+            assert_eq!(page[255].subject, "exec/page-255");
+            costs.push((
+                statement.get_status(rusqlite::StatementStatus::VmStep),
+                statement.get_status(rusqlite::StatementStatus::FullscanStep),
+                statement.get_status(rusqlite::StatementStatus::Sort),
+            ));
+        }
+        assert_eq!(
+            costs[0], costs[1],
+            "body page work must depend on its selected page, not the remaining canonical order"
+        );
+        assert_eq!(costs[0].1, 0, "ordinal lookup must not scan the order");
+        assert_eq!(
+            costs[0].2, 0,
+            "body pages must not repeat the canonical sort"
+        );
+        // This measures the actual body-page statement, not the once-per-replay canonical
+        // sort, the full runtime fold or writer latency.
+        tx.rollback().unwrap();
     }
 
     #[test]

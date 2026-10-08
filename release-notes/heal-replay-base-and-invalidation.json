@@ -3,12 +3,30 @@
   "summary": "Reduce heal request status work and unrelated body decoding during canonical replay.",
   "replay": {
     "status": "changed",
-    "detail": "No new replay trigger or recovery gate. Existing full replay selects base-kind bodies in pages of 256 and inserts event positions separately. Canonical folds, repaired exclusions and quarantine remain; the full replay still holds the writer and the requesting API still waits for it. Base progress counts selected bodies instead of all claims. This is not bounded writer repair or a measured latency guarantee."
+    "detail": "No new replay trigger or recovery gate. Existing full replay selects base-kind bodies in pages of 256 using a once-sorted, temporary canonical ID order and inserts event positions separately. Canonical folds, repaired exclusions and quarantine remain; the full replay still holds the writer and the requesting API still waits for it. Base progress counts selected bodies instead of all claims. This is not bounded writer repair or a measured latency guarantee."
   },
-  "schema": {"status": "none", "detail": "No database tables, indexes, triggers or schema-version changes."},
-  "rules": {"status": "none", "detail": "No checkpoint retention, proof, ordering or rules-digest change."},
-  "compatibility": {"status": "changed", "detail": "No client or peer wire change. Heal mutation handlers use a coherent index/generation invalidation hint rather than full replication status and may notify conservatively; graph equality and authority still use the existing contracts."},
-  "downtime": {"status": "unknown", "detail": "No additional startup gate. Deployment still restarts the service; restart-to-API and restart-to-health durations for large stores were not measured. Full replay writer hold remains an open repair gap."},
-  "manual": {"status": "none", "detail": "No new manual migration or identity change. Existing checkpoint deployment and verification gates still apply."},
-  "recovery": {"status": "none", "detail": "No new on-disk representation or migration to undo; this source change adds no further restriction on supported binary swap-back. Existing installation recovery constraints remain."}
+  "schema": {
+    "status": "none",
+    "detail": "No persistent database tables, indexes, triggers or schema-version changes. Replay uses a connection-local temporary canonical-ID order with ordinal lookup; it is cleared after the fold."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint retention, proof, ordering or rules-digest change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "No client or peer wire change. Heal mutation handlers use a coherent index/generation invalidation hint rather than full replication status and may notify conservatively; graph equality and authority still use the existing contracts."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "No additional startup gate. Deployment still restarts the service; restart-to-API and restart-to-health durations for large stores were not measured. Full replay writer hold remains an open repair gap."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new manual migration or identity change. Existing checkpoint deployment and verification gates still apply."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No new on-disk representation or migration to undo; this source change adds no further restriction on supported binary swap-back. Existing installation recovery constraints remain."
+  }
 }
