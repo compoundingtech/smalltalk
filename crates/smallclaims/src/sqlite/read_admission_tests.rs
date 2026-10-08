@@ -167,7 +167,6 @@ fn outer_snapshots_are_reused_when_reentered_below_another_store_at_bound_one() 
                     Ok(())
                 }).unwrap();
                 assert!(second.readers.get().is_autocommit());
-                Ok(())
             }).unwrap();
             Ok(())
         }).unwrap();
