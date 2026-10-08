@@ -1,4 +1,4 @@
-import type { St3Client } from '@smalltalk/st3-client'
+import { ClientError, type St3Client } from '@smalltalk/st3-client'
 import type { ActionResult } from '@smalltalk/st3-client/schema'
 import * as Native from '@smalltalk/st3-client/schema'
 
@@ -6,7 +6,10 @@ import { conversationPortFailure, hasConversationCapability } from './conversati
 import type { AttachmentPort, ConversationPortResult, MessageSendAction } from './source.ts'
 
 /** Upload, chunk reads and sending use the same gateway client, never a synthetic delivery. */
-export const gatewayAttachments = (client: St3Client): AttachmentPort => ({
+export const gatewayAttachments = (
+  client: St3Client,
+  snapshot: () => Promise<ConversationPortResult<string>>,
+): AttachmentPort => ({
   capabilities: async () => {
     try {
       const capabilities = Native.decodeUnknownSync(Native.Capabilities)((await client.capabilities()).value)
@@ -46,15 +49,18 @@ export const gatewayAttachments = (client: St3Client): AttachmentPort => ({
       return conversationPortFailure(cause)
     }
   },
-  send: async (request) =>
-    gatewayMessageSend(client)({
+  send: async (request) => {
+    const current = await snapshot()
+    if (current._tag === 'Refused') return current
+    return gatewayMessageSend(client)({
       api_version: request.api_version,
       type: request.type,
       id: request.id,
-      fence: request.fence,
+      fence: { snapshot_id: current.value, subject_revisions: {} },
       parameters: request.parameters,
       idempotency_key: request._tag === 'Resend' ? request.idempotencyKey : crypto.randomUUID(),
-    }),
+    })
+  },
 })
 
 /**
@@ -93,6 +99,9 @@ export const gatewayMessageSend =
       })
       return { _tag: 'Success', value: Native.decodeUnknownSync(Native.ActionResult)(response.value) }
     } catch (cause) {
+      if (cause instanceof ClientError && cause.response.code === 'stale-fence') {
+        return { _tag: 'Refused', reason: 'stale-fence', detail: cause.response.message, error: cause.response }
+      }
       return conversationPortFailure(cause)
     }
   }

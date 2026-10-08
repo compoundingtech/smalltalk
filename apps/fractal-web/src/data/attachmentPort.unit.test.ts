@@ -13,7 +13,6 @@ const chunk = { sha256, size: 731, offset: 512, data: 'cmVhbCB0YWls' }
 const request: AttachmentSendRequest = {
   _tag: 'Send',
   api_version: 'st3.client.v0', type: 'message.send', id: 'action/image-send',
-  fence: { snapshot_id: 'snapshot/user-observed', subject_revisions: {} },
   parameters: {
     to: 'agent/recipient', session_id: 'session/current', content: 'Here is the image',
     title: 'Actual title', in_reply_to: 'message/parent', tags: ['actual-tag'],
@@ -23,7 +22,10 @@ const request: AttachmentSendRequest = {
 /** The exact body a first send puts on the wire: its fields plus a generated key. */
 const firstSendBody = (action: typeof request) => {
   const { _tag: _tag, ...wire } = action
-  return { ...wire, idempotency_key: expect.stringMatching(/^[0-9a-f-]{36}$/) }
+  return {
+    ...wire, fence: { snapshot_id: 'snapshot/data-layer', subject_revisions: {} },
+    idempotency_key: expect.stringMatching(/^[0-9a-f-]{36}$/),
+  }
 }
 const ack = {
   kind: 'action-result', action_id: 'action/returned', operation_id: 'operation/returned',
@@ -56,7 +58,7 @@ const attachmentClient = ({
         : reply(url)
     },
   })
-  return { port: gatewayAttachments(client), calls }
+  return { port: gatewayAttachments(client, async () => ({ _tag: 'Success', value: 'snapshot/data-layer' })), calls }
 }
 
 describe('native attachment port', () => {

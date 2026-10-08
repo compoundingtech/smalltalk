@@ -1,5 +1,5 @@
 import { ClientError, St3Client } from '@smalltalk/st3-client'
-import { Runtime, decodeUnknownSync } from '@smalltalk/st3-client/schema'
+import { Runtime, Snapshot, decodeUnknownSync } from '@smalltalk/st3-client/schema'
 import type { Agent, Attention, Mission, TerminalScreen } from '@smalltalk/st3-client/schema'
 import {
   St3,
@@ -13,7 +13,7 @@ import {
   type SyncStatus,
   syncStatusFromFailure,
 } from '@st3/sdk/effect'
-import { Effect, Fiber, Layer, ManagedRuntime, Metric, Option, Stream } from 'effect'
+import { Effect, Fiber, Layer, ManagedRuntime, Metric, Option, Schema, Stream, SubscriptionRef } from 'effect'
 import * as Atom from 'effect/reactivity/Atom'
 import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 
@@ -40,6 +40,7 @@ import {
 import {
   type ConversationPage,
   type AttachmentPort,
+  type ConversationPortResult,
   type DataSource,
   type Feed,
   type Grants,
@@ -480,11 +481,36 @@ export const liveSource = ({
       ),
   })
   const attention = attentionRetained.atom
+  const messageSnapshot = (): Promise<ConversationPortResult<string>> =>
+    runtime.runPromise(
+      Effect.gen(function* () {
+        const st3 = yield* St3
+        const statuses = yield* SubscriptionRef.get(st3.syncStatuses)
+        let freshest: typeof Snapshot.Type | undefined
+        // Window snapshots fence the gateway's complete store, not just their rows.
+        // Conversation frames have no Snapshot; their opaque cursors are not action fences.
+        // Use the SDK's already-held evidence, excluding remote terminal-owner snapshots.
+        for (const [key, status] of statuses) {
+          if (!key.startsWith('window:') || status._tag !== 'Live' || status.snapshot === undefined) continue
+          const decoded = Schema.decodeUnknownOption(Snapshot)(status.snapshot)
+          if (Option.isSome(decoded) && (freshest === undefined || decoded.value.store_index > freshest.store_index))
+            freshest = decoded.value
+        }
+        if (freshest !== undefined) return { _tag: 'Success' as const, value: freshest.id }
+        return yield* st3.snapshot.pipe(
+          Effect.map((value): ConversationPortResult<string> => ({ _tag: 'Success', value })),
+          Effect.catch((failure) => Effect.succeed<ConversationPortResult<string>>({
+            _tag: 'Refused', reason: 'snapshot-unavailable',
+            detail: `Cannot obtain a current message snapshot: ${failure.message}`,
+          })),
+        )
+      }),
+    )
   const submitMessage = gatewayMessageSend(client)
 
   // Atom.family is weakly memoized. Keep the 24 recent snapshot controllers explicitly.
   const visibleConversations = new Map<string, boolean>()
-  const attachments = gatewayAttachments(client)
+  const attachments = gatewayAttachments(client, messageSnapshot)
   const conversationFamily = Atom.family((ref: string): RetainedConversation => {
     const timeline = new LiveTimeline()
     // A Sent row retires only on an in-window identity echo. Until smalltalk#1977 provides
@@ -569,15 +595,18 @@ export const liveSource = ({
         // Resolve this before POST so an echo that wins the HTTP race still replaces its outbox item.
         const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(idempotencyKey)))
         local.messageIds = [`message/${[...hash.slice(0, 8)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`]
-        const submit = () =>
-          submitMessage({
+        const submit = async () => {
+          const current = await messageSnapshot()
+          if (current._tag === 'Refused') return current
+          return submitMessage({
             api_version: request.api_version,
             type: request.type,
             id: request.id,
-            fence: request.fence,
+            fence: { snapshot_id: current.value, subject_revisions: {} },
             parameters: request.parameters,
             idempotency_key: idempotencyKey,
           })
+        }
         if (request._tag === 'Resend' && timeline.shownMessageIds().has(local.messageIds[0]!)) return submit()
         if (request._tag === 'Resend') {
           pending.set(id, local)
