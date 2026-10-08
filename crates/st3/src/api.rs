@@ -4234,6 +4234,21 @@ async fn client_agents(
     // snapshot before waiting, then recheck all cache fences in the admitted snapshot.
     let route_profile = crate::profile::current();
     for admitted in [false, true] {
+        // Serve the previous complete roster at its own cut while one reader refreshes.
+        // Filtered/history requests retain the ordinary fresh path.
+        if admitted && query.cursor.is_none() && !query.history && query.status.is_none() {
+            let reader = state.clone();
+            let query = query.clone();
+            let stale = blocking_store(move || {
+                reader.store.clone().read_snapshot(|index| {
+                    Ok(recent_agent_page(&reader, index, &query))
+                })
+            }).await??;
+            if let Some(page) = stale {
+                refresh_agent_roster(&state);
+                return Ok(page);
+            }
+        }
         let admission = if admitted {
             let waiting = route_profile.as_ref()
                 .map(|op| op.wall_span("agents/roster-admission"));
@@ -4271,12 +4286,93 @@ async fn client_agents(
     unreachable!("an admitted roster read always builds missing cards")
 }
 
+const AGENT_ROSTER_MAX_STALE: Duration = Duration::from_secs(5);
+
+fn recent_agent_page(
+    state: &AppState,
+    index: u64,
+    query: &ClientListQuery,
+) -> Result<Option<ClientPageResponse>, ApiError> {
+    let Some(entry) = state.store.recent_agent_roster(index, AGENT_ROSTER_MAX_STALE)
+        .map_err(ApiError::internal)? else { return Ok(None) };
+    let old_snapshot = client_snapshot_at(state, entry.index);
+    let mut cards = (*entry.items).clone();
+    overlay_agent_resources(&state.store, &mut cards, &old_snapshot.created_at)
+        .map_err(ApiError::internal)?;
+    let age = entry.published_at.elapsed();
+    if age >= AGENT_ROSTER_MAX_STALE { return Ok(None); }
+    let expires = client_now_ms().saturating_add(
+        AGENT_ROSTER_MAX_STALE.saturating_sub(age).as_millis(),
+    );
+    for card in &mut cards {
+        card["roster_cache"] = json!({
+            "state":"refreshing", "age_ms":age.as_millis(),
+            "max_age_ms":AGENT_ROSTER_MAX_STALE.as_millis(),
+            "expires_at_unix_ms":expires,
+            "store_index":entry.index, "local_frontier":entry.local,
+        });
+    }
+    let page = client_page_read(state, &old_snapshot, "agents", cards, query, true)?;
+    Ok(Some((Extension(old_snapshot), Json(page))))
+}
+
+/// Keep stale pagination on the immutable rows cached by its first page. Validate current
+/// authority/leases and the original five-second expiry before returning any continuation.
+fn recent_agent_continuation(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    query: &ClientListQuery,
+) -> Result<Option<ClientResourcePage>, ApiError> {
+    if query.cursor.is_none() { return Ok(None); }
+    let page = client_page_read(state, snapshot, "agents", Vec::new(), query, true)?;
+    let Some(marker) = page.items.first().and_then(|item| item.get("roster_cache")) else {
+        return Ok(None);
+    };
+    let entry = state.store.recent_agent_roster(
+        state.store.index().map_err(ApiError::internal)?, AGENT_ROSTER_MAX_STALE,
+    ).map_err(ApiError::internal)?;
+    if !marker["expires_at_unix_ms"].as_u64().is_some_and(|expiry| client_now_ms() < expiry as u128)
+        || !entry.is_some_and(|entry| entry.index == snapshot.store_index
+            && marker["local_frontier"].as_u64() == Some(entry.local)) {
+        return Err(client_page_expired("the refreshing roster expired or its authority changed; restart pagination"));
+    }
+    Ok(Some(page))
+}
+
+/// The existing admission is also the single-flight refresh guard. Its ownership lasts
+/// until physical work ends even when the triggering HTTP request has completed.
+fn refresh_agent_roster(state: &AppState) {
+    let Some(admission) = state.store.try_admit_agent_resources() else { return };
+    let state = state.clone();
+    let budget = smallclaims::read_budget::ReadBudget::new("roster/revalidate", Duration::from_secs(15));
+    tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        let result = smallclaims::read_budget::with(Some(budget), || crate::profile::task("roster/revalidate", || {
+            read_deadline::query(&state.store, "roster/revalidate", || {
+                state.store.clone().read_snapshot(|index| {
+                    state.store.with_owned_set_snapshot_reads(|| {
+                        client_agent_resources_cached(&state.store, false, index)?;
+                        client_agent_page_refs(&state.store, false, index)?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                }).map_err(ApiError::internal)
+            })
+        }));
+        if let Err(error) = result {
+            eprintln!("st3: agent roster refresh failed: {}", error.message);
+        }
+    });
+}
+
 fn client_agents_page_at(
     state: &AppState,
     snapshot: ClientSnapshot,
     query: &ClientListQuery,
     admitted: bool,
 ) -> Result<Option<ClientPageResponse>, ApiError> {
+    if let Some(page) = recent_agent_continuation(state, &snapshot, query)? {
+        return Ok(Some((Extension(snapshot), Json(page))));
+    }
     let store = &state.store;
     let index = snapshot.store_index;
     let mut items = if query.cursor.is_some() {
@@ -22684,6 +22780,123 @@ mission "wake" state="ready" {
         println!("roster warm HTTP fixture: held_cold_admission=true elapsed_ms={:.3}",
             started.elapsed().as_secs_f64() * 1000.0);
         drop(admission);
+    }
+
+    #[test]
+    fn agent_roster_unrelated_documents_and_resources_preserve_all_cards() {
+        let fixture = roster_claims_fixture();
+        let store = &fixture.store;
+        for history in [false, true] { checked_agent_cache(store, history, store.index().unwrap()); }
+        for n in 0..8 {
+            store.put_document(&format!("doc/roster-fixture/{n}"), b"private invented fixture",
+                &None, &format!("roster-doc-{n}")).unwrap();
+            store.append_claim(&ClaimInput {
+                subject: format!("resource/roster-fixture/{n}"), kind: "resource.observed".into(),
+                actor: Some("person/test".into()), fields: serde_json::from_value(json!({
+                    "kind":"human.review", "reason":format!("fixture {n}")
+                })).unwrap(), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let before = store.agent_resources_refolded_cards_for_test();
+            for history in [false, true] { checked_agent_cache(store, history, store.index().unwrap()); }
+            assert_eq!(store.agent_resources_refolded_cards_for_test(), before,
+                "unrelated documents/resources must not refold any of the sixty cards");
+        }
+        let before = store.agent_resources_refolded_cards_for_test();
+        roster_fixture_append(store, &fixture.subjects[0], "harness.observed", json!({
+            "state":"working", "driver":"omp", "incarnation_id":"roster-incarnation-0"
+        }));
+        checked_agent_cache(store, false, store.index().unwrap());
+        assert_eq!(store.agent_resources_refolded_cards_for_test() - before, 1,
+            "one-agent observation must rebuild exactly its card, with full oracle parity");
+    }
+
+    #[tokio::test]
+    async fn agent_roster_stale_page_keeps_old_cut_and_refreshes_once() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.store = Arc::new(roster_followup_store());
+        let old_index = state.store.index().unwrap();
+        checked_agent_cache(&state.store, false, old_index);
+        let (_, Json(original)) = client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(ClientListQuery::default())).await.unwrap();
+        let admission = state.store.admit_agent_resources().await;
+        state.store.append_claim(&roster_local_observation("harness.observed", json!({
+            "state":"working", "driver":"codex", "incarnation_id":"amber-1"
+        }))).unwrap();
+        let new_index = state.store.index().unwrap();
+        assert!(new_index > old_index);
+        let query = ClientListQuery { limit: Some(1), ..Default::default() };
+        let started = Instant::now();
+        let (Extension(snapshot), Json(first)) = tokio::time::timeout(Duration::from_secs(2),
+            client_agents(State(state.clone()), Extension(new_client_snapshot(&state)), Query(query.clone())))
+            .await.expect("bounded old cut must bypass the held physical refresh admission").unwrap();
+        println!("roster bounded stale fixture: held_admission=true old_cut={} new_cut={} elapsed_ms={:.3}",
+            snapshot.store_index, new_index, started.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(snapshot.store_index, old_index);
+        assert_eq!(first.items[0]["roster_cache"]["state"], "refreshing");
+        assert_eq!(first.items[0]["roster_cache"]["store_index"], old_index);
+        assert!(first.items[0]["roster_cache"]["age_ms"].as_u64().unwrap() < 5000);
+        assert!(first.page.has_more);
+        let cursor_query = ClientListQuery { cursor: first.page.next_cursor.clone(), ..query };
+        let (Extension(next_snapshot), Json(second)) = client_agents(State(state.clone()),
+            Extension(snapshot.clone()), Query(cursor_query.clone())).await.unwrap();
+        assert_eq!(next_snapshot.store_index, old_index);
+        let mut combined = first.items.into_iter().chain(second.items).collect::<Vec<_>>();
+        for row in &mut combined { row.as_object_mut().unwrap().remove("roster_cache"); }
+        assert_eq!(combined, original.items, "all stale pages must retain exactly the original rows");
+        assert!(state.store.try_admit_agent_resources().is_none(), "no second refresh guard");
+        drop(admission);
+        refresh_agent_roster(&state);
+        let completed = state.store.admit_agent_resources().await;
+        drop(completed);
+        let (Extension(fresh_snapshot), Json(fresh)) = client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(ClientListQuery::default())).await.unwrap();
+        assert_eq!(fresh_snapshot.store_index, new_index);
+        assert!(fresh.items.iter().all(|row| row.get("roster_cache").is_none()));
+        let mut oracle = checked_agent_cache(&state.store, false, new_index);
+        overlay_agent_resources(&state.store, &mut oracle, &fresh_snapshot.created_at).unwrap();
+        assert_eq!(fresh.items, oracle);
+        assert_ne!(fresh.items, original.items, "the single background refresh must publish the changed card");
+        assert!(recent_agent_continuation(&state, &snapshot, &cursor_query).is_err(),
+            "a stale continuation cannot silently switch to the refreshed cut");
+    }
+
+    #[test]
+    fn agent_roster_stale_refuses_age_authority_unknown_and_replay() {
+        for change in ["age", "runtime", "desired", "unknown", "replay"] {
+            let store = roster_followup_store();
+            checked_agent_cache(&store, false, store.index().unwrap());
+            assert!(store.recent_agent_roster(store.index().unwrap(), AGENT_ROSTER_MAX_STALE).unwrap().is_some());
+            match change {
+                "age" => store.age_agent_roster_for_test(AGENT_ROSTER_MAX_STALE),
+                "runtime" => { store.append_claim(&roster_local_observation("runtime.observed",
+                    json!({"status":"stopped", "runtime_id":"node.amber", "incarnation_id":"amber-1"}))).unwrap(); }
+                "desired" => {
+                    let source = "version 2\nagent \"amber\" { command \"printf changed\" }\nagent \"cobalt\" { command \"true\" }\n";
+                    let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+                    roster_fixture_apply(&store, &intent, "stale-owner-guard");
+                }
+                "unknown" => roster_fixture_append(&store, "custom/stale", "custom.stale", json!({"value":1})),
+                "replay" => store.forget_current_views(),
+                _ => unreachable!(),
+            }
+            assert!(store.recent_agent_roster(store.index().unwrap(), AGENT_ROSTER_MAX_STALE).unwrap().is_none(),
+                "{change} must require a fresh roster");
+        }
+    }
+
+    #[test]
+    fn agent_roster_stale_refuses_work_transition_and_expired_lease() {
+        let _clock = RosterFixtureClock::at(1_900_000_000_000);
+        let fixture = roster_claims_fixture();
+        let store = &fixture.store;
+        checked_agent_cache(store, false, store.index().unwrap());
+        assert!(store.recent_agent_roster(store.index().unwrap(), AGENT_ROSTER_MAX_STALE).unwrap().is_some());
+        roster_fixture_work(&fixture, 1, "claim", "stale-work-fence");
+        assert!(store.recent_agent_roster(store.index().unwrap(), AGENT_ROSTER_MAX_STALE).unwrap().is_none());
+        checked_agent_cache(store, false, store.index().unwrap());
+        roster_fixture_expire_leases(&fixture);
+        assert!(store.recent_agent_roster(store.index().unwrap(), AGENT_ROSTER_MAX_STALE).unwrap().is_none());
     }
 
     #[test]

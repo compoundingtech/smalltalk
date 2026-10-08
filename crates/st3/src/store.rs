@@ -2755,6 +2755,9 @@ impl Store {
         })? {
             let (subject, kind, actor) = row?;
             if self.smalltalk.claim_registry().claim(&kind).is_none() {
+                crate::performance::record_request(
+                    "roster/cold/unknown-kind", None, std::time::Duration::ZERO,
+                );
                 return Ok(None);
             }
             if subject.starts_with("agent/") {
@@ -2815,6 +2818,10 @@ impl Store {
             // the subject guards: a claim on an agent also changes its fallback revision.
             let irrelevant = match kind.as_str() {
                 "daemon.diagnostic" | "daemon.started" => subject.starts_with("daemon/"),
+                // Documents and external resource facts are not card inputs. Agent claims
+                // are handled above, so foreign-subject uses never gain this exemption.
+                "doc.bound" => subject.starts_with("doc/"),
+                "resource.observed" => subject.starts_with("resource/"),
                 "glass.upserted" | "glass.deleted" => subject.starts_with("glass/"),
                 "arrangement.edited" => subject.starts_with("arrangement/"),
                 "fleet.invite-created" | "fleet.invite-redeemed" | "fleet.invite-revoked" => subject.starts_with("fleet-invite/"),
@@ -2822,6 +2829,9 @@ impl Store {
                 _ => false,
             };
             if !irrelevant {
+                crate::performance::record_request(
+                    &format!("roster/cold/{kind}"), None, std::time::Duration::ZERO,
+                );
                 return Ok(None);
             }
         }
@@ -2975,6 +2985,7 @@ impl Store {
         let mut cache = self.smalltalk.agent_page_refs_cache.lock()
             .expect("agent page refs cache poisoned");
         cache.push_back(runtime::AgentResourcesEntry {
+            published_at: std::time::Instant::now(),
             index, local: 0, history, covered: None, valid_until_unix_ms, items: Arc::clone(&items),
         });
         let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
@@ -3120,6 +3131,7 @@ impl Store {
                 // heartbeat or fleet-only claim between two reads costs no clone, sort or build.
                 if changed.is_empty() {
                     return Ok(runtime::AgentResourcesEntry {
+                        published_at: std::time::Instant::now(),
                         index, local, history, covered,
                         valid_until_unix_ms,
                         items: Arc::clone(&previous.items),
@@ -3140,6 +3152,7 @@ impl Store {
                 items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
                 Ok(runtime::AgentResourcesEntry {
+                    published_at: std::time::Instant::now(),
                     index, local, history, covered,
                     valid_until_unix_ms,
                     items: Arc::new(items),
@@ -3157,6 +3170,7 @@ impl Store {
                 items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
                 Ok(runtime::AgentResourcesEntry {
+                    published_at: std::time::Instant::now(),
                     index, local, history, covered: selected.cloned(),
                     valid_until_unix_ms: self.agent_queue_valid_until(now)?,
                     items: Arc::new(items),
@@ -3210,6 +3224,40 @@ impl Store {
             .map(|entry| Arc::clone(&entry.items));
         drop(cache);
         Ok(hit.map(|hit| crate::performance::task("roster/cache-hit", || hit)))
+    }
+
+    /// A complete, recent cut eligible for a bounded stale first page. Structural/owner
+    /// changes, queue transitions, unknown inputs and expired leases require a fresh read.
+    pub(crate) fn recent_agent_roster(
+        &self, index: u64, max_age: std::time::Duration,
+    ) -> Result<Option<runtime::AgentResourcesEntry>> {
+        let now = now_ms();
+        let entry = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter().rev()
+            .find(|entry| !entry.history && entry.covered.is_none() && entry.index <= index
+                && entry.published_at.elapsed() < max_age
+                && entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry))
+            .cloned();
+        let Some(entry) = entry else { return Ok(None) };
+        if entry.index != index {
+            let Some(delta) = self.changed_agent_resources(entry.index, index, &entry.items)? else {
+                return Ok(None);
+            };
+            if delta.membership || delta.queues { return Ok(None); }
+        }
+        Ok(Some(entry))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_agent_roster_for_test(&self, age: std::time::Duration) {
+        for entry in self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter_mut() {
+            entry.published_at = std::time::Instant::now() - age;
+        }
+    }
+
+    pub(crate) fn try_admit_agent_resources(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.smalltalk.agent_resources_admission.clone().try_lock_owned().ok()
     }
 
     /// The matching warm pin for page refs: membership, ordering and queue metadata for exactly

@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "summary": "Attribute the native agents-list request to roster admission, blocking and reader admission, caches, card reduction and local overlays using existing opt-in operation profiling.",
+  "summary": "Keep native roster refreshes incremental for unrelated document/resource facts and serve a previous complete roster cut for up to five seconds during one shared background refresh. Attribute admission, queues, caches and card folds through the existing profiling facility.",
   "replay": {
     "status": "none",
-    "detail": "No claim or projection computation change."
+    "detail": "Claim admission, canonical projection and checkpoints are unchanged. Replay clears the existing cache; no stored data migration."
   },
   "schema": {
     "status": "none",
@@ -14,8 +14,8 @@
     "detail": "No authority or checkpoint rule change."
   },
   "compatibility": {
-    "status": "none",
-    "detail": "The list, filters, pagination and full card remain unchanged. Only bounded labels in existing opt-in profile records are added."
+    "status": "changed",
+    "detail": "Unfiltered current agents HTTP pages may return an explicit roster_cache refreshing marker, bounded monotonic age and original store/local cut. Stale continuations preserve their immutable rows and expire within the same five-second window. Owner/declaration/runtime/work changes, unknown inputs and expired queue leases require fresh reads. History and filtered requests keep their current behavior; cold initial reads still build. No IVM Source/Ready or collection activation change."
   },
   "downtime": {
     "status": "none",
@@ -27,6 +27,6 @@
   },
   "recovery": {
     "status": "none",
-    "detail": "Earlier binaries ignore these new profile phase labels. No data migration or certificate change."
+    "detail": "Ordinary rollback to an earlier binary restores fresh-only HTTP roster reads. Background refresh failures leave the existing bounded-age entry and do not extend its lifetime."
   }
 }

@@ -41,6 +41,8 @@ pub struct SmalltalkRuntime {
 
 #[derive(Clone)]
 pub(crate) struct AgentResourcesEntry {
+    /// Monotonic age of this published cut, independent of the graph's claim timestamps.
+    pub(crate) published_at: std::time::Instant,
     pub(crate) index: u64,
     pub(crate) local: u64,
     pub(crate) history: bool,
