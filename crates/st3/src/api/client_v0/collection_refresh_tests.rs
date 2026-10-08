@@ -100,7 +100,16 @@ impl Fixture {
                 subject: "agent/fixture-roster".into(),
                 kind: kind.into(),
                 actor: None,
-                fields: BTreeMap::from([("status".into(), json!("running"))]),
+                fields: if kind == "harness.usage" {
+                    BTreeMap::from([
+                        ("driver".into(), json!("codex")),
+                        ("semantics".into(), json!("response")),
+                        ("incarnation_id".into(), json!("fixture-one")),
+                        ("input_tokens".into(), json!(12)),
+                    ])
+                } else {
+                    BTreeMap::from([("status".into(), json!("running"))])
+                },
                 evidence: vec![],
                 expected_subject: None,
                 idempotency_key: None,
