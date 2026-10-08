@@ -147,6 +147,7 @@ pub(in crate::api) async fn list(
         },
         sync: client_sync_notice(&state),
         replicated: None,
+        history: None,
     };
     Ok((Extension(snapshot), Json(page)))
 }

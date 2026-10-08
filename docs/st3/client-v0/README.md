@@ -497,6 +497,76 @@ Pending held subscription requests are not attention sources. Historical `attent
 remain audit data. Both raw legacy mutation routes and `attention.resolve` return
 `attention-migrated`; capabilities mark that action unsupported.
 
+Request recorded closed episodes with `GET /v1/client/attention?history=true&state=resolved&limit=5`.
+The first page defaults to five items. `history=true` without `state` also selects resolved
+history; `state=open` keeps the live list. Without `history`, only open rows are returned;
+`state=resolved` requires `history=true`. The collection stream and combined Now projection
+continue to use the open list.
+Person sessions are limited to their authenticated person. Non-person sessions require an
+explicit `person=person/NAME` filter and existing `read.projections` authority for resolved
+list and detail reads. A global resolved-history read returns `forbidden`.
+
+Resolved rows keep the open episode's attention ID, title, kind, request/update, age and
+step/run references. They have `state: "resolved"`, no actions or action parameters, and
+`operational: {layer: "history", actionable: false, reasons: ["resolved"]}`. Optional
+`resolution` has optional `kind` (`answered`, `withdrawn`, `cancelled`, `closed`), `at`
+(ISO-8601 UTC), `by` (the source claim actor's subject ID), `reason`, and `answer_label`.
+A requester cancelling its ask is `withdrawn`; a recorded daemon cancellation is `cancelled`.
+Reading an informational update is `closed`. A response on another device is still
+`answered` by the person; a delegated answer names the actual agent actor. Device receipts
+provide no closure authority. Missing provenance stays absent.
+
+History derives from retained canonical person responses/cancellations, exact human-gate
+first answers, launch-preview decisions/replacements, revision approvals/cancellations, and
+self-contained registered custom source facts that change an active episode to closed or
+replace it. New episodes retain separate IDs after reopening. A source becoming unavailable,
+stale, unauthorized, or absent is not closure evidence. An implicit person cancellation is
+listed only once a source cancellation claim exists. Login disappearance, and custom sources
+whose past external dependency validity cannot be reconstructed, are omitted. Pre-upgrade
+custom history is available only when its retained facts and immutable manifest reconstruct
+the transition; old cached states and legacy `attention.*` claims are insufficient.
+
+Resolved pages expose optional `history: {complete: boolean, since?: Timestamp, note?: string}`.
+This implementation sends `complete: false` and no `since`. After indexing, its note is
+"Recorded closures only; login and some custom or implicit closures are unavailable."
+
+Background reconstruction runs against a read snapshot; publication discards computed results if
+another connection committed in the meantime. Each source is capped at 256 retained claims and
+256 generated rows, with a 250 ms reconstruction deadline. Oversized, slow or malformed sources
+are quarantined and omitted with the existing degraded-coverage note; new source writes retry them.
+Publication has a 250 ms SQLite progress deadline and performs no source reconstruction while
+holding the write lock. This bounded recorded-history coverage does not change open attention.
+
+While the background worker is catching up, the note is "Recorded history is still indexing;
+some closed items are not available yet." A quarantined source changes it to "Recorded history
+is incomplete because some sources could not be indexed." Notes are at most 120 plain-text
+characters. Show the supplied note under All closed; Recently closed can omit it. `since`,
+when present in a future response, states the beginning of complete retained coverage.
+
+History opens without reading claims. The first authorized explicit history read enables a
+resumable daemon worker; each read page examines at most 128 claim metadata rows and reconstructs
+at most 16 dirty sources before a short publication transaction. History-only writes use a fenced SQLite connection and do not
+invalidate open stream windows; idle checks are read-only. The initial page may be empty or
+partial. Source index failures quarantine the affected source, clear its dirty entry, and
+report degraded coverage; canonical
+claim writes and other history sources continue. A later source write retries the source.
+
+Pages order recorded closure time descending, then attention ID descending for ties. Rows
+without a recorded closure time use request time for ordering, without claiming a closure age.
+Repeat the same filters and limit with `page.next_cursor` to read All closed. Cursors are
+opaque, authenticated, person-bound, expire after the normal page TTL, and pin source versions
+to the first page's graph cut and local index version. Background materialization cannot add
+rows to a pinned continuation. Replay or checkpoint projection clearing advances an index epoch
+and expires existing cursors with `page-cursor-expired`; restart pagination while the worker
+rebuilds. Trimming a latest claim also resets the epoch if it lowers the retained claim frontier
+below the indexed frontier. Canonical claim renumbering never reuses local history versions.
+Reusing an unchanged cursor returns the same page. Changing the
+person, filters, limit, or cursor contents fails. Later closures and canonical source corrections
+do not shift existing pages. Reads seek per-person/source indexes and inspect at most
+`max(32, 2 * limit) + 1` history index entries per request. To preserve that bound when many
+newer versions are invisible to an old snapshot, a page can be short or empty with `has_more:
+true`; clients continue until `next_cursor` is absent. No GET scans or replays the graph.
+
 An agent asks through `work.ask` (`person_id`, `title`, `reason`, and exactly one of `step_id` or
 `new_run`). Claimed work requires its current generation, definition, attempt, readiness, and
 incarnation fences. The ask creates a ready person-assigned runtime step and pauses its origin

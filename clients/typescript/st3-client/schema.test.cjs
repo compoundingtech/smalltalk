@@ -4,6 +4,21 @@ const assert = require('node:assert/strict');
 // Node 24 loads the generated TypeScript directly, without a transpilation copy.
 const modules = Promise.all([import('effect'), import('./Schema.generated.ts')]);
 
+test('attention closure provenance and coverage remain optional and preserve recorded actors', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const decode = Rich.decodeUnknownSync(Rich.AttentionResolution, 'strict');
+    assert.deepEqual(decode({}), {});
+    const recorded = { kind: 'answered', at: '2026-10-07T12:00:00.000Z', by: 'person/lichen', answer_label: 'Keep' };
+    assert.deepEqual(Schema.encodeSync(Rich.AttentionResolution)(decode(recorded)), recorded);
+    assert.deepEqual(decode({ kind: 'closed' }), { kind: 'closed' });
+    assert.throws(() => decode({ kind: 'closed', at: 'unknown' }));
+    assert.throws(() => decode({ kind: 'dismissed' }));
+    const availability = Rich.decodeUnknownSync(Rich.AttentionHistoryAvailability, 'strict');
+    const coverage = { complete: false, note: 'Recorded closures only' };
+    assert.deepEqual(Schema.encodeSync(Rich.AttentionHistoryAvailability)(availability(coverage)), coverage);
+    assert.throws(() => availability({ complete: false, note: 'x'.repeat(121) }));
+});
+
 test('timestamp codecs reject normalized invalid calendar dates and preserve instants', async () => {
     const [{ DateTime, Schema }, Rich] = await modules;
     const decode = Rich.decodeUnknownSync(Rich.Timestamp);

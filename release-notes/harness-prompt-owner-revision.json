@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Validate private prompt attention revisions in the authenticated person's projection so real client answers can reach the native provider.",
+  "replay": {
+    "status": "none",
+    "detail": "No replicated event or replay changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No additional schema or client contract changes."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Attention revision validation uses the authenticated person's view; a foreign private prompt or stale episode revision remains refused."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Clients can submit the exact attention revision returned for their own prompt. Snapshot and native incarnation fences are preserved."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional migration or downtime requirement."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No additional manual action beyond installing the prompt source change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Existing single-use native response and recorded prompt cleanup rules remain unchanged."
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Complete prompt integration manifests and native action restart coverage, and consume existing history maintenance counters in trace diagnostics.",
+  "replay": { "status": "none", "detail": "No replay format or replicated projection changes." },
+  "schema": { "status": "none", "detail": "Document the existing harness.prompt registry entry and classify the existing prompt index as host-local; no additional table or wire fields." },
+  "rules": { "status": "none", "detail": "Existing prompt authority, revision, runtime and single-use rules are unchanged and qualified over the typed client across daemon restarts." },
+  "compatibility": { "status": "none", "detail": "No additional client contract or compatibility changes." },
+  "downtime": { "status": "none", "detail": "No additional migration or downtime requirement." },
+  "manual": { "status": "none", "detail": "No additional manual step is required." },
+  "recovery": { "status": "none", "detail": "Existing restart and uncertain-delivery behavior is unchanged; the added control verifies one native decision and persisted closure." }
+}

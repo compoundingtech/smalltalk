@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Qualify prompt opening, reexec and disappearance through the merged live observation drain without announcing provider completion.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or replicated projection change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No new schema, table or wire fields."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Existing prompt authority and lifecycle rules are unchanged; the control now uses the live drain wrapper."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client or provider protocol change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration or downtime required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No additional manual action required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Existing disappearance and reexec recovery are qualified through the live wrapper; no recovery behavior change."
+  }
+}

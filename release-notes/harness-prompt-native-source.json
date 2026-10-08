@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add a common prompt client contract and a local owner-fenced Claude permission-hook source and native response action.",
+  "replay": {
+    "status": "none",
+    "detail": "Prompt source and responses use local observations and an indexed local table; no replicated replay format or replay version changes."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Add local_harness_prompts with indexed live and recorded closure reads, harness.prompt local observation, optional Attention.prompt metadata and prompt.respond client action. Signed mixed history cursors pin the local read clock, source cuts and seek positions."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Only the requesting seat's current owning person can reserve a native response, with prompt, episode and running incarnation fences. Responses are single use; uncertain delivery stays reserved."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Prompt metadata is optional and its answer ID is a bounded string; the current native mapping accepts only approve or deny and requires runtime incarnation. Other prompt kinds and cross-host routing remain unqualified. Existing harness status fields and incomplete history disclosure are preserved."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "No deployment or live graph upgrade timing was measured. Additive local table creation occurs at daemon schema initialization."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "A new daemon and driver launch with the updated Claude hook registration is required. Unsupported prompt kinds continue through the native harness UI."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Never retry an uncertain native approval as a new action. Lost invocation visibility records unavailable; stop or restart ends the source. Expired and terminal episodes cannot authorize later invocations."
+  }
+}
