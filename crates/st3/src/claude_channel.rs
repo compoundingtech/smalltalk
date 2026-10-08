@@ -108,14 +108,10 @@ pub async fn run(
                         }
                     }
                     if state.initialized {
-                        // MCP initialization is positive native readiness, independent of hooks.
-                        let _: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
-                            subject: subject.into(), kind:"harness.observed".into(), actor:Some(subject.into()),
-                            fields:{let mut fields=BTreeMap::from([("state".into(),json!("ready")),("driver".into(),json!("claude")),
-                                ("transport".into(),json!("claude-channel")),("incarnation_id".into(),json!(incarnation))]);
-                                crate::suspension::annotate_quiescence(&mut fields); fields},
-                            evidence:Vec::new(),expected_subject:None,idempotency_key:Some(format!("channel-ready:{subject}:{incarnation}:{}",state.fence.epoch)),
-                        }).await;
+                        // Channel initialization is component evidence, not provider activity.
+                        let _: Result<ClaimRecord> = client.post(
+                            "/v1/claims", &channel_initialization_claim(&state.fence),
+                        ).await;
                     }
                 },
                 Some(st_drivers::reexec::StdinChunk::Eof) | None => return Ok(()),
@@ -584,6 +580,29 @@ async fn write(stdout: &mut tokio::io::Stdout, frame: &Value) -> Result<()> {
     stdout.flush().await?;
     Ok(())
 }
+fn channel_initialization_claim(fence: &Fence) -> ClaimInput {
+    ClaimInput {
+        subject: fence.subject.clone(),
+        kind: "harness.diagnostic".into(),
+        actor: Some(fence.subject.clone()),
+        fields: BTreeMap::from([
+            ("code".into(), json!("claude-channel-initialized")),
+            ("status".into(), json!("initialized")),
+            ("driver".into(), json!("claude")),
+            ("incarnation_id".into(), json!(fence.incarnation)),
+            ("reason".into(), json!("The scoped MCP protocol initialized; provider activity and live attachment are reported independently.")),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        // This payload is different from the legacy provider-ready observation.
+        // Preserve that old request's immutable input by using a fresh namespace.
+        idempotency_key: Some(format!(
+            "channel-initialized:{}:{}:{}",
+            fence.subject, fence.incarnation, fence.epoch,
+        )),
+    }
+}
+
 fn request(line: &str, initialized: &mut bool) -> Result<Option<Value>> {
     let request: Value = serde_json::from_str(line)?;
     let id = &request["id"];

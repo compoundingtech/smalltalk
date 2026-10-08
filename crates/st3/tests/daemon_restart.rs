@@ -1876,7 +1876,7 @@ impl ClaudeChannelFixture {
 
 /// Force a native activity publication to commit while the real channel's startup
 /// claim is in flight. This is a publisher/Store ordering control, not a hook eval.
-async fn delayed_channel_initialization_preserves_activity(activity: &str) {
+async fn delayed_channel_initialization_preserves_activity(activity: &str, legacy: bool) {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let mut daemon = Daemon::new(root);
@@ -1911,7 +1911,9 @@ async fn delayed_channel_initialization_preserves_activity(activity: &str) {
                         requests.push(input);
                         requests.len()
                     };
-                    if count == 1 { release.notified().await; }
+                    if count == 1 {
+                        release.notified().await;
+                    }
                 }
                 let response = next
                     .run(axum::extract::Request::from_parts(
@@ -1931,13 +1933,44 @@ async fn delayed_channel_initialization_preserves_activity(activity: &str) {
     ));
     daemon.start_isolated_app(app).await;
     let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-activity");
-    let (mut channel, mut input, received) = fixture.open_protocol(root, &daemon, "wrapper-activity");
+    let (mut channel, mut input, received) =
+        fixture.open_protocol(root, &daemon, "wrapper-activity");
     wait_until(
         "startup POST is held before commit",
         Duration::from_secs(5),
         || requests.lock().unwrap().len() == 1,
     )
     .await;
+    let legacy_claim = if legacy {
+        let request = requests.lock().unwrap()[0].clone();
+        let key = request["idempotency_key"].as_str().unwrap();
+        let epoch = key.rsplit(':').next().unwrap();
+        let mut fields = BTreeMap::from([
+            ("state".into(), json!("ready")),
+            ("driver".into(), json!("claude")),
+            ("transport".into(), json!("claude-channel")),
+            ("incarnation_id".into(), json!("wrapper-activity")),
+        ]);
+        st3::suspension::annotate_quiescence(&mut fields);
+        Some(
+            daemon
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "agent/quartz".into(),
+                    kind: "harness.observed".into(),
+                    actor: Some("agent/quartz".into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!(
+                        "channel-ready:agent/quartz:wrapper-activity:{epoch}"
+                    )),
+                })
+                .unwrap(),
+        )
+    } else {
+        None
+    };
     daemon.append(
         "agent/quartz",
         "harness.observed",
@@ -1954,6 +1987,11 @@ async fn delayed_channel_initialization_preserves_activity(activity: &str) {
             .state,
         activity
     );
+    let before = daemon
+        .store
+        .current_harness("agent/quartz")
+        .unwrap()
+        .unwrap();
     release.notify_one();
     wait_until(
         "actual startup claim commits",
@@ -1986,9 +2024,46 @@ async fn delayed_channel_initialization_preserves_activity(activity: &str) {
     })
     .await;
     assert!(channel.try_wait().unwrap().unwrap().success());
-    let selected = daemon.store.current_harness("agent/quartz").unwrap().unwrap();
+    let selected = daemon
+        .store
+        .current_harness("agent/quartz")
+        .unwrap()
+        .unwrap();
     let claims = daemon.store.claims_for("agent/quartz", None).unwrap();
     eprintln!("selected harness after startup: {selected:?}; actual claims: {claims:?}");
+    assert_eq!(
+        selected.claim, before.claim,
+        "component initialization changed the selected activity claim"
+    );
+    let diagnostics: Vec<_> = claims
+        .iter()
+        .filter(|claim| {
+            claim.kind == "harness.diagnostic"
+                && claim.body["fields"]["code"] == "claude-channel-initialized"
+        })
+        .collect();
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "component initialization must commit exactly once"
+    );
+    assert!(diagnostics[0].body["fields"].get("state").is_none());
+    if let Some(legacy) = legacy_claim {
+        let retained = claims.iter().find(|claim| claim.id == legacy.id).unwrap();
+        assert_eq!(
+            retained.body, legacy.body,
+            "legacy idempotency input changed"
+        );
+        for request in requests.lock().unwrap().iter() {
+            assert!(
+                request["idempotency_key"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("channel-initialized:")
+            );
+            assert_eq!(request["kind"], "harness.diagnostic");
+        }
+    }
     daemon.stop().await;
     assert_eq!(
         after, activity,
@@ -2001,7 +2076,7 @@ async fn delayed_claude_channel_initialization_preserves_idle() {
     if st3::test_support::supervise_test() {
         return;
     }
-    delayed_channel_initialization_preserves_activity("idle").await;
+    delayed_channel_initialization_preserves_activity("idle", false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2009,9 +2084,74 @@ async fn delayed_claude_channel_initialization_preserves_working() {
     if st3::test_support::supervise_test() {
         return;
     }
-    delayed_channel_initialization_preserves_activity("working").await;
+    delayed_channel_initialization_preserves_activity("working", false).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initialized_claude_channel_preserves_legacy_readiness_key() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    delayed_channel_initialization_preserves_activity("idle", true).await;
+}
+
+async fn initialized_channel_still_rejects_a_foreign_binding(replace_token: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    declare_claude(&daemon, "agent/quartz");
+    daemon.observe_running("agent/quartz", "wrapper-fence");
+    daemon.start_isolated().await;
+    let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-fence");
+    let (mut channel, input, _) = fixture.open(root, &daemon, "wrapper-fence").await;
+    if replace_token {
+        let replacement = st3::mailbox::Fence::new("agent/quartz", "wrapper-fence", "delivery");
+        let bound = daemon.store.bind_mailbox(&replacement).unwrap();
+        assert!(bound.epoch > 1);
+    } else {
+        daemon.observe_running("agent/quartz", "successor-fence");
+    }
+    wait_until(
+        "the real channel rejects revoked ownership",
+        Duration::from_secs(15),
+        || channel.try_wait().unwrap().is_some(),
+    )
+    .await;
+    let status = channel.try_wait().unwrap().unwrap();
+    let mut error = String::new();
+    channel
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut error)
+        .unwrap();
+    drop(input);
+    daemon.stop().await;
+    assert!(
+        !status.success(),
+        "revoked channel reported success: {error}"
+    );
+    assert!(
+        error.contains("stale-mailbox-session"),
+        "wrong revocation result: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initialized_claude_channel_rejects_a_successor_incarnation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    initialized_channel_still_rejects_a_foreign_binding(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initialized_claude_channel_rejects_a_replacement_token() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    initialized_channel_still_rejects_a_foreign_binding(true).await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_idle_staged_mail_recovers_startup_binding_and_both_native_receipt_forms() {
