@@ -211,6 +211,11 @@ describe('owner-wide arrangement inventory', () => {
     await expect(readArrangementInventory(lister(() => page([arrangement(1)])).gateway, owner, signal)).resolves.toMatchObject({ items: [arrangement(1)] })
   })
 
+  it('rejects a deleted row in the live list, so a lower-id deleted Sidebar can never win', async () => {
+    const listed = lister(() => page([{ ...arrangement(1, 'Sidebar'), deleted: true } as unknown as Arrangement, arrangement(4, 'Sidebar')]))
+    await expect(readArrangementInventory(listed.gateway, owner, new AbortController().signal)).rejects.toThrow()
+  })
+
   it('rejects endless fresh cursors at the item budget instead of paginating forever', async () => {
     const endless = lister((_cursor, call) => page([arrangement(call + 1)], `cursor/${call + 1}`))
     await expect(readArrangementInventory(endless.gateway, owner, new AbortController().signal)).rejects.toThrow(`exceeds ${inventoryItemBudget} arrangements`)
@@ -341,9 +346,10 @@ describe('owner-wide arrangement inventory', () => {
 })
 
 describe('sidebarWinner', () => {
-  it('selects the lowest UUIDv7 regardless of list order or name', () => {
-    expect(sidebarWinner([arrangement(3, 'Sidebar'), arrangement(1, 'Renamed'), arrangement(2, 'Sidebar')])?.id).toBe(arrangement(1).id)
-    expect(sidebarWinner([arrangement(0x10), arrangement(0x9)])?.id).toBe(arrangement(0x9).id)
+  it('selects the lowest UUIDv7 among live arrangements named exactly "Sidebar"', () => {
+    expect(sidebarWinner([arrangement(3, 'Sidebar'), arrangement(1, 'Renamed'), arrangement(2, 'Sidebar')])?.id).toBe(arrangement(2).id)
+    expect(sidebarWinner([arrangement(0x10, 'Sidebar'), arrangement(0x9, 'Sidebar')])?.id).toBe(arrangement(0x9).id)
+    expect(sidebarWinner([arrangement(1, 'sidebar'), arrangement(2, 'Sidebar ')])).toBeUndefined()
     expect(sidebarWinner([])).toBeUndefined()
   })
 })

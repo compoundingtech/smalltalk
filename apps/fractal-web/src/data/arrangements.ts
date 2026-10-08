@@ -81,12 +81,14 @@ const subscriptionId = 'arrangements-inventory'
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)))
 
 /**
- * The live Sidebar is the owner's arrangement with the lowest UUIDv7, independent of name or
- * page order. Inventory IDs are schema-checked lowercase UUIDv7s under one owner prefix, so ID
- * order is UUID (creation) order.
+ * Shared cross-client rule (matches the native client's arrangement list): among the owner's live
+ * arrangements named exactly "Sidebar", the lowest UUIDv7 wins. Inventory rows are already checked
+ * to be under the owner prefix with lowercase UUIDv7 IDs, so ID order is creation order. The web
+ * client only reads; folding duplicates is the native client's job.
  */
 export const sidebarWinner = (items: readonly Arrangement[]): Arrangement | undefined =>
-  items.reduce<Arrangement | undefined>((winner, item) => (winner === undefined || item.id < winner.id ? item : winner), undefined)
+  items.reduce<Arrangement | undefined>((winner, item) =>
+    !item.deleted && item.body.name.value === 'Sidebar' && (winner === undefined || item.id < winner.id) ? item : winner, undefined)
 
 /** Rows requested per page; a page returning more is malformed. */
 export const inventoryPageLimit = 100
