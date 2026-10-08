@@ -1368,7 +1368,7 @@ Member daemons replicate the claims; paired clients read them through a member g
 ## Person arrangements
 
 An arrangement is shared sidebar organization, not a private pane workspace. Discover
-`arrangements` capability version 1 and the `read.arrangements` / `control.arrangements`
+`arrangements` capability version 2 and the `read.arrangements` / `control.arrangements`
 scopes. Glass identity, pane bodies, and privacy are unchanged. Authenticated persons and
 trusted fleet agents read and write in today's free mode as their **real actor**; an agent
 never impersonates the owner. Ownership is permanently the person in
@@ -1521,7 +1521,7 @@ typed operation unions, not arbitrary JSON bodies. Regenerate all clients with
 `cargo run -p st3-client-codegen`; verify freshness with
 `cargo run -p st3-client-codegen -- --check`.
 
-Fractal migration is client-owned: discover capability, pause legacy writers, fold old
+Legacy custom-to-v1 Fractal migration is client-owned: discover capability, pause legacy writers, fold old
 `custom.fractal.sidebar` HLC history once, and durably stage the snapshot, target ID,
 exact typed operations and idempotency key. Preserve stable IDs, import order (keys are
 re-derived), tombstones and placements. Fractal sorts legacy siblings by `(key, ID)` and
@@ -1530,6 +1530,43 @@ Retry that exact staged request until acknowledged and readable, then switch
 exclusively to arrangements. Old stamps remain provenance, not live ordering. Keep staged
 state on failure, leave immutable custom history, and never dual-write. There is no
 upstream Fractal-specific importer.
+
+### Ordered memberships and new version-2 layouts
+
+New arrangements opt into a folder-only body with `arrangement.edit` parameters
+`{subject, owner, version: 2, operations: [{op: "create", name}]}`. Version is accepted only
+on creation; omission creates v1. A v2 body retains the versioned name and folder registers
+but has no `placements`. Existing v1 bodies and `subject.place` behavior remain supported:
+this primitive does not migrate historical winners or convert an existing arrangement.
+If offline v1 and v2 creates collide on one identity, retained unrepaired v1 creation or
+placement authority preserves the v1 layout; the v2 pair records remain retained but inactive.
+
+Read `GET /v1/client/arrangements/{person_name}/{uuid}/memberships?person=person%2FNAME`.
+The response is an `OrderedMembershipPage`, with `collection: "ordered-memberships"` and
+rows `{id, container, member, position: {bucket, key}, revision}`. `id` equals the member's
+stable subject; root is an explicit null bucket. Indexed order is `(effective bucket, key,
+member)`, with root first. Cursors bind the person, container, limit and snapshot; repeat those
+filters and reread after `page-cursor-expired`. Retired or unknown members are hidden, not
+deleted. Same-ID redeclaration restores the retained position, while runtime stopped or
+suspended observations do not retire a declaration.
+
+Submit `arrangement.membership.edit` with `{subject, owner, operations}`. Each operation is
+either `{op: "place", member, bucket: null | FolderId, key}` or `{op: "remove", member}`.
+The bucket field is mandatory even for root; bucket and key win atomically in canonical
+claim order. Removal retains an absent winner. These are claim-backed pair records, not
+new graph subjects. Real actors, owner checks, idempotency receipts and subject fences use
+the ordinary action protocol; a supplied container fence must match in the writer transaction.
+Local admission allows 4,096 live members, not 4,096 lifetime pairs, and never truncates a
+replicated union. An edit has at most 1,024 unique operations and a 1 MiB serialized bound.
+
+Subscribe with `{kind: "subscribe", id, collection: "ordered-memberships", person,
+subject: ArrangementId, limit}`. This bounded held window emits typed membership snapshots
+and changes, complete order and refill after removals/lifecycle changes. Membership rows are
+not `Resource` values; the schema uses separate frame variants and Rust emits
+`MembershipSnapshot`/`MembershipChanges` events. Generated clients expose typed membership
+page, action and subscription helpers. V1 membership reads/actions refuse rather than
+pretending legacy placements are an empty v2 collection. No new checkpoint rule drops
+hidden pairs, absent winners or their lifecycle dependencies.
 
 ## Agent and plain-shell creation
 

@@ -405,6 +405,10 @@ impl CollectionStream {
         if let Some(subject) = subject { command["subject"] = serde_json::json!(subject); }
         self.send(&command).await
     }
+
+    pub async fn subscribe_ordered_memberships(&mut self, id: &str, person: &str, subject: &str, limit: usize) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":"ordered-memberships", "person":person, "subject":subject, "limit":limit})).await
+    }
     pub async fn subscribe(
         &mut self,
         id: &str,
@@ -570,6 +574,23 @@ pub enum CollectionEvent {
         order: Vec<String>,
         has_more: bool,
     },
+    /// An `ordered-memberships` subscription's first window, and again after a resubscribe.
+    MembershipSnapshot {
+        id: String,
+        snapshot: Snapshot,
+        items: Vec<OrderedMembership>,
+        order: Vec<String>,
+        has_more: bool,
+    },
+    /// What changed in an `ordered-memberships` window, with its complete new order.
+    MembershipChanges {
+        id: String,
+        snapshot: Snapshot,
+        upserts: Vec<OrderedMembership>,
+        removes: Vec<String>,
+        order: Vec<String>,
+        has_more: bool,
+    },
     /// A terminal subscription's whole current screen; it replaces every earlier one.
     Screen {
         id: String,
@@ -608,7 +629,23 @@ impl CollectionEvent {
                 .map_err(|error| ClientError::Protocol(format!("collection frame `{name}`: {error}")))
         }
         let id = field::<String>(&frame, "id")?;
+        let memberships = frame.get("collection").and_then(serde_json::Value::as_str) == Some("ordered-memberships");
         match frame.get("kind").and_then(serde_json::Value::as_str) {
+            Some("snapshot") if memberships => Ok(Self::MembershipSnapshot {
+                snapshot: field(&frame, "snapshot")?,
+                items: field(&frame, "items")?,
+                order: field(&frame, "order")?,
+                has_more: field(&frame, "has_more")?,
+                id,
+            }),
+            Some("changes") if memberships => Ok(Self::MembershipChanges {
+                snapshot: field(&frame, "snapshot")?,
+                upserts: field(&frame, "upserts")?,
+                removes: field(&frame, "removes")?,
+                order: field(&frame, "order")?,
+                has_more: field(&frame, "has_more")?,
+                id,
+            }),
             Some("snapshot") => Ok(Self::Snapshot {
                 snapshot: field(&frame, "snapshot")?,
                 items: field(&frame, "items")?,
@@ -826,6 +863,15 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         | ErrorCode::InvalidArrangementFolder
         | ErrorCode::InvalidArrangementName
         | ErrorCode::InvalidArrangementKey
+        | ErrorCode::InvalidArrangementVersion
+        | ErrorCode::InvalidArrangementBody
+        | ErrorCode::UnsupportedMembershipContainer
+        | ErrorCode::MembershipOwnerForbidden
+        | ErrorCode::InvalidMembershipMember
+        | ErrorCode::InvalidMembershipBucket
+        | ErrorCode::InvalidMembershipKey
+        | ErrorCode::InvalidMembershipOperations
+        | ErrorCode::MembershipEditTooLarge
         | ErrorCode::InvalidSubjectReference
         | ErrorCode::Unknown => message.to_owned(),
     }
@@ -2513,6 +2559,49 @@ mod tests {
                 details: Default::default(),
             }),
         )
+    }
+
+    #[test]
+    fn membership_frames_decode_as_typed_membership_events_and_resource_frames_stay_resources() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/clients/ordered-memberships-v2.json"
+        ))
+        .unwrap();
+        let super::CollectionEvent::MembershipSnapshot { id, items, order, has_more, .. } =
+            super::CollectionEvent::from_frame(fixture["snapshot_frame"].clone()).unwrap()
+        else {
+            panic!("a membership snapshot must decode as MembershipSnapshot");
+        };
+        assert_eq!(id, "sidebar");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].member, "agent/ada/worker");
+        assert_eq!(items[0].position.bucket, None);
+        assert_eq!(items[1].position.bucket.as_deref(), Some("019a0000-0000-7000-8000-000000000010"));
+        assert_eq!(order, ["agent/ada/worker", "mission/m1"]);
+        assert!(!has_more);
+        let super::CollectionEvent::MembershipChanges { upserts, removes, order, .. } =
+            super::CollectionEvent::from_frame(fixture["changes_frame"].clone()).unwrap()
+        else {
+            panic!("membership changes must decode as MembershipChanges");
+        };
+        assert_eq!(upserts[0].member, "mission/m1");
+        assert_eq!(upserts[0].position.key, "Zz");
+        assert_eq!(removes, ["agent/ada/worker"]);
+        assert_eq!(order, ["mission/m1"]);
+        let mut missing_bucket = fixture["snapshot_frame"].clone();
+        missing_bucket["items"][0]["position"].as_object_mut().unwrap().remove("bucket");
+        assert!(matches!(
+            super::CollectionEvent::from_frame(missing_bucket),
+            Err(super::ClientError::Protocol(message)) if message.contains("bucket")
+        ));
+        let mut resources = fixture["snapshot_frame"].clone();
+        resources["collection"] = serde_json::json!("agents");
+        resources["items"] = serde_json::json!([]);
+        resources["order"] = serde_json::json!([]);
+        assert!(matches!(
+            super::CollectionEvent::from_frame(resources).unwrap(),
+            super::CollectionEvent::Snapshot { items, .. } if items.is_empty()
+        ));
     }
 
     #[test]

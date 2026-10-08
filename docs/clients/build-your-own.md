@@ -107,7 +107,7 @@ let agents: CollectionWindow | undefined;
 let conversation: Conversation<TimelineEntry> | undefined;
 const stream = await client.collectionStream({
   onFrame(frame) {
-    if ((frame.kind === 'snapshot' || frame.kind === 'changes') && frame.id === 'agents') {
+    if ((frame.kind === 'snapshot' || frame.kind === 'changes') && frame.collection === 'agents' && frame.id === 'agents') {
       agents = applyWindow(agents, frame); // current ordered window and its snapshot
     } else if (frame.kind === 'conversation' && frame.id === 'chosen') {
       conversation = applyConversation(conversation, {

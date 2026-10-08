@@ -4,6 +4,9 @@ mod glass_heads;
 mod arrangements;
 #[cfg(test)]
 mod arrangements_tests;
+mod ordered_membership;
+#[cfg(test)]
+mod ordered_membership_tests;
 mod glasses;
 pub(crate) mod mailbox_wakes;
 mod mailbox_changes;
@@ -3134,6 +3137,7 @@ impl Store {
         resources::rebuild(&transaction)?;
         glass_heads::rebuild(&transaction)?;
         arrangements::rebuild(&transaction)?;
+        ordered_membership::rebuild(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -5546,6 +5550,7 @@ impl Store {
                 params![retired.id, retired.revision, mission_state_name(&retired.state), claim.id],
             )
             .map_err(internal)?;
+        ordered_membership::flush(&transaction).map_err(internal)?;
         transaction
             .execute(
                 "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
@@ -9494,6 +9499,7 @@ impl Store {
                 }
                 if receipt_attached { repair_operations_tx(transaction,&[opaque_cache_key(idempotency_key)]).map_err(internal)?; }
                 owned_sets::project_tx(transaction)?;
+                ordered_membership::flush(transaction).map_err(internal)?;
                 let store_index = current_index_tx(transaction).map_err(internal)?;
                 let response = ApplyResponse {
                     changed: true,
@@ -11516,7 +11522,7 @@ impl Store {
             return resource_references::referrers_from_declarations(&connection, subject);
         }
         let mut statement = connection.prepare_cached(
-            "SELECT owner, name, reason FROM declared_resource_edges WHERE target=?1 ORDER BY owner, name",
+            "SELECT owner, name, reason FROM declared_resource_edges WHERE target=?1 AND relation='declared-resource' ORDER BY owner, name",
         )?;
         let rows = statement.query_map([subject], |row| {
             Ok(json!({
@@ -11776,18 +11782,21 @@ impl Store {
                 .query_map([run_id], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
+        ordered_membership::flush(&transaction)?;
         transaction.commit()?;
         Ok(residue)
     }
 
     pub fn discard_desired_owned_by(&self, owner_run: &str) -> Result<usize> {
-        let connection = self.connection.write();
-        connection
-            .execute(
-                "DELETE FROM desired WHERE owner_run=?1 AND subject NOT LIKE 'resource/uri/%'",
-                [owner_run],
-            )
-            .map_err(Into::into)
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "DELETE FROM desired WHERE owner_run=?1 AND subject NOT LIKE 'resource/uri/%'",
+            [owner_run],
+        )?;
+        ordered_membership::flush(&transaction)?;
+        transaction.commit()?;
+        Ok(changed)
     }
 
     pub fn eval_runtime_records(&self, run: &str) -> Result<Vec<(String, bool)>> {
@@ -16309,6 +16318,7 @@ impl Store {
             kind,
             "lane.approved"
                 | "arrangement.edited"
+                | "ordered-membership.edited"
                 | "lane.joined"
                 | "lane.left"
                 | "lane.marked"
@@ -20262,6 +20272,9 @@ pub(crate) fn append_claim_tx(
     if kind == "arrangement.edited" {
         arrangements::project(transaction, &record)?;
     }
+    if kind == "ordered-membership.edited" {
+        ordered_membership::project(transaction, &record)?;
+    }
     normalize_local_projection_timestamps_tx(
         transaction,
         subject,
@@ -20269,6 +20282,7 @@ pub(crate) fn append_claim_tx(
         body,
         record.accepted_at_unix_ms,
     )?;
+    ordered_membership::flush(transaction)?;
     Ok(record)
 }
 
@@ -27137,6 +27151,11 @@ fn try_project_simple_replication_tx(
                 incremental_claim_error(internal(error), claim, "arrangement-project")
             })?;
         }
+        if claim.kind == "ordered-membership.edited" {
+            ordered_membership::project(transaction, claim).map_err(|error| {
+                incremental_claim_error(internal(error), claim, "ordered-membership-project")
+            })?;
+        }
     }
     let mut aggregates = BTreeMap::<String, Option<Aggregate>>::new();
     // A claim is left to its aggregate's rebuild when that aggregate is dirty, and left waiting
@@ -27444,6 +27463,8 @@ fn replay_graph_from_nothing_with_progress_tx(
     custom::rebuild(transaction).map_err(internal)?;
     stage("full-replay/arrangements");
     arrangements::rebuild(transaction).map_err(internal)?;
+    stage("full-replay/ordered-membership");
+    ordered_membership::rebuild(transaction).map_err(internal)?;
     stage("full-replay/flush");
     Ok(())
 }
@@ -53884,6 +53905,7 @@ fn append_claim_with_subject_fences(
                     // Layout edits merge, but retiring a folded duplicate must not lose
                     // an edit accepted after the client read it.
                     if subject == &input.subject
+                        && input.kind != "ordered-membership.edited"
                         && !(input.kind == "arrangement.edited"
                             && input.fields.get("operations").and_then(Value::as_array)
                                 .is_some_and(|operations| operations.iter().any(|operation| operation["op"] == "retire")))
@@ -53932,7 +53954,7 @@ fn append_claim_with_subject_fences(
                 }
             }
             if let Some(expected) = &input.expected_subject {
-                let actual = if input.kind == "arrangement.edited" {
+                let actual = if matches!(input.kind.as_str(), "arrangement.edited" | "ordered-membership.edited") {
                     transaction.query_row("SELECT revision FROM arrangements WHERE subject=?1", [&input.subject], |row| row.get::<_,String>(0)).optional().map_err(internal)?
                 } else {
                     latest_claim_id_tx(transaction, &input.subject).map_err(internal)?
@@ -53977,6 +53999,7 @@ fn append_claim_with_subject_fences(
                 stored_fields = Some(fields);
             }
             arrangements::prepare(transaction, input)?;
+            ordered_membership::prepare(transaction, input)?;
             // A leave names its own batch as the last sequence of its window. The sequence is only
             // known here, under the writer lock, so a zero high water stands for "this batch".
             if input.kind == "fleet.member-left"
@@ -54012,7 +54035,7 @@ fn append_claim_with_subject_fences(
                     })?;
                 return Ok((latest, false));
             }
-            let predecessor = if input.kind == "arrangement.edited" {
+            let predecessor = if matches!(input.kind.as_str(), "arrangement.edited" | "ordered-membership.edited") {
                 transaction.query_row("SELECT revision FROM arrangements WHERE subject=?1", [&input.subject], |row| row.get::<_, String>(0)).optional().map_err(internal)?
             } else {
                 latest_claim_id_tx(transaction, &input.subject).map_err(internal)?
@@ -54247,6 +54270,10 @@ const PROJECTION_DIGEST_TABLES: &[(&str, &[&str])] = &[
     ("arrangements", &["changed_index"]),
     ("arrangement_registers", &[]),
     ("declared_resource_edges", &[]),
+    ("ordered_membership_heads", &[]),
+    ("ordered_membership_live", &[]),
+    ("ordered_membership_counts", &["changed_index"]),
+    ("ordered_membership_lifecycle", &[]),
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("glass_heads", &[]),

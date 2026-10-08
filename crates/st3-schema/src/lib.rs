@@ -3,6 +3,8 @@
 pub mod arrangements;
 pub mod custom;
 pub mod glasses;
+pub mod lifecycle;
+pub mod ordered_membership;
 pub mod owned_terminals;
 pub mod provenance;
 
@@ -226,8 +228,10 @@ impl std::fmt::Display for ValidationError {
 impl std::error::Error for ValidationError {}
 
 impl Registry {
+    /// Covers the claim registry and the lifecycle policy registry declared beside it.
     pub fn digest(&self) -> String {
-        let bytes = serde_json::to_vec(self).expect("the schema registry is serializable");
+        let bytes = serde_json::to_vec(&(self, lifecycle::registry()))
+            .expect("the schema and lifecycle registries are serializable");
         hex::encode(Sha256::digest(bytes))
     }
 
@@ -450,9 +454,14 @@ impl Registry {
                 }
             }
         }
-        if subject_spec.family == "arrangement" {
+        if kind == lifecycle::MEMBERSHIP_CLAIM {
+            ordered_membership::operations(subject, fields)?;
+        } else if subject_spec.family == "arrangement" {
             if kind != "arrangement.edited" {
-                return Err(error("claim-write-forbidden", "an arrangement requires arrangement.edited"));
+                return Err(error(
+                    "claim-write-forbidden",
+                    "an arrangement requires arrangement.edited or ordered-membership.edited",
+                ));
             }
             arrangements::operations(subject, fields)?;
         }
@@ -1202,6 +1211,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             WritePolicy::OrdinaryClient,
             Cardinality::Append,
             Some("arrangements"),
+            false,
+            &[],
+        ),
+        (
+            lifecycle::MEMBERSHIP_CLAIM,
+            &["arrangement"],
+            WritePolicy::OrdinaryClient,
+            Cardinality::Append,
+            Some("ordered-memberships"),
             false,
             &[],
         ),
@@ -2526,7 +2544,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("revision", string()),
             ("desired", object()),
         ],
-        "arrangement.edited" => &[("owner", required_reference_to(&["person"])), ("operations", required_array()), ("action_id", string()), ("action_digest", string())],
+        "arrangement.edited" => &[("owner", required_reference_to(&["person"])), ("operations", required_array()), ("version", integer()), ("action_id", string()), ("action_digest", string())],
+        "ordered-membership.edited" => &[("owner", required_reference_to(&["person"])), ("operations", required_array()), ("action_id", string()), ("action_digest", string())],
         "glass.upserted" => &[
             ("body", object()),
             ("base_revision", string()),
@@ -4106,6 +4125,7 @@ mod tests {
                 "observer.state",
                 "operational.failure",
                 "operational.recovered",
+                "ordered-membership.edited",
                 "owned-set.revised",
                 "person.delegation-set",
                 "planning-session.approved",

@@ -89,6 +89,7 @@ pub(crate) async fn get(
 struct Edit {
     subject: String,
     owner: String,
+    version: Option<u8>,
     operations: Vec<st3_schema::arrangements::Operation>,
 }
 
@@ -105,16 +106,20 @@ pub(super) async fn edit(
     {
         return Err(validation("arrangement owner must match its immutable subject owner"));
     }
+    let mut fields = BTreeMap::from([
+        ("owner".into(), json!(owner)),
+        ("operations".into(), serde_json::to_value(parameters.operations).map_err(ApiError::internal)?),
+        ("action_id".into(), json!(request.id)),
+        ("action_digest".into(), json!(action_request_digest(request)?)),
+    ]);
+    if let Some(version) = parameters.version {
+        fields.insert("version".into(), json!(version));
+    }
     let input = ClaimInput {
         subject: parameters.subject,
         kind: "arrangement.edited".into(),
         actor: Some(session_claim_actor(session)),
-        fields: BTreeMap::from([
-            ("owner".into(), json!(owner)),
-            ("operations".into(), serde_json::to_value(parameters.operations).map_err(ApiError::internal)?),
-            ("action_id".into(), json!(request.id)),
-            ("action_digest".into(), json!(action_request_digest(request)?)),
-        ]),
+        fields,
         evidence: vec![],
         expected_subject: None,
         idempotency_key: Some(format!("arrangement-edit:{}", creation_key(session, request))),
@@ -125,6 +130,149 @@ pub(super) async fn edit(
     });
     let store = state.store.clone();
     blocking_action(move || store.edit_arrangement(&input, &expected)).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipEdit {
+    subject: String,
+    owner: String,
+    operations: Value,
+}
+
+pub(super) async fn edit_memberships(
+    state: &AppState,
+    session: &ClientSession,
+    request: &ActionRequest,
+) -> Result<ClaimRecord, ApiError> {
+    let parameters: MembershipEdit = serde_json::from_value(request.parameters.clone())
+        .map_err(|error| validation(error.to_string()))?;
+    let owner = person(session, Some(&parameters.owner), true)?;
+    if st3_schema::arrangements::owner(&parameters.subject)
+        .map_err(|error| validation(error.message))? != owner
+    {
+        return Err(validation("arrangement owner must match its immutable subject owner"));
+    }
+    let fields = BTreeMap::from([
+        ("owner".into(), json!(owner)),
+        ("operations".into(), parameters.operations),
+        ("action_id".into(), json!(request.id)),
+        ("action_digest".into(), json!(action_request_digest(request)?)),
+    ]);
+    // Validate the original wire value before serde can normalize an omitted bucket
+    // into an explicit root position.
+    st3_schema::ordered_membership::operations(&parameters.subject, &fields)
+        .map_err(|error| ApiError::bad(St3Error::new(error.code, error.message)))?;
+    let input = ClaimInput {
+        subject: parameters.subject,
+        kind: "ordered-membership.edited".into(),
+        actor: Some(session_claim_actor(session)),
+        fields,
+        evidence: vec![],
+        expected_subject: None,
+        idempotency_key: Some(format!("arrangement-membership-edit:{}", creation_key(session, request))),
+    };
+    let mut expected = request.fence.subject_revisions.clone();
+    expected.retain(|subject, _| {
+        !subject.starts_with("attention/") && !subject.starts_with("session/external-")
+    });
+    let store = state.store.clone();
+    blocking_action(move || store.edit_ordered_memberships(&input, &expected)).await
+}
+
+#[derive(Deserialize, Serialize)]
+struct MembershipCursor {
+    snapshot: ClientSnapshot,
+    subject: String,
+    person: String,
+    limit: usize,
+    expires: u128,
+    bucket: String,
+    key: String,
+    member: String,
+}
+
+pub(crate) async fn memberships(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath((name, uuid)): AxumPath<(String, String)>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<(Extension<ClientSnapshot>, Json<ClientResourcePage>), ApiError> {
+    let owner = person(&session, query.person.as_deref(), false)?;
+    let subject = format!("arrangement/person/{name}/{uuid}");
+    if st3_schema::arrangements::owner(&subject).map_err(|error| validation(error.message))? != owner {
+        return Err(validation("selected arrangement owner must match person"));
+    }
+    if query.history || query.actor.is_some() || query.owner_run.is_some()
+        || query.status.is_some() || query.owner.is_some() || query.state.is_some() || query.native_only
+    {
+        return Err(validation("ordered memberships select subject and person only"));
+    }
+    let limit = query.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS);
+    if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
+        return Err(validation("membership page limit must be 1 through 200"));
+    }
+    let cursor = query.cursor.as_deref().map(|encoded| {
+        if encoded.len() > 16_384 {
+            return Err(validation("membership cursor is too large"));
+        }
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded.strip_prefix("membership/").ok_or_else(|| validation("invalid membership cursor"))?)
+            .map_err(|_| validation("invalid membership cursor"))?;
+        let cursor: MembershipCursor = serde_json::from_slice(&bytes)
+            .map_err(|_| validation("invalid membership cursor"))?;
+        if cursor.subject != subject || cursor.person != owner || cursor.limit != limit
+            || cursor.snapshot.host_id != client_host_id(&state.node) || client_now_ms() > cursor.expires
+        {
+            return Err(client_page_expired("membership cursor does not match this page or has expired"));
+        }
+        Ok(cursor)
+    }).transpose()?;
+    let read_state = state.clone();
+    let (snapshot, mut items, expires) = blocking_store(move || {
+        read_state.store.read_snapshot(|index| {
+            let snapshot = client_snapshot_at(&read_state, index);
+            if cursor.as_ref().is_some_and(|cursor| cursor.snapshot.store_index != index || cursor.snapshot.id != snapshot.id) {
+                return Ok(Err(client_page_expired("membership snapshot changed; restart pagination")));
+            }
+            let expires = cursor.as_ref().map_or_else(
+                || client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS), |cursor| cursor.expires);
+            let after = cursor.as_ref().map(|cursor| (cursor.bucket.as_str(), cursor.key.as_str(), cursor.member.as_str()));
+            let items = read_state.store.ordered_memberships(&subject, index, after, limit + 1)?;
+            Ok(Ok((snapshot, items, expires)))
+        })
+    }).await??;
+    let mut has_more = items.len() > limit;
+    items.truncate(limit);
+    let end = window_end(&items, 0, items.len())?;
+    has_more |= end < items.len();
+    items.truncate(end);
+    let next_cursor = if has_more {
+        let last = items.last().ok_or_else(|| ApiError::internal("membership page has no frontier"))?;
+        let cursor = MembershipCursor {
+            snapshot: snapshot.clone(),
+            subject: format!("arrangement/person/{name}/{uuid}"),
+            person: owner.clone(),
+            limit,
+            expires,
+            bucket: last["position"]["bucket"].as_str().unwrap_or("").into(),
+            key: last["position"]["key"].as_str().ok_or_else(|| ApiError::internal("membership has no key"))?.into(),
+            member: last["member"].as_str().ok_or_else(|| ApiError::internal("membership has no member"))?.into(),
+        };
+        Some(format!("membership/{}", base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&cursor).map_err(ApiError::internal)?)))
+    } else {
+        None
+    };
+    Ok((Extension(snapshot), Json(ClientResourcePage {
+        kind: "page".into(),
+        collection: "ordered-memberships".into(),
+        filters: BTreeMap::from([("subject".into(), format!("arrangement/person/{name}/{uuid}")), ("person".into(), owner)]),
+        items,
+        page: ClientPageInfo { limit, has_more, next_cursor, cursor_expires_at: has_more.then(|| client_timestamp(expires)) },
+        sync: client_sync_notice(&state),
+        replicated: None,
+    })))
 }
 
 #[cfg(test)]
@@ -519,5 +667,247 @@ mod tests {
         assert!(action(State(state.clone()),Extension(new_client_snapshot(&state)),Extension(session),
             Json(stale_launch)).await.is_err());
         assert_eq!(state.store.arrangement(SUBJECT,u64::MAX).unwrap().unwrap()["body"]["name"]["value"],"Main");
+    }
+
+    fn membership_request(state: &AppState, key: &str, operations: Value) -> ActionRequest {
+        let mut input = request(state, key, operations);
+        input.action_type = "arrangement.membership.edit".into();
+        input
+    }
+
+    async fn create_v2(state: &AppState, session: &ClientSession) {
+        let mut input = request(state, "create-v2", json!([{"op":"create","name":"Membership sidebar"}]));
+        input.parameters["version"] = json!(2);
+        edit(state, session, &input).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn membership_action_recovers_receipt_gap_and_records_real_actor() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "membership-receipt-gap");
+        let session = ClientSession::local(Some("agent/sidebar-editor")).unwrap();
+        create_v2(&state, &session).await;
+        let original = membership_request(&state, "membership-gap", json!([
+            {"op":"place","member":"agent/returned-seat","bucket":null,"key":"a0"}
+        ]));
+        let accepted = edit_memberships(&state, &session, &original).await.unwrap();
+        assert_eq!(accepted.actor.as_deref(), Some("agent/sidebar-editor"));
+        assert_eq!(accepted.body["fields"]["owner"], "person/ada");
+        let mut changed = original.clone();
+        changed.id = "action/changed-identity".into();
+        assert!(action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session.clone()), Json(changed)).await.is_err());
+        let recovered = action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session.clone()), Json(original.clone())).await.unwrap().0;
+        assert_eq!(recovered["membership_revision"], accepted.id);
+        let index = state.store.index().unwrap();
+        let retry = action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session.clone()), Json(original.clone())).await.unwrap().0;
+        assert_eq!(retry["operation_id"], recovered["operation_id"]);
+        assert_eq!(state.store.index().unwrap(), index);
+        let mut different = original;
+        different.parameters["operations"] = json!([{"op":"remove","member":"agent/returned-seat"}]);
+        assert_eq!(action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session), Json(different)).await.unwrap_err().code, "idempotency-conflict");
+        assert_eq!(state.store.claims_for(SUBJECT, Some("ordered-membership.edited")).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn membership_actions_require_owner_authority_v2_and_transactional_fences() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "membership-authority");
+        let ada = ClientSession::local(Some("person/ada")).unwrap();
+        let operation = json!([{"op":"place","member":"agent/seat","bucket":null,"key":"a0"}]);
+        let mut read_only = ada.clone();
+        read_only.scopes.remove("control.arrangements");
+        assert_eq!(edit_memberships(&state, &read_only,
+            &membership_request(&state, "missing-scope", operation.clone())).await.unwrap_err().code, "forbidden");
+        edit(&state, &ada, &request(&state, "create-v1", json!([{"op":"create","name":"Legacy"}]))).await.unwrap();
+        assert!(edit_memberships(&state, &ada, &membership_request(&state, "v1-refusal", operation.clone())).await.is_err());
+        let other = ClientSession::local(Some("person/grace")).unwrap();
+        assert_eq!(edit_memberships(&state, &other, &membership_request(&state, "cross-owner", operation.clone())).await.unwrap_err().code, "forbidden");
+        let mut wrong = membership_request(&state, "wrong-owner", operation.clone());
+        wrong.parameters["subject"] = json!(SUBJECT.replace("person/ada", "person/grace"));
+        assert_eq!(edit_memberships(&state, &ada, &wrong).await.unwrap_err().code, "validation-failed");
+
+        let second_root = tempfile::tempdir().unwrap();
+        let second = test_state_named(second_root.path(), "membership-v2-fences");
+        create_v2(&second, &ada).await;
+        let mut fenced = membership_request(&second, "stale-authority", operation);
+        fenced.fence.subject_revisions.insert("person/ada".into(), "claim/nonexistent".into());
+        assert!(action(State(second.clone()), Extension(new_client_snapshot(&second)),
+            Extension(ada), Json(fenced)).await.is_err());
+        assert!(second.store.claims_for(SUBJECT, Some("ordered-membership.edited")).unwrap().is_empty());
+    }
+
+    fn declare_resource_member(state: &AppState, member: &str) {
+        let name = member.strip_prefix("resource/").unwrap();
+        let declaration = crate::graph::parse_internal_intent(
+            &format!("version 2\nresource \"{name}\" {{ kind \"filesystem.file\" }}\n"),
+            "membership-resource-fixture",
+        ).unwrap();
+        state.store.apply_internal(&declaration, &format!("declare-{member}")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn membership_http_pages_use_live_keyset_order_and_expire_changed_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "membership-keyset");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        create_v2(&state, &session).await;
+        for member in ["resource/a", "resource/b", "resource/c"] {
+            declare_resource_member(&state, member);
+        }
+        edit_memberships(&state, &session, &membership_request(&state, "page-rows", json!([
+            {"op":"place","member":"resource/c","bucket":null,"key":"a0"},
+            {"op":"place","member":"resource/a","bucket":null,"key":"a0"},
+            {"op":"place","member":"resource/b","bucket":null,"key":"a0"},
+            {"op":"place","member":"agent/not-declared","bucket":null,"key":"a0"}
+        ]))).await.unwrap();
+        let path = "/v1/client/arrangements/ada/019a0000-0000-7000-8000-000000000001/memberships?person=person%2Fada&limit=1";
+        let get = |uri: String| {
+            let app = crate::api::router(state.clone());
+            async move {
+                app.oneshot(Request::builder().uri(uri).header(LOCAL_PERSON_HEADER, "person/ada")
+                    .body(Body::empty()).unwrap()).await.unwrap()
+            }
+        };
+        let first = get(path.into()).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: st3_client::Envelope<st3_client::OrderedMembershipPage> = serde_json::from_slice(
+            &to_bytes(first.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap()).unwrap();
+        let first = first.value;
+        assert_eq!(first.collection, "ordered-memberships");
+        assert_eq!(first.filters["subject"], SUBJECT);
+        assert_eq!(first.items[0].member, "resource/a");
+        let cursor = first.page.next_cursor.unwrap();
+        assert_eq!(get(format!("{}&cursor={cursor}", path.replace("limit=1", "limit=2")))
+            .await.status(), StatusCode::GONE);
+        let second = get(format!("{path}&cursor={cursor}")).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second: st3_client::Envelope<st3_client::OrderedMembershipPage> = serde_json::from_slice(
+            &to_bytes(second.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap()).unwrap();
+        let second = second.value;
+        assert_eq!(second.items[0].member, "resource/b");
+        assert!(second.page.has_more);
+        let third = get(format!("{path}&cursor={}", second.page.next_cursor.unwrap())).await;
+        assert_eq!(third.status(), StatusCode::OK);
+        let third: st3_client::Envelope<st3_client::OrderedMembershipPage> = serde_json::from_slice(
+            &to_bytes(third.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap()).unwrap();
+        let third = third.value;
+        assert_eq!(third.items[0].member, "resource/c");
+        assert!(!third.page.has_more);
+        declare_resource_member(&state, "resource/d");
+        assert_eq!(get(format!("{path}&cursor={cursor}")).await.status(), StatusCode::GONE);
+        assert_eq!(get(path.replace("person%2Fada", "person%2Fgrace")).await.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn membership_held_window_refills_on_lifecycle_only_declaration() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "membership-window-lifecycle");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        create_v2(&state, &session).await;
+        declare_resource_member(&state, "resource/b");
+        edit_memberships(&state, &session, &membership_request(&state, "window-rows", json!([
+            {"op":"place","member":"resource/a","bucket":null,"key":"a0"},
+            {"op":"place","member":"resource/b","bucket":null,"key":"a0"}
+        ]))).await.unwrap();
+        let windows = collection_windows::Windows::attach(&state.store).unwrap();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let subscription: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe","id":"memberships","collection":"ordered-memberships",
+            "person":"person/ada","subject":SUBJECT,"limit":1
+        })).unwrap();
+        let before = windows.changes(&state.store).unwrap();
+        let (_, first, has_more) = collection_items_with_windows(&state, &session, &subscription,
+            slots.clone().acquire_owned().await.unwrap(), Some(windows.clone())).await.unwrap();
+        assert_eq!(first[0]["member"], "resource/b");
+        assert!(!has_more);
+        let index = state.store.index().unwrap();
+        declare_resource_member(&state, "resource/a");
+        assert!(state.store.ordered_memberships_changed(index, state.store.index().unwrap()).unwrap());
+        let after = windows.changes(&state.store).unwrap();
+        assert!(collection_windows::Windows::changed("ordered-memberships", &before, &after));
+        let (_, second, has_more) = collection_items_with_windows(&state, &session, &subscription,
+            slots.clone().acquire_owned().await.unwrap(), Some(windows.clone())).await.unwrap();
+        assert_eq!(second[0]["member"], "resource/a");
+        assert!(has_more);
+        edit_memberships(&state, &session, &membership_request(&state, "remove-first", json!([
+            {"op":"remove","member":"resource/a"}
+        ]))).await.unwrap();
+        let (_, third, has_more) = collection_items_with_windows(&state, &session, &subscription,
+            slots.clone().acquire_owned().await.unwrap(), Some(windows)).await.unwrap();
+        assert_eq!(third[0]["member"], "resource/b");
+        assert!(!has_more);
+    }
+
+    #[tokio::test]
+    async fn membership_held_window_retires_refills_and_restores_agent_without_layout_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "membership-agent-lifecycle");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        create_v2(&state, &session).await;
+        let declare = crate::graph::parse_internal_intent(
+            "version 2\nagent \"ada/seat\" { workspace \"/tmp\"; command \"true\"; }\n",
+            "membership-agent-lifecycle",
+        ).unwrap();
+        state.store.apply_internal(&declare, "declare-seat").unwrap();
+        declare_resource_member(&state, "resource/fallback");
+        edit_memberships(&state, &session, &membership_request(&state, "agent-window", json!([
+            {"op":"place","member":"agent/ada/seat","bucket":null,"key":"a0"},
+            {"op":"place","member":"resource/fallback","bucket":null,"key":"a1"}
+        ]))).await.unwrap();
+        let windows = collection_windows::Windows::attach(&state.store).unwrap();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let subscription: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe","id":"agent-window","collection":"ordered-memberships",
+            "person":"person/ada","subject":SUBJECT,"limit":1
+        })).unwrap();
+        let (_, first, has_more) = collection_items_with_windows(&state, &session, &subscription,
+            slots.clone().acquire_owned().await.unwrap(), Some(windows.clone())).await.unwrap();
+        assert_eq!(first[0]["member"], "agent/ada/seat");
+        assert!(has_more);
+        let before = windows.changes(&state.store).unwrap();
+        let stop = crate::graph::parse_internal_intent(
+            "version 2\nstop \"agent/ada/seat\"\n", "membership-agent-lifecycle",
+        ).unwrap();
+        state.store.apply_internal(&stop, "retire-seat").unwrap();
+        let after = windows.changes(&state.store).unwrap();
+        assert!(collection_windows::Windows::changed("ordered-memberships", &before, &after));
+        let (_, second, has_more) = collection_items_with_windows(&state, &session, &subscription,
+            slots.clone().acquire_owned().await.unwrap(), Some(windows.clone())).await.unwrap();
+        assert_eq!(second[0]["member"], "resource/fallback");
+        assert!(!has_more);
+        state.store.apply_internal(&declare, "restore-seat").unwrap();
+        let (_, restored, has_more) = collection_items_with_windows(&state, &session, &subscription,
+            slots.clone().acquire_owned().await.unwrap(), Some(windows)).await.unwrap();
+        assert_eq!(restored[0]["member"], "agent/ada/seat");
+        assert_eq!(restored[0]["position"], first[0]["position"]);
+        assert!(has_more);
+        assert_eq!(state.store.claims_for(SUBJECT, Some("ordered-membership.edited")).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn membership_place_requires_explicit_bucket_before_typed_normalization() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "membership-explicit-bucket");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        create_v2(&state, &session).await;
+        let input = membership_request(&state, "missing-bucket", json!([
+            {"op":"place","member":"agent/seat","key":"a0"}
+        ]));
+        let index = state.store.index().unwrap();
+        let response = crate::api::router(state.clone()).oneshot(Request::builder()
+            .method("POST").uri("/v1/client/actions")
+            .header(LOCAL_PERSON_HEADER, "person/ada").header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&input).unwrap())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let envelope: st3_client::ErrorEnvelope = serde_json::from_slice(
+            &to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap()).unwrap();
+        assert_eq!(envelope.code, st3_client::ErrorCode::InvalidMembershipOperations);
+        assert!(!envelope.retryable);
+        assert_eq!(state.store.index().unwrap(), index);
+        assert!(state.store.claims_for(SUBJECT, Some("ordered-membership.edited")).unwrap().is_empty());
     }
 }

@@ -2,6 +2,40 @@ import XCTest
 @testable import St3Client
 
 final class St3ClientTests: XCTestCase {
+    func testOrderedMembershipContractAndVersionedBodies() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let data = try Data(contentsOf: root.appendingPathComponent("fixtures/clients/ordered-memberships-v2.json"))
+        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        func bytes(_ key: String) throws -> Data { try JSONSerialization.data(withJSONObject: XCTUnwrap(fixture[key])) }
+        let parameters = try JSONDecoder().decode(ArrangementMembershipEditParameters.self,
+            from: JSONSerialization.data(withJSONObject: XCTUnwrap((fixture["edit"] as? [String: Any])?["parameters"])))
+        let request = try ActionRequest.arrangementMembershipEdit(id: "action/membership-edit",
+            idempotencyKey: "membership-edit-ada-0001", fence: Fence(snapshotID: "snapshot/host-a/1842/2fc9", subjectRevisions: [:]), parameters: parameters)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? NSDictionary, fixture["edit"] as? NSDictionary)
+        let page = try JSONDecoder().decode(OrderedMembershipPage.self, from: bytes("page"))
+        XCTAssertNil(page.items[0].position.bucket)
+        XCTAssertEqual(page.items[0].id, page.items[0].member)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: JSONEncoder().encode(page)) as? NSDictionary, fixture["page"] as? NSDictionary)
+        let body = try JSONDecoder().decode(ArrangementBody.self, from: bytes("body"))
+        guard case .v2 = body else { return XCTFail("Expected version 2") }
+        var invalid = try XCTUnwrap(fixture["body"] as? [String: Any])
+        invalid["version"] = 3
+        XCTAssertThrowsError(try JSONDecoder().decode(ArrangementBody.self, from: JSONSerialization.data(withJSONObject: invalid)))
+        invalid["version"] = 2; invalid["placements"] = [:] as [String: String]
+        XCTAssertThrowsError(try JSONDecoder().decode(ArrangementBody.self, from: JSONSerialization.data(withJSONObject: invalid)))
+        let legacyData = try Data(contentsOf: root.appendingPathComponent("fixtures/clients/arrangements-v1.json"))
+        let legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: legacyData) as? [String: Any])
+        let resource = try XCTUnwrap(legacy["resource"] as? [String: Any])
+        let v1 = try JSONDecoder().decode(ArrangementBody.self, from: JSONSerialization.data(withJSONObject: XCTUnwrap(resource["body"])))
+        guard case .v1 = v1 else { return XCTFail("Expected version 1") }
+        for raw in ["unsupported-membership-container", "membership-owner-forbidden", "invalid-membership-member", "invalid-membership-bucket",
+                    "invalid-membership-key", "invalid-membership-operations", "invalid-arrangement-version", "invalid-arrangement-body", "membership-edit-too-large"] {
+            let code = try JSONDecoder().decode(ErrorCode.self, from: Data("\"\(raw)\"".utf8))
+            if case .unknown = code { XCTFail("\(raw) decoded as unknown") }
+            XCTAssertEqual(String(decoding: try JSONEncoder().encode(code), as: UTF8.self), "\"\(raw)\"")
+        }
+    }
     func testCreationActionFixtures() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }

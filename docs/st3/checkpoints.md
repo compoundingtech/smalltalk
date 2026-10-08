@@ -63,6 +63,11 @@ The rules identity covers projection inputs and replay as well as retention. Ver
 Version 12 ages out the sekrets claims written before they became local observations.
 Version 13 makes status-history retention use the reader's source selection, excluding stamped
 heartbeats before finding transitions. Legacy transitions that the reader exposes remain retained.
+Version 14 adds raw and live ordered memberships, live counters, their authoritative member
+lifecycle dependencies and the shared reverse-edge projection to proof/replay. Absent winners,
+hidden memberships and folder tombstones remain retained: no ordered-membership drop rule exists.
+Retiring a member changes visibility, not its retained pair position; redeclaring a reusable stable
+identity can restore that position.
 Different builds' rules digests must match exactly, not by version ordering: a mixed-version
 fleet waits at sealing until its participants use compatible rules, including during rollback.
 Verification also refuses seal terms whose rules digest differs from the running build, without

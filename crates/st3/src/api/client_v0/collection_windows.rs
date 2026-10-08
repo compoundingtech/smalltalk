@@ -9,13 +9,14 @@ const STORES: usize = 64;
 const WINDOWS: usize = 64;
 const SESSION_WINDOWS: usize = 16;
 const KIND_LIMIT: usize = 10_000;
-const COLLECTIONS: [&str; 6] = [
+const COLLECTIONS: [&str; 7] = [
     "missions",
     "attention",
     "agents",
     "work",
     "glasses",
     "arrangements",
+    "ordered-memberships",
 ];
 
 #[derive(Default)]
@@ -23,7 +24,7 @@ struct Revisions {
     index: u64,
     commits: u64,
     local: u64,
-    values: [u64; 6],
+    values: [u64; 7],
 }
 
 struct Cached {
@@ -223,9 +224,11 @@ impl Windows {
                 || kinds.is_empty()
                 || kinds.len() > KIND_LIMIT;
             let arrangements = store.arrangements_changed(revisions.index, index)?;
+            let memberships = store.ordered_memberships_changed(revisions.index, index)?;
             for (position, name) in COLLECTIONS.iter().enumerate() {
                 if all
                     || (*name == "arrangements" && arrangements)
+                    || (*name == "ordered-memberships" && memberships)
                     || kinds.iter().any(|kind| !collection_ignores(name, kind))
                 {
                     revisions.values[position] = revisions.values[position].wrapping_add(1);
@@ -241,10 +244,10 @@ impl Windows {
             .map(|position| revisions.values[position]))
     }
 
-    pub(super) fn changes(&self, store: &Store) -> anyhow::Result<[u64; 6]> {
+    pub(super) fn changes(&self, store: &Store) -> anyhow::Result<[u64; 7]> {
         let commits = self.commits();
         store.read_snapshot(|index| {
-            let mut values = [0; 6];
+            let mut values = [0; 7];
             for (position, collection) in COLLECTIONS.iter().enumerate() {
                 values[position] = self
                     .revision(store, index, collection, commits)?
@@ -256,7 +259,7 @@ impl Windows {
         })
     }
 
-    pub(super) fn changed(collection: &str, before: &[u64; 6], after: &[u64; 6]) -> bool {
+    pub(super) fn changed(collection: &str, before: &[u64; 7], after: &[u64; 7]) -> bool {
         COLLECTIONS
             .iter()
             .position(|name| *name == collection)
@@ -631,9 +634,18 @@ mod tests {
         for (collection, scope) in [
             ("glasses", "read.glasses"),
             ("arrangements", "read.arrangements"),
+            ("ordered-memberships", "read.arrangements"),
         ] {
             let root = tempfile::tempdir().unwrap();
             let state = state(root.path());
+            let arrangement = "arrangement/person/ada/019a0000-0000-7000-8000-000000000001";
+            if collection == "ordered-memberships" {
+                state.store.append_claim(&ClaimInput {
+                    subject:arrangement.into(),kind:"arrangement.edited".into(),actor:Some("person/ada".into()),
+                    fields:serde_json::from_value(json!({"owner":"person/ada","version":2,"operations":[{"op":"create","name":"Membership scope"}]})).unwrap(),
+                    evidence:vec![],expected_subject:None,idempotency_key:None,
+                }).unwrap();
+            }
             let grant = "custom/client/scoped-window-reader";
             let pair = |scopes: Value| {
                 state.store.append_claim(&ClaimInput {
@@ -648,9 +660,10 @@ mod tests {
             let windows = Windows::attach(&state.store).unwrap();
             let slots = Arc::new(tokio::sync::Semaphore::new(1));
             let mut query = request(collection);
-            if collection == "arrangements" {
+            if matches!(collection, "arrangements" | "ordered-memberships") {
                 query.person = Some("person/ada".into());
             }
+            if collection == "ordered-memberships" { query.subject = Some(arrangement.into()); }
             collection_items_with_windows(
                 &state,
                 &original,
@@ -660,7 +673,12 @@ mod tests {
             )
             .await
             .unwrap();
+            let before = windows.changes(&state.store).unwrap();
             pair(json!(["read.projections"]));
+            if collection == "ordered-memberships" {
+                assert!(Windows::changed(collection, &before, &windows.changes(&state.store).unwrap()),
+                    "scope changes invalidate a held membership window without a membership edit");
+            }
             for cache in [Some(windows.clone()), None] {
                 let error = collection_items_with_windows(
                     &state,

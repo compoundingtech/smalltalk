@@ -125,6 +125,44 @@ Both tables participate in shuffle/restart/checkpoint row comparisons and per-co
 incremental-digest mutation/rollback checks. Binary winner keys are serialized as hex in
 the independent row oracle, preserving their complete canonical bytes.
 
+### Ordered membership projections
+
+`ordered-membership.edited` claims on a declared container select one canonical LWW
+position or retained absence per `(container, member)`. These indexed pair records are
+not graph subjects and do not own their members.
+
+| Table | Scope | Digest boundary |
+| --- | --- | --- |
+| `ordered_membership_heads` | Shared projection | Raw nullable position, winning revision and complete canonical winner bytes; hidden and absent heads remain represented. |
+| `ordered_membership_live` | Shared projection | Lifecycle-visible effective `(container, bucket, key, member)` ordering and pair revision. Root is indexed as the empty bucket; member identity breaks equal-key ties. |
+| `ordered_membership_counts` | Shared projection | Transactional live count; `changed_index` is a local invalidation frontier and excluded from the digest. |
+| `ordered_membership_lifecycle` | Shared projection | Authoritative visibility and selected declaration/retirement revision for each referenced member and container. |
+| `declared_resource_edges` | Shared projection | The existing target reverse index serves both named declaration references and retained ordered memberships, distinguished by `relation` in the primary key. |
+| `local_ordered_membership_pending` | Local queue | Deduplicated lifecycle invalidations drained in the writer transaction; no independent authority. |
+
+The lifecycle registry beside the schema registry declares each supported family's
+visibility authority and container capability. Seats remain visible while running, stopped,
+offline or suspended; only a shared stop declaration hides them, and same-ID redeclaration
+restores an unchanged position. Unknown members are hidden without erasing their heads.
+Lifecycle invalidation follows the shared target reverse index, with work proportional to
+incoming containers. Folder deletion/lifting follows the existing arrangement resolver.
+Current keyset pages seek the materialized live order, never raw heads followed by dead-member
+filtering. Admission limits count live entries only; replication retains convergent overflow.
+Claim history, absent winners, hidden edges and folder tombstones have no new drop rule.
+
+Version-2 arrangements have folder-only bodies and consume ordered memberships.
+Version-1 placements remain intact and are not treated as empty membership pages or
+implicitly converted. Canonical-winner-preserving migration of existing placements is
+separate from this primitive. The combined layout identity is
+`st3.shared-projections.ordered-membership.v1`; older layouts continue exchanging claims
+but do not compare incompatible projection maps.
+Concurrent v1/v2 creates preserve any unrepaired v1 creation or placement authority.
+Projection caches that effective layout in an existing explicit-version register; pure
+legacy layouts gain no synthetic register, and reads/admission use an indexed lookup.
+Repairing a retained arrangement or membership original rebuilds both dependent projections,
+including the container revision and reverse edges, so operations omitted by a replacement
+cannot remain visible. Incremental projection and rebuild both exclude repaired originals.
+
 ## Every store_index order
 
 Locations below refer to the audited commit, so later line-number changes do not invalidate the inventory. Shared rows must move to the canonical helper, including commutative enumerations whose returned ordering is observable. Local rows may retain arrival order only for the purpose stated.

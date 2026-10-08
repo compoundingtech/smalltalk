@@ -87,3 +87,41 @@ const missingTerminalCapability: CollectionCommand = { kind: 'subscribe', id: 't
 // @ts-expect-error Failure metadata is explicitly declared; arbitrary properties remain closed.
 const extraResyncProperty: CollectionFrame = { kind: 'resync', id: 'agents', undeclared: true };
 void [missingTerminalCapability, extraResyncProperty];
+
+// Ordered-membership windows carry membership rows, never resources; the collection picks the type.
+import { applyWindow, type CollectionStreamOptions, type CollectionWindow } from './Client.generated.ts';
+import type { OrderedMembership, Snapshot } from './Models.generated.ts';
+const frameSnapshot: Snapshot = { id: 'snapshot/host-a/1842/2fc9', host_id: 'host/host-a', store_index: 1842, projection_version: 'client-projection.v0', created_at: '2026-09-20T12:00:00.000Z' };
+const sidebarRow: OrderedMembership = { id: 'agent/ada/worker', container: 'arrangement/person/ada/019a0000-0000-7000-8000-000000000001', member: 'agent/ada/worker', position: { bucket: null, key: 'a0' }, revision: 'claim/place' };
+const membershipSnapshot: CollectionFrame = { kind: 'snapshot', id: 'sidebar', collection: 'ordered-memberships', snapshot: frameSnapshot, items: [sidebarRow], order: ['agent/ada/worker'], has_more: false };
+const membershipChanges: CollectionFrame = { kind: 'changes', id: 'sidebar', collection: 'ordered-memberships', snapshot: frameSnapshot, upserts: [{ ...sidebarRow, position: { bucket: '019a0000-0000-7000-8000-000000000010', key: 'a1' } }], removes: [], order: ['agent/ada/worker'], has_more: false };
+// @ts-expect-error A membership row states its bucket, null for the root.
+const missingBucket: OrderedMembership = { ...sidebarRow, position: { key: 'a0' } };
+// @ts-expect-error Membership windows do not carry resources.
+const membershipResources: CollectionFrame = { kind: 'snapshot', id: 'sidebar', collection: 'ordered-memberships', snapshot: frameSnapshot, items: [machine], order: [], has_more: false };
+// @ts-expect-error Resource windows do not carry membership rows.
+const resourceMemberships: CollectionFrame = { kind: 'snapshot', id: 'agents', collection: 'agents', snapshot: frameSnapshot, items: [sidebarRow], order: [], has_more: false };
+void [membershipSnapshot, membershipChanges, missingBucket, membershipResources, resourceMemberships];
+let sidebar: CollectionWindow<OrderedMembership> | undefined;
+let agentsWindow: CollectionWindow | undefined;
+const onFrame: CollectionStreamOptions['onFrame'] = frame => {
+    if (frame.kind !== 'snapshot' && frame.kind !== 'changes') return;
+    if (frame.collection === 'ordered-memberships') {
+        const rows: OrderedMembership[] = frame.kind === 'snapshot' ? frame.items : frame.upserts;
+        const placed: (string | null)[] = rows.map(row => row.position.bucket);
+        void placed;
+        sidebar = applyWindow(sidebar, frame);
+        const first = sidebar?.items[0];
+        const member: string | undefined = first?.member;
+        const key: string | undefined = first?.position.key;
+        void [member, key];
+    } else {
+        agentsWindow = applyWindow(agentsWindow, frame);
+        const kind: string | undefined = agentsWindow?.items[0]?.kind;
+        void kind;
+        // @ts-expect-error A resource window is not a membership window.
+        sidebar = applyWindow(sidebar, frame);
+    }
+};
+onFrame(membershipSnapshot);
+onFrame(membershipChanges);

@@ -4,25 +4,26 @@ use super::*;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS declared_resource_edges (
     owner TEXT NOT NULL,
+    relation TEXT NOT NULL DEFAULT 'declared-resource',
     name TEXT NOT NULL,
     target TEXT NOT NULL,
     reason TEXT,
-    PRIMARY KEY(owner, name)
+    PRIMARY KEY(owner, relation, name)
 );
-CREATE INDEX IF NOT EXISTS declared_resource_edges_target ON declared_resource_edges(target, owner, name);
+CREATE INDEX IF NOT EXISTS declared_resource_edges_target ON declared_resource_edges(target, owner, relation, name);
 CREATE TRIGGER IF NOT EXISTS declared_resource_agent_insert AFTER INSERT ON desired BEGIN
     INSERT INTO declared_resource_edges(owner, name, target, reason)
     SELECT NEW.subject, json_extract(value,'$.name'), json_extract(value,'$.subject'), json_extract(value,'$.reason')
     FROM json_each(NEW.body,'$.resources') WHERE NEW.kind='agent';
 END;
 CREATE TRIGGER IF NOT EXISTS declared_resource_agent_update AFTER UPDATE ON desired BEGIN
-    DELETE FROM declared_resource_edges WHERE owner=OLD.subject;
+    DELETE FROM declared_resource_edges WHERE owner=OLD.subject AND relation='declared-resource';
     INSERT INTO declared_resource_edges(owner, name, target, reason)
     SELECT NEW.subject, json_extract(value,'$.name'), json_extract(value,'$.subject'), json_extract(value,'$.reason')
     FROM json_each(NEW.body,'$.resources') WHERE NEW.kind='agent';
 END;
 CREATE TRIGGER IF NOT EXISTS declared_resource_agent_delete AFTER DELETE ON desired BEGIN
-    DELETE FROM declared_resource_edges WHERE owner=OLD.subject;
+    DELETE FROM declared_resource_edges WHERE owner=OLD.subject AND relation='declared-resource';
 END;
 CREATE TRIGGER IF NOT EXISTS declared_resource_mission_insert AFTER INSERT ON mission_definitions BEGIN
     INSERT INTO declared_resource_edges(owner, name, target, reason)
@@ -31,14 +32,14 @@ CREATE TRIGGER IF NOT EXISTS declared_resource_mission_insert AFTER INSERT ON mi
     WHERE r.mission_id=NEW.mission_id AND r.revision=NEW.revision;
 END;
 CREATE TRIGGER IF NOT EXISTS declared_resource_mission_update AFTER UPDATE ON mission_definitions BEGIN
-    DELETE FROM declared_resource_edges WHERE owner='mission/' || OLD.mission_id;
+    DELETE FROM declared_resource_edges WHERE owner='mission/' || OLD.mission_id AND relation='declared-resource';
     INSERT INTO declared_resource_edges(owner, name, target, reason)
     SELECT 'mission/' || NEW.mission_id, json_extract(edge.value,'$.name'), json_extract(edge.value,'$.subject'), json_extract(edge.value,'$.reason')
     FROM mission_revisions r, json_each(r.body,'$.resources') edge
     WHERE r.mission_id=NEW.mission_id AND r.revision=NEW.revision;
 END;
 CREATE TRIGGER IF NOT EXISTS declared_resource_mission_delete AFTER DELETE ON mission_definitions BEGIN
-    DELETE FROM declared_resource_edges WHERE owner='mission/' || OLD.mission_id;
+    DELETE FROM declared_resource_edges WHERE owner='mission/' || OLD.mission_id AND relation='declared-resource';
 END;
 "#;
 
@@ -61,8 +62,42 @@ pub(super) struct BackfillStep {
 }
 
 pub(super) fn create_schema(connection: &Connection) -> Result<()> {
+    // Upgrade the same reverse index, preserving its existing selected-declaration rows.
+    // The discriminator prevents authored resource names from colliding with pair records.
+    connection.execute_batch("SAVEPOINT ordered_membership_reverse_index_upgrade")?;
+    let result = (|| -> Result<()> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='declared_resource_edges')",
+        [], |row| row.get(0),
+    )?;
+    let has_relation = exists && connection.prepare("PRAGMA table_info(declared_resource_edges)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?.iter().any(|column| column == "relation");
+    if exists && !has_relation {
+    for trigger in ["agent_insert", "agent_update", "agent_delete", "mission_insert", "mission_update", "mission_delete"] {
+        connection.execute_batch(&format!("DROP TRIGGER IF EXISTS declared_resource_{trigger}"))?;
+    }
+        connection.execute_batch(
+            "DROP INDEX IF EXISTS declared_resource_edges_target;
+             ALTER TABLE declared_resource_edges RENAME TO declared_resource_edges_v1;",
+        )?;
+    }
     connection.execute_batch(SCHEMA)?;
-    Ok(())
+    if exists && !has_relation {
+        connection.execute_batch(
+            "INSERT INTO declared_resource_edges(owner,name,target,reason)
+             SELECT owner,name,target,reason FROM declared_resource_edges_v1;
+             DROP TABLE declared_resource_edges_v1;",
+        )?;
+    }
+        Ok(())
+    })();
+    connection.execute_batch(if result.is_ok() {
+        "RELEASE ordered_membership_reverse_index_upgrade"
+    } else {
+        "ROLLBACK TO ordered_membership_reverse_index_upgrade; RELEASE ordered_membership_reverse_index_upgrade"
+    })?;
+    result
 }
 
 /// Bring the edge projection up to date as the store opens. A shared-memory store holds a
@@ -164,7 +199,7 @@ pub(super) fn backfill_step_tx(transaction: &Transaction<'_>, limit: usize) -> R
     let folded = revisions.len();
     for (owner, _, body) in &revisions {
         transaction.execute(
-            "DELETE FROM declared_resource_edges WHERE owner=?1",
+            "DELETE FROM declared_resource_edges WHERE owner=?1 AND relation='declared-resource'",
             [owner],
         )?;
         transaction.execute(
@@ -305,6 +340,36 @@ pub(super) fn referrers_from_declarations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_reverse_index_upgrades_atomically_without_relation_collisions() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE desired(subject TEXT PRIMARY KEY,kind TEXT,body TEXT);
+             CREATE TABLE mission_definitions(mission_id TEXT PRIMARY KEY,revision TEXT);
+             CREATE TABLE mission_revisions(mission_id TEXT,revision TEXT,body TEXT);
+             CREATE TABLE declared_resource_edges(owner TEXT,name TEXT,target TEXT,reason TEXT,PRIMARY KEY(owner,name));
+             CREATE INDEX declared_resource_edges_target ON declared_resource_edges(target,owner,name);
+             INSERT INTO desired VALUES('agent/seat','agent','{\"resources\":[{\"name\":\"goal\",\"subject\":\"resource/goal\",\"reason\":\"original\"}]}');
+             INSERT INTO declared_resource_edges VALUES('agent/seat','goal','resource/goal','original');",
+        ).unwrap();
+        create_schema(&connection).unwrap();
+        let row: (String,String,String) = connection.query_row(
+            "SELECT relation,target,reason FROM declared_resource_edges", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(row, ("declared-resource".into(),"resource/goal".into(),"original".into()));
+        connection.execute(
+            "INSERT INTO declared_resource_edges(owner,relation,name,target) VALUES('agent/seat','ordered-membership','goal','resource/member')", [],
+        ).unwrap();
+        connection.execute("UPDATE desired SET body='{\"resources\":[]}' WHERE subject='agent/seat'", []).unwrap();
+        let relations: Vec<String> = connection.prepare("SELECT relation FROM declared_resource_edges").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(relations, ["ordered-membership"]);
+        create_schema(&connection).unwrap();
+        let count: usize = connection.query_row("SELECT COUNT(*) FROM declared_resource_edges", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1, "reopening the upgraded schema preserves the same reverse index");
+    }
 
     #[test]
     fn incoming_resource_edges_follow_replacement_replication_and_replay() {

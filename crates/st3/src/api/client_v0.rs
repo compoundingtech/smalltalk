@@ -82,6 +82,11 @@ fn collection_ignores(collection: &str, kind: &str) -> bool {
         return !kind.starts_with("arrangement.")
             && !matches!(kind, "custom.client.pairing-completed" | "custom.client.pairing-revoked");
     }
+    // The projection's revision includes container edits and registry-selected member
+    // lifecycle changes; do not duplicate that registry with a list of claim kinds here.
+    if collection == "ordered-memberships" {
+        return !matches!(kind, "custom.client.pairing-completed" | "custom.client.pairing-revoked");
+    }
     matches!(kind, "daemon.diagnostic" | "transport.observed" | "workspace.observed")
         || (kind == "harness.usage" && collection != "agents")
 }
@@ -133,17 +138,20 @@ async fn collection_items_with_windows(
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     if !matches!(
         request.collection.as_str(),
-        "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements"
+        "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements" | "ordered-memberships"
     ) {
         return Err(validation("unknown collection subscription"));
     }
     if request.status.is_some() && request.collection != "agents" {
         return Err(validation("status filters are supported for agents only"));
     }
-    if request.subject.is_some() && request.collection != "arrangements" {
+    if request.subject.is_some() && !matches!(request.collection.as_str(), "arrangements" | "ordered-memberships") {
         return Err(validation(
-            "subject filters are supported for arrangements only",
+            "subject filters are supported for arrangements and ordered memberships only",
         ));
+    }
+    if request.collection == "ordered-memberships" && request.subject.is_none() {
+        return Err(validation("ordered memberships require an arrangement subject"));
     }
     let limit = request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS);
     if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
@@ -154,7 +162,7 @@ async fn collection_items_with_windows(
             return Err(validation("glasses select the session person"));
         }
         Some(glass_person(session, false)?)
-    } else if request.collection == "arrangements" {
+    } else if matches!(request.collection.as_str(), "arrangements" | "ordered-memberships") {
         if request.actor.is_some() {
             return Err(validation(
                 "arrangements select an explicit person, not an actor",
@@ -209,7 +217,7 @@ async fn collection_items_with_windows(
     let status = request.status.clone();
     let collection = request.collection.clone();
     let custom_forms = session.custom_forms;
-    let arrangement_window = collection == "arrangements";
+    let arrangement_window = matches!(collection.as_str(), "arrangements" | "ordered-memberships");
     let mut admitted = collection != "agents";
     let (snapshot, mut items, mut has_more) = loop {
         let roster_admission = if collection == "agents" && admitted {
@@ -248,7 +256,7 @@ async fn collection_items_with_windows(
                     require_scope(&current, "read.projections")?;
                     let person = match collection.as_str() {
                         "glasses" => Some(glass_person(&current, false)?),
-                        "arrangements" => Some(arrangements::person(
+                        "arrangements" | "ordered-memberships" => Some(arrangements::person(
                             &current,
                             request.person.as_deref(),
                             false,
@@ -296,6 +304,12 @@ async fn collection_items_with_windows(
                                 )?
                             }
                         }
+                        "ordered-memberships" => store.ordered_memberships(
+                            subject.as_deref().expect("selected arrangement subject"),
+                            index,
+                            None,
+                            limit.saturating_add(1),
+                        )?,
                         "attention" => {
                             client_attention_resources_at(&store, person.as_deref(), false, now)?
                         }
@@ -376,6 +390,7 @@ fn collection_window_label(collection: &str) -> &'static str {
         "work" => "stream collection/work",
         "glasses" => "stream collection/glasses",
         "arrangements" => "stream collection/arrangements",
+        "ordered-memberships" => "stream collection/ordered-memberships",
         _ => "stream collection/invalid",
     }
 }
@@ -822,7 +837,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     // the next loop and is reflected in a following change frame.
     let mut changed = state.event_notify.subscribe();
     let windows = collection_windows::Windows::attach(&state.store);
-    let mut window_revisions = [0; 6];
+    let mut window_revisions = [0; 7];
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
     let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
     let mut conversations = ConversationFollowers::default();
@@ -970,7 +985,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                     let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims);
                     let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses") && state.store.glasses_changed(weighed, index).unwrap_or(true);
                     let arrangements_changed = subscriptions.values().any(|s| s.request.collection == "arrangements") && state.store.arrangements_changed(weighed, index).unwrap_or(true);
-                    reread_due |= glasses_changed || arrangements_changed || match claims {
+                    let memberships_changed = subscriptions.values().any(|s| s.request.collection == "ordered-memberships") && state.store.ordered_memberships_changed(weighed, index).unwrap_or(true);
+                    reread_due |= glasses_changed || arrangements_changed || memberships_changed || match claims {
                         Err(_) => true,
                         Ok(claims) => claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
                             claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
@@ -1418,6 +1434,7 @@ const LIMITED_PAIRING_SCOPES: &[&str] = &[
 ];
 const ACTIONS: &[&str] = &[
     "arrangement.edit",
+    "arrangement.membership.edit",
     "attention.resolve",
     "review.approve",
     "review.reject",
@@ -1475,6 +1492,7 @@ const ACTIONS: &[&str] = &[
 const AVAILABLE_ACTIONS: &[&str] = &[
     "custom.reply",
     "arrangement.edit",
+    "arrangement.membership.edit",
     "review.approve",
     "review.reject",
     "review.request-changes",
@@ -1642,7 +1660,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
-    capabilities.push(json!({"id":"arrangements", "version":1, "state":if session.allows("read.arrangements") && acting_party(session) { "granted" } else { "ungranted" }}));
+    capabilities.push(json!({"id":"arrangements", "version":2, "state":if session.allows("read.arrangements") && acting_party(session) { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
@@ -9733,7 +9751,7 @@ pub(super) async fn action(
     }
     let mut reconciled_attachment = None;
     let mut checked_fence = request.fence.clone();
-    if request.action_type == "arrangement.edit" {
+    if matches!(request.action_type.as_str(), "arrangement.edit" | "arrangement.membership.edit") {
         // Layout revisions merge; fenced retirement and graph/launch identity revisions
         // are checked in the writer transaction. Attention episodes and external filesystem
         // sessions retain projected preflight checks (external state is outside SQLite).
@@ -9800,10 +9818,10 @@ pub(super) async fn action(
     } else {
         None
     };
-    let arrangement_claim = if request.action_type == "arrangement.edit" {
-        Some(arrangements::edit(&state, &session, &request).await?)
-    } else {
-        None
+    let arrangement_claim = match request.action_type.as_str() {
+        "arrangement.edit" => Some(arrangements::edit(&state, &session, &request).await?),
+        "arrangement.membership.edit" => Some(arrangements::edit_memberships(&state, &session, &request).await?),
+        _ => None,
     };
     let affected = if let Some(attachment) = &terminal_attachment {
         vec![
@@ -9823,7 +9841,7 @@ pub(super) async fn action(
         result["terminal_attachment"] = attachment;
     }
     if let Some(claim) = arrangement_claim {
-        result["arrangement_revision"] = json!(claim.id);
+        result[if request.action_type == "arrangement.membership.edit" { "membership_revision" } else { "arrangement_revision" }] = json!(claim.id);
     }
     let mut persisted_result = result.clone();
     persisted_result
