@@ -12,6 +12,7 @@ struct Fixture {
     view: &'static str,
     gate: Option<Arc<Gate>>,
     repeat_gate: Arc<AtomicBool>,
+    observe_progress: AtomicBool,
     fail: bool,
     captures: Arc<AtomicUsize>,
     storage_failure: Arc<AtomicBool>,
@@ -81,6 +82,15 @@ impl Operator for FixtureOperator {
 impl Source for Fixture {
     fn name(&self) -> &'static str {
         self.source
+    }
+    fn progress_identity(&self) -> Option<events::SourceIdentity> {
+        self.observe_progress
+            .load(Ordering::SeqCst)
+            .then(|| events::SourceIdentity {
+                name: self.source.into(),
+                fingerprint: "fixture-alder.v1".into(),
+                epoch: 1,
+            })
     }
     fn views(&self) -> Vec<Box<dyn View>> {
         vec![Box::new(FixtureView {
@@ -274,6 +284,7 @@ fn source(
         view,
         gate,
         repeat_gate: Arc::new(AtomicBool::new(false)),
+        observe_progress: AtomicBool::new(false),
         fail,
         captures: Arc::new(AtomicUsize::new(0)),
         storage_failure: Arc::new(AtomicBool::new(false)),
@@ -652,6 +663,7 @@ async fn failed_durable_fence_refuses_reads_even_if_native_coverage_claims_ready
     let fixture = source("fixture.alpha", "fixture.alpha.rows", None, true);
     fixture.covered.store(true, Ordering::SeqCst);
     fixture.arm_fence_failure.store(true, Ordering::SeqCst);
+    fixture.observe_progress.store(true, Ordering::SeqCst);
     let store = Arc::new(
         Store::open_with_collection_sources(
             &root.path().join("graph.db"),
@@ -661,6 +673,7 @@ async fn failed_durable_fence_refuses_reads_even_if_native_coverage_claims_ready
         .unwrap(),
     );
     let registry = store.collection_sources().unwrap();
+    let mut notices = store.prepared_ivm_publisher().unwrap().subscribe();
     assert!(
         store
             .read_snapshot(|_| registry.coverage(
@@ -674,6 +687,8 @@ async fn failed_durable_fence_refuses_reads_even_if_native_coverage_claims_ready
     replace(&store, fixture.source, 17);
     store.start_collection_reactor().unwrap();
     wait_for(|| fixture.fence_failures.load(Ordering::SeqCst) > 0).await;
+    let invalidation = next_source_notice(&mut notices, false).await;
+    assert!(matches!(invalidation, events::SourceWake::Invalidated(_)));
     assert!(registry.unavailable[0].load(Ordering::Acquire));
     // The armed hook makes the separate durable fencing transaction fail at begin.
     assert!(
@@ -699,6 +714,27 @@ async fn failed_durable_fence_refuses_reads_even_if_native_coverage_claims_ready
             .unwrap()
     );
     assert_eq!(output(&store, fixture.source), None);
+}
+
+async fn next_source_notice(
+    receiver: &mut tokio::sync::broadcast::Receiver<events::Notice>,
+    published: bool,
+) -> events::SourceWake {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match receiver.recv().await.unwrap() {
+                events::Notice::Source(wake @ events::SourceWake::Published(_)) if published => {
+                    return wake;
+                }
+                events::Notice::Source(wake @ events::SourceWake::Invalidated(_)) if !published => {
+                    return wake;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -808,6 +844,13 @@ impl Source for CacheOnly {
     fn name(&self) -> &'static str {
         "fixture.cache-only"
     }
+    fn progress_identity(&self) -> Option<events::SourceIdentity> {
+        Some(events::SourceIdentity {
+            name: self.name().into(),
+            fingerprint: "fixture.cache-only.v1".into(),
+            epoch: 1,
+        })
+    }
     fn views(&self) -> Vec<Box<dyn View>> {
         vec![]
     }
@@ -902,12 +945,22 @@ impl AfterCommit for CacheMarker {
         _: u64,
     ) -> Result<bool> {
         assert!(Arc::ptr_eq(&store.ivm_views().unwrap(), &cx.views));
-        cx.installer.position(c, "fixture.cache-only")?;
+        let position = cx.installer.position(c, "fixture.cache-only")?;
         if smallclaims::store::current_index(c)? != self.index {
             return Ok(true);
         }
         // No DML and no retained Store; this is a committed toy marker, not a full cut.
         *self.ready.lock().unwrap() = Some(self.index);
+        let publisher = store
+            .prepared_ivm_publisher()
+            .context("fixture publisher")?;
+        publisher.publication_completed(&events::SourceToken {
+            database_id: publisher
+                .source_database_id()
+                .context("fixture source database")?
+                .into(),
+            position,
+        })?;
         Ok(false)
     }
 }
@@ -931,6 +984,8 @@ async fn cache_only_source_uses_borrowed_owner_and_guarded_shared_lifecycle() {
         .unwrap(),
     );
     assert!(store.prepared_ivm_publisher().is_some());
+    let publisher = store.prepared_ivm_publisher().unwrap();
+    let mut notices = publisher.subscribe();
     let registry = store.collection_sources().unwrap();
     assert!(registry.names[0].is_empty());
     assert!(
@@ -946,6 +1001,14 @@ async fn cache_only_source_uses_borrowed_owner_and_guarded_shared_lifecycle() {
     assert!(store.start_collection_reactor().unwrap());
     assert!(!store.start_collection_reactor().unwrap());
     wait_for(|| source.ready.lock().unwrap().is_some()).await;
+    let first_publication = next_source_notice(&mut notices, true).await;
+    // Rebuild the toy cache at the identical source token. A raw dedup notice would
+    // remain silent; the distinct post-swap publication must still release a waiter.
+    *source.ready.lock().unwrap() = None;
+    registry.wake();
+    let second_publication = next_source_notice(&mut notices, true).await;
+    assert_eq!(second_publication, first_publication);
+    assert!(source.ready.lock().unwrap().is_some());
     assert!(
         store
             .read_snapshot(|_| registry.coverage(
@@ -959,6 +1022,7 @@ async fn cache_only_source_uses_borrowed_owner_and_guarded_shared_lifecycle() {
     source.fail.store(true, Ordering::SeqCst);
     registry.wake();
     wait_for(|| registry.unavailable[0].load(Ordering::Acquire)).await;
+    next_source_notice(&mut notices, false).await;
     assert!(
         !store
             .read_snapshot(|_| registry.coverage(

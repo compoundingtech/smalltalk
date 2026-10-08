@@ -31,6 +31,8 @@ pub(crate) struct OpenView<T> {
 
 pub(crate) enum ViewWake {
     Committed(events::CommitFrontiers),
+    /// Named source progress/publication is only a hint to recheck the selected provider.
+    Source(events::SourceWake),
     /// A dropped notice is recovered by checking the indexed journal and its floor.
     Lagged,
     /// A failed provider capture never becomes a successful update or synthetic row.
@@ -191,6 +193,7 @@ impl<S: Borrow<Store>> IvmViewBridge<S> {
     ) -> ViewWake {
         match receiver.recv().await {
             Ok(events::Notice::Committed(frontiers)) => ViewWake::Committed(frontiers),
+            Ok(events::Notice::Source(wake)) => ViewWake::Source(wake),
             Ok(events::Notice::Unavailable(error)) => ViewWake::Unavailable(error),
             Err(broadcast::error::RecvError::Lagged(_)) => ViewWake::Lagged,
             Err(broadcast::error::RecvError::Closed) => ViewWake::Closed,

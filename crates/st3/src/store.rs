@@ -2710,10 +2710,16 @@ impl Store {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         anyhow::ensure!(publisher.is_none(), "Store publisher already prepared");
-        *publisher = Some(Arc::new(smallclaims::ivm::events::Publisher::attach(
-            &self.graph,
-            128,
-        )?));
+        let identities = self
+            .collection_sources()
+            .map(|registry| registry.publisher_sources())
+            .unwrap_or_default();
+        let prepared = if identities.is_empty() {
+            smallclaims::ivm::events::Publisher::attach(&self.graph, 128)?
+        } else {
+            smallclaims::ivm::events::Publisher::attach_with_sources(&self.graph, 128, &identities)?
+        };
+        *publisher = Some(Arc::new(prepared));
         Ok(())
     }
     pub fn open(path: &Path, origin: impl Into<String>) -> Result<Self> {

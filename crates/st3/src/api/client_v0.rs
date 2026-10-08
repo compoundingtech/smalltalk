@@ -1136,6 +1136,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 use crate::graph_watch_ivm::ViewWake;
                 match notice {
                     ViewWake::Committed(frontiers) => { let _ = frontiers; }
+                    ViewWake::Source(wake) => { let _ = wake; }
                     ViewWake::Lagged => {}
                     ViewWake::Unavailable(error) => { tracing::warn!(%error, "collection IVM notice capture failed"); }
                     ViewWake::Closed => {

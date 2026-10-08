@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 use super::*;
 use smallclaims::ivm::{
-    View, Views,
+    View, Views, events,
     install::{Installer, Operator},
 };
 use std::sync::{
@@ -36,6 +36,12 @@ pub(crate) struct Context {
 /// Source implementations must not retain a strong Store or another runtime owner.
 pub(crate) trait Source: Send + Sync {
     fn name(&self) -> &'static str;
+    /// Opt into the one Publisher's committed native-source and post-swap wakes.
+    /// This is fixed expected configuration, never inferred from persisted rows.
+    /// The source owns complete transactional raw/capture and lifetime coverage.
+    fn progress_identity(&self) -> Option<events::SourceIdentity> {
+        None
+    }
     /// Cache-only sources may return zero views/operators. They still own a named,
     /// persistent source lifetime, complete cut coverage and guarded cache reads.
     fn views(&self) -> Vec<Box<dyn View>>;
@@ -144,6 +150,9 @@ impl From<bool> for Publication {
 /// accessor-only Store methods; no writer acquisition, nested snapshot, reduction or repair.
 /// Recheck the full captured cut, source lifetime/availability and publication generation
 /// before swapping immutable prepared state. Return true to recapture stale work.
+/// An opted-in source calls the prepared Publisher's publication_completed with the
+/// original committed SourceToken after its check and swap, before returning false.
+/// Stale/refused actions never emit Published; it is a wake hint, not a Ready certificate.
 /// This action cannot undo the committed page. Errors/panics refuse reads and fence the
 /// source; adapters must retain independent cut/lifetime checks and Registry::coverage.
 pub(crate) trait AfterCommit: Send {
@@ -163,6 +172,7 @@ pub(crate) struct Registry {
     retries: Vec<AtomicU64>,
     unavailable: Vec<AtomicBool>,
     stale_publications: Vec<AtomicU64>,
+    progress_identities: Vec<Option<events::SourceIdentity>>,
     wake: Arc<Notify>,
 }
 
@@ -176,6 +186,7 @@ impl Registry {
         let mut definitions = Vec::new();
         let mut operators = Vec::new();
         let mut names = Vec::new();
+        let mut progress_identities = Vec::new();
         for source in &sources {
             anyhow::ensure!(
                 !source.name().is_empty()
@@ -184,6 +195,20 @@ impl Registry {
                 "invalid or duplicate collection source"
             );
             let views = source.views();
+            let identity = source.progress_identity();
+            if let Some(identity) = &identity {
+                anyhow::ensure!(
+                    identity.name == source.name()
+                        && identity.name.len() <= 128
+                        && !identity.name.contains('\0')
+                        && !identity.fingerprint.is_empty()
+                        && identity.fingerprint.len() <= 4096
+                        && !identity.fingerprint.contains('\0')
+                        && identity.epoch <= i64::MAX as u64,
+                    "invalid collection source progress identity"
+                );
+            }
+            progress_identities.push(identity);
             let ops = source.operators();
             anyhow::ensure!(
                 views.len() <= 16 && views.len() == ops.len(),
@@ -218,6 +243,7 @@ impl Registry {
             retries: sources.iter().map(|_| AtomicU64::new(0)).collect(),
             unavailable: sources.iter().map(|_| AtomicBool::new(false)).collect(),
             stale_publications: sources.iter().map(|_| AtomicU64::new(0)).collect(),
+            progress_identities,
             sources,
             names,
             wake: Arc::new(Notify::new()),
@@ -291,6 +317,24 @@ impl Registry {
 
     pub fn wake(&self) {
         self.wake.notify_one();
+    }
+
+    pub fn publisher_sources(&self) -> Vec<events::SourceIdentity> {
+        self.progress_identities.iter().flatten().cloned().collect()
+    }
+
+    fn invalidate_publication(&self, store: &Store, index: usize, reason: &str) {
+        let Some(identity) = &self.progress_identities[index] else {
+            return;
+        };
+        let result = store
+            .prepared_ivm_publisher()
+            .context("collection source publisher not prepared")
+            .and_then(|publisher| publisher.publication_invalidated(identity, reason));
+        if let Err(error) = result {
+            // Guard refusal already holds, including when its durable fence failed.
+            tracing::warn!(source=identity.name, %error, "collection source invalidation wake failed");
+        }
     }
 
     pub fn stale_publications(&self, source: &str) -> Result<u64> {
@@ -390,6 +434,19 @@ async fn run(store: Weak<Store>, registry: Arc<Registry>, stopped: Arc<AtomicBoo
         for offset in 0..registry.sources.len() {
             let index = (first + offset) % registry.sources.len();
             let retry = registry.retries[index].load(Ordering::Acquire);
+            if failed.get(&index) == Some(&retry) {
+                continue;
+            }
+            if registry.unavailable[index].load(Ordering::Acquire) {
+                let Some(reader) = store.upgrade() else {
+                    return;
+                };
+                // A hook may fence a source without an owned page. Its commit observer
+                // wakes this pass after writer return; notify waiters once and suspend.
+                registry.invalidate_publication(&reader, index, "collection source unavailable");
+                failed.insert(index, retry);
+                continue;
+            }
             if let Some(backoff) = backoffs.get(&index) {
                 if backoff.retry != retry {
                     backoffs.remove(&index);
@@ -398,9 +455,6 @@ async fn run(store: Weak<Store>, registry: Arc<Registry>, stopped: Arc<AtomicBoo
                         Some(deadline.map_or(backoff.until_ms, |old| old.min(backoff.until_ms)));
                     continue;
                 }
-            }
-            if failed.get(&index) == Some(&retry) {
-                continue;
             }
             let Some(reader) = store.upgrade() else {
                 return;
@@ -485,13 +539,20 @@ async fn run(store: Weak<Store>, registry: Arc<Registry>, stopped: Arc<AtomicBoo
                         if stop.load(Ordering::Acquire) {
                             return result;
                         }
-                        let mut writer = reader.connection.write_background();
-                        if stop.load(Ordering::Acquire) {
-                            return result;
-                        }
-                        let tx = writer.transaction()?;
-                        worker.fence(&tx, index, &format!("collection reactor: {error:#}"))?;
-                        tx.commit()?;
+                        let fence_result = (|| -> Result<()> {
+                            let mut writer = reader.connection.write_background();
+                            if stop.load(Ordering::Acquire) {
+                                return Ok(());
+                            }
+                            let tx = writer.transaction()?;
+                            worker.fence(&tx, index, &format!("collection reactor: {error:#}"))?;
+                            tx.commit()?;
+                            Ok(())
+                        })();
+                        // The managed fence transaction and writer have returned on either
+                        // Result path. A failed durable fence still has the process guard.
+                        worker.invalidate_publication(&reader, index, &format!("{error:#}"));
+                        fence_result?;
                     }
                     result
                 })
