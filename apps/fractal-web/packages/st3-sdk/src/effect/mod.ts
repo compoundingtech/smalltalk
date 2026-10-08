@@ -329,6 +329,7 @@ export interface St3Options {
 }
 
 const decodeResource = decodeUnknownSync(Resource)
+
 const decodeEntry = decodeUnknownSync(TimelineEntry)
 const decodeScreen = decodeUnknownSync(TerminalScreen)
 const decodeRuntime = decodeUnknownSync(Runtime)

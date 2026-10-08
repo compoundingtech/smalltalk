@@ -113,12 +113,25 @@ test('roster lifecycle future-kind stays Unknown without dropping the row', () =
   expect(fleet.agents[0]).toMatchObject({ ref: 'agent/lifecycle', lifecycle: { _tag: 'Unknown' } })
 })
 
-test('roster lifecycle tolerance keeps other fields strict', () => {
+test('roster lifecycle tolerance still enforces other field schemas', () => {
   expect(() => decodeRosterResource({
     kind: 'agent', id: 'agent/lifecycle', name: 'Future declaration', runtime_ids: [],
     reachability: 'reachable', state: 'running', revision: '1',
     updated_at: 'not-a-timestamp', lifecycle: 'future-kind',
   })).toThrow()
+})
+
+test('roster lifecycle tolerance preserves forward-compatible fields and enum cases', () => {
+  const decoded = decodeRosterResource({
+    kind: 'agent', id: 'agent/lifecycle', name: 'Future declaration', runtime_ids: [],
+    reachability: 'reachable', state: 'future-state', revision: '1',
+    updated_at: '2026-10-04T12:00:00.000Z', lifecycle: 'future-kind',
+    future_field: { detail: 'Additional server evidence' },
+  })
+  if (decoded.kind !== 'agent') throw new TypeError('Expected an agent roster row')
+  expect(decoded.state).toEqual({ _tag: 'Unknown', raw: 'future-state' })
+  expect(fleetFromAgents([decoded]).agents[0])
+    .toMatchObject({ ref: 'agent/lifecycle', lifecycle: { _tag: 'Unknown' } })
 })
 
 test('incremental roster lifecycle changes invalidate the retained sidebar row', () => {
