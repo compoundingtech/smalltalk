@@ -229,6 +229,7 @@ async fn collection_items_with_windows(
         let actor = actor.clone();
         let subject = subject.clone();
         let status = status.clone();
+        let filter = filter.clone();
         let collection = collection.clone();
         let person = person.clone();
         let prepared = prepared.clone();
