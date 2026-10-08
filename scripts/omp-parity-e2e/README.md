@@ -25,7 +25,7 @@ alone with `node scripts/omp-parity-e2e/render.mjs tmp/omp-parity-e2e/page.json`
 `OMP_E2E_TIMEOUT` controls each polling/HTTP timeout in seconds (default 45).
 `TMPDIR` controls temporary runtime and tmux socket placement. HOME and all XDG
 state/config/cache/runtime paths are overridden; ST3_ENDPOINT/ST3_PERSON are set
-only to the isolated daemon's Unix socket and `person/omp-e2e`.
+only to the isolated daemon's Unix socket and `person/tester`.
 
 Every check writes `PASS` or `FAIL` to `<out>/report.txt`. Independent checks
 continue after failure; failed setup dependencies stop immediately. The final

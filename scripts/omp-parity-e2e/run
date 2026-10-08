@@ -141,7 +141,7 @@ wait_doctor() {
 require 'isolated daemon ready (doctor)' wait_doctor
 http() {
   curl --silent --show-error --fail --max-time "$TIMEOUT" --unix-socket "$SOCKET" \
-    -H 'x-st3-person: person/omp-e2e' "$@"
+    -H 'x-st3-person: person/tester' "$@"
 }
 negotiated() { http -H 'x-st3-features: conversation-blocks.v1' "$@"; }
 uri() { jq -rn --arg value "$1" '$value | @uri'; }
@@ -320,7 +320,7 @@ done
 
 # Open the actual saved session through Ctrl+K's direct session-id affordance.
 # No host-wide fake OMP process: the fixture remains a historical session.
-export ST3_ENDPOINT="$SOCKET" ST3_PERSON='person/omp-e2e'
+export ST3_ENDPOINT="$SOCKET" ST3_PERSON='person/tester'
 printf -v UI_COMMAND '%q --local' "$STUI"
 check 'start isolated stui terminal' tmux -f /dev/null -S "$TMUX_SOCKET" new-session -d -s omp-e2e -n stui -x 240 -y 100 "$UI_COMMAND"
 TMUX_STARTED=1

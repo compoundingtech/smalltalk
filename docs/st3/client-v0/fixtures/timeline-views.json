@@ -75,8 +75,8 @@
           "blocks": [
             {
               "id": "block/5", "kind": "irc", "source_type": "omp.custom_message.irc",
-              "view": { "type": "irc", "from": "person/jane", "message": "release channel pings stay in the transcript", "message_id": "irc-9182" },
-              "payload": { "kind": "irc:incoming", "from": "person/jane", "text": "release channel pings stay in the transcript", "messageId": "irc-9182" }
+              "view": { "type": "irc", "from": "person/ada", "message": "release channel pings stay in the transcript", "message_id": "irc-9182" },
+              "payload": { "kind": "irc:incoming", "from": "person/ada", "text": "release channel pings stay in the transcript", "messageId": "irc-9182" }
             },
             {
               "id": "block/6", "kind": "job", "source_type": "omp.custom_message.launch-completion",
