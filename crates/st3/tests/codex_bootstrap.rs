@@ -652,7 +652,7 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
     if bound_shell {
         assert_ne!(
             lease["pid"].as_u64().unwrap(),
-            u64::from(observation.pid.unwrap()),
+            u64::from(shell_pid),
             "bootstrap must admit the wrapper child, not the shell"
         );
         let ready: Value = std::fs::read_to_string(&receipts)

@@ -52,7 +52,7 @@ impl Fence {
                 }
                 Err(error)
                     if crate::client::api_error_code(&error).is_some_and(|code| {
-                        !matches!(code, "internal" | "database-busy" | "database-locked" | "mailbox-session-starting")
+                        !matches!(code, "internal" | "database-busy" | "database-locked" | "mailbox-session-starting" | "mailbox-authority-unavailable")
                     }) =>
                 {
                     return Err(error);

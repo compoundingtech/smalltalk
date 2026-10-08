@@ -84,10 +84,11 @@ fn reject_binding(
         );
         // Forced raw owner displacement is foreign to the durable native lease.
         // Linux custody fences this unqualified token. Other platforms retain legacy admission.
-        assert_eq!(
-            st3::test_support::check_fixture_mailbox(store, &successor).is_err(),
-            cfg!(target_os = "linux")
-        );
+        if cfg!(target_os = "linux") {
+            assert_eq!(st3::test_support::check_fixture_mailbox(store, &successor).unwrap_err().code, "stale-mailbox-session");
+        } else {
+            st3::test_support::check_fixture_mailbox(store, &successor).unwrap();
+        }
         successor
     } else {
         if rejection == "runtime" {
@@ -394,10 +395,11 @@ read -r _
             "pending"
         );
         if rejection == Some("token") {
-            assert_eq!(
-                st3::test_support::check_fixture_mailbox(&store, owner).is_err(),
-                cfg!(target_os = "linux")
-            );
+            if cfg!(target_os = "linux") {
+            assert_eq!(st3::test_support::check_fixture_mailbox(&store, owner).unwrap_err().code, "stale-mailbox-session");
+        } else {
+            st3::test_support::check_fixture_mailbox(&store, owner).unwrap();
+        }
         }
         assert!(!barrier.join("provider-return.json").exists());
         std::fs::write(barrier.join("exit-provider"), b"go").unwrap();
@@ -441,10 +443,11 @@ read -r _
     if let Some(owner) = rejection_fence {
         assert!(shell.try_wait().unwrap().is_none());
         if rejection == Some("token") {
-            assert_eq!(
-                st3::test_support::check_fixture_mailbox(&store, &owner).is_err(),
-                cfg!(target_os = "linux")
-            );
+            if cfg!(target_os = "linux") {
+            assert_eq!(st3::test_support::check_fixture_mailbox(&store, &owner).unwrap_err().code, "stale-mailbox-session");
+        } else {
+            st3::test_support::check_fixture_mailbox(&store, &owner).unwrap();
+        }
         } else {
             assert_eq!(
                 st3::test_support::check_fixture_mailbox(&store, &owner)

@@ -210,7 +210,7 @@ fn assess_selected(recipient: &str, driver: &str, incarnation: Option<&str>, cur
             "omp" => "omp-channel", "pi" => "pi-channel", _ => return false,
         };
         beat.report.transport.as_deref() == Some(transport)
-            && incarnation.is_none_or(|incarnation| beat.fence.as_ref().is_some_and(|fence| fence.incarnation == incarnation))
+            && (beat.report.legacy || incarnation.is_none_or(|incarnation| beat.fence.as_ref().is_some_and(|fence| fence.incarnation == incarnation)))
     };
     let mut beat = presence.beats.lock().ok().and_then(|beats| {
         beats
@@ -438,6 +438,9 @@ mod tests {
         assert!(reason(&assessment).contains("claude-channel-unattached"));
         record_legacy(recipient, "claude-channel", 7);
         assert_eq!(known(recipient).unwrap().state, "legacy");
+        // A legacy poll proves transport liveness without asserting a fenced incarnation.
+        assert_eq!(assess_current(recipient, "claude", Some("current")).state, "legacy");
+        assert!(assess_current(recipient, "codex", Some("current")).state != "legacy");
     }
 
     fn report(image: Option<&str>, channel: Option<(Option<&str>, u64)>) -> Report {

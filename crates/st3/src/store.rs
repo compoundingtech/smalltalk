@@ -15836,9 +15836,20 @@ impl Store {
         request: &crate::mailbox::Fence,
         authority: Option<&crate::mailbox::Authority>,
     ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_lease_checked(request, authority, &|| Ok(()))
+    }
+
+    /// Recheck captured physical custody under the writer, before any capability mutation.
+    pub(crate) fn bind_mailbox_with_lease_checked(
+        &self,
+        request: &crate::mailbox::Fence,
+        authority: Option<&crate::mailbox::Authority>,
+        validate: &dyn Fn() -> Result<(), St3Error>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
         let mut connection = self.connection.write();
         let tx = connection.transaction().map_err(internal)?;
         check_mailbox_incarnation(&tx, request)?;
+        validate()?;
         if let Some(authority) = authority {
             mailbox_lease::check_declaration(&tx, request, authority, &self.origin)?;
             mailbox_lease::admit(&tx, request, authority)?;

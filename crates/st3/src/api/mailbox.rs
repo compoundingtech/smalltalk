@@ -18,12 +18,12 @@ pub(super) async fn subscribe(
     let checked_peer = peer.clone();
     blocking_action(move || {
         if !cfg!(target_os = "linux") { return checked_state.store.check_mailbox(&binding); }
-        authority::with_authority(&checked_state, &binding, &checked_peer, |owner| {
+        authority::with_authority(&checked_state, &binding, &checked_peer, |owner, validate| {
         if checked_state.store.check_mailbox(&binding).is_ok() {
             // Upgrade a still-current pre-lease binding without changing its capability.
-            checked_state.store.bind_mailbox_with_lease(&binding, Some(owner)).map(|_| ())
+            checked_state.store.bind_mailbox_with_lease_checked(&binding, Some(owner), validate).map(|_| ())
         } else {
-            checked_state.store.repair_mailbox(&binding, owner).map(|_| ())
+            checked_state.store.repair_mailbox_checked(&binding, owner, validate).map(|_| ())
         }
         })
     }).await?;
@@ -42,8 +42,8 @@ pub(super) async fn bind(
     let peer = peer.expect("authorize checked the native peer").0;
     let bound = blocking_action(move || {
         if !cfg!(target_os = "linux") { return bind_state.store.bind_mailbox(&request); }
-        authority::with_authority(&bind_state, &request, &peer, |owner| {
-            bind_state.store.bind_mailbox_with_lease(&request, Some(owner))
+        authority::with_authority(&bind_state, &request, &peer, |owner, validate| {
+            bind_state.store.bind_mailbox_with_lease_checked(&request, Some(owner), validate)
         })
     }).await?;
     signal_local_change(&state);
@@ -61,7 +61,8 @@ pub(super) async fn attachment(
     let peer = peer.expect("authorize checked the native peer").0;
     let attached = blocking_action(move || {
         if store.has_mailbox_lease(&fence)? {
-            authority::with_authority(&checked_state, &fence, &peer, |owner| {
+            authority::with_authority(&checked_state, &fence, &peer, |owner, validate| {
+                validate()?;
                 if !store.owns_mailbox_lease(&fence, owner)? {
                     return Err(St3Error::new("stale-mailbox-session", "another process owns this mailbox lease"));
                 }
@@ -139,7 +140,8 @@ pub(super) async fn receipt(
     let kind = input.kind.clone();
     let (record, appended, work_wake) = blocking_action(move || {
         let (record, appended) = if store.has_mailbox_lease(&request.fence)? {
-            authority::with_authority(&checked_state, &request.fence, &checked_peer, |owner| {
+            authority::with_authority(&checked_state, &request.fence, &checked_peer, |owner, validate| {
+                validate()?;
                 if !store.owns_mailbox_lease(&request.fence, owner)? {
                     return Err(St3Error::new("stale-mailbox-session", "another process owns this mailbox lease"));
                 }
@@ -578,8 +580,8 @@ async fn stream_with_timers_inner<F, S, H>(
                         && store.check_mailbox(&binding).is_err()
                     {
                         let _ = authority::loss_if_current(&repair_state, &binding, peer);
-                        let repair = authority::with_authority(&repair_state, &binding, peer, |owner| {
-                            store.repair_mailbox(&binding, owner)
+                        let repair = authority::with_authority(&repair_state, &binding, peer, |owner, validate| {
+                            store.repair_mailbox_checked(&binding, owner, validate)
                         });
                         if matches!(repair, Ok(true)) {
                             repaired = true;

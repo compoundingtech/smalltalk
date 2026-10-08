@@ -865,6 +865,30 @@ impl Store {
         )
     }
 
+    /// A transient physical query may retry only a still-current canonical capability.
+    /// An absent owner row can be repaired; a foreign owner or retired binding is terminal.
+    pub(crate) fn check_mailbox_custody_fence(&self, fence: &Fence) -> Result<(), St3Error> {
+        let connection = self.readers.get();
+        check_mailbox_incarnation(&connection, fence)?;
+        if lease(&connection, fence)?.is_none() {
+            return check_mailbox_fence(&connection, fence, &self.origin);
+        }
+        check_lease_fence(&connection, fence, &self.origin)?;
+        let bound: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_mailbox_bindings WHERE token=?1 AND subject=?2
+             AND component=?3 AND incarnation=?4 AND epoch=?5)",
+            params![fence.token, fence.subject, fence.component, fence.incarnation, fence.epoch],
+            |row| row.get(0),
+        ).map_err(internal)?;
+        if !bound { return Err(refused("the binding token was revoked")); }
+        let has_owner: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_mailbox_owners WHERE subject=?1 AND component=?2)",
+            params![fence.subject,fence.component], |row| row.get(0),
+        ).map_err(internal)?;
+        if has_owner { check_mailbox_fence(&connection, fence, &self.origin)?; }
+        Ok(())
+    }
+
     pub(crate) fn mailbox_session_active(
         &self,
         fence: &Fence,
@@ -954,9 +978,19 @@ impl Store {
         fence: &Fence,
         authority: &Authority,
     ) -> Result<bool, St3Error> {
+        self.repair_mailbox_checked(fence, authority, &|| Ok(()))
+    }
+
+    pub(crate) fn repair_mailbox_checked(
+        &self,
+        fence: &Fence,
+        authority: &Authority,
+        validate: &dyn Fn() -> Result<(), St3Error>,
+    ) -> Result<bool, St3Error> {
         let mut connection = self.connection.write();
         let tx = connection.transaction().map_err(internal)?;
         check_mailbox_incarnation(&tx, fence)?;
+        validate()?;
         check_declaration(&tx, fence, authority, &self.origin)?;
         let Some((owner, held, revoked)) = lease(&tx, fence)? else {
             return Err(refused("this binding has no authenticated recovery lease"));

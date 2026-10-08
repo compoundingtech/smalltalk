@@ -103,7 +103,8 @@ pub(super) fn admit_report(
         .mailbox_lease_authority(fence)?
         .ok_or_else(|| refused("the report has no canonical lease"))?;
     if owner.sequence == 0 {
-        return with_authority(state, fence, peer, |owner| {
+        return with_authority(state, fence, peer, |owner, validate| {
+            validate()?;
             state.store.check_mailbox(fence)?;
             if !state.store.owns_mailbox_lease(fence, owner)? {
                 return Err(refused("the report lease was superseded"));
@@ -111,9 +112,7 @@ pub(super) fn admit_report(
             Ok(())
         });
     }
-    if owner.pid != peer.pid
-        || st_runtime::process_start_token(peer.pid).ok() != Some(owner.process_token)
-    {
+    if owner.pid != peer.pid || process_birth(peer.pid)? != owner.process_token {
         return Err(refused("the admitted process generation disappeared"));
     }
     let agent_dir = source_agent_dir(state, fence);
@@ -205,7 +204,8 @@ pub(super) fn repair_proven(
             "the delivery report belongs to another native process",
         ));
     }
-    with_authority(state, fence, peer, |owner| {
+    with_authority(state, fence, peer, |owner, validate| {
+        validate()?;
         state.store.check_mailbox(fence)?;
         if !state.store.owns_mailbox_lease(fence, owner)? {
             return Err(refused("the replay lease was superseded"));
@@ -265,78 +265,151 @@ fn belongs_to_runtime(_pid: u32, _runtime_pid: u32) -> bool {
     false
 }
 
-#[derive(Deserialize)]
-struct TerminalAuthorityStats {
+/// A captured physical witness is immutable across the writer admission boundary.
+/// A PID alone never certifies the daemon, its terminal child or the authenticated peer.
+#[derive(Clone, Debug)]
+struct BootstrapWitness {
     name: String,
-    daemon: TerminalAuthorityDaemon,
-    process: TerminalAuthorityProcess,
-}
-#[derive(Deserialize)]
-struct TerminalAuthorityDaemon {
-    pid: u32,
-}
-#[derive(Deserialize)]
-struct TerminalAuthorityProcess {
-    alive: bool,
-    pid: Option<u32>,
+    created_at: String,
+    daemon: (u32, u64),
+    terminal: (u32, u64),
+    peer: (u32, u64),
+    bound: bool,
 }
 
-/// The registry incarnation names the supporting daemon. Resolve its live terminal
-/// child through that exact daemon; it is the wrapper for managed launch or the bound shell.
-fn terminal_process(
-    state: &AppState,
-    physical: &st_runtime::PtyObservation,
+fn unavailable(reason: impl Into<String>) -> St3Error {
+    St3Error::new("mailbox-authority-unavailable", reason)
+}
+
+fn terminal_identity(
+    name: &str,
+    created_at: &str,
+    daemon_pid: u32,
+    stats: &pty_core::stats::StatsResult,
 ) -> Result<u32, St3Error> {
-    let daemon_pid = physical
-        .pid
-        .ok_or_else(|| refused("the runtime has no daemon identity"))?;
-    let daemon_birth = st_runtime::process_start_token(daemon_pid).map_err(internal)?;
-    let raw = pty_core::registry::with_root(&state.pty_root, || {
-        pty_client::query_status_json(&physical.name, pty_client::STATS_TIMEOUT)
-    })
-    .map_err(|error| {
-        refused(format!(
-            "the terminal process identity is unavailable: {error}"
-        ))
-    })?;
-    let stats: TerminalAuthorityStats = serde_json::from_str(&raw)
-        .map_err(|_| refused("the terminal process identity is malformed"))?;
-    if stats.name != physical.name
-        || stats.daemon.pid != daemon_pid
+    if stats.name != name
+        || stats.created_at.as_deref() != Some(created_at)
+        || u32::try_from(stats.daemon.pid).ok() != Some(daemon_pid)
         || !stats.process.alive
-        || st_runtime::process_start_token(daemon_pid).ok() != Some(daemon_birth)
     {
         return Err(refused(
-            "the physical runtime changed while checking terminal custody",
+            "the exact physical terminal generation was replaced or ended",
         ));
     }
-    let terminal_pid = stats
+    stats
         .process
         .pid
+        .and_then(|pid| u32::try_from(pid).ok())
         .filter(|pid| *pid > 1)
-        .ok_or_else(|| refused("the runtime has no live terminal process"))?;
-    st_runtime::process_start_token(terminal_pid).map_err(internal)?;
-    if !belongs_to_runtime(terminal_pid, daemon_pid) {
-        return Err(refused(
-            "the terminal process is outside its physical runtime",
-        ));
+        .ok_or_else(|| unavailable("the runtime has no proven live terminal process"))
+}
+
+impl BootstrapWitness {
+    fn validate_with(
+        &self,
+        stats: Result<pty_core::stats::StatsResult, St3Error>,
+        birth: impl Fn(u32) -> Result<u64, St3Error>,
+        parent: impl Fn(u32) -> Option<u32>,
+    ) -> Result<(), St3Error> {
+        let terminal = terminal_identity(&self.name, &self.created_at, self.daemon.0, &stats?)?;
+        if terminal != self.terminal.0 {
+            return Err(refused("the physical terminal child was replaced"));
+        }
+        for (pid, captured) in [self.daemon, self.terminal, self.peer] {
+            if birth(pid)? != captured {
+                return Err(refused(
+                    "a captured physical process generation was replaced",
+                ));
+            }
+        }
+        let wrapper_matches = if self.bound {
+            parent(self.peer.0) == Some(self.terminal.0)
+        } else {
+            self.peer == self.terminal
+        };
+        if !wrapper_matches {
+            return Err(refused(
+                "the authenticated wrapper left its exact terminal custody",
+            ));
+        }
+        let mut pid = self.terminal.0;
+        let mut seen = BTreeSet::new();
+        while pid != self.daemon.0 {
+            if pid <= 1 || !seen.insert(pid) || seen.len() > 128 {
+                return Err(refused("the terminal child left its exact daemon custody"));
+            }
+            pid = parent(pid).ok_or_else(|| unavailable("terminal ancestry is unavailable"))?;
+        }
+        Ok(())
     }
-    Ok(terminal_pid)
+
+    fn validate(&self, state: &AppState) -> Result<(), St3Error> {
+        self.validate_with(
+            terminal_stats(state, &self.name),
+            process_birth,
+            runtime_parent,
+        )
+    }
+}
+
+fn process_birth(pid: u32) -> Result<u64, St3Error> {
+    st_runtime::process_start_token(pid)
+        .map_err(|error| unavailable(format!("process generation is unavailable: {error}")))
+}
+
+fn terminal_stats(state: &AppState, name: &str) -> Result<pty_core::stats::StatsResult, St3Error> {
+    pty_client::query_stats_in_with_timeout(&state.pty_root, name, pty_client::STATS_TIMEOUT)
+        .map_err(|error| unavailable(format!("the terminal identity is unavailable: {error}")))
+}
+
+/// The registry incarnation names the supporting daemon. Its typed live answer must
+/// agree with the selected creation stamp before its terminal child grants bootstrap custody.
+fn bootstrap_witness(
+    state: &AppState,
+    physical: &st_runtime::PtyObservation,
+    peer: &NativeDeliveryPeer,
+    peer_birth: u64,
+    bound: bool,
+) -> Result<BootstrapWitness, St3Error> {
+    let daemon_pid = physical
+        .pid
+        .ok_or_else(|| unavailable("the runtime has no daemon identity"))?;
+    let created_at = physical
+        .created_at
+        .clone()
+        .filter(|stamp| !stamp.is_empty())
+        .ok_or_else(|| unavailable("the runtime has no creation identity"))?;
+    let daemon_birth = process_birth(daemon_pid)?;
+    let stats = terminal_stats(state, &physical.name)?;
+    let terminal_pid = terminal_identity(&physical.name, &created_at, daemon_pid, &stats)?;
+    let witness = BootstrapWitness {
+        name: physical.name.clone(),
+        created_at,
+        daemon: (daemon_pid, daemon_birth),
+        terminal: (terminal_pid, process_birth(terminal_pid)?),
+        peer: (peer.pid, peer_birth),
+        bound,
+    };
+    witness.validate_with(Ok(stats), process_birth, runtime_parent)?;
+    Ok(witness)
 }
 
 pub(super) fn with_authority<T>(
     state: &AppState,
     fence: &Fence,
     peer: &NativeDeliveryPeer,
-    action: impl FnOnce(&Authority) -> Result<T, St3Error>,
+    action: impl FnOnce(&Authority, &dyn Fn() -> Result<(), St3Error>) -> Result<T, St3Error>,
 ) -> Result<T, St3Error> {
+    if fence.epoch != 0 {
+        state.store.check_mailbox_custody_fence(fence)?;
+    }
     let (arguments, env) = local_process_arguments(peer.pid)
-        .ok_or_else(|| refused("the authenticated channel process disappeared"))?;
+        .ok_or_else(|| unavailable("the authenticated channel process identity is unavailable"))?;
     let var = |key: &str| {
         env.iter()
             .find_map(|entry| entry.strip_prefix(&format!("{key}=")).map(str::to_owned))
     };
-    let process_token = st_runtime::process_start_token(peer.pid).map_err(internal)?;
+    let process_token = process_birth(peer.pid)?;
     let desired = state
         .store
         .desired_subjects_named(std::slice::from_ref(&fence.subject))
@@ -396,7 +469,7 @@ pub(super) fn with_authority<T>(
                                 .unwrap_or(&fence.subject),
                         ))
         })
-        .ok_or_else(|| refused("the exact physical runtime is unavailable"))?;
+        .ok_or_else(|| unavailable("the exact physical runtime is unavailable"))?;
     let runtime_pid = physical
         .pid
         .ok_or_else(|| refused("the runtime has no process identity"))?;
@@ -419,8 +492,8 @@ pub(super) fn with_authority<T>(
             "the channel carries another runtime's observation paths",
         ));
     }
-    let source =
-        st_drivers::harness_events::read_bound_provider_state(&agent_dir).map_err(internal)?;
+    let source = st_drivers::harness_events::read_bound_provider_state(&agent_dir)
+        .map_err(|error| unavailable(error.to_string()))?;
     if let Some((_, raw)) = &source {
         let observed = decode_provider_authority(raw)?;
         if observed.evidence_incarnation.is_none() || observed.ownership_sequence.is_none() {
@@ -429,6 +502,7 @@ pub(super) fn with_authority<T>(
             ));
         }
     }
+    let captured_source = source.clone();
     let bytes = source
         .filter(|(runtime, _)| runtime == &fence.incarnation)
         .map(|(_, raw)| raw);
@@ -439,7 +513,14 @@ pub(super) fn with_authority<T>(
                 "waiting for provider ownership",
             ));
         }
-        let terminal_pid = terminal_process(state, &physical)?;
+        let witness = bootstrap_witness(
+            state,
+            &physical,
+            peer,
+            process_token,
+            member.terminal_binding.is_some(),
+        )?;
+        let terminal_pid = witness.terminal.0;
         let current_wrapper = (member.terminal_binding.is_none() && peer.pid == terminal_pid
             || member.terminal_binding.is_some() && runtime_parent(peer.pid) == Some(terminal_pid))
             && arguments.windows(2).any(|pair| pair == ["driver", "codex"])
@@ -470,7 +551,20 @@ pub(super) fn with_authority<T>(
             ));
         }
         state.store.mailbox_session_active(fence, &bootstrap)?;
-        return action(&bootstrap);
+        let validate = || {
+            witness.validate(state)?;
+            // Do not admit a stale bootstrap capture after qualified ownership appeared.
+            let current = st_drivers::harness_events::read_bound_provider_state(&agent_dir)
+                .map_err(|error| unavailable(error.to_string()))?;
+            if current != captured_source {
+                return Err(St3Error::new(
+                    "mailbox-session-starting",
+                    "provider ownership changed during bootstrap admission",
+                ));
+            }
+            Ok(())
+        };
+        return action(&bootstrap, &validate);
     };
     let observed = provider_authority(&bytes)?;
     if observed.harness.as_deref() != Some(&provider)
@@ -523,7 +617,7 @@ pub(super) fn with_authority<T>(
         &authority.session,
         authority.sequence,
         || {
-            if st_runtime::process_start_token(peer.pid).ok() != Some(process_token) {
+            if process_birth(peer.pid)? != process_token {
                 return Err(anyhow::Error::new(refused(
                     "the channel process generation changed",
                 )));
@@ -532,7 +626,7 @@ pub(super) fn with_authority<T>(
             // it while holding the record lock rather than admitting a completion race.
             current_provider(state, fence, &agent_dir, &authority)?;
             state.store.promote_mailbox_bootstrap(fence, &authority)?;
-            action(&authority).map_err(anyhow::Error::new)
+            action(&authority, &|| Ok(())).map_err(anyhow::Error::new)
         },
     )
     .map_err(|error| {
@@ -545,6 +639,203 @@ pub(super) fn with_authority<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_stats() -> pty_core::stats::StatsResult {
+        serde_json::from_value(json!({
+            "name":"physical", "createdAt":"generation-1", "uptimeSeconds":1,
+            "daemon":{"pid":100,"resources":null},
+            "process":{"alive":true,"pid":200,"exitCode":null,"resources":null},
+            "terminal":{"cols":80,"rows":24,"cursorX":0,"cursorY":0,
+                "scrollbackUsed":0,"scrollbackCapacity":100},
+            "clients":{"total":0,"attached":0,"readOnly":0},
+            "modes":{"sgrMouse":false,"cursorHidden":false,"kittyKeyboard":false,"kittyKeyboardFlags":[]}
+        })).unwrap()
+    }
+
+    #[test]
+    fn bootstrap_generation_refusals_leave_capabilities_and_epochs_unchanged() {
+        for case in [
+            "name",
+            "stamp",
+            "missing-stamp",
+            "daemon-pid",
+            "terminal-pid",
+            "ended",
+            "daemon-birth",
+            "terminal-birth",
+            "peer-birth",
+            "uncertain",
+            "absent",
+            "timeout",
+            "parent",
+        ] {
+            let store = Store::open_memory("node").unwrap();
+            let intent = crate::graph::parse_intent(
+                "version 2\nagent \"eval.worker\" { host \"node\"; workspace \"/tmp\"; harness \"codex\" {} }", "node",
+            ).unwrap();
+            store
+                .apply_internal(&intent, "bootstrap-witness-fixture")
+                .unwrap();
+            crate::mailbox::tests::ready(&store, "current");
+            let owner = Authority {
+                provider: "codex".into(),
+                session: "runtime:current".into(),
+                sequence: 0,
+                pid: std::process::id(),
+                process_token: st_runtime::process_start_token(std::process::id()).unwrap(),
+            };
+            let bound = store
+                .bind_mailbox_with_lease(
+                    &Fence::new("agent/eval.worker", "current", "delivery"),
+                    Some(&owner),
+                )
+                .unwrap();
+            let witness = BootstrapWitness {
+                name: "physical".into(),
+                created_at: "generation-1".into(),
+                daemon: (100, 10),
+                terminal: (200, 20),
+                peer: (300, 30),
+                bound: true,
+            };
+            let mut stats = fixture_stats();
+            match case {
+                "name" => stats.name = "foreign".into(),
+                "stamp" => stats.created_at = Some("reused-pid-generation".into()),
+                "missing-stamp" => stats.created_at = None,
+                "daemon-pid" => stats.daemon.pid += 1,
+                "terminal-pid" => stats.process.pid = Some(201),
+                "ended" => stats.process.alive = false,
+                _ => {}
+            }
+            let validate = || {
+                witness.validate_with(
+                    if case == "timeout" {
+                        Err(unavailable("isolated injected stats timeout"))
+                    } else {
+                        Ok(stats.clone())
+                    },
+                    |pid| {
+                        if case == "uncertain" {
+                            return Err(unavailable("isolated unreadable process"));
+                        }
+                        if case == "absent" && pid == 200 {
+                            return Err(unavailable("isolated absent terminal"));
+                        }
+                        let original = u64::from(pid / 10);
+                        Ok(original
+                            + u64::from(matches!(
+                                (case, pid),
+                                ("daemon-birth", 100)
+                                    | ("terminal-birth", 200)
+                                    | ("peer-birth", 300)
+                            )))
+                    },
+                    |pid| match pid {
+                        200 => Some(100),
+                        300 => Some(if case == "parent" { 201 } else { 200 }),
+                        _ => None,
+                    },
+                )
+            };
+            let expected = if matches!(case, "uncertain" | "absent" | "timeout") {
+                "mailbox-authority-unavailable"
+            } else {
+                "stale-mailbox-session"
+            };
+            let duplicate = Fence::new(&bound.subject, &bound.incarnation, &bound.component);
+            assert_eq!(
+                store
+                    .bind_mailbox_with_lease_checked(&duplicate, Some(&owner), &validate)
+                    .unwrap_err()
+                    .code,
+                expected,
+                "{case}"
+            );
+            assert_eq!(
+                store.mailbox_lease_authority(&bound).unwrap(),
+                Some(owner.clone()),
+                "{case}"
+            );
+            store.check_mailbox(&bound).unwrap();
+            let connection = store.connection.write();
+            let tokens: u64 = connection
+                .query_row("SELECT COUNT(*) FROM local_mailbox_bindings", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(tokens, 1, "{case}");
+            // An absent owner is the only repairable displacement. Uncertainty still cannot insert it.
+            connection
+                .execute("DELETE FROM local_mailbox_owners", [])
+                .unwrap();
+            drop(connection);
+            assert_eq!(
+                store
+                    .repair_mailbox_checked(&bound, &owner, &validate)
+                    .unwrap_err()
+                    .code,
+                expected,
+                "{case}"
+            );
+            let connection = store.connection.write();
+            let owners: u64 = connection
+                .query_row("SELECT COUNT(*) FROM local_mailbox_owners", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(owners, 0, "{case}");
+            assert_eq!(
+                connection
+                    .query_row("SELECT epoch FROM local_mailbox_leases", [], |row| row
+                        .get::<_, u64>(0))
+                    .unwrap(),
+                bound.epoch
+            );
+        }
+    }
+
+    #[test]
+    fn managed_bootstrap_requires_wrapper_equality_and_bound_bootstrap_requires_direct_parent() {
+        let mut witness = BootstrapWitness {
+            name: "physical".into(),
+            created_at: "generation-1".into(),
+            daemon: (100, 10),
+            terminal: (200, 20),
+            peer: (200, 20),
+            bound: false,
+        };
+        let birth = |pid| Ok(u64::from(pid / 10));
+        let parent = |pid| match pid {
+            200 => Some(100),
+            300 => Some(200),
+            400 => Some(300),
+            _ => None,
+        };
+        witness
+            .validate_with(Ok(fixture_stats()), birth, parent)
+            .unwrap();
+        witness.peer = (300, 30);
+        assert_eq!(
+            witness
+                .validate_with(Ok(fixture_stats()), birth, parent)
+                .unwrap_err()
+                .code,
+            "stale-mailbox-session"
+        );
+        witness.bound = true;
+        witness
+            .validate_with(Ok(fixture_stats()), birth, parent)
+            .unwrap();
+        witness.peer = (400, 40);
+        assert_eq!(
+            witness
+                .validate_with(Ok(fixture_stats()), birth, parent)
+                .unwrap_err()
+                .code,
+            "stale-mailbox-session"
+        );
+    }
 
     #[test]
     fn raw_terminal_authority_survives_staleness_and_clock_skew_under_the_owner_lock() {
