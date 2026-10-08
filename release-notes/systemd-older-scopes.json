@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Systemd 236\u2013253 scopes preserve literal argv without the unsupported expansion option. Systemd 254+ retains --expand-environment=no. Both paths require a reachable user manager and disable password prompts. Legacy st2 drivers on 236\u2013253 change from degraded detached tasks to cgroup-isolated scopes; st3 on those hosts changes from failed scope launches to working scopes."
+    "detail": "Systemd 236\u2013253 scopes preserve literal argv without the unsupported expansion option. Systemd 254+ retains --expand-environment=no. Both paths require a reachable user manager and disable password prompts. Legacy st2 drivers on 236\u2013253 change from degraded detached tasks to cgroup-isolated scopes; st3 on those hosts changes from failed scope launches to working scopes. Scope descriptions are fixed to st seat so literal non-UTF-8 task arguments never enter a D-Bus description string."
   },
   "downtime": {
     "status": "unknown",

@@ -163,7 +163,8 @@ fn wrap_for_mode(
                     "--quiet",
                     "--no-ask-password",
                 ])
-                .arg(format!("--unit={unit}"));
+                .arg(format!("--unit={unit}"))
+                .arg("--description=st seat");
             if expansion_flag {
                 command.arg("--expand-environment=no");
             }
@@ -452,6 +453,7 @@ mod tests {
         assert_eq!(actual[separator + 1], program);
         assert_eq!(&actual[separator + 2..], &arguments);
         assert!(!actual.contains(&OsStr::new("--expand-environment=no")));
+        assert!(actual[..separator].contains(&OsStr::new("--description=st seat")));
         assert!(actual.contains(&OsStr::new("--no-ask-password")));
         assert_eq!(command.get_program(), OsStr::new("systemd-run"));
     }

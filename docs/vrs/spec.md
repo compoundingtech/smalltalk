@@ -907,7 +907,7 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   command order is:
 
   ```text
-  systemd-run --user --scope --collect --quiet --no-ask-password --unit=<unit> --expand-environment=no -- <program> <arg>...
+  systemd-run --user --scope --collect --quiet --no-ask-password --unit=<unit> "--description=st seat" --expand-environment=no -- <program> <arg>...
   ```
 
   On systemd v236–253, omit `--expand-environment=no`: those versions execute

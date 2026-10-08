@@ -44,10 +44,14 @@ st2-maintained encoding and would no longer be opaque launch argv.
 
 ## Decision
 
+All scopes use the fixed description `st seat`. A generated description embeds
+argument bytes in a D-Bus string, which rejects non-UTF-8 arguments before
+the task executes. Keeping the description separate preserves opaque argv.
+
 Linux scope launches on systemd v254+ use this exact outer argument order:
 
 ```text
-systemd-run --user --scope --collect --quiet --no-ask-password --unit=<unit> --expand-environment=no -- <program> <arg>...
+systemd-run --user --scope --collect --quiet --no-ask-password --unit=<unit> "--description=st seat" --expand-environment=no -- <program> <arg>...
 ```
 
 On systemd v236–253, omit only `--expand-environment=no`. These versions
