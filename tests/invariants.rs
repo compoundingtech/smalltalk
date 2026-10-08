@@ -142,7 +142,7 @@ mod tests {
 
 #[test]
 fn qualified_proof_references_resolve() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = Path::new(test_env!("CARGO_MANIFEST_DIR"));
     let invariants = include_str!("../docs/st2/invariants.md");
     let mut checked = 0;
 

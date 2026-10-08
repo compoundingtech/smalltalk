@@ -31,7 +31,7 @@ fn declare_principal(root: &Path, identity: &str) {
 }
 
 fn request(root: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("request")
         .args(args)
         .args(["--root", root.to_str().unwrap(), "--host", "h"])

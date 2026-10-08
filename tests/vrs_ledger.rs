@@ -33,7 +33,7 @@ fn root_requirement_ids_are_unique() {
 /// retitled decision is not a ledger property.
 #[test]
 fn root_decision_number_duplicates_match_recorded_history() {
-    let decision_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/vrs/.decisions");
+    let decision_dir = Path::new(test_env!("CARGO_MANIFEST_DIR")).join("docs/vrs/.decisions");
     let mut by_number = BTreeMap::<String, BTreeSet<String>>::new();
 
     for entry in fs::read_dir(decision_dir).expect("root decision directory must be readable") {
@@ -71,7 +71,7 @@ fn root_decision_number_duplicates_match_recorded_history() {
 
 #[test]
 fn root_delta_ids_are_unique() {
-    let delta_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/vrs/.delta");
+    let delta_dir = Path::new(test_env!("CARGO_MANIFEST_DIR")).join("docs/vrs/.delta");
     let mut seen = BTreeSet::new();
 
     for entry in fs::read_dir(delta_dir).expect("root delta directory must be readable") {
@@ -108,7 +108,7 @@ fn collided_decision_numbers_are_never_cited_bare() {
         "docs/vrs/.decisions/0006-observed-harness-state-is-a-driver-written-catalog-record.md",
     ];
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = Path::new(test_env!("CARGO_MANIFEST_DIR"));
     let mut bare = Vec::new();
     let mut checked = 0usize;
 

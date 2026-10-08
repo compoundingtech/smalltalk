@@ -229,17 +229,16 @@ fn declaring_the_reserved_resync_stream_is_refused() {
 /// rebuild recipe). It maps `dev.schickling.agent-goal://<host>/<id>` to
 /// `<agent_dir>/resources/goal.md`.
 #[cfg(feature = "wasm-resolver")]
-const DEMO_WASM_SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/crates/agent-spec/tests/fixtures/demo_resolver.wasm"
-);
+fn demo_wasm_src() -> &'static str {
+    test_env!("CARGO_MANIFEST_DIR", "/crates/agent-spec/tests/fixtures/demo_resolver.wasm")
+}
 
 /// Declare a catalog-level wasm profile for the goal scheme and materialize the fixture module
 /// where the declaration points: `<catalog>/resolvers/goal.wasm` (catalog-root anchored).
 #[cfg(feature = "wasm-resolver")]
 fn catalog_with_profile(catalog: &Path, class: &str) {
     fs::create_dir_all(catalog.join("resolvers")).unwrap();
-    fs::copy(DEMO_WASM_SRC, catalog.join("resolvers/goal.wasm")).unwrap();
+    fs::copy(demo_wasm_src(), catalog.join("resolvers/goal.wasm")).unwrap();
     fs::write(
         st2::catalog::config_path(catalog),
         format!(

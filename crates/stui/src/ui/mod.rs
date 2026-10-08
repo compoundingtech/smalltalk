@@ -17,6 +17,7 @@ pub mod doc;
 mod edit;
 mod glass;
 mod hover;
+mod hyperlinks;
 #[cfg(test)]
 #[path = "../../tests/support/terminal_tab.rs"]
 mod terminal_tab;
@@ -290,6 +291,10 @@ struct ChatState {
     editing: bool,
 }
 
+/// How long an agent's tab stays in front before its terminal attaches, on a device that opens
+/// agents on their terminal: flicking through tabs attaches nothing.
+const ATTACH_DWELL: Duration = Duration::from_millis(300);
+
 /// How long a second Ctrl+T may follow the first and leave the terminal.
 /// How many closed items Home keeps listed under "Recently closed".
 const RECENTLY_CLOSED: usize = 5;
@@ -336,6 +341,11 @@ pub struct Ui {
     /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
     /// the page before it.
     older_wanted: RefCell<BTreeSet<String>>,
+    /// This device opens an agent's tab on its terminal, not its conversation (a setting).
+    terminal_first: bool,
+    /// The agent whose tab just took the focus, and when: its terminal attaches once the tab has
+    /// stayed in front for a moment, so passing through tabs attaches nothing.
+    attach_when: Option<(String, Instant)>,
     popover: Option<String>,
     chat: Option<ChatState>,
     /// st's conversation search for the palette: the query asked and what came back.
@@ -428,6 +438,58 @@ fn link_note(target: &str) -> String {
     }
 }
 
+/// What clicking a web address did when it also opened the browser here.
+fn link_opened_note(target: &str) -> String {
+    format!("Opened {} in your browser · also copied", text::truncate(target, 60))
+}
+
+/// The program that opens a web address in the browser of the machine stui runs on, when that is
+/// where the person sits: not over SSH, and with a desktop (always on macOS). Anything but an
+/// http(s) address is only copied.
+fn browser_opener(url: &str, set: impl Fn(&str) -> bool, macos: bool) -> Option<&'static str> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return None;
+    }
+    if ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"].iter().any(|name| set(name)) {
+        return None;
+    }
+    if macos {
+        Some("open")
+    } else if set("DISPLAY") || set("WAYLAND_DISPLAY") {
+        Some("xdg-open")
+    } else {
+        None
+    }
+}
+
+/// Open `url` in the default browser here if this looks like the person's own machine. It never
+/// waits for the browser and never fails the click: the link is copied either way.
+fn open_in_browser(url: &str) -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    let set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    let Some(program) = browser_opener(url, set, cfg!(target_os = "macos")) else {
+        return false;
+    };
+    match std::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Reap it when it exits, so a click never leaves a zombie behind.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Whether `c` can be part of a written-out web address.
 fn is_address_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
@@ -477,6 +539,8 @@ impl Ui {
             acted: HashSet::new(),
             closed: HashSet::new(),
             older_wanted: RefCell::default(),
+            terminal_first: false,
+            attach_when: None,
             popover: None,
             chat: None,
             parked: Vec::new(),
@@ -632,7 +696,9 @@ impl Ui {
         if let Some(path) = prefs::path() {
             // Simplified is the default, as on the phone (Nathan, 2026-10-04); a device that
             // chose the full view keeps it.
-            self.simple = simplified(&prefs::load(&path));
+            let loaded = prefs::load(&path);
+            self.simple = simplified(&loaded);
+            self.terminal_first = loaded.terminal_first == Some(true);
         }
     }
 
@@ -644,20 +710,62 @@ impl Ui {
         }
     }
 
-    /// Every conversation simplified (a tool call to a line, a run of calls to one line) or in
-    /// full: this device's choice, remembered.
-    pub(crate) fn toggle_simple(&mut self) {
-        self.simple = !self.simple;
-        // Tests never touch the device's own choice.
+    /// Remember this device's choices. Tests never touch the device's own.
+    fn save_prefs(&self) {
         #[cfg(not(test))]
         if let Some(path) = prefs::path() {
             let _ = prefs::save(
                 &path,
                 &prefs::Prefs {
                     simple: Some(self.simple),
+                    terminal_first: Some(self.terminal_first),
                 },
             );
         }
+    }
+
+    /// Open an agent's tab on its terminal, or on its conversation (the default): this device's
+    /// choice, remembered.
+    pub(crate) fn toggle_terminal_first(&mut self) {
+        self.terminal_first = !self.terminal_first;
+        self.save_prefs();
+        self.flash(if self.terminal_first {
+            "Agents open on their terminal · the conversation is a key away (Ctrl+\\ leaves the terminal)"
+        } else {
+            "Agents open on their conversation · Ctrl+] attaches the terminal"
+        });
+    }
+
+    /// Whether this device opens agents on their terminal.
+    pub(crate) fn terminal_first(&self) -> bool {
+        self.terminal_first
+    }
+
+    /// Attach the terminal of an agent whose tab has been in front for a moment, when this device
+    /// opens agents on their terminal.
+    pub(crate) fn step_default_view(&mut self) {
+        let Some((id, at)) = &self.attach_when else {
+            return;
+        };
+        if at.elapsed() < ATTACH_DWELL {
+            return;
+        }
+        let id = id.clone();
+        self.attach_when = None;
+        let still_here = matches!(self.focused_pane(), Some(Pane::Agent(Some(ref now))) if *now == id);
+        let attached = self.terminal.as_ref().is_some_and(|view| view.agent == id)
+            || self.parked.iter().any(|view| view.agent == id);
+        if still_here && !attached && !self.editing && self.terminal_first {
+            self.attach_terminal(&id);
+        }
+    }
+
+    /// Every conversation simplified (a tool call to a line, a run of calls to one line) or in
+    /// full: this device's choice, remembered.
+    pub(crate) fn toggle_simple(&mut self) {
+        self.simple = !self.simple;
+        // Tests never touch the device's own choice.
+        self.save_prefs();
         self.flash(if self.simple {
             "Simplified: each tool call is one line, a run of them one line · ctrl+p for everything"
         } else {
@@ -5229,10 +5337,16 @@ impl Ui {
             Hit::Home if self.home_open() && !self.usage_open() => self.close_home(),
             Hit::Home => self.open_home(),
             // The terminal may be on another machine than stui (over SSH or fabric): the
-            // clipboard is the person's, so the link lands where their browser is.
+            // clipboard is the person's, so the link lands where their browser is. Run locally,
+            // the browser opens too.
             Hit::Link(url) => {
                 copy(&url);
-                self.flash(link_note(&url));
+                let opened = open_in_browser(&url);
+                self.flash(if opened {
+                    link_opened_note(&url)
+                } else {
+                    link_note(&url)
+                });
             }
             Hit::Split(right) => self.split(right),
             Hit::GlassTab(group, tab) => self.show_in(group, tab),
@@ -5288,6 +5402,13 @@ impl Ui {
                 }
             }
             Hit::Key('s') if self.glasses.is_none() => self.sidebar = !self.sidebar,
+            // "↑↓ Another" while an answer is being chosen goes to the next one, round again.
+            Hit::Key('a') if self.answering.is_some() => {
+                let count = self
+                    .structured_request()
+                    .map_or(0, |(_, request)| request.answers.len());
+                self.answering = self.answering.map(|index| (index + 1) % count.max(1));
+            }
             Hit::Key(key) => {
                 if key == 'y' {
                     if let Some(action) = self.confirm.take() {
@@ -5299,6 +5420,10 @@ impl Ui {
                 }
             }
             Hit::Enter if self.new_mission.is_some() => self.create_launch(),
+            // "Send this answer" sends the answer being chosen, not the (empty) text box.
+            Hit::Enter if self.answering.is_some() => {
+                self.answer_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
             Hit::Enter => {
                 if self.chat.is_some() {
                     self.submit_chat()
@@ -5306,6 +5431,7 @@ impl Ui {
                     self.submit()
                 }
             }
+            Hit::Escape if self.answering.is_some() => self.answering = None,
             Hit::Escape if self.new_mission.is_some() => {
                 self.new_mission = None;
                 self.close_form_tab();
@@ -6257,6 +6383,24 @@ mod tests {
     }
 
     #[test]
+    fn a_web_address_opens_the_browser_only_on_the_persons_own_machine() {
+        let none = |_: &str| false;
+        let only = |wanted: &'static str| move |name: &str| name == wanted;
+        let url = "https://example.com/a";
+        // A Mac opens it; Linux needs a desktop; SSH never does; a path or other scheme never does.
+        assert_eq!(browser_opener(url, none, true), Some("open"));
+        assert_eq!(browser_opener(url, none, false), None);
+        assert_eq!(browser_opener(url, only("DISPLAY"), false), Some("xdg-open"));
+        assert_eq!(browser_opener(url, only("WAYLAND_DISPLAY"), false), Some("xdg-open"));
+        assert_eq!(browser_opener(url, |name| name == "SSH_CONNECTION" || name == "DISPLAY", false), None);
+        assert_eq!(browser_opener(url, only("SSH_TTY"), true), None);
+        assert_eq!(browser_opener("/srv/repo/spec.md", none, true), None);
+        assert_eq!(browser_opener("file:///etc/passwd", none, true), None);
+        assert_eq!(browser_opener("javascript:alert(1)", none, true), None);
+        assert!(link_opened_note(url).contains("also copied"));
+    }
+
+    #[test]
     fn a_feedback_request_offers_words_and_a_dismissal_not_an_answer_to_choose() {
         // Nathan, 2026-10-05: "why can't I dismiss this attention item?"
         let feedback = |kind: &str, answers: Vec<st3_client::RequestAnswerOption>| {
@@ -6453,6 +6597,84 @@ mod tests {
                 if id == "attention/shipped" && answer == "read" && reason == "Read it"),
             "{:?}",
             ui.effects
+        );
+    }
+
+    #[test]
+    fn the_buttons_under_a_chosen_answer_send_it_move_on_and_put_it_away() {
+        // Nathan, 2026-10-07: "I can't choose an option for this attention item, it says I must
+        // write something": the Send button went to the empty text box.
+        let mut world = demo::world();
+        let option = |id: &str, label: &str| st3_client::RequestAnswerOption {
+            id: id.into(),
+            label: label.into(),
+            consequence: "Clears this item.".into(),
+            ..Default::default()
+        };
+        let request = st3_client::StructuredRequest {
+            version: 1,
+            entry_type: "choice".into(),
+            question: "What should change?".into(),
+            why_person: "Only you can say.".into(),
+            summary: None,
+            reasons: Vec::new(),
+            recommendation: None,
+            subjects: Vec::new(),
+            answers: vec![option("a", "Refresh"), option("b", "Shorten"), option("c", "Leave it")],
+            custom: false,
+        };
+        let item = Attention {
+            id: "attention/choose".into(),
+            tier: Tier::Stopped,
+            title: "What should change?".into(),
+            waiting: None,
+            age: "1h".into(),
+            mission: None,
+            agent: Some("agent/example/cos".into()),
+            kind: AttentionKind::Request {
+                from: "Chief of Staff".into(),
+                from_id: "agent/example/cos".into(),
+                question: request.question.clone(),
+                structured: Some(Box::new(request)),
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+            blocked: None,
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        ui.select(0);
+        ui.click(Hit::Answer(1));
+        // Another goes to the next answer, round again, and does not start over at the first.
+        ui.click(Hit::Key('a'));
+        assert_eq!(ui.answering, Some(2));
+        ui.click(Hit::Key('a'));
+        assert_eq!(ui.answering, Some(0));
+        ui.click(Hit::Key('a'));
+        ui.click(Hit::Key('a'));
+        assert_eq!(ui.answering, Some(2));
+        // Not now puts it away without sending.
+        ui.click(Hit::Escape);
+        assert_eq!(ui.answering, None);
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+        // Send this answer sends the chosen one, and never says "Write something first".
+        ui.click(Hit::Answer(2));
+        ui.click(Hit::Enter);
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, answer: Some(answer), .. }]
+                if id == "attention/choose" && answer == "c"),
+            "{:?}",
+            ui.effects
+        );
+        assert!(
+            ui.flash.as_ref().is_none_or(|(text, _)| !text.contains("Write something")),
+            "{:?}",
+            ui.flash
         );
     }
 
@@ -7123,8 +7345,8 @@ mod tests {
     #[test]
     fn conversations_are_simplified_unless_this_device_chose_the_full_view() {
         assert!(simplified(&prefs::Prefs::default()));
-        assert!(simplified(&prefs::Prefs { simple: Some(true) }));
-        assert!(!simplified(&prefs::Prefs { simple: Some(false) }));
+        assert!(simplified(&prefs::Prefs { simple: Some(true), ..Default::default() }));
+        assert!(!simplified(&prefs::Prefs { simple: Some(false), ..Default::default() }));
     }
 
     #[test]

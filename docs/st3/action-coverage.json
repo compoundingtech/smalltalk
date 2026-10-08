@@ -2470,6 +2470,14 @@
       "verification": "local palette/reducer; resulting daemon effects are listed separately"
     },
     {
+      "action": "ToggleTerminalFirst",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
+        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
       "action": "Name",
       "tests": [
         "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",

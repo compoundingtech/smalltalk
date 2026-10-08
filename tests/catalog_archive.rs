@@ -34,7 +34,7 @@ fn fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf) {
 fn st2(root: &Path, bin: &Path, args: &[&str]) -> Output {
     let home = root.parent().unwrap().join("home");
     fs::create_dir_all(&home).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["--catalog", root.to_str().unwrap()])
         .args(args)
         .env("PATH", bin)

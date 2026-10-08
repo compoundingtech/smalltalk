@@ -1,3 +1,7 @@
+#[macro_use]
+#[path = "../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -168,11 +172,11 @@ fn opaque_session_driver_materializes_without_rewriting_or_adding_launch_tasks()
 
 #[test]
 fn cli_prints_each_snapshot_without_changing_its_input() {
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/driver");
+    let fixtures = Path::new(test_env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/driver");
     for provider in ["claude", "codex", "pi", "omp"] {
         let input = fixtures.join(format!("{provider}.in.kdl"));
         let before = fs::read(&input).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+        let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args(["--catalog"])
             .arg(&fixtures)
             .args(["driver", "expand"])
@@ -283,7 +287,7 @@ fn claude_driver_uses_the_packaged_channel_without_project_mcp_state() {
 
 #[test]
 fn claude_mcp_is_canonical_and_claude_is_a_hidden_alias() {
-    let help = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let help = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["driver", "--help"])
         .output()
         .unwrap();
@@ -300,7 +304,7 @@ fn claude_mcp_is_canonical_and_claude_is_a_hidden_alias() {
     );
 
     for command in ["claude-mcp", "claude"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+        let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args(["driver", command, "--help"])
             .output()
             .unwrap();
@@ -312,7 +316,7 @@ fn claude_mcp_is_canonical_and_claude_is_a_hidden_alias() {
     }
 
     let temp = tempfile::tempdir().unwrap();
-    let old = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let old = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("--catalog")
         .arg(temp.path())
         .args(["driver", "claude", "--identity", "missing"])
@@ -321,7 +325,7 @@ fn claude_mcp_is_canonical_and_claude_is_a_hidden_alias() {
     let old_error = String::from_utf8(old.stderr).unwrap();
     assert!(old_error.contains("`st2 driver claude` is deprecated"));
 
-    let current = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let current = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("--catalog")
         .arg(temp.path())
         .args(["driver", "claude-mcp", "--identity", "missing"])
@@ -330,7 +334,7 @@ fn claude_mcp_is_canonical_and_claude_is_a_hidden_alias() {
     let current_error = String::from_utf8(current.stderr).unwrap();
     assert!(!current_error.contains("deprecated"));
 
-    let implicit = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let implicit = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .env("ST_AGENT", "missing")
         .arg("--catalog")
         .arg(temp.path())

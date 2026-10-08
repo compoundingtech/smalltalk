@@ -82,7 +82,7 @@ impl Fixture {
     /// no longer in it.
     fn spawn_supervisor_in_own_group(&self) -> Child {
         use std::os::unix::process::CommandExt;
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_st2"));
+        let mut cmd = Command::new(test_env!("CARGO_BIN_EXE_st2"));
         cmd.arg("up")
             .arg(&self.catalog)
             .args(["--host", HOST, "--interval", "60"])

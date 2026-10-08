@@ -179,6 +179,7 @@ fn missing_staged_subject_index_does_not_fence_valid_candidates() {
     let store = Store::open_memory("amber").unwrap();
     direct(&store, &bundle("unowned", false), "initial").unwrap();
     let desired = store.desired_subjects().unwrap();
+    store.owned_desired_guard(&desired[0]).unwrap();
     let before = store.owned_desired_subjects(&desired).unwrap();
     store
         .connection
@@ -291,6 +292,7 @@ fn staged_ownership_is_invisible_after_rollback_and_fences_after_commit() {
         } else {
             assert_eq!(store.index().unwrap(), index);
             assert_eq!(store.owned_desired_subjects(&desired).unwrap(), initial);
+            store.owned_desired_guard(&desired[0]).unwrap();
         }
         assert_pass_candidates_match_effect_guards(&store, &desired);
     }
@@ -342,6 +344,7 @@ fn repaired_receipt_eligibility_is_rechecked_between_passes() {
     );
     assert!(target.owned_desired_subjects(&old).unwrap().is_empty());
     assert_pass_candidates_match_effect_guards(&target, &new);
+    target.owned_desired_guard(&new[0]).unwrap();
     let record = target
         .replica_records(false)
         .unwrap()
@@ -367,6 +370,8 @@ fn repaired_receipt_eligibility_is_rechecked_between_passes() {
         )
         .unwrap();
     assert_eq!(target.owned_sets().unwrap()[0].claim, first.claim);
+    assert_eq!(target.owned_desired_guard(&new[0]).unwrap_err().code, "stale-set-member");
+    target.owned_desired_guard(&old[0]).unwrap();
     assert!(target.owned_desired_subjects(&new).unwrap().is_empty());
     assert!(
         target

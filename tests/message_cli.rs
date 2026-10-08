@@ -40,7 +40,7 @@ fn write_agent(root: &Path, identity: &str) {
 }
 
 fn list_identity(root: &Path, identity: &str, extra: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "ls", identity, "--root"])
         .arg(root)
         .args(["--host", "h"])
@@ -60,7 +60,7 @@ fn send_message(
     body: &str,
     extra: &[&str],
 ) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "send", to, "--root"])
         .arg(root)
         .args(["--host", "h", "--as", from, "-m", body])
@@ -70,7 +70,7 @@ fn send_message(
 }
 
 fn sent(root: &Path, identity: &str, extra: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "sent", identity, "--root"])
         .arg(root)
         .args(["--host", "h", "--as", identity])
@@ -86,7 +86,7 @@ fn send_rejects_empty_explicit_and_stdin_bodies_without_persisting_a_message() {
         write_agent(tmp.path(), "sender");
         write_agent(tmp.path(), "recipient");
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+        let mut command = Command::new(test_env!("CARGO_BIN_EXE_st2"));
         command
             .args(["message", "send", "recipient", "--root"])
             .arg(tmp.path())
@@ -132,7 +132,7 @@ fn event_metadata_is_exposed_by_list_and_read_json() {
     assert_eq!(listed[0]["eventId"], "run-812");
     assert_eq!(listed[0]["eventKey"], "main");
 
-    let read = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let read = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "read", "bob", filename, "--root"])
         .arg(tmp.path())
         .args(["--host", "h", "--json"])
@@ -245,7 +245,7 @@ fn replies_are_indexed_with_the_canonical_recipient_and_thread_relation() {
         .unwrap()
         .trim()
         .to_string();
-    let reply = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let reply = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "reply", &original, "--root"])
         .arg(tmp.path())
         .args([
@@ -286,7 +286,7 @@ fn keyed_reply_retry_reads_an_archived_source_and_returns_the_committed_reply() 
         .unwrap()
         .trim()
         .to_string();
-    let first = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let first = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "reply", &original, "--root"])
         .arg(tmp.path())
         .args([
@@ -316,14 +316,14 @@ fn keyed_reply_retry_reads_an_archived_source_and_returns_the_committed_reply() 
         .into_string()
         .unwrap();
 
-    let archived = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let archived = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "archive", &original, "--root"])
         .arg(tmp.path())
         .args(["--host", "h", "--as", "sender"])
         .output()
         .unwrap();
     assert!(archived.status.success());
-    let retry = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let retry = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "reply", &original, "--root"])
         .arg(tmp.path())
         .args([
@@ -371,7 +371,7 @@ fn keyed_retry_recovers_every_crash_boundary_without_false_sent_or_duplicates() 
         write_agent(tmp.path(), "sender");
         write_agent(tmp.path(), "recipient");
 
-        let failed = Command::new(env!("CARGO_BIN_EXE_st2"))
+        let failed = Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args(["message", "send", "recipient", "--root"])
             .arg(tmp.path())
             .args([
@@ -701,7 +701,7 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     let tmp = tempfile::tempdir().unwrap();
     write_agent(tmp.path(), "sender");
     write_agent(tmp.path(), "recipient");
-    let interrupted = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let interrupted = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "send", "recipient", "--root"])
         .arg(tmp.path())
         .args(["--host", "h", "--as", "sender", "-m", "original pending"])
@@ -736,7 +736,7 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     let tmp = tempfile::tempdir().unwrap();
     write_agent(tmp.path(), "sender");
     write_agent(tmp.path(), "recipient");
-    let interrupted = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let interrupted = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "send", "recipient", "--root"])
         .arg(tmp.path())
         .args(["--host", "h", "--as", "sender", "-m", "original row"])
@@ -765,7 +765,7 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     let tmp = tempfile::tempdir().unwrap();
     write_agent(tmp.path(), "sender");
     write_agent(tmp.path(), "recipient");
-    let interrupted = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let interrupted = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "send", "recipient", "--root"])
         .arg(tmp.path())
         .args(["--host", "h", "--as", "sender", "-m", "pending"])
@@ -793,7 +793,7 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     let tmp = tempfile::tempdir().unwrap();
     write_agent(tmp.path(), "sender");
     write_agent(tmp.path(), "recipient");
-    let interrupted = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let interrupted = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "send", "recipient", "--root"])
         .arg(tmp.path())
         .args(["--host", "h", "--as", "sender", "-m", "committed"])
@@ -815,7 +815,7 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     let tmp = tempfile::tempdir().unwrap();
     write_agent(tmp.path(), "sender");
     write_agent(tmp.path(), "recipient");
-    let interrupted = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let interrupted = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "send", "recipient", "--root"])
         .arg(tmp.path())
         .args([
@@ -1018,7 +1018,7 @@ fn unkeyed_retry_after_committed_response_loss_publishes_again() {
         write_agent(tmp.path(), "sender");
         write_agent(tmp.path(), "recipient");
 
-        let failed = Command::new(env!("CARGO_BIN_EXE_st2"))
+        let failed = Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args(["message", "send", "recipient", "--root"])
             .arg(tmp.path())
             .args(["--host", "h", "--as", "sender", "-m", "at least once"])
@@ -1086,7 +1086,7 @@ fn external_eval_capability_bypasses_ordinary_sent_history_at_either_endpoint() 
     fs::create_dir_all(tmp.path().join("requester/inbox")).unwrap();
 
     for (from, to) in [("sender", "requester"), ("requester", "recipient")] {
-        let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+        let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args(["message", "send", to, "--root"])
             .arg(tmp.path())
             .args(["--host", "h", "--as", from, "-m", "eval traffic"])
@@ -1260,7 +1260,7 @@ fn known_empty_native_and_catalog_less_flat_boxes_remain_valid() {
 #[test]
 fn send_routes_only_by_stable_identity_in_a_catalog_and_preserves_catalogless_bus() {
     let send = |root: &Path, recipient: &str, root_flag: &str, external: Option<&str>| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+        let mut command = Command::new(test_env!("CARGO_BIN_EXE_st2"));
         command
             .args(["message", "send", recipient, root_flag])
             .arg(root)

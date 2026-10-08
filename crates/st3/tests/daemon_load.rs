@@ -11,8 +11,10 @@
 //! performance report, the busiest of twelve five-minute windows on 2026-10-03: seats posting harness
 //! events and claims, paging their mailboxes and reading their desired state, the replication
 //! worker exporting and receiving exchanges with a peer, lease renewals, status and work reads,
-//! and a person moving through stui. Thirty seats also hold event long-polls open. Only kinds and
-//! rates; no contents.
+//! and a person moving through stui. Thirty seats also hold event long-polls open, and 22 client
+//! WebSockets subscribe to the agents roster together and stay subscribed. Only kinds and rates;
+//! no contents. Roster snapshots have a 300 ms budget, including a separate connect-to-snapshot
+//! measurement. Their HTTP correctness oracle runs afterward, not as a cache-warming pre-read.
 //!
 //! The daemon runs on its own runtime, and the load on another, so the CPU it reports is the
 //! daemon's: the process's CPU less the load threads' (and the peer store's writer, which stands
@@ -40,7 +42,7 @@ use st3::api::AppState;
 use st3::client::Client;
 use st3::model::WorkRequest;
 use st3::store::Store;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Barrier, Notify, mpsc, watch};
 
 use crate::daemon_bench::{
     FLEET, NODE, PEER, Subjects, claim_input, env_number, fleet_subjects, generated_stores,
@@ -71,6 +73,12 @@ const IN_FLIGHT_LIMIT: usize = 256;
 
 const LONG_POLL: &str = "seat event long poll";
 const SEATS: usize = 30;
+
+const ROSTER_SUBSCRIBERS: usize = 22;
+const ROSTER_LIMIT: usize = 200;
+const ROSTER_SNAPSHOT: &str = "agents roster snapshot";
+const ROSTER_CONNECT_SNAPSHOT: &str = "agents roster connect+snapshot";
+const ROSTER_BUDGET: Duration = Duration::from_millis(300);
 
 /// One kind of request, how many the busy host served each second, and its p99 budget.
 struct Load {
@@ -130,6 +138,10 @@ struct Report {
     #[serde(default)]
     long_poll_seats: usize,
     #[serde(default)]
+    roster_subscribers: usize,
+    #[serde(default)]
+    roster_change_frames: usize,
+    #[serde(default)]
     regime: String,
     #[serde(default)]
     actual_ci_checkout: Option<String>,
@@ -175,7 +187,7 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
     let seconds = env_number("ST_LOAD_SECONDS", 120_u64);
     let keep = std::env::var_os("ST_BENCH_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/st-bench"));
+        .unwrap_or_else(|| Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../../target/st-bench"));
     std::fs::create_dir_all(&keep).unwrap();
 
     let make_daemon = || {
@@ -254,6 +266,17 @@ fn report_failures(report: &Report) -> Vec<String> {
             "only {} of {SEATS} seats completed a long-poll",
             report.long_poll_seats
         ));
+    }
+    if report.roster_subscribers != ROSTER_SUBSCRIBERS {
+        failures.push(format!(
+            "only {} of {ROSTER_SUBSCRIBERS} subscribers received a correct agents snapshot",
+            report.roster_subscribers
+        ));
+    }
+    for name in [ROSTER_SNAPSHOT, ROSTER_CONNECT_SNAPSHOT] {
+        if report.paths.get(name).map_or(0, |path| path.count) != ROSTER_SUBSCRIBERS {
+            failures.push(format!("{name}: expected {ROSTER_SUBSCRIBERS} correct snapshots"));
+        }
     }
     if report.daemon_cores > CPU_BUDGET {
         failures.push(format!(
@@ -372,6 +395,57 @@ fn compare(report: &Report, baseline: &Baseline) -> Vec<String> {
         ));
     }
     failures
+}
+
+#[test]
+fn concurrent_roster_snapshots_use_the_budget_and_existing_baseline_comparison() {
+    assert_eq!(ROSTER_SUBSCRIBERS, 22);
+    assert_eq!(ROSTER_LIMIT, 200);
+    let budgets = BTreeMap::new();
+    let mut report = Report {
+        roster_subscribers: ROSTER_SUBSCRIBERS,
+        roster_change_frames: 7,
+        ..Report::default()
+    };
+    let mut baseline = Baseline {
+        report: Report::default(),
+        runs: BASELINE_RUNS,
+    };
+    for name in [ROSTER_SNAPSHOT, ROSTER_CONNECT_SNAPSHOT] {
+        assert_eq!(budget(&budgets, name), Duration::from_millis(300));
+        baseline.report.paths.insert(
+            name.into(),
+            PathReport {
+                count: ROSTER_SUBSCRIBERS,
+                p99_ms: 100.0,
+                ..PathReport::default()
+            },
+        );
+        report.paths.insert(
+            name.into(),
+            PathReport {
+                count: ROSTER_SUBSCRIBERS,
+                p99_ms: 200.0,
+                budget_ms: ROSTER_BUDGET.as_secs_f64() * 1_000.0,
+                ..PathReport::default()
+            },
+        );
+    }
+    let failures = compare(&report, &baseline);
+    assert_eq!(failures.len(), 2);
+    for name in [ROSTER_SNAPSHOT, ROSTER_CONNECT_SNAPSHOT] {
+        assert!(failures.iter().any(|failure| failure.starts_with(name)));
+    }
+    let encoded = serde_json::to_value(&report).unwrap();
+    let decoded: Report = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(decoded.roster_subscribers, ROSTER_SUBSCRIBERS);
+    assert_eq!(decoded.roster_change_frames, 7);
+    let mut legacy = encoded;
+    legacy.as_object_mut().unwrap().remove("roster_subscribers");
+    legacy.as_object_mut().unwrap().remove("roster_change_frames");
+    let decoded: Report = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.roster_subscribers, 0);
+    assert_eq!(decoded.roster_change_frames, 0);
 }
 
 #[test]
@@ -522,6 +596,10 @@ fn print(report: &Report) {
     println!(
         "\n== load test: scale {}, {} claims, {:.0}s, daemon {:.2} cores",
         report.scale, report.claims, report.seconds, report.daemon_cores
+    );
+    println!(
+        "agents roster: {}/{} concurrent subscribers with correct snapshots; {} validated change frames; window limit {}",
+        report.roster_subscribers, ROSTER_SUBSCRIBERS, report.roster_change_frames, ROSTER_LIMIT
     );
     println!(
         "{:<28} {:>7} {:>8} {:>8} {:>8} {:>8}",
@@ -843,6 +921,8 @@ fn run(
     let in_flight = Arc::new(AtomicUsize::new(0));
     let running = Arc::new(AtomicBool::new(true));
     let long_poll_seats = Arc::new(AtomicUsize::new(0));
+    let mut roster_subscribers = 0;
+    let roster_change_frames = Arc::new(AtomicUsize::new(0));
     let migration_pending_at_load_start = context.store.event_payload_migration_pending().unwrap();
     if matches!(regime, LoadRegime::Steady) {
         assert!(!migration_pending_at_load_start);
@@ -853,6 +933,8 @@ fn run(
     load.block_on(async {
         let mut tasks = Vec::new();
         let mut polls = Vec::new();
+        let (roster_stop, stopped) = watch::channel(false);
+        let (initial_done, initial_ready) = watch::channel(false);
         for (index, kind) in MIX.iter().enumerate() {
             let (context, timings, failed, in_flight, running) = (
                 context.clone(),
@@ -861,7 +943,13 @@ fn run(
                 in_flight.clone(),
                 running.clone(),
             );
+            let mut initial_ready = initial_ready.clone();
             tasks.push(tokio::spawn(async move {
+                // The first person read must not warm the shared roster before the simultaneous
+                // snapshots. The rest of the fleet's writes and reads run throughout.
+                if kind.name == "person read" {
+                    let _ = initial_ready.changed().await;
+                }
                 let period = Duration::from_secs_f64(1.0 / kind.per_second);
                 // Spread the kinds' first requests over their periods.
                 tokio::time::sleep(period.mul_f64((index as f64 * 0.37) % 1.0)).await;
@@ -970,13 +1058,97 @@ fn run(
                 }
             }));
         }
-        tokio::time::sleep(duration).await;
+        let barrier = Arc::new(Barrier::new(ROSTER_SUBSCRIBERS));
+        let (snapshots, mut initial) = mpsc::channel(ROSTER_SUBSCRIBERS);
+        let mut subscribers = Vec::new();
+        for subscriber in 0..ROSTER_SUBSCRIBERS {
+            let client = st3_client::Client::unix_as(&socket, "person/bench-operator");
+            let (barrier, stopped, snapshots, failed, changes) = (
+                barrier.clone(),
+                stopped.clone(),
+                snapshots.clone(),
+                failed.clone(),
+                roster_change_frames.clone(),
+            );
+            subscribers.push(tokio::spawn(async move {
+                if let Err(error) = roster_subscriber(
+                    client, subscriber, barrier, stopped, snapshots, changes,
+                )
+                .await
+                {
+                    *failed
+                        .lock()
+                        .unwrap()
+                        .entry(format!("{ROSTER_SNAPSHOT}: subscriber {subscriber}: {error}"))
+                        .or_default() += 1;
+                }
+            }));
+        }
+        drop(snapshots);
+        let mut captured = Vec::with_capacity(ROSTER_SUBSCRIBERS);
+        while let Some(snapshot) = initial.recv().await {
+            captured.push(snapshot);
+        }
+        // Capture every initial frame before reading the oracle: HTTP and WS share the roster
+        // projection. Compare stable membership/declaration fields, not concurrently changing
+        // activity, usage, lease or presence fields.
+        let oracle = context
+            .person
+            .get::<Value>(&format!("/v1/client/agents?limit={ROSTER_LIMIT}"))
+            .await
+            .map_err(|error| error.to_string());
+        for name in [ROSTER_SNAPSHOT, ROSTER_CONNECT_SNAPSHOT] {
+            timings.lock().unwrap().entry(name.into()).or_default();
+        }
+        match oracle {
+            Ok(oracle) => {
+                for snapshot in captured {
+                    match roster_matches_oracle(&snapshot.frame, &oracle) {
+                        Ok(()) => {
+                            roster_subscribers += 1;
+                            let mut timings = timings.lock().unwrap();
+                            timings.get_mut(ROSTER_SNAPSHOT).unwrap().push(snapshot.subscription);
+                            timings
+                                .get_mut(ROSTER_CONNECT_SNAPSHOT)
+                                .unwrap()
+                                .push(snapshot.connection);
+                        }
+                        Err(error) => {
+                            *failed
+                                .lock()
+                                .unwrap()
+                                .entry(format!("{ROSTER_SNAPSHOT}: {error}"))
+                                .or_default() += 1;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                *failed
+                    .lock()
+                    .unwrap()
+                    .entry(format!("{ROSTER_SNAPSHOT}: HTTP oracle: {error}"))
+                    .or_default() += 1;
+            }
+        }
+        initial_done.send_replace(true);
+        tokio::time::sleep_until(tokio::time::Instant::from_std(started + duration)).await;
         running.store(false, Ordering::Relaxed);
         // Cancelling outstanding quiet waits keeps their deliberate timeout outside the CPU
         // drain window. Otherwise up to 30 idle seconds would dilute the daemon's average CPU.
         for poll in polls {
             poll.abort();
             let _ = poll.await;
+        }
+        roster_stop.send_replace(true);
+        for subscriber in subscribers {
+            if let Err(error) = subscriber.await {
+                *failed
+                    .lock()
+                    .unwrap()
+                    .entry(format!("{ROSTER_SNAPSHOT}: subscriber task: {error}"))
+                    .or_default() += 1;
+            }
         }
         for task in tasks {
             let _ = task.await;
@@ -1030,6 +1202,8 @@ fn run(
         seconds: elapsed,
         daemon_cores: daemon_cpu / elapsed,
         long_poll_seats: long_poll_seats.load(Ordering::Relaxed),
+        roster_subscribers,
+        roster_change_frames: roster_change_frames.load(Ordering::Relaxed),
         regime: regime.name().into(),
         actual_ci_checkout: std::env::var("GITHUB_SHA").ok(),
         event_migration,
@@ -1040,6 +1214,233 @@ fn run(
         paths,
         failed,
     }
+}
+
+struct RosterSnapshot {
+    frame: Value,
+    subscription: Duration,
+    connection: Duration,
+}
+
+async fn roster_subscriber(
+    client: st3_client::Client,
+    subscriber: usize,
+    barrier: Arc<Barrier>,
+    mut stopped: watch::Receiver<bool>,
+    snapshots: mpsc::Sender<RosterSnapshot>,
+    changes: Arc<AtomicUsize>,
+) -> Result<(), String> {
+    // Start handshakes together, then send subscriptions together once every handshake has
+    // completed (or failed). Even a failed connector reaches the second barrier.
+    barrier.wait().await;
+    let connection = Instant::now();
+    let opened = tokio::time::timeout(Duration::from_secs(30), client.collection_stream()).await;
+    barrier.wait().await;
+    let mut stream = opened
+        .map_err(|_| "WebSocket handshake timed out".to_owned())?
+        .map_err(|error| error.to_string())?;
+    let id = format!("load-roster-{subscriber}");
+    let outcome = async {
+        let subscription = Instant::now();
+        let frame = tokio::time::timeout(Duration::from_secs(30), async {
+            stream
+                .subscribe(&id, "agents", ROSTER_LIMIT, None, None)
+                .await
+                .map_err(|error| error.to_string())?;
+            stream
+                .next()
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "WebSocket closed before its snapshot".to_owned())
+        })
+        .await
+        .map_err(|_| "initial snapshot timed out".to_owned())??;
+        let mut rows = BTreeSet::new();
+        let mut index = apply_roster_frame(&frame, &id, true, &mut rows)?;
+        snapshots
+            .send(RosterSnapshot {
+                frame,
+                subscription: subscription.elapsed(),
+                connection: connection.elapsed(),
+            })
+            .await
+            .map_err(|_| "snapshot collector stopped".to_owned())?;
+        // The collector can now finish without waiting for the held subscriptions to close.
+        drop(snapshots);
+        loop {
+            tokio::select! {
+                result = stopped.changed() => {
+                    result.map_err(|_| "shutdown signal disappeared".to_owned())?;
+                    if *stopped.borrow() {
+                        break;
+                    }
+                }
+                frame = stream.next() => {
+                    let frame = frame
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "WebSocket closed during the workload".to_owned())?;
+                    let next = apply_roster_frame(&frame, &id, false, &mut rows)?;
+                    if next < index {
+                        return Err("roster snapshot index moved backward".into());
+                    }
+                    index = next;
+                    changes.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), stream.close())
+        .await
+        .map_err(|_| "WebSocket close timed out".to_owned())?;
+    outcome
+}
+
+/// Validate real agent cards, not just any frame that happened to answer the subscription.
+fn roster_row_ids(items: &Value) -> Result<BTreeSet<String>, String> {
+    let items = items
+        .as_array()
+        .ok_or_else(|| "roster rows are not an array".to_owned())?;
+    let mut ids = BTreeSet::new();
+    for item in items {
+        let agent = <st3_client::Agent as serde::Deserialize>::deserialize(item)
+            .map_err(|error| format!("invalid agent card: {error}"))?;
+        if item["kind"] != "agent" || !agent.header.id.starts_with("agent/") || agent.name.is_empty() {
+            return Err("roster row is not a named agent".into());
+        }
+        if !ids.insert(agent.header.id) {
+            return Err("roster contains duplicate agent rows".into());
+        }
+    }
+    Ok(ids)
+}
+
+/// Reconstruct each subscriber's window as changes arrive; invalid removals/order are failures.
+fn apply_roster_frame(
+    frame: &Value,
+    id: &str,
+    initial: bool,
+    rows: &mut BTreeSet<String>,
+) -> Result<u64, String> {
+    let kind = if initial { "snapshot" } else { "changes" };
+    if frame["kind"] != kind || frame["id"] != id || frame["collection"] != "agents" {
+        return Err(format!("expected agents {kind} for {id}, received {frame}"));
+    }
+    let snapshot = <st3_client::Snapshot as serde::Deserialize>::deserialize(&frame["snapshot"])
+        .map_err(|error| format!("invalid roster snapshot fence: {error}"))?;
+    if frame["has_more"].as_bool().is_none() {
+        return Err("roster has no pagination flag".into());
+    }
+    let order: Vec<String> =
+        <Vec<String> as serde::Deserialize>::deserialize(&frame["order"])
+            .map_err(|error| format!("invalid roster order: {error}"))?;
+    let ordered = order.iter().cloned().collect::<BTreeSet<_>>();
+    if order.len() > ROSTER_LIMIT || ordered.len() != order.len() {
+        return Err("roster order exceeds its window or contains duplicates".into());
+    }
+    if initial {
+        *rows = roster_row_ids(&frame["items"])?;
+        if rows.is_empty() {
+            return Err("the generated roster snapshot is empty".into());
+        }
+        let item_order = frame["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        if item_order.iter().copied().ne(order.iter().map(String::as_str)) {
+            return Err("snapshot rows disagree with their order".into());
+        }
+    } else {
+        let removes = <Vec<String> as serde::Deserialize>::deserialize(&frame["removes"])
+            .map_err(|error| format!("invalid roster removals: {error}"))?;
+        for removed in removes {
+            if !rows.remove(&removed) {
+                return Err("roster removed an agent outside its previous window".into());
+            }
+        }
+        rows.extend(roster_row_ids(&frame["upserts"])?);
+    }
+    if *rows != ordered {
+        return Err("roster rows disagree with their reconstructed window".into());
+    }
+    Ok(snapshot.store_index)
+}
+
+fn roster_matches_oracle(frame: &Value, oracle: &Value) -> Result<(), String> {
+    let expected = roster_row_ids(&oracle["items"])?;
+    let actual = roster_row_ids(&frame["items"])?;
+    if expected.is_empty()
+        || expected != actual
+        || oracle["page"]["has_more"].as_bool().is_none()
+        || frame["has_more"] != oracle["page"]["has_more"]
+    {
+        return Err("snapshot membership/pagination differs from the HTTP roster".into());
+    }
+    for (row, reference) in frame["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(oracle["items"].as_array().unwrap())
+    {
+        for field in ["kind", "id", "name", "host_id", "workspace"] {
+            if row[field] != reference[field] {
+                return Err(format!("snapshot {field}/order differs from the HTTP roster"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn roster_frames_require_correct_cards_membership_and_snapshot_before_changes() {
+    let card = json!({
+        "kind": "agent", "id": "agent/bench/seat-0", "name": "seat-0",
+        "revision": "revision/load", "updated_at": "2026-10-01T00:00:00Z",
+        "state": "running", "reachability": "reachable", "host_id": "host/bench",
+        "last_activity_at": null, "silent_since": null, "workspace": "/work/bench"
+    });
+    let frame = json!({
+        "kind": "snapshot", "id": "load-roster-0", "collection": "agents",
+        "snapshot": {
+            "id": "snapshot/load", "host_id": "host/bench", "store_index": 1,
+            "projection_version": "client-projection.v0", "created_at": "2026-10-01T00:00:00Z"
+        },
+        "items": [card], "order": ["agent/bench/seat-0"], "has_more": false
+    });
+    let oracle = json!({"items": frame["items"], "page": {"has_more": false}});
+    let mut rows = BTreeSet::new();
+    assert_eq!(apply_roster_frame(&frame, "load-roster-0", true, &mut rows).unwrap(), 1);
+    assert!(roster_matches_oracle(&frame, &oracle).is_ok());
+    assert!(apply_roster_frame(&frame, "load-roster-0", false, &mut rows).is_err());
+    for (field, value) in [
+        ("kind", json!("resync")),
+        ("id", json!("another-subscription")),
+        ("collection", json!("missions")),
+        ("items", json!([])),
+        ("order", json!([])),
+    ] {
+        let mut invalid = frame.clone();
+        invalid[field] = value;
+        assert!(apply_roster_frame(&invalid, "load-roster-0", true, &mut BTreeSet::new()).is_err());
+    }
+    let mut invalid = frame.clone();
+    invalid["items"][0]["kind"] = json!("work");
+    assert!(apply_roster_frame(&invalid, "load-roster-0", true, &mut BTreeSet::new()).is_err());
+    let mut renamed = frame.clone();
+    renamed["items"][0]["name"] = json!("wrong seat");
+    assert!(roster_matches_oracle(&renamed, &oracle).is_err());
+    let mut change = json!({
+        "kind": "changes", "id": "load-roster-0", "collection": "agents",
+        "snapshot": frame["snapshot"], "upserts": [], "removes": ["agent/bench/seat-0"],
+        "order": [], "has_more": false
+    });
+    assert!(apply_roster_frame(&change, "load-roster-0", false, &mut rows).is_ok());
+    assert!(rows.is_empty());
+    change["removes"] = json!(["agent/bench/not-in-window"]);
+    assert!(apply_roster_frame(&change, "load-roster-0", false, &mut rows).is_err());
 }
 
 /// One request of the kind `name`, and the name to record it under when that is more exact.
@@ -1204,6 +1605,9 @@ fn budget(budgets: &BTreeMap<&str, Duration>, name: &str) -> Duration {
     // A successful quiet poll intentionally waits 30 seconds before answering.
     if name == LONG_POLL {
         return Duration::from_secs(31);
+    }
+    if matches!(name, ROSTER_SNAPSHOT | ROSTER_CONNECT_SNAPSHOT) {
+        return ROSTER_BUDGET;
     }
     if let Some(route) = name.strip_prefix("person read ") {
         let budget = PERSON_READS

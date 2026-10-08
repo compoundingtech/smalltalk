@@ -53,7 +53,7 @@ impl Seat {
 
         let bin = tmp.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
-        symlink(env!("CARGO_BIN_EXE_st2"), bin.join("st2")).unwrap();
+        symlink(test_env!("CARGO_BIN_EXE_st2"), bin.join("st2")).unwrap();
 
         let home = tmp.path().join("home");
         fs::create_dir_all(home.join(".claude")).unwrap();
@@ -101,7 +101,7 @@ impl Seat {
     }
 
     fn tee_as(&self, identity: &str, overrides: &[(&str, &str)]) -> Output {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/st-drivers/hooks/claude-statusline.sh");
+        let script = Path::new(test_env!("CARGO_MANIFEST_DIR")).join("crates/st-drivers/hooks/claude-statusline.sh");
         let path = format!(
             "{}:{}",
             self.bin.display(),
@@ -375,7 +375,7 @@ fn without_st2_on_path_the_script_drains_stdin_and_renders_nothing() {
     // seconds. The PATH keeps the shell's own utilities and drops only `st2`, which is the shape
     // of that failure; a PATH with nothing on it would be testing the harness, not the tee.
     let path = which_dirs(&["bash", "cat"]);
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/st-drivers/hooks/claude-statusline.sh");
+    let script = Path::new(test_env!("CARGO_MANIFEST_DIR")).join("crates/st-drivers/hooks/claude-statusline.sh");
     assert!(
         which("st2", &path).is_none(),
         "the fallback PATH must not carry an st2"

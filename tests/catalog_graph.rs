@@ -12,7 +12,7 @@ fn write(root: &Path, relative: &str, body: &str) {
 fn st2(root: &Path, args: &[&str], pty_root: Option<&Path>) -> Output {
     let home = root.join("home");
     fs::create_dir_all(&home).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+    let mut command = Command::new(test_env!("CARGO_BIN_EXE_st2"));
     command
         .args(["--catalog", root.to_str().unwrap()])
         .args(args)

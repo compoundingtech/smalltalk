@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Avoid a redundant canonical-key query for every named sparse harness observation when building native agent cards. Keys are resolved only for merging unnamed legacy observations or comparing a work overlay. A regression guard keeps SQL statement count constant as named sparse history grows; production latency acceptance remains separately measured.",
+  "replay": { "status": "none", "detail": "No replay or backfill is required." },
+  "schema": { "status": "none", "detail": "No tables, indexes or triggers change." },
+  "rules": { "status": "none", "detail": "Canonical order, runtime eligibility, sparse optional-field retention, explicit null clearing and work-overlay precedence remain unchanged." },
+  "compatibility": { "status": "none", "detail": "The native card and status contracts and source fingerprints remain unchanged. This also applies when the agent collection view is disabled." },
+  "downtime": { "status": "none", "detail": "No data migration or special downtime is required." },
+  "manual": { "status": "none", "detail": "No new operator action is required." },
+  "recovery": { "status": "none", "detail": "Historical cuts and existing authority, repair and source-availability fences remain unchanged." }
+}

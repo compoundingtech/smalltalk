@@ -1,0 +1,1325 @@
+[
+  {
+    "id": "timeline-entry/omp-100",
+    "sequence": 100,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:00.000Z",
+    "role": "system",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "Invented text 1",
+      "attachment_id": null,
+      "blocks": [
+        {
+          "id": "omp-100/example-0002",
+          "kind": "text",
+          "source_type": "content",
+          "payload": {
+            "body_ref": true
+          }
+        },
+        {
+          "id": "omp-100/example-0003",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "custom_message",
+              "customType": "async-result",
+              "content": "Invented content 2",
+              "display": true,
+              "details": {
+                "jobs": [
+                  {
+                    "jobId": "Invented jobId 3",
+                    "type": "bash",
+                    "label": "Invented label 4",
+                    "durationMs": 280007
+                  }
+                ]
+              },
+              "attribution": "Invented attribution 5",
+              "id": "example-0004",
+              "parentId": "example-0005",
+              "timestamp": "2026-10-07T21:28:07.525Z"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-101",
+    "sequence": 101,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:01.000Z",
+    "role": "system",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "[unrecognized omp entry `custom`]\n{\"raw\":{\"type\":\"custom\",\"customType\":\"tool_execution_start\",\"data\":{\"toolCallId\":\"example-0008\",\"toolName\":\"hub\",\"startedAt\":\"2026-10-07T21:28:09.860Z\",\"intent\":\"Invented intent 7\"},\"id\":\"example-0009\",\"parentId\":\"example-0004\",\"timestamp\":\"2026-10-07T21:28:09.860Z\"}}",
+      "attachment_id": null,
+      "blocks": [
+        {
+          "id": "omp-101/example-0007",
+          "kind": "unknown",
+          "source_type": "custom",
+          "payload": {
+            "raw": {
+              "type": "custom",
+              "customType": "tool_execution_start",
+              "data": {
+                "toolCallId": "example-0008",
+                "toolName": "hub",
+                "startedAt": "2026-10-07T21:28:09.860Z",
+                "intent": "Invented intent 7"
+              },
+              "id": "example-0009",
+              "parentId": "example-0004",
+              "timestamp": "2026-10-07T21:28:09.860Z"
+            }
+          }
+        },
+        {
+          "id": "omp-101/example-0010",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "custom",
+              "customType": "tool_execution_start",
+              "data": {
+                "toolCallId": "example-0008",
+                "toolName": "hub",
+                "startedAt": "2026-10-07T21:28:09.860Z",
+                "intent": "Invented intent 8"
+              },
+              "id": "example-0009",
+              "parentId": "example-0004",
+              "timestamp": "2026-10-07T21:28:09.860Z"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-102",
+    "sequence": 102,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:02.000Z",
+    "role": "assistant",
+    "final": true,
+    "type": "message",
+    "body": {
+      "message_id": "example-0012",
+      "reply_to": null,
+      "from": null,
+      "to": null,
+      "title": null,
+      "blocks": [
+        {
+          "id": "omp-102/example-0013",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "message",
+              "id": "example-0012",
+              "parentId": "example-0009",
+              "timestamp": "2026-10-07T21:28:09.861Z",
+              "message": {
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "toolCall",
+                    "id": "example-0008",
+                    "name": "hub",
+                    "arguments": {
+                      "op": "Invented op 9",
+                      "ids": [
+                        "Invented ids 10"
+                      ],
+                      "timeout": 600,
+                      "i": "Invented i 11"
+                    },
+                    "intent": "Invented intent 12"
+                  }
+                ],
+                "api": "anthropic-messages",
+                "provider": "anthropic",
+                "model": "claude-sonnet-5-5",
+                "usage": {
+                  "input": 4,
+                  "output": 130,
+                  "cacheRead": 88574,
+                  "cacheWrite": 272,
+                  "totalTokens": 88980,
+                  "cost": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "total": 0
+                  },
+                  "cttl": {
+                    "ephemeral5m": 272
+                  }
+                },
+                "stopReason": "toolUse",
+                "timestamp": 1791408487531,
+                "responseId": "example-0014",
+                "duration": 2308.4468689999776,
+                "ttft": 1650.3714240000118,
+                "completedAt": 1791408489859,
+                "contextSnapshot": {
+                  "promptTokens": 88850,
+                  "nonMessageTokens": 25429,
+                  "compactionEpoch": 0
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-103",
+    "sequence": 103,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:03.000Z",
+    "role": "assistant",
+    "final": true,
+    "type": "tool_call",
+    "body": {
+      "call_id": "example-0008",
+      "name": "hub",
+      "arguments": {
+        "op": "Invented op 13",
+        "ids": [
+          "Invented ids 14"
+        ],
+        "timeout": 600,
+        "i": "Invented i 15"
+      },
+      "blocks": [
+        {
+          "id": "omp-103/example-0016",
+          "kind": "tool_call",
+          "source_type": "tool_call",
+          "payload": {
+            "body_ref": true
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-104",
+    "sequence": 104,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:04.000Z",
+    "role": "tool",
+    "final": true,
+    "type": "message",
+    "body": {
+      "message_id": "example-0018",
+      "reply_to": null,
+      "from": null,
+      "to": null,
+      "title": null,
+      "blocks": [
+        {
+          "id": "omp-104/example-0019",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "message",
+              "id": "example-0018",
+              "parentId": "example-0012",
+              "timestamp": "2026-10-07T21:28:19.861Z",
+              "message": {
+                "role": "toolResult",
+                "toolCallId": "example-0008",
+                "toolName": "hub",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Invented text 16"
+                  }
+                ],
+                "details": {
+                  "op": "Invented op 17",
+                  "jobs": [
+                    {
+                      "id": "example-0020",
+                      "type": "bash",
+                      "status": "running",
+                      "label": "Invented label 18",
+                      "durationMs": 89385
+                    }
+                  ]
+                },
+                "isError": false,
+                "useless": true,
+                "timestamp": 1791408499860,
+                "prunedAt": 1791408676964
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-105",
+    "sequence": 105,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:05.000Z",
+    "role": "tool",
+    "final": true,
+    "type": "tool_result",
+    "body": {
+      "call_id": "example-0008",
+      "status": "success",
+      "media_type": "application/json",
+      "content": [
+        {
+          "type": "text",
+          "text": "Invented text 19"
+        }
+      ],
+      "blocks": [
+        {
+          "id": "omp-105/example-0022",
+          "kind": "tool_output",
+          "source_type": "tool_result",
+          "metadata": {
+            "op": "Invented op 20",
+            "jobs": [
+              {
+                "id": "example-0020",
+                "type": "bash",
+                "status": "running",
+                "label": "Invented label 21",
+                "durationMs": 89385
+              }
+            ]
+          },
+          "payload": {
+            "body_ref": true
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-106",
+    "sequence": 106,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:06.000Z",
+    "role": "system",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "[unrecognized omp entry `custom`]\n{\"raw\":{\"type\":\"custom\",\"customType\":\"tool_execution_start\",\"data\":{\"toolCallId\":\"example-0025\",\"toolName\":\"bash\",\"startedAt\":\"2026-10-07T21:28:22.200Z\",\"args\":{\"command\":\"Invented command 23\"},\"intent\":\"Invented intent 24\"},\"id\":\"example-0026\",\"parentId\":\"example-0018\",\"timestamp\":\"2026-10-07T21:28:22.200Z\"}}",
+      "attachment_id": null,
+      "blocks": [
+        {
+          "id": "omp-106/example-0024",
+          "kind": "unknown",
+          "source_type": "custom",
+          "payload": {
+            "raw": {
+              "type": "custom",
+              "customType": "tool_execution_start",
+              "data": {
+                "toolCallId": "example-0025",
+                "toolName": "bash",
+                "startedAt": "2026-10-07T21:28:22.200Z",
+                "args": {
+                  "command": "Invented command 23"
+                },
+                "intent": "Invented intent 24"
+              },
+              "id": "example-0026",
+              "parentId": "example-0018",
+              "timestamp": "2026-10-07T21:28:22.200Z"
+            }
+          }
+        },
+        {
+          "id": "omp-106/example-0027",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "custom",
+              "customType": "tool_execution_start",
+              "data": {
+                "toolCallId": "example-0025",
+                "toolName": "bash",
+                "startedAt": "2026-10-07T21:28:22.200Z",
+                "args": {
+                  "command": "Invented command 25"
+                },
+                "intent": "Invented intent 26"
+              },
+              "id": "example-0026",
+              "parentId": "example-0018",
+              "timestamp": "2026-10-07T21:28:22.200Z"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-107",
+    "sequence": 107,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:07.000Z",
+    "role": "assistant",
+    "final": true,
+    "type": "message",
+    "body": {
+      "message_id": "example-0029",
+      "reply_to": null,
+      "from": null,
+      "to": null,
+      "title": null,
+      "blocks": [
+        {
+          "id": "omp-107/example-0030",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "message",
+              "id": "example-0029",
+              "parentId": "example-0026",
+              "timestamp": "2026-10-07T21:28:22.200Z",
+              "message": {
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "toolCall",
+                    "id": "example-0025",
+                    "name": "bash",
+                    "arguments": {
+                      "command": "Invented command 27",
+                      "i": "Invented i 28",
+                      "timeout": 300
+                    },
+                    "intent": "Invented intent 29"
+                  }
+                ],
+                "api": "anthropic-messages",
+                "provider": "anthropic",
+                "model": "claude-sonnet-5-5",
+                "usage": {
+                  "input": 2,
+                  "output": 135,
+                  "cacheRead": 88846,
+                  "cacheWrite": 222,
+                  "totalTokens": 89205,
+                  "cost": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "total": 0
+                  },
+                  "cttl": {
+                    "ephemeral5m": 222
+                  }
+                },
+                "stopReason": "toolUse",
+                "timestamp": 1791408499888,
+                "responseId": "example-0031",
+                "duration": 2294.8282690000487,
+                "ttft": 1557.662852000096,
+                "completedAt": 1791408502199,
+                "contextSnapshot": {
+                  "promptTokens": 89070,
+                  "nonMessageTokens": 25429,
+                  "compactionEpoch": 0
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-108",
+    "sequence": 108,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:08.000Z",
+    "role": "assistant",
+    "final": true,
+    "type": "tool_call",
+    "body": {
+      "call_id": "example-0025",
+      "name": "bash",
+      "arguments": {
+        "command": "Invented command 30",
+        "i": "Invented i 31",
+        "timeout": 300
+      },
+      "blocks": [
+        {
+          "id": "omp-108/example-0033",
+          "kind": "tool_call",
+          "source_type": "tool_call",
+          "payload": {
+            "body_ref": true
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-109",
+    "sequence": 109,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:09.000Z",
+    "role": "tool",
+    "final": true,
+    "type": "message",
+    "body": {
+      "message_id": "example-0035",
+      "reply_to": null,
+      "from": null,
+      "to": null,
+      "title": null,
+      "blocks": [
+        {
+          "id": "omp-109/example-0036",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "message",
+              "id": "example-0035",
+              "parentId": "example-0029",
+              "timestamp": "2026-10-07T21:29:22.202Z",
+              "message": {
+                "role": "toolResult",
+                "toolCallId": "example-0025",
+                "toolName": "bash",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Invented text 32"
+                  }
+                ],
+                "details": {
+                  "async": {
+                    "state": "Invented state 33",
+                    "jobId": "Invented jobId 34",
+                    "type": "bash"
+                  },
+                  "timeoutSeconds": 300
+                },
+                "isError": false,
+                "timestamp": 1791408562201
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-110",
+    "sequence": 110,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:10.000Z",
+    "role": "tool",
+    "final": true,
+    "type": "tool_result",
+    "body": {
+      "call_id": "example-0025",
+      "status": "success",
+      "media_type": "application/json",
+      "content": [
+        {
+          "type": "text",
+          "text": "Invented text 35"
+        }
+      ],
+      "blocks": [
+        {
+          "id": "omp-110/example-0038",
+          "kind": "tool_output",
+          "source_type": "tool_result",
+          "metadata": {
+            "async": {
+              "state": "Invented state 36",
+              "jobId": "Invented jobId 37",
+              "type": "bash"
+            },
+            "timeoutSeconds": 300
+          },
+          "payload": {
+            "body_ref": true
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-111",
+    "sequence": 111,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:11.000Z",
+    "role": "system",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "Invented text 38",
+      "attachment_id": null,
+      "blocks": [
+        {
+          "id": "omp-111/example-0040",
+          "kind": "text",
+          "source_type": "content",
+          "payload": {
+            "body_ref": true
+          }
+        },
+        {
+          "id": "omp-111/example-0041",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "custom_message",
+              "customType": "async-result",
+              "content": "Invented content 39",
+              "display": true,
+              "details": {
+                "jobs": [
+                  {
+                    "jobId": "Invented jobId 40",
+                    "type": "bash",
+                    "label": "Invented label 41",
+                    "durationMs": 200009
+                  }
+                ]
+              },
+              "attribution": "Invented attribution 42",
+              "id": "example-0042",
+              "parentId": "example-0035",
+              "timestamp": "2026-10-07T21:29:22.223Z"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-112",
+    "sequence": 112,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:12.000Z",
+    "role": "system",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "[unrecognized omp entry `custom`]\n{\"raw\":{\"type\":\"custom\",\"customType\":\"tool_execution_start\",\"data\":{\"toolCallId\":\"example-0045\",\"toolName\":\"hub\",\"startedAt\":\"2026-10-07T21:29:24.479Z\",\"intent\":\"Invented intent 44\"},\"id\":\"example-0046\",\"parentId\":\"example-0042\",\"timestamp\":\"2026-10-07T21:29:24.479Z\"}}",
+      "attachment_id": null,
+      "blocks": [
+        {
+          "id": "omp-112/example-0044",
+          "kind": "unknown",
+          "source_type": "custom",
+          "payload": {
+            "raw": {
+              "type": "custom",
+              "customType": "tool_execution_start",
+              "data": {
+                "toolCallId": "example-0045",
+                "toolName": "hub",
+                "startedAt": "2026-10-07T21:29:24.479Z",
+                "intent": "Invented intent 44"
+              },
+              "id": "example-0046",
+              "parentId": "example-0042",
+              "timestamp": "2026-10-07T21:29:24.479Z"
+            }
+          }
+        },
+        {
+          "id": "omp-112/example-0047",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "custom",
+              "customType": "tool_execution_start",
+              "data": {
+                "toolCallId": "example-0045",
+                "toolName": "hub",
+                "startedAt": "2026-10-07T21:29:24.479Z",
+                "intent": "Invented intent 45"
+              },
+              "id": "example-0046",
+              "parentId": "example-0042",
+              "timestamp": "2026-10-07T21:29:24.479Z"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-113",
+    "sequence": 113,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:13.000Z",
+    "role": "assistant",
+    "final": true,
+    "type": "message",
+    "body": {
+      "message_id": "example-0049",
+      "reply_to": null,
+      "from": null,
+      "to": null,
+      "title": null,
+      "blocks": [
+        {
+          "id": "omp-113/example-0050",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "message",
+              "id": "example-0049",
+              "parentId": "example-0046",
+              "timestamp": "2026-10-07T21:29:24.480Z",
+              "message": {
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "toolCall",
+                    "id": "example-0045",
+                    "name": "hub",
+                    "arguments": {
+                      "op": "Invented op 46",
+                      "ids": [
+                        "Invented ids 47"
+                      ],
+                      "timeout": 600,
+                      "i": "Invented i 48"
+                    },
+                    "intent": "Invented intent 49"
+                  }
+                ],
+                "api": "anthropic-messages",
+                "provider": "anthropic",
+                "model": "claude-sonnet-5-5",
+                "usage": {
+                  "input": 4,
+                  "output": 130,
+                  "cacheRead": 89068,
+                  "cacheWrite": 516,
+                  "totalTokens": 89718,
+                  "cost": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "total": 0
+                  },
+                  "cttl": {
+                    "ephemeral5m": 516
+                  }
+                },
+                "stopReason": "toolUse",
+                "timestamp": 1791408562230,
+                "responseId": "example-0051",
+                "duration": 2228.732307999977,
+                "ttft": 1572.1977649999317,
+                "completedAt": 1791408564478,
+                "contextSnapshot": {
+                  "promptTokens": 89588,
+                  "nonMessageTokens": 25429,
+                  "compactionEpoch": 0
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-114",
+    "sequence": 114,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:14.000Z",
+    "role": "assistant",
+    "final": true,
+    "type": "tool_call",
+    "body": {
+      "call_id": "example-0045",
+      "name": "hub",
+      "arguments": {
+        "op": "Invented op 50",
+        "ids": [
+          "Invented ids 51"
+        ],
+        "timeout": 600,
+        "i": "Invented i 52"
+      },
+      "blocks": [
+        {
+          "id": "omp-114/example-0053",
+          "kind": "tool_call",
+          "source_type": "tool_call",
+          "payload": {
+            "body_ref": true
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-115",
+    "sequence": 115,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:15.000Z",
+    "role": "tool",
+    "final": true,
+    "type": "message",
+    "body": {
+      "message_id": "example-0055",
+      "reply_to": null,
+      "from": null,
+      "to": null,
+      "title": null,
+      "blocks": [
+        {
+          "id": "omp-115/example-0056",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "message",
+              "id": "example-0055",
+              "parentId": "example-0049",
+              "timestamp": "2026-10-07T21:29:29.480Z",
+              "message": {
+                "role": "toolResult",
+                "toolCallId": "example-0045",
+                "toolName": "hub",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Invented text 53"
+                  }
+                ],
+                "details": {
+                  "op": "Invented op 54",
+                  "jobs": [
+                    {
+                      "id": "example-0020",
+                      "type": "bash",
+                      "status": "running",
+                      "label": "Invented label 55",
+                      "durationMs": 159004
+                    }
+                  ]
+                },
+                "isError": false,
+                "useless": true,
+                "timestamp": 1791408569479,
+                "prunedAt": 1791408676964
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-116",
+    "sequence": 116,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:16.000Z",
+    "role": "tool",
+    "final": true,
+    "type": "tool_result",
+    "body": {
+      "call_id": "example-0045",
+      "status": "success",
+      "media_type": "application/json",
+      "content": [
+        {
+          "type": "text",
+          "text": "Invented text 56"
+        }
+      ],
+      "blocks": [
+        {
+          "id": "omp-116/example-0058",
+          "kind": "tool_output",
+          "source_type": "tool_result",
+          "metadata": {
+            "op": "Invented op 57",
+            "jobs": [
+              {
+                "id": "example-0020",
+                "type": "bash",
+                "status": "running",
+                "label": "Invented label 58",
+                "durationMs": 159004
+              }
+            ]
+          },
+          "payload": {
+            "body_ref": true
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-117",
+    "sequence": 117,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:17.000Z",
+    "role": "system",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "Invented text 59",
+      "attachment_id": null,
+      "blocks": [
+        {
+          "id": "omp-117/example-0060",
+          "kind": "text",
+          "source_type": "content",
+          "payload": {
+            "body_ref": true
+          }
+        },
+        {
+          "id": "omp-117/example-0061",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "custom_message",
+              "customType": "async-result",
+              "content": "Invented content 60",
+              "display": true,
+              "details": {
+                "jobs": [
+                  {
+                    "jobId": "Invented jobId 61",
+                    "type": "bash",
+                    "label": "Invented label 62",
+                    "durationMs": 290013
+                  }
+                ]
+              },
+              "attribution": "Invented attribution 63",
+              "id": "example-0062",
+              "parentId": "example-0055",
+              "timestamp": "2026-10-07T21:29:29.501Z"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-118",
+    "sequence": 118,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:18.000Z",
+    "role": "system",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "[unrecognized omp entry `custom`]\n{\"raw\":{\"type\":\"custom\",\"customType\":\"tool_execution_start\",\"data\":{\"toolCallId\":\"example-0065\",\"toolName\":\"bash\",\"startedAt\":\"2026-10-07T21:29:32.337Z\",\"args\":{\"command\":\"Invented command 65\"},\"intent\":\"Invented intent 66\"},\"id\":\"example-0066\",\"parentId\":\"example-0062\",\"timestamp\":\"2026-10-07T21:29:32.337Z\"}}",
+      "attachment_id": null,
+      "blocks": [
+        {
+          "id": "omp-118/example-0064",
+          "kind": "unknown",
+          "source_type": "custom",
+          "payload": {
+            "raw": {
+              "type": "custom",
+              "customType": "tool_execution_start",
+              "data": {
+                "toolCallId": "example-0065",
+                "toolName": "bash",
+                "startedAt": "2026-10-07T21:29:32.337Z",
+                "args": {
+                  "command": "Invented command 65"
+                },
+                "intent": "Invented intent 66"
+              },
+              "id": "example-0066",
+              "parentId": "example-0062",
+              "timestamp": "2026-10-07T21:29:32.337Z"
+            }
+          }
+        },
+        {
+          "id": "omp-118/example-0067",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "custom",
+              "customType": "tool_execution_start",
+              "data": {
+                "toolCallId": "example-0065",
+                "toolName": "bash",
+                "startedAt": "2026-10-07T21:29:32.337Z",
+                "args": {
+                  "command": "Invented command 67"
+                },
+                "intent": "Invented intent 68"
+              },
+              "id": "example-0066",
+              "parentId": "example-0062",
+              "timestamp": "2026-10-07T21:29:32.337Z"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-119",
+    "sequence": 119,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:19.000Z",
+    "role": "assistant",
+    "final": true,
+    "type": "message",
+    "body": {
+      "message_id": "example-0069",
+      "reply_to": null,
+      "from": null,
+      "to": null,
+      "title": null,
+      "blocks": [
+        {
+          "id": "omp-119/example-0070",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "message",
+              "id": "example-0069",
+              "parentId": "example-0066",
+              "timestamp": "2026-10-07T21:29:32.338Z",
+              "message": {
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "toolCall",
+                    "id": "example-0065",
+                    "name": "bash",
+                    "arguments": {
+                      "command": "Invented command 69",
+                      "i": "Invented i 70",
+                      "timeout": 200
+                    },
+                    "intent": "Invented intent 71"
+                  }
+                ],
+                "api": "anthropic-messages",
+                "provider": "anthropic",
+                "model": "claude-sonnet-5-5",
+                "usage": {
+                  "input": 4,
+                  "output": 172,
+                  "cacheRead": 89584,
+                  "cacheWrite": 334,
+                  "totalTokens": 90094,
+                  "cost": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "total": 0
+                  },
+                  "cttl": {
+                    "ephemeral5m": 334
+                  }
+                },
+                "stopReason": "toolUse",
+                "timestamp": 1791408569504,
+                "responseId": "example-0071",
+                "duration": 2811.6930840000277,
+                "ttft": 1918.356537000043,
+                "completedAt": 1791408572336,
+                "contextSnapshot": {
+                  "promptTokens": 89922,
+                  "nonMessageTokens": 25429,
+                  "compactionEpoch": 0
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-120",
+    "sequence": 120,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:20.000Z",
+    "role": "assistant",
+    "final": true,
+    "type": "tool_call",
+    "body": {
+      "call_id": "example-0065",
+      "name": "bash",
+      "arguments": {
+        "command": "Invented command 72",
+        "i": "Invented i 73",
+        "timeout": 200
+      },
+      "blocks": [
+        {
+          "id": "omp-120/example-0073",
+          "kind": "tool_call",
+          "source_type": "tool_call",
+          "payload": {
+            "body_ref": true
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-121",
+    "sequence": 121,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:21.000Z",
+    "role": "tool",
+    "final": true,
+    "type": "message",
+    "body": {
+      "message_id": "example-0075",
+      "reply_to": null,
+      "from": null,
+      "to": null,
+      "title": null,
+      "blocks": [
+        {
+          "id": "omp-121/example-0076",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "message",
+              "id": "example-0075",
+              "parentId": "example-0069",
+              "timestamp": "2026-10-07T21:30:32.339Z",
+              "message": {
+                "role": "toolResult",
+                "toolCallId": "example-0065",
+                "toolName": "bash",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Invented text 74"
+                  }
+                ],
+                "details": {
+                  "async": {
+                    "state": "Invented state 75",
+                    "jobId": "Invented jobId 76",
+                    "type": "bash"
+                  },
+                  "timeoutSeconds": 200
+                },
+                "isError": false,
+                "timestamp": 1791408632338
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-122",
+    "sequence": 122,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:22.000Z",
+    "role": "tool",
+    "final": true,
+    "type": "tool_result",
+    "body": {
+      "call_id": "example-0065",
+      "status": "success",
+      "media_type": "application/json",
+      "content": [
+        {
+          "type": "text",
+          "text": "Invented text 77"
+        }
+      ],
+      "blocks": [
+        {
+          "id": "omp-122/example-0078",
+          "kind": "tool_output",
+          "source_type": "tool_result",
+          "metadata": {
+            "async": {
+              "state": "Invented state 78",
+              "jobId": "Invented jobId 79",
+              "type": "bash"
+            },
+            "timeoutSeconds": 200
+          },
+          "payload": {
+            "body_ref": true
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-123",
+    "sequence": 123,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:00:23.000Z",
+    "role": "system",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "Invented text 80",
+      "attachment_id": null,
+      "blocks": [
+        {
+          "id": "omp-123/example-0080",
+          "kind": "text",
+          "source_type": "content",
+          "payload": {
+            "body_ref": true
+          }
+        },
+        {
+          "id": "omp-123/example-0081",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "custom_message",
+              "customType": "async-result",
+              "content": "Invented content 81",
+              "display": true,
+              "details": {
+                "jobs": [
+                  {
+                    "jobId": "Invented jobId 82",
+                    "type": "bash",
+                    "label": "Invented label 83",
+                    "durationMs": 200946
+                  }
+                ]
+              },
+              "attribution": "Invented attribution 84",
+              "id": "example-0082",
+              "parentId": "example-0075",
+              "timestamp": "2026-10-07T21:30:32.360Z"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "timeline-entry/omp-200",
+    "sequence": 200,
+    "revision": 1,
+    "timestamp": "2026-10-07T09:10:00.000Z",
+    "role": "system",
+    "final": true,
+    "type": "content",
+    "body": {
+      "media_type": "text/plain",
+      "text": "[unrecognized omp entry `custom`]\n{\"raw\":{\"type\":\"custom\",\"customType\":\"session_exit\",\"data\":{\"reason\":\"Invented reason 99\"},\"id\":\"example-exit\",\"parentId\":\"example-0001\",\"timestamp\":\"2026-10-07T09:10:00.000Z\"}}",
+      "attachment_id": null,
+      "blocks": [
+        {
+          "id": "omp-200/0",
+          "kind": "unknown",
+          "source_type": "custom",
+          "payload": {
+            "raw": {
+              "type": "custom",
+              "customType": "session_exit",
+              "data": {
+                "reason": "Invented reason 99"
+              },
+              "id": "example-exit",
+              "parentId": "example-0001",
+              "timestamp": "2026-10-07T09:10:00.000Z"
+            }
+          }
+        },
+        {
+          "id": "omp-200/source",
+          "kind": "source_record",
+          "source_type": "omp",
+          "visibility": "internal",
+          "payload": {
+            "raw": {
+              "type": "custom",
+              "customType": "session_exit",
+              "data": {
+                "reason": "Invented reason 99"
+              },
+              "id": "example-exit",
+              "parentId": "example-0001",
+              "timestamp": "2026-10-07T09:10:00.000Z"
+            }
+          }
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Decide sooner that a seat needs no login item, and read the person steps through the assignee index",
+  "replay": {"status": "none", "detail": "No replay or rebuild, and no claim is projected differently. Which seats raise a login item and which person steps raise an attention item are unchanged."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers. The login probe reads claims_harness_login_candidate_index and the person-step read uses step_runs_assignee_index, both of which already exist."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change. The Now and Attention reads return the same items, only sooner. One edge: a step assignee spelled with an upper-case Person/ prefix, which the daemon never writes, is no longer matched as a person."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to recover: the change only decides sooner that a seat has no login evidence, and swaps a case-insensitive LIKE for an index range. A seat that does have login evidence takes the same path as before."}
+}

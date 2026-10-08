@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Prepare current collection cursor delivery over the existing v0 socket with explicit complete-source adapter admission.",
+  "replay": {"status": "none", "detail": "No production adapter is admitted. The consumer handles journal gaps with an authorized replacement snapshot, without replaying source history or inventing a v0 reconnect cursor."},
+  "schema": {"status": "none", "detail": "No new production tables, migrations or numeric database version changes. Explicit fixtures use the existing foundation view/event schemas through the shared runtime support."},
+  "rules": {"status": "none", "detail": "No rule or compatibility digest changes."},
+  "compatibility": {"status": "none", "detail": "Default collection readers remain active. No new collection names, fields or generated clients. Explicit complete adapters use existing snapshot, changes, resync and error frames; current cap stays sixteen and older-daemon cap stays eight."},
+  "downtime": {"status": "none", "detail": "No default startup/backfill work beyond normal deployment restart; the production adapter map is empty."},
+  "manual": {"status": "none", "detail": "No deployment action activates this seam. Transaction-owned durable/local/deadline coverage, explicit install/catchup and full collection parity are still required before admitting a production adapter."},
+  "recovery": {"status": "none", "detail": "Default data and readers are unchanged. Explicit consumers keep old cursors until successful delivery, request resync on gaps, and take an authoritative snapshot on reconnect. Partial operators are not advertised as complete collections."}
+}

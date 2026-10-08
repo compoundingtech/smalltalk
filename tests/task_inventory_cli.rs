@@ -54,7 +54,7 @@ fn write_executable(path: &Path, body: &str) {
 }
 
 fn tasks(catalog: &Path, bin: &Path, state: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["tasks", "--host", "h", "--json", "--catalog"])
         .arg(catalog)
         .env("PATH", bin)
@@ -67,7 +67,7 @@ fn tasks(catalog: &Path, bin: &Path, state: &Path) -> Output {
 }
 
 fn real_tasks(catalog: &Path, state: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["tasks", "--host", "h", "--json", "--catalog"])
         .arg(catalog)
         .env("XDG_STATE_HOME", state)
@@ -79,7 +79,7 @@ fn real_tasks(catalog: &Path, state: &Path) -> Output {
 }
 
 fn seeded_supervisor_scope(catalog: &Path, host: Option<&str>, state: &Path) -> PathBuf {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+    let mut command = Command::new(test_env!("CARGO_BIN_EXE_st2"));
     command
         .args(["unpark", "h.worker", "--catalog"])
         .arg(catalog);
@@ -117,7 +117,7 @@ fn execute_recovery(action: &serde_json::Value, bin: &Path, ambient_catalog: &Pa
         let argv = action["argv"]
             .as_array()
             .expect("recovery action carries argv");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+        let mut command = Command::new(test_env!("CARGO_BIN_EXE_st2"));
         command.args(argv.iter().skip(1).map(|arg| arg.as_str().unwrap()));
         command
     };
@@ -137,7 +137,7 @@ fn execute_recovery(action: &serde_json::Value, bin: &Path, ambient_catalog: &Pa
 #[test]
 fn projected_recovery_targets_its_exact_catalog_and_host_despite_ambient_defaults() {
     let (tmp, selected_catalog, bin) = fixture("[]");
-    symlink(env!("CARGO_BIN_EXE_st2"), bin.join("st2")).unwrap();
+    symlink(test_env!("CARGO_BIN_EXE_st2"), bin.join("st2")).unwrap();
     let ambient_catalog = tmp.path().join("ambient-catalog");
     fs::create_dir(&ambient_catalog).unwrap();
     let state = tmp.path().join("state");
@@ -308,7 +308,7 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
     let prepared_a = tmp.path().join("prepared-a");
     let prepared_b = tmp.path().join("prepared-b");
     let snapshot = |output: &Path| {
-        let result = Command::new(env!("CARGO_BIN_EXE_st2"))
+        let result = Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args([
                 "catalog",
                 "snapshot",
@@ -348,7 +348,7 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
             observer_ready, observer_release
         ),
     );
-    let inventory = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let inventory = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["tasks", "--host", "h", "--json", "--catalog"])
         .arg(&catalog)
         .env("PATH", &bin)
@@ -370,7 +370,7 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
         let input_sha256 = st2::catalog_transaction::digest_prepared(&catalog, prepared)
             .unwrap()
             .root_sha256;
-        Command::new(env!("CARGO_BIN_EXE_st2"))
+        Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args([
                 "catalog",
                 "apply",
@@ -434,7 +434,7 @@ fn completed_single_agent_writer_abas_during_runtime_observation_are_incomplete(
                 observer_ready, observer_release
             ),
         );
-        let inventory = Command::new(env!("CARGO_BIN_EXE_st2"))
+        let inventory = Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args(["tasks", "--host", "h", "--json", "--catalog"])
             .arg(&catalog)
             .env("PATH", &bin)
@@ -465,7 +465,7 @@ fn completed_single_agent_writer_abas_during_runtime_observation_are_incomplete(
             )
             .unwrap();
             let digest = |source: &Path| {
-                let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+                let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
                     .args(["agent", "digest", "--spec"])
                     .arg(source)
                     .arg("--json")
@@ -483,7 +483,7 @@ fn completed_single_agent_writer_abas_during_runtime_observation_are_incomplete(
                 (&source_b, digest_b.as_str(), digest_a.as_str()),
                 (&source_a, digest_a.as_str(), digest_b.as_str()),
             ] {
-                let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+                let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
                     .args([
                         "agent",
                         "publish",
@@ -509,7 +509,7 @@ fn completed_single_agent_writer_abas_during_runtime_observation_are_incomplete(
                 vec!["rename", "h.worker", "temporary", "--host", "h"],
                 vec!["rename", "h.worker", "--clear", "--host", "h"],
             ] {
-                let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+                let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
                     .arg("--catalog")
                     .arg(&catalog)
                     .args(args)
@@ -742,7 +742,7 @@ fn catalog_semantic_drift_during_observation_fails_closed() {
 fn missing_catalog_and_missing_json_flag_fail_explicitly() {
     let tmp = tempfile::tempdir().unwrap();
     let missing = tmp.path().join("missing-catalog");
-    let missing_output = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let missing_output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["tasks", "--host", "h", "--json", "--catalog"])
         .arg(&missing)
         .env("XDG_STATE_HOME", tmp.path().join("state"))
@@ -758,7 +758,7 @@ fn missing_catalog_and_missing_json_flag_fail_explicitly() {
     assert!(value["tasks"].as_array().unwrap().is_empty());
 
     let (fixture_tmp, catalog, bin) = fixture("[]");
-    let no_json = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let no_json = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["tasks", "--host", "h", "--catalog"])
         .arg(&catalog)
         .env("PATH", bin)

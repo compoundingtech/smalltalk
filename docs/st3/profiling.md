@@ -142,8 +142,120 @@ every subject's status read into a scan of its historical JSON bodies. The opera
 TEXT affinity is removed in that join so SQLite can seek the JSON-expression index.
 
 The agent-card cache holds its mutex only while selecting or publishing immutable cached
-rows, not while building cards. A request's SQLite snapshot therefore does not wait at that
-mutex behind another request's disk reads.
+rows, not while building cards. HTTP agent pages and WS roster windows first probe read-only
+caches inside a fresh, authorized SQLite snapshot. An exact, lease-valid warm hit bypasses the
+store-wide roster admission even while an unrelated cold reader holds it. A miss releases its
+snapshot before awaiting admission, then opens a new snapshot and rechecks authority and caches.
+Cold HTTP first pages build shallow refs and selected cards under one admission and one snapshot;
+warm first pages need neither admission nor a second snapshot. The existing same-key WS window
+admission remains in place for authority fencing. The cold worker retains store admission through
+completion even if its caller disconnects, so waiting followers pin no old WAL read mark.
+
+Eight immutable graph-index/local-frontier/history cuts are retained. HTTP pages lazily fill missing subjects into
+the same projection used by the complete WS roster, without reducing unrelated cards. Local
+agent observations and registered agent claims update only their subject's card. Run and generation
+changes refresh owned cards and diff roster membership; step/work changes map owners, assignees,
+claimants and activity actors. Queue-affecting claims refresh fleet queue selection and selected
+labels once, then compare all queue fields per card before refolding. Message sends refresh their
+agent endpoints because they contribute to activity timestamps. All message lifecycle receipts
+also refresh projected agent parties: draining rollout blockers read the message's delivery state,
+including ancestors of eligible replies. Receipt claims need not contain endpoint fields.
+Daemon diagnostics, glasses, arrangements and fleet-only claims reuse the cards. Unknown kinds and
+unclassified structural changes conservatively cold-build. Authorization is checked before reuse,
+and local delivery presence stays a per-read overlay rather than graph-cached authority.
+
+The reuse allowlist includes transitive rollout, suspension, fault and placement dependencies:
+
+| Claims | Card read | Delta mapping |
+| --- | --- | --- |
+| `message.sent` | activity and rollout delivery blockers | projected agent sender/recipient |
+| `message.staged`, `message.delivered`, `message.read`, `message.closed` | rollout delivery blockers and eligible reply ancestry | projected agent sender/recipient; cold if no message projection exists |
+| `daemon.diagnostic`, `daemon.started` | none; diagnostic reports are separate from agent reconcile faults | empty, guarded to daemon subjects |
+| `glass.upserted`, `glass.deleted` | none; glass projection is not a card or blocker input | empty, guarded to glass subjects |
+| `arrangement.edited` | none; arrangement projection is not a card or blocker input | empty, guarded to arrangement subjects |
+| `fleet.invite-created`, `fleet.invite-redeemed`, `fleet.invite-revoked` | none | empty, guarded to invitation subjects |
+| `fleet.member-admitted`, `fleet.member-endpoints`, `fleet.member-left`, `fleet.member-removed` | none; host metadata is declaration-derived and placement fences do not read peer liveness | empty, guarded to host subjects |
+
+Shared cards are built only from current, independently time-fenced queue metadata. A
+pagination continuation applies its frozen ordering/host/queue refs to the response clone
+after reading the shared cards; frozen pagination cuts must never seed the shared projection.
+The shallow HTTP membership/order/queue refs have the same bounded graph-cut retention.
+Warm pages reuse those refs rather than scanning all fleet work. An explicit allow-list of
+existing-agent harness observations and daemon diagnostics leaves them valid; every other
+claim rebuilds them. Runtime status can move an undeclared or stopped agent into history,
+so even an existing agent's `runtime.observed` rebuilds shallow refs.
+Both shallow refs and the full-card projection expire at the earliest current-generation
+work-lease deadline. Expired work becomes ready (or disappears from a revision-draining queue)
+without a new claim. Full-card refreshes retain expired rows only as diff sources, never as warm
+hits: `roster/queue-diff` scans queue selection and labels once and refolds only cards whose queue
+fields changed. It also refreshes the next deadline. Shallow refs still rebuild after expiry.
+Safe card-local advances carry the prior deadline forward. Shallow-ref warm hits add no SQL;
+full-card probes
+read the relevant local frontier before selecting cached rows. The outer shared agents
+WS window inherits the same fence, so it cannot hide an expired full-card projection.
+HTTP reads see expiry immediately; live WS subscribers see the transition on the next
+existing 30-second authority/freshness tick. That existing live-stream bound is unchanged.
+
+Historical status cuts read queue and declaration presentation from the caller's current SQLite
+projection, just as cold cards do. When the requested graph index precedes that physical
+projection's frontier, full-card reads bypass shared cached rows and cold-build selected coverage;
+they do not borrow stale queue fields from an earlier physical snapshot.
+
+The isolated 60-agent, six-mission, 60-step fixture counts canonical claim kinds and local samples:
+`cargo test -p st3 --lib agent_roster_typical_claim_kind_baseline -- --nocapture`.
+Its frozen pre-incremental classification distinguishes the old cold fallback from the current
+selected-card build count. Full JSON parity, including queues, todos and usage, is checked by
+`agent_roster_seeded_claim_sequences_match_cold_json` with reproducible proptest sequences,
+both history modes, selected coverage, historical cuts and injected-clock lease expiry.
+The ignored `agent_roster_one_step_claim_fixture_timing` reports cold/incremental wall times and
+the number of refolded cards after one work claim; run it explicitly with `--ignored --nocapture`.
+These debug-profile fixtures are not deployed latency or loaded-host benchmarks.
+
+The relevant local-observation frontier is the largest agent `harness.timeline` row ID visible
+inside the same SQLite snapshot with `after_store_index` at or before the requested graph cut,
+or zero when none exists. A partial covering index, `local_observations_roster_frontier_index`,
+contains only those rows. The reverse lookup skips newer heartbeat rows entirely, without
+assuming row IDs and graph indices are monotonic; an old cut still steps over newer agent
+timeline rows in the index. Existing stores create the index automatically on their next open,
+without a schema-version bump or replay migration. Initial creation took 0.171 seconds on
+an offline 1.78 GB store copy with 161,048 local observations (118,115 indexed agent timeline
+rows), using SQLite 3.53.3. The 8,701-row synthetic fixture took 0.516 ms; these isolated
+index-creation timings do not measure end-to-end startup or predict other stores.
+Heartbeat-only `harness.observed`, local telemetry and non-agent timeline appends leave cached
+cards reusable. Every agent timeline entry type advances the frontier, including usage entries,
+because managed-session recency reads the latest timeline row even when last activity does not.
+Replicated status and usage changes retain their graph-index invalidation. A same-index local
+content transcript append misses the read-only getter
+and updates the affected card's `last_activity_at` when rebuilt for both HTTP and WS; ignoring
+timeline rows here would make a shared warm roster instant but stale. Read-only getters never
+build, require selected-subject coverage, and pin immutable rows without filtering or cloning them.
+
+Cache relevance does not filter the existing `changed()` notification signal. Local
+heartbeat and timeline publications still wake every existing event subscriber; a heartbeat
+can then reuse the roster rows, while timeline activity misses and refreshes them. The normal
+`agent_roster_cache_reuse_preserves_changed_for_existing_subscribers` regression checks both
+publications with two subscribers.
+
+The performance report exposes each roster stage under bounded task labels:
+`roster/admission-wait` (waiting for the shared admission or an in-flight build),
+`roster/frontier-read`, `roster/cache-hit`, `roster/build` (incremental advance or cold build),
+`roster/card-projection` (refolding changed cards) and `agent_work_queues`.
+
+The focused 70-agent, 20-session fixture reports card-status, usage, repeated-projection and
+incremental-update costs with `cargo test -p st3 --lib agent_roster_snapshot_fixture_timing --
+--ignored --nocapture`. It is a serial fixture micro-measure, not a load benchmark. CI's
+`perf-load` workload holds concurrent agents WS subscribers and measures first-snapshot
+latency against the roster's 300 ms budget.
+
+Normal tests include a small cached-versus-uncached roster comparison before and after local
+timeline activity, in both history modes. Run the heartbeat-only fixture with
+`cargo test -p st3 --lib agent_roster_heartbeat_only_local_stream_hit_rate -- --nocapture`:
+it prints append/probe/hit counts, hit rate and elapsed time, requires every heartbeat probe to
+reuse the same immutable rows, and requires a subsequent timeline append to miss before rebuild.
+The normal warm HTTP fixture
+`warm_agent_http_page_bypasses_unrelated_cold_roster_admission` holds store admission while reading
+a cached first page and prints its elapsed time. These are deterministic cache/admission
+regressions with diagnostic timings, not production latency guarantees.
 
 Every five seconds a dedicated native thread attempts a passive WAL checkpoint outside the
 writer queue. Once every frame is backfilled, it attempts `TRUNCATE` with zero busy timeout.

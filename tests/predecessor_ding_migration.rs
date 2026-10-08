@@ -68,7 +68,7 @@ impl Fixture {
         for path in [&main_catalog, &migration_catalog, &xdg, &pty_root, &bin] {
             fs::create_dir_all(path).unwrap();
         }
-        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_st2"), bin.join("st2")).unwrap();
+        std::os::unix::fs::symlink(test_env!("CARGO_BIN_EXE_st2"), bin.join("st2")).unwrap();
         Self {
             _tmp: tmp,
             main_catalog,
@@ -95,7 +95,7 @@ impl Fixture {
     }
 
     fn candidate(&self) -> Command {
-        self.isolated(Path::new(env!("CARGO_BIN_EXE_st2")))
+        self.isolated(Path::new(test_env!("CARGO_BIN_EXE_st2")))
     }
 
     fn predecessor(&self) -> Command {

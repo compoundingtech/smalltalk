@@ -38,6 +38,8 @@ use crate::sqlite::{
 
 #[cfg(test)]
 mod projection_busy_tests;
+#[cfg(test)]
+mod receive_writer_tests;
 mod binary_payloads;
 pub mod events;
 pub mod idempotency;
@@ -760,6 +762,27 @@ impl Store {
         callback: impl Fn(&Connection) + Send + Sync + 'static,
     ) -> CommitObserver {
         self.connection.observe_commits(callback)
+    }
+
+    /// Explicitly attach one bounded transaction-owned source adapter. This covers queued
+    /// batches and managed lent-writer transactions before commit; it neither installs views
+    /// nor certifies source coverage. See WriterConnection::install_transaction_finalizer.
+    pub fn install_transaction_finalizer(
+        &self,
+        callback: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.connection.install_transaction_finalizer(callback)
+    }
+
+    /// Attach one paired source adapter. Prepare runs inside the new outer transaction before
+    /// any managed source write; finalize runs before commit. Raw bypass coverage remains the
+    /// adapter's responsibility. See WriterConnection::install_transaction_hooks.
+    pub fn install_transaction_hooks(
+        &self,
+        prepare: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+        finalize: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.connection.install_transaction_hooks(prepare, finalize)
     }
 
     /// Open the store at `path`, creating it when it does not exist, with `runtime`'s tables
@@ -2386,25 +2409,61 @@ pub fn store_envelope_signature_tx(
     signature: &str,
     now: &str,
 ) -> Result<usize> {
-    let message =
-        crate::fleet::envelope_signature_message(fleet_id, writer, sequence, envelope_hash);
-    if !crate::fleet::verify_signature(member_key, &message, signature) {
+    let Some(verified) = VerifiedEnvelopeSignature::verify(
+        fleet_id, writer, sequence, envelope_hash, member_key, signature,
+    ) else {
         return Ok(0);
-    }
-    Ok(transaction
-        .prepare_cached(
-            "INSERT OR IGNORE INTO replica_envelope_signatures(
-             writer, sequence, envelope_hash, member_key, signature, stored_at_unix_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?
-        .execute(params![
+    };
+    verified.store(transaction, now)
+}
+
+/// Verification depends only on the signed bytes, not on store state. Keep the verified
+/// identity and signature together so receipt can do the cryptography before taking the
+/// writer, while tombstone and membership decisions still happen on the store.
+struct VerifiedEnvelopeSignature<'a> {
+    writer: &'a str,
+    sequence: u64,
+    envelope_hash: &'a str,
+    member_key: &'a str,
+    signature: &'a str,
+}
+
+impl<'a> VerifiedEnvelopeSignature<'a> {
+    fn verify(
+        fleet_id: &str,
+        writer: &'a str,
+        sequence: u64,
+        envelope_hash: &'a str,
+        member_key: &'a str,
+        signature: &'a str,
+    ) -> Option<Self> {
+        let message =
+            crate::fleet::envelope_signature_message(fleet_id, writer, sequence, envelope_hash);
+        crate::fleet::verify_signature(member_key, &message, signature).then_some(Self {
             writer,
             sequence,
             envelope_hash,
             member_key,
             signature,
-            now
-        ])?)
+        })
+    }
+
+    fn store(&self, transaction: &Transaction<'_>, now: &str) -> Result<usize> {
+        Ok(transaction
+            .prepare_cached(
+                "INSERT OR IGNORE INTO replica_envelope_signatures(
+             writer, sequence, envelope_hash, member_key, signature, stored_at_unix_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?
+            .execute(params![
+                self.writer,
+                self.sequence,
+                self.envelope_hash,
+                self.member_key,
+                self.signature,
+                now
+            ])?)
+    }
 }
 
 /// What `st fleet remove` did.
@@ -3431,9 +3490,13 @@ fn load_compact_replication_inventory(
 /// the most identities one divergent exchange lists beyond its first differing range.
 pub const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 
-/// Envelopes admitted per writer transaction. Admission takes 2-3 ms per envelope on a populated
-/// store, so a chunk holds the writer for well under a second.
-pub const ADMISSION_CHUNK_ENVELOPES: usize = 256;
+/// Maximum envelopes admitted per writer transaction. Admission can take several milliseconds
+/// per envelope on a populated store; leave room for queued write acknowledgements below 50 ms.
+pub const ADMISSION_CHUNK_ENVELOPES: usize = 8;
+
+/// Stop a chunk before starting another envelope once its writer work reaches this budget.
+/// An envelope and the commit are indivisible; this does not preempt either one.
+const ADMISSION_WRITER_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Newly admitted claims projected per writer transaction. A catch-up page must not keep
 /// queued lease renewals and messages behind its entire incremental projection.
@@ -5771,8 +5834,40 @@ impl Store {
             ));
         }
         let timing = time_stage(&self.replication_timers.receipt);
+        let envelope_signatures = input
+            .envelopes
+            .iter()
+            .map(|envelope| {
+                let (Some(key), Some(signature)) = (&envelope.member_key, &envelope.signature) else {
+                    return None;
+                };
+                VerifiedEnvelopeSignature::verify(
+                    fleet_id,
+                    &envelope.writer,
+                    envelope.sequence,
+                    &envelope.hash,
+                    key,
+                    signature,
+                )
+            })
+            .collect::<Vec<_>>();
+        let follow_up_signatures = input
+            .signatures
+            .iter()
+            .filter_map(|signature| {
+                VerifiedEnvelopeSignature::verify(
+                    fleet_id,
+                    &signature.writer,
+                    signature.sequence,
+                    &signature.hash,
+                    &signature.member_key,
+                    &signature.signature,
+                )
+            })
+            .collect::<Vec<_>>();
         // The envelopes wait as pending in a savepoint of the writer's next batch; admission and
-        // projection take them from there.
+        // projection take them from there. Keep the whole receipt atomic, but perform its
+        // immutable signature verification before queueing this writer job.
         let (received, duplicate, signatures) = self
             .connection
             .batched(|transaction| -> Result<(usize, usize, usize), St3Error> {
@@ -5780,7 +5875,7 @@ impl Store {
                 let mut duplicate = 0;
                 let mut signatures = 0;
                 let now = now_ms().to_string();
-                for envelope in &input.envelopes {
+                for (envelope, verified) in input.envelopes.iter().zip(&envelope_signatures) {
                     // A checkpoint dropped this envelope here. Its tombstone already stands for it.
                     if checkpoint::envelope_tombstoned(
                         transaction,
@@ -5793,19 +5888,8 @@ impl Store {
                         duplicate += 1;
                         continue;
                     }
-                    if let (Some(member_key), Some(signature)) = (&envelope.member_key, &envelope.signature)
-                    {
-                        signatures += store_envelope_signature_tx(
-                            transaction,
-                            fleet_id,
-                            &envelope.writer,
-                            envelope.sequence,
-                            &envelope.hash,
-                            member_key,
-                            signature,
-                            &now,
-                        )
-                        .map_err(internal)?;
+                    if let Some(verified) = verified {
+                        signatures += verified.store(transaction, &now).map_err(internal)?;
                     }
                     let inserted = transaction
                         .prepare_cached(
@@ -5834,28 +5918,18 @@ impl Store {
                         received += 1;
                     }
                 }
-                for signature in &input.signatures {
+                for signature in &follow_up_signatures {
                     if checkpoint::envelope_tombstoned(
                         transaction,
-                        &signature.writer,
+                        signature.writer,
                         signature.sequence,
-                        &signature.hash,
+                        signature.envelope_hash,
                     )
                     .map_err(internal)?
                     {
                         continue;
                     }
-                    signatures += store_envelope_signature_tx(
-                        transaction,
-                        fleet_id,
-                        &signature.writer,
-                        signature.sequence,
-                        &signature.hash,
-                        &signature.member_key,
-                        &signature.signature,
-                        &now,
-                    )
-                    .map_err(internal)?;
+                    signatures += signature.store(transaction, &now).map_err(internal)?;
                 }
                 transaction
                     .execute(
@@ -5932,7 +6006,7 @@ impl Store {
             && !waiting
             && !input.inventory.digest.is_empty()
             && input.inventory.digest == snapshot.inventory.digest
-            && !input.graph_digest.is_empty()
+            && (!input.projection_digests.is_empty() || !input.graph_digest.is_empty())
             && received == 0
             && signatures == 0
             && !self.replication_projection_deferred())
@@ -6027,7 +6101,9 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner);
         let _timing = time_stage(&self.replication_timers.admission);
         let (retry_hash_mismatches, envelopes) = {
-            let connection = self.connection.write();
+            // This query does not mutate source or authority. Fetch the pending payloads on a
+            // reader and release its lease before queueing any admission writer transaction.
+            let connection = self.readers.get();
             // Builds before the insertion-order hash fallback rejected genuine claims from
             // 2026-09-16 as hash mismatches. Check those records once more, once.
             let retry_hash_mismatches = connection
@@ -6056,11 +6132,11 @@ impl Store {
             (retry_hash_mismatches, envelopes)
         };
         let mut outcome = ReplicationAdmission::default();
-        // Membership is a few hundred statements on the writer; with nothing to admit, skip it.
+        // Membership is a few hundred read statements; with nothing to admit, skip it.
         let mut membership = if envelopes.is_empty() {
             Default::default()
         } else {
-            fleet_membership_tx(&self.connection.write())?
+            fleet_membership_tx(&self.readers.get())?
         };
         let mut pending = envelopes;
         // Admitting one envelope can admit a membership claim that decides another envelope,
@@ -6073,11 +6149,20 @@ impl Store {
             // seconds, so every write behind it waited. Between chunks the writer serves what
             // queued meanwhile. Each envelope is admitted in its own savepoint, so an invalid
             // one is rolled back and recorded alone.
-            for chunk in pending.chunks(ADMISSION_CHUNK_ENVELOPES) {
+            let mut next = 0;
+            while next < pending.len() {
                 let mut connection = self.connection.write();
                 let mut pass = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                for envelope in chunk {
+                let started = std::time::Instant::now();
+                let end = (next + ADMISSION_CHUNK_ENVELOPES).min(pending.len());
+                let first = next;
+                while next < end {
+                    if next != first && started.elapsed() >= ADMISSION_WRITER_BUDGET {
+                        break;
+                    }
+                    let envelope = &pending[next];
+                    next += 1;
                     let started = std::time::Instant::now();
                     let hold = fleet_admission_hold(&pass, &membership, envelope)?;
                     outcome.verify += started.elapsed();
@@ -6133,7 +6218,7 @@ impl Store {
                 outcome.held = held.len();
                 break;
             }
-            membership = fleet_membership_tx(&self.connection.write())?;
+            membership = fleet_membership_tx(&self.readers.get())?;
             pending = held;
         }
         self.replication_timers

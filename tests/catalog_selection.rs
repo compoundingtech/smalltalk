@@ -19,7 +19,7 @@ fn write_agent(catalog: &Path, host: &str, identity: &str) {
 }
 
 fn agents(extra: &[&str], catalog_env: Option<&Path>, xdg_state: &Path) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_st2"));
+    let mut cmd = Command::new(test_env!("CARGO_BIN_EXE_st2"));
     cmd.args(["agents", "--host", "h", "--json"])
         .args(extra)
         .env("XDG_STATE_HOME", xdg_state);
@@ -56,7 +56,7 @@ fn agents_defaults_to_home_local_state_without_xdg_state_home() {
     let catalog = home.path().join(".local/state/st2/default/catalog");
     write_agent(&catalog, "h", "home-seat");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let out = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["agents", "--host", "h", "--json"])
         .env("HOME", home.path())
         .env_remove("XDG_STATE_HOME")
@@ -122,7 +122,7 @@ fn agent_publish_can_target_only_the_global_catalog_flag() {
     .unwrap();
     let input_sha256 = format!("{:x}", Sha256::digest(fs::read(&spec).unwrap()));
 
-    let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let out = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("--catalog")
         .arg(&catalog)
         .args(["agent", "publish", "--spec"])
@@ -154,7 +154,7 @@ fn catalog_aliases_share_the_canonical_reader_lock_domain() {
     std::os::unix::fs::symlink(&catalog, &alias).unwrap();
 
     for args in [["ls"].as_slice(), ["agents", "--json"].as_slice()] {
-        let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        let out = Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args(args)
             .arg("--catalog")
             .arg(&alias)
