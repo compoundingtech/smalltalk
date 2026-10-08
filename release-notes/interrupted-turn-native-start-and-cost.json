@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "Publish durable native start activity atomically and keep an empty turn-receipt drain independent of store size.",
+  "commits": [
+    "209750b210032b11b081a12bff60eec69f0ce813"
+  ],
+  "replay": {
+    "status": "changed",
+    "detail": "Normal receipt draining starts from the bounded local pending queue rather than scanning claims when the queue is empty. Repair, first-open and checkpoint replay semantics remain those of the original interrupted-turn obligation change; no provider input or tool execution is replayed."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "This followup adds no database tables, columns, indices or migration. It corrects the query plan for the existing pending queue and refreshes the registry documentation and action inventory."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No further checkpoint rules or projection compatibility change; the original turn-obligation rules14 transition still requires coordinated member upgrade."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "A genuinely new native start now stores Active and its receipt together in one durable snapshot. Duplicate start notifications preserve an existing human hold and positively settled turns remain closed. The OMP admission scratch peer explicitly implements the already-required durable receipt capability and correlated acknowledgements; no new wire capability or continuation API is introduced."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional first-open migration or service interruption is introduced by this followup. The original receipt-index startup cost remains unmeasured and unknown."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No additional operator action beyond the original debt inspection, attributed acknowledgement and coordinated upgrade procedure. Source/card activation and required checks remain independently held."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Loss immediately after a successful native start cannot leave its durable receipt paired with Idle. An exact terminal observed at the monotonic receipt timestamp stays positive evidence instead of becoming timestamp uncertainty. Tests cover private crash boundaries, late results and persistent CLI acknowledgement. A clean later turn or an acknowledgement still cannot claim an unknown tool executed."
+  }
+}
