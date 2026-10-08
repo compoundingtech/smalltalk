@@ -21,6 +21,8 @@ export type FeedHandlers = {
   onConnection: (state: 'connecting' | 'live' | 'reconnecting', issue?: string) => void;
   /** The server refused a window; the others keep going. */
   onWindowError?: (name: FeedWindow, message: string) => void;
+  /** A window left on purpose (`setMissions(false)`): what was held for it is out of date. */
+  onWindowStopped?: (name: FeedWindow) => void;
   /** Development measurement hook; never carries transcript content or a target. */
   onConversationFrame?: (rows: number, replace: boolean) => void;
 };
@@ -87,6 +89,11 @@ export class Feed {
   // briefly revokes a source's readiness, and that blip is not worth a message.
   private reports: Partial<Record<FeedWindow, ReturnType<typeof setTimeout>>> = {};
   private readonly reportAfterMs: number;
+  // The missions window is large, so a screen asks for it only while a missions list or card shows.
+  private missions: boolean;
+  private missionUsers = 0;
+  private missionsLeave: ReturnType<typeof setTimeout> | undefined;
+  private readonly missionsGraceMs: number;
   private probe: ReturnType<typeof setInterval> | undefined;
   /** When a frame last arrived on the open socket. */
   private lastFrameAt = Date.now();
@@ -97,8 +104,10 @@ export class Feed {
   private readonly newActionId: () => string;
   private readonly retryDelaysMs: readonly number[];
 
-  constructor(client: Client, handlers: FeedHandlers, foreground: Foreground, newActionId: () => string, retryDelaysMs: readonly number[] = RETRY_DELAYS_MS, reportAfterMs = 1000) {
+  constructor(client: Client, handlers: FeedHandlers, foreground: Foreground, newActionId: () => string, retryDelaysMs: readonly number[] = RETRY_DELAYS_MS, reportAfterMs = 1000, followMissions = true, missionsGraceMs = 30_000) {
     this.reportAfterMs = reportAfterMs;
+    this.missionsGraceMs = missionsGraceMs;
+    this.missions = followMissions;
     this.client = client;
     this.handlers = handlers;
     this.foreground = foreground;
@@ -120,6 +129,7 @@ export class Feed {
 
   close(): void {
     if (this.closed) return;
+    clearTimeout(this.missionsLeave);
     this.terminal?.close();
     this.closed = true;
     this.suspend();
@@ -226,14 +236,49 @@ export class Feed {
       if (stale()) { opened.close(); return; }
       this.lastFrameAt = Date.now();
       this.stream = opened;
-      for (const name of Object.keys(FEED_WINDOWS) as FeedWindow[]) this.subscribeWindow(name);
+      for (const name of Object.keys(FEED_WINDOWS) as FeedWindow[]) if (name !== 'missions' || this.missions) this.subscribeWindow(name);
       if (this.conversation) opened.subscribeConversation(CONVERSATION, this.conversation.target);
       if (this.glasses) { this.glasses.window = undefined; opened.subscribeGlasses(GLASSES); }
       if (this.terminal) void this.terminal.attach();
     } catch (error) { if (!stale()) this.dropped(error); }
   }
 
+  /** A screen showing missions asks for the window and gives it back when it leaves; it is kept for a
+   * while after the last one so moving between screens does not fetch it each time. */
+  watchMissions(): () => void {
+    this.missionUsers++;
+    clearTimeout(this.missionsLeave);
+    this.missionsLeave = undefined;
+    this.setMissions(true);
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      if (--this.missionUsers > 0) return;
+      this.missionsLeave = setTimeout(() => { this.missionsLeave = undefined; this.setMissions(false); }, this.missionsGraceMs);
+    };
+  }
+
+  /** Follow the missions window, or leave it (its rows are then dropped as out of date). */
+  setMissions(on: boolean): void {
+    if (on === this.missions) return;
+    this.missions = on;
+    if (!this.stream) return; // the next connection subscribes as wanted
+    if (on) { this.subscribeWindow('missions'); return; }
+    this.stream.unsubscribe('missions');
+    delete this.windows.missions;
+    this.loaded('missions');
+    this.handlers.onWindowStopped?.('missions');
+  }
+
+  /** A frame for the missions window that was already on its way when it was left: heard from,
+   *  but it must not bring back rows or errors the screens dropped. */
+  private leftWindow(name: FeedWindow): boolean {
+    return name === 'missions' && !this.missions;
+  }
+
   private subscribeWindow(name: FeedWindow): void {
+    if (name === 'missions' && !this.missions) return;
     delete this.windows[name];
     this.stream?.subscribe(name, FEED_WINDOWS[name].collection, FEED_WINDOWS[name].limit);
   }
@@ -265,6 +310,7 @@ export class Feed {
     } else if (frame.kind === 'snapshot' || frame.kind === 'changes') {
       if (!(frame.id in FEED_WINDOWS)) return;
       const name = frame.id as FeedWindow;
+      if (this.leftWindow(name)) return;
       const next = applyWindow(this.windows[name], frame);
       if (!next) { this.retryLater(name, () => this.subscribeWindow(name)); return; }
       this.windows[name] = next;
@@ -282,6 +328,7 @@ export class Feed {
       else if (frame.id === GLASSES && this.glasses) { this.glasses.window = undefined; this.stream?.subscribeGlasses(GLASSES); }
       else if (frame.id in FEED_WINDOWS) {
         const name = frame.id as FeedWindow;
+        if (this.leftWindow(name)) return;
         if (this.retryLater(name, () => this.subscribeWindow(name)) && frame.message) {
           const text = `${plainMessage(frame.code, frame.message)} · trying again`;
           clearTimeout(this.reports[name]);
@@ -325,6 +372,7 @@ export class Feed {
       }
       else if (id && id in FEED_WINDOWS) {
         const name = id as FeedWindow;
+        if (this.leftWindow(name)) return;
         // A list whose first read failed is asked for again when that may help, so it never stays stale under "live".
         const plain = plainMessage(frame.code, frame.message);
         if (!isTransientCode(frame.code)) this.handlers.onWindowError?.(name, plain);

@@ -5,7 +5,7 @@ import { RefreshControl, ScrollView, View } from 'react-native';
 import type { UsagePeriod } from '../../../clients/typescript/st3-client';
 import { plainError } from '../../../clients/typescript/st3-client';
 import { agentName } from '../agentsView';
-import { Banners, StatusLine } from '../chrome';
+import { Banners, StatusLine, useMissionsOnFocus } from '../chrome';
 import type { StackParams } from '../navigation';
 import { useStore } from '../store';
 import { theme } from '../theme';
@@ -51,6 +51,7 @@ export function useUsage(hours: number) {
 
 export function useNames(): Names {
   const { data } = useStore();
+  useMissionsOnFocus();
   return useMemo(() => ({
     agents: new Map(data.agents.map(agent => [agent.id, agentName(agent)])),
     missions: new Map(data.missions.map(mission => [mission.id, mission.title])),

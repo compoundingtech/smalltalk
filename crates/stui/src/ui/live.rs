@@ -167,6 +167,8 @@ struct Following {
 const USAGE_EVERY: Duration = Duration::from_secs(60);
 /// How often the connected clients are read again while the fleet shows.
 const CLIENTS_EVERY: Duration = Duration::from_secs(10);
+/// How long the missions window stays followed after a mission list or card leaves the screen.
+const MISSIONS_GRACE: Duration = Duration::from_secs(30);
 
 /// Why usage could not be read, saying so plainly when the daemon predates the read.
 fn usage_error(error: &st3_client::ClientError) -> String {
@@ -375,6 +377,10 @@ pub fn run(context: Context) -> Result<()> {
     let mut cursor_style: Option<crossterm::cursor::SetCursorStyle> = None;
     // The tab shown on the last pass: opening a tab loads what only it needs.
     let mut shown_tab = usize::MAX;
+    // Whether the feed was last told to follow the missions window, and until when the last time
+    // one was on screen keeps it followed.
+    let mut missions_sent = false;
+    let mut missions_until: Option<Instant> = None;
     // When usage was last asked for and over how many hours, and whether that read is out.
     let mut usage_read: Option<(Instant, u64)> = None;
     // When the connected clients were last read, while the fleet shows, and whether a read is out.
@@ -446,6 +452,14 @@ pub fn run(context: Context) -> Result<()> {
                     has_more,
                 } => {
                     extras.window_errors.remove(&format!("{window:?}"));
+                    if window == Window::Summary {
+                        extras.summary = items.iter().find_map(|item| match item {
+                            Resource::Summary(summary) => Some(summary.clone()),
+                            _ => None,
+                        });
+                        changed = true;
+                        continue;
+                    }
                     // Back in touch: glass changes st has not confirmed go again, same keys.
                     if !extras.live {
                         for write in ui.unsent_glass_writes() {
@@ -460,9 +474,12 @@ pub fn run(context: Context) -> Result<()> {
                     };
                     match window {
                         Window::Attention => model.now = collection,
-                        Window::Missions => model.missions = collection,
+                        Window::Missions => {
+                            model.missions = collection;
+                            extras.missions_followed = true;
+                        }
                         Window::Agents => model.agents = collection,
-                        Window::Glasses => {}
+                        Window::Glasses | Window::Summary => {}
                     }
                     extras.live = true;
                     extras.offline = None;
@@ -512,6 +529,15 @@ pub fn run(context: Context) -> Result<()> {
                     }
                     failed.insert(target, message);
                     changed = true;
+                }
+                feed::Update::WindowStopped(window) => {
+                    // A window left on purpose (no Missions list on screen): what was held for it
+                    // is out of date and not shown as current.
+                    if window == Window::Missions {
+                        model.missions = Collection::default();
+                        extras.missions_followed = false;
+                        changed = true;
+                    }
                 }
                 feed::Update::WindowFailed(window, error) => {
                     ui.flash(format!("Could not load {window:?}: {error}"));
@@ -1255,6 +1281,17 @@ pub fn run(context: Context) -> Result<()> {
                 save_cache(cache_path.as_deref(), &person, &model);
                 last_cache_save = Instant::now();
             }
+        }
+        // The missions window is large, so it is followed only while a mission list or card is on
+        // screen, and kept for a while after so flipping between tabs does not fetch it each time.
+        let wanted_now = ui.missions_wanted();
+        if wanted_now {
+            missions_until = Some(Instant::now() + MISSIONS_GRACE);
+        }
+        let wanted = wanted_now || missions_until.is_some_and(|until| Instant::now() < until);
+        if wanted != missions_sent {
+            missions_sent = wanted;
+            let _ = commands.send(Command::Missions { follow: wanted });
         }
         ui.step_voice();
         ui.step_terminal_hold();

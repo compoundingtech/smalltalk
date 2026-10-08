@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "stui follows the missions window only while a mission list or card is on screen, and reads st's active-missions count for the top bar",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, columns, indexes or triggers."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No wire change of its own. The feed asks for the optional summary collection only where st grants it; an older member is followed as before, and the top bar then says missions without a count while no mission list is open."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to recover."
+  }
+}

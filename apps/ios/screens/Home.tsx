@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import { Alert, Linking, Pressable, ScrollView, SectionList, View } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { Banners, Empty, StatusLine, useDebugScroll, useRefresh } from '../chrome';
+import { Banners, Empty, StatusLine, useDebugScroll, useMissionsOnFocus, useRefresh } from '../chrome';
 import { ContextMenu } from '../menu';
 import { HOME_LEGEND, homeRows, homeSections, type HomeRow, cleanMessageText, ANSWERS, isRequest, report, spaced, yesNo } from '@smalltalk/st3-views';
 import type { RootParams } from '../navigation';
@@ -93,6 +93,7 @@ export function HomeScreen() {
 // One attention item: what it asks, who raised it, and what can be done here.
 export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) {
   const { data, busy, status, actions } = useStore();
+  useMissionsOnFocus();
   const found = data.attention.find(candidate => candidate.id === route.params.id);
   // Nothing leaves Home by itself: an update is read when the person says so, never by opening it.
   const kept = useRef(found);
