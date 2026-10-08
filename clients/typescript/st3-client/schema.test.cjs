@@ -245,7 +245,9 @@ test('exact agent subscriptions preserve the selector and reject other collectio
     const [{ Schema, Option }, Rich] = await modules;
     const command = { kind: 'subscribe', id: 'details', collection: 'agents', agent: 'agent/example/worker', limit: 1 };
     const decode = Rich.decodeUnknownSync(Rich.CollectionCommand, 'strict');
-    assert.deepEqual(Schema.encodeSync(Rich.CollectionCommand)(decode(command)), command);
+    assert.deepEqual(Schema.encodeSync(Rich.CollectionCommand)(decode(command)), {
+        ...command, actor: null, person: null, status: null,
+    });
     assert(Option.isNone(decode({ ...command, agent: null }).agent));
     assert(Option.isNone(decode({ ...command, agent: undefined }).agent));
     for (const agent of ['worker', 'person/worker', 'agent/', 'agent/bad id']) {
