@@ -94,6 +94,7 @@ pub async fn run(
         tokio::select! {
             frame = subscription.receiver.recv() => match frame {
                 Some(Frame::Mailbox { messages: next }) => { messages = next; replayed = true; },
+                Some(Frame::Replay { nonce }) => subscription.acknowledge_replay(nonce),
                 Some(Frame::Drain { operation }) => subscription.acknowledge_drain(operation),
                 Some(Frame::Seat { .. }) => {}, // the outer driver owns the PTY title
                 Some(Frame::Fenced { reason }) => anyhow::bail!("{reason}"),

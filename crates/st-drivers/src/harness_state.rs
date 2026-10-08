@@ -843,7 +843,7 @@ pub fn claim(
 /// Run `action` only while `incarnation` and `seq` are the exact current owner of an agent's
 /// harness record. The record lock stays held through the action so a successor cannot claim
 /// between the ownership check and the caller's related publication.
-pub(crate) fn with_current_ownership<T>(
+pub fn with_current_ownership<T>(
     agent_dir: &Path,
     incarnation: &str,
     seq: u64,

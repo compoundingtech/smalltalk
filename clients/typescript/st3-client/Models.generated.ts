@@ -1434,6 +1434,7 @@ export type Snapshot = {
   host_id: HostId;
   id: SnapshotId;
   projection_version: "client-projection.v0";
+  published_at?: Timestamp;
   store_index: number;
 };
 

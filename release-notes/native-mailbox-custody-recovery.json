@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Authenticate native mailbox custody, prove replay recovery and report the declared current harness",
+  "replay": {
+    "status": "changed",
+    "detail": "No full graph replay is requested. Native delivery reconnects replay the existing fenced mailbox snapshot under stable message identities. A negotiated consumer nonce acknowledgment plus an authenticated current native report proves mailbox recovery; it never completes a turn or authorizes task, tool, input or approval replay."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Store initialization adds the local_mailbox_leases table with the complete subject/component/runtime/provider/session/sequence/PID/process-birth/token/epoch/revocation tuple. Numeric schema and checkpoint rules versions are unchanged. This local custody table persists across daemon reopen and is not erased by reinstalling a binary. A second additive local table, local_mailbox_argv_bindings, retains each physically admitted argv capability and its complete captured declaration across daemon reopen. Existing owner/binding tables are unchanged; native leases and argv designations are separate sources."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules version or digest changes. Existing complete-card Source/operator certificates do not cover the new mutable lease source or changed harness/fault oracle; successor source capture and pure helper qualification must use the exact integrating source."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Linux native admission now requires kernel peer identity, current declared provider, exact physical runtime ancestry/generation and current durable provider ownership. Codex cold startup has a separate physical bootstrap discriminator, promoted without token/epoch/PID change after the real provider claim. Replay frames require the mailbox_replay_ack capability; older clients receive existing frames but cannot prove fault recovery without consumer acknowledgment. Other-platform admission retains its existing behavior. Cross-version provider pairings remain unqualified until their own checks; unchanged public card schema does not preserve the old semantic certificate. Bootstrap admission retains the selected daemon creation stamp and daemon/terminal/peer process births and revalidates their exact managed-wrapper or bound direct-parent relationship under the Store writer. Indeterminate physical queries authorize no mutation and return a retryable unavailable error only after durable capability fencing; retired or foreign capabilities remain terminal. Unfenced older typed reports remain explicit legacy liveness for the declared transport, never current native readiness. Exact-current-runtime provider-neutral diagnostic/modal blocks remain visible without granting missing-provider positive activity. Explicit local argv-only agent programs retain their envelope transport under declared member, host, exact physical runtime and process-generation admission, without model-provider custody or native fault-repair proof. Existing qualified or revoked lease history prevents this legacy path from discarding native authority. Authenticated argv designation is persisted with the exact token/subject/component/incarnation/epoch/member tuple and checked against current desired host/declaration on reads, reports and under receipt commit admission, without waiting for reconnect or runtime reconciliation. That capability cannot be reissued or adopted as native custody; unspecified older/protocol-fixture and non-Linux bindings retain their explicit legacy scope."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal Operations daemon/binary deployment applies. Candidate restart-to-API and restart-to-health durations have not been measured. During a live delivery loss the current card shows waiting/indeterminate and the configured owner receives a keyed fault until actual replay recovery is proved."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "A still-current pre-lease capability can be authenticated in place without epoch churn. Opaque same-runtime legacy ownership history does not authorize a fresh takeover, and retired tokens remain terminal. Existing reported outages have no established common historical trigger; unsupported or superseded custody needs its configured owner's normal supported recovery action, rather than token deletion, terminal injection or automatic seat restart."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Authenticated transport reconnect preserves the canonical token/epoch; missing owner metadata can be restored only for that still-current durable lease and existing binding. A dead channel may admit a separately authenticated same-provider/session successor; a captured newer provider owner may take over. Live duplicates, later owners, binding revocation, wrong provider/runtime, terminal completion and intentional stop remain fenced. Roll forward through normal Operations deployment; swapping to a binary that ignores persisted custody is not qualified recovery and does not undo the local schema addition. A surviving authenticated wrapper may advance provider ownership sequence within the exact same session, PID and process birth under the current capability, provider lock and Store writer, preserving token and epoch across re-exec. Different-session takeover requires its own admission; old or retired capabilities never regain authority. Codex live observations defer only the matching owned terminal event until the actual provider task returns, preserving its success or failure and the bound physical shell. Observation and delivery ticks stop after that exact completion announcement; foreign token, runtime and invocation fences remain fatal while completion is pending. Mailbox snapshots only read and capture maintenance identities. A bounded background actor closes one attributed own-post wake per committed command with current capability and exact subject-head checks; it never records a native receipt. Captured card faults use one same-cut statement with a short child read budget and fail instead of returning a partial/current result when unavailable."
+  }
+}
