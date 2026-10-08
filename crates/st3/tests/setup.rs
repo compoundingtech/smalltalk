@@ -160,6 +160,13 @@ fn harness_probe_uses_login_path_order_and_flags_without_starting_a_seat() {
     let missing = fixture.setup_config_only(&["--harness", "claude"]);
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("not installed on the daemon's login PATH"));
+    let claude = fixture.path("bin/claude");
+    fs::write(&claude, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    let inline = success(&fixture.setup_config_only(&["--harness", "claude", "--claude-channel", "false"]));
+    assert_eq!(inline.matches("Selected harness: claude").count(), 1);
+    assert!(inline.contains("inline server:st3 development channel"));
+    assert!(!fixture.path("home/.claude/plugins").exists());
     assert!(!fixture.path("home/.local/state/st3/claims.sqlite3").exists());
 }
 
@@ -356,4 +363,173 @@ fn plain_st_first_run_asks_names_starts_daemon_and_opens_home() {
             .unwrap();
     assert_eq!(table["person"].as_str(), Some("person/ada"));
     assert_eq!(table["node"].as_str(), Some("studio"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onboarding_publication_is_graph_decided_and_preserves_stopped_expert() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let state_dir = fixture.path("home/.local/state/st3");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        fixture.path("home/.config/st3/config.toml"),
+        "node = 'studio'\n",
+    )
+    .unwrap();
+    let store = std::sync::Arc::new(
+        st3::store::Store::open(&state_dir.join("claims.sqlite3"), "studio").unwrap(),
+    );
+    let state = st3::api::AppState {
+        store: store.clone(),
+        notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+        event_notify: tokio::sync::watch::channel(0_u64).0,
+        node: "studio".into(),
+        state_dir: state_dir.clone(),
+        pty_root: state_dir.join("pty"),
+        pty_binary: "pty".into(),
+        fleet_id: None,
+        configured_peers: Vec::new(),
+        client_relay: None,
+        native_session_home: None,
+        planner_default: Default::default(),
+    };
+    // These declarations use a simulated provider; no host provider or daemon is touched.
+    let router = st3::api::router(state).layer(axum::middleware::from_fn(
+        |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            if request.uri().path() == "/v1/harnesses" {
+                return axum::response::IntoResponse::into_response(axum::Json(
+                    serde_json::json!({
+                        "api_version": "st3.v1", "value": ["codex"]
+                    }),
+                ));
+            }
+            next.run(request).await
+        },
+    ));
+    let socket = fixture.path("run/st3.sock");
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, router).await });
+    let client = st3::client::Client::unix(&socket);
+    for _ in 0..100 {
+        if client.get::<serde_json::Value>("/v1/health").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let setup = || {
+        let mut command = fixture.cli();
+        command.args([
+            "setup",
+            "--person",
+            "ada",
+            "--node",
+            "studio",
+            "--yes",
+            "--install",
+            "false",
+            "--service",
+            "false",
+            "--start",
+            "false",
+        ]);
+        command
+    };
+    let run = |mut command: Command| async move {
+        tokio::task::spawn_blocking(move || command.output().unwrap())
+            .await
+            .unwrap()
+    };
+    let (first, simultaneous) = tokio::join!(run(setup()), run(setup()));
+    let text = success(&first) + &success(&simultaneous);
+    assert!(text.contains("Started mission/st/onboarding"), "{text}");
+    let history: serde_json::Value = client
+        .get("/v1/mission-overview?mission=st%2Fonboarding")
+        .await
+        .unwrap();
+    assert_eq!(history["total_runs"], 1);
+    let initial = store.mission_run("st/onboarding").unwrap().unwrap();
+    assert_eq!(initial.requester, "person/ada");
+    let token = store
+        .selected_desired_token("agent/st/expert")
+        .unwrap()
+        .unwrap();
+    let claim: st3::model::ClaimRecord = client
+        .get(&format!("/v1/claims/by-id/{token}"))
+        .await
+        .unwrap();
+    assert_eq!(claim.actor.as_deref(), Some("person/ada"));
+    let declarations = store.desired_subjects().unwrap();
+    let expert = declarations
+        .iter()
+        .find(|subject| subject.subject == "agent/st/expert")
+        .unwrap();
+    assert!(
+        serde_json::to_string(expert)
+            .unwrap()
+            .contains("--dangerously-bypass-approvals-and-sandbox")
+    );
+    let guides: st3::model::DocumentListResponse = client
+        .get("/v1/documents?name=doc%2Fst%2Fguide")
+        .await
+        .unwrap();
+    assert_eq!(guides.items.len(), 1);
+    let spec = store
+        .mission_spec("st/onboarding", Some(&initial.revision))
+        .unwrap()
+        .unwrap();
+    assert!(
+        spec.constraints
+            .iter()
+            .any(|constraint| constraint.contains(&guides.items[0].hash))
+    );
+    let mut stop = fixture.cli();
+    stop.args(["agents", "stop", "agent/st/expert", "--as", "person/ada"]);
+    success(&run(stop).await);
+    let stopped = store.selected_desired_token("agent/st/expert").unwrap();
+    let mut cancel = fixture.cli();
+    cancel.args([
+        "missions",
+        "cancel",
+        "mission-run/st/onboarding",
+        "--reason",
+        "fixture completed",
+        "--as",
+        "person/ada",
+    ]);
+    success(&run(cancel).await);
+    // This API fixture has no reconciler to finish cancellation cleanup.
+    store
+        .set_mission_run_state(
+            "st/onboarding",
+            "cancelled",
+            "terminal",
+            Some("fixture cleanup completed"),
+        )
+        .unwrap();
+    let index = store.index().unwrap();
+    success(&run(setup()).await);
+    assert_eq!(
+        store.selected_desired_token("agent/st/expert").unwrap(),
+        stopped
+    );
+    assert_eq!(
+        store.index().unwrap(),
+        index,
+        "ordinary setup must not resurrect the expert or restart finished onboarding"
+    );
+    let mut rerun = setup();
+    rerun.arg("--onboarding");
+    assert!(success(&run(rerun).await).contains("Started mission/st/onboarding"));
+    let history: serde_json::Value = client
+        .get("/v1/mission-overview?mission=st%2Fonboarding")
+        .await
+        .unwrap();
+    assert_eq!(history["total_runs"], 2);
+    assert_ne!(
+        store.selected_desired_token("agent/st/expert").unwrap(),
+        stopped
+    );
+    server.abort();
 }

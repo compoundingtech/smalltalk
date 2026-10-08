@@ -43,11 +43,15 @@ pub struct SetupArgs {
     /// Install the user-owned Claude channel (default: true; never installs policy).
     #[arg(long, action = clap::ArgAction::Set)]
     pub claude_channel: Option<bool>,
+    /// Start onboarding again, including a stopped built-in expert.
+    #[arg(long)]
+    pub onboarding: bool,
 }
 
 pub struct PreparedSetup {
     pub config: Config,
     pub harness: Option<String>,
+    pub initial_subject: Option<String>,
 }
 
 fn interactive() -> bool {
@@ -65,11 +69,11 @@ fn require_person_process() -> Result<()> {
 }
 
 /// Called before entering the TUI runtime. Remote paired-client dispatch skips this.
-pub fn prepare_plain_ui() -> Result<()> {
+pub fn prepare_plain_ui() -> Result<Option<String>> {
     require_person_process()?;
     anyhow::ensure!(interactive(), "interactive setup needs a terminal");
     if st3_client::device::Profile::load(&st3_client::device::profile_path()?)?.is_some() {
-        return Ok(());
+        return Ok(None);
     }
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -78,7 +82,7 @@ pub fn prepare_plain_ui() -> Result<()> {
             let mut config = Config::load_with_fleet(None)?;
             crate::node_identity::resolve(&mut config)?;
             if config.person.is_none() {
-                run(SetupArgs::default()).await?;
+                return Ok(run(SetupArgs::default()).await?.initial_subject);
             } else if !daemon_ready(&config).await
                 && ask_bool(
                     "The st daemon is not running. Start it?",
@@ -96,7 +100,15 @@ pub fn prepare_plain_ui() -> Result<()> {
                 )
                 .await?;
             }
-            Ok(())
+            if daemon_ready(&config).await && !crate::onboarding::has_run(&config).await? {
+                let harness =
+                    prepare_harness(&config, &std::env::current_exe()?, &SetupArgs::default())
+                        .await?;
+                if let Some(harness) = harness {
+                    return crate::onboarding::start(&config, &harness, false).await;
+                }
+            }
+            Ok(None)
         })
 }
 
@@ -188,8 +200,30 @@ pub async fn run(args: SetupArgs) -> Result<PreparedSetup> {
         println!("Configuration saved; the daemon remains stopped.");
     }
     let harness = prepare_harness(&config, &executable, &args).await?;
+    let initial_subject = if let Some(harness) = &harness {
+        if daemon_ready(&config).await {
+            crate::onboarding::start(&config, harness, args.onboarding).await?
+        } else {
+            anyhow::ensure!(
+                !args.onboarding,
+                "rerunning onboarding needs a running daemon; pass --start true"
+            );
+            println!("Start the st daemon and run st setup to begin onboarding.");
+            None
+        }
+    } else {
+        anyhow::ensure!(
+            !args.onboarding,
+            "rerunning onboarding needs an installed harness"
+        );
+        None
+    };
     println!("Your agents run without permission prompts inside their own workspaces.");
-    Ok(PreparedSetup { config, harness })
+    Ok(PreparedSetup {
+        config,
+        harness,
+        initial_subject,
+    })
 }
 
 async fn prepare_harness(
@@ -265,7 +299,11 @@ async fn prepare_harness(
             true,
         )?;
         if !install {
-            return Ok(fallback_harness(&found));
+            println!(
+                "Claude user plugin installation skipped; seats use the inline server:st3 development channel. Provider or organization channel restrictions still apply."
+            );
+            println!("Selected harness: {chosen}");
+            return Ok(Some(chosen));
         }
         // CLI plugin commands must see the same account login environment as the daemon.
         let environment = crate::environment::snapshot()?;

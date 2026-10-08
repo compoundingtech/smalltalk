@@ -74,6 +74,7 @@ pub mod sekrets;
 pub mod service;
 /// First-run configuration and human-only daemon startup.
 pub mod setup;
+pub mod onboarding;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
 pub mod startup;
