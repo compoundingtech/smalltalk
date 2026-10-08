@@ -81,9 +81,9 @@ const ROSTER_CONNECT_SNAPSHOT: &str = "agents roster connect+snapshot";
 const ROSTER_BUDGET: Duration = Duration::from_millis(300);
 
 /// The statements a cold full roster rebuild may run per agent card. Main ran about 23 per card
-/// on 2026-10-08, reading each agent's status inputs one agent at a time; reading them a chunk
-/// of agents at a time leaves about 12, all in the per-card loop.
-const COLD_ROSTER_STATEMENTS_PER_CARD: u64 = 12;
+/// on 2026-10-08, reading each agent's inputs one agent at a time; reading them a chunk of
+/// agents at a time, it runs 866 for 3,011 cards (0.29 per card).
+const COLD_ROSTER_STATEMENTS_PER_CARD: f64 = 0.33;
 
 /// Held by each test that measures the whole process, its CPU or its statements, so that one
 /// does not count the other's work when both run in one test process.
@@ -326,7 +326,7 @@ fn a_cold_roster_rebuild_reads_the_fleet_in_few_statements() {
     let (cards, statements) = rounds[rounds.len() - 1];
     assert!(cards > 0, "the generated store has no agent cards");
     assert!(
-        statements <= COLD_ROSTER_STATEMENTS_PER_CARD * cards as u64,
+        statements as f64 <= COLD_ROSTER_STATEMENTS_PER_CARD * cards as f64,
         "a cold roster rebuild ran {statements} statements for {cards} cards, more than \
          {COLD_ROSTER_STATEMENTS_PER_CARD} per card"
     );
