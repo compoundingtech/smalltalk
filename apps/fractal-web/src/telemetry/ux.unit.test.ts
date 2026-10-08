@@ -19,12 +19,35 @@ const harness = () => {
   } })
   let at = 0
   const paints = new Set<() => void>()
-  const ux = makeUxTelemetry({ tracer: () => tracer, now: () => at, timeOrigin: 0, paint: (callback) => { paints.add(callback); return () => { paints.delete(callback) } } })
-  return { ux, snapshot: () => { vi.advanceTimersByTime(250); return ring.getSnapshot() }, ended, time: (value: number) => { at = value }, paint: () => { const callbacks = [...paints]; paints.clear(); for (const callback of callbacks) callback() } }
+  const ready = vi.fn()
+  const ux = makeUxTelemetry({ tracer: () => tracer, now: () => at, timeOrigin: 0, paint: (callback) => { paints.add(callback); return () => { paints.delete(callback) } }, onFirstPaint: ready })
+  return { ux, ready, snapshot: () => { vi.advanceTimersByTime(250); return ring.getSnapshot() }, ended, time: (value: number) => { at = value }, paint: () => { const callbacks = [...paints]; paints.clear(); for (const callback of callbacks) callback() } }
 }
 
 afterEach(() => vi.useRealTimers())
 describe('bounded perceived UX', () => {
+  it.each(['shellCommitted', 'rosterCommitted'] as const)('does not release startup transport until %s has painted', (commit) => {
+    const h = harness()
+    expect(h.ux.activeSpan()).toBeDefined()
+    expect(h.ux.traceContext()?.traceparent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/)
+    expect(h.ready).not.toHaveBeenCalled()
+    h.ux[commit]()
+    expect(h.ready).not.toHaveBeenCalled()
+    h.paint()
+    expect(h.ready).toHaveBeenCalledOnce()
+    h.ux.dispose()
+  })
+  it('cancels readiness with an abandoned commit or disposed page', () => {
+    const h = harness()
+    const cancel = h.ux.shellCommitted()
+    cancel()
+    h.paint()
+    expect(h.ready).not.toHaveBeenCalled()
+    h.ux.rosterCommitted()
+    h.ux.dispose()
+    h.paint()
+    expect(h.ready).not.toHaveBeenCalled()
+  })
   it('ends reload on visible roster, measuring the q96 shell-to-roster budget', () => {
     const h = harness()
     h.time(25); h.ux.shellCommitted(); h.paint()

@@ -77,6 +77,31 @@ The shared views have no React, React Native, Expo or native key-store dependenc
 return `person`/`green` color tokens; map them through your palette. Pass your product name,
 version and build to `clientName`, and a device label to `signatureRefusal` if desired.
 
+## Fractal web browser telemetry
+
+Browser trace export is opt-in. Set `VITE_OTLP_TRACES_URL` to the complete OTLP/HTTP
+traces endpoint when building the Fractal web app with Vite (or in its Vite `.env`
+file). For example, a deployment build can set
+`VITE_OTLP_TRACES_URL=https://collector.example.test/v1/traces`. Vite embeds this
+public URL in the browser bundle; changing it requires rebuilding the bundle.
+The collector must accept browser OTLP/JSON requests and allow the app origin
+through CORS. Do not put credentials in this public configuration.
+
+With the key unset or blank, the browser installs no exporter and sends no OTLP
+requests. In-process tracing remains available. Configured deployments retain
+100% dogfood sampling. The app server does not proxy OTLP requests.
+
+Tracing and the mandatory first-frame context are captured synchronously. When a collector
+is configured, exporter construction and its flush timer normally wait until the committed
+shell or observed roster has painted. A ten-second timeout, foreground visibility change,
+startup error or pagehide releases that gate if no paint arrives. Up to 256 completed startup
+spans are kept in memory and handed to the exporter with their original trace identities and
+timestamps; spans still open at that boundary are exported when they end. Early pagehide or
+shutdown initializes the same exporter once and drains the startup buffer instead of dropping
+it. Shutdown initialization, already-started pagehide transport and the native final flush
+share one absolute one-second deadline; the native flush receives only the time remaining
+after the manual transport drain. The independently demanded session-trace provider remains lazy.
+
 ## Connect, follow and send
 
 Rust local clients use `Client::unix` or `unix_as`. A paired Unix gateway uses `unix_gateway`;

@@ -12,7 +12,7 @@
  * The tracer is teed into an in-memory `SpanRing` for the dev perf panel and, when an OTLP URL is
  * given, exported as OTLP/JSON via `fetch` to a same-origin path (dev: Vite proxy → collector).
  */
-import { Context, Effect, Exit, FiberSet, Layer, Option, Tracer } from 'effect'
+import { Context, Deferred, Effect, Exit, FiberSet, Layer, Option, Scope, Tracer } from 'effect'
 import * as FetchHttpClient from 'effect/http/FetchHttpClient'
 import * as OtlpExporter from 'effect/observability/OtlpExporter'
 import * as OtlpSerialization from 'effect/observability/OtlpSerialization'
@@ -49,7 +49,7 @@ export interface TelemetryOptions {
 export interface Telemetry {
   readonly ring: SpanRing
   readonly ux: UxTelemetry
-  /** Provides the teed `Tracer` (and OTLP exporter when configured). */
+  /** Provides the synchronous teed `Tracer`; OTLP starts only after a shell/roster paint. */
   readonly layer: Layer.Layer<never>
   /** Root `React.Profiler` callback: marks commits so interactions can measure commit latency. */
   readonly onCommit: React.ProfilerOnRenderCallback
@@ -67,6 +67,11 @@ interface PendingInteraction {
   commitPaintAt: number | undefined
   /** Paint after the input event itself; used when no commit was observed. */
   eventPaintAt: number | undefined
+}
+
+interface EarlySpanCapture {
+  readonly span: Tracer.Span
+  readonly events: ReadonlyArray<Parameters<Tracer.Span['event']>> | undefined
 }
 
 // Never export free-form data-perf-target, DOM IDs, selected refs or accessible text.
@@ -157,8 +162,69 @@ const supportsEntryType = (type: string) => PerformanceObserver.supportedEntryTy
 export const makeTelemetry = (options: TelemetryOptions): Telemetry => {
   const { otlpTracesUrl } = options
   const ring = makeSpanRing()
-  let tracer: Tracer.Tracer = Tracer.nativeTracer
+  const ready = Deferred.makeUnsafe<void>()
+  // Keep the first startup spans, rather than a rolling tail that could evict first-frame roots.
+  const earlySpans: EarlySpanCapture[] = []
+  const earlySpanLimit = 256
+  let exporter: Tracer.Tracer | undefined
+  let disposed = false
   let flush: (() => void) | undefined
+  let flushRequested = false
+  let shutdownRequested = false
+  let closeExporter: (() => void) | undefined
+
+  /** Replay only pre-exporter spans, retaining the IDs already propagated to the SDK/gateway. */
+  const exportEarlySpan = ({ span, events }: EarlySpanCapture, target: Tracer.Tracer) => {
+    if (span.status._tag !== 'Ended') return
+    const replay = target.span({
+      name: span.name,
+      parent: span.parent,
+      annotations: span.annotations,
+      links: Array.from(span.links),
+      startTime: span.status.startTime,
+      kind: span.kind,
+      root: Option.isNone(span.parent),
+      sampled: span.sampled,
+    })
+    // OTLP generates IDs lazily. Fix the public identity before its end/serialization, without
+    // depending on Effect's private span fields or re-parenting independent first-frame roots.
+    Object.defineProperties(replay, {
+      traceId: { value: span.traceId },
+      spanId: { value: span.spanId },
+    })
+    for (const [key, value] of span.attributes) replay.attribute(key, value)
+    if (events !== undefined)
+      for (const [name, at, attributes] of events) replay.event(name, at, attributes)
+    replay.end(span.status.endTime, span.status.exit)
+  }
+
+  // This tracer is available before Layer.build and never changes identity. Spans that start
+  // before readiness still end into the eventual exporter, even if they remain open at paint.
+  const deferredTracer = Tracer.make({
+    span(spanOptions) {
+      if (otlpTracesUrl === undefined || disposed || !spanOptions.sampled)
+        return Tracer.nativeTracer.span(spanOptions)
+      if (exporter !== undefined) return exporter.span(spanOptions)
+      const span = Tracer.nativeTracer.span(spanOptions)
+      // Tracer.Span exposes event(), not an events read model. Capture through that public API;
+      // production replaces it with a no-op in the tee, so it needs no event buffer at all.
+      const events: Array<Parameters<Tracer.Span['event']>> | undefined = options.production ? undefined : []
+      if (events !== undefined) {
+        span.event = (...event) => {
+          if (events.length < 64) events.push(event)
+        }
+      }
+      const captured: EarlySpanCapture = { span, events }
+      const end = span.end.bind(span)
+      span.end = (at, exit) => {
+        end(at, exit)
+        if (disposed) return
+        if (exporter !== undefined) exportEarlySpan(captured, exporter)
+        else if (earlySpans.length < earlySpanLimit) earlySpans.push(captured)
+      }
+      return span
+    },
+  })
 
   /** Wraps a tracer so every ended span is also pushed into the ring. */
   const tee = (inner: Tracer.Tracer): Tracer.Tracer =>
@@ -209,9 +275,14 @@ export const makeTelemetry = (options: TelemetryOptions): Telemetry => {
       },
       ...(inner.context === undefined ? {} : { context: inner.context }),
     })
-  tracer = tee(Tracer.nativeTracer)
+  const tracer = tee(deferredTracer)
   let ux: UxTelemetry | undefined
-  const getUx = () => ux ??= makeUxTelemetry({ tracer: () => tracer })
+  const getUx = () => ux ??= makeUxTelemetry({
+    tracer: () => tracer,
+    onFirstPaint: () => {
+      if (!disposed) Deferred.doneUnsafe(ready, Effect.void)
+    },
+  })
 
   const resource = {
     serviceName,
@@ -227,36 +298,65 @@ export const makeTelemetry = (options: TelemetryOptions): Telemetry => {
 
   const layer: Layer.Layer<never> =
     otlpTracesUrl === undefined
-      ? Layer.effect(
-          Tracer.Tracer,
-          Effect.sync(() => {
-            tracer = tee(Tracer.nativeTracer)
-            return tracer
-          }),
-        )
+      ? Layer.succeed(Tracer.Tracer, tracer)
       : Layer.effect(
           Tracer.Tracer,
           Effect.gen(function* () {
-            const otlp = yield* OtlpTracer.make({
-              url: otlpTracesUrl,
-              resource,
-              exportInterval: '1 second',
-              // Production spans contain only bounded fields: small batches leave room within
-              // fetch's 64KiB keepalive quota, including the hidden/pagehide vitals summary.
-              maxBatchSize: options.production ? 16 : 128,
-            })
-            const flusher = yield* OtlpExporter.Flusher
-            const fibers = yield* FiberSet.make<void, never>()
-            const run = yield* FiberSet.runtime(fibers)<never>()
-            flush = () => {
-              run(flusher.flush.pipe(Effect.timeoutOption('1 second')))
+            const scope = yield* Scope.Scope
+            const exporterScope = yield* Scope.make()
+            let shutdownDeadline = 0
+            // Effect reads a DurationObject when its sleep executes, not when the exporter is
+            // constructed. Both sequential finalizers therefore consume the same remaining time.
+            const shutdownTimeout = {
+              get milliseconds() { return Math.max(0, shutdownDeadline - performance.now()) },
             }
-            yield* Effect.addFinalizer(() =>
-              Effect.sync(() => {
-                flush = undefined
-              }),
+            const initialize = yield* Effect.cached(Effect.gen(function* () {
+              const otlp = yield* OtlpTracer.make({
+                url: otlpTracesUrl,
+                resource,
+                exportInterval: '1 second',
+                shutdownTimeout,
+                maxBatchSize: options.production ? 16 : 128,
+              })
+              const flusher = yield* OtlpExporter.Flusher
+              const fibers = yield* FiberSet.make<void, never>()
+              yield* Effect.addFinalizer(() =>
+                FiberSet.awaitEmpty(fibers).pipe(Effect.timeoutOption(shutdownTimeout), Effect.asVoid),
+              )
+              const run = yield* FiberSet.runtime(fibers)<never>()
+              exporter = otlp
+              flush = () => { run(flusher.flush.pipe(Effect.timeoutOption('1 second'))) }
+              for (const span of earlySpans) exportEarlySpan(span, otlp)
+              earlySpans.length = 0
+              if (flushRequested) flush()
+            }).pipe(
+              Effect.provideService(Scope.Scope, exporterScope),
+              Effect.uninterruptible,
+            ))
+            const shutdown = yield* Effect.cached(Effect.gen(function* () {
+              // Initialization, manual drain and native final flush share one absolute deadline.
+              shutdownDeadline = performance.now() + 1000
+              yield* initialize
+              yield* Scope.close(exporterScope, Exit.void)
+              flush = undefined
+              exporter = undefined
+              closeExporter = undefined
+              earlySpans.length = 0
+            }).pipe(Effect.uninterruptible))
+            const services = yield* Effect.context<Effect.Services<typeof shutdown>>()
+            closeExporter = () => { Effect.runForkWith(services)(shutdown) }
+            // Normal startup remains paint-gated. Hidden tabs and failed startup still get a
+            // bounded fallback; teardown shares this initializer instead of dropping its buffer.
+            yield* Effect.raceFirst(Deferred.await(ready), Effect.sleep('10 seconds')).pipe(
+              Effect.andThen(Effect.suspend(() => shutdownRequested ? shutdown : initialize)),
+              Effect.forkIn(scope),
             )
-            tracer = tee(otlp)
+            yield* Effect.addFinalizer(() => {
+              ux?.dispose()
+              disposed = true
+              shutdownRequested = true
+              return shutdown
+            })
             return tracer
           }),
         ).pipe(
@@ -481,18 +581,28 @@ export const makeTelemetry = (options: TelemetryOptions): Telemetry => {
           ...(vitals.lcpMs === undefined ? {} : { 'wf.vitals.lcp_ms': vitals.lcpMs }),
         },
       })
+      flushRequested = true
+      Deferred.doneUnsafe(ready, Effect.void)
       flush?.()
     }
     window.addEventListener('pagehide', onPageHide)
     const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') Deferred.doneUnsafe(ready, Effect.void)
       if (document.visibilityState === 'hidden') onPageHide()
     }
     document.addEventListener('visibilitychange', onVisibilityChange)
+    const onStartupError = () => { Deferred.doneUnsafe(ready, Effect.void) }
+    window.addEventListener('error', onStartupError)
+    window.addEventListener('unhandledrejection', onStartupError)
 
     uninstall = () => {
       uninstall = undefined
       for (const timer of timers.values()) clearTimeout(timer)
       ux?.dispose()
+      disposed = true
+      shutdownRequested = true
+      Deferred.doneUnsafe(ready, Effect.void)
+      closeExporter?.()
       timers.clear()
       for (const cancel of paints) cancel()
       paints.clear()
@@ -501,6 +611,8 @@ export const makeTelemetry = (options: TelemetryOptions): Telemetry => {
         window.removeEventListener(type, onInteraction, { capture: true })
       window.removeEventListener('pagehide', onPageHide)
       document.removeEventListener('visibilitychange', onVisibilityChange)
+      window.removeEventListener('error', onStartupError)
+      window.removeEventListener('unhandledrejection', onStartupError)
       for (const observer of observers) observer.disconnect()
     }
     return uninstall

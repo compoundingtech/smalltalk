@@ -45,12 +45,14 @@ export interface UxTelemetry {
 }
 
 /** Always-sampled, bounded roots. Identifiers remain only in local matching state, never attributes. */
-export const makeUxTelemetry = ({ tracer, now = () => performance.now(), timeOrigin = performance.timeOrigin, paint = afterNextPaint, deadlineMs = 30_000 }: {
+export const makeUxTelemetry = ({ tracer, now = () => performance.now(), timeOrigin = performance.timeOrigin, paint = afterNextPaint, deadlineMs = 30_000, onFirstPaint }: {
   readonly tracer: () => Tracer.Tracer
   readonly now?: () => number
   readonly timeOrigin?: number
   readonly paint?: (callback: () => void) => () => void
   readonly deadlineMs?: number
+  /** Starts deferred transport only after the committed shell or observed roster is painted. */
+  readonly onFirstPaint?: () => void
 }): UxTelemetry => {
   const nanos = (ms: number) => BigInt(Math.round((timeOrigin + ms) * 1_000_000))
   const operations = new Set<Operation>()
@@ -101,8 +103,8 @@ export const makeUxTelemetry = ({ tracer, now = () => performance.now(), timeOri
   return {
     activeSpan: current,
     traceContext: () => { const span = current(); return span === undefined ? undefined : { traceparent: `00-${span.traceId}-${span.spanId}-${span.sampled ? '01' : '00'}` } },
-    shellCommitted: () => onPaint(() => { shellAt ??= now(); reload.span.attribute('wf.ux.shell_ms', shellAt); finishReload() }),
-    rosterCommitted: () => onPaint(() => { rosterAt ??= now(); finishReload() }),
+    shellCommitted: () => onPaint(() => { shellAt ??= now(); reload.span.attribute('wf.ux.shell_ms', shellAt); finishReload(); onFirstPaint?.() }),
+    rosterCommitted: () => onPaint(() => { rosterAt ??= now(); finishReload(); onFirstPaint?.() }),
     beginSwitch: ({ ref, warm, slotCount }) => {
       switching?.data.finish('superseded')
       switching?.root.finish('superseded')

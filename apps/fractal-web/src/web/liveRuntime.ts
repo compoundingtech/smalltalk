@@ -4,10 +4,10 @@ import { liveSource } from '../data/liveSource.ts'
 import { makeTelemetry } from '../telemetry/browser.ts'
 
 /** Page-owned scopes survive React Fast Refresh; a full navigation owns teardown. */
-const createPageRuntime = () => {
+export const createPageRuntime = () => {
   // Dogfood records 100% of pages: budget roots and their SDK detail cannot disappear at 10%.
   const telemetry = makeTelemetry({
-    otlpTracesUrl: `${window.location.origin}/otlp/v1/traces`,
+    otlpTracesUrl: import.meta.env.VITE_OTLP_TRACES_URL?.trim() || undefined,
     production: !import.meta.env.DEV,
     resourceAttributes: {
       'service.version': buildIdentity.machineVersion,
@@ -16,6 +16,9 @@ const createPageRuntime = () => {
       'wf.rum.sampling': 'dogfood-all',
     },
   })
+  // Capture the mandatory reload root and its trace context synchronously, before SDK adoption
+  // of the early roster socket. This does not create an exporter or wait for a committed paint.
+  const ux = telemetry.ux
   // Observer lifetime is the live source's SDK scope, not a React effect or another runtime.
   const telemetryLayer = Layer.effectDiscard(
     Effect.acquireRelease(
@@ -29,11 +32,11 @@ const createPageRuntime = () => {
     options: {
       baseUrl: window.location.origin, maxFollows: 8, conversationSlots: 'advertised',
       adoptEarlyCollections: true,
-      parentSpan: () => telemetry.ux.activeSpan(),
-      traceContext: () => telemetry.ux.traceContext(),
+      parentSpan: ux.activeSpan,
+      traceContext: ux.traceContext,
     },
     telemetryLayer,
-    ux: () => telemetry.ux,
+    ux: () => ux,
   })
   return { live, telemetry }
 }
