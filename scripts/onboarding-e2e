@@ -84,7 +84,24 @@ print(json.dumps({"argv":request["argv"],"exit":proc.returncode,"frame":frame,
 SCENARIOS = ("baseline", "setup", "first-run", "no-harness", "claude-policy-absent",
     "claude-policy-present", "codex", "both", "no-gh", "gh-logged-out", "gh-broken",
     "no-manager", "hostname-localhost", "hostname-spaces", "hostname-long",
-    "existing-store", "linger-on", "linger-off", "expert-lifecycle", "claude-pre-channel")
+    "existing-store", "linger-on", "linger-off", "expert-lifecycle", "claude-pre-channel", "small-machine", "small-machine-512m")
+
+SMALL_MEMORY={"small-machine":1024**3,"small-machine-512m":512*1024**2}
+
+CACHE_PROBE=r'''
+import json,shlex,subprocess
+from pathlib import Path
+def systemctl(*args):
+ return subprocess.check_output(["systemctl","--user",*args,"st3.service"],text=True)
+pid=int(systemctl("show","--property=MainPID","--value").strip())
+assert pid>0,"daemon service has no MainPID"
+unit_env=dict(item.split("=",1) for item in shlex.split(systemctl("show","--property=Environment","--value")) if "=" in item)
+daemon_env=dict(item.split(b"=",1) for item in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0") if b"=" in item)
+key="SMALLCLAIMS_READ_CACHE_KIB"
+value=daemon_env.get(key.encode())
+print(json.dumps({"pid":pid,"unit_cache_kib":unit_env.get(key),"daemon_cache_kib":value.decode() if value is not None else None,
+ "unit_has_cache_directive":any(line.startswith("Environment=") and key+"=" in line for line in systemctl("cat").splitlines())}))
+'''
 
 def command(argv, **kwargs):
     return subprocess.run(argv, capture_output=True, **kwargs)
@@ -94,6 +111,7 @@ class Machine:
         self.args,self.ubuntu,self.scenario=args,ubuntu,scenario
         self.name="st-onboarding-"+uuid.uuid4().hex[:12]
         self.created=False
+        self.memory_bytes=SMALL_MEMORY.get(scenario,3*1024**3) if args.backend!="external" else None
         # Avoid sharing the host developer's per-UID inotify quota in Docker.
         self.uid=42420
 
@@ -144,7 +162,8 @@ class Machine:
                     r=command(["docker","build","--build-arg","UBUNTU="+self.ubuntu,"-t",image,d],timeout=300)
                     if r.returncode: raise RuntimeError(r.stderr.decode(errors="replace"))
             hostname={"hostname-localhost":"localhost","hostname-long":"x"*63}.get(self.scenario,"studio")
-            argv=["docker","run","-d","--name",self.name,"--hostname",hostname,"--cpus","2","--memory","3g"]
+            memory={"small-machine":"1g","small-machine-512m":"512m"}.get(self.scenario,"3g")
+            argv=["docker","run","-d","--name",self.name,"--hostname",hostname,"--cpus","2","--memory",memory]
             if self.scenario=="no-manager": argv += [image,"sleep","infinity"]
             else: argv += ["--privileged","--cgroupns=private","--tmpfs","/run","--tmpfs","/run/lock",image]
             r=command(argv,timeout=60)
@@ -223,6 +242,20 @@ def restart_requested(result,subject):
     waiting=f"st: `{subject}` restarted and is waiting for your input; attach with `st terminals attach {subject}`"
     return result["exit"]==0 or (result["exit"]==2 and result["stderr"].strip()==waiting)
 
+def cache_state_matches(state,override):
+    fields={"pid","unit_cache_kib","daemon_cache_kib","unit_has_cache_directive"}
+    expected=str(override) if override is not None else None
+    return isinstance(state,dict) and fields<=state.keys() and type(state["pid"]) is int and state["pid"]>0 and (
+        state["unit_cache_kib"]==expected and state["daemon_cache_kib"]==expected and state["unit_has_cache_directive"] is (override is not None))
+
+def reader_cache_target(report):
+    if not isinstance(report,dict) or not isinstance(report.get("checks"),list): return None
+    if any(c.get("status")=="fail" for c in report["checks"]): return None
+    checks=[c for c in report["checks"] if c.get("name")=="reader-memory"]
+    if len(checks)!=1: return None
+    match=re.search(r"per-reader cache target ([1-9][0-9]*) KiB",checks[0].get("message",""))
+    return int(match.group(1)) if match else None
+
 class Run:
     def __init__(self,machine,out,archive,metadata):
         self.m,self.out,self.archive,self.metadata=machine,out,archive,metadata
@@ -241,7 +274,7 @@ class Run:
 
     def save(self):
         result={"ubuntu":self.m.ubuntu,"scenario":self.m.scenario,"backend":self.m.args.backend,
-            "machine":self.m.name,"fixture_uid":self.m.uid,"archive":self.metadata,"checks":self.checks,"commands":self.commands}
+            "machine":self.m.name,"fixture_uid":self.m.uid,"memory_bytes":self.m.memory_bytes,"archive":self.metadata,"checks":self.checks,"commands":self.commands}
         (self.out/"result.json").write_text(json.dumps(result,indent=2)+"\n")
         lines=[f"# Onboarding: {self.m.ubuntu} / {self.m.scenario}","",f"Archive SHA256: `{self.metadata['sha256']}`.",""]
         lines += [f"- **{c['status']}** `{c['id']}`: {c['detail']}" for c in self.checks]
@@ -320,6 +353,9 @@ class Run:
     def setup(self):
         if not self.install(False): return
         scenario=self.m.scenario
+        if scenario in SMALL_MEMORY:
+            r=self.execute("Small-machine memory limit","cat /sys/fs/cgroup/memory.max")
+            if not self.check("small-machine-memory-limit",r["exit"]==0 and r["stdout"].strip()==str(self.m.memory_bytes),f"visible cgroup memory.max is exactly {self.m.memory_bytes//1024**2} MiB"): return
         if scenario in ("gh-logged-out","gh-broken"):
             body="#!/bin/sh\necho 'fixture gh unavailable' >&2\nexit "+("127" if scenario=="gh-broken" else "1")+"\n"
             self.execute("Logged-out/broken gh fixture","mkdir -p ~/.local/bin; printf %s "+shlex.quote(body)+" > ~/.local/bin/gh; chmod +x ~/.local/bin/gh")
@@ -382,11 +418,13 @@ class Run:
         r=self.cli("Doctor without development tools","doctor")
         self.check("doctor-healthy",r["exit"]==0 and not re.search(r"^fail\b",self.output(r),re.M),"ordinary doctor healthy")
         self.check("doctor-user-tools",not re.search(r"^warn.*(cargo|rustc|nix|sccache|mold|gh\b)",self.output(r),re.M|re.I),"no irrelevant tool warnings")
+        if scenario in SMALL_MEMORY: self.small_machine_checks(text)
+        elif scenario=="setup" and self.m.args.backend=="docker": self.default_cache_checks("Initial default-size daemon")
         if scenario!="no-manager" and "Linger=yes" not in self.output(self.execute("Lingering status","loginctl show-user ada -p Linger")):
             self.check("linger-guidance","loginctl" in text and "enable-linger" in text,"exact command printed when lingering is refused")
         p=self.pty("Plain st renders; palette selects Home/Now",[self.st])
         self.check("tui-frame",p.get("frame",False) and p.get("home_frame",False) and p.get("quit_sent",False) and p.get("restored",False) and p.get("exit")==0,"first frame, visible Home/Now, Ctrl+Q and terminal restoration")
-        if scenario not in ("setup","first-run","hostname-localhost","hostname-spaces","hostname-long","no-manager","linger-on","linger-off","existing-store"):
+        if scenario not in ("setup","first-run","hostname-localhost","hostname-spaces","hostname-long","no-manager","linger-on","linger-off","existing-store",*SMALL_MEMORY):
             if scenario=="claude-pre-channel":
                 self.pre_channel_checks()
                 self.onboarding_checks(scenario)
@@ -397,6 +435,9 @@ class Run:
         r=self.cli("Idempotent setup","setup","--person","ada","--node","studio","--yes","--service",service)
         after=self.json_cli("Runs after rerun","missions","ls","--all")
         self.check("idempotent-setup",r["exit"]==0 and before is not None and mission_runs(before) is not None and mission_runs(before)==mission_runs(after),"second setup creates no second mission run")
+        if scenario in SMALL_MEMORY:
+            self.cache_checks("Idempotent small-machine setup","small-machine-idempotent-cache",self.cache_override,self.cache_target)
+        elif scenario=="setup" and self.m.args.backend=="docker": self.default_cache_checks("Idempotent default-size daemon")
         if scenario.startswith("hostname-"):
             for invalid in ("local","Ada Studio","x"*64):
                 r=self.cli("Refuse invalid machine name "+repr(invalid),"setup","--person","ada","--node",invalid,"--yes","--start","false")
@@ -407,6 +448,37 @@ class Run:
             r=self.execute("Retired executable absent","test ! -e ~/.local/bin/stui")
             self.check("archive-no-stui",r["exit"]==0,"no stui executable installed")
         self.reboot_check()
+
+    def cache_checks(self,title,key,override,target):
+        r=self.execute(title+" unit and live environment","python3 -c "+shlex.quote(CACHE_PROBE))
+        try: state=json.loads(r["stdout"]) if r["exit"]==0 else None
+        except ValueError: state=None
+        report=self.json_cli(title+" doctor","doctor")
+        actual=reader_cache_target(report)
+        self.check(key,cache_state_matches(state,override) and actual is not None and (target is None or actual==target),
+            f"main unit and live daemon override {override}; healthy doctor reader target {actual} KiB (expected {target})")
+        return state
+
+    def default_cache_checks(self,title):
+        target=self.metadata["build"].get("reader_cache_default_kib")
+        self.cache_checks(title,"default-cache-override-absent",None,target)
+
+    def small_machine_checks(self,text):
+        default=self.metadata["build"]["reader_cache_default_kib"]
+        retained=self.metadata["build"]["reader_cache_retained_readers"]
+        self.cache_target=min(default,max(1,self.m.memory_bytes//1024//4//retained))
+        self.cache_override=self.cache_target if self.cache_target<default else None
+        selected=re.findall(r"^Read cache: ([1-9][0-9]*) KiB per reader\.\s*$",text,re.M)
+        self.check("small-machine-cache-summary",selected==([str(self.cache_override)] if self.cache_override is not None else []),
+            f"setup selects {self.cache_target} KiB from default {default}, {retained} retained readers and quarter RAM budget; no summary when default fits")
+        if self.m.scenario=="small-machine-512m":
+            self.check("small-machine-cache-reduced",self.cache_target<default,"512 MiB control selects a strictly smaller cache")
+        original=self.cache_checks("Initial small-machine daemon","small-machine-cache-selected",self.cache_override,self.cache_target)
+        page=self.json_cli("Small-machine daemon serves machine API","machines","ls")
+        self.check("small-machine-daemon-serving",isinstance(page,dict) and isinstance(page.get("items"),list) and any(x.get("id")=="machine/studio" for x in page["items"]),"live daemon API serves the configured machine")
+        r=self.cli("Restart small-machine daemon service","service","restart")
+        current=self.cache_checks("Restarted small-machine daemon","small-machine-restart-cache",self.cache_override,self.cache_target)
+        self.check("small-machine-service-restarted",r["exit"]==0 and isinstance(original,dict) and isinstance(current,dict) and original.get("pid")!=current.get("pid"),"service restart creates a different daemon PID with persistent cache settings")
 
     def install_harnesses(self,scenario):
         fixtures=self.m.args.fixtures
@@ -661,6 +733,7 @@ def main():
     args=parser.parse_args()
     scenarios=args.scenario or [args.mode or "setup"]
     if args.mode and args.scenario: parser.error("use mode or --scenario")
+    if any(s in SMALL_MEMORY for s in scenarios) and args.backend!="docker": parser.error("small-machine scenarios require Docker so their container memory limits are set and verified")
     if args.harness_only and args.require_wrap_up: parser.error("--harness-only and --require-wrap-up test different phases; choose one")
     if args.harness_only and any(s in ("expert-lifecycle","claude-pre-channel") for s in scenarios): parser.error("expert lifecycle and pre-channel scenarios require full expert checks")
     if any(s!="baseline" for s in scenarios) and not args.archive: parser.error("candidate scenarios require --archive")
@@ -696,6 +769,10 @@ def main():
                 for name in ("install.sh","install-macos.py"):
                     if metadata["package"]+"/"+name not in t.getnames():
                         parser.error("Mac archive is missing "+name+"; no VM was started")
+        if any(s in SMALL_MEMORY for s in scenarios):
+            for key in ("reader_cache_default_kib","reader_cache_retained_readers"):
+                value=metadata["build"].get(key)
+                if type(value) is not int or value<=0: parser.error("small-machine requires positive "+key+" in the pinned BUILD.json; no container was started")
         args.out.mkdir(parents=True)
         if args.backend=="tart":
             sys.path.insert(0,str(Path(__file__).resolve().parent/"onboarding-fixtures"))

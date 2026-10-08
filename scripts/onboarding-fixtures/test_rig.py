@@ -79,6 +79,33 @@ class RigChecks(unittest.TestCase):
         self.assertFalse(rig.restart_requested({"exit":2,"stderr":waiting},"agent/other"))
         self.assertFalse(rig.restart_requested({"exit":1,"stderr":waiting},subject))
 
+    def test_cache_evidence_requires_unit_and_live_process_to_agree(self):
+        reduced={"pid":20,"unit_cache_kib":"1024","daemon_cache_kib":"1024","unit_has_cache_directive":True}
+        self.assertTrue(rig.cache_state_matches(reduced,1024))
+        self.assertFalse(rig.cache_state_matches({**reduced,"daemon_cache_kib":"2048"},1024))
+        self.assertFalse(rig.cache_state_matches({**reduced,"unit_has_cache_directive":False},1024))
+        self.assertFalse(rig.cache_state_matches({**reduced,"pid":0},1024))
+        default={"pid":20,"unit_cache_kib":None,"daemon_cache_kib":None,"unit_has_cache_directive":False}
+        self.assertTrue(rig.cache_state_matches(default,None))
+        self.assertFalse(rig.cache_state_matches(reduced,None))
+        self.assertFalse(rig.cache_state_matches({"pid":20},None))
+
+    def test_reader_target_rejects_failure_zero_and_ambiguous_evidence(self):
+        reader={"name":"reader-memory","status":"pass","message":"per-reader cache target 1024 KiB"}
+        self.assertEqual(rig.reader_cache_target({"checks":[reader]}),1024)
+        self.assertEqual(rig.reader_cache_target({"checks":[{**reader,"status":"warn"}]}),1024)
+        self.assertIsNone(rig.reader_cache_target({"checks":[reader,{"name":"daemon","status":"fail"}]}))
+        self.assertIsNone(rig.reader_cache_target({"checks":[{**reader,"message":"per-reader cache target 0 KiB"}]}))
+        self.assertIsNone(rig.reader_cache_target({"checks":[reader,reader]}))
+
+    def test_small_machine_refuses_a_backend_without_a_container_limit(self):
+        with tempfile.TemporaryDirectory() as d:
+            out=Path(d,"report")
+            r=subprocess.run([str(SCRIPTS/"onboarding-e2e"),"--scenario","small-machine","--backend","external","--out",str(out)],capture_output=True,text=True)
+            self.assertEqual(r.returncode,2)
+            self.assertIn("require Docker",r.stderr)
+            self.assertFalse(out.exists())
+
     def test_focus_probe_rejects_sidebar_and_unfocused_composer(self):
         code='import os,tty; tty.setraw(0); os.write(1,b"\\x1b[?1049h working Expert sidebar Message Expert "+"·".encode()+b" click");\nwhile True:\n value=os.read(0,100)\n if b"\\x11" in value: os.write(1,b"\\x1b[?1049l"); break\n if b"home" in value: os.write(1,b"Now Nothing needs you")\n'
         request={"argv":["python3","-c",code],"timeout":5,"expect_expert":True,"expert_focus_timeout":0.1}

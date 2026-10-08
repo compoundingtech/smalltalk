@@ -3,7 +3,8 @@
 `scripts/onboarding-e2e` runs one fresh Ubuntu machine per scenario, sequentially.
 It consumes a verified release archive, copies bytes through stdin, and installs as
 `ada`. It never builds Rust, installs a real provider, logs into an account, or runs
-a paid model. Docker instances have two CPUs, 3 GiB RAM and no host bind mounts.
+a paid model. Docker instances have two CPUs and no host bind mounts. Most use
+3 GiB RAM; the small-machine cases use enforced 1 GiB and 512 MiB limits.
 The systemd image uses a privileged container, matching the original experiment.
 Docker ada uses UID42420, including when adapting an older equivalent image,
 so its user manager does not share the host developer's per-UID inotify quota.
@@ -56,10 +57,36 @@ Select additional scenarios with repeated `--scenario` and `--ubuntu` flags:
 | hostname-localhost, hostname-spaces, hostname-long | First run and reserved/spaced/overlong input rejection |
 | existing-store | Seed real state and an unrelated mission run; preserve it on setup |
 | linger-on, linger-off | Root-only manager probe after restart, before any test-user login |
+| small-machine | Actual 1 GiB container limit; automatic cache selection, live daemon, doctor and restart persistence |
+| small-machine-512m | Actual 512 MiB limit forces a smaller cache even with the current 2 MiB default |
 
 Linux kernel hostnames cannot contain spaces; hostname-spaces sets a pretty
 hostname and also tests rejection of a spaced node argument. The long kernel
 hostname uses the maximum legal 63 characters; a 64-character node is rejected.
+
+The small-machine cases require Docker and positive `reader_cache_default_kib`
+and `reader_cache_retained_readers` fields in the pinned BUILD.json, taken from
+the exact compiled source. The rig verifies the real guest cgroup limit and
+derives the expected target from a quarter of RAM divided by retained readers,
+bounded by the compiled default. No synthetic `/proc/meminfo`, cache environment
+injection or host mount is used. With 128 retained readers, 1 GiB permits 2048 KiB
+per reader, so the current 2048 KiB default needs no override; a larger default
+must reduce. The 512 MiB control permits 1024 KiB and requires a strict reduction.
+Ordinary `setup` on the default 3 GiB Docker machine must persist no override.
+
+When a reduction is selected, the exact `Read cache: N KiB per reader.` summary,
+main service environment, actual daemon `/proc/PID/environ` and live doctor
+reader-memory target must agree. When the default fits, the summary and both
+environment overrides must be absent. The daemon must serve its configured
+machine through the API and doctor must have no failed checks. An explicit
+service restart must create a different daemon PID with the same cache choice;
+ordinary repeated setup must preserve it. Each report records the memory limit.
+
+```sh
+scripts/onboarding-e2e --scenario setup --scenario small-machine \
+  --scenario small-machine-512m --ubuntu 24.04 --image onb-sysd2404 \
+  --archive /tmp/cache-candidate.tar.gz --sha256 HEX --out /tmp/cache-proof
+```
 
 Provider scenarios use `scripts/st3-boot-canaries` and the Claude adapter in
 `scripts/onboarding-fixtures`. For the harness-and-channel step, add
