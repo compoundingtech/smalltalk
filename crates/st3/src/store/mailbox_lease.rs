@@ -366,6 +366,36 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn empty_registry_adopts_only_the_current_legacy_capability_without_epoch_churn() {
+        let store = fixture();
+        let old = store.bind_mailbox(&request()).unwrap();
+        let current = store.bind_mailbox(&request()).unwrap();
+        assert!(
+            store
+                .bind_mailbox_with_lease(&request(), Some(&authority(2)))
+                .is_err()
+        );
+        assert!(
+            store
+                .bind_mailbox_with_lease(&old, Some(&authority(2)))
+                .is_err()
+        );
+        let adopted = store
+            .bind_mailbox_with_lease(&current, Some(&authority(2)))
+            .unwrap();
+        assert_eq!(
+            (adopted.token, adopted.epoch),
+            (current.token.clone(), current.epoch)
+        );
+        assert_eq!(
+            store.mailbox_lease_authority(&current).unwrap(),
+            Some(authority(2))
+        );
+        assert!(store.repair_mailbox(&old, &authority(1)).is_err());
+        store.check_mailbox(&current).unwrap();
+    }
 }
 
 fn refused(reason: &str) -> St3Error {
@@ -465,6 +495,28 @@ fn admit_with_probe(
         return Err(refused("missing authenticated provider ownership"));
     }
     let Some((owner, prior, revoked)) = lease(connection, request)? else {
+        // A restarted registry is not takeover permission. A pre-lease current binding
+        // may be authenticated in place, but opaque same-runtime history cannot grant a
+        // fresh token seniority over its current owner.
+        if request.epoch == 0 {
+            let unqualified_owner: Option<String> = connection.query_row(
+                "SELECT incarnation FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
+                params![request.subject, request.component], |row| row.get(0),
+            ).optional().map_err(internal)?;
+            if unqualified_owner.as_deref() == Some(&request.incarnation) {
+                let current_token: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM local_mailbox_bindings binding JOIN local_mailbox_owners owner
+                     ON owner.subject=binding.subject AND owner.component=binding.component AND owner.incarnation=binding.incarnation AND owner.epoch=binding.epoch
+                     WHERE binding.token=?1 AND binding.subject=?2 AND binding.component=?3 AND binding.incarnation=?4)",
+                    params![request.token,request.subject,request.component,request.incarnation], |row| row.get(0),
+                ).map_err(internal)?;
+                if !current_token {
+                    return Err(refused(
+                        "unqualified ownership history does not authorize a fresh takeover",
+                    ));
+                }
+            }
+        }
         return Ok(());
     };
     if owner.incarnation != request.incarnation {
