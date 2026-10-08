@@ -3183,6 +3183,7 @@ fn build_run_command_names_the_complete_managed_environment_without_its_values()
     t.env.insert("TERM".into(), "screen-256color".into());
     t.env
         .insert("PTY_ROOT".into(), "/declared/root/must-not-win".into());
+    t.env.insert("PTY_SESSION_DIR".into(), "synthetic-legacy-root-e4bd".into());
     let cmd = cli.build_run_command(&t, Path::new("/cat/example-linux/demo"));
 
     let args: Vec<String> = cmd
@@ -3254,6 +3255,8 @@ fn build_run_command_names_the_complete_managed_environment_without_its_values()
         Some("task-value")
     );
     assert!(inherited.contains_key("ST_HOOKS"));
+    assert!(!named.contains("PTY_SESSION_DIR"));
+    assert!(cmd.get_envs().any(|(key, value)| key == "PTY_SESSION_DIR" && value.is_none()));
     // The seat's secret-bearing value still reaches the launcher, but only
     // through its inherited environment — never on the argument list.
     let secret = &inherited["SEAT_TOKEN"];
@@ -3262,6 +3265,47 @@ fn build_run_command_names_the_complete_managed_environment_without_its_values()
         cmd.get_program().to_string_lossy() != *secret,
         "unreachable: the program slot never holds the value"
     );
+}
+
+#[test]
+fn spawn_failure_reason_never_contains_launcher_output() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let temporary = tempfile::tempdir().unwrap();
+    let executable = temporary.path().join("pty-failure");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf '%s\\n' \"$SEAT_TOKEN\" >&2\nprintf '%s\\n' \"$SEAT_TOKEN\"\nexit 23\n",
+    ).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cli = PtyCli {
+        bin: executable.display().to_string(),
+        catalog_root: temporary.path().to_path_buf(),
+        on_command_spawn: None,
+    };
+    const SECRET: &str = "synthetic-driver-failure-secret-731c";
+    let mut task = target("h.worker", "exit 0");
+    task.env.insert("SEAT_TOKEN".into(), SECRET.into());
+    task.env.insert("PTY_SESSION_DIR".into(), SECRET.into());
+    let reason = format!("{:#}", cli.spawn(&task, temporary.path()).unwrap_err());
+    assert!(reason.contains("spawning pty"));
+    assert!(reason.contains("23"));
+    assert!(!reason.contains(SECRET));
+    // Observation/cleanup failures can also become replicated action reasons.
+    std::fs::write(
+        &executable,
+        format!("#!/bin/sh\nprintf '%s\\n' '{SECRET}' >&2\nexit 23\n"),
+    ).unwrap();
+    for error in [
+        cli.list_entries().unwrap_err(),
+        cli.stats_entries_at(temporary.path()).unwrap_err(),
+        cli.stats_entry_at(temporary.path(), "h.worker").unwrap_err(),
+        cli.kill("h.worker").unwrap_err(),
+        cli.remove("h.worker").unwrap_err(),
+    ] {
+        let reason = format!("{error:#}");
+        assert!(reason.contains("23"));
+        assert!(!reason.contains(SECRET));
+    }
 }
 
 #[test]

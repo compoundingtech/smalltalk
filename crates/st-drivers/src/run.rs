@@ -306,12 +306,13 @@ impl PtyCli {
             env.insert(OsString::from("ST_HOOKS"), path.into_os_string());
         }
         for (key, value) in &target.env {
-            let value = if key == "PTY_ROOT" {
-                effective_pty_root(&self.catalog_root).into_os_string()
-            } else {
-                OsString::from(self.expand(value))
-            };
-            env.insert(OsString::from(key), value);
+            if crate::pty_launch_environment::PTY_PLACEMENT_ENV.contains(&key.as_str()) {
+                if key != "PTY_ROOT" {
+                    eprintln!("st: ignoring runtime-owned placement variable {key}");
+                }
+                continue;
+            }
+            env.insert(OsString::from(key), OsString::from(self.expand(value)));
         }
         env
     }
@@ -397,6 +398,10 @@ impl PtyCli {
         // injects the new session's own PTY_SESSION identity.
         let managed_env = self.managed_task_env(target);
         cmd.envs(&managed_env);
+        crate::pty_launch_environment::configure_pty_placement(
+            &mut cmd,
+            &effective_pty_root(&self.catalog_root),
+        );
         // Coding-agent command runners commonly set NO_COLOR for their own captured output. That
         // ambient preference belongs to the launcher, not to the interactive agent it happens to
         // reconcile. Agent Spec env remains authoritative when an agent deliberately opts out.
@@ -663,7 +668,7 @@ impl PtyCli {
             anyhow::bail!(
                 "`pty metadata patch --id {}` failed: {}",
                 presentation.pty_id,
-                String::from_utf8_lossy(&out.stderr).trim()
+                out.status
             );
         }
         Ok(())
@@ -697,7 +702,7 @@ impl PtyCli {
         if !out.status.success() {
             anyhow::bail!(
                 "`pty list --json` failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+                out.status
             );
         }
         serde_json::from_slice(&out.stdout)
@@ -715,7 +720,7 @@ impl PtyCli {
         if !out.status.success() {
             anyhow::bail!(
                 "`pty stats --json` failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+                out.status
             );
         }
         serde_json::from_slice(&out.stdout)
@@ -733,7 +738,7 @@ impl PtyCli {
         if !out.status.success() {
             anyhow::bail!(
                 "`pty stats --json {pty_id}` failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+                out.status
             );
         }
         serde_json::from_slice(&out.stdout)
@@ -826,7 +831,7 @@ impl Runner for PtyCli {
         // immediate `pty run` fails "id already in use". Reap the lingering corpse + brief backoff +
         // retry closes the window WITHIN the pass, instead of leaving `--once` to error and relying on a
         // later loop cycle to self-heal (loop mode did; `--once` had one shot). Bounded; on a persistent
-        // failure it surfaces the error unchanged.
+        // failure it surfaces the exit status without copying value-bearing launcher output.
         const SPAWN_ATTEMPTS: u32 = 4;
         let mut last_err = String::new();
         for attempt in 0..SPAWN_ATTEMPTS {
@@ -843,8 +848,9 @@ impl Runner for PtyCli {
             } else {
                 stderr.trim()
             };
-            last_err = format!("{}: {detail}", out.status);
-            let corpse_race = last_err.contains("already in use");
+            let corpse_race = detail.contains("already in use");
+            // Claims and traces receive only the exit status, never launcher output.
+            last_err = out.status.to_string();
             if !corpse_race || attempt + 1 == SPAWN_ATTEMPTS {
                 break;
             }
@@ -872,7 +878,7 @@ impl Runner for PtyCli {
         if !out.status.success() {
             anyhow::bail!(
                 "`pty kill {pty_id}` failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
+                out.status
             );
         }
         Ok(())
@@ -910,7 +916,7 @@ impl Runner for PtyCli {
         }
         anyhow::bail!(
             "`pty rm {pty_id}` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            out.status
         )
     }
 
@@ -923,7 +929,7 @@ impl Runner for PtyCli {
         if !out.status.success() {
             anyhow::bail!(
                 "`pty rm {pty_id}` failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
+                out.status
             );
         }
         Ok(())

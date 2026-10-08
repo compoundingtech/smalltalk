@@ -9,6 +9,8 @@ mod isolate;
 mod priority;
 mod process;
 mod pty;
+#[path = "../../pty-launch-environment.rs"]
+mod pty_launch_environment;
 
 pub use environment::{
     ShellStartupTimeout, expand_path_placeholder, is_shell_startup_timeout, login_environment, login_environment_from,

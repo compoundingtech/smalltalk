@@ -923,8 +923,14 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   and resolves each value from that environment, so a service manager or
   process listing records names only for those generated environment flags.
   The resolved managed overlay still wins over the launcher's environment;
-  the runtime-selected `PTY_ROOT` wins over a seat-declared value so spawn and
-  observation share a registry. Other member-environment precedence is unchanged.
+  the shared `PTY_PLACEMENT_ENV` set identifies `PTY_ROOT` and the deprecated
+  `PTY_SESSION_DIR` as runtime-owned controls. The runtime-selected `PTY_ROOT`
+  wins, and `PTY_SESSION_DIR` is removed after the overlay (including inherited
+  values). Declared legacy placement is ignored with a name-only diagnostic.
+  Spawn and observation share a registry; other member-environment precedence
+  is unchanged. Launcher stdout/stderr is used only to classify the existing
+  retry case. Failure reasons contain an exit status, never captured output
+  that could echo environment values into replicated claims or traces.
 
   This mechanism does not sanitize explicitly authored argv or tag expansions.
   Seat-declared environment values stored in replicated graph claims remain a

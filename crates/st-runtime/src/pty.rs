@@ -351,6 +351,11 @@ impl PtyRuntime {
             arguments.push(OsString::from("--no-display-name"));
         }
         let mut terminal_env = env.clone();
+        for key in crate::pty_launch_environment::PTY_PLACEMENT_ENV {
+            if key != "PTY_ROOT" && terminal_env.remove(key).is_some() {
+                eprintln!("st: ignoring runtime-owned placement variable {key}");
+            }
+        }
         terminal_env
             .entry("TERM".into())
             .or_insert_with(|| "xterm-256color".into());
@@ -410,8 +415,7 @@ impl PtyRuntime {
                 command.env_clear().envs(environment);
             }
             command.envs(&terminal_env);
-            // The launcher registry is runtime-owned, even when the seat names PTY_ROOT.
-            command.env("PTY_ROOT", &self.root);
+            crate::pty_launch_environment::configure_pty_placement(&mut command, &self.root);
             let output = match output_within(command, self.command_timeout) {
                 Ok(output) => output,
                 Err(error) => {
@@ -426,8 +430,11 @@ impl PtyRuntime {
                 crate::protect_servers(std::slice::from_ref(&published));
                 return Ok(());
             }
-            last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if !last_error.contains("already in use") || attempt + 1 == ATTEMPTS {
+            // Launcher output can echo environment values. Use it only for retry
+            // classification, never in an error that becomes a replicated claim.
+            let id_in_use = String::from_utf8_lossy(&output.stderr).contains("already in use");
+            last_error = output.status.to_string();
+            if !id_in_use || attempt + 1 == ATTEMPTS {
                 break;
             }
             if self
@@ -1563,6 +1570,51 @@ exit 0
         let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
         assert!(env_flag_names(&arguments).contains(&"PTY_ROOT"));
         assert!(!arguments.contains(declared.to_str().unwrap()));
+    }
+
+    #[test]
+    fn spawn_keeps_legacy_placement_values_out_of_the_launcher() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        let binary = fake_pty(
+            root.path(),
+            "fake-pty-legacy-root",
+            "  test \"${PTY_SESSION_DIR+x}\" != x || exit 9\n  publish new",
+        );
+        let runtime = PtyRuntime::new(registry.clone()).with_binary(binary.to_string_lossy());
+        spawn_work(
+            &runtime,
+            root.path(),
+            &BTreeMap::from([("PTY_SESSION_DIR".into(), "synthetic-legacy-root-8e1d".into())]),
+        ).unwrap();
+        assert!(registry.join("work.json").exists());
+        let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
+        assert!(!env_flag_names(&arguments).contains(&"PTY_SESSION_DIR"));
+    }
+
+    #[test]
+    fn spawn_failure_reason_never_contains_launcher_output() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_pty(
+            root.path(),
+            "fake-pty-secret-failure",
+            "  printf '%s\\n' \"$SEAT_TOKEN\" >&2\n  printf '%s\\n' \"$SEAT_TOKEN\"\n  exit 23",
+        );
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        const SECRET: &str = "synthetic-failure-secret-d739";
+        let error = spawn_work(
+            &runtime,
+            root.path(),
+            &BTreeMap::from([
+                ("SEAT_TOKEN".into(), SECRET.into()),
+                ("PTY_SESSION_DIR".into(), SECRET.into()),
+            ]),
+        ).unwrap_err();
+        let reason = format!("{error:#}");
+        assert!(reason.contains("spawn PTY failed"));
+        assert!(reason.contains("23"));
+        assert!(!reason.contains(SECRET));
     }
 
     #[test]

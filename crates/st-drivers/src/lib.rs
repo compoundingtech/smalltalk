@@ -17,6 +17,9 @@
 #[path = "../../../scripts/ci-test-paths.rs"]
 mod ci_test_paths;
 
+#[path = "../../pty-launch-environment.rs"]
+mod pty_launch_environment;
+
 pub mod account;
 pub mod catalog;
 pub mod catalog_archive;

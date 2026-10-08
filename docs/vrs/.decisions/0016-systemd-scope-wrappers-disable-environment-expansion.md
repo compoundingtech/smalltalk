@@ -74,8 +74,15 @@ Launch environment values were passed on process command lines, where service
 managers and process listings can record them. The launchers now export the
 resolved environment to the PTY process and pass only `--env NAME`. PTY resolves
 each name from that inherited environment and persists the resolved overlay
-for restart. The runtime-selected `PTY_ROOT` wins over a seat declaration;
-the other resolved environment precedence remains unchanged.
+for restart. The shared `PTY_PLACEMENT_ENV` set owns `PTY_ROOT` and the deprecated
+`PTY_SESSION_DIR`: the canonical runtime root wins after the overlay, and the
+legacy variable is removed (also from inherited environments). Declared legacy
+placement receives a value-free, name-only diagnostic. Other resolved
+environment precedence remains unchanged.
+
+Captured launcher output can echo environment values. It is used only for the
+existing retry classification; failure reasons expose exit status rather than
+copying stdout/stderr into replicated claims and claim-trace output.
 
 Both scope wrappers also pin the description to the unit name instead of
 systemd's default full command line. The amended outer argument order is:
@@ -90,5 +97,6 @@ environment values stored in replicated graph claims remain a known exposure
 outside this amendment's fix.
 
 Evidence: launcher environment/argv regression tests, runtime-selected registry
-precedence with a seat-declared `PTY_ROOT`, and fixed-description wrapper tests.
+precedence with declared canonical/legacy placement controls, sentinel-bearing
+failed launchers with value-free reasons, and fixed-description wrapper tests.
 R42's ratified requirements text is unchanged.
