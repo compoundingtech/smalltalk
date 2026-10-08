@@ -3019,14 +3019,16 @@ impl Store {
         self.smalltalk.agent_roster_chunked.lock().expect("roster counts poisoned").clone()
     }
 
-    /// Whether the newest complete roster already is the one at `index`: a refresh there
-    /// would find nothing to fold.
+    /// Whether the newest complete roster already is the one at `index`: same graph cut,
+    /// same local activity, and no queue deadline passed since. A refresh would fold nothing.
     pub(crate) fn agent_roster_current(&self, index: u64, history: bool) -> Result<bool> {
         let local = roster_local_frontier(&self.readers.get(), index)?;
+        let now = now_ms();
         Ok(self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
             .any(|entry| entry.history == history && entry.covered.is_none()
-                && entry.index == index && entry.local == local))
+                && entry.index == index && entry.local == local
+                && entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)))
     }
 
     /// Whether a refresher keeps the roster published, so readers must never fold it.

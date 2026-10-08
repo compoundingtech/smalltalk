@@ -4469,8 +4469,9 @@ fn client_agents_published_page(
         )?;
         return Ok(Some((Extension(snapshot), Json(page))));
     };
-    // Only an older roster needs a refresh; one at the current cut is already the newest.
-    if index < current {
+    // A roster older than the current cut, its local activity or its queue deadline needs a
+    // refresh; the newest one needs none.
+    if index < current || !store.agent_roster_current(current, query.history).map_err(ApiError::internal)? {
         if query.history {
             store.request_agent_roster_history();
         } else {
