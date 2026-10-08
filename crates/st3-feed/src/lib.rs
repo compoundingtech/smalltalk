@@ -489,6 +489,11 @@ async fn connected(
                 match event {
                     CollectionEvent::Snapshot { id, snapshot, items, order, has_more } => {
                         let Some(window) = Window::from_id(&id) else { continue };
+                        // A frame already on its way when the window was left: the socket was
+                        // heard from, but nothing of the window comes back.
+                        if left(window, *missions) {
+                            continue;
+                        }
                         *failures = 0;
                         window_retries.loaded(window);
                         pending_reports.retain(|(pending, _, _)| *pending != window);
@@ -501,6 +506,9 @@ async fn connected(
                     }
                     CollectionEvent::Changes { id, snapshot, upserts, removes, order, has_more } => {
                         let Some(window) = Window::from_id(&id) else { continue };
+                        if left(window, *missions) {
+                            continue;
+                        }
                         window_retries.loaded(window);
                         pending_reports.retain(|(pending, _, _)| *pending != window);
                         let rows = windows.entry(window).or_default();
@@ -526,7 +534,9 @@ async fn connected(
                     // upgrade, a herd; so each is asked after a wait that grows and is jittered, and
                     // one good snapshot resets the wait.
                     CollectionEvent::Resync { id, code, message } => {
-                        if let Some(window) = Window::from_id(&id) {
+                        if let Some(window) = Window::from_id(&id)
+                            && !left(window, *missions)
+                        {
                             // Said once, with st's own reason when it gave one (its source is
                             // not ready); the retries are quiet until the window loads.
                             let first = window_retries.failed(window, Instant::now());
@@ -559,6 +569,9 @@ async fn connected(
                     }
                     CollectionEvent::Error { id, code, message } => {
                         if let Some(window) = Window::from_id(&id) {
+                            if left(window, *missions) {
+                                continue;
+                            }
                             // Said once; the retries are quiet until it loads.
                             if window_retries.failed(window, Instant::now()) {
                                 let message = st3_client::plain_message(code.as_ref(), &message);
@@ -701,6 +714,13 @@ async fn connected(
             }
         }
     }
+}
+
+/// Whether a frame for `window` is one already on its way when the window was left: the missions
+/// window is followed only on request, and a snapshot, change, resync or error that arrives after
+/// the unsubscribe must not bring back the rows, the followed state or an error the UI dropped.
+fn left(window: Window, missions_followed: bool) -> bool {
+    window == Window::Missions && !missions_followed
 }
 
 /// Up to half of `wait` more, so many clients told to ask again at once do not all ask together.
@@ -1430,6 +1450,17 @@ mod tests {
         drop(commands);
         tokio::time::timeout(Duration::from_secs(5), feed).await.unwrap().unwrap();
         server.abort();
+    }
+
+    #[test]
+    fn a_frame_for_the_missions_window_after_it_was_left_is_ignored() {
+        // The other windows are never left; missions are ignored only while not followed.
+        for window in [Window::Attention, Window::Agents, Window::Glasses, Window::Summary] {
+            assert!(!left(window, false), "{window:?} is always followed");
+            assert!(!left(window, true));
+        }
+        assert!(left(Window::Missions, false), "a late missions frame is dropped");
+        assert!(!left(Window::Missions, true), "followed missions are kept");
     }
 
     #[tokio::test]

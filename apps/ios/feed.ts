@@ -271,6 +271,12 @@ export class Feed {
     this.handlers.onWindowStopped?.('missions');
   }
 
+  /** A frame for the missions window that was already on its way when it was left: heard from,
+   *  but it must not bring back rows or errors the screens dropped. */
+  private leftWindow(name: FeedWindow): boolean {
+    return name === 'missions' && !this.missions;
+  }
+
   private subscribeWindow(name: FeedWindow): void {
     if (name === 'missions' && !this.missions) return;
     delete this.windows[name];
@@ -304,6 +310,7 @@ export class Feed {
     } else if (frame.kind === 'snapshot' || frame.kind === 'changes') {
       if (!(frame.id in FEED_WINDOWS)) return;
       const name = frame.id as FeedWindow;
+      if (this.leftWindow(name)) return;
       const next = applyWindow(this.windows[name], frame);
       if (!next) { this.retryLater(name, () => this.subscribeWindow(name)); return; }
       this.windows[name] = next;
@@ -321,6 +328,7 @@ export class Feed {
       else if (frame.id === GLASSES && this.glasses) { this.glasses.window = undefined; this.stream?.subscribeGlasses(GLASSES); }
       else if (frame.id in FEED_WINDOWS) {
         const name = frame.id as FeedWindow;
+        if (this.leftWindow(name)) return;
         if (this.retryLater(name, () => this.subscribeWindow(name)) && frame.message) {
           const text = `${plainMessage(frame.code, frame.message)} · trying again`;
           clearTimeout(this.reports[name]);
@@ -364,6 +372,7 @@ export class Feed {
       }
       else if (id && id in FEED_WINDOWS) {
         const name = id as FeedWindow;
+        if (this.leftWindow(name)) return;
         // A list whose first read failed is asked for again when that may help, so it never stays stale under "live".
         const plain = plainMessage(frame.code, frame.message);
         if (!isTransientCode(frame.code)) this.handlers.onWindowError?.(name, plain);

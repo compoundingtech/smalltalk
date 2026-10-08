@@ -281,7 +281,7 @@ assert.equal(shouldProbe(1_000, 11_000), true);
   // The missions window is followed only when asked: not subscribed at the start, subscribed when a
   // missions screen shows, and left (its rows dropped) when none does.
   const { client, sockets } = fakeClient();
-  const { handlers } = watch();
+  const { seen, handlers } = watch();
   const stopped = [];
   const feed = new Feed(client, { ...handlers, onWindowStopped: name => stopped.push(name) }, new ForegroundGate('active'), () => 'action/test', [100], 1000, false);
   await settle();
@@ -295,6 +295,16 @@ assert.equal(shouldProbe(1_000, 11_000), true);
   assert.deepEqual(stopped, ['missions']);
   feed.setMissions(false);
   assert.deepEqual(stopped, ['missions'], 'leaving twice says nothing more');
+  // Frames already on their way when it was left change nothing: no rows, no retry, no error.
+  const sent = socket.sent.length;
+  socket.frame({ kind: 'snapshot', id: 'missions', collection: 'missions', snapshot: snapshot(9), items: [mission('mission/late')], order: ['mission/late'], has_more: false });
+  socket.frame({ kind: 'changes', id: 'missions', collection: 'missions', snapshot: snapshot(10), upserts: [mission('mission/later')], removes: [], order: ['mission/later'], has_more: false });
+  socket.frame({ kind: 'resync', id: 'missions', collection: 'missions', code: 'internal', message: 'collection source is unavailable', retryable: true });
+  socket.frame({ kind: 'error', id: 'missions', code: 'internal', message: 'the window failed', retryable: true });
+  await settle(1100);
+  assert.equal(seen.windows.missions, undefined, 'a late missions frame brings no rows back');
+  assert.equal(seen.errors.length, 0, 'and no error');
+  assert.equal(socket.sent.length, sent, 'and is not subscribed again');
   feed.close();
 }
 
