@@ -48,6 +48,8 @@ pub struct SmalltalkRuntime {
     pub(crate) agent_resources_builds: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(crate) agent_resources_refolded_cards: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) agent_resources_largest_fold: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone)]
