@@ -1039,7 +1039,8 @@ impl Store {
             }
             Ok(())
         };
-        append_claim_with_admission(&self.graph, input, None, None, None, None, Some(&admission))
+        append_claim_with_commit_context(&self.graph, input, None, None, None, None,
+            ClaimCommitContext { admission: Some(&admission), ..Default::default() })
             .map(|(claim, _)| claim)
     }
     /// Promote physical Codex bootstrap custody, or advance a surviving process's

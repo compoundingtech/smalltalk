@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "summary": "Preserve the state context of bounded legacy status history during checkpoint trimming",
+  "replay": {
+    "status": "none",
+    "detail": "No startup replay trigger or projection algorithm change. The existing scratch-copy proof still compares the same reader answers before and after proposed trimming; no new proof loop or production scan is introduced."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database table, index, trigger, schema-version or migration change."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Rules 14 retains the transition preceding the first visible status-history entry for each represented incarnation, including a witness before the seven-day window. Participants must run matching rules digests before agreeing on new seals. Stale seal verification remains refused; the newest due cut lifecycle does not automatically close older unverified cuts.",
+    "transitions": [
+      [
+        13,
+        14
+      ]
+    ]
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, replicated claim, pairing, provider-admission or checkpoint certificate shape change. Reader selection and its seven-day/200-item bound remain unchanged. Mixed-build checkpoint effects are classified under rules."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Restart-to-API and restart-to-health times for this source have not been measured. Deploy through the normal rolling fleet lifecycle and verify health separately from API availability; local scratch-proof passes do not qualify production downtime."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Existing stores with unstamped legacy transitions at a bounded status-history edge can be affected. Operations must check checkpoint status and deploy all members in one coordinated window only when no checkpoint is stable but unapplied. An unapplied rules-13 certificate may require its original rules-13 manifest after upgrading; if every member upgrades before that manifest exists, plan-changed can block new sealing until a rules-13 member serves it. Preserve participant and first-verification fences. Verify affected old cuts or record supported clean supersession; newest-cut progress does not establish older-cut acceptance. See docs/st3/checkpoints.md and docs/st3/replication.md. Local reproduction proves a defect family, not the cause or closure of a particular historical checkpoint."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Roll forward to matching rules 14 builds. Swapping back to rules 13 restores the boundary-context defect; mixed rules stall new agreement. Binary reinstall does not undo completed trims. No migration or proof weakening is introduced; participant and verification fences still apply."
+  }
+}

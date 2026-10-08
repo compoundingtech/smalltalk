@@ -77,7 +77,7 @@
   {
     "body": {
       "kind": "event",
-      "value": "[unrecognized claude entry `future-kind`]\n{\"raw\":{\"type\":\"future-kind\"}}"
+      "value": "[unrecognized codex record `future-kind`]\n{\"raw\":{\"type\":\"future-kind\"}}"
     },
     "id": "timeline-entry/native-153"
   }

@@ -22,6 +22,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod prepared;
+
 const LAYOUT: &str = "smallclaims.ivm.install.v1";
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS ivm_install_sources (
@@ -271,6 +273,7 @@ impl Installer {
 
     pub fn create_schema(&self, connection: &Connection) -> Result<()> {
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(prepared::SCHEMA)?;
         for operator in self.operators.values() {
             operator.create_schema(connection)?;
         }
@@ -356,6 +359,10 @@ impl Installer {
         source: &str,
         mutation: &Mutation,
     ) -> Result<SourcePosition> {
+        ensure!(
+            !self.deferred(tx, source)?,
+            "deferred source requires prepared publication; synchronous operator path refused"
+        );
         let (mut position, available) = source_position(tx, source)?;
         position.revision = position
             .revision
@@ -484,6 +491,17 @@ impl Installer {
             .get(view)
             .context("unknown installation operator")?;
         let position = self.position(tx, operator.source())?;
+        if self.deferred(tx, operator.source())? {
+            let (rows,bytes,reference):(u64,u64,usize)=tx.query_row(
+                "SELECT row_limit,byte_limit,reference_limit FROM ivm_install_deferred WHERE source=?1",
+                [operator.source()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            ensure!(
+                limits.pending_rows >= rows
+                    && limits.pending_bytes >= bytes
+                    && limits.page_bytes >= reference,
+                "deferred job bounds must cover the source queue/reference limits"
+            );
+        }
         let fingerprint = &self.fingerprints[view];
         let leftovers: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM ivm_install_jobs j WHERE view=?1 AND
@@ -555,6 +573,10 @@ impl Installer {
     }
 
     pub fn scan(&self, tx: &Transaction<'_>, page: &ScanPage, now_ms: u64) -> Result<Outcome> {
+        ensure!(
+            !self.deferred(tx, &load_job(tx, &page.job)?.source)?,
+            "deferred source requires prepared publication; synchronous operator path refused"
+        );
         let job = load_job(tx, &page.job)?;
         let started = Instant::now();
         tx.execute_batch("SAVEPOINT ivm_install_page")?;
@@ -602,6 +624,10 @@ impl Installer {
     /// Apply at most one bounded journal page; the caller yields/releases the writer between
     /// calls. No long read snapshot or transaction spans these calls or publication.
     pub fn catch_up(&self, tx: &Transaction<'_>, id: &str, now_ms: u64) -> Result<Outcome> {
+        ensure!(
+            !self.deferred(tx, &load_job(tx, id)?.source)?,
+            "deferred source requires prepared publication; synchronous operator path refused"
+        );
         let job = load_job(tx, id)?;
         let started = Instant::now();
         tx.execute_batch("SAVEPOINT ivm_install_page")?;
@@ -746,7 +772,9 @@ impl Installer {
             "invalid journal reclamation page"
         );
         let position = self.position(tx, source)?;
-        let through: u64 = tx.query_row("SELECT COALESCE(MIN(applied_revision),?2) FROM ivm_install_jobs WHERE source=?1 AND phase IN ('scan','catchup')",
+        let through: u64 = tx.query_row("SELECT COALESCE(MIN(revision),?2) FROM (
+            SELECT applied_revision AS revision FROM ivm_install_jobs WHERE source=?1 AND phase IN ('scan','catchup')
+            UNION ALL SELECT revision FROM ivm_install_roots WHERE source=?1 AND ready=1)",
             params![source,position.revision],|r| r.get(0))?;
         let mut statement = tx.prepare_cached("SELECT revision,bytes FROM ivm_install_journal WHERE source=?1 AND revision<=?2 ORDER BY revision LIMIT ?3")?;
         let entries = statement

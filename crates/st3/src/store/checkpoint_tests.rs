@@ -1891,6 +1891,130 @@ fn status_history_mixed_legacy_and_heartbeat_stamps_survive_both_checkpoint_cuts
 }
 
 #[test]
+fn status_history_legacy_boundary_keeps_the_transition_that_makes_it_visible() {
+    legacy_boundary_checkpoint_history(199, None, false, false, false, false);
+}
+
+#[test]
+fn status_history_boundary_context_survives_caps_ties_and_recorded_stamps() {
+    for tail in [198, 200] {
+        legacy_boundary_checkpoint_history(tail, None, false, false, false, false);
+    }
+    legacy_boundary_checkpoint_history(199, Some(true), true, false, false, false);
+    legacy_boundary_checkpoint_history(199, None, true, false, false, false);
+}
+
+#[test]
+fn status_history_boundary_context_can_precede_the_seven_day_window() {
+    legacy_boundary_checkpoint_history(199, None, false, true, false, false);
+}
+
+#[test]
+fn status_history_boundary_context_is_kept_per_incarnation() {
+    legacy_boundary_checkpoint_history(198, None, false, false, true, false);
+}
+
+#[test]
+fn status_history_boundary_context_preserves_native_prompt_restoration() {
+    legacy_boundary_checkpoint_history(199, None, false, false, false, true);
+}
+
+fn legacy_boundary_checkpoint_history(tail: usize, stamp: Option<bool>, ties: bool,
+    before_window: bool, two_incarnations: bool, prompts: bool)
+{
+    let cuts = ["2026-10-04T00:00:00Z", "2026-10-05T00:00:00Z"].map(|cut| {
+        chrono::DateTime::parse_from_rfc3339(cut).unwrap().timestamp_millis() as u128
+    });
+    let store = Store::open_memory("cedar").unwrap();
+    let subject = "agent/cedar";
+    let witness_at = if before_window { cuts[0] - seat_status::WINDOW_MS - 1_000 }
+        else { cuts[0] - 5 * 60 * 60 * 1_000 };
+    let at = witness_at - 4 * 60 * 60 * 1_000;
+    let boundary_at = witness_at + 60_000;
+    let append = |kind: &str, fields: Value, time: u128| {
+        store.set_write_clock_at(time).unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        // Keep legacy unstamped sources verbatim instead of using today's stamp producer.
+        let claim = append_claim_tx(&transaction, &store.origin, subject, kind,
+            Some(subject), &json!({"fields":fields}), &[], None).unwrap();
+        transaction.commit().unwrap();
+        claim
+    };
+    let incarnations = if two_incarnations { vec!["one", "two"] } else { vec!["one"] };
+    let harness = |incarnation: &str, state: &str, time: u128, stamp: Option<bool>| {
+        let mut fields = json!({"state":state, "incarnation_id":incarnation, "observed_at_ms":time as u64});
+        if let Some(stamp) = stamp { fields["status_transition"] = json!(stamp); }
+        append("harness.observed", fields, time)
+    };
+    let diagnostic = |code: &str, time: u128| append("harness.diagnostic",
+        json!({"incarnation_id":"one", "code":code, "driver":"codex",
+            "reason":"fixture", "severity":"warning"}), time);
+    for incarnation in &incarnations {
+        append("runtime.observed", json!({
+            "status":"running", "runtime_id":"native", "incarnation_id":incarnation
+        }), at);
+        harness(incarnation, "idle", at + 1_000, Some(true));
+    }
+    if prompts { diagnostic("provider-trust-prompt", witness_at - 1_000); }
+    let predecessors = incarnations.iter().map(|incarnation|
+        harness(incarnation, "working", witness_at, None)).collect::<Vec<_>>();
+    if prompts { diagnostic("provider-auth-restored", witness_at + 1_000); }
+    let boundaries = incarnations.iter().map(|incarnation|
+        harness(incarnation, "idle", boundary_at, stamp)).collect::<Vec<_>>();
+    for index in 0..tail {
+        let incarnation = incarnations[index % incarnations.len()];
+        let round = index / incarnations.len();
+        harness(incarnation, if round % 2 == 0 { "working" } else { "idle" },
+            boundary_at + if ties { 0 } else { (index as u128 + 1) * 1_000 }, Some(true));
+    }
+    // Each cut reads the same fixed canonical sources, never the first cut's trimmed result.
+    for cut in cuts {
+        let connection = store.readers.get();
+        let (before, before_sources) = seat_status::history_at_with_sources(&connection, subject, cut, i64::MAX as u64).unwrap();
+        drop(connection);
+        if tail + incarnations.len() == seat_status::MAX_TRANSITIONS && cut == cuts[0] {
+            assert_eq!(before["items"].as_array().unwrap().len(), seat_status::MAX_TRANSITIONS);
+            assert_eq!(before_sources[0].claim, boundaries[0].id);
+        }
+        let sealed = store.checkpoint_sealed_set(cut).unwrap();
+        let plan = plan_drops(&sealed);
+        for boundary in &boundaries {
+            if before_sources.iter().any(|source| source.claim == boundary.id) {
+                assert!(!dropped(&plan).contains(&boundary.id));
+            }
+        }
+        if tail + incarnations.len() == seat_status::MAX_TRANSITIONS && !prompts && cut == cuts[0] {
+            for predecessor in &predecessors {
+                assert!(!dropped(&plan).contains(&predecessor.id), "boundary context must survive");
+            }
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let copy = scratch.path().join("checkpoint.sqlite3");
+        store.copy_store_to(&copy).unwrap();
+        let proof = prove_on_copy(&copy, &sealed, &plan).unwrap();
+        let mut connection = Connection::open(&copy).unwrap();
+        smallclaims::store::projection_digest::register(&connection).unwrap();
+        let transaction = connection.transaction().unwrap();
+        record_checkpoint_tombstones_tx(&transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims).unwrap();
+        delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
+        let (after, after_sources) = seat_status::history_at_with_sources(&transaction, subject, cut, i64::MAX as u64).unwrap();
+        let before_items = before["items"].as_array().unwrap();
+        let after_items = after["items"].as_array().unwrap();
+        let first_difference = (0..before_items.len().max(after_items.len()))
+            .find(|index| before_items.get(*index) != after_items.get(*index));
+        assert!(proof.passed, "legacy-boundary cut={cut} before_len={} after_len={} first_difference={first_difference:?} before_sources={:?} after_sources={:?} mismatches={:?}",
+            before_items.len(), after_items.len(),
+            before_sources.iter().take(3).map(|source| &source.claim).collect::<Vec<_>>(),
+            after_sources.iter().take(3).map(|source| &source.claim).collect::<Vec<_>>(), proof.mismatches);
+        assert_eq!(after["items"], before["items"]);
+        assert_eq!(after_sources.iter().map(|source| (&source.claim, &source.order)).collect::<Vec<_>>(),
+            before_sources.iter().map(|source| (&source.claim, &source.order)).collect::<Vec<_>>());
+        transaction.rollback().unwrap();
+    }
+}
+
+#[test]
 fn status_history_mixed_stamps_keep_baselines_prompts_auth_and_canonical_ties() {
     for (ties, channels, older_baseline) in [
         (true, false, false), (false, true, false),

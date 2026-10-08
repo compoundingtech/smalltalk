@@ -1198,8 +1198,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         // Whether a successful pass must close this host's reconciler item. The first pass after a
         // start checks, since a panic or a restart can leave one open.
         let mut may_have_failed = true;
+        let mut first_wake = true;
         loop {
-            match self
+            let trigger = match self
                 .blocking(|this| {
                     crate::profile::task("task reconcile-deadline", || {
                         this.next_reconcile_deadline()
@@ -1210,21 +1211,36 @@ impl<R: RuntimeControl> Reconciler<R> {
                 Some(deadline) => {
                     let delay = deadline_sleep_ms(deadline, now_ms(), quiet_pass_started);
                     tokio::select! {
-                        _ = self.notify.notified() => {}
+                        _ = self.notify.notified() => "trigger/notification",
                         _ = tokio::time::sleep(Duration::from_millis(delay)) => {
                             crate::performance::record_wake("deadline", None);
+                            "trigger/deadline"
                         }
                     }
                 }
-                None => self.notify.notified().await,
-            }
+                None => {
+                    self.notify.notified().await;
+                    "trigger/notification"
+                }
+            };
+            let trigger = if std::mem::take(&mut first_wake) {
+                "trigger/startup"
+            } else {
+                trigger
+            };
             for pass in 0..64 {
                 let started = now_ms();
                 let check_recovery = may_have_failed;
+                let pass_trigger = if pass == 0 {
+                    trigger
+                } else {
+                    "trigger/changed-repeat"
+                };
                 let (changed, failed) = self
                     .blocking(move |this| {
                         let before = this.store.index().ok();
                         let failed = match crate::profile::task("task reconcile-pass", || {
+                            let _trigger_span = crate::profile::span(pass_trigger);
                             this.reconcile_once()
                         }) {
                             Err(error) => {
@@ -2037,6 +2053,31 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         };
         let eligible = |subject: &DesiredSubject| eligible.contains(&subject.subject);
+        // Select members before workspace/authority preparation. Filesystem-only changes are
+        // checked by the full member safety pass; failures leave the member unevaluated so
+        // restoration still retries on the next pass. Actual effects retain their fresh guards.
+        let skip_members = self.skip_unneeded
+            && ptys.is_some()
+            && !self.incremental.take_full_pass("member", now_ms());
+        // Runtime changes must select a member before preparation, including execs and screens.
+        self.incremental.observe_execs(|runtime_id| {
+            self.runtime
+                .observe_exec(runtime_id)
+                .ok()
+                .flatten()
+                .map(|observation| observation.status)
+        });
+        self.incremental.poll_values(
+            "screen:",
+            self.screen_poll_every_ms,
+            now_ms(),
+            |runtime_id| {
+                self.runtime
+                    .screen(runtime_id)
+                    .ok()
+                    .map(|screen| screen_digest(&screen))
+            },
+        );
         let mut member_errors = BTreeMap::new();
         for subject in &active {
             if subject.kind == "stop" {
@@ -2049,6 +2090,19 @@ impl<R: RuntimeControl> Reconciler<R> {
             else {
                 continue;
             };
+            if skip_members
+                && !self
+                    .incremental
+                    .needs(&format!("member:{}", subject.subject), now_ms())
+                && !self.incremental.needs("render", now_ms())
+                && !self
+                    .render_failures
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains_key(&subject.subject)
+            {
+                continue;
+            }
             if !eligible(subject) || !self.owned_desired_ready(subject) {
                 continue;
             }
@@ -2103,9 +2157,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             .collect::<Vec<_>>();
         // A live member is evaluated again when a claim it read, its runtime, its exec state or
         // its screen changed, when its time came, or when its workspace or render failed.
-        let skip_members = self.skip_unneeded
-            && ptys.is_some()
-            && !self.incremental.take_full_pass("member", now_ms());
         // Render writes every member's files together (members sharing a repository share its
         // exclude file), so it runs whole or not at all: when what it read last changed, when a
         // member will be evaluated, or on a full pass. Otherwise its last failures stand; files
@@ -2244,27 +2295,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             && ptys.is_some()
             && !self.incremental.take_full_pass("stop", now_ms());
         let mut stops = BTreeSet::new();
-        self.incremental.observe_execs(|runtime_id| {
-            self.runtime
-                .observe_exec(runtime_id)
-                .ok()
-                .flatten()
-                .map(|observation| observation.status)
-        });
-        self.incremental.poll_values(
-            "screen:",
-            self.screen_poll_every_ms,
-            now_ms(),
-            |runtime_id| {
-                self.runtime
-                    .screen(runtime_id)
-                    .ok()
-                    .map(|screen| screen_digest(&screen))
-            },
-        );
         let mut members = BTreeSet::new();
         let mut work_message_agents = Vec::new();
         let mut deferred_member_faults = BTreeMap::new();
+        let mut evaluated_member_wakes = BTreeSet::new();
         let mut diagnostic_errors = Vec::new();
         let unreadable_span = crate::profile::span("pass/unreadable-members");
         self.record_unreadable_members(&active, &mut diagnostic_errors);
@@ -2294,19 +2328,28 @@ impl<R: RuntimeControl> Reconciler<R> {
                             caught(|| self.reconcile_placement_away(subject, ptys.as_ref()))
                         })
                     });
-                    if result.is_ok() { self.incremental.evaluated(&item, reads, due); }
-                    if let Err(error) = self.record_member_reconcile_result(&subject.subject, result) {
-                        diagnostic_errors.push(format!("{}: placement-away: {error:#}", subject.subject));
+                    if result.is_ok() {
+                        self.incremental.evaluated(&item, reads, due);
+                    }
+                    if let Err(error) =
+                        self.record_member_reconcile_result(&subject.subject, result)
+                    {
+                        diagnostic_errors
+                            .push(format!("{}: placement-away: {error:#}", subject.subject));
                     }
                 }
             }
             if subject.kind == "stop" {
+                let item = format!("stop:{}", subject.subject);
+                stops.insert(item.clone());
+                if skip_stops && !self.incremental.needs(&item, now_ms()) {
+                    continue;
+                }
                 if !self.owned_desired_ready(subject) {
+                    stops.remove(&item);
                     continue;
                 }
                 let _member_span = crate::profile::span("pass/member stop");
-                let item = format!("stop:{}", subject.subject);
-                stops.insert(item.clone());
                 self.reconcile_stop_item(
                     subject,
                     &item,
@@ -2700,6 +2743,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .last()
                 .is_some_and(|(declaration, _, _)| declaration.subject == subject.subject);
             if deferred {
+                evaluated_member_wakes.insert(subject.subject.clone());
                 if let Err(error) = result {
                     deferred_member_faults.insert(subject.subject.clone(), error);
                 }
@@ -2791,6 +2835,16 @@ impl<R: RuntimeControl> Reconciler<R> {
             let agent = &declaration.subject;
             let item = format!("wake:{agent}@{incarnation}");
             wakes.insert(item.clone());
+            // A truly untouched member/wake has no result to publish. In particular it must
+            // not recover a retained member fault by reporting an unevaluated success. When
+            // member work ran, even a clean wake must fence and publish that actual result.
+            if skip_wakes
+                && !evaluated_member_wakes.contains(agent)
+                && !deferred_member_faults.contains_key(agent)
+                && !self.incremental.needs(&item, now_ms())
+            {
+                continue;
+            }
             let result = self.reconcile_guarded_item(
                 "wake",
                 &item,
@@ -4170,7 +4224,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 ("severity".into(), Value::String("error".into())),
                                 ("status".into(), Value::String("failed".into())),
                                 ("code".into(), Value::String("work-wake-exhausted".into())),
-                                ("reason".into(), Value::String(reason)),
+                                ("reason".into(), Value::String(reason.clone())),
                                 ("incarnation_id".into(), Value::String(incarnation.into())),
                                 ("step_run".into(), Value::String(step.subject.clone())),
                                 ("wake_attempts".into(), Value::from(attempt_count)),
@@ -4179,8 +4233,37 @@ impl<R: RuntimeControl> Reconciler<R> {
                             ]),
                             evidence,
                             expected_subject: None,
-                            idempotency_key: Some(diagnostic_key),
+                            idempotency_key: Some(diagnostic_key.clone()),
                         })?;
+                        self.signal_changed();
+                    }
+                    // Exhaustion is a fault for an owner to inspect, not permission to resend
+                    // or bypass the queue head. One episode covers this ready epoch/incarnation,
+                    // even if the number of attempts changes. Existing diagnostics are eligible
+                    // too, so a restart between diagnostic and notice cannot lose the notice.
+                    let episode = format!("work-wake-notice:{agent}:{tag_value}");
+                    if self
+                        .store
+                        .operation_claim(&format!("{episode}:first"))?
+                        .is_none()
+                    {
+                        let diagnostic = self
+                            .store
+                            .operation_claim(&diagnostic_key)?
+                            .context("the exhausted wake diagnostic was not recorded")?;
+                        self.store.record_runtime_failure(
+                            &episode,
+                            &AttentionRequest {
+                                reviewer: agent.into(),
+                                title: "Ready work remains unclaimed after its wake".into(),
+                                reason: format!("{reason}. Inspect `{}` and [diagnostic `{}`](/v1/claims/by-id/{}); retry, revise or cancel the work.", step.subject, diagnostic.id, diagnostic.id),
+                                severity: "error".into(),
+                                targets: vec![agent.into(), step.subject.clone(), diagnostic.id],
+                                actor: "agent/st3/reconciler".into(),
+                                idempotency_key: episode.clone(),
+                            },
+                            "work-wake-exhausted",
+                        )?;
                         self.signal_changed();
                     }
                 }
@@ -36562,6 +36645,8 @@ mission "gated" state="ready" {
   }
 }
 "#;
+
+    mod ready_wake_fault_notice;
 
     struct SeatQueueFixture {
         store: Arc<Store>,

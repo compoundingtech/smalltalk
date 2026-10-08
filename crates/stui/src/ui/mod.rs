@@ -22,6 +22,7 @@ mod hyperlinks;
 #[path = "../../tests/support/terminal_tab.rs"]
 mod terminal_tab;
 pub use glass::set_glasses_version;
+pub use lastrun::log_panics as lastrun_log_panics;
 mod glass_store;
 mod lastrun;
 pub mod layout;
@@ -291,6 +292,10 @@ struct ChatState {
     editing: bool,
 }
 
+/// How long an agent's tab stays in front before its terminal attaches, on a device that opens
+/// agents on their terminal: flicking through tabs attaches nothing.
+const ATTACH_DWELL: Duration = Duration::from_millis(300);
+
 /// How long a second Ctrl+T may follow the first and leave the terminal.
 /// How many closed items Home keeps listed under "Recently closed".
 const RECENTLY_CLOSED: usize = 5;
@@ -337,6 +342,11 @@ pub struct Ui {
     /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
     /// the page before it.
     older_wanted: RefCell<BTreeSet<String>>,
+    /// This device opens an agent's tab on its terminal, not its conversation (a setting).
+    terminal_first: bool,
+    /// The agent whose tab just took the focus, and when: its terminal attaches once the tab has
+    /// stayed in front for a moment, so passing through tabs attaches nothing.
+    attach_when: Option<(String, Instant)>,
     popover: Option<String>,
     chat: Option<ChatState>,
     /// st's conversation search for the palette: the query asked and what came back.
@@ -429,6 +439,58 @@ fn link_note(target: &str) -> String {
     }
 }
 
+/// What clicking a web address did when it also opened the browser here.
+fn link_opened_note(target: &str) -> String {
+    format!("Opened {} in your browser · also copied", text::truncate(target, 60))
+}
+
+/// The program that opens a web address in the browser of the machine stui runs on, when that is
+/// where the person sits: not over SSH, and with a desktop (always on macOS). Anything but an
+/// http(s) address is only copied.
+fn browser_opener(url: &str, set: impl Fn(&str) -> bool, macos: bool) -> Option<&'static str> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return None;
+    }
+    if ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"].iter().any(|name| set(name)) {
+        return None;
+    }
+    if macos {
+        Some("open")
+    } else if set("DISPLAY") || set("WAYLAND_DISPLAY") {
+        Some("xdg-open")
+    } else {
+        None
+    }
+}
+
+/// Open `url` in the default browser here if this looks like the person's own machine. It never
+/// waits for the browser and never fails the click: the link is copied either way.
+fn open_in_browser(url: &str) -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    let set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    let Some(program) = browser_opener(url, set, cfg!(target_os = "macos")) else {
+        return false;
+    };
+    match std::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Reap it when it exits, so a click never leaves a zombie behind.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Whether `c` can be part of a written-out web address.
 fn is_address_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
@@ -478,6 +540,8 @@ impl Ui {
             acted: HashSet::new(),
             closed: HashSet::new(),
             older_wanted: RefCell::default(),
+            terminal_first: false,
+            attach_when: None,
             popover: None,
             chat: None,
             parked: Vec::new(),
@@ -633,7 +697,9 @@ impl Ui {
         if let Some(path) = prefs::path() {
             // Simplified is the default, as on the phone (Nathan, 2026-10-04); a device that
             // chose the full view keeps it.
-            self.simple = simplified(&prefs::load(&path));
+            let loaded = prefs::load(&path);
+            self.simple = simplified(&loaded);
+            self.terminal_first = loaded.terminal_first == Some(true);
         }
     }
 
@@ -645,20 +711,62 @@ impl Ui {
         }
     }
 
-    /// Every conversation simplified (a tool call to a line, a run of calls to one line) or in
-    /// full: this device's choice, remembered.
-    pub(crate) fn toggle_simple(&mut self) {
-        self.simple = !self.simple;
-        // Tests never touch the device's own choice.
+    /// Remember this device's choices. Tests never touch the device's own.
+    fn save_prefs(&self) {
         #[cfg(not(test))]
         if let Some(path) = prefs::path() {
             let _ = prefs::save(
                 &path,
                 &prefs::Prefs {
                     simple: Some(self.simple),
+                    terminal_first: Some(self.terminal_first),
                 },
             );
         }
+    }
+
+    /// Open an agent's tab on its terminal, or on its conversation (the default): this device's
+    /// choice, remembered.
+    pub(crate) fn toggle_terminal_first(&mut self) {
+        self.terminal_first = !self.terminal_first;
+        self.save_prefs();
+        self.flash(if self.terminal_first {
+            "Agents open on their terminal · the conversation is a key away (Ctrl+\\ leaves the terminal)"
+        } else {
+            "Agents open on their conversation · Ctrl+] attaches the terminal"
+        });
+    }
+
+    /// Whether this device opens agents on their terminal.
+    pub(crate) fn terminal_first(&self) -> bool {
+        self.terminal_first
+    }
+
+    /// Attach the terminal of an agent whose tab has been in front for a moment, when this device
+    /// opens agents on their terminal.
+    pub(crate) fn step_default_view(&mut self) {
+        let Some((id, at)) = &self.attach_when else {
+            return;
+        };
+        if at.elapsed() < ATTACH_DWELL {
+            return;
+        }
+        let id = id.clone();
+        self.attach_when = None;
+        let still_here = matches!(self.focused_pane(), Some(Pane::Agent(Some(ref now))) if *now == id);
+        let attached = self.terminal.as_ref().is_some_and(|view| view.agent == id)
+            || self.parked.iter().any(|view| view.agent == id);
+        if still_here && !attached && !self.editing && self.terminal_first {
+            self.attach_terminal(&id);
+        }
+    }
+
+    /// Every conversation simplified (a tool call to a line, a run of calls to one line) or in
+    /// full: this device's choice, remembered.
+    pub(crate) fn toggle_simple(&mut self) {
+        self.simple = !self.simple;
+        // Tests never touch the device's own choice.
+        self.save_prefs();
         self.flash(if self.simple {
             "Simplified: each tool call is one line, a run of them one line · ctrl+p for everything"
         } else {
@@ -991,9 +1099,15 @@ impl Ui {
                         self.world.diverged.join(", ")
                     ));
                 }
+                if !self.world.stale.is_empty() {
+                    self.flash(format!(
+                        "Out of date: st stopped serving {}",
+                        self.world.stale.join("; ")
+                    ));
+                }
                 if known {
                     self.open(&machine);
-                } else if self.world.diverged.is_empty() {
+                } else if self.world.diverged.is_empty() && self.world.stale.is_empty() {
                     self.flash(format!(
                         "Connected to {} as {}",
                         self.world.host, self.world.person
@@ -1364,6 +1478,7 @@ impl Ui {
         let (glyph, word, color) = match &self.world.link {
             // Live, but showing a graph that exchanges cannot correct.
             Link::Live if !self.world.diverged.is_empty() => ("⚠", "diverged", theme::RED),
+            Link::Live if !self.world.stale.is_empty() => ("◐", "stale", theme::YELLOW),
             Link::Live => ("●", "live", theme::GREEN),
             Link::Connecting => (self.spinner(), "connecting", theme::YELLOW),
             Link::Offline(_) => ("○", "offline", theme::RED),
@@ -5230,10 +5345,16 @@ impl Ui {
             Hit::Home if self.home_open() && !self.usage_open() => self.close_home(),
             Hit::Home => self.open_home(),
             // The terminal may be on another machine than stui (over SSH or fabric): the
-            // clipboard is the person's, so the link lands where their browser is.
+            // clipboard is the person's, so the link lands where their browser is. Run locally,
+            // the browser opens too.
             Hit::Link(url) => {
                 copy(&url);
-                self.flash(link_note(&url));
+                let opened = open_in_browser(&url);
+                self.flash(if opened {
+                    link_opened_note(&url)
+                } else {
+                    link_note(&url)
+                });
             }
             Hit::Split(right) => self.split(right),
             Hit::GlassTab(group, tab) => self.show_in(group, tab),
@@ -6270,6 +6391,24 @@ mod tests {
     }
 
     #[test]
+    fn a_web_address_opens_the_browser_only_on_the_persons_own_machine() {
+        let none = |_: &str| false;
+        let only = |wanted: &'static str| move |name: &str| name == wanted;
+        let url = "https://example.com/a";
+        // A Mac opens it; Linux needs a desktop; SSH never does; a path or other scheme never does.
+        assert_eq!(browser_opener(url, none, true), Some("open"));
+        assert_eq!(browser_opener(url, none, false), None);
+        assert_eq!(browser_opener(url, only("DISPLAY"), false), Some("xdg-open"));
+        assert_eq!(browser_opener(url, only("WAYLAND_DISPLAY"), false), Some("xdg-open"));
+        assert_eq!(browser_opener(url, |name| name == "SSH_CONNECTION" || name == "DISPLAY", false), None);
+        assert_eq!(browser_opener(url, only("SSH_TTY"), true), None);
+        assert_eq!(browser_opener("/srv/repo/spec.md", none, true), None);
+        assert_eq!(browser_opener("file:///etc/passwd", none, true), None);
+        assert_eq!(browser_opener("javascript:alert(1)", none, true), None);
+        assert!(link_opened_note(url).contains("also copied"));
+    }
+
+    #[test]
     fn a_feedback_request_offers_words_and_a_dismissal_not_an_answer_to_choose() {
         // Nathan, 2026-10-05: "why can't I dismiss this attention item?"
         let feedback = |kind: &str, answers: Vec<st3_client::RequestAnswerOption>| {
@@ -6852,6 +6991,20 @@ mod tests {
     }
 
     #[test]
+    fn a_list_st_stopped_serving_after_it_loaded_marks_the_connection_stale_and_says_why() {
+        let mut world = demo::world();
+        world.stale = vec!["Agents: collection source is unavailable".into()];
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        let top = frame(&ui, 140, 50)[0].clone();
+        assert!(top.contains("stale") && !top.contains("live"), "{top}");
+        // Clicking the connection word says why, and the rows stay.
+        ui.show_connection();
+        assert!(ui.flash.as_ref().is_some_and(|(text, _)| text.contains("collection source is unavailable")));
+        assert!(!ui.world.agents.items().is_empty());
+    }
+
+    #[test]
     fn x_dismisses_whatever_on_home_can_be_dismissed() {
         let mut world = demo::world();
         if let Load::Ready(items) = &mut world.attention {
@@ -7214,8 +7367,8 @@ mod tests {
     #[test]
     fn conversations_are_simplified_unless_this_device_chose_the_full_view() {
         assert!(simplified(&prefs::Prefs::default()));
-        assert!(simplified(&prefs::Prefs { simple: Some(true) }));
-        assert!(!simplified(&prefs::Prefs { simple: Some(false) }));
+        assert!(simplified(&prefs::Prefs { simple: Some(true), ..Default::default() }));
+        assert!(!simplified(&prefs::Prefs { simple: Some(false), ..Default::default() }));
     }
 
     #[test]
