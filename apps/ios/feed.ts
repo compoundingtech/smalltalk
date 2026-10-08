@@ -272,7 +272,10 @@ export class Feed {
       // copy shown can say it is stale (the owner's host is away).
       if (id === CONVERSATION && this.conversation) { if (frame.message) this.conversation.handlers.onIssue(`${plainMessage(frame.code, frame.message)} · trying again`); }
       else if (frame.id === GLASSES && this.glasses) { this.glasses.window = undefined; this.stream?.subscribeGlasses(GLASSES); }
-      else if (frame.id in FEED_WINDOWS) { const name = frame.id as FeedWindow; this.retryLater(name, () => this.subscribeWindow(name)); }
+      else if (frame.id in FEED_WINDOWS) {
+        const name = frame.id as FeedWindow;
+        if (this.retryLater(name, () => this.subscribeWindow(name)) && frame.message) this.handlers.onWindowError?.(name, `${plainMessage(frame.code, frame.message)} · trying again`);
+      }
     } else if (frame.kind === 'screen') {
       if (id === TERMINAL) this.terminal?.screen(frame.value);
     } else if (frame.kind === 'conversation') {

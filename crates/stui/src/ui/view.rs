@@ -46,6 +46,9 @@ pub struct World {
     /// Peers this host's graph has diverged from: the same envelopes project a different graph
     /// here, so what stui shows can be wrong until the host is repaired.
     pub diverged: Vec<String>,
+    /// Lists st stopped serving after they loaded, each with st's reason: the rows shown are the
+    /// last it sent, and may be out of date until it serves them again.
+    pub stale: Vec<String>,
     pub attention: Load<Vec<Attention>>,
     pub agents: Load<Vec<Agent>>,
     pub missions: Load<Vec<Mission>>,

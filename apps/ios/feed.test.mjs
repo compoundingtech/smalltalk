@@ -22,6 +22,31 @@ function watch() {
 const subscribed = socket => socket.sent.filter(command => command.kind === 'subscribe').map(command => command.id);
 
 {
+  // A pending source keeps its delivered rows and says they are stale. Ready changes
+  // recover on the held subscription, canceling the pending resubscription timer.
+  const { client, sockets } = fakeClient();
+  const { seen, handlers } = watch();
+  const feed = new Feed(client, handlers, new ForegroundGate('active'), () => 'action/test', [100]);
+  await settle();
+  const socket = sockets[0];
+  socket.frame({ kind: 'snapshot', id: 'agents', collection: 'agents', snapshot: snapshot(1), items: [agent('agent/amber'), agent('agent/blue')], order: ['agent/amber', 'agent/blue'], has_more: false });
+  const before = socket.sent.length;
+  const pending = { kind: 'resync', id: 'agents', collection: 'agents', code: 'internal', message: 'collection source is unavailable; held rows are stale until readiness returns', retryable: true };
+  socket.frame(pending);
+  socket.frame(pending);
+  assert.deepEqual(seen.windows.agents.ids, ['agent/amber', 'agent/blue'], 'resync preserves the last delivered rows');
+  assert.equal(seen.errors.length, 1, 'one issue per unavailable interval');
+  assert.match(seen.errors[0], /agents: .*held rows are stale/);
+  socket.frame({ kind: 'changes', id: 'agents', collection: 'agents', snapshot: snapshot(2), upserts: [agent('agent/coral')], removes: ['agent/amber'], order: ['agent/coral', 'agent/blue'], has_more: false });
+  assert.deepEqual(seen.windows.agents.ids, ['agent/coral', 'agent/blue']);
+  await settle(170);
+  assert.equal(socket.sent.length, before, 'Ready changes cancel resubscription');
+  socket.frame(pending);
+  assert.equal(seen.errors.length, 2, 'a later unavailable interval is reported again');
+  feed.close();
+}
+
+{
   // Snapshot then changes produce ordered lists; a removal leaves the window.
   const { client, sockets } = fakeClient();
   const { seen, handlers } = watch();

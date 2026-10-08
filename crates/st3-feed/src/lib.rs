@@ -453,6 +453,7 @@ async fn connected(
                     }
                     CollectionEvent::Changes { id, snapshot, upserts, removes, order, has_more } => {
                         let Some(window) = Window::from_id(&id) else { continue };
+                        window_retries.loaded(window);
                         let rows = windows.entry(window).or_default();
                         for id in removes {
                             rows.remove(&id);

@@ -147,11 +147,23 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         .filter(|peer| peer.diverged_since.is_some())
         .map(|peer| peer.host_id.trim_start_matches("host/").to_owned())
         .collect();
+    let loaded_windows = [
+        ("Attention", model.now.snapshot.is_some()),
+        ("Agents", model.agents.snapshot.is_some()),
+        ("Missions", model.missions.snapshot.is_some()),
+    ];
+    let stale = extras
+        .window_errors
+        .iter()
+        .filter(|(name, _)| loaded_windows.iter().any(|(window, loaded)| *loaded && window == &name.as_str()))
+        .map(|(name, why)| format!("{name}: {why}"))
+        .collect();
     World {
         person: person.to_owned(),
         host,
         link,
         diverged,
+        stale,
         attention: loaded_or_why(model.now.snapshot.is_some(), attention, extras.window_errors.get("Attention")),
         agents: loaded_or_why(model.agents.snapshot.is_some(), agents(model, &missions), extras.window_errors.get("Agents")),
         missions: loaded_or_why(model.missions.snapshot.is_some(), missions, extras.window_errors.get("Missions")),
