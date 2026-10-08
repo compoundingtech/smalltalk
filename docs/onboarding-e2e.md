@@ -112,7 +112,7 @@ The full expert phase adds two focused scenarios:
   composer hint with `type or click` before navigating Home. It requires a reachable
   built-in expert and the exact graph wake read, stops the expert, explicitly
   cancels `mission-run/st/onboarding`, and repeats ordinary setup twice. The expert
-  must stay stopped/unreachable with one historical run. `setup --onboarding` must
+  must stay stopped and non-actionable in history with one historical run. `setup --onboarding` must
   then restore it with a different observed incarnation and add exactly one UUID
   run alongside cancelled history; the restored expert must read a new exact wake.
 - `claude-pre-channel`: `setup --harness claude --claude-channel false` must preserve
@@ -124,10 +124,18 @@ The full expert phase adds two focused scenarios:
 
 These cases require the expert-seat candidate and reject `--harness-only`.
 Historical run counts use `missions show` overview fields, including cancelled
-runs. The Claude adapter records `ST3_INCARNATION` on every receipt; an old process's
+runs; the CLI returns the run itself when exactly one historical run exists.
+Stopped seats can retain historical runtime/reachability fields; their stopped,
+historical/non-actionable projection is authoritative. The Claude adapter records `ST3_INCARNATION` on every receipt; an old process's
 read cannot satisfy the post-restart assertion. The native Claude fixture respects
 `CLAUDE_CONFIG_DIR` so the managed transcript is available for resume. Fixtures
 read/claim only; a plumbing pass does not prove later gate content or wrap-up.
+
+Restart can return exit2 with the exact restarted-and-waiting-for-input message
+before channel consent finishes. The pre-channel case accepts only that recognized
+nonzero outcome, then still requires a different current healthy incarnation, its
+exact post-install wake read, the installed plugin argv and its consent receipt.
+This proves channel recovery; the early restart CLI wait classification remains.
 
 ```sh
 scripts/onboarding-e2e --scenario expert-lifecycle --scenario claude-pre-channel \

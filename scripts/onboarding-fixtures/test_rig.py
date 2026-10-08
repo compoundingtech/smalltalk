@@ -62,6 +62,23 @@ class RigChecks(unittest.TestCase):
         self.assertFalse(rig.successful_read([{**old,"incarnation":"new","exit":2}],"message/abc","new"))
         self.assertTrue(rig.successful_read([old,{**old,"incarnation":"new"}],"message/abc","new"))
 
+    def test_history_counts_single_unwrapped_and_multiple_runs(self):
+        single={"mission":"mission/st/onboarding","subject":"mission-run/st/onboarding","status":"cancelled"}
+        self.assertEqual(rig.onboarding_history(single),{"total_runs":1,"newest":[{"id":single["subject"],"status":"cancelled"}]})
+        multiple={"total_runs":2,"newest":[{"id":single["subject"]},{"id":single["subject"]+"/fixture"}]}
+        self.assertEqual(rig.onboarding_history(multiple),multiple)
+        self.assertIsNone(rig.onboarding_history({**single,"subject":"mission-run/st/onboarding-other"}))
+        self.assertIsNone(rig.onboarding_history({"status":"cancelled"}))
+
+    def test_restart_waiting_requires_exact_subject_and_message(self):
+        subject="agent/st/expert"
+        waiting=f"st: `{subject}` restarted and is waiting for your input; attach with `st terminals attach {subject}`\n"
+        self.assertTrue(rig.restart_requested({"exit":2,"stderr":waiting},subject))
+        self.assertTrue(rig.restart_requested({"exit":0,"stderr":""},subject))
+        self.assertFalse(rig.restart_requested({"exit":2,"stderr":"provider failed"},subject))
+        self.assertFalse(rig.restart_requested({"exit":2,"stderr":waiting},"agent/other"))
+        self.assertFalse(rig.restart_requested({"exit":1,"stderr":waiting},subject))
+
     def test_focus_probe_rejects_sidebar_and_unfocused_composer(self):
         code='import os,tty; tty.setraw(0); os.write(1,b"\\x1b[?1049h working Expert sidebar Message Expert "+"·".encode()+b" click");\nwhile True:\n value=os.read(0,100)\n if b"\\x11" in value: os.write(1,b"\\x1b[?1049l"); break\n if b"home" in value: os.write(1,b"Now Nothing needs you")\n'
         request={"argv":["python3","-c",code],"timeout":5,"expect_expert":True,"expert_focus_timeout":0.1}
