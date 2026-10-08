@@ -906,6 +906,10 @@ pub(crate) struct SubjectCache {
 
 const AGENT_CARD_STATUS_LIMIT: usize = 4096;
 
+/// How long a roster refresh request may go unanswered before readers stop serving published
+/// rows and say the roster is not ready.
+const AGENT_ROSTER_OVERDUE_MS: u64 = 30_000;
+
 /// One subject's reduction, read at snapshot `read_at`, so it holds from there on.
 struct StatusEntry {
     read_at: u64,
@@ -2759,6 +2763,14 @@ impl Store {
                 row.get::<_, Option<String>>(2)?))
         })? {
             let (subject, kind, actor) = row?;
+            // A card reads claims about its agent, the runs, generations and steps that own or
+            // queue agents, and messages; work activity is read by actor on step claims. A
+            // claim about any other subject, of any kind, changes no card.
+            if !["agent/", "mission-run/", "run-generation/", "step-run/", "message/"]
+                .iter().any(|prefix| subject.starts_with(prefix))
+            {
+                continue;
+            }
             if self.smalltalk.claim_registry().claim(&kind).is_none() {
                 return Ok(None);
             }
@@ -2816,19 +2828,8 @@ impl Store {
                     .filter(|party| party.starts_with("agent/")));
                 continue;
             }
-            // These projections touch neither card reductions nor queue/label inputs. Keep
-            // the subject guards: a claim on an agent also changes its fallback revision.
-            let irrelevant = match kind.as_str() {
-                "daemon.diagnostic" | "daemon.started" => subject.starts_with("daemon/"),
-                "glass.upserted" | "glass.deleted" => subject.starts_with("glass/"),
-                "arrangement.edited" => subject.starts_with("arrangement/"),
-                "fleet.invite-created" | "fleet.invite-redeemed" | "fleet.invite-revoked" => subject.starts_with("fleet-invite/"),
-                "fleet.member-admitted" | "fleet.member-endpoints" | "fleet.member-left" | "fleet.member-removed" => subject.starts_with("host/"),
-                _ => false,
-            };
-            if !irrelevant {
-                return Ok(None);
-            }
+            // Any other claim about a card input subject: refold conservatively.
+            return Ok(None);
         }
         if !owners.is_empty() {
             // Existing cards carry their historical ownership; current declarations also
@@ -2936,12 +2937,53 @@ impl Store {
         Some(wake)
     }
 
+    /// Whether a fold at `index` can start from the newest complete roster and refold only the
+    /// cards whose claims changed since, rather than every card.
+    pub(crate) fn agent_roster_delta_known(&self, index: u64) -> Result<bool> {
+        let previous = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| !entry.history && entry.covered.is_none() && entry.index <= index)
+            .max_by_key(|entry| (entry.index, entry.local)).cloned();
+        let Some(previous) = previous else { return Ok(false) };
+        Ok(previous.index == index
+            || self.changed_agent_resources(previous.index, index, &previous.items)?.is_some())
+    }
+
+    /// Whether a refresher keeps the roster published, so readers must never fold it.
+    pub(crate) fn agent_roster_refresher_running(&self) -> bool {
+        self.smalltalk.agent_roster_refresh.get().is_some()
+    }
+
     /// Ask the refresher, if one runs, to publish the roster at the newest cut. Requests made
     /// while it folds coalesce into one more refresh.
     pub(crate) fn request_agent_roster_refresh(&self) {
         if let Some(wake) = self.smalltalk.agent_roster_refresh.get() {
+            let _ = self.smalltalk.agent_roster_requested_at.compare_exchange(
+                0, now_ms() as u64, std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             wake.notify_one();
         }
+    }
+
+    /// Run one refresh, answering the requests made before it began only if it publishes.
+    pub(crate) fn answer_agent_roster_requests<T>(&self, refresh: impl FnOnce() -> Result<T>) -> Result<T> {
+        let requested = &self.smalltalk.agent_roster_requested_at;
+        let pending = requested.swap(0, std::sync::atomic::Ordering::AcqRel);
+        let result = refresh();
+        if result.is_err() && pending != 0 {
+            // Still unanswered: keep the oldest request time unless a newer request is waiting.
+            let _ = requested.compare_exchange(0, pending, std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Whether a refresh request has gone unanswered so long that the refresher must be failing
+    /// or stopped: published rows are then no longer served, and readers are told not ready.
+    fn agent_roster_refresh_overdue(&self) -> bool {
+        let requested = self.smalltalk.agent_roster_requested_at.load(std::sync::atomic::Ordering::Acquire);
+        requested != 0 && (now_ms() as u64).saturating_sub(requested) > AGENT_ROSTER_OVERDUE_MS
     }
 
     /// The newest complete current roster published at or before `index`, with its own graph
@@ -2950,6 +2992,9 @@ impl Store {
     /// refresher there is none: readers then fold exactly their own cut, as before.
     pub(crate) fn published_agent_roster(&self, index: u64) -> Option<(u64, Arc<Vec<Value>>)> {
         self.smalltalk.agent_roster_refresh.get()?;
+        if self.agent_roster_refresh_overdue() {
+            return None;
+        }
         self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| !entry.history && entry.covered.is_none() && entry.index <= index)
@@ -2967,6 +3012,9 @@ impl Store {
         count: usize,
     ) -> Option<(u64, Arc<Vec<Value>>, Vec<Value>)> {
         self.smalltalk.agent_roster_refresh.get()?;
+        if self.agent_roster_refresh_overdue() {
+            return None;
+        }
         let (cut, refs) = self.smalltalk.agent_page_refs_cache.lock()
             .expect("agent page refs cache poisoned").iter()
             .filter(|entry| !entry.history && entry.index <= index)
@@ -2986,7 +3034,8 @@ impl Store {
         Some((cut, refs, head))
     }
 
-    /// Follows the graph index of the newest complete current roster.
+    /// Follows the revision of complete current roster publications: it rises with every one,
+    /// including a replacement at the same graph index after local activity or a deadline.
     pub(crate) fn subscribe_agent_roster(&self) -> tokio::sync::watch::Receiver<u64> {
         self.smalltalk.agent_roster_published.subscribe()
     }
@@ -3244,11 +3293,7 @@ impl Store {
         };
         drop(cache);
         if complete {
-            self.smalltalk.agent_roster_published.send_if_modified(|published| {
-                let newer = index > *published;
-                *published = (*published).max(index);
-                newer
-            });
+            self.smalltalk.agent_roster_published.send_modify(|revision| *revision += 1);
         }
         Ok(select(&items))
     }

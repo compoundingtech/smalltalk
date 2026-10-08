@@ -36,8 +36,11 @@ pub struct SmalltalkRuntime {
     /// Set once a daemon keeps the complete roster published off the request path; readers
     /// wake it instead of folding cards themselves.
     pub(crate) agent_roster_refresh: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
-    /// The graph index of the newest complete current roster, so collection streams holding
-    /// an older cut reread once a newer one is published.
+    /// When the oldest refresh request no refresh has answered yet was made, in Unix ms; 0
+    /// when none waits. A refresh clears it only once it publishes.
+    pub(crate) agent_roster_requested_at: std::sync::atomic::AtomicU64,
+    /// Counts complete current roster publications, same graph index or not, so collection
+    /// streams that read an earlier one reread the newer.
     pub(crate) agent_roster_published: tokio::sync::watch::Sender<u64>,
     #[cfg(test)]
     pub(crate) agent_resources_builds: std::sync::atomic::AtomicUsize,
@@ -341,7 +344,7 @@ impl Runtime for SmalltalkRuntime {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-        self.agent_roster_published.send_replace(0);
+        self.agent_roster_published.send_modify(|revision| *revision += 1);
         self.agent_page_refs_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

@@ -61,9 +61,9 @@ struct CollectionSubscription {
     cursor: Option<collection_ivm::Delivered>,
     order: Vec<String>,
     has_more: bool,
-    /// The graph index of the last delivered snapshot. An agents window delivered from an
-    /// older published roster rereads once a newer one is published.
-    delivered_index: u64,
+    /// The roster publication revision when this window's last read began. An agents window
+    /// rereads once a later roster is published, even at the same graph index.
+    roster_revision: u64,
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
@@ -313,6 +313,12 @@ async fn collection_items_with_windows(
                                 published = Some(cut);
                                 Some(cards)
                             }
+                            // A daemon's readers never fold the roster: until its refresher
+                            // has published one, the window is not ready yet.
+                            None if store.agent_roster_refresher_running() => {
+                                store.request_agent_roster_refresh();
+                                return Ok(Err(super::agent_roster_not_ready()));
+                            }
                             None if admitted => None,
                             None => return Ok(Ok(None)),
                         },
@@ -543,7 +549,6 @@ async fn deliver_collection(
         return Refreshed::Closed;
     }
     subscription.delivered = true;
-    subscription.delivered_index = snapshot.store_index;
     subscription.previous = Arc::new(current);
     subscription.order = order;
     subscription.has_more = has_more;
@@ -1134,7 +1139,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         }
                         refresh.push(request.id.clone());
                         // Collection results and conversation frames share the same generation fence.
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, delivered_index: 0, request });
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, request });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
@@ -1216,10 +1221,10 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
             }
             result = roster.changed(), if !command_waiting => {
                 if result.is_err() { return; }
-                // A window served from an older published roster rereads the newer one.
+                // A window read before this roster was published rereads it.
                 let published = *roster.borrow_and_update();
                 reread_due |= subscriptions.values().any(|s| s.ivm.is_none()
-                    && s.request.collection == "agents" && s.delivered && s.delivered_index < published);
+                    && s.request.collection == "agents" && s.roster_revision < published);
                 if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
                 refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
             }
@@ -1285,6 +1290,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 continue;
             }
             subscription.dirty = false;
+            subscription.roster_revision = *roster.borrow();
             let (cancel, canceled) = tokio::sync::oneshot::channel::<()>();
             subscription.reading = Some(cancel);
             let request = subscription.request.clone();
@@ -10940,8 +10946,9 @@ mission "queue-parity" state="ready" {
         let first = state.store.index().unwrap();
         let mut published = state.store.subscribe_agent_roster();
         crate::api::start_agent_roster(&state);
-        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|index| *index == first))
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
             .await.expect("the daemon publishes its roster as it starts").unwrap();
+        assert_eq!(state.store.published_agent_roster(first).unwrap().0, first);
         // Hold the next refresh back: readers must answer from the publication without it.
         let refresh = state.store.admit_agent_resources().await;
         append("harness.observed", json!({"state":"working", "driver":"codex",
@@ -10989,10 +10996,12 @@ mission "queue-parity" state="ready" {
         assert_eq!(snapshot["items"][0]["id"], subject);
         assert!(snapshot["items"][0]["harness_state"].is_null(), "{snapshot}");
 
-        let (Extension(page_snapshot), Json(page)) = tokio::time::timeout(Duration::from_secs(1),
+        // A page waits a bounded time for a publication at its own cut, then answers from the
+        // newest one rather than folding.
+        let (Extension(page_snapshot), Json(page)) = tokio::time::timeout(Duration::from_secs(3),
             client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
                 Query(ClientListQuery::default())))
-            .await.expect("an HTTP page must not wait for the refresh").unwrap();
+            .await.expect("an HTTP page must not wait for the held refresh").unwrap();
         assert_eq!(page_snapshot.store_index, first);
         assert_eq!(page.items, snapshot["items"].as_array().unwrap().clone());
 
@@ -11007,6 +11016,97 @@ mission "queue-parity" state="ready" {
             .await.unwrap();
         assert_eq!(page_snapshot.store_index, current);
         assert_eq!(page.items, changes["upserts"].as_array().unwrap().clone());
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_stream_rereads_a_same_index_publication_after_local_activity() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/local-roster";
+        let append = |kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        append("runtime.observed", json!({"status":"running",
+            "runtime_id":"local-roster", "incarnation_id":"one"}));
+        append("harness.observed", json!({"state":"working", "driver":"codex",
+            "incarnation_id":"one"}));
+        let index = state.store.index().unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+
+        let app = axum::Router::new().route("/stream", axum::routing::get({
+            let state = state.clone();
+            move |upgrade: WebSocketUpgrade| {
+                let state = state.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        let windows = collection_windows::Windows::attach(&state.store);
+                        collection_stream_socket_with_reader(
+                            socket, state, ClientSession::local(None).unwrap(), None,
+                            move |state, session, request, permit| {
+                                let windows = windows.clone();
+                                async move {
+                                    collection_items_with_windows(
+                                        &state, &session, &request, permit, windows,
+                                    ).await
+                                }
+                            },
+                        )
+                    })
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"kind":"subscribe",
+            "id":"roster", "collection":"agents", "limit":200}).to_string().into())).await.unwrap();
+        let mut next = async |within: Duration| -> Value {
+            let frame = tokio::time::timeout(within, socket.next()).await
+                .expect("a roster frame").unwrap().unwrap();
+            serde_json::from_str(frame.to_text().unwrap()).unwrap()
+        };
+        let snapshot = next(Duration::from_secs(5)).await;
+        assert_eq!(snapshot["kind"], "snapshot", "{snapshot}");
+        assert!(snapshot["items"][0]["last_activity_at"].is_null(), "{snapshot}");
+
+        // Local activity changes the card without advancing the graph. The stream rereads the
+        // same-index publication while the refresh is held, and receives nothing new.
+        let refresh = state.store.admit_agent_resources().await;
+        let revision = *published.borrow_and_update();
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "harness.timeline".into(),
+            actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({"operation":"append",
+                "entry_id":"local-activity", "source_id":"fixture/local-activity",
+                "sequence":1, "revision":1, "role":"assistant", "entry_type":"message",
+                "final":true, "driver":"codex", "incarnation_id":"one",
+                "observed_at_unix_ms":client_now_ms(), "body":{"text":"local activity"}})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        assert_eq!(state.store.index().unwrap(), index, "local activity must not advance the graph");
+        state.event_notify.send_modify(|_| {});
+        tokio::time::sleep(COLLECTION_REREAD_INTERVAL + Duration::from_millis(500)).await;
+        assert_eq!(*published.borrow(), revision, "the held refresh has not published");
+
+        // The refresh replaces the roster at the same graph index; the stream catches up.
+        drop(refresh);
+        let changes = next(Duration::from_secs(10)).await;
+        assert_eq!(changes["kind"], "changes", "{changes}");
+        assert_eq!(changes["snapshot"]["store_index"], index);
+        assert!(!changes["upserts"][0]["last_activity_at"].is_null(), "{changes}");
+        assert!(*published.borrow() > revision);
         socket.close(None).await.unwrap();
         server.abort();
     }
