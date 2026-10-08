@@ -3968,9 +3968,9 @@ fn omp_assistant_error_view(message: &Value) -> Option<Value> {
             if let Some(at) = superseded.get("timestamp").and_then(Value::as_i64) {
                 by["timestamp"] = json!(at);
             }
-            for field in ["responseId", "provider", "model"] {
+            for (target, field) in [("response_id", "responseId"), ("provider", "provider"), ("model", "model")] {
                 if let Some(value) = superseded.get(field).and_then(Value::as_str) {
-                    by[field] = json!(value);
+                    by[target] = json!(value);
                 }
             }
             if by.as_object().is_some_and(|by| !by.is_empty()) {
@@ -5445,6 +5445,7 @@ mod tests {
                     "model": "gpt-5.6-sol"
                 })
             );
+            assert!(block["view"]["retry"]["superseded_by"].get("responseId").is_none());
             assert_eq!(error["body"]["text"], "[retry recovered] error; retried");
         }
     }
