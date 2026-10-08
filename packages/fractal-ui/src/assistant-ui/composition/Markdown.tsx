@@ -24,8 +24,12 @@ export interface InlineResource { readonly path: string; readonly added: number;
 export type InlineReferenceRenderer = (path: string) => React.ReactNode | undefined
 export type MarkdownImageResolution = { readonly _tag: 'Load'; readonly src: string } | { readonly _tag: 'Defer' }
 export type MarkdownImageResolver = (src: string) => MarkdownImageResolution
-export const MarkdownImagePolicy = React.createContext<MarkdownImageResolver | undefined>(undefined)
-export interface MarkdownProps { text: string; streaming?: boolean; resources?: readonly InlineResource[]; onOpenResource?: (path?: string) => void; renderInlineReference?: InlineReferenceRenderer; resolveImage?: MarkdownImageResolver }
+/** Host handoff for a deferred image. When set, the placeholder action calls it instead of loading the image inline. */
+export type MarkdownImageOpener = (src: string) => void
+export interface MarkdownImageOptions { readonly resolveImage?: MarkdownImageResolver; readonly onLoadImage?: MarkdownImageOpener }
+const NO_IMAGE_OPTIONS: MarkdownImageOptions = {}
+export const MarkdownImagePolicy = React.createContext<MarkdownImageOptions>(NO_IMAGE_OPTIONS)
+export interface MarkdownProps { text: string; streaming?: boolean; resources?: readonly InlineResource[]; onOpenResource?: (path?: string) => void; renderInlineReference?: InlineReferenceRenderer; resolveImage?: MarkdownImageResolver; onLoadImage?: MarkdownImageOpener }
 const EMPTY_RESOURCES: readonly InlineResource[] = []
 const REMARK_PLUGINS = [remarkGfm]
 const STREAMING_PLUGINS = [markStreamingTail]
@@ -48,28 +52,31 @@ function markStreamingTail() {
   }
 }
 
-export const Markdown = React.memo(function Markdown({ text, streaming = false, resources = EMPTY_RESOURCES, onOpenResource, renderInlineReference, resolveImage }: MarkdownProps) {
-  const inheritedImagePolicy = React.useContext(MarkdownImagePolicy)
-  const references = React.useMemo(() => ({ resources, onOpenResource, renderInlineReference, resolveImage: resolveImage ?? inheritedImagePolicy }), [resources, onOpenResource, renderInlineReference, resolveImage, inheritedImagePolicy])
+export const Markdown = React.memo(function Markdown({ text, streaming = false, resources = EMPTY_RESOURCES, onOpenResource, renderInlineReference, resolveImage, onLoadImage }: MarkdownProps) {
+  const inherited = React.useContext(MarkdownImagePolicy)
+  const references = React.useMemo(() => ({ resources, onOpenResource, renderInlineReference, resolveImage: resolveImage ?? inherited.resolveImage, onLoadImage: onLoadImage ?? inherited.onLoadImage }), [resources, onOpenResource, renderInlineReference, resolveImage, onLoadImage, inherited])
   const source = React.useMemo(() => streaming ? completeStreamingTail(text) : text, [text, streaming])
   return <ReferenceContext.Provider value={references}><div data-testid="markdown" {...stylex.props(styles.markdown)}><ReactMarkdown skipHtml urlTransform={(url, key) => key === 'src' ? url : defaultUrlTransform(url)} remarkPlugins={REMARK_PLUGINS} rehypePlugins={streaming ? STREAMING_PLUGINS : undefined} components={MARKDOWN_COMPONENTS}>{source}</ReactMarkdown></div></ReferenceContext.Provider>
 })
 
 function DeferredImage({ src = '', alt = '' }: React.ComponentProps<'img'>) {
-  const { resolveImage } = React.useContext(ReferenceContext)
+  const { resolveImage, onLoadImage } = React.useContext(ReferenceContext)
   const [approvedSrc, setApprovedSrc] = React.useState<string | undefined>(undefined)
   const policy = resolveImage?.(src) ?? { _tag: 'Defer' }
   const loadedSrc = policy._tag === 'Load' ? policy.src : approvedSrc === src ? src : undefined
   let host = 'image source'
   try { const url = new URL(src); host = url.host || `${url.protocol} image` } catch { host = 'attachment' }
-  return loadedSrc !== undefined ? <img src={loadedSrc} alt={alt} referrerPolicy="no-referrer" {...stylex.props(styles.image)} /> : <span data-testid="deferred-image" data-image-src={src} {...stylex.props(styles.imagePlaceholder)}><span>{alt || 'Image'} · {host}</span><Button onPress={() => setApprovedSrc(src)} onClick={event => { event.preventDefault(); event.stopPropagation() }} {...stylex.props(styles.imageAction)}>Load image</Button></span>
+  if (loadedSrc !== undefined) return <img src={loadedSrc} alt={alt} referrerPolicy="no-referrer" {...stylex.props(styles.image)} />
+  // The host may forbid inline remote images (CSP img-src); it then opens the source itself.
+  const action = onLoadImage === undefined ? { label: 'Load image', press: () => setApprovedSrc(src) } : { label: `Open image · ${host}`, press: () => onLoadImage(src) }
+  return <span data-testid="deferred-image" data-image-src={src} {...stylex.props(styles.imagePlaceholder)}><span>{alt || 'Image'} · {host}</span><Button onPress={action.press} onClick={event => { event.preventDefault(); event.stopPropagation() }} {...stylex.props(styles.imageAction)}>{action.label}</Button></span>
 }
 
 function MarkdownLink({ children, href, title, node }: React.ComponentProps<'a'> & ExtraProps) {
-  const { resolveImage } = React.useContext(ReferenceContext)
+  const { resolveImage, onLoadImage } = React.useContext(ReferenceContext)
   const imageLink = node?.children.some(child => child.type === 'element' && child.tagName === 'img') ?? false
   const link = <Link href={href} target="_blank" rel="noopener noreferrer" render={props => <a {...props as React.ComponentPropsWithRef<'a'>} title={title} />} {...stylex.props(styles.link)}>{imageLink ? 'Open link' : children}</Link>
-  return <ReferenceContext.Provider value={{ resolveImage }}>{imageLink ? <span>{children}{' '}{link}</span> : link}</ReferenceContext.Provider>
+  return <ReferenceContext.Provider value={{ resolveImage, onLoadImage }}>{imageLink ? <span>{children}{' '}{link}</span> : link}</ReferenceContext.Provider>
 }
 
 function Paragraph({ children, node }: React.ComponentProps<'p'> & ExtraProps) {
@@ -297,7 +304,7 @@ const styles = stylex.create({
   emphasis: { fontStyle: 'italic' },
   syntaxComment: { color: textColor.fgMuted, fontStyle: 'italic' },
   syntaxKeyword: { color: status.runningFg },
-  syntaxString: { color: status.diffAdded },
+  syntaxString: { color: textColor.fgMuted },
   syntaxLiteral: { color: status.attention },
   syntaxFunction: { color: textColor.fg, fontWeight: t.weightMedium },
   syntaxDeleted: { color: status.dangerFg },
