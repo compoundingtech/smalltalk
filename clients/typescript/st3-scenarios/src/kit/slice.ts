@@ -173,6 +173,8 @@ export interface HttpCondition {
 export type SyncEvent =
   | (At & { readonly _tag: 'open-fail'; readonly opens?: number | 'all' })
   | (At & { readonly _tag: 'open-ok' })
+  | (At & { readonly _tag: 'open-hold' })
+  | (At & { readonly _tag: 'open-release' })
   | (At & {
       readonly _tag: 'http-raw'
       readonly route: HttpRoute

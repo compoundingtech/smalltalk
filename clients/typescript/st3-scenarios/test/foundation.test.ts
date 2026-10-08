@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { ANCHOR_MS, agent, buildWorld, foldSlice, genericVariants, loadWorld, terminalRecord, terminalRun, wireValues, type RawResource, type Slice, type SyncEvent, type WorldDefinition } from '../src/index.ts'
+import type { Session } from '@smalltalk/st3-client'
+import { ANCHOR_MS, agent, buildWorld, foldSlice, genericVariants, loadWorld, terminalRecord, terminalRun, wireValues, type RawResource, type Slice, type SyncEvent, type TerminalRecord, type WorldDefinition } from '../src/index.ts'
 import { drawCast } from '../src/kit/cast.ts'
 import { rngFromSeed } from '../src/kit/rng.ts'
 import { entry, thread } from '../src/kit/factories/turn.ts'
@@ -21,6 +22,15 @@ const setup = (timeline: SyncEvent[] = []) => {
   return { world, replay, clock }
 }
 const context = (): FactoryContext => { const world = base(); return { cast: world.cast, world: world.id, rng: rngFromSeed(1), t: timeContext(world.now) } }
+const attachCapability = async (replay: Replay, record: TerminalRecord): Promise<string> => {
+  const response = await replay.fetch('http://scenario.invalid/v1/client/actions', { method: 'POST', body: JSON.stringify({
+    id: 'action/foundation-review', type: 'terminal.attach', parameters: { target_id: record.terminal },
+    fence: { runtime_incarnation: record.incarnation },
+  }) })
+  expect(response.status).toBe(200)
+  const body = await response.json() as { value: { terminal_attachment: { stream_capability: string } } }
+  return body.value.terminal_attachment.stream_capability
+}
 
 const emptyDefinition: WorldDefinition = {
   id: 'foundation-empty', title: 'Empty contract test', narrative: 'Empty contract test', seed: 1,
@@ -149,6 +159,42 @@ describe('foundation contracts', () => {
     expect(outcomes.at(-1)).toBe('recovered')
   })
 
+  it('keeps socket opens CONNECTING until open-release resumes them', () => {
+    const { replay, clock } = setup([
+      { _tag: 'open-hold', at_ms: 0, store: 0 },
+      { _tag: 'open-release', at_ms: 1_000, store: 0 },
+    ])
+    const outcomes: string[] = []
+    const socket = replay.socket('ws://scenario.invalid/v1/client/collections', [], {})
+    socket.onopen = () => outcomes.push('open')
+    socket.onerror = () => outcomes.push('error')
+    socket.onclose = () => outcomes.push('close')
+    socket.onmessage = () => outcomes.push('message')
+    clock.advance(0)
+    socket.send(JSON.stringify({ kind: 'subscribe', collection: 'agents', id: 'held' }))
+    clock.advance(999)
+    expect(outcomes).toEqual([])
+    clock.advance(1)
+    expect(outcomes).toEqual(['open'])
+    socket.send(JSON.stringify({ kind: 'subscribe', collection: 'agents', id: 'released' }))
+    expect(outcomes).toEqual(['open', 'message'])
+  })
+
+  it('does not reopen a pending socket closed before release', () => {
+    const { replay, clock } = setup([
+      { _tag: 'open-hold', at_ms: 0, store: 0 },
+      { _tag: 'open-release', at_ms: 1_000, store: 0 },
+    ])
+    const outcomes: string[] = []
+    const socket = replay.socket('ws://scenario.invalid/v1/client/collections', [], {})
+    socket.onopen = () => outcomes.push('open')
+    socket.onclose = () => outcomes.push('close')
+    clock.advance(0)
+    socket.close()
+    clock.advance(1_000)
+    expect(outcomes).toEqual(['close'])
+  })
+
   it('repeats the legacy unqualified uncoded error on every resubscribe until cleared', () => {
     const { replay, clock } = setup([{ _tag: 'error', at_ms: 0, store: 0, message: 'invalid subscription or subscription limit exceeded', retryable: false, repeat: true }, { _tag: 'error-clear', at_ms: 1_000, store: 0 }])
     const frames: unknown[] = []
@@ -231,5 +277,124 @@ describe('foundation contracts', () => {
     expect(record.screens.every((screen) => screen.at_ms <= 0)).toBe(true)
     expect(record.runtime.owner_id).toBe(member.id)
     expect(agent(ctx, member, { state: 'desired', sinceMs: 0 })).toMatchObject({ agent: { state: 'desired', runtime_ids: [], incarnation_id: null }, runtime: null })
+  })
+
+  it.each(['root', 'nested'] as const)('rejects a known-object %s ancestor repair hiding undeclared descendants', (scope) => {
+    const original = base()
+    const known = original.slices.roster.state.agents[0]!
+    if (known.checkout == null) throw new Error('Ancestor-repair fixture requires a checkout')
+    const contaminated = scope === 'root'
+      ? { ...known, state: 'future-agent-state', reachability: 'future-reachability' }
+      : { ...known, checkout: { ...known.checkout, undeclared_future_field: true } }
+    const slice: Slice<'roster'> = { ...original.slices.roster, decode: 'tolerant', timeline: [],
+      unknown: [{ pointer: scope === 'root' ? '/state/agents/0' : '/state/agents/0/checkout', known_value: scope === 'root' ? known : known.checkout }],
+      state: { ...original.slices.roster.state, agents: [contaminated] } }
+    expect(decodeSlice(original.id, slice)).not.toEqual([])
+  })
+
+  it('refuses a held terminal subscription immediately when membership is removed', async () => {
+    const original = base()
+    const terminal = original.slices.terminal.state.terminals[0]!
+    const world = original.with({
+      terminal: { ...original.slices.terminal, timeline: [{ _tag: 'terminal-remove', at_ms: 1_000, store: 0, terminal: terminal.terminal }] },
+      sync: { ...original.slices.sync, timeline: [
+        { _tag: 'hold', at_ms: 0, store: 0, selector: { collection: 'terminal', terminal: terminal.terminal } },
+        { _tag: 'release', at_ms: 2_000, store: 0, selector: { collection: 'terminal', terminal: terminal.terminal } },
+      ] },
+    })
+    const clock = manualClock(world.now)
+    const replay = createReplay(world, { clock })
+    replays.push(replay)
+    const capability = await attachCapability(replay, terminal)
+    const frames: unknown[] = []
+    const socket = replay.socket('ws://scenario.invalid/v1/client/collections', [], {})
+    socket.onmessage = ({ data }) => frames.push(JSON.parse(String(data)))
+    clock.advance(0)
+    socket.send(JSON.stringify({ kind: 'subscribe', collection: 'terminal', id: 'held-terminal', terminal: terminal.terminal, incarnation: terminal.incarnation, capability }))
+    expect(frames).toEqual([])
+    clock.advance(1_000)
+    expect(frames).toEqual([expect.objectContaining({ kind: 'error', id: 'held-terminal', code: 'not-found', retryable: false })])
+    clock.advance(1_000)
+    expect(frames).toHaveLength(1)
+  })
+
+  it('dispatches thread record replacement to ready agent and previous-session subscriptions', () => {
+    const original = base()
+    const old = original.slices.conversation.state.threads[0]!
+    const replacement = { ...old, session_id: `${old.session_id}-replacement`, items: old.items.slice(0, 2), page_size: 1, has_more: false }
+    const delta = old.items[2]!
+    const world = original.with({ conversation: { ...original.slices.conversation, timeline: [
+      { _tag: 'thread-create', at_ms: 1_000, store: 0, thread: replacement },
+      { _tag: 'entries', at_ms: 2_000, store: 0, agent: old.agent, items: [delta] },
+    ] } })
+    const clock = manualClock(world.now)
+    const replay = createReplay(world, { clock })
+    replays.push(replay)
+    const frames: unknown[] = []
+    const socket = replay.socket('ws://scenario.invalid/v1/client/collections', [], {})
+    socket.onmessage = ({ data }) => frames.push(JSON.parse(String(data)))
+    clock.advance(0)
+    socket.send(JSON.stringify({ kind: 'subscribe', collection: 'conversation', id: 'agent', conversation: old.agent }))
+    socket.send(JSON.stringify({ kind: 'subscribe', collection: 'conversation', id: 'session', conversation: old.session_id }))
+    frames.length = 0
+    clock.advance(1_000)
+    expect(frames).toEqual(['agent', 'session'].map((id) => expect.objectContaining({
+      kind: 'conversation', id, session_id: replacement.session_id, replace: true, items: replacement.items.slice(-1), has_more: true,
+    })))
+    frames.length = 0
+    clock.advance(1_000)
+    expect(frames).toEqual(['agent', 'session'].map((id) => expect.objectContaining({
+      kind: 'conversation', id, session_id: replacement.session_id, replace: false, items: [delta],
+    })))
+  })
+
+  it.each(['same', 'new'] as const)('refreshes or invalidates ready terminal subscriptions for a %s incarnation replacement', async (incarnation) => {
+    const original = base()
+    const terminal = original.slices.terminal.state.terminals[0]!
+    const nextIncarnation = incarnation === 'same' ? terminal.incarnation : `${terminal.incarnation}-replacement`
+    const screen = { ...terminal.screens.at(-1)!.screen, runtime_incarnation: nextIncarnation, revision: 'replacement-screen' }
+    const replacement = { ...terminal, incarnation: nextIncarnation, runtime: { ...terminal.runtime, incarnation_id: nextIncarnation },
+      screens: [{ at_ms: 1_000, screen }] }
+    const world = original.with({ terminal: { ...original.slices.terminal, timeline: [{ _tag: 'terminal-create', at_ms: 1_000, store: 0, record: replacement }] } })
+    const clock = manualClock(world.now)
+    const replay = createReplay(world, { clock })
+    replays.push(replay)
+    const capability = await attachCapability(replay, terminal)
+    const frames: unknown[] = []
+    const socket = replay.socket('ws://scenario.invalid/v1/client/collections', [], {})
+    socket.onmessage = ({ data }) => frames.push(JSON.parse(String(data)))
+    clock.advance(0)
+    socket.send(JSON.stringify({ kind: 'subscribe', collection: 'terminal', id: 'terminal', terminal: terminal.terminal, incarnation: terminal.incarnation, capability }))
+    expect(frames).toHaveLength(1)
+    frames.length = 0
+    clock.advance(1_000)
+    expect(frames).toEqual([expect.objectContaining(incarnation === 'same'
+      ? { kind: 'screen', id: 'terminal', value: screen }
+      : { kind: 'error', id: 'terminal', code: 'stale-fence', retryable: false })])
+  })
+
+  it('rejects a strict-valid known session upsert in a roster rather than storing it as future data', () => {
+    const original = base()
+    const member = original.cast.agents[0]!
+    const session: Session = { kind: 'session', id: member.session, revision: '1', updated_at: new Date(original.now).toISOString(),
+      owner_id: member.id, started_at: new Date(original.now).toISOString(), state: 'running', timeline_cursor: 'cursor/foundation' }
+    const roster: Slice<'roster'> = { ...original.slices.roster, timeline: [{ _tag: 'changes', at_ms: 1_000, store: 0, upserts: [session], removes: [] }] }
+    expect(decodeSlice(original.id, roster)).toEqual([])
+    expect(() => foldSlice(roster, 1_000)).toThrow('a session upsert has no place in this slice')
+  })
+
+  it('drops discarded unknown declarations when regenerating the empty roster variant', () => {
+    const definition: WorldDefinition = { ...emptyDefinition, slices: (ctx) => {
+      const own = emptyDefinition.slices(ctx)
+      const known = base().slices.roster.state.agents[0]!
+      return { ...own, roster: { ...own.roster, decode: 'tolerant',
+        unknown: [{ pointer: '/state/agents/0/future_field' }], state: { ...own.roster.state, agents: [{ ...known, future_field: true }] } } }
+    } }
+    const world = buildWorld(definition, genericVariants, ANCHOR_MS)
+    expect(decodeSlice(world.id, world.slices.roster)).toEqual([])
+    const cleared = world.with({ roster: 'empty' }).slices.roster
+    expect(cleared.unknown).toBeUndefined()
+    expect(cleared.decode).toBe('strict')
+    expect(decodeSlice(world.id, cleared)).toEqual([])
   })
 })

@@ -1,0 +1,120 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "attention",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 4
+  },
+  "state": {
+    "attention": [],
+    "messages": []
+  },
+  "timeline": [
+    {
+      "_tag": "changes",
+      "at_ms": 3000,
+      "removes": [],
+      "store": 4,
+      "upserts": [
+        {
+          "actions": [
+            "custom.reply"
+          ],
+          "attention_kind": "human-gate",
+          "detail": "Run the sprout smoke check on the newly connected machine.",
+          "id": "attention/scenario-first-run-onboarding-first-launch",
+          "kind": "attention",
+          "person_id": "person/ada",
+          "priority": "normal",
+          "requested_at": "2030-01-01T12:00:03.000Z",
+          "requester_id": "agent/example/sprout/builder",
+          "revision": "a1",
+          "source_id": "agent/example/sprout/builder",
+          "state": "open",
+          "targets": [
+            "agent/example/sprout/builder"
+          ],
+          "title": "Launch your first mission",
+          "updated_at": "2030-01-01T12:00:03.000Z"
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 5000,
+      "removes": [
+        "attention/scenario-first-run-onboarding-first-launch"
+      ],
+      "store": 7,
+      "upserts": [
+        {
+          "content": "Launch the smoke check.",
+          "from": "person/ada",
+          "id": "message/scenario-first-run-onboarding-launch-answer",
+          "in_reply_to": null,
+          "kind": "message",
+          "revision": "m1",
+          "sent_at": "2030-01-01T12:00:05.000Z",
+          "state": "delivered",
+          "tags": [],
+          "title": "First mission approved",
+          "to": "agent/example/sprout/builder",
+          "updated_at": "2030-01-01T12:00:05.000Z"
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 16000,
+      "removes": [],
+      "store": 20,
+      "upserts": [
+        {
+          "content": "The smoke check passed: 3 tests, 0 failures.",
+          "from": "agent/example/sprout/builder",
+          "id": "message/scenario-first-run-onboarding-first-green",
+          "in_reply_to": null,
+          "kind": "message",
+          "revision": "m1",
+          "sent_at": "2030-01-01T12:00:16.000Z",
+          "state": "delivered",
+          "tags": [],
+          "title": "First run is green",
+          "to": "person/ada",
+          "updated_at": "2030-01-01T12:00:16.000Z"
+        }
+      ]
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/requested_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/sent_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/0/sent_at"
+    }
+  ],
+  "variant": "default",
+  "world": "first-run-onboarding"
+}

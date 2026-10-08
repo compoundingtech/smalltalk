@@ -26,6 +26,8 @@ type Subscription = {
   limit: number
   filters: Filters
   conversation?: string
+  /** Canonical agent binding survives a replacement session while keeping the original selector. */
+  threadAgent?: string
   terminal?: string
   incarnation?: string
   capability?: string
@@ -62,7 +64,7 @@ const record = (value: unknown): value is Record<string, unknown> => typeof valu
 const stringField = (value: Record<string, unknown>, key: string): string | undefined => typeof value[key] === 'string' ? value[key] : undefined
 /** A conversation subscription names its thread by agent id, session id, or session id without `session/`. */
 const followsThread = (sub: Subscription, thread: { agent: string; session_id: string }): boolean =>
-  sub.conversation === thread.agent || sub.conversation === thread.session_id || `session/${sub.conversation}` === thread.session_id
+  sub.threadAgent === thread.agent || sub.conversation === thread.agent || sub.conversation === thread.session_id || `session/${sub.conversation}` === thread.session_id
 
 const conditionKey = (route: string, when?: HttpCondition): string => JSON.stringify([route, when?.cursor ?? null, Object.entries(when?.query ?? {}).sort(([a], [b]) => a.localeCompare(b))])
 const requestMatches = (url: URL, when?: HttpCondition): boolean =>
@@ -74,6 +76,7 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
   const consumed = new Set<SliceKind>()
   const actions: ActionRequest[] = []
   const connections = new Set<Connection>()
+  const pendingOpens = new Map<Connection, () => void>()
   const cancellations = new Set<() => void>()
   const held = new Set<string>()
   const leases = new Map<string, { terminal: string; incarnation: string; expires: number }>()
@@ -83,6 +86,7 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
   let sync: SyncNotice | undefined
   let closed = false
   let failedOpens = 0
+  let opensHeld = false
   let blockedUntil = -Infinity
   let request = 0
   let capability = 0
@@ -158,6 +162,7 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
       case 'conversation': {
         const thread = state('conversation').threads.find((thread) => followsThread(sub, thread))
         if (thread === undefined) return refuse(connection, sub, 'not-found', false)
+        sub.threadAgent = thread.agent
         emit(connection, { kind: 'conversation', id: sub.id, collection: 'conversation', session_id: thread.session_id,
           replace: true, items: thread.items.slice(-thread.page_size), has_more: thread.has_more || thread.items.length > thread.page_size })
         return
@@ -186,12 +191,40 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
     connection.open = false
     connection.subscriptions.clear()
     connections.delete(connection)
+    pendingOpens.delete(connection)
     connection.socket.onclose?.({ code, reason })
   }
   const dispatch = (kind: SliceKind, event: TimelineEvent) => {
     switch (event._tag) {
-      case 'thread-create': case 'terminal-create':
-        for (const connection of connections) for (const sub of connection.subscriptions.values()) first(connection, sub)
+      case 'thread-create': {
+        const timeline = world.slices.conversation.timeline
+        const previous = foldSlice({ ...world.slices.conversation, timeline: timeline.slice(0, timeline.indexOf(event)) }, event.at_ms)
+          .state.threads.find((thread) => thread.agent === event.thread.agent)
+        for (const connection of connections) for (const sub of connection.subscriptions.values()) {
+          if (sub.collection !== 'conversation' || !(followsThread(sub, event.thread) || previous !== undefined && followsThread(sub, previous))) continue
+          sub.threadAgent = event.thread.agent
+          if (!sub.ready) first(connection, sub)
+          else emit(connection, { kind: 'conversation', id: sub.id, collection: 'conversation', session_id: event.thread.session_id,
+            replace: true, items: event.thread.items.slice(-event.thread.page_size), has_more: event.thread.has_more || event.thread.items.length > event.thread.page_size })
+        }
+        return
+      }
+      case 'terminal-create':
+        for (const connection of connections) for (const sub of connection.subscriptions.values()) {
+          if (sub.collection !== 'terminal' || sub.terminal !== event.record.terminal) continue
+          if (!sub.ready) first(connection, sub)
+          else if (event.record.runtime.state === 'exited') refuse(connection, sub, 'terminal-ended', false)
+          else if (sub.incarnation !== event.record.incarnation) refuse(connection, sub, 'stale-fence', false)
+          else {
+            const screen = event.record.screens.filter((item) => item.at_ms <= offset()).at(-1)?.screen
+            if (screen !== undefined) emit(connection, { kind: 'screen', id: sub.id, collection: 'terminal', snapshot: fence(), value: screen })
+          }
+        }
+        return
+      case 'terminal-remove':
+        for (const connection of connections) for (const sub of connection.subscriptions.values()) {
+          if (sub.collection === 'terminal' && sub.terminal === event.terminal) refuse(connection, sub, 'not-found', false)
+        }
         return
       case 'thread-remove': {
         const previous = foldSlice(world.slices.conversation, event.at_ms - 1).state.threads.find((thread) => thread.agent === event.agent)
@@ -224,13 +257,13 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
         }
         return
       }
-      case 'screen': case 'unavailable': case 'end': case 'incarnation': case 'terminal-remove':
+      case 'screen': case 'unavailable': case 'end': case 'incarnation':
         for (const connection of connections) for (const sub of connection.subscriptions.values()) {
           if (!sub.ready || sub.collection !== 'terminal' || sub.terminal !== event.terminal) continue
           if (event._tag === 'screen') {
             const terminal = state('terminal').terminals.find((terminal) => terminal.terminal === event.terminal)
             if (sub.incarnation === terminal?.incarnation) emit(connection, { kind: 'screen', id: sub.id, collection: 'terminal', snapshot: fence(), value: event.screen })
-          } else refuse(connection, sub, event._tag === 'terminal-remove' ? 'not-found' : event._tag === 'unavailable' ? 'terminal-unavailable' : event._tag === 'end' ? 'terminal-ended' : 'stale-fence', event._tag === 'unavailable')
+          } else refuse(connection, sub, event._tag === 'unavailable' ? 'terminal-unavailable' : event._tag === 'end' ? 'terminal-ended' : 'stale-fence', event._tag === 'unavailable')
         }
         return
       case 'open-fail':
@@ -238,6 +271,12 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
         failedOpens = event.opens === 'all' ? Infinity : event.opens ?? 1
         return
       case 'open-ok': failedOpens = 0; return
+      case 'open-hold': opensHeld = true; return
+      case 'open-release':
+        opensHeld = false
+        for (const open of pendingOpens.values()) schedule(clock.now(), open)
+        pendingOpens.clear()
+        return
       case 'close':
         blockedUntil = Infinity
         for (const connection of [...connections]) finishConnection(connection, event.code, event.reason)
@@ -317,8 +356,12 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
       },
     }, open: false, closed: false, subscriptions: new Map(), legacy: protocols.includes('st3.client.terminal.v0') }
     connections.add(connection)
-    schedule(clock.now(), () => {
-      if (connection.closed) return
+    const open = () => {
+      if (connection.closed || connection.open) return
+      if (opensHeld) {
+        pendingOpens.set(connection, open)
+        return
+      }
       if (failedOpens > 0 || clock.now() < blockedUntil) {
         if (failedOpens > 0) failedOpens -= 1
         connection.socket.onerror?.({})
@@ -334,7 +377,8 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
         connection.subscriptions.set(sub.id, sub)
         first(connection, sub)
       }
-    })
+    }
+    schedule(clock.now(), open)
     return connection.socket
   }
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })

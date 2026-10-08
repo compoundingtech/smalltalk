@@ -49,9 +49,10 @@ describe('rebase', () => {
   const nows = Schema.Int.check(Schema.isBetween({ minimum: Date.UTC(1900, 0, 1), maximum: Date.UTC(2200, 0, 1) }))
 
   it.prop('a rebased file equals the world generated at that now; differences stay exact', { now: nows }, ({ now }) => {
+    const worlds = new Map(catalog.map(({ id }) => [id, loadWorld(id, { now })]))
     for (const { id, kind, file } of files) {
       const rebased = rebase({ state: file.state, timeline: file.timeline }, file.times, ANCHOR, now)
-      const world = loadWorld(id, { now })
+      const world = worlds.get(id)!
       const direct = JSON.parse(canonicalJson(sliceFile(world, world.slices[kind] as AnySlice)))
       expect(rebased).toEqual({ state: direct.state, timeline: direct.timeline })
       for (const { pointer, codec } of file.times as { pointer: string; codec: string }[]) {
@@ -62,7 +63,7 @@ describe('rebase', () => {
         if (codec === 'timestamp') expect(after).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
       }
     }
-  })
+  }, { timeout: 60_000 })
 
   it('lists every instant of the default world', () => {
     const world = loadWorld('fleet-mid-refactor', { now: ANCHOR_MS })

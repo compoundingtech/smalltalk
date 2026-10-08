@@ -62,6 +62,384 @@
           {
             "id": "agent/example/atlas/builder",
             "name": "Atlas Builder"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          }
+        ]
+      },
+      "id": "ci-failing-fix",
+      "narrative": "main is red after option-schema 4.1 changes omitted-value handling. A bisect finds the bump, a one-line default restores the contract, and the CI retry turns green.",
+      "seed": 21,
+      "slices": {
+        "attention": "ci-failing-fix/attention.json",
+        "conversation": "ci-failing-fix/conversation.json",
+        "details": "ci-failing-fix/details.json",
+        "roster": "ci-failing-fix/roster.json",
+        "sync": "ci-failing-fix/sync.json",
+        "terminal": "ci-failing-fix/terminal.json"
+      },
+      "title": "CI failing fix"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/lantern",
+            "name": "lantern"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          }
+        ]
+      },
+      "id": "long-debug-rabbit-hole",
+      "narrative": "A forty-minute hunt through network retries, fake timers and cache state finds an order-dependent shared AbortController. Hundreds of terminal lines and multiple conversation pages end in a one-line fixture fix.",
+      "seed": 22,
+      "slices": {
+        "attention": "long-debug-rabbit-hole/attention.json",
+        "conversation": "long-debug-rabbit-hole/conversation.json",
+        "details": "long-debug-rabbit-hole/details.json",
+        "roster": "long-debug-rabbit-hole/roster.json",
+        "sync": "long-debug-rabbit-hole/sync.json",
+        "terminal": "long-debug-rabbit-hole/terminal.json"
+      },
+      "title": "Long debug rabbit hole"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/sprout/builder",
+            "name": "Sprout Builder"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/quarry",
+            "name": "quarry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          }
+        ]
+      },
+      "id": "first-run-onboarding",
+      "narrative": "An empty daemon joins its first machine, launches its first agent and mission, and finishes a green smoke run.",
+      "seed": 4,
+      "slices": {
+        "attention": "first-run-onboarding/attention.json",
+        "conversation": "first-run-onboarding/conversation.json",
+        "details": "first-run-onboarding/details.json",
+        "roster": "first-run-onboarding/roster.json",
+        "sync": "first-run-onboarding/sync.json",
+        "terminal": "first-run-onboarding/terminal.json"
+      },
+      "title": "First run onboarding"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/harbor/builder",
+            "name": "Harbor Builder"
+          },
+          {
+            "id": "agent/example/harbor/reviewer",
+            "name": "Harbor Reviewer"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/lantern",
+            "name": "lantern"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          }
+        ]
+      },
+      "id": "merge-conflict-standoff",
+      "narrative": "Two agents change the cache policy on the same line. A person reviews the three-way conflict and approves a combined patch.",
+      "seed": 5,
+      "slices": {
+        "attention": "merge-conflict-standoff/attention.json",
+        "conversation": "merge-conflict-standoff/conversation.json",
+        "details": "merge-conflict-standoff/details.json",
+        "roster": "merge-conflict-standoff/roster.json",
+        "sync": "merge-conflict-standoff/sync.json",
+        "terminal": "merge-conflict-standoff/terminal.json"
+      },
+      "title": "Merge conflict standoff"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/harbor/builder",
+            "name": "Harbor Builder"
+          },
+          {
+            "id": "agent/example/harbor/reviewer",
+            "name": "Harbor Reviewer"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          },
+          {
+            "id": "host/orchard",
+            "name": "orchard"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          }
+        ]
+      },
+      "id": "offline-reconnect-storm",
+      "narrative": "A deployment summary streams through three socket drops. Backoff preserves stale content until authoritative snapshots restore the final revisions.",
+      "seed": 6,
+      "slices": {
+        "attention": "offline-reconnect-storm/attention.json",
+        "conversation": "offline-reconnect-storm/conversation.json",
+        "details": "offline-reconnect-storm/details.json",
+        "roster": "offline-reconnect-storm/roster.json",
+        "sync": "offline-reconnect-storm/sync.json",
+        "terminal": "offline-reconnect-storm/terminal.json"
+      },
+      "title": "Offline reconnect storm"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/meadow/builder",
+            "name": "Meadow Builder"
+          },
+          {
+            "id": "agent/example/meadow/reviewer",
+            "name": "Meadow Reviewer"
+          },
+          {
+            "id": "agent/example/meadow/docs",
+            "name": "Meadow Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/quarry",
+            "name": "quarry"
+          },
+          {
+            "id": "host/lantern",
+            "name": "lantern"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          }
+        ]
+      },
+      "id": "release-candidate-polish",
+      "narrative": "The release candidate is ready: a patch version and changelog are committed, the verification matrix is green, and the team has gone idle.",
+      "seed": 7,
+      "slices": {
+        "attention": "release-candidate-polish/attention.json",
+        "conversation": "release-candidate-polish/conversation.json",
+        "details": "release-candidate-polish/details.json",
+        "roster": "release-candidate-polish/roster.json",
+        "sync": "release-candidate-polish/sync.json",
+        "terminal": "release-candidate-polish/terminal.json"
+      },
+      "title": "Release candidate polish"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/lantern",
+            "name": "lantern"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "empty",
+      "narrative": "A newly connected fleet has no agents, missions, messages, conversations or terminals yet.",
+      "seed": 21,
+      "slices": {
+        "attention": "empty/attention.json",
+        "conversation": "empty/conversation.json",
+        "details": "empty/details.json",
+        "roster": "empty/roster.json",
+        "sync": "empty/sync.json",
+        "terminal": "empty/terminal.json"
+      },
+      "title": "Empty fleet"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "loading",
+      "narrative": "Discovery succeeded. Collection, conversation and terminal requests are still waiting for their first replies.",
+      "seed": 1,
+      "slices": {
+        "attention": "loading/attention.json",
+        "conversation": "loading/conversation.json",
+        "details": "loading/details.json",
+        "roster": "loading/roster.json",
+        "sync": "loading/sync.json",
+        "terminal": "loading/terminal.json"
+      },
+      "title": "Waiting for first replies"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          },
+          {
+            "id": "host/lantern",
+            "name": "lantern"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          }
+        ]
+      },
+      "id": "unknown-fields",
+      "narrative": "An Atlas builder checks a newer daemon: an extra agent field, a reconciling state, a compatibility-probe resource and diagnostic-summary entries survive tolerant reads without hiding unrelated schema errors.",
+      "seed": 19,
+      "slices": {
+        "attention": "unknown-fields/attention.json",
+        "conversation": "unknown-fields/conversation.json",
+        "details": "unknown-fields/details.json",
+        "roster": "unknown-fields/roster.json",
+        "sync": "unknown-fields/sync.json",
+        "terminal": "unknown-fields/terminal.json"
+      },
+      "title": "Unknown fields"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
           },
           {
             "id": "agent/example/atlas/reviewer",
@@ -109,6 +487,654 @@
         "terminal": "failed-sync-socket-dropped/terminal.json"
       },
       "title": "Failed sync: socket dropped"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "failed-sync-open-fail",
+      "narrative": "The refactor fleet retains its work and conversations while open-fail affects synchronization.",
+      "seed": 1,
+      "slices": {
+        "attention": "failed-sync-open-fail/attention.json",
+        "conversation": "failed-sync-open-fail/conversation.json",
+        "details": "failed-sync-open-fail/details.json",
+        "roster": "failed-sync-open-fail/roster.json",
+        "sync": "failed-sync-open-fail/sync.json",
+        "terminal": "failed-sync-open-fail/terminal.json"
+      },
+      "title": "Failed sync: open-fail"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "failed-sync-resync-coded",
+      "narrative": "The refactor fleet retains its work and conversations while resync-coded affects synchronization.",
+      "seed": 1,
+      "slices": {
+        "attention": "failed-sync-resync-coded/attention.json",
+        "conversation": "failed-sync-resync-coded/conversation.json",
+        "details": "failed-sync-resync-coded/details.json",
+        "roster": "failed-sync-resync-coded/roster.json",
+        "sync": "failed-sync-resync-coded/sync.json",
+        "terminal": "failed-sync-resync-coded/terminal.json"
+      },
+      "title": "Failed sync: resync-coded"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "failed-sync-forbidden",
+      "narrative": "The refactor fleet retains its work and conversations while forbidden affects synchronization.",
+      "seed": 1,
+      "slices": {
+        "attention": "failed-sync-forbidden/attention.json",
+        "conversation": "failed-sync-forbidden/conversation.json",
+        "details": "failed-sync-forbidden/details.json",
+        "roster": "failed-sync-forbidden/roster.json",
+        "sync": "failed-sync-forbidden/sync.json",
+        "terminal": "failed-sync-forbidden/terminal.json"
+      },
+      "title": "Failed sync: forbidden"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "failed-sync-non-client-response",
+      "narrative": "The refactor fleet retains its work and conversations while non-client-response affects synchronization.",
+      "seed": 1,
+      "slices": {
+        "attention": "failed-sync-non-client-response/attention.json",
+        "conversation": "failed-sync-non-client-response/conversation.json",
+        "details": "failed-sync-non-client-response/details.json",
+        "roster": "failed-sync-non-client-response/roster.json",
+        "sync": "failed-sync-non-client-response/sync.json",
+        "terminal": "failed-sync-non-client-response/terminal.json"
+      },
+      "title": "Failed sync: non-client-response"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "failed-sync-subscription-error",
+      "narrative": "The refactor fleet retains its work and conversations while subscription-error affects synchronization.",
+      "seed": 1,
+      "slices": {
+        "attention": "failed-sync-subscription-error/attention.json",
+        "conversation": "failed-sync-subscription-error/conversation.json",
+        "details": "failed-sync-subscription-error/details.json",
+        "roster": "failed-sync-subscription-error/roster.json",
+        "sync": "failed-sync-subscription-error/sync.json",
+        "terminal": "failed-sync-subscription-error/terminal.json"
+      },
+      "title": "Failed sync: subscription-error"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "failed-sync-subscription-limit-legacy",
+      "narrative": "The refactor fleet retains its work and conversations while subscription-limit-legacy affects synchronization.",
+      "seed": 1,
+      "slices": {
+        "attention": "failed-sync-subscription-limit-legacy/attention.json",
+        "conversation": "failed-sync-subscription-limit-legacy/conversation.json",
+        "details": "failed-sync-subscription-limit-legacy/details.json",
+        "roster": "failed-sync-subscription-limit-legacy/roster.json",
+        "sync": "failed-sync-subscription-limit-legacy/sync.json",
+        "terminal": "failed-sync-subscription-limit-legacy/terminal.json"
+      },
+      "title": "Failed sync: subscription-limit-legacy"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "failed-sync-capability-absent",
+      "narrative": "The refactor fleet retains its work and conversations while capability-absent affects synchronization.",
+      "seed": 1,
+      "slices": {
+        "attention": "failed-sync-capability-absent/attention.json",
+        "conversation": "failed-sync-capability-absent/conversation.json",
+        "details": "failed-sync-capability-absent/details.json",
+        "roster": "failed-sync-capability-absent/roster.json",
+        "sync": "failed-sync-capability-absent/sync.json",
+        "terminal": "failed-sync-capability-absent/terminal.json"
+      },
+      "title": "Failed sync: capability-absent"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "failed-sync-rate-limited",
+      "narrative": "The refactor fleet retains its work and conversations while rate-limited affects synchronization.",
+      "seed": 1,
+      "slices": {
+        "attention": "failed-sync-rate-limited/attention.json",
+        "conversation": "failed-sync-rate-limited/conversation.json",
+        "details": "failed-sync-rate-limited/details.json",
+        "roster": "failed-sync-rate-limited/roster.json",
+        "sync": "failed-sync-rate-limited/sync.json",
+        "terminal": "failed-sync-rate-limited/terminal.json"
+      },
+      "title": "Failed sync: rate-limited"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "failed-sync-cursor-gap",
+      "narrative": "The refactor fleet retains its work and conversations while cursor-gap affects synchronization.",
+      "seed": 1,
+      "slices": {
+        "attention": "failed-sync-cursor-gap/attention.json",
+        "conversation": "failed-sync-cursor-gap/conversation.json",
+        "details": "failed-sync-cursor-gap/details.json",
+        "roster": "failed-sync-cursor-gap/roster.json",
+        "sync": "failed-sync-cursor-gap/sync.json",
+        "terminal": "failed-sync-cursor-gap/terminal.json"
+      },
+      "title": "Failed sync: cursor-gap"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "failed-sync-page-cursor-expired",
+      "narrative": "The refactor fleet retains its work and conversations while page-cursor-expired affects synchronization.",
+      "seed": 1,
+      "slices": {
+        "attention": "failed-sync-page-cursor-expired/attention.json",
+        "conversation": "failed-sync-page-cursor-expired/conversation.json",
+        "details": "failed-sync-page-cursor-expired/details.json",
+        "roster": "failed-sync-page-cursor-expired/roster.json",
+        "sync": "failed-sync-page-cursor-expired/sync.json",
+        "terminal": "failed-sync-page-cursor-expired/terminal.json"
+      },
+      "title": "Failed sync: page-cursor-expired"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "replication-diverged",
+      "narrative": "One peer has claims on both sides of a divergence. Reads remain live while the peer is repaired.",
+      "seed": 1,
+      "slices": {
+        "attention": "replication-diverged/attention.json",
+        "conversation": "replication-diverged/conversation.json",
+        "details": "replication-diverged/details.json",
+        "roster": "replication-diverged/roster.json",
+        "sync": "replication-diverged/sync.json",
+        "terminal": "replication-diverged/terminal.json"
+      },
+      "title": "Replication diverged"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "واجهة العربية — 日本語の表示 — Café — 👩🏽‍💻 🚀 — 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界 — ~/src/atlas/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/fixtures"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "日本語の移行 👩🏽‍💻"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "دليل الواجهة Café"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "unicode",
+      "narrative": "An internationalization review exercises RTL, CJK, decomposed accents, emoji and unusually long labels.",
+      "seed": 1,
+      "slices": {
+        "attention": "unicode/attention.json",
+        "conversation": "unicode/conversation.json",
+        "details": "unicode/details.json",
+        "roster": "unicode/roster.json",
+        "sync": "unicode/sync.json",
+        "terminal": "unicode/terminal.json"
+      },
+      "title": "Unicode display and content"
     }
   ]
 }

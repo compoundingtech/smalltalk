@@ -13,7 +13,7 @@ import { applyConversation, isConversational, type Conversation } from '../../st
 import { decodeSlice } from '../scripts/decode.ts'
 import {
   ANCHOR_MS, SLICE_KINDS, catalog, foldSlice, loadWorld, syncStatusAt,
-  type SliceKind, type SyncEvent, type World,
+  type SliceKind, type SyncEvent, type World, type WireResource,
 } from '../src/index.ts'
 import { createReplay, manualClock } from '../src/replay/index.ts'
 import { ScenarioProvider, createReadTracker, useScenarioSlice } from '../src/react/index.ts'
@@ -37,17 +37,17 @@ const collectionSlice = (collection: string): SliceKind => {
     default: return 'sync'
   }
 }
-const rowsAt = (world: World, at: number): Record<string, Resource[]> => {
+const rowsAt = (world: World, at: number): Record<string, WireResource[]> => {
   const roster = foldSlice(world.slices.roster, at).state
   const details = foldSlice(world.slices.details, at).state
   const attention = foldSlice(world.slices.attention, at).state
   const terminal = foldSlice(world.slices.terminal, at).state
   const order = new Map(roster.order.map((id, index) => [id, index]))
   return {
-    agents: [...roster.agents].sort((a, b) => (order.get(a.id) ?? Infinity) - (order.get(b.id) ?? Infinity)),
+    agents: [...[...roster.agents].sort((a, b) => (order.get(a.id) ?? Infinity) - (order.get(b.id) ?? Infinity)), ...(roster.resources ?? [])],
     runtimes: [...roster.runtimes, ...terminal.terminals.map(({ runtime }) => runtime)],
-    machines: roster.machines, missions: details.missions, work: details.work,
-    attention: attention.attention, messages: attention.messages,
+    machines: roster.machines, missions: [...details.missions, ...(details.resources ?? [])], work: details.work,
+    attention: [...attention.attention, ...(attention.resources ?? [])], messages: attention.messages,
     terminals: terminal.terminals.map(({ runtime }) => runtime),
   }
 }
@@ -56,7 +56,7 @@ const rowsAt = (world: World, at: number): Record<string, Resource[]> => {
 // Each slice is a separate component: no variable hook order when the catalog grows.
 const SliceConsumer = ({ kind }: { kind: SliceKind }) => {
   const slice = useScenarioSlice(kind)
-  return React.createElement('pre', { 'data-slice': kind }, JSON.stringify({
+  return React.createElement('pre', { 'data-slice': kind }, JSON.stringify(slice.loading ? { loading: true } : {
     loading: slice.loading, state: slice.state, ...('status' in slice ? { status: slice.status } : {}),
   }))
 }
@@ -102,11 +102,15 @@ const verifyReplay = async (world: World) => {
     }
     return active
   }
-  const read = async <T>(route: string, kinds: readonly SliceKind[], run: () => Promise<T>): Promise<T | undefined> =>
+  const read = async <T>(route: string, kinds: readonly SliceKind[], run: () => Promise<T>, query: Readonly<Record<string, string>> = {}): Promise<T | undefined> =>
     step(world, kinds.join('+'), `${currentStep}:HTTP ${route}`, async () => {
       const active = overrides()
-      const override = active.get(`/v1/client/${route}`) ?? active.get(route)
-        ?? (!['capabilities', 'actions', 'events', 'timeline'].includes(route) ? active.get('resources') : undefined)
+      const matches = (event: Extract<SyncEvent, { _tag: 'http-error' | 'http-raw' }>): boolean =>
+        (event.when?.cursor === undefined || (event.when.cursor === 'present') === (query.cursor !== undefined))
+        && Object.entries(event.when?.query ?? {}).every(([key, value]) => query[key] === value)
+      const override = [active.get(`/v1/client/${route}`), active.get(route),
+        ...(!['capabilities', 'actions', 'events', 'timeline'].includes(route) ? [active.get('resources')] : [])]
+        .find((event) => event !== undefined && matches(event))
       const loading = kinds.some((kind) => world.slices[kind].loading)
       abortLoadingRead = loading
       try {
@@ -135,7 +139,7 @@ const verifyReplay = async (world: World) => {
         replace: frame.replace, items: frame.items, hasMore: frame.has_more ?? conversations.get(id)?.hasOlder ?? false, sessionId: frame.session_id,
       }))
       if (frame.kind === 'screen') screens.set(id, frame)
-      if (frame.kind === 'error' || frame.kind === 'resync') inactive.add(id)
+      if (frame.kind === 'error' || frame.kind === 'resync') inactive.add(id === '' ? '*' : id)
     }
     readFrames = frames.length
   }
@@ -144,7 +148,7 @@ const verifyReplay = async (world: World) => {
     const at = clock.now() - world.now
     const rows = rowsAt(world, at)
     for (const [collection, expected] of Object.entries(rows)) {
-      if (!(SOCKET_COLLECTIONS as readonly string[]).includes(collection) || ended || inactive.has(collection)) continue
+      if (!(SOCKET_COLLECTIONS as readonly string[]).includes(collection) || ended || inactive.has('*') || inactive.has(collection)) continue
       const kind = collectionSlice(collection)
       if (world.slices[kind].loading) { expect(windows.has(collection), label(world, kind, `${currentStep}:${collection}:loading`)).toBe(false); continue }
       const held = new Set<string>()
@@ -160,9 +164,10 @@ const verifyReplay = async (world: World) => {
     }
     if (!ended && !world.slices.conversation.loading) for (const thread of foldSlice(world.slices.conversation, at).state.threads) {
       const id = `conversation:${thread.agent}`
-      if (inactive.has(id)) continue
+      if (inactive.has('*') || inactive.has(id)) continue
       const initial = world.slices.conversation.state.threads.find((value) => value.agent === thread.agent)
-      if (initial === undefined) continue
+        ?? world.slices.conversation.timeline.filter((event) => event._tag === 'thread-create').find((event) => event.thread.agent === thread.agent)?.thread
+      if (initial === undefined) throw new Error(`No creation record for ${thread.agent}`)
       let visible = new Set(initial.items.slice(-initial.page_size).map(({ id }) => id))
       for (const event of world.slices.conversation.timeline) if (event.at_ms <= at) {
         if (event._tag === 'thread-create' && event.thread.agent === thread.agent) visible = new Set(event.thread.items.slice(-event.thread.page_size).map(({ id }) => id))
@@ -183,7 +188,7 @@ const verifyReplay = async (world: World) => {
     }
     if (!ended && !world.slices.terminal.loading) for (const terminal of foldSlice(world.slices.terminal, at).state.terminals) {
       const id = `terminal:${terminal.terminal}`
-      if (inactive.has(id)) continue
+      if (inactive.has('*') || inactive.has(id)) continue
       const expected = terminal.screens.filter(({ at_ms }) => at_ms <= at).at(-1)?.screen
       if (expected !== undefined) await step(world, 'terminal', `${currentStep}:screen ${terminal.terminal}`, () => expect(screens.get(id)?.value).toEqual(expected))
     }
@@ -241,7 +246,8 @@ const verifyReplay = async (world: World) => {
         const cursors = new Set<string>()
         const pages: TimelineEntry[][] = []
         do {
-          const result = await read('timeline', ['conversation'], () => client.timelineList(thread.session_id, { limit, ...(cursor === undefined ? {} : { cursor }) }))
+          const result = await read('timeline', ['conversation'], () => client.timelineList(thread.session_id, { limit, ...(cursor === undefined ? {} : { cursor }) }),
+            cursor === undefined ? {} : { cursor })
           if (result === undefined) return
           pages.unshift(result.value.items)
           cursor = result.value.page.has_more ? result.value.page.next_cursor ?? undefined : undefined
@@ -261,22 +267,34 @@ const verifyReplay = async (world: World) => {
       onEnd: (error) => { ended = true; endings.push(error) },
     })
     for (const collection of SOCKET_COLLECTIONS) stream.subscribe(collection, collection, WINDOW_LIMIT)
-    for (const thread of world.slices.conversation.state.threads) stream.subscribeConversation(`conversation:${thread.agent}`, thread.agent)
-    for (const terminal of world.slices.terminal.state.terminals) {
-      if (terminal.runtime.state === 'exited' || world.slices.terminal.loading || world.slices.roster.loading || discovery === undefined) { inactive.add(`terminal:${terminal.terminal}`); continue }
-      const runtime = await read('runtimes', ['roster', 'terminal'], () => client.runtimesGet(terminal.runtime.id))
-      if (runtime === undefined || runtime.value.kind !== 'runtime') { inactive.add(`terminal:${terminal.terminal}`); continue }
-      const incarnation = runtime.value.incarnation_id
-      if (incarnation == null) throw new Error(`${label(world, 'terminal', currentStep)}: runtime has no incarnation`)
-      const attached = await read('actions', ['terminal'], () => client.terminalAttach({
-        id: `action/e2e-${terminal.terminal}`, idempotency_key: `e2e-${terminal.terminal}`,
-        parameters: { target_id: terminal.terminal },
-        fence: { snapshot_id: runtime.snapshot.id, subject_revisions: {}, runtime_incarnation: incarnation },
-      }))
-      const attachment = attached?.value.terminal_attachment
-      if (attachment?.stream_capability == null) { inactive.add(`terminal:${terminal.terminal}`); continue }
-      stream.subscribeTerminal(`terminal:${terminal.terminal}`, attachment.terminal_id, attachment.runtime_incarnation, attachment.stream_capability)
+    const subscribedThreads = new Set<string>()
+    const subscribedTerminals = new Set<string>()
+    const subscribeCurrent = async () => {
+      if (ended || inactive.has('*')) return
+      const at = clock.now() - world.now
+      for (const thread of foldSlice(world.slices.conversation, at).state.threads) if (!subscribedThreads.has(thread.agent)) {
+        subscribedThreads.add(thread.agent)
+        stream.subscribeConversation(`conversation:${thread.agent}`, thread.agent)
+      }
+      for (const terminal of foldSlice(world.slices.terminal, at).state.terminals) {
+        if (subscribedTerminals.has(terminal.terminal)) continue
+        subscribedTerminals.add(terminal.terminal)
+        if (terminal.runtime.state === 'exited' || world.slices.terminal.loading || world.slices.roster.loading || discovery === undefined) { inactive.add(`terminal:${terminal.terminal}`); continue }
+        const runtime = await read('runtimes', ['roster', 'terminal'], () => client.runtimesGet(terminal.runtime.id))
+        if (runtime === undefined || runtime.value.kind !== 'runtime') { inactive.add(`terminal:${terminal.terminal}`); continue }
+        const incarnation = runtime.value.incarnation_id
+        if (incarnation == null) throw new Error(`${label(world, 'terminal', currentStep)}: runtime has no incarnation`)
+        const attached = await read('actions', ['terminal'], () => client.terminalAttach({
+          id: `action/e2e-${terminal.terminal}`, idempotency_key: `e2e-${terminal.terminal}`,
+          parameters: { target_id: terminal.terminal },
+          fence: { snapshot_id: runtime.snapshot.id, subject_revisions: {}, runtime_incarnation: incarnation },
+        }))
+        const attachment = attached?.value.terminal_attachment
+        if (attachment?.stream_capability == null) { inactive.add(`terminal:${terminal.terminal}`); continue }
+        stream.subscribeTerminal(`terminal:${terminal.terminal}`, attachment.terminal_id, attachment.runtime_incarnation, attachment.stream_capability)
+      }
     }
+    await subscribeCurrent()
     expectedEnd = world.slices.sync.timeline.some((event) => event.at_ms <= 0 && (event._tag === 'close' || event._tag === 'open-fail'))
     await step(world, 'sync', 'anchor:socket open and first frames', () => clock.advance(0))
     expect(endings.length === 0 || expectedEnd, label(world, 'sync', 'anchor:unexpected socket end')).toBe(true)
@@ -287,6 +305,8 @@ const verifyReplay = async (world: World) => {
       currentStep = `${event.at_ms}ms:${kind}[${index}]:${event._tag}`
       expectedEnd ||= event._tag === 'close' || event._tag === 'open-fail'
       await step(world, kind, `${currentStep}:dispatch`, () => clock.advance(world.now + event.at_ms - clock.now()))
+      await subscribeCurrent()
+      clock.advance(0)
       expect(endings.length === 0 || expectedEnd, label(world, 'sync', `${currentStep}:unexpected socket end`)).toBe(true)
       await compare()
       if (kind === 'sync' && ['http-error', 'http-raw', 'http-ok'].includes(event._tag) && 'route' in event) {
@@ -295,7 +315,7 @@ const verifyReplay = async (world: World) => {
         else if (route === 'events') await read(route, ['sync'], () => client.eventsList())
         else if (route === 'timeline') {
           const thread = world.slices.conversation.state.threads[0]
-          if (thread !== undefined) await read(route, ['conversation'], () => client.timelineList(thread.session_id, { cursor: 'scenario-cursor/1' }))
+          if (thread !== undefined) await read(route, ['conversation'], () => client.timelineList(thread.session_id, { cursor: 'scenario-cursor/1' }), { cursor: 'scenario-cursor/1' })
         } else {
           const list = lists.find(([collection]) => route === collection || route === `/v1/client/${collection}`) ?? lists[0]!
           await read(route, list[1], () => list[2]({ limit: WINDOW_LIMIT }))
@@ -310,7 +330,6 @@ describe.each(catalog.map(({ id }) => [id]))('catalog consumer end-to-end: %s', 
   it.each([ANCHOR_MS, REBASED_NOW])('loads and decodes every slice at now=%s', (now) => {
     const world = loadWorld(id!, { now })
     for (const kind of SLICE_KINDS) expect(decodeSlice(world.id, world.slices[kind]), label(world, kind, `decode now=${now}`)).toEqual([])
-    // TODO(strict-negative-paths): read slice.unknown JSON pointers and assert exact strict failures once that planned contract exists.
   })
 
   it('serves discovery, all pages, first socket frames and every timeline step to St3Client', async () => {
@@ -334,12 +353,12 @@ describe.each(catalog.map(({ id }) => [id]))('catalog consumer end-to-end: %s', 
       clock.advance(world.now + at - clock.now())
       const expected = React.createElement('main', {}, ...SLICE_KINDS.map((kind) => {
         const slice = foldSlice(world.slices[kind], at)
-        return React.createElement('pre', { key: kind, 'data-slice': kind }, JSON.stringify({ loading: slice.loading, state: slice.state,
+        return React.createElement('pre', { key: kind, 'data-slice': kind }, JSON.stringify(slice.loading ? { loading: true } : { loading: slice.loading, state: slice.state,
           ...(kind === 'sync' ? { status: syncStatusAt(world.slices.sync, at, world.now) } : {}) }))
       }))
       expect(render(), label(world, 'all', `provider fold at ${at}ms`)).toBe(renderToStaticMarkup(expected))
     }
-    // Pinned per-world checks avoid running the checker's O(catalog²) world-pair loop once per world.
+    // Check each world's variant and pinning contracts; world-switch contrasts run once below.
     // Scope marker checks to one slice: shared titles/text in other slices are legitimate, not stale data.
     for (const kind of SLICE_KINDS) await step(world, kind, 'scenarioStoryCheck pinned world', () => scenarioStoryCheck({
       render: () => React.createElement(SliceConsumer, { kind }),
@@ -348,7 +367,7 @@ describe.each(catalog.map(({ id }) => [id]))('catalog consumer end-to-end: %s', 
   }, 30_000)
 })
 
-it('checks unpinned consumer data dependence across the entire catalog once', async () => {
+it('checks unpinned consumer data dependence using catalog world contrasts once', async () => {
   const world = loadWorld(catalog[0]!.id, { now: ANCHOR_MS })
   for (const kind of SLICE_KINDS) await step(world, kind, 'scenarioStoryCheck full catalog world-switch', () => scenarioStoryCheck({
     render: () => React.createElement(SliceConsumer, { kind }),

@@ -1,0 +1,212 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "conversation",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 4
+  },
+  "state": {
+    "threads": []
+  },
+  "timeline": [
+    {
+      "_tag": "thread-create",
+      "at_ms": 5000,
+      "store": 8,
+      "thread": {
+        "agent": "agent/example/sprout/builder",
+        "has_more": false,
+        "items": [],
+        "page_size": 50,
+        "session_id": "session/example-sprout-builder"
+      }
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/sprout/builder",
+      "at_ms": 5000,
+      "items": [
+        {
+          "body": {
+            "from": "person/ada",
+            "message_id": "message/scenario-first-run-onboarding-builder-1",
+            "to": "agent/example/sprout/builder"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding-builder-1",
+          "revision": 1,
+          "role": "user",
+          "sequence": 1,
+          "timestamp": "2030-01-01T12:00:05.000Z",
+          "type": "message"
+        }
+      ],
+      "store": 9
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/sprout/builder",
+      "at_ms": 5000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding-builder-2",
+          "revision": 1,
+          "role": "user",
+          "sequence": 2,
+          "timestamp": "2030-01-01T12:00:05.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 10
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/sprout/builder",
+      "at_ms": 7000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "The first mission is running. Checking sprout now."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding-builder-3",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 3,
+          "timestamp": "2030-01-01T12:00:07.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 13
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/sprout/builder",
+      "at_ms": 9000,
+      "items": [
+        {
+          "body": {
+            "arguments": {
+              "command": "pnpm test smoke"
+            },
+            "call_id": "call-builder-4",
+            "name": "shell"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding-builder-4",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4,
+          "timestamp": "2030-01-01T12:00:09.000Z",
+          "type": "tool_call"
+        }
+      ],
+      "store": 14
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/sprout/builder",
+      "at_ms": 11000,
+      "items": [
+        {
+          "body": {
+            "call_id": "call-builder-4",
+            "content": "3 tests passed; 0 failures",
+            "media_type": "text/plain",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding-builder-5",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 5,
+          "timestamp": "2030-01-01T12:00:11.000Z",
+          "type": "tool_result"
+        }
+      ],
+      "store": 15
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/sprout/builder",
+      "at_ms": 11000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "The first run is green: 3 tests passed, 0 failures."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding-builder-6",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 6,
+          "timestamp": "2030-01-01T12:00:11.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 16
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/sprout/builder",
+      "at_ms": 13000,
+      "items": [
+        {
+          "body": {
+            "status": "completed"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding-builder-7",
+          "revision": 1,
+          "role": "system",
+          "sequence": 7,
+          "timestamp": "2030-01-01T12:00:13.000Z",
+          "type": "status"
+        }
+      ],
+      "store": 17
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/3/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/4/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/5/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/6/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/7/items/0/timestamp"
+    }
+  ],
+  "variant": "default",
+  "world": "first-run-onboarding"
+}

@@ -3,6 +3,10 @@
 Seeded, privacy-safe scenario worlds for every Smalltalk client, and the kit that builds and
 replays them. [spec.md](spec.md) is the contract.
 
+The registered catalog contains 23 worlds: seven narratives, empty/loading/forward-compatibility
+edges, eleven failed-sync causes, replication divergence and Unicode. The `huge` world and its
+fixture encoding are not registered pending the storage decision (Axe `0crzkm`).
+
 ```ts
 import { loadWorld } from '@smalltalk/st3-scenarios'
 import { createReplay, realClock } from '@smalltalk/st3-scenarios/replay'
@@ -42,14 +46,23 @@ instants each file lists in `times` (vectors: `fixtures/scenarios/_vectors/rebas
   overrides stay under `~/src/<project>/`. `agent` also supports `state: 'desired'` without a runtime.
 - `thread-create {thread}` and `terminal-create {record}` introduce complete resources after
   offset zero; `thread-remove {agent}` and `terminal-remove {terminal}` remove membership.
+  Replacement creation refreshes ready conversation/terminal subscribers or rejects a stale
+  terminal incarnation. Removal also refuses subscriptions whose first reply is still held.
   Use the shared `terminalRecord(ctx, member, run, startedMs)` factory, not a world-local helper.
 - Future resource kinds live in the roster/details/attention state's optional `resources`
   array and in `changes.upserts`. Fold keeps them outside known-kind dispatch; replay sends
-  the original encoded values over primary collection sockets and generic resources HTTP.
+  the original encoded values over primary collection sockets/HTTP pages and generic resources
+  HTTP. Recognized client-v0 kinds without a proper slice collection are rejected, not stored
+  as future resources.
 - Contaminated slices use `decode: 'tolerant'` and
   `unknown: [{ pointer, known_value? }]`. Each exact pointer supplies a strict-valid repair
   witness; omit `known_value` to remove an extra object key. The decode gate requires each
   declared contamination to fail strict decoding independently, and rejects undeclared errors.
+  Declarations cannot repair a known object's ancestor to hide descendant errors. Whole
+  resource/entry witnesses require a genuinely unknown union discriminator.
+- `open-hold` keeps subsequent socket opens pending without any open/error/close callback;
+  `open-release` resumes pending opens at the current clock instant. Already-open sockets
+  are unaffected. Both are sync timeline events carrying `at_ms` and `store`.
 - Socket `open-fail { opens: 'all' }` persists until `open-ok`; a positive integer fails that
   many opens (omission means one). Subscription `error { repeat: true, ... }` rejects each
   resubscribe until `error-clear`. HTTP faults accept
@@ -62,6 +75,13 @@ instants each file lists in `times` (vectors: `fixtures/scenarios/_vectors/rebas
   `<slice>Variants: VariantTable['<slice>']`; the central module composes them. Populated variants
   synthesize from the cast when default records are absent. No paged/sharded fixture encoding
   is defined here; the catalog's `huge` format remains a separate decision.
+
+- `roster.all-states` cycles states across existing cast agents; `conversation.long` has 80
+  exchanges per agent; `attention.many` has 50 cards. Singleton `remote-only-mail` casts use
+  protocol-valid agent loopback mail, not invented participants.
+- Loading consumers render their loading state without displaying withheld backing records.
+  Story checks use one representative visible world contrast per declared slice; replication
+  metadata alone is not a visible contrast for a roster-name story.
 
 | Command | Effect |
 | --- | --- |

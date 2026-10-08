@@ -1,0 +1,673 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": true,
+  "slice": "terminal",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 1
+  },
+  "state": {
+    "terminals": [
+      {
+        "cast": {
+          "events": [
+            [
+              0,
+              "o",
+              "\u001b[32matlas\u001b[0m:builder $ pnpm -r typecheck\r\n"
+            ],
+            [
+              0.767,
+              "o",
+              "packages/api typecheck: Done\r\n"
+            ],
+            [
+              1.372,
+              "o",
+              "packages/web typecheck: Done\r\n"
+            ],
+            [
+              2.134,
+              "o",
+              "\u001b[31mpackages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but got 1.\u001b[0m\r\n"
+            ],
+            [
+              2.62,
+              "o",
+              "\u001b[31mpackages/worker typecheck: Failed\u001b[0m\r\n"
+            ],
+            [
+              2.67,
+              "o",
+              "\u001b[32matlas\u001b[0m:builder $ "
+            ]
+          ],
+          "header": {
+            "height": 12,
+            "title": "pnpm -r typecheck",
+            "version": 2,
+            "width": 100
+          },
+          "started_at_ms": -150000
+        },
+        "incarnation": "pty-57:1",
+        "owner": "agent/example/atlas/builder",
+        "runtime": {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-atlas-builder-shell",
+          "incarnation_id": "pty-57:1",
+          "kind": "runtime",
+          "owner_host_id": "host/meadow",
+          "owner_id": "agent/example/atlas/builder",
+          "revision": "rt-shell-1",
+          "runtime_id": "example-atlas-builder-shell",
+          "runtime_kind": "terminal",
+          "state": "running",
+          "terminal_id": "terminal/example-atlas-builder",
+          "updated_at": "2030-01-01T11:57:30.000Z"
+        },
+        "screens": [
+          {
+            "at_ms": -150000,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 1,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 28,
+                      "text": ":builder $ pnpm -r typecheck"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm -r typecheck",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 1,
+              "revision": "cast-1",
+              "rows": 12,
+              "runtime_incarnation": "pty-57:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm -r typecheck",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -149233,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 2,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 28,
+                      "text": ":builder $ pnpm -r typecheck"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm -r typecheck",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "text": "packages/api typecheck: Done"
+                    }
+                  ],
+                  "text": "packages/api typecheck: Done",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 2,
+              "revision": "cast-2",
+              "rows": 12,
+              "runtime_incarnation": "pty-57:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm -r typecheck",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -148628,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 3,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 28,
+                      "text": ":builder $ pnpm -r typecheck"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm -r typecheck",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "text": "packages/api typecheck: Done"
+                    }
+                  ],
+                  "text": "packages/api typecheck: Done",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "text": "packages/web typecheck: Done"
+                    }
+                  ],
+                  "text": "packages/web typecheck: Done",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 3,
+              "revision": "cast-3",
+              "rows": 12,
+              "runtime_incarnation": "pty-57:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm -r typecheck",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -147866,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 5,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 28,
+                      "text": ":builder $ pnpm -r typecheck"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm -r typecheck",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "text": "packages/api typecheck: Done"
+                    }
+                  ],
+                  "text": "packages/api typecheck: Done",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "text": "packages/web typecheck: Done"
+                    }
+                  ],
+                  "text": "packages/web typecheck: Done",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "fg": 1,
+                      "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g"
+                    }
+                  ],
+                  "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 1,
+                      "text": "ot 1."
+                    }
+                  ],
+                  "text": "ot 1.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 4,
+              "revision": "cast-4",
+              "rows": 12,
+              "runtime_incarnation": "pty-57:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm -r typecheck",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -147380,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 6,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 28,
+                      "text": ":builder $ pnpm -r typecheck"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm -r typecheck",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "text": "packages/api typecheck: Done"
+                    }
+                  ],
+                  "text": "packages/api typecheck: Done",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "text": "packages/web typecheck: Done"
+                    }
+                  ],
+                  "text": "packages/web typecheck: Done",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "fg": 1,
+                      "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g"
+                    }
+                  ],
+                  "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 1,
+                      "text": "ot 1."
+                    }
+                  ],
+                  "text": "ot 1.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 33,
+                      "fg": 1,
+                      "text": "packages/worker typecheck: Failed"
+                    }
+                  ],
+                  "text": "packages/worker typecheck: Failed",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 5,
+              "revision": "cast-5",
+              "rows": 12,
+              "runtime_incarnation": "pty-57:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm -r typecheck",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -147330,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 16,
+                "row": 6,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 28,
+                      "text": ":builder $ pnpm -r typecheck"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm -r typecheck",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "text": "packages/api typecheck: Done"
+                    }
+                  ],
+                  "text": "packages/api typecheck: Done",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "text": "packages/web typecheck: Done"
+                    }
+                  ],
+                  "text": "packages/web typecheck: Done",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "fg": 1,
+                      "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g"
+                    }
+                  ],
+                  "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 1,
+                      "text": "ot 1."
+                    }
+                  ],
+                  "text": "ot 1.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 33,
+                      "fg": 1,
+                      "text": "packages/worker typecheck: Failed"
+                    }
+                  ],
+                  "text": "packages/worker typecheck: Failed",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 11,
+                      "text": ":builder $ "
+                    }
+                  ],
+                  "text": "atlas:builder $ ",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 6,
+              "revision": "cast-6",
+              "rows": 12,
+              "runtime_incarnation": "pty-57:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm -r typecheck",
+              "truncated": false
+            }
+          }
+        ],
+        "terminal": "terminal/example-atlas-builder"
+      }
+    ]
+  },
+  "timeline": [],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/terminals/0/runtime/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "loading"
+}

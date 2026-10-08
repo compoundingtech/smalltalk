@@ -204,6 +204,10 @@ after it (see [Store versions](#store-versions)).
 Creation events carry the complete thread or terminal record, including pagination or runtime,
 cast and screens metadata. Resources are genuinely absent before creation, rather than hidden
 empty records. Creating an existing key replaces its record; removal deletes membership.
+Ready conversation subscribers receive a replacement frame and stay bound to their agent
+across a changed session ID. A replaced terminal refreshes the current screen when its
+incarnation matches, or rejects the old subscriber with `stale-fence` when it changes.
+Membership removal refuses matching subscriptions even when their first reply is held/loading.
 All four membership events advance the store. `terminalRecord(ctx, member, run, startedMs)`
 builds a terminal runtime and retains only run screens at offsets at or before zero; authors
 put later screens in timeline events.
@@ -212,8 +216,10 @@ Roster, details and attention may additionally hold `resources: RawResource[]`: 
 kinds, preserved as encoded `{id, kind, revision, updated_at, ...}` values outside known-kind
 dispatch. Unknown `changes.upserts` fold into this collection and `removes` deletes them by ID.
 Replay includes them in that slice's primary collection (`agents`, `missions`, `attention`),
-its bounded socket window and generic resources HTTP observations without dropping their fields.
-Known kinds still require their proper collection. Their schema-declared header timestamps
+its bounded socket window, primary collection HTTP pages and generic resources HTTP observations
+without dropping their fields. Every client-v0 known kind, including kinds this kit does not
+model in a slice, still requires its proper collection; unsupported known kinds fail the fold.
+Their schema-declared header timestamps
 participate in `times`; opaque future payload timestamps do not.
 
 `selector` names a subscription by its collection and filter, for example
@@ -240,6 +246,12 @@ reexports sync helpers. Variants synthesize missing default records from the dec
 an empty conversation variant can create cast-owned empty threads, and populated terminal
 variants can build a cast-owned terminal. A populated variant requires an appropriate cast
 member; it never invents a foreign identity or dereferences a missing first record.
+
+`roster.all-states` cycles the supported lifecycle/harness combinations over the declared cast;
+it does not add agents merely to display every state. `conversation.long` contains 80 exchanges
+per cast agent, and `attention.many` contains 50 cards distributed over cast-owned work.
+`conversation.remote-only-mail` uses another cast agent, preferring a different host; a singleton
+cast uses agent-to-agent loopback mail, which the protocol permits, never person-origin content.
 
 ### Terminal data
 
@@ -342,6 +354,9 @@ and the Swift reader in `St3Client` each run all vectors in their own tests.
   nonoverlapping JSON pointers inside a wire value. `known_value` is a strict-valid repair
   witness (a known enum, or a complete known resource/entry for a future kind); omit it only
   to remove an extra object key. Witnesses are diagnostic metadata, never transport data.
+  Known-object ancestors cannot serve as declarations for contaminated descendants: declare
+  each enum leaf or actual excess key. Whole-resource or whole-entry witnesses are permitted
+  only when the real tolerant codec identifies their union discriminator as genuinely unknown.
   The gate first decodes the original tolerantly, then strict-decodes the value with all
   declarations repaired, rejecting undeclared contamination. It also strict-decodes each
   declared path in isolation with all other declarations repaired and requires failure.
@@ -485,13 +500,14 @@ over the event union (a `never` check), and each row has a test through the real
 | roster, details, attention | `changes` | Updates the state. For every open subscription whose filtered, limited window changes: one `changes` frame with `upserts`, `removes` (including rows leaving the window), the complete new `order`, `has_more` and a new fence. Unaffected subscriptions get nothing. |
 | conversation | `entries` | One `conversation` frame with `replace: false` and those entries, without `has_more`, to subscribers of that agent or session. |
 | conversation | `replace` | One `conversation` frame with `replace: true`, the newest page (`page_size`) and `has_more`. |
-| conversation | `thread-create {thread}` / `thread-remove {agent}` | Introduces / removes full thread membership. A new subscribe or timeline HTTP read sees the introduced metadata and newest page; held first replies are released when their policy allows. Removal sends `not-found` to existing subscribers and later reads. |
-| terminal | `terminal-create {record}` / `terminal-remove {terminal}` | Introduces / removes full terminal membership. Runtime reads, attaches and subscriptions see the new runtime/incarnation/screens. Removal sends `not-found` to existing subscribers and later reads/attaches. |
+| conversation | `thread-create {thread}` / `thread-remove {agent}` | Introduces / removes full thread membership. Creating an existing agent sends ready subscribers a replacement frame and retains their agent binding across session changes; pending first replies obey hold/loading policies. Removal sends `not-found` to every matching subscriber and later reads. |
+| terminal | `terminal-create {record}` / `terminal-remove {terminal}` | Introduces / removes full terminal membership. Runtime reads, attaches and subscriptions see new metadata. Existing ready subscriptions get the replacement screen for an unchanged incarnation, `stale-fence` for a changed incarnation, or `terminal-ended` for an exited runtime. Removal sends `not-found` even to held/loading subscriptions, and later reads/attaches. |
 | terminal | `screen` | One `screen` frame with the `TerminalScreen` to subscribers holding the current incarnation. |
 | terminal | `unavailable` | An `error` frame, code `terminal-unavailable`, `retryable: true`. A fresh `terminal.attach` returns the current incarnation and a capability, and a subscribe with it resumes with the current screen. A subscribe that reuses the earlier lease also resumes while the lease is valid (a separate protocol test; the SDK always attaches afresh). |
 | terminal | `end` | An `error` frame, code `terminal-ended`, `retryable: false`, to every subscriber. Later attaches and subscribes return `terminal-ended`. |
 | terminal | `incarnation` | Sets a new incarnation. Current subscribers get an `error` frame, code `stale-fence`. A subscribe with the old incarnation gets `stale-fence`; `terminal.attach` returns the new incarnation and a new capability. |
 | sync | `open-fail {opens?}` / `open-ok` | Each failed open emits `onerror`, then `onclose` code 1006 and no body. Omitted `opens` fails one open; a positive integer fails that many opens; `'all'` fails every open until `open-ok` or a later `open-fail` replaces the policy. |
+| sync | `open-hold` / `open-release` | Subsequent socket opens stay pending without `onopen`, `onerror` or `onclose` until release. Release schedules their normal opening callbacks at the current clock instant; already-open sockets are unaffected, and closed pending sockets never reopen. Other open-failure policies remain independent. |
 | sync | `http-raw {route, when?, status, content_type, body}` | Matching requests return a non-client-v0 response (for example a proxy's HTML page). The decode gate skips `body`; the privacy gate still scans it. |
 | sync | `close {code, reason}` | Closes the open socket with that WebSocket close code. |
 | sync | `reopen {after_ms}` | Allows a new socket open again after `after_ms`; until then opens fail with close code 1006. |
@@ -542,7 +558,7 @@ client-v0 schema; until then they are excluded from committed fixtures and the g
 | `socket-dropped` | after Live: `close {1006}`, opens keep failing | `Stale{Reconnecting{attempt n, nextAt, issue}, lastLiveAt}` |
 | `reconnected` | `socket-dropped`, then `reopen` | `Stale{Reconnecting}`, then `Live` from the new snapshot |
 | `closed-unknown` | close without a scheduled retry | `Stale{Unknown}` |
-| `resync-coded` | `resync {code: remote-unavailable, message}` over a live conversation | `Stale{Resync{code, message, attempt}}`, content kept |
+| `resync-coded` | `resync {code: remote-unavailable, message}` over a live conversation, or the live agents window when the world has no initial conversation | `Stale{Resync{code, message, attempt}}`, content kept |
 | `resync-uncoded` | `resync` without code | `Stale{Unknown}` |
 | `forbidden` | capabilities `http-error`: 403 with an `ErrorEnvelope`, code `forbidden` | `Failed{Server{forbidden, message}}`; reconnecting stops |
 | `non-client-response` | capabilities `http-raw`: 403 with an HTML body | the probe failure is not a client-v0 rejection, so the SDK keeps retrying: `Stale{Reconnecting}` (or `Stale{Unknown}` without a scheduled retry) |
@@ -665,10 +681,12 @@ and fails unless all hold:
    - **states** for sides without content (`empty`, `loading`, `none`): the side shows none of
      the other side's distinguishing markers and the renders differ.
    A pair passes when every side meets its own expectation.
-3. **World switch:** for stories that do not pin a world, the check picks two catalog worlds whose
-   declared slices differ in wire state (worlds that share them, such as the `failed-sync-*`
-   worlds for a roster story, are never paired) and applies check 2's rule, using
-   distinguishing markers derived from the difference between the two worlds' slices.
+3. **World switch:** for stories that do not pin a world, the check picks one representative pair
+   of catalog worlds per non-invariant declared slice whose wire states and visible contrast
+   expectations differ. Worlds sharing the slice, such as `failed-sync-*` worlds for a roster
+   story, are never paired. Marker multisets and contentless states define content-slice contrasts;
+   portable statuses define sync contrasts. Transport scripts or replication metadata alone do
+   not require a roster-name story to render differently. The pair applies check 2's rule.
 4. **Pinned world:** for stories that pin a world, changing the toolbar global leaves the render
    unchanged; check 3 does not apply.
 5. **URL state:** rendering from the URL state (`globals` and `args`) equals rendering from the
@@ -729,11 +747,17 @@ The path-filtered `fractal-web-execution` job runs these gates as lanes of `scri
 3. Decode: every wire value in every committed slice and in every in-process variant is decoded
    with `@smalltalk/st3-client/schema` in strict mode, once at the anchor and once rebased to a
    random `now`. `unknown-fields` decodes tolerant and fails strict at exactly its declared paths.
-4. Privacy: `scripts/check-public-repo` covers the committed files; `scripts/scan.ts` adds the
-   token, credential, host and home-path rules of the earlier synthetic-fixtures scan (the
-   home-path rule is case-sensitive, so a source path such as `src/users/` passes), checks
-   that every subject reference is in the [identity namespace](#identity-namespace), and rejects
-   date and clock patterns in vocabulary banks.
+4. Privacy: `scripts/check-public-repo` covers the committed files and fails the gate when it
+   cannot run, is killed, or exits non-zero without a finding in this package or the scenarios.
+   `scripts/scan.ts` walks every published file of the package (skipping `node_modules` and
+   gitignored output) and the committed scenarios with the token, credential, internal machine
+   name, real user name and home-path rules of the earlier synthetic-fixtures scan (the home-path
+   rule is case-sensitive, so a source path such as `src/users/` passes). It also rejects email
+   addresses outside the reserved example domains, IPv4 addresses outside the documentation ranges
+   and loopback, and URLs whose host is not `scenario.invalid`, `localhost` or an `example.com`,
+   `example.org` or `example.net` name. It checks that every subject reference is in the
+   [identity namespace](#identity-namespace), and rejects date and clock patterns in vocabulary
+   banks.
 5. Consumers: the SDK sync-matrix fold, stui's contract test, the Rust and Swift rebase vectors
    and the fractal-web bundle check run in their own jobs (see below).
 

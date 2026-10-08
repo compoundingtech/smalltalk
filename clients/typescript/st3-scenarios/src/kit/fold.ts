@@ -1,3 +1,5 @@
+import type { Resource } from '@smalltalk/st3-client'
+
 import type { AnySlice, Slice, SliceKind, SliceStates, SyncSurface, TimelineEvent, WireResource } from './slice.ts'
 import type { SyncStatus } from './syncStatus.ts'
 
@@ -8,7 +10,8 @@ const upsert = <A extends Keyed>(list: readonly A[], value: A): A[] => {
   return index === -1 ? [...list, value] : list.map((item, at) => (at === index ? value : item))
 }
 
-const COLLECTION_OF_KIND: Record<string, string> = {
+/** Complete client-v0 known-kind set; unsupported collections must not become future resources. */
+const COLLECTION_OF_KIND: Record<Resource['kind'], string> = {
   agent: 'agents',
   runtime: 'runtimes',
   machine: 'machines',
@@ -16,12 +19,26 @@ const COLLECTION_OF_KIND: Record<string, string> = {
   work: 'work',
   attention: 'attention',
   message: 'messages',
+  launch: 'launches',
+  'launch-variant': 'launchVariants',
+  'launch-decision': 'launchDecisions',
+  'launch-approval': 'launchApprovals',
+  observer: 'observers',
+  subscription: 'subscriptions',
+  lane: 'lanes',
+  device: 'devices',
+  operation: 'operations',
+  history: 'history',
+  session: 'sessions',
+  glass: 'glasses',
+  arrangement: 'arrangements',
+  'owned-set': 'ownedSets',
 }
 
 const applyChanges = <S extends object>(state: S, upserts: readonly WireResource[], removes: readonly string[], order: readonly string[] | undefined): S => {
   const next = { ...state } as Record<string, unknown>
   for (const value of upserts) {
-    const key = Object.hasOwn(COLLECTION_OF_KIND, value.kind) ? COLLECTION_OF_KIND[value.kind] : undefined
+    const key = Object.hasOwn(COLLECTION_OF_KIND, value.kind) ? COLLECTION_OF_KIND[value.kind as Resource['kind']] : undefined
     if (key === undefined) next.resources = upsert((next.resources ?? []) as Keyed[], value)
     else {
       if (!Array.isArray(next[key])) throw new Error(`a ${value.kind} upsert has no place in this slice`)
@@ -104,6 +121,8 @@ const applyEvent = (slice: AnySlice, event: TimelineEvent): AnySlice['state'] =>
     case 'unavailable':
     case 'open-fail':
     case 'open-ok':
+    case 'open-hold':
+    case 'open-release':
     case 'error-clear':
     case 'http-raw':
     case 'close':

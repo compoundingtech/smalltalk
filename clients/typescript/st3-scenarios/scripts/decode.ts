@@ -44,6 +44,7 @@ export const decodeSlice = (world: string, slice: AnySlice): DecodeFailure[] => 
     const tolerantError = decode(value, 'tolerant')
     if (tolerantError !== undefined) failure(pointer, tolerantError)
     try {
+      const decoded: unknown = Schema.decodeUnknownSync(Schema[definition] as never, 'tolerant')(value)
       // Replacing every declaration must restore a strict-valid value. Any independent,
       // undeclared contamination still fails this check.
       const patch = (input: unknown, path: string, replacement: unknown): unknown => {
@@ -68,6 +69,25 @@ export const decodeSlice = (world: string, slice: AnySlice): DecodeFailure[] => 
       }
       for (let index = 0; index < paths.length; index += 1) {
         const path = paths[index]!
+        const tokens = path.pointer === pointer ? [] : path.pointer.slice(pointer.length + 1).split('/')
+          .map((token) => token.replace(/~1/gu, '/').replace(/~0/gu, '~'))
+        let rawLeaf: unknown = value
+        let decodedLeaf: unknown = decoded
+        let decodedParent: unknown
+        for (const token of tokens) {
+          decodedParent = decodedLeaf
+          rawLeaf = rawLeaf !== null && typeof rawLeaf === 'object' ? (rawLeaf as Record<string, unknown>)[token] : undefined
+          decodedLeaf = decodedLeaf !== null && typeof decodedLeaf === 'object' ? (decodedLeaf as Record<string, unknown>)[token] : undefined
+        }
+        // Scalar declarations are checked by the isolated strict probe below; a known scalar
+        // therefore remains a stale declaration. Composite ancestors cannot hide leaf errors.
+        const scalarLeaf = rawLeaf === null || typeof rawLeaf !== 'object'
+        const key = tokens.at(-1)
+        const excessKey = key !== undefined && decodedParent !== null && typeof decodedParent === 'object' && !Object.hasOwn(decodedParent, key)
+        const discriminator = definition === 'Resource' ? 'kind' : definition === 'TimelineEntry' ? 'type' : undefined
+        const unknownMember = tokens.length === 0 && discriminator !== undefined && decodedLeaf !== null && typeof decodedLeaf === 'object' &&
+          Schema.containsUnknownCase((decodedLeaf as Record<string, unknown>)[discriminator])
+        if (!scalarLeaf && !excessKey && !unknownMember) throw new Error('unknown declaration must name an enum leaf, excess key, or genuinely unknown union member')
         if (paths.some((other, at) => at !== index && (other.pointer === path.pointer || other.pointer.startsWith(`${path.pointer}/`)))) {
           throw new Error('unknown paths must be unique and nonoverlapping')
         }

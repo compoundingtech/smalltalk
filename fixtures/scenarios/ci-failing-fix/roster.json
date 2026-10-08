@@ -1,0 +1,528 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "roster",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 21
+  },
+  "state": {
+    "agents": [
+      {
+        "active_work_count": 1,
+        "ask": null,
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "builder/repair-dependency-bump",
+          "repository": "~/src/atlas"
+        },
+        "current_session_id": "session/example-atlas-builder",
+        "current_work": [
+          {
+            "id": "step-run/example/atlas/repair-dependency-bump/1/step-2",
+            "mission_id": "mission/example/atlas/repair-dependency-bump",
+            "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+            "path": "step-2",
+            "since": "2030-01-01T11:50:00.000Z",
+            "state": "claimed",
+            "title": "Bisect the regression"
+          }
+        ],
+        "current_work_ids": [
+          "step-run/example/atlas/repair-dependency-bump/1/step-2"
+        ],
+        "driver": "claude",
+        "fault": null,
+        "harness_state": "busy",
+        "host_id": "host/meadow",
+        "id": "agent/example/atlas/builder",
+        "incarnation_id": "rt-atlas-builder-726:8",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:59:30.000Z",
+        "name": "Atlas Builder",
+        "next_work": {
+          "id": "step-run/example/atlas/repair-dependency-bump/1/step-3",
+          "mission_id": "mission/example/atlas/repair-dependency-bump",
+          "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+          "path": "step-3",
+          "since": "2030-01-01T11:50:00.000Z",
+          "state": "ready",
+          "title": "Restore the omitted limit default"
+        },
+        "next_work_id": "step-run/example/atlas/repair-dependency-bump/1/step-3",
+        "owner_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+        "queued_work_count": 2,
+        "reachability": "local",
+        "revision": "ag5",
+        "runtime_ids": [
+          "runtime/example-atlas-builder"
+        ],
+        "since": "2030-01-01T11:50:00.000Z",
+        "state": "running",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [
+          {
+            "id": "step-run/example/atlas/repair-dependency-bump/1/step-3",
+            "mission_id": "mission/example/atlas/repair-dependency-bump",
+            "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+            "path": "step-3",
+            "since": "2030-01-01T11:50:00.000Z",
+            "state": "ready",
+            "title": "Restore the omitted limit default"
+          },
+          {
+            "id": "step-run/example/atlas/repair-dependency-bump/1/step-4",
+            "mission_id": "mission/example/atlas/repair-dependency-bump",
+            "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+            "path": "step-4",
+            "since": "2030-01-01T11:50:00.000Z",
+            "state": "ready",
+            "title": "Rerun the CI matrix"
+          }
+        ],
+        "upcoming_work_ids": [
+          "step-run/example/atlas/repair-dependency-bump/1/step-3",
+          "step-run/example/atlas/repair-dependency-bump/1/step-4"
+        ],
+        "updated_at": "2030-01-01T11:59:30.000Z",
+        "workspace": "~/src/atlas/.worktrees/builder"
+      }
+    ],
+    "machines": [
+      {
+        "capacity": {
+          "reason": "no capacity observation",
+          "state": "unknown"
+        },
+        "fleet_id": "fleet/example-atlas",
+        "host_id": "host/meadow",
+        "id": "machine/meadow",
+        "kind": "machine",
+        "name": "meadow",
+        "occupancy": {
+          "running_runtimes": 2
+        },
+        "projects": [
+          "~/src/atlas"
+        ],
+        "revision": "mh-meadow",
+        "runtime_ids": [
+          "runtime/example-atlas-builder",
+          "runtime/example-atlas-builder-shell"
+        ],
+        "state": "local",
+        "transports": [
+          {
+            "last_success_at": "2030-01-01T11:59:30.000Z",
+            "protocol": "unix",
+            "status": "local"
+          }
+        ],
+        "updated_at": "2030-01-01T11:59:30.000Z",
+        "work": [
+          "work/example/atlas/repair-dependency-bump/1/step-2"
+        ]
+      }
+    ],
+    "order": [
+      "agent/example/atlas/builder"
+    ],
+    "runtimes": [
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-atlas-builder",
+        "incarnation_id": "rt-atlas-builder-726:8",
+        "kind": "runtime",
+        "owner_host_id": "host/meadow",
+        "owner_id": "agent/example/atlas/builder",
+        "owner_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+        "revision": "rt34",
+        "runtime_id": "rt-atlas-builder-726",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:50:00.000Z"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "changes",
+      "at_ms": 10000,
+      "removes": [],
+      "store": 8,
+      "upserts": [
+        {
+          "active_work_count": 1,
+          "ask": null,
+          "blocked_on": null,
+          "checkout": {
+            "base": "origin/main",
+            "branch": "builder/repair-dependency-bump",
+            "repository": "~/src/atlas"
+          },
+          "current_session_id": "session/example-atlas-builder",
+          "current_work": [
+            {
+              "id": "step-run/example/atlas/repair-dependency-bump/1/step-3",
+              "mission_id": "mission/example/atlas/repair-dependency-bump",
+              "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+              "path": "step-3",
+              "since": "2030-01-01T12:00:10.000Z",
+              "state": "claimed",
+              "title": "Restore the omitted limit default"
+            }
+          ],
+          "current_work_ids": [
+            "step-run/example/atlas/repair-dependency-bump/1/step-3"
+          ],
+          "driver": "claude",
+          "fault": null,
+          "harness_state": "busy",
+          "host_id": "host/meadow",
+          "id": "agent/example/atlas/builder",
+          "incarnation_id": "rt-atlas-builder-726:8",
+          "kind": "agent",
+          "last_activity_at": "2030-01-01T12:00:10.000Z",
+          "name": "Atlas Builder",
+          "next_work": {
+            "id": "step-run/example/atlas/repair-dependency-bump/1/step-4",
+            "mission_id": "mission/example/atlas/repair-dependency-bump",
+            "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+            "path": "step-4",
+            "since": "2030-01-01T12:00:10.000Z",
+            "state": "ready",
+            "title": "Rerun the CI matrix"
+          },
+          "next_work_id": "step-run/example/atlas/repair-dependency-bump/1/step-4",
+          "owner_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+          "queued_work_count": 1,
+          "reachability": "local",
+          "revision": "ag18",
+          "runtime_ids": [
+            "runtime/example-atlas-builder"
+          ],
+          "since": "2030-01-01T12:00:10.000Z",
+          "state": "running",
+          "subagents": [],
+          "under": [],
+          "upcoming_work": [
+            {
+              "id": "step-run/example/atlas/repair-dependency-bump/1/step-4",
+              "mission_id": "mission/example/atlas/repair-dependency-bump",
+              "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+              "path": "step-4",
+              "since": "2030-01-01T12:00:10.000Z",
+              "state": "ready",
+              "title": "Rerun the CI matrix"
+            }
+          ],
+          "upcoming_work_ids": [
+            "step-run/example/atlas/repair-dependency-bump/1/step-4"
+          ],
+          "updated_at": "2030-01-01T12:00:10.000Z",
+          "workspace": "~/src/atlas/.worktrees/builder"
+        },
+        {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-atlas-builder",
+          "incarnation_id": "rt-atlas-builder-726:8",
+          "kind": "runtime",
+          "owner_host_id": "host/meadow",
+          "owner_id": "agent/example/atlas/builder",
+          "owner_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+          "revision": "rt29",
+          "runtime_id": "rt-atlas-builder-726",
+          "runtime_kind": "agent",
+          "state": "running",
+          "updated_at": "2030-01-01T12:00:10.000Z"
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 18000,
+      "removes": [],
+      "store": 13,
+      "upserts": [
+        {
+          "active_work_count": 1,
+          "ask": null,
+          "blocked_on": null,
+          "checkout": {
+            "base": "origin/main",
+            "branch": "builder/repair-dependency-bump",
+            "repository": "~/src/atlas"
+          },
+          "current_session_id": "session/example-atlas-builder",
+          "current_work": [
+            {
+              "id": "step-run/example/atlas/repair-dependency-bump/1/step-4",
+              "mission_id": "mission/example/atlas/repair-dependency-bump",
+              "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+              "path": "step-4",
+              "since": "2030-01-01T12:00:18.000Z",
+              "state": "verifying",
+              "title": "Rerun the CI matrix"
+            }
+          ],
+          "current_work_ids": [
+            "step-run/example/atlas/repair-dependency-bump/1/step-4"
+          ],
+          "driver": "claude",
+          "fault": null,
+          "harness_state": "busy",
+          "host_id": "host/meadow",
+          "id": "agent/example/atlas/builder",
+          "incarnation_id": "rt-atlas-builder-726:8",
+          "kind": "agent",
+          "last_activity_at": "2030-01-01T12:00:18.000Z",
+          "name": "Atlas Builder",
+          "next_work": null,
+          "next_work_id": null,
+          "owner_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+          "queued_work_count": 0,
+          "reachability": "local",
+          "revision": "ag16",
+          "runtime_ids": [
+            "runtime/example-atlas-builder"
+          ],
+          "since": "2030-01-01T12:00:18.000Z",
+          "state": "running",
+          "subagents": [],
+          "under": [],
+          "upcoming_work": [],
+          "upcoming_work_ids": [],
+          "updated_at": "2030-01-01T12:00:18.000Z",
+          "workspace": "~/src/atlas/.worktrees/builder"
+        },
+        {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-atlas-builder",
+          "incarnation_id": "rt-atlas-builder-726:8",
+          "kind": "runtime",
+          "owner_host_id": "host/meadow",
+          "owner_id": "agent/example/atlas/builder",
+          "owner_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+          "revision": "rt31",
+          "runtime_id": "rt-atlas-builder-726",
+          "runtime_kind": "agent",
+          "state": "running",
+          "updated_at": "2030-01-01T12:00:18.000Z"
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 30000,
+      "removes": [],
+      "store": 20,
+      "upserts": [
+        {
+          "active_work_count": 0,
+          "ask": null,
+          "blocked_on": null,
+          "checkout": {
+            "base": "origin/main",
+            "branch": "builder/repair-dependency-bump",
+            "repository": "~/src/atlas"
+          },
+          "current_session_id": "session/example-atlas-builder",
+          "current_work": [],
+          "current_work_ids": [],
+          "driver": "claude",
+          "fault": null,
+          "harness_state": "idle",
+          "host_id": "host/meadow",
+          "id": "agent/example/atlas/builder",
+          "incarnation_id": "rt-atlas-builder-726:8",
+          "kind": "agent",
+          "last_activity_at": "2030-01-01T12:00:30.000Z",
+          "name": "Atlas Builder",
+          "next_work": null,
+          "next_work_id": null,
+          "owner_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+          "queued_work_count": 0,
+          "reachability": "local",
+          "revision": "ag25",
+          "runtime_ids": [
+            "runtime/example-atlas-builder"
+          ],
+          "since": "2030-01-01T12:00:30.000Z",
+          "state": "waiting",
+          "subagents": [],
+          "under": [],
+          "upcoming_work": [],
+          "upcoming_work_ids": [],
+          "updated_at": "2030-01-01T12:00:30.000Z",
+          "workspace": "~/src/atlas/.worktrees/builder"
+        },
+        {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-atlas-builder",
+          "incarnation_id": "rt-atlas-builder-726:8",
+          "kind": "runtime",
+          "owner_host_id": "host/meadow",
+          "owner_id": "agent/example/atlas/builder",
+          "owner_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+          "revision": "rt39",
+          "runtime_id": "rt-atlas-builder-726",
+          "runtime_kind": "agent",
+          "state": "running",
+          "updated_at": "2030-01-01T12:00:30.000Z"
+        },
+        {
+          "capacity": {
+            "reason": "no capacity observation",
+            "state": "unknown"
+          },
+          "fleet_id": "fleet/example-atlas",
+          "host_id": "host/meadow",
+          "id": "machine/meadow",
+          "kind": "machine",
+          "name": "meadow",
+          "occupancy": {
+            "running_runtimes": 2
+          },
+          "projects": [
+            "~/src/atlas"
+          ],
+          "revision": "mh-green",
+          "runtime_ids": [
+            "runtime/example-atlas-builder",
+            "runtime/example-atlas-builder-shell"
+          ],
+          "state": "local",
+          "transports": [
+            {
+              "last_success_at": "2030-01-01T11:59:30.000Z",
+              "protocol": "unix",
+              "status": "local"
+            }
+          ],
+          "updated_at": "2030-01-01T12:00:30.000Z",
+          "work": []
+        }
+      ]
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/next_work/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/upcoming_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/upcoming_work/1/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/transports/0/last_success_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/next_work/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/upcoming_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/2/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/2/transports/0/last_success_at"
+    }
+  ],
+  "variant": "default",
+  "world": "ci-failing-fix"
+}
