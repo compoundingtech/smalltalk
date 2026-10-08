@@ -39,6 +39,37 @@ fn directory() -> Option<PathBuf> {
         .then(|| base.join("st3").join("stui").join("runs"))
 }
 
+/// Keep a trace of what a panic said and where, in `panics.log` beside the run files, so a
+/// crash that the terminal's own restore hides can be read afterwards (Nathan, 2026-10-07: "it
+/// keeps crashing"). The default hook still runs, so the terminal is restored as before.
+pub fn log_panics(build: &str) {
+    let build = build.to_owned();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(file) = directory().and_then(|runs| runs.parent().map(|dir| dir.join("panics.log")))
+        {
+            write_panic(
+                &file,
+                &build,
+                &format!("{info}\n{}", std::backtrace::Backtrace::force_capture()),
+            );
+        }
+        previous(info);
+    }));
+}
+
+/// Append one panic to the log, which is cleared once it passes 200 KB.
+fn write_panic(file: &Path, build: &str, what: &str) {
+    use std::io::Write as _;
+    let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")));
+    if std::fs::metadata(file).is_ok_and(|meta| meta.len() > 200_000) {
+        let _ = std::fs::remove_file(file);
+    }
+    if let Ok(mut out) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
+        let _ = writeln!(out, "{} {build} {what}\n", now_unix());
+    }
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -178,5 +209,21 @@ mod tests {
             file: Some(file.clone()),
         });
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn a_panic_is_written_to_the_log_and_the_log_stays_small() {
+        let root = std::env::temp_dir().join(format!("stui-panic-{}", std::process::id()));
+        let file = root.join("stui").join("panics.log");
+        write_panic(&file, "build-1", "panicked at src/x.rs:1:1: boom");
+        let first = std::fs::read_to_string(&file).unwrap();
+        assert!(first.contains("build-1") && first.contains("boom"), "{first}");
+        write_panic(&file, "build-1", "second");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("second"));
+        std::fs::write(&file, "x".repeat(200_001)).unwrap();
+        write_panic(&file, "build-1", "after the cut");
+        let cut = std::fs::read_to_string(&file).unwrap();
+        assert!(cut.len() < 1_000 && cut.contains("after the cut"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
