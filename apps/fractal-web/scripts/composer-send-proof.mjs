@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { createServer, loadConfigFromFile } from 'vite'
 
 const app = fileURLToPath(new URL('..', import.meta.url))
+// The only seat message actions may target; the operator names a disposable scratch seat.
 const seat = process.env.WF_E2E_SCRATCH_SEAT?.trim()
 if (!seat) throw new Error('Set WF_E2E_SCRATCH_SEAT to a disposable scratch seat')
 const rev = execFileSync('git', ['-C', app, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
@@ -53,7 +54,6 @@ const server = await createServer({
 try {
   await server.listen()
   const port = server.httpServer.address().port
-  if (port === 8445) throw new Error('Forbidden listener port')
   await run(['open', 'about:blank'])
   const result = await run(['run-code', `async page => {
     const seat = ${JSON.stringify(seat)}
@@ -94,7 +94,7 @@ try {
       const response = await route.fetch()
       await route.fulfill({ response })
     })
-    await page.goto(origin + '/w/' + encodeURIComponent(seat))
+    await page.goto(origin + '/w/' + seat.split('/').map(encodeURIComponent).join('/') + '?open=thread')
     const input = page.getByRole('textbox', { name: 'Message', exact: true })
     await input.waitFor({ state: 'visible', timeout: 60000 })
     if (await input.isDisabled()) throw new Error('Scratch-seat composer disabled: ' + await page.locator('body').innerText())

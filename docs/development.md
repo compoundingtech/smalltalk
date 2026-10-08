@@ -217,8 +217,8 @@ node apps/fractal-web/scripts/composer-send-proof.mjs --without-binding
 ```
 
 The live proof requires a send-granted gateway through the existing `WF_ST_GATEWAY` and
-`WF_ST_AUTHORIZATION` environment variables. It starts its own loopback server on an ephemeral
-port, never uses port 8445, and permits message actions only to the dedicated scratch seat.
+`WF_ST_AUTHORIZATION` environment variables and a disposable seat in `WF_E2E_SCRATCH_SEAT`. It
+starts its own loopback server on an ephemeral port and permits message actions only to that seat.
 It gates real HTTP/echo delivery to observe Pending→Sent→echo, injects one explicit refusal,
 checks Retry reuses the key, and prints build revision, seat and timings. The negative control
 removes the submit binding and proves the send criterion rejects it without issuing mail.
