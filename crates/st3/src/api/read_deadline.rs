@@ -2,12 +2,26 @@
 //! Cancellation is cooperative: SQLite reads use progress handlers and Rust folds check
 //! the budget between items. It does not preempt an individual filesystem call or parse.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::sync::Arc;
 
 thread_local! {
     static STORE: RefCell<Option<Arc<super::Store>>> = const { RefCell::new(None) };
+    // The router runs its handler on a blocking worker already. Submitting its synchronous
+    // store work again wastes a second pool slot and can wait behind unrelated blocking work.
+    static IN_HANDLER: Cell<bool> = const { Cell::new(false) };
+}
+
+fn with_handler<T>(work: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IN_HANDLER.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(IN_HANDLER.with(|slot| slot.replace(true)));
+    work()
 }
 
 fn with_store<T>(store: Option<Arc<super::Store>>, work: impl FnOnce() -> T) -> T {
@@ -296,7 +310,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    spawn(work, false)
+    spawn(move || with_handler(work), false)
 }
 
 #[track_caller]
@@ -314,7 +328,21 @@ where
     });
     let worker_budget = budget.clone();
     let store = STORE.with(|slot| slot.borrow().clone());
-    let task = tokio::task::spawn_blocking(move || {
+    // Capture cancellation before executing an inline operation, including a panic.
+    struct Cancel(Option<ReadBudget>);
+    impl Drop for Cancel {
+        fn drop(&mut self) {
+            if let Some(budget) = &self.0 {
+                budget.cancel();
+            }
+        }
+    }
+    let cancel = Cancel(budget.clone());
+    let profile = query.then(crate::profile::current).flatten();
+    let queued = profile.as_ref().map(|op| op.wall_span("blocking/queue"));
+    let run = move || {
+        drop(queued);
+        let _work = profile.as_ref().map(|op| op.wall_span("blocking/work"));
         with_store(store.clone(), || {
             read_budget::with(worker_budget.clone(), || {
                 if let Some(budget) = &worker_budget {
@@ -337,23 +365,38 @@ where
                 Ok(result)
             })
         })
-    });
-    // Capture the guard before returning the future: dropping an unpolled future
-    // must cancel the already submitted blocking task as well.
-    struct Cancel(Option<ReadBudget>);
-    impl Drop for Cancel {
-        fn drop(&mut self) {
-            if let Some(budget) = &self.0 {
-                budget.cancel();
-            }
-        }
+    };
+    enum Task<T> {
+        Inline(Result<T, WorkError>),
+        Spawned(tokio::task::JoinHandle<Result<T, WorkError>>),
     }
-    let cancel = Cancel(budget.clone());
+    // The marker is installed only by spawn_handler, never on an async runtime worker.
+    // Both paths retain the same read budget, reader lease and committed mutation result.
+    let inline = IN_HANDLER.with(Cell::get)
+        && matches!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        );
+    let task = if inline {
+        // Leave the handler's block_on context while executing synchronous callbacks. Some
+        // callbacks enter a runtime themselves (for example a forwarded conversation read).
+        // This is already a blocking worker, so no second pool slot is needed. A current-thread
+        // runtime keeps its existing spawned path because it cannot use block_in_place.
+        Task::Inline(tokio::task::block_in_place(run))
+    } else {
+        Task::Spawned(tokio::task::spawn_blocking(run))
+    };
     async move {
         let _cancel = cancel;
+        let completed = async move {
+            match task {
+                Task::Inline(result) => result,
+                Task::Spawned(task) => task.await.map_err(WorkError::Join)?,
+            }
+        };
         if let Some(budget) = budget {
-            let result = match tokio::time::timeout(budget.remaining(), task).await {
-                Ok(result) => result.map_err(WorkError::Join)?,
+            let result = match tokio::time::timeout(budget.remaining(), completed).await {
+                Ok(result) => result,
                 Err(_) => {
                     budget.cancel();
                     Err(WorkError::Deadline(budget.check().unwrap_err()))
@@ -364,7 +407,7 @@ where
             budget.check().map_err(WorkError::Deadline)?;
             result
         } else {
-            task.await.map_err(WorkError::Join)?
+            completed.await
         }
     }
 }
@@ -410,6 +453,76 @@ pub(super) fn error(error: &WorkError) -> Option<ApiError> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_handler_write_ack_does_not_wait_for_a_second_blocking_pool_slot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            super::super::Store::open(&directory.path().join("claims.sqlite3"), "blocking-test")
+                .unwrap(),
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (entered, occupied) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            });
+            occupied.await.unwrap();
+            // One pool slot is busy with unrelated work; the handler uses the other.
+            // Release it independently so the old nested-submission control fails cleanly,
+            // rather than deadlocking or leaving a background worker after an assertion.
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(350));
+                release.send(()).unwrap();
+            });
+            let writing = store.clone();
+            let started = std::time::Instant::now();
+            let result = spawn_handler(move || {
+                tokio::runtime::Handle::current().block_on(super::super::blocking_action(move || {
+                    // A synchronous callback may need to wait for an async service itself.
+                    tokio::runtime::Handle::current().block_on(async {});
+                    writing.connection.batched(|transaction| {
+                        transaction.execute(
+                            "INSERT INTO meta(key,value) VALUES('blocking-ack','committed')", [],
+                        ).map_err(|error| crate::model::St3Error::new("internal", error.to_string()))?;
+                        Ok(())
+                    }).map_err(|error| crate::model::St3Error::new("internal", error))?
+                }))
+            }).await;
+            let elapsed = started.elapsed();
+            releaser.join().unwrap();
+            blocker.await.unwrap();
+            result.unwrap().unwrap();
+            let value: String = store.readers.get().query_row(
+                "SELECT value FROM meta WHERE key='blocking-ack'", [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(value, "committed");
+            assert!(elapsed < Duration::from_millis(100), "write ACK took {elapsed:?}");
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn an_inline_read_keeps_its_deadline_without_cancelling_a_later_write() {
+        let result = spawn_handler(|| {
+            let handle = tokio::runtime::Handle::current();
+            let read = read_budget::with(Some(ReadBudget::new("/expired", Duration::ZERO)), || {
+                spawn_blocking(|| panic!("an expired read must not run"))
+            });
+            assert!(matches!(handle.block_on(read), Err(WorkError::Deadline(_))));
+            handle.block_on(spawn_blocking(|| 42))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, 42);
+    }
 
     fn request(method: Method, path: &str) -> Request<Body> {
         Request::builder()
