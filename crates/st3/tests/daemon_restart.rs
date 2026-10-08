@@ -682,7 +682,7 @@ time.sleep(300)
     .await;
 
     let client = st3::client::Client::unix(&daemon.socket);
-    let before: Value = client.get("/v1/client/agents").await.unwrap();
+    let before: Value = client.get("/v1/client/agents?fresh=true").await.unwrap();
     let before = before["items"]
         .as_array()
         .unwrap()

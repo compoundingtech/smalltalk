@@ -10320,7 +10320,8 @@ impl Store {
     /// Delete local observations older than `older_than_unix_ms`, and all but the newest
     /// `max_per_subject_kind` of each subject and kind. The newest observation of each
     /// subject and kind stays. Deletes run in short transactions of at most `chunk` rows, so
-    /// a crash leaves a consistent table that the next pass finishes.
+    /// a crash leaves a consistent table that the next pass finishes. Each chunk borrows the
+    /// background writer so queued foreground requests can run between chunks.
     pub fn trim_local_observations(
         &self,
         older_than_unix_ms: u128,
@@ -10336,7 +10337,7 @@ impl Store {
         // rank every row of the table with a window function inside the writer's hold, every
         // chunk of every pass, even when nothing was due.
         loop {
-            let connection = self.connection.write();
+            let connection = self.connection.write_background();
             let removed = connection.execute(
                 "DELETE FROM local_observations WHERE id IN (
                     SELECT id FROM local_observations AS old
@@ -10374,7 +10375,7 @@ impl Store {
         };
         for (subject, kind) in over_cap {
             loop {
-                let connection = self.connection.write();
+                let connection = self.connection.write_background();
                 // The newest id past the cap: rank `cap + 1` from the newest.
                 let boundary: Option<i64> = connection
                     .query_row(
@@ -10405,12 +10406,13 @@ impl Store {
     }
 
     /// Forget the responses counted before `older_than_unix_ms`, in short transactions of at
-    /// most `chunk` rows. Ingest refuses responses that old, so none can be counted twice.
+    /// most `chunk` rows using background writer loans. Ingest refuses responses that old, so
+    /// none can be counted twice.
     pub fn trim_usage_responses(&self, older_than_unix_ms: u128, chunk: usize) -> Result<usize> {
         let chunk = chunk.max(1).min(i64::MAX as usize) as i64;
         let mut deleted = 0;
         loop {
-            let connection = self.connection.write();
+            let connection = self.connection.write_background();
             let removed = connection.execute(
                 "DELETE FROM local_usage_responses WHERE rowid IN (
                     SELECT rowid FROM local_usage_responses WHERE observed_at_unix_ms < ?1 LIMIT ?2

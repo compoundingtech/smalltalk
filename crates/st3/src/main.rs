@@ -13228,15 +13228,10 @@ async fn run_agent_inspection(
         .await;
     }
     let generated = generated_client(endpoint, None)?;
-    let response = if let Some(status) = args.status.as_deref() {
-        generated
-            .agents_list_for_status(status, args.cursor.as_deref(), Some(args.limit), args.all)
-            .await?
-    } else {
-        generated
-            .agents_list(args.cursor.as_deref(), Some(args.limit), args.all)
-            .await?
-    };
+    // A command shows what was written before it ran.
+    let response = generated
+        .agents_list_fresh(args.status.as_deref(), args.cursor.as_deref(), Some(args.limit), args.all)
+        .await?;
     if json_output {
         print_value(&response, true)?;
         note_partial_page(&response.value);
