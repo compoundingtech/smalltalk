@@ -8,13 +8,9 @@ export const App = () => (
   <>
     <DevBar />
     <DataSourceProvider source={live.source} registry={live.registry}>
-      {telemetry === undefined ? (
-        <LiveAgentWorkspace />
-      ) : (
-        <React.Profiler id="workbench" onRender={telemetry.onCommit}>
-          <LiveAgentWorkspace />
-        </React.Profiler>
-      )}
+      <React.Profiler id="workbench" onRender={telemetry.onCommit}>
+        <LiveAgentWorkspace ux={telemetry.ux} onSelectConversation={live.selectConversation} />
+      </React.Profiler>
     </DataSourceProvider>
   </>
 )

@@ -8,13 +8,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Duplex } from 'node:stream'
 import { brotliCompressSync } from 'node:zlib'
-import { Tracer } from 'effect'
+import { Option, Tracer } from 'effect'
 import { createFractalWebServer } from './core.mts'
 import type { FractalWebServer } from './core.mts'
 import { cleanHeaders, clientRoute } from './gateway.mts'
+import { traceparent } from './tracing.mts'
 // Assembled so the source itself never carries a literal bearer credential pair.
 const gatewayAuthorization = 'Bearer' + ' fx-auth'
 const browserAuthorization = 'Bearer' + ' fx-input'
+const browserTraceId = '4bf92f3577b34da6a3ce929d0e0e4736'
+const browserSpanId = '00f067aa0ba902b7'
+const browserTraceparent = `00-${browserTraceId}-${browserSpanId}-01`
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { while (cleanups.length) await cleanups.pop()?.() })
@@ -38,18 +42,18 @@ const fixture = async (
   await writeFile(join(root, 'outside.txt'), 'not a public asset')
   await symlink(join(root, 'outside.txt'), join(dist, 'outside.txt'))
   const sockets = new Set<Duplex>()
-  const received: { path: string; auth?: string; cookie?: string; trace?: string; host?: string; body: string }[] = []
+  const received: { path: string; auth?: string; cookie?: string; origin?: string; baggage?: string | string[]; trace?: string | string[]; state?: string | string[]; host?: string; body: string }[] = []
   const gateway = createServer((req, res) => { void (async () => {
     const chunks: Buffer[] = []
     for await (const chunk of req) chunks.push(Buffer.from(chunk))
-    received.push({ path: req.url ?? '', auth: req.headers.authorization, cookie: req.headers.cookie, trace: req.headers.traceparent, host: req.headers.host, body: Buffer.concat(chunks).toString('utf8') })
+    received.push({ path: req.url ?? '', auth: req.headers.authorization, cookie: req.headers.cookie, origin: req.headers.origin, baggage: req.headers.baggage, trace: req.headers.traceparent, state: req.headers.tracestate, host: req.headers.host, body: Buffer.concat(chunks).toString('utf8') })
     res.writeHead(200, { 'content-length': Buffer.byteLength(responseBody), ...responseHeaders }); res.end(responseBody)
   })().catch(() => res.destroy()) })
   gateway.on('upgrade', (req, socket, head) => {
     sockets.add(socket)
     socket.on('close', () => sockets.delete(socket))
     socket.on('error', () => undefined)
-    received.push({ path: req.url ?? '', auth: req.headers.authorization, trace: req.headers.traceparent, body: 'upgrade' })
+    received.push({ path: req.url ?? '', auth: req.headers.authorization, cookie: req.headers.cookie, origin: req.headers.origin, baggage: req.headers.baggage, trace: req.headers.traceparent, state: req.headers.tracestate, body: 'upgrade' })
     socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n')
     if (head.length) socket.write(head)
     socket.on('data', (chunk) => socket.write(chunk))
@@ -69,6 +73,35 @@ const fixture = async (
   const address = app.server.address()
   if (address === null || typeof address === 'string') throw new TypeError('Fixture listener is missing')
   return { root, app, gateway, port: address.port, base: `http://127.0.0.1:${address.port}`, received, spans, sockets }
+}
+const openUpgrade = async (port: number, path: string, headers: Record<string, string> = {}): Promise<string> => {
+  const socket = connect(port, '127.0.0.1')
+  socket.on('error', () => undefined)
+  cleanups.push(async () => { socket.destroy() })
+  await once(socket, 'connect')
+  const reply = new Promise<string>((resolve, fail) => {
+    let value = ''
+    const cleanup = () => { socket.off('data', data); socket.off('error', error); socket.off('close', closed) }
+    const error = (cause: Error) => { cleanup(); fail(cause) }
+    const closed = () => { cleanup(); fail(new TypeError('Upgrade closed before its handshake')) }
+    const data = (chunk: Buffer) => {
+      value += chunk.toString()
+      if (value.includes('\r\n\r\n')) { cleanup(); resolve(value) }
+    }
+    socket.on('data', data); socket.once('error', error); socket.once('close', closed)
+  })
+  socket.write(`GET ${path} HTTP/1.1\r\nHost: fixture\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n${Object.entries(headers).map(([name, value]) => `${name}: ${value}\r\n`).join('')}\r\n`)
+  return reply
+}
+const requestSpans = (spans: readonly Tracer.Span[]) => {
+  const server = spans.filter((span) => span.name === 'fractal.server.request')
+  const gateway = spans.filter((span) => span.name === 'fractal.gateway.request')
+  expect(server).toHaveLength(1)
+  expect(gateway).toHaveLength(1)
+  if (server[0] === undefined || gateway[0] === undefined) throw new TypeError('Expected server and gateway spans')
+  expect(Option.getOrUndefined(gateway[0].parent)).toBe(server[0])
+  expect(gateway[0].traceId).toBe(server[0].traceId)
+  return { server: server[0], gateway: gateway[0] }
 }
 
 it('proxies only the paired client API, streams bodies and injects trusted credentials/traces', async () => {
@@ -118,6 +151,111 @@ it('never recompresses an encoded upstream JSON response', async () => {
   expect(await response.text()).toBe(body)
 })
 
+it.each(['01', '00'])('continues browser HTTP context into the server and gateway child (%s)', async (flags) => {
+  const setup = await fixture()
+  const parent = `00-${browserTraceId}-${browserSpanId}-${flags}`
+  const response = await fetch(`${setup.base}/v1/client/capabilities`, { headers: {
+    traceparent: parent, tracestate: 'fixture=browser', authorization: browserAuthorization,
+    cookie: 'browser=secret', origin: 'https://example.test', baggage: 'private=browser',
+  } })
+  expect(await response.json()).toEqual({ paired: true })
+  const spans = requestSpans(setup.spans)
+  expect(Option.getOrUndefined(spans.server.parent)).toEqual(expect.objectContaining({
+    _tag: 'ExternalSpan', traceId: browserTraceId, spanId: browserSpanId, sampled: flags === '01',
+  }))
+  expect(spans.gateway.traceId).toBe(browserTraceId)
+  expect(spans.gateway.sampled).toBe(flags === '01')
+  expect(setup.received).toEqual([expect.objectContaining({
+    trace: traceparent(spans.gateway), state: 'fixture=browser', auth: gatewayAuthorization,
+    cookie: undefined, origin: undefined, baggage: undefined,
+  })])
+  expect(setup.received[0]?.trace).not.toBe(parent)
+})
+it.each([
+  `00-${'0'.repeat(32)}-${browserSpanId}-01`,
+  `00-${browserTraceId}-${'0'.repeat(16)}-01`,
+  `${browserTraceparent},${browserTraceparent}`,
+  browserTraceparent.toUpperCase(),
+  browserTraceparent.replace(/^00/, 'ff'),
+])('discards malformed browser HTTP context and forwards a new trusted child', async (parent) => {
+  const setup = await fixture()
+  const response = await fetch(`${setup.base}/v1/client/capabilities`, { headers: { traceparent: parent, tracestate: 'fixture=untrusted' } })
+  expect(await response.json()).toEqual({ paired: true })
+  const spans = requestSpans(setup.spans)
+  expect(Option.isNone(spans.server.parent)).toBe(true)
+  expect(setup.received[0]?.trace).toBe(traceparent(spans.gateway))
+  expect(setup.received[0]?.state).toBeUndefined()
+  expect(spans.gateway.traceId).not.toBe(browserTraceId)
+})
+it('continues valid HTTP context but never forwards invalid vendor state', async () => {
+  const setup = await fixture()
+  const response = await fetch(`${setup.base}/v1/client/capabilities`, { headers: {
+    traceparent: browserTraceparent, tracestate: 'fixture=first,fixture=duplicate',
+  } })
+  expect(await response.json()).toEqual({ paired: true })
+  const spans = requestSpans(setup.spans)
+  expect(spans.gateway.traceId).toBe(browserTraceId)
+  expect(setup.received[0]?.trace).toBe(traceparent(spans.gateway))
+  expect(setup.received[0]?.state).toBeUndefined()
+})
+it('continues browser WebSocket query context and strips it before the upstream handshake', async () => {
+  const setup = await fixture()
+  const path = `/v1/client/collections/stream?kind=agent&cursor=a%2fb+%20&traceparent=${browserTraceparent}&tracestate=fixture%3Dbrowser`
+  expect(await openUpgrade(setup.port, path, {
+    Authorization: browserAuthorization, Cookie: 'browser=secret', Origin: 'https://example.test', Baggage: 'private=browser',
+  })).toContain('101 Switching Protocols')
+  const spans = requestSpans(setup.spans)
+  expect(Option.getOrUndefined(spans.server.parent)).toEqual(expect.objectContaining({
+    _tag: 'ExternalSpan', traceId: browserTraceId, spanId: browserSpanId,
+  }))
+  expect(spans.gateway.traceId).toBe(browserTraceId)
+  expect(setup.received).toEqual([expect.objectContaining({
+    path: '/v1/client/collections/stream?kind=agent&cursor=a%2fb+%20', trace: traceparent(spans.gateway),
+    state: 'fixture=browser', auth: gatewayAuthorization, cookie: undefined, origin: undefined, baggage: undefined,
+  })])
+  expect(setup.received[0]?.trace).not.toBe(browserTraceparent)
+  for (const span of [spans.server, spans.gateway]) {
+    expect(span.attributes.get('http.route')).toBe('/v1/client/*')
+    expect(span.attributes.get('span.label')).toBe('/v1/client/*')
+    expect([...span.attributes.values()].some((value) => typeof value === 'string' && value.includes('traceparent='))).toBe(false)
+  }
+})
+it('continues WebSocket header context rather than a conflicting query context', async () => {
+  const setup = await fixture()
+  expect(await openUpgrade(setup.port, `/v1/client/collections/stream?traceparent=invalid&tracestate=untrusted`, {
+    Traceparent: browserTraceparent, Tracestate: 'fixture=header',
+  })).toContain('101 Switching Protocols')
+  const spans = requestSpans(setup.spans)
+  expect(Option.getOrUndefined(spans.server.parent)?.spanId).toBe(browserSpanId)
+  expect(spans.gateway.traceId).toBe(browserTraceId)
+  expect(setup.received[0]).toEqual(expect.objectContaining({
+    path: '/v1/client/collections/stream', trace: traceparent(spans.gateway), state: 'fixture=header',
+  }))
+})
+it.each([
+  'traceparent=invalid',
+  `traceparent=00-${'0'.repeat(32)}-${browserSpanId}-01`,
+  `traceparent=${browserTraceparent}&traceparent=${browserTraceparent}`,
+  `traceparent=${browserTraceparent}%0D%0AX-Private%3Ainjected`,
+])('discards invalid WebSocket query context without forwarding it', async (query) => {
+  const setup = await fixture()
+  expect(await openUpgrade(setup.port, `/v1/client/collections/stream?kind=agent&${query}&tracestate=fixture%3Duntrusted`)).toContain('101 Switching Protocols')
+  const spans = requestSpans(setup.spans)
+  expect(Option.isNone(spans.server.parent)).toBe(true)
+  expect(setup.received[0]).toEqual(expect.objectContaining({
+    path: '/v1/client/collections/stream?kind=agent', trace: traceparent(spans.gateway), state: undefined,
+  }))
+  expect(spans.gateway.traceId).not.toBe(browserTraceId)
+})
+it('rejects WebSocket query header injection while continuing its valid browser trace', async () => {
+  const setup = await fixture()
+  expect(await openUpgrade(setup.port, `/v1/client/collections/stream?traceparent=${browserTraceparent}&tracestate=fixture%3Dx%0D%0AX-Private%3Ainjected`)).toContain('101 Switching Protocols')
+  const spans = requestSpans(setup.spans)
+  expect(spans.gateway.traceId).toBe(browserTraceId)
+  expect(setup.received[0]).toEqual(expect.objectContaining({
+    path: '/v1/client/collections/stream', trace: traceparent(spans.gateway), state: undefined,
+  }))
+})
 it('fails closed for auth-hook refusal and failures, without tracing or proxying', async () => {
   const setup = await fixture(async (req) => { if (req.url === '/throws') throw new TypeError('auth failure'); return false })
   expect((await fetch(`${setup.base}/v1/client/capabilities`)).status).toBe(403)

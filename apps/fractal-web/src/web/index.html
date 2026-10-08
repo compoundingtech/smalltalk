@@ -5,6 +5,75 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>webfractal</title>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgZmlsbD0iIzE4MTgxYiIvPjxwYXRoIGQ9Ik05IDhoMTV2NEgxM3Y0aDl2NGgtOXY2SDl6IiBmaWxsPSIjZmFmYWZhIi8+PC9zdmc+" />
+    <script data-wf-early-connect>
+      // Early roster connect: open the collections socket and subscribe to the fleet roster while
+      // the main bundle loads. The SDK (`@st3/sdk/effect` early.ts) takes this handle, adopts the
+      // socket, and answers its own identical roster subscribe from it. Memory only; bounded
+      // buffer; closes itself on overflow, socket end, pagehide, or 15 s without being taken.
+      ;(() => {
+        const key = '__wfEarlyCollections'
+        if (typeof WebSocket !== 'function' || typeof crypto === 'undefined' || globalThis[key] !== undefined) return
+        const startedAt = performance.now()
+        const hex = (bytes) => Array.from(crypto.getRandomValues(new Uint8Array(bytes)), (byte) => byte.toString(16).padStart(2, '0')).join('')
+        const traceId = hex(16)
+        const spanId = hex(8)
+        if (/^0+$/.test(traceId) || /^0+$/.test(spanId)) return
+        const traceparent = '00-' + traceId + '-' + spanId + '-01'
+        const id = 'wf-early-' + hex(8)
+        const command = { kind: 'subscribe', id, collection: 'agents', limit: 100 }
+        const url = new URL('/v1/client/collections/stream', location.href)
+        url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+        url.searchParams.set('traceparent', traceparent)
+        let socket
+        try {
+          socket = new WebSocket(url, ['st3.client.collections.v0'])
+        } catch {
+          return
+        }
+        const maxFrames = 64
+        const maxChars = 4 * 1024 * 1024
+        const handle = { id, command, traceparent, startedAt, subscribeSentAt: undefined, frames: [], take: undefined }
+        let chars = 0
+        let ended = false
+        let timer
+        const detach = () => {
+          ended = true
+          clearTimeout(timer)
+          socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null
+          removeEventListener('pagehide', end)
+          if (globalThis[key] === handle) delete globalThis[key]
+        }
+        const end = () => {
+          if (ended) return
+          detach()
+          handle.frames = []
+          try {
+            socket.close(1000)
+          } catch {}
+        }
+        socket.onopen = () => {
+          socket.send(JSON.stringify({ ...command, trace: { traceparent } }))
+          handle.subscribeSentAt = performance.now()
+        }
+        socket.onmessage = (event) => {
+          const frame = String(event.data)
+          chars += frame.length
+          if (handle.frames.length >= maxFrames || chars > maxChars) end()
+          else handle.frames.push(frame)
+        }
+        socket.onclose = end
+        socket.onerror = end
+        handle.take = () => {
+          if (ended) return undefined
+          detach()
+          return { socket, id, command, traceparent, startedAt, subscribeSentAt: handle.subscribeSentAt, frames: handle.frames }
+        }
+        timer = setTimeout(end, 15000)
+        addEventListener('pagehide', end)
+        globalThis[key] = handle
+      })()
+    </script>
+    <!-- After the early script: a pending stylesheet would block that classic script. -->
     <link rel="stylesheet" href="/app.css" />
   </head>
   <body>

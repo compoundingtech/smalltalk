@@ -6,7 +6,7 @@ import { constants, createBrotliCompress, createGzip } from 'node:zlib'
 import { Context, Effect, Layer } from 'effect'
 import type { Tracer } from 'effect'
 import { BoundaryError, reject } from './boundary.mts'
-import { spanOptions, traceparent } from './tracing.mts'
+import { spanOptions, traceHeaders } from './tracing.mts'
 import { encodingQualities } from './static.mts'
 
 const responseCodings = ['br', 'gzip', 'identity'] as const
@@ -30,6 +30,17 @@ export const clientRoute = (url: string): boolean => {
     const decoded = decodeURIComponent(path)
     return !decoded.includes('\\') && !decoded.includes('\0') && !decoded.split('/').includes('..')
   } catch { return false }
+}
+/** Remove propagation-only query fields without rewriting application query bytes. */
+export const withoutTraceQuery = (url: string | undefined): string | undefined => {
+  if (url === undefined) return undefined
+  const queryStart = url.indexOf('?')
+  if (queryStart === -1) return url
+  const fields = url.slice(queryStart + 1).split('&').filter((field) => {
+    const key = new URLSearchParams(field).keys().next().value
+    return key !== 'traceparent' && key !== 'tracestate'
+  })
+  return url.slice(0, queryStart) + (fields.length === 0 ? '' : `?${fields.join('&')}`)
 }
 const unavailable = (cause?: unknown) => new BoundaryError({ status: 502, code: 'client-gateway-unavailable', message: 'Client gateway unavailable\n', cause })
 const makeGateway = ({ socketPath, host, authorization, timeoutMs }: { socketPath: string; host: string; authorization: string; timeoutMs: number }) => Effect.gen(function* () {
@@ -61,7 +72,7 @@ const makeGateway = ({ socketPath, host, authorization, timeoutMs }: { socketPat
         settled = true; cleanup(); resume(Effect.succeed(reply?.statusCode ?? 502))
       }
       const upstream = request({ socketPath, path: req.url, method: req.method, headers: {
-        ...cleanHeaders(req.headers), host, authorization, traceparent: traceparent(span),
+        ...cleanHeaders(req.headers), host, authorization, ...traceHeaders(span),
       }, agent: false }, (incoming) => {
         reply = incoming
         const headers = cleanHeaders(incoming.headers)
@@ -103,7 +114,7 @@ const makeGateway = ({ socketPath, host, authorization, timeoutMs }: { socketPat
       return Effect.sync(() => { settled = true; upstream.destroy(); reply?.destroy(); cleanup() })
     }).pipe(Effect.timeoutOrElse({ duration: timeoutMs, orElse: () => Effect.fail(unavailable()) }))
     yield* Effect.annotateCurrentSpan('http.response.status_code', status)
-  }).pipe(Effect.withSpan('fractal.gateway.request', { ...spanOptions('/v1/client/*', req.method ?? '_OTHER', 'client'), parent }),
+  }).pipe(Effect.withSpan('fractal.gateway.request', { ...spanOptions('/v1/client/*', req.method ?? '_OTHER', 'client'), parent, annotations: parent.annotations }),
     Effect.catchTag('BoundaryError', () => Effect.sync(() => {
       if (res.destroyed) return
       if (res.headersSent) res.destroy()
@@ -121,8 +132,8 @@ const makeGateway = ({ socketPath, host, authorization, timeoutMs }: { socketPat
       const error = (cause: Error) => fail(cause)
       const clientClosed = () => fail()
       const cleanup = () => { socket.off('error', error); socket.off('close', clientClosed) }
-      const upstream = request({ socketPath, path: req.url, method: req.method, headers: {
-        ...cleanHeaders(req.headers, true), host, authorization, traceparent: traceparent(span),
+      const upstream = request({ socketPath, path: withoutTraceQuery(req.url), method: req.method, headers: {
+        ...cleanHeaders(req.headers, true), host, authorization, ...traceHeaders(span),
       }, agent: false })
       socket.once('error', error); socket.once('close', clientClosed)
       upstream.on('error', error)
@@ -154,7 +165,7 @@ const makeGateway = ({ socketPath, host, authorization, timeoutMs }: { socketPat
     }).pipe(Effect.timeoutOrElse({ duration: timeoutMs, orElse: () => Effect.fail(unavailable()) }))
     yield* Effect.annotateCurrentSpan('http.response.status_code', status)
     return status
-  }).pipe(Effect.withSpan('fractal.gateway.request', { ...spanOptions('/v1/client/*', 'GET', 'client'), parent }),
+  }).pipe(Effect.withSpan('fractal.gateway.request', { ...spanOptions('/v1/client/*', 'GET', 'client'), parent, annotations: parent.annotations }),
     Effect.catchTag('BoundaryError', () => Effect.sync(() => {
       if (!socket.destroyed) socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
       return 502
