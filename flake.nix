@@ -31,6 +31,24 @@
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+
+        # Reuse the GitHub-archive flake source instead of importCargoLock's git fetcher.
+        # Reject new git sources until they also have an archive-backed input.
+        cargoDeps =
+          (pkgs.rustPlatform.importCargoLock.override {
+            fetchgit =
+              { url, rev, ... }:
+              assert pkgs.lib.assertMsg (url == "https://github.com/compoundingtech/pty")
+                "Cargo git dependency ${url} needs an archive-backed flake input";
+              assert pkgs.lib.assertMsg (rev == pty.rev)
+                "pty flake input (${pty.rev}) and Cargo.lock (${rev}) must pin the same revision";
+              pty.outPath;
+          }) {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "pty-core-0.13.0-rust" = pty.narHash;
+            };
+          };
         hmModuleEval = nixpkgs.lib.evalModules {
           specialArgs = {
             inherit pkgs;
@@ -220,12 +238,7 @@
           inherit version;
           src = self;
 
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-            outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-iUey+Jj6CT+Oqa0bWDGFXubqYBbpzlLUvpZ9CLFisBo=";
-            };
-          };
+          inherit cargoDeps;
 
           # The workspace default members include the st3 crates. This package ships only st2;
           # st3, `st`, stui, and st3-migrate come from the st3 package, so each has one build.
@@ -365,12 +378,7 @@
           '';
           # Stamp st3, its shared driver library, and stui from this declared flake source.
           CLI_BUILD_STAMP = buildStamp;
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-            outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-iUey+Jj6CT+Oqa0bWDGFXubqYBbpzlLUvpZ9CLFisBo=";
-            };
-          };
+          inherit cargoDeps;
           cargoBuildFlags = [
             "-p"
             "st3"
@@ -604,12 +612,7 @@
           pname = "st2-provider-components";
           inherit version;
           src = self;
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-            outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-iUey+Jj6CT+Oqa0bWDGFXubqYBbpzlLUvpZ9CLFisBo=";
-            };
-          };
+          inherit cargoDeps;
           buildPhase = ''
             runHook preBuild
             cargo build --offline --release --target wasm32-unknown-unknown \

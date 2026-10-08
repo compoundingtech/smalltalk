@@ -457,6 +457,9 @@ CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, st
 CREATE INDEX IF NOT EXISTS claims_subject_kind_accepted_index
 ON claims(subject, kind, length(accepted_at_unix_ms), accepted_at_unix_ms);
 CREATE INDEX IF NOT EXISTS claims_batch_index ON claims(batch_id, store_index);
+-- Heal compares claim identities, not bodies. Keep both join keys in a compact index so a
+-- range digest does not visit every body-bearing claim page.
+CREATE INDEX IF NOT EXISTS claims_batch_claim_id ON claims(batch_id, id);
 CREATE INDEX IF NOT EXISTS claims_accepted_order_index
 ON claims(length(accepted_at_unix_ms), accepted_at_unix_ms, store_index);
 CREATE INDEX IF NOT EXISTS claims_operation_index
@@ -567,6 +570,10 @@ CREATE INDEX IF NOT EXISTS replica_records_state
 ON replica_records(state, writer, sequence);
 CREATE INDEX IF NOT EXISTS replica_records_claim
 ON replica_records(claim_id, position);
+-- Any repaired copy excludes the original claim. This partial identity index answers that
+-- existence check without fetching the retained raw record of every admitted claim.
+CREATE INDEX IF NOT EXISTS replica_records_repaired_claim
+ON replica_records(claim_id) WHERE state='repaired';
 
 CREATE TABLE IF NOT EXISTS projection_health (
     aggregate TEXT PRIMARY KEY,
@@ -4803,6 +4810,13 @@ impl Store {
 
     pub fn index(&self) -> Result<u64> {
         Ok(self.committed_index.load(Ordering::Acquire))
+    }
+
+    /// A cheap committed point for a mutation caller deciding whether to wake its readers.
+    /// This is an invalidation hint, never a graph-equality or admission certificate. Replay
+    /// may conservatively change the generation even when its final graph bytes agree.
+    pub fn replication_change_point(&self) -> Result<(u64, i64)> {
+        self.read_snapshot(|index| Ok((index, graph_generation(&self.readers.get())?)))
     }
 
     /// Run `read` with every read this thread makes through the store seeing one SQLite

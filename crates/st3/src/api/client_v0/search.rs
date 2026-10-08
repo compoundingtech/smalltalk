@@ -184,7 +184,9 @@ fn refresh(
             continue;
         };
         let owner = resource["owner_id"].as_str().unwrap_or_default();
-        let remote = match conversation_owner_host(state, session, id) {
+        let remote = match conversation_owner_host(
+            state, session, id, owner.starts_with("agent/").then_some(owner),
+        ) {
             Ok(remote) => remote,
             Err(error) => {
                 incomplete.push(format!("{id}: {}", error.message));

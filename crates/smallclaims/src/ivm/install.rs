@@ -22,6 +22,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod capture;
 pub mod prepared;
 
 const LAYOUT: &str = "smallclaims.ivm.install.v1";

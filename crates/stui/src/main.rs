@@ -666,6 +666,7 @@ async fn send_terminal_key(
 fn main() -> Result<()> {
     // What `st clients` lists for this stui: its name and build, as reported.
     st3_client::set_client_name(version::client_name());
+    ui::lastrun_log_panics(&version::short(version::now()));
     // A designated test client (scripts/stui-test-client) can log the timing of its own requests
     // and collection frames: routes, statuses, sizes and durations only, never contents.
     if let Some(path) = std::env::var_os("STUI_TIMING_LOG") {
@@ -826,6 +827,15 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn the_timing_log_starts_with_the_wall_clock_instant_its_times_count_from() {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_791_443_946_902);
+        let line: serde_json::Value = serde_json::from_str(&timing_start_line(at)).unwrap();
+        assert_eq!(line["type"], "start");
+        assert_eq!(line["at_ms"], 0);
+        assert_eq!(line["epoch_ms"], 1_791_443_946_902_u64);
+    }
 
     #[test]
     fn words_answer_a_structured_request_the_way_it_takes_them() {
@@ -1624,12 +1634,24 @@ mod custom_form_tests {
 }
 
 /// Append one JSON line per request and collections frame this process makes to `path`.
+/// The first line of the timing log: `at_ms` 0 is this wall-clock instant.
+fn timing_start_line(now: std::time::SystemTime) -> String {
+    let epoch_ms = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
+    serde_json::json!({ "at_ms": 0, "type": "start", "epoch_ms": epoch_ms }).to_string()
+}
+
 fn install_timing_log(path: PathBuf) {
     use std::io::Write as _;
     let started = std::time::Instant::now();
     let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
         return;
     };
+    let mut file = file;
+    // The origin of every `at_ms` below, as wall-clock time, so this log lines up with another
+    // process's clock (a runner's key writes, a recipient's record).
+    let _ = writeln!(file, "{}", timing_start_line(std::time::SystemTime::now()));
     let file = std::sync::Mutex::new(file);
     st3_client::set_observer(move |observation| {
         let at_ms = started.elapsed().as_millis() as u64;

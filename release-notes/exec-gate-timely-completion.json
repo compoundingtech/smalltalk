@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Recognize exec gate checks recorded before their deadline when reconciliation is delayed",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, migration or rebuild. Persisted timeout results are not rewritten."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No graph, database or driver receipt schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Admission, canonical ordering and checkpoint rules are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "A delayed reconciliation pass uses an eligible local self-actor exit receipt from the exact requested check when it was accepted strictly before the original deadline and the matching runtime has exited. Exit 0 passes, exit 1 schedules a recheck, and other statuses remain broken. Same-millisecond request and completion are ordered by the original writer sequence and canonical replica position. Ambiguous multiple launches and foreign-origin receipt/request evidence retain timeout behavior. Running, late, unproved or contradictory completion retains timeout behavior. A check that earlier builds would classify as timed out may now report its real exit result. Current local start observations and legacy admitted start claims bind the available incarnation; multiple launches retain timeout behavior."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None beyond the normal daemon binary replacement."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "None."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Timely completed checks are no longer faulted solely because their next reconciliation happens after the deadline. Existing recorded broken results are not rewritten. Actual execution limits, gate report refusals, partial-listing checks and existing result authority fences remain in force."
+  }
+}
