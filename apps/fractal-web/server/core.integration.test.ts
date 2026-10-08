@@ -1,4 +1,5 @@
 import { afterEach, expect, it } from 'vitest'
+import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import type { IncomingMessage, OutgoingHttpHeaders, Server } from 'node:http'
 import { connect } from 'node:net'
@@ -103,6 +104,36 @@ const requestSpans = (spans: readonly Tracer.Span[]) => {
   expect(gateway[0].traceId).toBe(server[0].traceId)
   return { server: server[0], gateway: gateway[0] }
 }
+
+it('restricts HTML, assets, HEAD and cached responses with the same image policy', async () => {
+  const setup = await fixture()
+  const response = await fetch(setup.base)
+  const html = await response.text()
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1]
+  expect(script).toBeDefined()
+  const hash = createHash('sha256').update(script!).digest('base64')
+  const expected = [
+    "default-src 'self'",
+    `script-src 'self' 'sha256-${hash}'`,
+    "style-src 'self' 'sha256-38RhXrc7EdReTKsOm23ZPOCUgniTUUcjky8QOOrQx6o=' 'sha256-gYiS/BvZvRcK27JIXTuwhZ3hs2+VJ1X+2gUlE+farlg='",
+    "style-src-attr 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self'",
+    `connect-src 'self' ws://127.0.0.1:${setup.port} wss://127.0.0.1:${setup.port}`,
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+  ].join('; ')
+  expect(response.headers.get('content-security-policy')).toBe(expected)
+  for (const path of ['/main.js', '/build-identity.json', '/route-without-extension']) {
+    expect((await fetch(setup.base + path)).headers.get('content-security-policy')).toBe(expected)
+    expect((await fetch(setup.base + path, { method: 'HEAD' })).headers.get('content-security-policy')).toBe(expected)
+  }
+  const cached = await fetch(setup.base, { headers: { 'if-none-match': response.headers.get('etag')! } })
+  expect(cached.status).toBe(304)
+  expect(cached.headers.get('content-security-policy')).toBe(expected)
+})
 
 it('proxies only the paired client API, streams bodies and injects trusted credentials/traces', async () => {
   const setup = await fixture()

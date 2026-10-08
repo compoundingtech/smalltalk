@@ -4,6 +4,7 @@ import { resolve } from 'node:path'
 import type { Duplex } from 'node:stream'
 import { Cause, Context, Effect, Exit, Fiber, Layer, Schema, Scope, Tracer } from 'effect'
 import { completedResponse, reject } from './boundary.mts'
+import { createContentSecurityPolicy } from './csp.mts'
 import { clientRoute, Gateway } from './gateway.mts'
 import { RuntimeIdentity, StaticAssets } from './static.mts'
 import { requestSpanOptions } from './tracing.mts'
@@ -14,6 +15,8 @@ export interface MiddlewareOptions {
   readonly admit: (request: IncomingMessage) => boolean | Promise<boolean>
   readonly gateway: { readonly socketPath: string; readonly host: string; readonly authorization: string; readonly timeoutMs: number }
   readonly tracer: Tracer.Tracer
+  /** Explicit cross-origin HTTP collectors; the gateway itself is always same-origin. */
+  readonly connectOrigins?: readonly string[]
 }
 export interface ServerOptions extends Omit<MiddlewareOptions, 'server'> {
   readonly dist: string
@@ -39,8 +42,9 @@ const makeBoundary = (options: MiddlewareOptions, assets?: { root: string; ident
   try {
     const gateway = Context.get(Effect.runSync(Layer.buildWithScope(Gateway.layer(options.gateway), scope)), Gateway)
     const staticAssets = assets === undefined ? undefined : Context.get(
-      Effect.runSync(Layer.buildWithScope(StaticAssets.layer(assets.root, assets.identity), scope)), StaticAssets,
+      Effect.runSync(Layer.buildWithScope(StaticAssets.layer(assets.root, assets.identity, options.connectOrigins), scope)), StaticAssets,
     )
+    const policy = createContentSecurityPolicy('', options.connectOrigins)
     let closed = false
     let closing: Promise<void> | undefined
     const run = <TValue,>(operation: Effect.Effect<TValue>, downstream: ServerResponse | Duplex): Promise<void> => {
@@ -70,6 +74,7 @@ const makeBoundary = (options: MiddlewareOptions, assets?: { root: string; ident
       catch { return false }
     }
     const handle = async (req: IncomingMessage, res: ServerResponse, next: Effect.Effect<void>): Promise<void> => {
+      res.setHeader('content-security-policy', policy(req.headers.host))
       // Admission refusals and auth-hook failures do not enter tracing.
       if (!await admitted(req)) { reject(res, 403, 'Forbidden\n'); return }
       const dispatch = Effect.gen(function* () {

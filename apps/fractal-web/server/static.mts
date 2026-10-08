@@ -6,6 +6,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { extname, join, resolve, sep } from 'node:path'
 import { Context, Effect, Layer, Schema } from 'effect'
 import { BoundaryError, jsonText, reject, ServerConfigError } from './boundary.mts'
+import { createContentSecurityPolicy } from './csp.mts'
 import { spanOptions } from './tracing.mts'
 
 const types: Readonly<Record<string, string>> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.ttf': 'font/ttf', '.txt': 'text/plain; charset=utf-8' }
@@ -72,16 +73,19 @@ const staticRepresentation = Effect.fn('fractal.static.representation')(function
   }
   return null
 })
-const makeStatic = (root: string, identity: RuntimeIdentity) => Effect.gen(function* () {
+const makeStatic = (root: string, identity: RuntimeIdentity, connectOrigins: readonly string[]) => Effect.gen(function* () {
   const realRoot = yield* Effect.try({ try: () => realpathSync(root), catch: notFound })
   const index = yield* Effect.try({ try: () => readFileSync(join(root, 'index.html'), 'utf8'),
     catch: (cause) => new ServerConfigError({ message: 'Unable to read compiled application', cause }) })
   const script = `<script>globalThis.__BUILD_DEPLOYMENT_ID__=${jsonText(identity.deploymentId).replace(/[<>&\u2028\u2029]/g, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`)};</script>`
-  const html = Buffer.from(index.includes('<head>') ? index.replace('<head>', `<head>${script}`) : script + index)
+  const htmlText = index.includes('<head>') ? index.replace('<head>', `<head>${script}`) : script + index
+  const html = Buffer.from(htmlText)
+  const policy = createContentSecurityPolicy(htmlText, connectOrigins)
   const metadata = Buffer.from(jsonText(identity.buildIdentity))
   const htmlEtag = `"${createHash('sha256').update(html).digest('base64url')}"`
   const assetNamespace = createHash('sha256').update(root).digest('base64url')
   return { handle: (req: IncomingMessage, res: ServerResponse) => Effect.gen(function* () {
+    res.setHeader('content-security-policy', policy(req.headers.host))
     const pathname = yield* Effect.try({ try: () => decodeURIComponent((req.url ?? '/').split('?')[0]!), catch: notFound })
     if (req.method !== 'GET' && req.method !== 'HEAD') { reject(res, 405, 'Method not allowed\n'); return }
     if (pathname.includes('\0') || pathname.includes('\\') || pathname.split('/').includes('..')) return yield* notFound()
@@ -136,7 +140,7 @@ export interface StaticAssetService {
   handle(req: IncomingMessage, res: ServerResponse): Effect.Effect<void>
 }
 export class StaticAssets extends Context.Service<StaticAssets, StaticAssetService>()('fractal-web/StaticAssets') {
-  static layer(root: string, identity: RuntimeIdentity) { return Layer.effect(this, makeStatic(root, identity)) }
+  static layer(root: string, identity: RuntimeIdentity, connectOrigins: readonly string[] = []) { return Layer.effect(this, makeStatic(root, identity, connectOrigins)) }
 }
 
 /** Decode the published CliBuildIdentity without formatting or replacing its version fields. */

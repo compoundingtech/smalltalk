@@ -94,6 +94,75 @@ nix develop .#web -c python3 scripts/ci-fractal-web-licenses --check
 full guard immediately after its frozen install. The generator/full guard restore the
 inventory's read-only permissions (Git does not preserve them).
 
+## fractal-web Content Security Policy
+
+The app server and Vite's development/preview servers set an enforcing
+`Content-Security-Policy` on HTML and assets, including HEAD and cached responses.
+This is defence in depth: agent Markdown must not automatically fetch remote images,
+and an accidental renderer regression must not reveal the reader's network address
+or contact an agent-selected tracking endpoint.
+
+The policy is:
+
+```text
+default-src 'self'; script-src 'self' <inline-script SHA-256 hashes>; style-src 'self' 'sha256-38RhXrc7EdReTKsOm23ZPOCUgniTUUcjky8QOOrQx6o=' 'sha256-gYiS/BvZvRcK27JIXTuwhZ3hs2+VJ1X+2gUlE+farlg='; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' ws://<page-authority> wss://<page-authority> <configured collector origins>; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'
+```
+
+Hashes authorize only scripts in trusted application HTML: the early collections
+connect, the server's deployment identity, and Vite's development React-refresh
+preamble. There is no script `unsafe-inline` or `unsafe-eval` exception. Compiled
+StyleX CSS and fonts are same-origin. Only `style-src-attr` needs `unsafe-inline`:
+StyleX variable values, resizable widths and React Aria positioning are runtime
+style attributes whose changing values cannot use fixed hashes. The two style
+hashes authorize React Aria 3.52.1's fixed pressable touch-action and iOS modal
+overscroll stylesheets (`usePress` and `usePreventScroll`); recheck them when
+upgrading React Aria. Production and preview admit no other inline stylesheet
+elements. Vite development additionally allows `style-src-elem 'self' 'unsafe-inline'`
+for its injected stylesheets and
+`worker-src 'self' blob:` for Vite's HMR reconnect SharedWorker. These development
+exceptions do not relax `img-src` or production's script/worker policy.
+
+Both socket schemes are restricted to the request's exact authority (host and port),
+supporting HTTP development and HTTPS behind TLS termination without trusting
+forwarded headers. The browser gateway is `window.location.origin`; the early socket
+uses the same origin. `WF_ST_GATEWAY` selects a server-side Unix socket, not a
+cross-origin browser destination. Same-origin `/otlp` also needs no exception.
+For an explicit cross-origin OTLP collector, Vite derives its exact HTTP(S) origin
+from `VITE_OTLP_TRACES_URL`. Hosts embedding `createFractalWebServer` or
+`createFractalWebMiddleware` must supply the same origin in `connectOrigins`.
+Only exact origins are accepted, without credentials, paths or wildcards.
+Cross-origin Vite HMR configuration is rejected; HMR must use the page authority.
+
+The explicit **Open image · host** action opens the original URL in a new tab using
+`window.open(url, '_blank', 'noopener,noreferrer')`, while retaining a placeholder
+that shows the target host before the action. Do not implement a same-origin image
+proxy: it would make the app server a fetcher for agent-selected URLs, introducing
+SSRF/internal-network exposure and bandwidth abuse, while weakening this boundary.
+`ConversationPane` passes the kit's `onLoadImage` callback through `Transcript` and
+leaves `resolveImage` at its default `Defer`. The kit renders no remote image before
+or after this callback; it never fetches the URL on the app's behalf.
+`onOpenResource` remains reserved for workspace references.
+
+Run the regression proofs with:
+
+```sh
+CI=1 pnpm --dir apps/fractal-web exec vitest run server/core.integration.test.ts server/csp.unit.test.ts
+CI=1 node apps/fractal-web/scripts/csp-proof.mjs
+CI=1 pnpm exec tsc --noEmit -p apps/fractal-web
+```
+
+The browser proof builds and serves the real app, exercises production, preview
+and development, and proves the native transcript's image action shows the host,
+hands off to the new-tab opener, and renders no remote image or image request.
+The cold development phase prebundles the transcript's Markdown and React dependencies
+together, so late dependency discovery cannot invalidate its in-flight imports.
+It then records CSP violations before and after injecting a remote image.
+Its test-only proxy strips the header for a negative control: the image
+request then reaches a browser route, which aborts it without contacting the
+remote site. With CSP enforced the route is never reached and `img-src` reports
+the violation. Browser sessions, listeners and temporary build files are closed
+and removed on exit. There is no production CSP-disable switch.
+
 ## Continuous integration
 
 Workspace CI runs on pull requests and merge groups. The five required checks are `linux-gate`,

@@ -4,9 +4,11 @@ import react from '@vitejs/plugin-react'
 import { createStylexVitePlugins } from './scripts/stylex.mjs'
 import { webfractalGateway } from './scripts/vite-gateway.mjs'
 import { extensionBuild } from './scripts/extensions-build.mjs'
+import { fractalContentSecurityPolicy } from './scripts/vite-csp.mjs'
 export default defineConfig({
   root: 'src/web',
   plugins: [
+    fractalContentSecurityPolicy(),
     {
       name: 'fractal-build-identity',
       resolveId(id) {
