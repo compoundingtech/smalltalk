@@ -380,6 +380,30 @@ done`,
       extraLogs: '${{ runner.temp }}/perf/',
       before: [perfStoresCache('cost')],
     }),
+    // Advisory SQL report: reads the cost check's report for N+1 and overfetch and says which
+    // routes look like them. Not required, never fails, only writes the job summary. It runs even
+    // when perf-cost went red, since the artifact is still there.
+    'sql-advisory': {
+      name: 'sql-advisory',
+      needs: ['perf-cost'],
+      if: "always() && github.event_name != 'merge_group'",
+      'runs-on': 'ubuntu-latest',
+      'timeout-minutes': 10,
+      steps: [
+        { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
+        { name: 'Fetch the cost report', uses: 'actions/download-artifact@v4', 'continue-on-error': true, with: { name: 'perf-cost-logs', path: 'perf-cost-logs' } },
+        {
+          name: 'Advisory SQL report',
+          'continue-on-error': true,
+          run: `report=$(find perf-cost-logs -name cost.json 2>/dev/null | head -1)
+if [ -n "$report" ]; then
+  python3 scripts/sql_advisory.py "$report"
+else
+  printf '## Advisory SQL report\\n\\nNo cost report was produced for this run.\\n' >> "$GITHUB_STEP_SUMMARY"
+fi`,
+        },
+      ],
+    },
     // st2's transport-isolation cascade tests need a real systemd user manager, which the
     // runner image lacks. A NixOS VM runs this job's prebuilt test binary; it compiles nothing.
     'isolation-vm': {
@@ -433,4 +457,4 @@ printf '| sekrets VM test | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SU
       ],
     },
   },
-}, {"pick-runner": "Runner selection uses live API state and builds nothing.", "upgrade-impact": "Runs Python/Git classification checks without downloads or compilation.", "namespace-capacity": "Capacity is live API state and builds nothing.", "linux-gate": "Collects completed checks and builds nothing."}))
+}, {"pick-runner": "Runner selection uses live API state and builds nothing.", "upgrade-impact": "Runs Python/Git classification checks without downloads or compilation.", "namespace-capacity": "Capacity is live API state and builds nothing.", "linux-gate": "Collects completed checks and builds nothing.", "sql-advisory": "Runs a Python report over downloaded artifacts; it downloads and compiles nothing else."}))

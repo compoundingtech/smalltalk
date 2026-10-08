@@ -135,5 +135,37 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       env: { CARGO_PROFILE_DEV_OPT_LEVEL: '1' }, extraLogs: '${{ runner.temp }}/perf/',
       before: [perfStoresCache('cost')],
     }),
+    // Advisory: the same store with a short and a ten-times-longer past of one seat. Only on main,
+    // where the extra runner time is spent once per merge. Not required.
+    'perf-history': linuxStageJob({
+      name: 'perf-history', stage: 'history', setup: commonSetupSteps,
+      description: 'Run the history check', command: ['bash', 'scripts/ci-perf', 'history'],
+      env: { CARGO_PROFILE_DEV_OPT_LEVEL: '1' }, extraLogs: '${{ runner.temp }}/perf/',
+      before: [perfStoresCache('history')],
+    }),
+    // Advisory SQL report from the cost and history reports. Not required, never fails.
+    'sql-advisory': {
+      name: 'sql-advisory',
+      needs: ['perf-cost', 'perf-history'],
+      if: 'always()',
+      'runs-on': 'ubuntu-latest',
+      'timeout-minutes': 10,
+      steps: [
+        { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
+        { name: 'Fetch the cost report', uses: 'actions/download-artifact@v4', 'continue-on-error': true, with: { name: 'perf-cost-logs', path: 'perf-cost-logs' } },
+        { name: 'Fetch the history report', uses: 'actions/download-artifact@v4', 'continue-on-error': true, with: { name: 'perf-history-logs', path: 'perf-history-logs' } },
+        {
+          name: 'Advisory SQL report',
+          'continue-on-error': true,
+          run: `report=$(find perf-cost-logs -name cost.json 2>/dev/null | head -1)
+history=$(find perf-history-logs -name history.json 2>/dev/null | head -1)
+if [ -n "$report" ]; then
+  python3 scripts/sql_advisory.py "$report" \${history:+--history "$history"}
+else
+  printf '## Advisory SQL report\\n\\nNo cost report was produced for this run.\\n' >> "$GITHUB_STEP_SUMMARY"
+fi`,
+        },
+      ],
+    },
   },
-}, {"main-checks": "Verifies exact queue checks through the API and builds nothing.", "cache-maintenance": "Cache maintenance uses live API data and builds nothing."}))
+}, {"main-checks": "Verifies exact queue checks through the API and builds nothing.", "cache-maintenance": "Cache maintenance uses live API data and builds nothing.", "sql-advisory": "Runs a Python report over downloaded artifacts; it downloads and compiles nothing else."}))

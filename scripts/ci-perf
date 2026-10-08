@@ -2,7 +2,7 @@
 # Run one performance stage inside the pinned devShell: the cost check or the load test.
 # Each is its own GitHub Actions job; neither is part of the required linux-gate (docs/ci.md).
 set -euo pipefail
-stage=${1:?usage: scripts/ci-perf cost|load}
+stage=${1:?usage: scripts/ci-perf cost|history|load}
 # Logs and reports stay outside the checkout: the public-content test scans untracked files.
 out="$RUNNER_TEMP/perf"
 mkdir -p "$out"
@@ -49,6 +49,17 @@ case "$stage" in
       summarize_cost "$out/cost.json"
     else
       echo "::error::cost check produced no measurement report"
+      status=1
+    fi
+    ;;
+  history)
+    # Advisory: the same store measured with a short and a ten-times-longer past of one seat. The
+    # report is read by scripts/sql_advisory.py in the sql-advisory job; nothing here asserts on it.
+    rm -f "$out/history.json"
+    ST_HISTORY_REPORT="$out/history.json" cargo test -p st3 --test integration --locked daemon_history:: \
+      -- --nocapture --test-threads 1 2>&1 | tee "$out/history.log" || status=$?
+    if [ ! -s "$out/history.json" ]; then
+      echo "::error::the history check produced no measurement report"
       status=1
     fi
     ;;

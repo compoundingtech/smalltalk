@@ -1430,6 +1430,37 @@ jobs:
         env:
           CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"${{ steps.cargo-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the generated stores","outcome":"${{ steps.cache-10.outcome }}","hit":"${{ steps.cache-10.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
+  sql-advisory:
+    name: sql-advisory
+    needs: [perf-cost]
+    if: always() && github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Fetch the cost report
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: perf-cost-logs
+          path: perf-cost-logs
+      - name: Advisory SQL report
+        continue-on-error: true
+        run: |
+          report=$(find perf-cost-logs -name cost.json 2>/dev/null | head -1)
+          if [ -n "$report" ]; then
+            python3 scripts/sql_advisory.py "$report"
+          else
+            printf '## Advisory SQL report\n\nNo cost report was produced for this run.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Report job cache coverage
+        if: always()
+        shell: bash
+        env:
+          CACHE_REASON: Runs a Python report over downloaded artifacts; it downloads and compiles nothing else.
+        run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""
   isolation-vm:
     name: isolation-vm
     needs: [pick-runner, linux-test-build]

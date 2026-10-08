@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Run the advisory SQL report in CI: a non-required sql-advisory job, and a history check on main",
+  "replay": {"status": "none", "detail": "No replay or rebuild. Workflow and script changes only; the daemon is unchanged."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step. The new jobs are not required checks and never fail a merge."},
+  "recovery": {"status": "none", "detail": "Nothing to recover: a sql-advisory job reads the cost check's report on pull requests and main, and a perf-history job measures the history pair on main. Both only write job summaries."}
+}
