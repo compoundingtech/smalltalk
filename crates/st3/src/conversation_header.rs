@@ -1,7 +1,6 @@
 //! The conversation header (client contract `conversation-blocks.v1` §3, q3): the live summary
-//! of a conversation, derived from the same normalized window a page was built from. Every field
-//! names its source and the entry it came from, so a client can tell a derived summary from a
-//! live one. Nothing here reads a transcript again or stores anything.
+//! of a conversation, derived from its normalized window and its seat's existing current reads.
+//! Every field names its source and source time. Nothing here rereads a transcript or stores data.
 use serde_json::{Map, Value, json};
 
 /// Terminal statuses for jobs and subagents: anything else is still in flight.
@@ -212,11 +211,123 @@ pub(crate) fn merge_register(mut derived: Value, register: Option<&Value>) -> Op
     (!target.is_empty()).then_some(derived)
 }
 
-/// The live latest-wins values for a conversation, e.g. `working`. Wire the register here when
-/// draft #1583 (the live conversation register) lands; until then no register exists and the
-/// header is derived from the transcript window alone.
-pub(crate) fn register_value(_state: &crate::api::AppState, _session_id: &str) -> Option<Value> {
-    None
+/// Read the session's seat at one SQLite cut. Unmanaged sessions have no seat register.
+/// Current occupancy and retained numeric spend use their existing, separate read paths.
+pub(crate) fn register_value(state: &crate::api::AppState, session_id: &str) -> Option<Value> {
+    let result = state.store.read_snapshot(|index| {
+        let Some((owner, Some(incarnation), _)) =
+            crate::api::managed_session_owner_at(&state.store, index, session_id)?
+        else {
+            return Ok(None);
+        };
+        let runtime = state.store.latest_claim(&owner, Some("runtime.observed"))?;
+        let running = runtime.as_ref().is_some_and(|claim| {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            fields["status"] == "running" && fields["incarnation_id"] == incarnation
+        });
+        let activity = if running {
+            state.store.latest_claim(&owner, Some("harness.observed"))?
+        } else {
+            None
+        };
+        let (context, spend) = state.store.conversation_usage_observations(&owner, &incarnation)?;
+        let usage = if spend.is_some() {
+            state.store.usage_summary_at(&owner, Some(&incarnation), Some(index))?
+        } else {
+            None
+        };
+        let cost = usage.as_ref()
+            .filter(|usage| usage.currency.as_deref() == Some("USD"))
+            .and_then(|usage| usage.cost)
+            .zip(spend.as_ref());
+        let todo = crate::api::conversation_todo_value(
+            &state.store, &owner, Some(&incarnation), index,
+        )?;
+        Ok(map_register(&incarnation, activity.as_ref(), context.as_ref(), cost, &todo))
+    });
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "could not read conversation header register");
+            None
+        }
+    }
+}
+
+/// Map only positively observed values into the existing header contract. A stale binding
+/// cannot override transcript provenance, and unknown activity must never look idle.
+fn map_register(
+    incarnation: &str,
+    activity: Option<&crate::model::ClaimRecord>,
+    context: Option<&crate::model::ClaimRecord>,
+    cost: Option<(f64, &crate::model::ClaimRecord)>,
+    todo: &Value,
+) -> Option<Value> {
+    let mut header = Map::new();
+    if let Some((claim, fields)) = activity.and_then(|claim| fresh_fields(claim, incarnation)) {
+        let working = match fields["state"].as_str() {
+            Some("working") if fields["provider_auth"] != false
+                && fields["reason"] != "providerAuth" => Some(true),
+            Some("idle" | "ready") if fields["provider_auth"] != false
+                && fields["reason"] != "providerAuth" => Some(false),
+            _ => None,
+        };
+        if let Some(working) = working {
+            header.insert("working".into(), register_field(json!(working), &observed_at(claim)));
+        }
+    }
+    if let Some((claim, fields)) = context.and_then(|claim| fresh_fields(claim, incarnation)) {
+        let at = observed_at(claim);
+        if let Some(model) = fields["model"].as_str() {
+            header.insert("model".into(), register_field(json!(model), &at));
+        }
+        let tokens = fields["context_used_tokens"].as_u64();
+        let window = fields["context_window_tokens"].as_u64();
+        if tokens.is_some() || window.is_some() {
+            header.insert("context".into(), register_field(json!({
+                "tokens": tokens, "window": window,
+            }), &at));
+        }
+    }
+    if let Some((usd, claim)) = cost
+        && usd.is_finite()
+        && fresh_fields(claim, incarnation).is_some()
+    {
+        header.insert("cost".into(), register_field(json!({"usd": usd}), &observed_at(claim)));
+    }
+    if todo["stale"] == false
+        && todo["snapshot"]["incarnation_id"] == incarnation
+        && let Some(phases) = todo["snapshot"]["phases"].as_array()
+    {
+        let phases = phases.iter().map(|phase| json!({
+            "phase": phase["name"], "items": phase["tasks"],
+        })).collect::<Vec<_>>();
+        if let Some(at) = todo["snapshot"]["observed_at"].as_str() {
+            header.insert("todos".into(), register_field(json!(phases), at));
+        }
+    }
+    (!header.is_empty()).then_some(Value::Object(header))
+}
+
+fn fresh_fields<'a>(
+    claim: &'a crate::model::ClaimRecord,
+    incarnation: &str,
+) -> Option<(&'a crate::model::ClaimRecord, &'a Value)> {
+    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    (fields["incarnation_id"] == incarnation && fields["stale"] != true)
+        .then_some((claim, fields))
+}
+
+fn observed_at(claim: &crate::model::ClaimRecord) -> String {
+    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    let at = fields["observed_at_unix_ms"].as_u64()
+        .or_else(|| fields["observed_at_ms"].as_u64())
+        .map_or(claim.accepted_at_unix_ms, u128::from);
+    crate::api::client_timestamp(at)
+}
+
+fn register_field(value: Value, at: &str) -> Value {
+    json!({"value": value, "as_of": at})
 }
 
 /// Whether the window the items came from lost its prefix: the native fold's truncation entry,
@@ -567,5 +678,157 @@ mod tests {
                 },
             })),
         );
+    }
+
+    fn observation(kind: &str, fields: Value) -> crate::model::ClaimRecord {
+        crate::model::ClaimRecord {
+            id: format!("current/node/{kind}"),
+            store_index: 1,
+            batch_id: String::new(),
+            subject: "agent/node/seat".into(),
+            kind: kind.into(),
+            origin: "node".into(),
+            actor: Some("agent/node/seat".into()),
+            operation_id: None,
+            request_digest: None,
+            body: json!({"fields": fields}),
+            predecessors: Vec::new(),
+            accepted_at_unix_ms: 1_791_288_009_000,
+        }
+    }
+
+    fn todo_projection(stale: bool) -> Value {
+        json!({
+            "stale": stale,
+            "snapshot": {
+                "incarnation_id": "one", "observed_at": "2026-10-06T12:00:03Z",
+                "phases": [{"name": "Review", "tasks": [
+                    {"content": "read", "status": "completed"},
+                    {"content": "edit", "status": "blocked", "blocker": "approval"},
+                ]}],
+            },
+        })
+    }
+
+    #[test]
+    fn present_register_maps_activity_context_cost_and_todo_phases() {
+        let activity = observation("harness.observed", json!({
+            "incarnation_id": "one", "state": "working", "observed_at_ms": 1000,
+        }));
+        let context = observation("harness.usage", json!({
+            "incarnation_id": "one", "semantics": "context_occupancy",
+            "context_used_tokens": 42, "context_window_tokens": 100,
+            "model": "provider/model", "observed_at_unix_ms": 2000,
+        }));
+        let spend = observation("harness.usage", json!({
+            "incarnation_id": "one", "semantics": "session_cumulative",
+            "cost": 1.25, "currency": "USD", "total_tokens": 9000,
+        }));
+        let register = map_register("one", Some(&activity), Some(&context),
+            Some((1.25, &spend)), &todo_projection(false)).unwrap();
+        let header = merge_register(json!({}), Some(&register)).unwrap();
+        assert_eq!(header.as_object().unwrap().len(), 5);
+        assert_eq!(header["working"]["value"], true);
+        assert_eq!(header["working"]["as_of"], "1970-01-01T00:00:01Z");
+        assert_eq!(header["model"]["value"], "provider/model");
+        assert_eq!(header["context"]["value"], json!({"tokens": 42, "window": 100}));
+        assert_eq!(header["context"]["as_of"], "1970-01-01T00:00:02Z");
+        assert_eq!(header["cost"]["value"], json!({"usd": 1.25}));
+        assert_eq!(header["cost"]["as_of"],
+            crate::api::client_timestamp(spend.accepted_at_unix_ms));
+        assert_eq!(header["todos"]["value"], json!([{"phase": "Review", "items": [
+            {"content": "read", "status": "completed"},
+            {"content": "edit", "status": "blocked", "blocker": "approval"},
+        ]}]));
+        assert_eq!(header["todos"]["as_of"], "2026-10-06T12:00:03Z");
+        assert!(header.as_object().unwrap().values().all(|field| field["source"] == "register"));
+    }
+
+    #[test]
+    fn absent_register_does_not_invent_usage_or_working() {
+        assert_eq!(map_register("one", None, None, None, &Value::Null), None);
+        let idle = observation("harness.observed", json!({
+            "incarnation_id": "one", "state": "idle",
+        }));
+        let register = map_register("one", Some(&idle), None, None, &Value::Null).unwrap();
+        assert_eq!(register.as_object().unwrap().len(), 1);
+        assert_eq!(register["working"]["value"], false);
+        let limit = observation("harness.usage", json!({
+            "incarnation_id": "one", "context_window_tokens": 100,
+        }));
+        assert_eq!(map_register("one", None, Some(&limit), None, &Value::Null).unwrap()
+            ["context"]["value"], json!({"tokens": null, "window": 100}));
+        let mut empty = todo_projection(false);
+        empty["snapshot"]["phases"] = json!([]);
+        assert_eq!(map_register("one", None, None, None, &empty).unwrap()["todos"]["value"],
+            json!([]));
+    }
+
+    #[test]
+    fn stale_register_cannot_override_transcript_or_claim_idle() {
+        let activity = observation("harness.observed", json!({
+            "incarnation_id": "one", "state": "working",
+        }));
+        let context = observation("harness.usage", json!({
+            "incarnation_id": "one", "context_used_tokens": 42, "model": "old/model",
+        }));
+        assert_eq!(map_register("two", Some(&activity), Some(&context),
+            Some((1.25, &context)), &todo_projection(true)), None);
+        let mut stale = context.clone();
+        stale.body["fields"]["stale"] = json!(true);
+        assert_eq!(map_register("one", None, Some(&stale), Some((1.25, &stale)),
+            &todo_projection(true)), None);
+        for state in ["indeterminate", "blocked", "ended", "needs-login"] {
+            let mut unknown = activity.clone();
+            unknown.body["fields"]["state"] = json!(state);
+            assert_eq!(map_register("one", Some(&unknown), None, None, &Value::Null), None);
+        }
+        let mut unauthenticated = activity;
+        unauthenticated.body["fields"]["provider_auth"] = json!(false);
+        assert_eq!(map_register("one", Some(&unauthenticated), None, None, &Value::Null), None);
+        let mut login_reason = unauthenticated.clone();
+        login_reason.body["fields"].as_object_mut().unwrap().remove("provider_auth");
+        login_reason.body["fields"]["reason"] = json!("providerAuth");
+        assert_eq!(map_register("one", Some(&login_reason), None, None, &Value::Null), None);
+        let transcript = json!({
+            "model": {"value": "transcript/model", "source": "transcript",
+                "as_of": "2026-10-06T12:00:00Z"},
+        });
+        let stale = map_register("two", None, Some(&context), None, &todo_projection(true));
+        assert_eq!(merge_register(transcript.clone(), stale.as_ref()), Some(transcript));
+    }
+
+    #[test]
+    fn register_usage_reads_keep_occupancy_separate_from_numeric_spend() {
+        let store = crate::store::Store::open_memory("header-register").unwrap();
+        let seat = "agent/header-register";
+        let append = |kind: &str, fields: Value| {
+            store.append_claim(&crate::model::ClaimInput {
+                subject: seat.into(), kind: kind.into(), actor: Some(seat.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        append("runtime.observed", json!({
+            "status": "running", "incarnation_id": "one", "runtime_id": "header-register",
+        }));
+        for total in [100, 200] {
+            append("harness.usage", json!({
+                "semantics": "session_cumulative", "driver": "omp", "incarnation_id": "one",
+                "total_tokens": total, "cost": 1.25, "currency": "USD",
+            }));
+            append("harness.usage", json!({
+                "semantics": "context_occupancy", "driver": "omp", "incarnation_id": "one",
+                "context_used_tokens": 42, "context_window_tokens": 100,
+            }));
+            let (context, spend) = store.conversation_usage_observations(seat, "one").unwrap();
+            assert_eq!(context.unwrap().body["fields"]["context_used_tokens"], 42);
+            assert_eq!(spend.unwrap().body["fields"]["total_tokens"], total);
+            let usage = store.usage_summary_at(seat, Some("one"), None).unwrap().unwrap();
+            assert_eq!(usage.cost, Some(1.25));
+            assert_eq!(usage.context.unwrap().used_tokens, Some(42));
+        }
+        let (context, spend) = store.conversation_usage_observations(seat, "two").unwrap();
+        assert!(context.is_none() && spend.is_none(), "another incarnation cannot reuse usage");
     }
 }

@@ -1549,6 +1549,20 @@ Assistant session errors add `TimelineViewAssistantError` with `status`,
 Recovery markers do not invent live retry state. Recovered errors start compact,
 retain original errors on expansion, and superseded errors are not drawn.
 
+For managed conversations, the header resolves the session's seat and reads its current
+`harness.observed`, context-occupancy `harness.usage`, retained USD usage summary, and
+`harness.todo.observed` through the existing store projections. `harness-context` produces
+the occupancy fields (`context_used_tokens`, `context_window_tokens`, `model`) and separate
+numeric spend (`cost`, `currency`); lifetime token totals are not context occupancy.
+Working/idle is shown only for the session's running incarnation and positively known
+`working` or `idle`/`ready` activity, never stale, unknown, blocked, or unauthenticated state.
+Todo phases map `name`/`tasks` to the header's `phase`/`items`; the existing todo projection's
+session/incarnation `stale` fence prevents an old binding from overriding transcript data.
+Each field retains its source observation time (falling back to acceptance time), with
+register fields winning over transcript fields. Header-only changes return without waiting
+for a new transcript entry; a present empty header on an authoritative change clears the
+previous header, while an omitted header on a quiet poll leaves it unchanged. No conversation
+content or header history is persisted by this read.
 
 `read.projections` authorizes **raw native conversation content**, including full
 arguments, output, reasoning shown by the harness, unknown JSON and images. It is

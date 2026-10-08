@@ -3148,8 +3148,7 @@ pub(super) fn agent_todo_value(
     })
 }
 
-#[cfg(test)]
-fn agent_todo(
+pub(crate) fn agent_todo(
     store: &Store,
     subject: &str,
     incarnation: Option<&str>,
@@ -3916,8 +3915,8 @@ fn timeline_order(a: &Value, b: &Value) -> std::cmp::Ordering {
 }
 
 /// The conversation header (client contract `conversation-blocks.v1` §3): derived from a
-/// normalized bounded window, with live register values winning once the register (#1583)
-/// exists. Native keyset pages pass their newest bounded head, not an offset page cache.
+/// normalized bounded window, with current seat register values winning.
+/// Native keyset pages pass their newest bounded head, not an offset page cache.
 fn conversation_page_header(
     state: &AppState,
     session: &ClientSession,
@@ -5524,6 +5523,10 @@ fn conversation_read_now(
     let mut value = json!({"kind":"conversation-changes", "session_id":session_id, "items":items, "next_cursor":next_cursor});
     if let Some(header) = page.get("header") {
         value["header"] = header.clone();
+    } else if session.conversation_blocks {
+        // An authoritative empty header retracts stale live-only fields. Omission on a quiet
+        // poll still means no header update, as the existing delta consumers expect.
+        value["header"] = json!({});
     }
     Ok(value)
 }
@@ -5689,6 +5692,7 @@ async fn conversation_changes_local(
     // A cursor this member gave out, with nothing that concerns the conversation changed since:
     // there is nothing to read yet, so wait without rebuilding the timeline.
     let mut quiet = None;
+    let mut header_changed = false;
     if let Some(cursor) = after
         && let Some(seen) = issued_transcript(cursor)
         && let Ok(ConversationPosition { store_index, local_position, .. }) =
@@ -5703,6 +5707,8 @@ async fn conversation_changes_local(
         if !since.changed(state)? {
             mark = since;
             quiet = Some(json!({"kind":"conversation-changes", "session_id":session_id, "items":[], "next_cursor":cursor}));
+        } else {
+            header_changed = true;
         }
     }
     loop {
@@ -5719,6 +5725,7 @@ async fn conversation_changes_local(
             .as_array()
             .is_some_and(|items| items.is_empty())
             || after.is_none()
+            || (session.conversation_blocks && header_changed)
             || tokio::time::Instant::now() >= deadline
         {
             return Ok(value);
@@ -5730,6 +5737,7 @@ async fn conversation_changes_local(
                 .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
             tokio::select! { _ = changed.changed() => {}, _ = tokio::time::sleep(pause) => {} }
             if mark.changed(state)? {
+                header_changed = true;
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -13717,6 +13725,50 @@ mission "example/zero-run" state="ready" {
             .unwrap()
             .0;
         assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn conversation_register_only_changes_return_immediately_and_clear_stale_header() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "conversation-register");
+        let agent = "agent/conversation-register";
+        let incarnation = "register-runtime:one";
+        let append = |kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: agent.into(), kind: kind.into(), actor: Some(agent.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        append("runtime.observed", json!({
+            "status": "running", "runtime_id": "register-runtime",
+            "incarnation_id": incarnation, "terminal": false,
+        }));
+        let session_id = managed_session_id(agent, incarnation);
+        let mut session = ClientSession::local(Some("person/example")).unwrap();
+        session.conversation_blocks = true;
+        let baseline = conversation_changes_local(&state, &session, &session_id, None, 0)
+            .await.unwrap();
+        let mut cursor = baseline["next_cursor"].as_str().unwrap().to_owned();
+        for activity in ["working", "idle", "indeterminate"] {
+            append("harness.observed", json!({
+                "state": activity, "driver": "omp", "incarnation_id": incarnation,
+            }));
+            let changed = tokio::time::timeout(Duration::from_millis(500),
+                conversation_changes_local(&state, &session, &session_id, Some(&cursor), 30_000))
+                .await.expect("a header-only update waited for a transcript entry").unwrap();
+            assert!(changed["items"].as_array().unwrap().is_empty(), "{changed}");
+            if activity == "indeterminate" {
+                assert_eq!(changed["header"], json!({}));
+            } else {
+                assert_eq!(changed["header"]["working"]["value"], activity == "working");
+                assert_eq!(changed["header"]["working"]["source"], "register");
+            }
+            cursor = changed["next_cursor"].as_str().unwrap().to_owned();
+        }
+        let quiet = conversation_changes_local(&state, &session, &session_id, Some(&cursor), 0)
+            .await.unwrap();
+        assert!(quiet.get("header").is_none(), "a quiet poll must not overwrite the header");
     }
 
     #[tokio::test]

@@ -2695,7 +2695,7 @@ impl Store {
         }
         let previous = cache
             .iter()
-            .filter(|(at, _, all, _)| *at <= index && *all == history)
+            .filter(|(at, current, all, _)| *at <= index && *current <= revision && *all == history)
             .max_by_key(|(at, current, _, _)| (*at, *current))
             .map(|(at, current, _, items)| (*at, *current, Arc::clone(items)));
         // A caller already holds a SQLite snapshot. Waiting behind another card build here
@@ -14197,6 +14197,34 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    /// Read occupancy and priced spend separately: a newer occupancy register must not hide
+    /// the session's cost, and a newer spend observation must not replace context occupancy.
+    pub(crate) fn conversation_usage_observations(
+        &self,
+        subject: &str,
+        incarnation: &str,
+    ) -> Result<(Option<ClaimRecord>, Option<ClaimRecord>)> {
+        let connection = self.readers.get();
+        let latest = |predicate: &str| -> Result<Option<ClaimRecord>> {
+            let query = current_sql(&format!(
+                "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+                 WHERE claims.subject=?1 AND claims.kind='harness.usage'
+                   AND json_extract(claims.body,'$.fields.incarnation_id')=?2
+                   AND {predicate}
+                 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+            ));
+            Ok(connection.prepare_cached(&query)?
+                .query_row(params![subject, incarnation], claim_from_row)
+                .optional()?)
+        };
+        Ok((
+            latest("json_extract(claims.body,'$.fields.semantics')='context_occupancy'")?,
+            latest("json_extract(claims.body,'$.fields.semantics') IN ('session_cumulative','response','response_rollup')
+                AND json_type(claims.body,'$.fields.cost') IN ('integer','real')
+                AND json_extract(claims.body,'$.fields.currency')='USD'")?,
+        ))
     }
 
     /// Aggregate durable provider usage without mixing context-window occupancy

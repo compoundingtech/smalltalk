@@ -576,8 +576,11 @@ export function headerLine(header: ConversationHeader | undefined, now: string):
   const parts: string[] = [];
   const model = str(header.model?.value) ? marked(`model ${str(header.model?.value)}`, header.model!) : undefined;
   if (model) parts.push(model);
-  const tokens = record(header.context?.value).tokens;
-  const context = typeof tokens === 'number' ? marked(`context ${tokens} tokens`, header.context!) : undefined;
+  const { tokens, window } = record(header.context?.value);
+  const contextLabel = typeof tokens === 'number'
+    ? `context ${tokens} tokens${typeof window === 'number' ? ` of ${window}` : ''}`
+    : typeof window === 'number' ? `context limit ${window} tokens` : undefined;
+  const context = contextLabel !== undefined ? marked(contextLabel, header.context!) : undefined;
   if (context) parts.push(context);
   const usd = record(header.cost?.value).usd;
   const cost = typeof usd === 'number' ? marked(`cost $${usd.toFixed(2)}`, header.cost!) : undefined;

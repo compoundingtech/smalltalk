@@ -261,6 +261,8 @@ assert.equal(cleanMessageText(rawText, SHOW_EVERYTHING), rawText);
   assert.equal(headerLine({ model: field('synthetic/model ') }, '2026-10-06T12:59:30Z'), 'model synthetic/model · transcript · 1h ago', 'rounded minutes promote to hours without extra spaces');
   assert.equal(headerLine({ working: field(false, 'register') }, '2026-10-07T11:30:00Z'), 'idle · register · 1d ago', 'rounded hours promote to days');
   assert.equal(headerLine({ working: field(false, 'register') }, asOf), 'idle · register · 0s ago');
+  assert.equal(headerLine({ context: field({ tokens: 42, window: 100 }, 'register') }, asOf), 'context 42 tokens of 100 · register · 0s ago');
+  assert.equal(headerLine({ context: field({ tokens: null, window: 100 }, 'register') }, asOf), 'context limit 100 tokens · register · 0s ago');
   assert.equal(headerLine({ ask: field(null) }, asOf), null, 'a header with nothing to say says nothing');
   assert.equal(headerLine(undefined, asOf), null);
 }

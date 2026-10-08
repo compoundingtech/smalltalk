@@ -257,5 +257,7 @@ assert.equal(shouldProbe(1_000, 11_000), true);
   sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: false, items: [] });
   sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: true, items: [], header: { model: { value: 'x', source: 'register', as_of: '2026-10-06T12:00:00Z' } } });
   assert.deepEqual(frames.map(frame => frame.header), [header, undefined, { model: { value: 'x', source: 'register', as_of: '2026-10-06T12:00:00Z' } }]);
+  sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: false, items: [], header: {} });
+  assert.deepEqual(frames.at(-1).header, {}, 'an authoritative empty header reaches the view and clears stale working state');
   feed.close();
 }

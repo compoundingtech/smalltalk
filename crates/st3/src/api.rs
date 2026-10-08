@@ -74,6 +74,7 @@ mod owned_sets;
 mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
+pub(crate) use client_v0::agent_todo as conversation_todo_value;
 
 /// Recheck the initialized live delivery owner before replacing an unattached seat.
 pub(crate) fn claude_channel_attached(store: &Store, subject: &str, incarnation: &str) -> bool {
@@ -2630,7 +2631,7 @@ fn managed_session_id(owner: &str, identity: &str) -> String {
     format!("session/{}", &digest[..24])
 }
 
-fn managed_session_owner_at(
+pub(crate) fn managed_session_owner_at(
     store: &Store,
     snapshot_index: u64,
     session_id: &str,

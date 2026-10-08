@@ -112,13 +112,14 @@ fn model(_: &str, value: &Value) -> Option<String> {
 }
 
 fn context(_: &str, value: &Value) -> Option<String> {
-    let tokens = value.get("tokens")?.as_u64()?;
-    let window = value
-        .get("window")
-        .and_then(Value::as_u64)
-        .map(|window| format!(" of {window}"))
-        .unwrap_or_default();
-    Some(format!("context {tokens} tokens{window}"))
+    let tokens = value.get("tokens").and_then(Value::as_u64);
+    let window = value.get("window").and_then(Value::as_u64);
+    match (tokens, window) {
+        (Some(tokens), Some(window)) => Some(format!("context {tokens} tokens of {window}")),
+        (Some(tokens), None) => Some(format!("context {tokens} tokens")),
+        (None, Some(window)) => Some(format!("context limit {window} tokens")),
+        (None, None) => None,
+    }
 }
 
 fn cost(_: &str, value: &Value) -> Option<String> {
@@ -262,6 +263,18 @@ mod tests {
             "model m · idle · register · 1h ago"
         );
         assert_eq!(age("2026-10-05T12:00:00Z", "2026-10-06T12:00:00Z"), "1d");
+    }
+
+    #[test]
+    fn register_context_limits_render_without_occupancy() {
+        assert_eq!(line(&json!({
+            "context": {"value": {"tokens": null, "window": 100},
+                "source": "register", "as_of": "2026-10-06T12:00:00Z"},
+        }), "2026-10-06T12:00:00Z"), "context limit 100 tokens · register · 0s ago");
+        assert_eq!(line(&json!({
+            "context": {"value": {"tokens": 42, "window": 100},
+                "source": "register", "as_of": "2026-10-06T12:00:00Z"},
+        }), "2026-10-06T12:00:00Z"), "context 42 tokens of 100 · register · 0s ago");
     }
 
     #[test]

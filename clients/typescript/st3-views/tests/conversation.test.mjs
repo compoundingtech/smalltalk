@@ -38,6 +38,7 @@ assert.equal(replaced.hasOlder, false);
   assert.deepEqual(applyConversation(withHeader, { replace: false, items: [content(61, 'm61')], hasMore: false, sessionId: 'session/one' }).header, header, 'a change keeps the last header');
   const next = { cost: { value: { usd: 1.5 }, source: 'register', as_of: '2026-10-06T12:01:00Z' } };
   assert.deepEqual(applyConversation(withHeader, { replace: true, items: [content(62, 'm62')], hasMore: false, sessionId: 'session/one', header: next }).header, next, 'a newer header replaces it');
+  assert.deepEqual(applyConversation(withHeader, { replace: false, items: [], hasMore: false, sessionId: 'session/one', header: {} }).header, {}, 'an empty header clears stale register fields without dropping entries');
   assert.equal(applyConversation(withHeader, { replace: true, items: [content(63, 'm63')], hasMore: false, sessionId: 'session/two' }).header, undefined, 'another session starts without one');
 }
 

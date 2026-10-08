@@ -78,11 +78,11 @@ const isHeaderField = (value: unknown): value is HeaderField =>
 function conversationHeader(frame: CollectionFrame): ConversationHeader | undefined {
   if (!('header' in frame) || typeof frame.header !== 'object' || frame.header === null) return undefined;
   const header: ConversationHeader = {};
-  let kept = false;
   for (const [name, field] of Object.entries(frame.header)) {
-    if (HEADER_FIELDS[name] && isHeaderField(field)) { header[name as keyof ConversationHeader] = field; kept = true; }
+    if (HEADER_FIELDS[name] && isHeaderField(field)) header[name as keyof ConversationHeader] = field;
   }
-  return kept ? header : undefined;
+  // A present empty object is an authoritative clear; absence leaves the previous header.
+  return header;
 }
 export const conversationMayClear = (code: string | undefined) => code !== 'timeline-history-incomplete';
 
