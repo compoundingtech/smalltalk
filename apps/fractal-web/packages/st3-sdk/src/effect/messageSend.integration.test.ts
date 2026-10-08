@@ -153,6 +153,27 @@ describe('message.send HTTP transport', () => {
       ),
   )
 
+  it.live('returns the gateway canonical message identity independently of the idempotency key', () =>
+    withGateway((baseUrl) =>
+      withSdk(baseUrl, (sdk) =>
+        Effect.gen(function* () {
+          yield* sdk.snapshot
+          // The gateway, not a composer-key hash, chooses the canonical message identity.
+          for (const idempotencyKey of ['composer-key/first', 'composer-key/second']) {
+            const fresh = yield* sdk.snapshot
+            const result = yield* sdk.messageSend({
+              ...request,
+              idempotency_key: idempotencyKey,
+              fence: { ...request.fence, snapshot_id: fresh },
+            })
+            expect(result.kind).toBe('action-result')
+            expect(result.affected_ids).toEqual(['message/delivered'])
+          }
+        }),
+      ),
+    ),
+  )
+
   it.live('keeps denied-scope code, retryability, HTTP status and refusal details typed', () =>
     withGateway((baseUrl) =>
       withSdk(baseUrl, (sdk) =>
