@@ -122,7 +122,10 @@ impl Cache {
                 let entry = &entries[index];
                 doc.entries.push((entry.id.clone(), doc.lines.len()));
                 // Mail between others is two lines until opened (Nathan, 2026-10-02).
-                if matches!(&entry.body, Body::Mail { .. }) && folds(&entry.body) && !expanded.contains(&entry.id) {
+                if matches!(&entry.body, Body::Mail { .. })
+                    && folds(&entry.body)
+                    && !expanded.contains(&entry.id)
+                {
                     doc.append(mail_lines(entry, width, theme), 0);
                     index += 1;
                     continue;
@@ -487,11 +490,21 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 doc.lines(rows.into_iter().skip(hidden));
             }
             if let (Some(row), Some(session)) = (
-                open_row.filter(|row| if preview_head { *row < total - hidden } else { *row >= hidden }),
+                open_row.filter(|row| {
+                    if preview_head {
+                        *row < total - hidden
+                    } else {
+                        *row >= hidden
+                    }
+                }),
                 crate::header::open_session(output),
             ) {
                 doc.targets.push(Target {
-                    line: if preview_head { row + 1 } else { row - hidden + 1 },
+                    line: if preview_head {
+                        row + 1
+                    } else {
+                        row - hidden + 1
+                    },
                     column: 0,
                     width: width as u16,
                     hit: PaneIntent::Open(session.to_owned()),

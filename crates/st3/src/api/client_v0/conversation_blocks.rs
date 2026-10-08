@@ -1094,11 +1094,17 @@ mod tests {
     async fn write_and_compaction_views_are_bounded_and_fetch_complete_content() {
         use std::io::Write as _;
         let root = tempfile::tempdir().unwrap();
-        let text = format!("first synthetic line\n{}\nlast synthetic line", "é".repeat(64 * 1024));
-        let native = fixture(root.path(), json!([{
-            "type":"toolCall","id":"large-write","name":"write",
-            "arguments":{"path":"synthetic.txt","content":text}
-        }]));
+        let text = format!(
+            "first synthetic line\n{}\nlast synthetic line",
+            "é".repeat(64 * 1024)
+        );
+        let native = fixture(
+            root.path(),
+            json!([{
+                "type":"toolCall","id":"large-write","name":"write",
+                "arguments":{"path":"synthetic.txt","content":text}
+            }]),
+        );
         writeln!(std::fs::OpenOptions::new().append(true).open(&native.transcript).unwrap(),
             "{}", json!({"type":"compaction","id":"large-compaction","timestamp":"2026-10-06T12:00:02Z","summary":text,"tokensBefore":100,"tokensAfter":20})).unwrap();
         let originals = crate::external_sessions::normalized_timeline(&native).unwrap();
@@ -1109,15 +1115,30 @@ mod tests {
         let prepared = read(&native, &session, &native.id).unwrap();
         assert_native_keyset_pages_match_full_read(&state, &native, &session, &prepared);
         for (kind, field) in [("write", "content"), ("compaction", "summary")] {
-            let item = prepared.iter().find(|item| item["body"]["blocks"][0]["view"]["type"] == kind).unwrap();
+            let item = prepared
+                .iter()
+                .find(|item| item["body"]["blocks"][0]["view"]["type"] == kind)
+                .unwrap();
             let block = &item["body"]["blocks"][0];
-            assert!(block["view"][field].as_str().unwrap().contains("[st truncated this native timeline value:"));
+            assert!(
+                block["view"][field]
+                    .as_str()
+                    .unwrap()
+                    .contains("[st truncated this native timeline value:")
+            );
             let token = block["continuation"]["ref"].as_str().unwrap();
             let pointer = locator(token, &native.id).unwrap().pointer;
-            let original = originals.iter().find(|original| original["id"] == item["id"]).unwrap();
+            let original = originals
+                .iter()
+                .find(|original| original["id"] == item["id"])
+                .unwrap();
             let fetched = fetch_json_chunks(&state, &native, token).await;
             assert_eq!(fetched, *original.pointer(&pointer).unwrap());
-            let view = if pointer == "/body" { &fetched["blocks"][0]["view"] } else { &fetched };
+            let view = if pointer == "/body" {
+                &fetched["blocks"][0]["view"]
+            } else {
+                &fetched
+            };
             assert_eq!(view[field], text);
         }
     }
