@@ -275,6 +275,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn dead_channel_successor_preserves_provider_session_and_retires_old_capability() {
         let store = fixture();
         let mut child = std::process::Command::new("sleep")
