@@ -232,6 +232,7 @@ pub struct Client {
     max_response_bytes: Arc<AtomicUsize>,
     outage_wait: Duration,
     announce_outage_wait: bool,
+    list_filter: Option<String>,
 }
 
 impl std::fmt::Debug for Client {
@@ -413,7 +414,20 @@ impl CollectionStream {
         actor: Option<&str>,
         status: Option<&str>,
     ) -> Result<(), ClientError> {
-        self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":collection, "limit":limit, "actor":actor, "status":status})).await
+        self.subscribe_filtered(id, collection, limit, actor, status, None).await
+    }
+    /// Subscribe to a server-filtered collection window.
+    /// The server rejects filters exceeding 256 UTF-8 bytes; it never truncates the text.
+    pub async fn subscribe_filtered(
+        &mut self,
+        id: &str,
+        collection: &str,
+        limit: usize,
+        actor: Option<&str>,
+        status: Option<&str>,
+        filter: Option<&str>,
+    ) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":collection, "limit":limit, "actor":actor, "status":status, "filter":filter})).await
     }
     /// Follow a terminal on this socket. `terminal.attach` returns the incarnation and the
     /// single-use capability; screens then arrive as [`CollectionEvent::Screen`], the latest
@@ -931,6 +945,13 @@ impl Client {
         self.announce_outage_wait = announce;
         self
     }
+    /// Apply literal id/name/title filtering on the server before list pagination.
+    /// The server rejects filters exceeding 256 UTF-8 bytes; this builder remains infallible.
+    pub fn with_list_filter(mut self, filter: Option<&str>) -> Self {
+        self.list_filter = filter.filter(|text| !text.is_empty()).map(str::to_owned);
+        self
+    }
+
     pub fn unix(path: impl AsRef<Path>) -> Self {
         Self {
             endpoint: Endpoint::Unix(path.as_ref().to_owned()),
@@ -942,6 +963,7 @@ impl Client {
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
             announce_outage_wait: false,
+            list_filter: None,
         }
     }
 
@@ -956,6 +978,7 @@ impl Client {
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
             announce_outage_wait: false,
+            list_filter: None,
         }
     }
 
@@ -973,6 +996,7 @@ impl Client {
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
             announce_outage_wait: false,
+            list_filter: None,
         }
     }
 
@@ -989,6 +1013,7 @@ impl Client {
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
             announce_outage_wait: false,
+            list_filter: None,
         }
     }
 
@@ -1003,6 +1028,7 @@ impl Client {
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
             announce_outage_wait: false,
+            list_filter: None,
         }
     }
 
@@ -1083,6 +1109,9 @@ impl Client {
         if history {
             query.push("history=true".into());
         }
+        if let Some(filter) = self.list_filter.as_deref() {
+            query.push(format!("filter={}", percent_encode(filter)));
+        }
         for (name, value) in filters {
             query.push(format!(
                 "{}={}",
@@ -1095,7 +1124,18 @@ impl Client {
         } else {
             format!("?{}", query.join("&"))
         };
-        self.get(&format!("/v1/client/{collection}{suffix}")).await
+        let path = format!("/v1/client/{collection}{suffix}");
+        if let Some(filter) = self.list_filter.as_deref() {
+            let response: serde_json::Value = self.get(&path).await?;
+            if response["value"]["filters"]["filter"].as_str() != Some(filter) {
+                return Err(ClientError::Protocol(
+                    "the server does not support list text filtering; upgrade the server".into(),
+                ));
+            }
+            serde_json::from_value(response).map_err(|error| ClientError::Protocol(error.to_string()))
+        } else {
+            self.get(&path).await
+        }
     }
 
     /// Exact terminal filters, applied by the server before pagination.
@@ -2717,6 +2757,57 @@ mod tests {
                 "GET /v1/client/terminals?limit=1&owner=agent/lookup/seat%2B064 HTTP/1.1",
                 "GET /v1/client/terminals?limit=1&state=running HTTP/1.1",
                 "GET /v1/client/terminals HTTP/1.1",
+            ]);
+        });
+    }
+
+    #[test]
+    fn list_text_filters_encode_literals_and_require_exact_server_acknowledgment() {
+        runtime().block_on(async {
+            const FILTER: &str = "Ä_%+ seat";
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("list-filter.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for acknowledgment in [None, Some("ä_%+ seat"), Some(FILTER), None] {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert_ne!(read, 0, "request ended before its headers");
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    requests.push(String::from_utf8(request).unwrap().lines().next().unwrap().to_owned());
+                    let mut body: serde_json::Value = serde_json::from_str(EMPTY_PAGE).unwrap();
+                    body["value"]["kind"] = serde_json::json!("page");
+                    body["value"]["collection"] = serde_json::json!("missions");
+                    if let Some(filter) = acknowledgment {
+                        body["value"]["filters"]["filter"] = serde_json::json!(filter);
+                    }
+                    let body = serde_json::to_string(&body).unwrap();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+                requests
+            });
+            let filtered = Client::unix(&socket).with_list_filter(Some(FILTER));
+            for _ in 0..2 {
+                let error = filtered.missions_list(None, Some(1), false).await.unwrap_err();
+                assert!(matches!(error, ClientError::Protocol(message) if message.contains("upgrade the server")));
+            }
+            let accepted = filtered.missions_list(None, Some(1), false).await.unwrap();
+            assert_eq!(accepted.value.filters.get("filter").map(String::as_str), Some(FILTER));
+            Client::unix(&socket).missions_list(None, Some(1), false).await.unwrap();
+            assert_eq!(server.await.unwrap(), [
+                "GET /v1/client/missions?limit=1&filter=%C3%84_%25%2B%20seat HTTP/1.1",
+                "GET /v1/client/missions?limit=1&filter=%C3%84_%25%2B%20seat HTTP/1.1",
+                "GET /v1/client/missions?limit=1&filter=%C3%84_%25%2B%20seat HTTP/1.1",
+                "GET /v1/client/missions?limit=1 HTTP/1.1",
             ]);
         });
     }

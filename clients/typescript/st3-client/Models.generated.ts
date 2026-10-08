@@ -530,6 +530,7 @@ export type ClientConnections = {
 export type CollectionCommand = ({
   actor?: string | null;
   collection: "missions" | "attention" | "agents" | "work" | "glasses";
+  filter?: string | null;
   id: string;
   kind: "subscribe";
   limit?: number;

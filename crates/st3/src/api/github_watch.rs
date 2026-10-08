@@ -50,6 +50,8 @@ pub struct OwnRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct WatchesQuery {
+    #[serde(default, deserialize_with = "deserialize_list_filter")]
+    filter: Option<String>,
     #[serde(default)]
     agent: Option<String>,
 }
@@ -491,7 +493,11 @@ pub(super) async fn watches(
 ) -> Result<Json<Vec<Value>>, ApiError> {
     let store = state.store.clone();
     let agent = query.agent.filter(|agent| !agent.is_empty());
-    blocking_action(move || store.watches(agent.as_deref()))
+    blocking_action(move || {
+        let mut items = store.watches(agent.as_deref())?;
+        items.retain(|item| list_item_matches(item, query.filter.as_deref()));
+        Ok(items)
+    })
         .await
         .map(Json)
 }

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add server-side literal text filters to CLI listings before pagination",
+  "replay": {"status": "none", "detail": "No claim replay, startup backfill, or new materialization. Filtering uses existing current projections and list readers; their historical cold-read costs remain."},
+  "schema": {"status": "changed", "detail": "Additive optional filter query and collection subscription field, filter acknowledgment on client pages, and filter binding in continuation tokens. No database tables, indexes, migrations, or stored claim changes."},
+  "rules": {"status": "none", "detail": "Existing actor visibility, session authorization, canonical selection and closed/reminder membership apply before filtered results. A filter or cursor grants no authority."},
+  "compatibility": {"status": "changed", "detail": "Every ls command accepts --filter TEXT up to 256 UTF-8 bytes, a case-insensitive literal substring of projected id/name/title. Filtered pages and continuation use the same filter. Filtered pagination instructions move to stderr. Existing unfiltered CLI and cursor membership remain; newly filtered HTTP SDK calls refuse older servers that omit the filter acknowledgment."},
+  "downtime": {"status": "none", "detail": "Normal daemon/CLI rollout. Register the pure matcher once when each reader connection opens; no startup scans or required downtime."},
+  "manual": {"status": "changed", "detail": "Deploy the supporting server before using filtered HTTP SDK listings. Use --filter instead of piping the first page to grep; repeat the shell-quoted filter with continuation."},
+  "recovery": {"status": "none", "detail": "Existing page expiry/restart and authorization behavior remain. Changing a filter during continuation is refused; restart the filtered listing."}
+}

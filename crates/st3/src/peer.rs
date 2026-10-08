@@ -130,6 +130,8 @@ pub enum ClientReadOperation {
         history: bool,
         limit: Option<usize>,
         cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<String>,
     },
 }
 
@@ -1231,12 +1233,13 @@ async fn receive_client_read(
                 history,
                 limit,
                 cursor,
+                filter,
             } => {
                 anyhow::ensure!(
                     limit.is_none_or(|limit| (1..=200).contains(&limit)),
                     "the messages limit is invalid"
                 );
-                let page = client
+                let page = client.clone().with_list_filter(filter.as_deref())
                     .messages_list_for_peer(&actor, cursor.as_deref(), limit, history)
                     .await?
                     .value;

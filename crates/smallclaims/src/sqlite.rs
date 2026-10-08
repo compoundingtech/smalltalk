@@ -958,6 +958,9 @@ impl ReadPool {
 
     fn open_connection(&self) -> Result<ReadConnection> {
         let connection = open_read_connection(&self.path, self.shared_memory)?;
+        // Function registration invalidates cached statements; install once, before this
+        // reader enters the pool or can hold a statement in progress.
+        crate::store::register_list_filter_function(&connection)?;
         let open = self.counts.open.fetch_add(1, Ordering::Relaxed) + 1;
         self.counts.peak.fetch_max(open, Ordering::Relaxed);
         self.counts.opened.fetch_add(1, Ordering::Relaxed);
