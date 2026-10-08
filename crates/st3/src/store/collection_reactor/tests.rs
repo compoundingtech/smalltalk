@@ -287,7 +287,7 @@ async fn owned_preparation_releases_snapshot_and_writer_and_stale_pages_retry() 
         .await
         .unwrap();
     // Preparation is blocked with owned facts. Readers and the one admission writer remain live.
-    assert_eq!(store.read_snapshot(|index| Ok(index)).unwrap(), 0);
+    assert_eq!(store.read_snapshot(Ok).unwrap(), 0);
     replace(&store, fixture.source, 2);
     assert_eq!(output(&store, fixture.source), None);
     *gate.release.0.lock().unwrap() = true;

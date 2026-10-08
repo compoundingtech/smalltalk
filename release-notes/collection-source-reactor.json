@@ -1,11 +1,32 @@
 {
   "version": 1,
   "summary": "Add an explicit shared reactor for independent native collection sources",
-  "replay": {"status": "none", "detail": "No history replay or automatic source installation. Source owners capture bounded native facts and explicitly manage namespace installation."},
-  "schema": {"status": "none", "detail": "Default Store schema is unchanged. The explicit constructor reuses existing opt-in Views and Installer schema plus schemas supplied by registered source owners."},
-  "rules": {"status": "none", "detail": "Admission, canonical ordering, checkpoint rules and digests are unchanged."},
-  "compatibility": {"status": "changed", "detail": "New crate-internal source lifecycle and scheduler API. Collection adapters must independently check native coverage even on silent pages. No production source is registered or selected by this change."},
-  "downtime": {"status": "none", "detail": "No new default startup work or daemon lifecycle change."},
-  "manual": {"status": "none", "detail": "No operator action is required; source registration is an explicit application API."},
-  "recovery": {"status": "changed", "detail": "An explicitly registered source callback failure rolls back the page and fences that source and its views. Ordinary commit wakes do not restart it; the owner must repair coverage and explicitly retry. Existing default Store recovery is unchanged."}
+  "replay": {
+    "status": "none",
+    "detail": "No history replay or automatic source installation. Source owners capture bounded native facts and explicitly manage namespace installation."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Default Store schema is unchanged. The explicit constructor reuses existing opt-in Views and Installer schema plus schemas supplied by registered source owners."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Admission, canonical ordering, checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "New crate-internal source lifecycle and scheduler API. Collection adapters must independently check native coverage even on silent pages. No production source is registered or selected by this change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No new default startup work or daemon lifecycle change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action is required; source registration is an explicit application API."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Logical source callback failures roll back their page or hook bookkeeping and fence only that source and its views; ordinary commits never repair a fenced source. SQLite storage failures propagate and roll back, with background writer contention retried. Default Store recovery is unchanged."
+  }
 }
