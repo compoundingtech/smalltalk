@@ -101,9 +101,9 @@ pub(crate) fn record(recipient: &str, report: &str) {
 
 /// Title updates cannot establish delivery readiness. They can report the outer driver's
 /// attachment check, including a missing plugin for which no delivery process exists.
-pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) {
+pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) -> bool {
     let Ok(report) = serde_json::from_str::<Report>(raw) else {
-        return;
+        return false;
     };
     let target = if fence.component == "delivery" {
         if report.transport.as_deref() != Some("claude-channel")
@@ -115,7 +115,7 @@ pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) {
     } else if report.transport.as_deref() == Some("claude-channel") {
         &presence().monitors
     } else {
-        return;
+        return false;
     };
     if let Ok(mut beats) = target.lock() {
         beats.insert(
@@ -126,7 +126,9 @@ pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) {
                 fence: Some(fence.clone()),
             },
         );
+        return true;
     }
+    false
 }
 
 pub(super) fn attachment(recipient: &str, incarnation: &str) -> Option<crate::mailbox::Fence> {
@@ -192,15 +194,33 @@ impl Assessment {
 
 /// Assess the delivery path of a local native seat, independently of harness readiness.
 pub(crate) fn assess(recipient: &str, driver: &str) -> Assessment {
+    assess_selected(recipient, driver, None, false)
+}
+
+pub(crate) fn assess_current(recipient: &str, driver: &str, incarnation: Option<&str>) -> Assessment {
+    assess_selected(recipient, driver, incarnation, true)
+}
+
+fn assess_selected(recipient: &str, driver: &str, incarnation: Option<&str>, current: bool) -> Assessment {
     let presence = presence();
+    let eligible = |beat: &&Beat| {
+        if !current { return true; }
+        let transport = match driver {
+            "claude" => "claude-channel", "codex" => "app-server", "opencode" => "opencode-server",
+            "omp" => "omp-channel", "pi" => "pi-channel", _ => return false,
+        };
+        beat.report.transport.as_deref() == Some(transport)
+            && incarnation.is_none_or(|incarnation| beat.fence.as_ref().is_some_and(|fence| fence.incarnation == incarnation))
+    };
     let mut beat = presence.beats.lock().ok().and_then(|beats| {
         beats
             .get(recipient)
+            .filter(eligible)
             .map(|beat| (beat.at, beat.report.clone()))
     });
     if driver == "claude"
         && let Ok(monitors) = presence.monitors.lock()
-        && let Some(monitor) = monitors.get(recipient)
+        && let Some(monitor) = monitors.get(recipient).filter(eligible)
         && monitor.report.ready == Some(false)
     {
         beat = Some((monitor.at, monitor.report.clone()));

@@ -64,6 +64,7 @@ mod client_presence;
 mod client_v0;
 mod custom;
 mod delivery_presence;
+pub(crate) mod agent_harness;
 mod delivery_probes;
 mod github_watch;
 mod harness_events;
@@ -2374,7 +2375,7 @@ fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyh
             Some(_) => "current",
         };
         item["observation"] = json!(observation);
-        if observation == "stale" && item["harness_state"] == "idle" {
+        if observation == "stale" && matches!(item["harness_state"].as_str(), Some("ready" | "idle" | "working")) {
             item["harness_state"] = json!("indeterminate");
             if item["state"] == "running" {
                 item["state"] = json!("waiting");
@@ -2457,7 +2458,7 @@ fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
     let Some(recipient) = item.get("id").and_then(Value::as_str) else {
         return;
     };
-    let assessment = delivery_presence::assess(recipient, &driver);
+    let assessment = delivery_presence::assess_current(recipient, &driver, item["incarnation_id"].as_str());
     if assessment.stale() {
         item["state"] = Value::String("waiting".into());
     }
@@ -2576,6 +2577,7 @@ fn client_agent_resources_from_status(
         .collect::<BTreeMap<_, _>>();
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
     let member_faults = store.member_reconcile_faults_for(&agent_subjects, snapshot_index)?;
+    let mailbox_faults = store.mailbox_faults_for(&agent_subjects, snapshot_index)?;
     // Cards without a harness need only their actual claim's acceptance time, not its body.
     // Keep the existing per-claim fallback if the bulk metadata read cannot be completed.
     let actual_claim_times = store.claim_acceptance_times(
@@ -2608,7 +2610,9 @@ fn client_agent_resources_from_status(
         .filter(|subject| history || subject.projection.layer == "current")
         .map(|mut subject| -> anyhow::Result<(String, Value)> {
             subject.harness = store.observed_harness_at(&subject.subject, snapshot_index)?;
-            let fault = member_faults.get(&subject.subject);
+            let member_fault = member_faults.get(&subject.subject);
+            let mailbox_fault = mailbox_faults.get(&subject.subject);
+            let fault = member_fault.or(mailbox_fault);
             let fields = subject
                 .actual
                 .as_ref()
@@ -2616,11 +2620,14 @@ fn client_agent_resources_from_status(
             let observed = fields
                 .and_then(|fields| fields.get("status"))
                 .and_then(Value::as_str);
-            let driver = subject
-                .harness
-                .as_ref()
-                .and_then(|harness| harness.driver.clone())
-                .or_else(|| subject.desired.as_ref().and_then(desired_harness_driver));
+            let declared_provider = subject.desired.as_ref().and_then(desired_harness_driver);
+            subject.harness = agent_harness::eligible(
+                declared_provider.as_deref(),
+                fields.and_then(|fields| fields.get("incarnation_id")).and_then(Value::as_str),
+                subject.harness.take(),
+            );
+            subject.harness = agent_harness::availability(subject.harness.take(), mailbox_fault.map(String::as_str));
+            let driver = declared_provider.or_else(|| subject.harness.as_ref().and_then(|harness| harness.driver.clone()));
             let harness_state = subject.harness.as_ref().map(|harness| harness.state.clone());
             let last_activity_at = store.agent_last_activity_at(
                 &subject.subject,
@@ -2704,7 +2711,7 @@ fn client_agent_resources_from_status(
                 .map(|token| crate::placement::handoff(store, &subject.subject, token, snapshot_index))
                 .transpose()?.flatten();
             let moving = handoff.as_ref().is_some_and(|h| h.phase != "running");
-            let state = if fault.is_some() { "failed" } else if moving { "waiting" } else { state };
+            let state = if member_fault.is_some() { "failed" } else if mailbox_fault.is_some() || moving { "waiting" } else { state };
             let suspension = crate::suspension::current(store, &subject.subject)?;
             // A suspended seat has no process by design: it is neither stopped nor failed.
             let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
@@ -23262,6 +23269,46 @@ mission "agent-health" state="ready" {
         let resources =
             client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
         assert_eq!(resources[0]["state"], "running");
+
+        let healthy_cut = store.index().unwrap();
+        let harness = |driver: &str, incarnation: &str, key: &str| {
+            store.append_claim(&ClaimInput {
+                subject: subject.clone(), kind: "harness.observed".into(), actor: Some(subject.clone()),
+                fields: serde_json::from_value(json!({"state":"ready","driver":driver,"incarnation_id":incarnation})).unwrap(),
+                evidence: vec![], expected_subject: None, idempotency_key: Some(key.into()),
+            }).unwrap();
+        };
+        harness("claude", "incarnation-1", "agent-health-foreign-provider");
+        let resources = client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["driver"], "codex");
+        assert_eq!(resources[0]["state"], "starting");
+        assert!(resources[0]["harness_state"].is_null(), "wrong-provider readiness must not survive the cached card");
+        assert_eq!(resources[0]["queued_work_count"], 1);
+        harness("codex", "incarnation-1", "agent-health-native-provider-restored");
+        let fault = crate::model::AttentionRequest {
+            reviewer: "person/test".into(), title: "Mailbox unavailable".into(), reason: "The current mailbox lost delivery custody.".into(),
+            severity: "error".into(), targets: vec![subject.clone()], actor: "daemon/runtime".into(), idempotency_key: "agent-health-mailbox-loss".into(),
+        };
+        let episode = "attention/agent-health-mailbox";
+        let recorded = store.record_runtime_failure(episode, &fault, "mailbox-channel-lost").unwrap();
+        let repeated = store.record_runtime_failure(episode, &fault, "mailbox-channel-lost").unwrap();
+        assert_eq!(recorded.request, repeated.request);
+        let resources = client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["state"], "waiting");
+        assert_eq!(resources[0]["harness_state"], "indeterminate");
+        assert_eq!(resources[0]["blocked_on"], "channel");
+        assert_eq!(resources[0]["fault"], fault.reason);
+        harness("codex", "incarnation-1", "agent-health-superficial-ready");
+        let resources = client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["state"], "waiting", "ready alone cannot clear a mailbox fault");
+        let historic = client_agent_resources(&store, false, "snapshot", healthy_cut).unwrap();
+        assert_eq!(historic[0]["state"], "running");
+        assert!(historic[0]["fault"].is_null(), "the historical cut must not observe a later fault");
+        store.recover_operational_failure(episode, "authenticated replay control", "agent-health-repaired").unwrap();
+        let resources = client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["state"], "running");
+        assert!(resources[0]["fault"].is_null());
+        assert_eq!(resources[0]["next_work_id"], queued);
 
         store
             .append_claim(&ClaimInput {

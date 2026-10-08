@@ -196,3 +196,26 @@ pub fn check_fixture_mailbox(store: &crate::store::Store, fence: &crate::mailbox
 {
     store.check_mailbox(fence)
 }
+
+#[cfg(feature = "test-support")]
+fn mailbox_transports() -> &'static std::sync::Mutex<std::collections::BTreeMap<(usize, String), tokio::sync::watch::Sender<bool>>> {
+    static CONTROLS: OnceLock<std::sync::Mutex<std::collections::BTreeMap<(usize, String), tokio::sync::watch::Sender<bool>>>> = OnceLock::new();
+    CONTROLS.get_or_init(Default::default)
+}
+
+/// Process-local transport loss in an invented integration fixture. No API route,
+/// CLI flag or environment variable can select a production seat or activate it.
+#[cfg(feature = "test-support")]
+pub fn hold_fixture_mailbox(store: &std::sync::Arc<crate::store::Store>, subject: &str, held: bool) {
+    assert!(subject.starts_with("agent/eval."), "mailbox loss controls require an invented fixture seat");
+    mailbox_transports().lock().unwrap()
+        .entry((std::sync::Arc::as_ptr(store) as usize, subject.into()))
+        .or_insert_with(|| tokio::sync::watch::channel(false).0).send_replace(held);
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_mailbox_transport(store: &std::sync::Arc<crate::store::Store>, subject: &str) -> tokio::sync::watch::Receiver<bool> {
+    mailbox_transports().lock().unwrap()
+        .entry((std::sync::Arc::as_ptr(store) as usize, subject.into()))
+        .or_insert_with(|| tokio::sync::watch::channel(false).0).subscribe()
+}

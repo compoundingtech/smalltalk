@@ -3,6 +3,8 @@
 use super::*;
 use crate::mailbox::{Fence, Frame, Receipt};
 
+mod authority;
+
 pub(super) async fn subscribe(
     State(state): State<AppState>,
     Query(fence): Query<Fence>,
@@ -10,12 +12,24 @@ pub(super) async fn subscribe(
     websocket: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     authorize(&fence, peer.as_ref().map(|p| &p.0))?;
-    let store = state.store.clone();
+    let checked_state = state.clone();
     let binding = fence.clone();
-    blocking_action(move || store.check_mailbox(&binding)).await?;
+    let peer = peer.expect("authorize checked the native peer").0;
+    let checked_peer = peer.clone();
+    blocking_action(move || {
+        if !cfg!(target_os = "linux") { return checked_state.store.check_mailbox(&binding); }
+        authority::with_authority(&checked_state, &binding, &checked_peer, |owner| {
+        if checked_state.store.check_mailbox(&binding).is_ok() {
+            // Upgrade a still-current pre-lease binding without changing its capability.
+            checked_state.store.bind_mailbox_with_lease(&binding, Some(owner)).map(|_| ())
+        } else {
+            checked_state.store.repair_mailbox(&binding, owner).map(|_| ())
+        }
+        })
+    }).await?;
     // Wake the predecessor immediately, even when no graph content changed.
     signal_local_change(&state);
-    Ok(websocket.on_upgrade(move |socket| stream(state, fence, socket)))
+    Ok(websocket.on_upgrade(move |socket| stream(state, fence, socket, peer)))
 }
 
 pub(super) async fn bind(
@@ -24,8 +38,14 @@ pub(super) async fn bind(
     Json(request): Json<Fence>,
 ) -> Result<Json<Fence>, ApiError> {
     authorize(&request, peer.as_ref().map(|p| &p.0))?;
-    let store = state.store.clone();
-    let bound = blocking_action(move || store.bind_mailbox(&request)).await?;
+    let bind_state = state.clone();
+    let peer = peer.expect("authorize checked the native peer").0;
+    let bound = blocking_action(move || {
+        if !cfg!(target_os = "linux") { return bind_state.store.bind_mailbox(&request); }
+        authority::with_authority(&bind_state, &request, &peer, |owner| {
+            bind_state.store.bind_mailbox_with_lease(&request, Some(owner))
+        })
+    }).await?;
     signal_local_change(&state);
     Ok(Json(bound))
 }
@@ -37,7 +57,17 @@ pub(super) async fn attachment(
 ) -> Result<Json<crate::mailbox::Attachment>, ApiError> {
     authorize(&fence, peer.as_ref().map(|p| &p.0))?;
     let store = state.store.clone();
+    let checked_state = state.clone();
+    let peer = peer.expect("authorize checked the native peer").0;
     let attached = blocking_action(move || {
+        if store.has_mailbox_lease(&fence)? {
+            authority::with_authority(&checked_state, &fence, &peer, |owner| {
+                if !store.owns_mailbox_lease(&fence, owner)? {
+                    return Err(St3Error::new("stale-mailbox-session", "another process owns this mailbox lease"));
+                }
+                store.check_mailbox(&fence)
+            })?;
+        }
         store.check_mailbox(&fence)?;
         Ok(super::claude_channel_attached(
             &store,
@@ -87,7 +117,7 @@ pub(super) async fn receipt(
             BTreeMap::from([
                 ("status".into(), json!(request.lifecycle)),
                 ("recipient".into(), json!(request.fence.subject)),
-                ("transport".into(), json!(peer.unwrap().0.transport)),
+                ("transport".into(), json!(peer.as_ref().unwrap().0.transport)),
             ])
         } else {
             BTreeMap::from([("status".into(), json!(request.lifecycle))])
@@ -104,9 +134,18 @@ pub(super) async fn receipt(
         )),
     };
     let store = state.store.clone();
+    let checked_state = state.clone();
+    let checked_peer = peer.expect("authorize checked the native peer").0;
     let kind = input.kind.clone();
     let (record, appended, work_wake) = blocking_action(move || {
-        let (record, appended) = store.append_mailbox_receipt_outcome(&input, &request.fence)?;
+        let (record, appended) = if store.has_mailbox_lease(&request.fence)? {
+            authority::with_authority(&checked_state, &request.fence, &checked_peer, |owner| {
+                if !store.owns_mailbox_lease(&request.fence, owner)? {
+                    return Err(St3Error::new("stale-mailbox-session", "another process owns this mailbox lease"));
+                }
+                store.append_mailbox_receipt_outcome(&input, &request.fence)
+            })?
+        } else { store.append_mailbox_receipt_outcome(&input, &request.fence)? };
         // A message this store cannot read is treated as a work wake.
         let work_wake = store
             .message(&input.subject)
@@ -383,8 +422,40 @@ where
 /// Maximum gap between durable change checks, including when a notification is missed.
 const MAILBOX_RECHECK: Duration = Duration::from_secs(30);
 
-async fn stream(state: AppState, fence: Fence, socket: WebSocket) {
-    stream_with_reader(state, fence, socket, raw_snapshot).await;
+async fn stream(state: AppState, fence: Fence, socket: WebSocket, peer: NativeDeliveryPeer) {
+    #[cfg(feature = "test-support")]
+    let mut control = crate::test_support::fixture_mailbox_transport(&state.store, &fence.subject);
+    #[cfg(feature = "test-support")]
+    if fence.component == "delivery" {
+        while *control.borrow_and_update() {
+            if control.changed().await.is_err() { return; }
+        }
+    }
+    let safety = futures_util::stream::unfold(safety_timer(&fence), |mut timer| async move {
+        timer.tick().await;
+        Some(((), timer))
+    });
+    let heartbeat = futures_util::stream::unfold(tokio::time::interval(Duration::from_secs(10)), |mut timer| async move {
+        timer.tick().await;
+        Some(((), timer))
+    });
+    let stream = stream_with_timers_inner(state.clone(), fence.clone(), socket, raw_snapshot, safety, heartbeat, cfg!(target_os = "linux").then(|| peer.clone()));
+    #[cfg(not(feature = "test-support"))]
+    stream.await;
+    #[cfg(feature = "test-support")]
+    tokio::select! {
+        _ = stream => {},
+        _ = async {
+            if fence.component != "delivery" { std::future::pending::<()>().await; }
+            while control.changed().await.is_ok() {
+                if *control.borrow_and_update() { return; }
+            }
+            std::future::pending::<()>().await;
+        } => {},
+    }
+    let _ = crate::api::read_deadline::spawn_blocking(move || {
+        authority::loss_if_current(&state, &fence, &peer)
+    }).await;
 }
 
 fn safety_delay(fence: &Fence) -> Duration {
@@ -408,6 +479,7 @@ fn safety_timer(fence: &Fence) -> tokio::time::Interval {
     timer
 }
 
+#[cfg(test)]
 async fn stream_with_reader<F>(state: AppState, fence: Fence, socket: WebSocket, read: F)
 where
     F: Fn(&Store, &Fence) -> anyhow::Result<Snapshot> + Clone + Send + 'static,
@@ -419,6 +491,7 @@ where
     stream_with_rechecks(state, fence, socket, read, safety).await;
 }
 
+#[cfg(test)]
 async fn stream_with_rechecks<F, S>(
     state: AppState,
     fence: Fence,
@@ -439,13 +512,25 @@ async fn stream_with_rechecks<F, S>(
     stream_with_timers(state, fence, socket, read, safety, heartbeat).await;
 }
 
+#[cfg(test)]
 async fn stream_with_timers<F, S, H>(
     state: AppState,
     fence: Fence,
-    mut socket: WebSocket,
+    socket: WebSocket,
     read: F,
     safety: S,
     heartbeat: H,
+) where
+    F: Fn(&Store, &Fence) -> anyhow::Result<Snapshot> + Clone + Send + 'static,
+    S: futures_util::Stream<Item = ()> + Send + 'static,
+    H: futures_util::Stream<Item = ()> + Send + 'static,
+{
+    stream_with_timers_inner(state, fence, socket, read, safety, heartbeat, None).await;
+}
+
+async fn stream_with_timers_inner<F, S, H>(
+    state: AppState, fence: Fence, mut socket: WebSocket, read: F, safety: S, heartbeat: H,
+    peer: Option<NativeDeliveryPeer>,
 ) where
     F: Fn(&Store, &Fence) -> anyhow::Result<Snapshot> + Clone + Send + 'static,
     S: futures_util::Stream<Item = ()> + Send + 'static,
@@ -463,21 +548,46 @@ async fn stream_with_timers<F, S, H>(
     let mut previous_seat = Vec::new();
     let mut previous_mailbox = Vec::new();
     let mut previous_drain = None;
+    let mut replay_nonce = Fence::new(&fence.subject, &fence.incarnation, "replay").token;
+    let mut replay_challenge_sent = false;
+    let mut replay_supported = false;
+    let mut replay_proven = false;
     let mut recovered = std::collections::BTreeSet::new();
     let mut policy_rechecks = std::collections::BTreeSet::new();
     let mut dirty = true;
     let mut last: Option<(crate::store::MailboxWatermark, Snapshot)> = None;
     loop {
         if dirty {
+            // A later close notification may record another loss after this connection's
+            // first proof. Durable wakes (and the bounded safety heartbeat) let its current
+            // consumed nonce repair that episode too, without reoffering native work.
+            replay_proven = false;
             let store = state.store.clone();
             let binding = fence.clone();
             let read = read.clone();
             subscription.changed.borrow_and_update();
             let mut admitted = recovered.clone();
             let mut policies = policy_rechecks.clone();
-            let previous = last.take();
+            let mut previous = last.take();
+            let repair_state = state.clone();
+            let repair_peer = peer.clone();
             let result = crate::api::read_deadline::spawn_blocking(move || {
                 crate::profile::task("task mailbox-update", || {
+                    let mut repaired = false;
+                    if let Some(peer) = &repair_peer
+                        && store.check_mailbox(&binding).is_err()
+                    {
+                        let _ = authority::loss_if_current(&repair_state, &binding, peer);
+                        let repair = authority::with_authority(&repair_state, &binding, peer, |owner| {
+                            store.repair_mailbox(&binding, owner)
+                        });
+                        if matches!(repair, Ok(true)) {
+                            repaired = true;
+                            // Keep the original connection admission floor and stable mail keys.
+                            // Rebuild only the durable snapshot after canonical lease restoration.
+                            previous = None;
+                        }
+                    }
                     let result = update_snapshot(
                         &store,
                         &binding,
@@ -487,17 +597,23 @@ async fn stream_with_timers<F, S, H>(
                         &mut admitted,
                         &mut policies,
                     );
-                    (result, admitted, policies)
+                    (result, admitted, policies, repaired)
                 })
             })
             .await;
             let (mark, (seat, mut messages), updated) = match result {
-                Ok((Ok(snapshot), admitted, policies)) => {
+                Ok((Ok(snapshot), admitted, policies, repaired)) => {
+                    if repaired {
+                        previous_mailbox.clear();
+                        replay_nonce = Fence::new(&fence.subject, &fence.incarnation, "replay").token;
+                        replay_challenge_sent = false;
+                        replay_proven = false;
+                    }
                     recovered = admitted;
                     policy_rechecks = policies;
                     snapshot
                 }
-                Ok((Err(error), _, _)) => {
+                Ok((Err(error), _, _, _)) => {
                     if error
                         .downcast_ref::<St3Error>()
                         .is_some_and(|error| error.code == "stale-mailbox-session")
@@ -555,6 +671,10 @@ async fn stream_with_timers<F, S, H>(
                 }
                 previous_mailbox = bytes;
             }
+            if fence.component == "delivery" && replay_supported && !replay_challenge_sent {
+                if send(&mut socket, &Frame::Replay { nonce: replay_nonce.clone() }).await.is_err() { return; }
+                replay_challenge_sent = true;
+            }
             if fence.component == "delivery" {
                 let drain = state
                     .store
@@ -586,7 +706,33 @@ async fn stream_with_timers<F, S, H>(
             incoming = socket.recv() => match incoming {
                 Some(Ok(WsMessage::Text(report))) => {
                     if state.store.check_mailbox(&fence).is_ok() {
-                        delivery_presence::record_fenced(&fence, &report);
+                        let authenticated = if let Some(peer) = peer.clone() {
+                            let checked_state = state.clone();
+                            let binding = fence.clone();
+                            let raw = report.to_string();
+                            matches!(crate::api::read_deadline::spawn_blocking(move || {
+                                authority::admit_report(&checked_state, &binding, &peer, &raw)
+                            }).await, Ok(Ok(())))
+                        } else { true };
+                        let recorded = authenticated && delivery_presence::record_fenced(&fence, &report);
+                        let value = serde_json::from_str::<Value>(&report).unwrap_or(Value::Null);
+                        replay_supported |= peer.is_some() && value["mailbox_replay_ack"] == true;
+                        if fence.component == "delivery" && replay_supported && !previous_mailbox.is_empty() && !replay_challenge_sent {
+                            if send(&mut socket, &Frame::Replay { nonce: replay_nonce.clone() }).await.is_err() { return; }
+                            replay_challenge_sent = true;
+                        }
+                        if recorded && !replay_proven && replay_challenge_sent
+                            && value["mailbox_replay_nonce"].as_str() == Some(&replay_nonce)
+                            && value["ready"] == true
+                            && let Some(peer) = peer.clone()
+                        {
+                            let repair_state = state.clone();
+                            let binding = fence.clone();
+                            let raw = report.to_string();
+                            replay_proven = matches!(crate::api::read_deadline::spawn_blocking(move || {
+                                authority::repair_proven(&repair_state, &binding, &peer, &raw)
+                            }).await, Ok(Ok(())));
+                        }
                         if let Ok(value) = serde_json::from_str::<Value>(&report)
                             && fence.component == "delivery"
                             && let Some(id) = value["drain_operation"].as_str()

@@ -19747,6 +19747,9 @@ async fn run_pi_channel(
                         state.failed_diagnostics.retain(|message| active.contains(message));
                         pushed_messages = messages;
                     },
+                    Some(st3::mailbox::Frame::Replay { nonce }) => {
+                        if let Some(subscription) = &subscription { subscription.acknowledge_replay(nonce); }
+                    },
                     Some(st3::mailbox::Frame::Drain { operation }) => {
                         if let Some(subscription) = &subscription { subscription.acknowledge_drain(operation); }
                     },
@@ -22253,6 +22256,10 @@ impl NativeMailbox {
     }
     fn accept(&mut self, frame: Option<st3::mailbox::Frame>, runtime_id: &str) -> Result<()> {
         match frame {
+            Some(st3::mailbox::Frame::Replay { nonce }) => {
+                if let Some(subscription) = &self.subscription { subscription.acknowledge_replay(nonce); }
+                Ok(())
+            }
             Some(st3::mailbox::Frame::Drain { operation }) => {
                 if let Some(subscription) = &self.subscription {
                     subscription.acknowledge_drain(operation);

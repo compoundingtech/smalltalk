@@ -1,0 +1,807 @@
+//! A channel binding is a connection capability, not authority to replace a live session.
+use super::*;
+use crate::mailbox::{Authority, Fence};
+use crate::model::MemberSpec;
+
+fn lease(
+    connection: &Connection,
+    fence: &Fence,
+) -> Result<Option<(Fence, Authority, bool)>, St3Error> {
+    connection
+        .prepare_cached(
+            "SELECT incarnation,token,epoch,provider,session,sequence,pid,process_token,revoked
+         FROM local_mailbox_leases WHERE subject=?1 AND component=?2",
+        )
+        .map_err(internal)?
+        .query_row(params![fence.subject, fence.component], |row| {
+            Ok((
+                Fence {
+                    subject: fence.subject.clone(),
+                    component: fence.component.clone(),
+                    incarnation: row.get(0)?,
+                    token: row.get(1)?,
+                    epoch: row.get(2)?,
+                },
+                Authority {
+                    provider: row.get(3)?,
+                    session: row.get(4)?,
+                    sequence: row.get(5)?,
+                    pid: row.get(6)?,
+                    process_token: row.get::<_, String>(7)?.parse().unwrap_or(0),
+                },
+                row.get(8)?,
+            ))
+        })
+        .optional()
+        .map_err(internal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn authority(sequence: u64) -> Authority {
+        Authority {
+            provider: "omp".into(),
+            session: format!("provider-{sequence}"),
+            sequence,
+            pid: std::process::id(),
+            process_token: st_runtime::process_start_token(std::process::id()).unwrap(),
+        }
+    }
+    fn request() -> Fence {
+        Fence::new("agent/eval.worker", "current", "delivery")
+    }
+    fn declare(store: &Store) {
+        let intent = crate::graph::parse_intent("version 2\nagent \"eval.worker\" { host \"node\"; workspace \"/tmp\"; harness \"omp\" {} }", "node").unwrap();
+        store.apply_internal(&intent, "lease-fixture").unwrap();
+    }
+    fn fixture() -> Store {
+        let store = Store::open_memory("node").unwrap();
+        declare(&store);
+        crate::mailbox::tests::ready(&store, "current");
+        store
+    }
+
+    #[test]
+    fn live_duplicates_and_pid_reuse_cannot_replace_or_receive_the_lease() {
+        let store = fixture();
+        let authority = authority(1);
+        let request = request();
+        let bound = store
+            .bind_mailbox_with_lease(&request, Some(&authority))
+            .unwrap();
+        for _ in 0..3 {
+            let duplicate = self::request();
+            assert_eq!(
+                store
+                    .bind_mailbox_with_lease(&duplicate, Some(&authority))
+                    .unwrap_err()
+                    .code,
+                "stale-mailbox-session"
+            );
+            let bindings: u64 = store
+                .connection
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM local_mailbox_bindings", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(bindings, 1);
+            store.check_mailbox(&bound).unwrap();
+        }
+        let mut reused = authority.clone();
+        reused.process_token += 1;
+        assert!(
+            store
+                .bind_mailbox_with_lease(&request, Some(&reused))
+                .is_err()
+        );
+        assert!(store.repair_mailbox(&bound, &reused).is_err());
+        assert_eq!(
+            store
+                .bind_mailbox_with_lease(&request, Some(&authority))
+                .unwrap()
+                .epoch,
+            bound.epoch
+        );
+    }
+
+    #[test]
+    fn repair_retains_exact_capability_but_never_rewinds_a_successor_or_revocation() {
+        let store = fixture();
+        let first = authority(1);
+        let bound = store
+            .bind_mailbox_with_lease(&request(), Some(&first))
+            .unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM local_mailbox_owners", [])
+            .unwrap();
+        assert!(store.check_mailbox(&bound).is_err());
+        assert!(store.repair_mailbox(&bound, &first).unwrap());
+        assert!(!store.repair_mailbox(&bound, &first).unwrap());
+        store.check_mailbox(&bound).unwrap();
+        let successor = store
+            .bind_mailbox_with_lease(&request(), Some(&authority(2)))
+            .unwrap();
+        assert_eq!(successor.epoch, bound.epoch + 1);
+        assert!(store.repair_mailbox(&bound, &first).is_err());
+        assert!(store.bind_mailbox_with_lease(&bound, Some(&first)).is_err());
+        store.check_mailbox(&successor).unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM local_mailbox_bindings WHERE token=?1",
+                [&successor.token],
+            )
+            .unwrap();
+        assert!(store.repair_mailbox(&successor, &authority(2)).is_err());
+        let mut unbound = successor.clone();
+        unbound.epoch = 0;
+        assert!(
+            store
+                .bind_mailbox_with_lease(&unbound, Some(&authority(2)))
+                .is_err(),
+            "a revoked token cannot allocate again"
+        );
+    }
+
+    #[test]
+    fn dead_channel_successor_preserves_provider_session_and_retires_old_capability() {
+        let store = fixture();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut predecessor = authority(1);
+        predecessor.pid = child.id();
+        predecessor.process_token = st_runtime::process_start_token(child.id()).unwrap();
+        let old = store
+            .bind_mailbox_with_lease(&request(), Some(&predecessor))
+            .unwrap();
+        assert!(
+            store
+                .bind_mailbox_with_lease(&request(), Some(&authority(1)))
+                .is_err()
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let new = store
+            .bind_mailbox_with_lease(&request(), Some(&authority(1)))
+            .unwrap();
+        assert_eq!(new.epoch, old.epoch + 1);
+        assert!(store.repair_mailbox(&old, &predecessor).is_err());
+        assert!(
+            store
+                .bind_mailbox_with_lease(&old, Some(&predecessor))
+                .is_err()
+        );
+        store.check_mailbox(&new).unwrap();
+    }
+
+    #[test]
+    fn persisted_canonical_lease_survives_store_reopen_and_rejects_completed_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fixture.sqlite");
+        let bound = {
+            let store = Store::open(&path, "node").unwrap();
+            declare(&store);
+            crate::mailbox::tests::ready(&store, "current");
+            store
+                .bind_mailbox_with_lease(&request(), Some(&authority(1)))
+                .unwrap()
+        };
+        let store = Store::open(&path, "node").unwrap();
+        assert_eq!(
+            store
+                .bind_mailbox_with_lease(&bound, Some(&authority(1)))
+                .unwrap()
+                .epoch,
+            bound.epoch
+        );
+        assert!(
+            store
+                .bind_mailbox_with_lease(&request(), Some(&authority(1)))
+                .is_err()
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: bound.subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: Some(bound.subject.clone()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("exited")),
+                    ("incarnation_id".into(), json!("current")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert!(store.repair_mailbox(&bound, &authority(1)).is_err());
+        assert!(
+            store
+                .bind_mailbox_with_lease(&request(), Some(&authority(1)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bootstrap_promotion_keeps_capability_and_cannot_undo_provider_takeover() {
+        let store = fixture();
+        let intent = crate::graph::parse_intent("version 2\nagent \"eval.worker\" { host \"node\"; workspace \"/tmp\"; harness \"codex\" {} }", "node").unwrap();
+        store
+            .apply_internal(&intent, "codex-bootstrap-fixture")
+            .unwrap();
+        let mut bootstrap = authority(1);
+        bootstrap.provider = "codex".into();
+        bootstrap.session = "runtime:current".into();
+        bootstrap.sequence = 0;
+        let bound = store
+            .bind_mailbox_with_lease(&request(), Some(&bootstrap))
+            .unwrap();
+        assert!(
+            store
+                .bind_mailbox_with_lease(&request(), Some(&bootstrap))
+                .is_err()
+        );
+        let mut provider = authority(1);
+        provider.provider = "codex".into();
+        let mut wrong_birth = provider.clone();
+        wrong_birth.process_token += 1;
+        assert!(
+            store
+                .promote_mailbox_bootstrap(&bound, &wrong_birth)
+                .is_err()
+        );
+        store.promote_mailbox_bootstrap(&bound, &provider).unwrap();
+        assert_eq!(
+            store.mailbox_lease_authority(&bound).unwrap(),
+            Some(provider.clone())
+        );
+        let reconnect = store
+            .bind_mailbox_with_lease(&bound, Some(&provider))
+            .unwrap();
+        assert_eq!(
+            (reconnect.token, reconnect.epoch),
+            (bound.token.clone(), bound.epoch)
+        );
+        assert!(
+            store
+                .bind_mailbox_with_lease(&bound, Some(&bootstrap))
+                .is_err()
+        );
+        let mut successor = authority(2);
+        successor.provider = "codex".into();
+        let new = store
+            .bind_mailbox_with_lease(&request(), Some(&successor))
+            .unwrap();
+        assert!(
+            store
+                .bind_mailbox_with_lease(&bound, Some(&provider))
+                .is_err()
+        );
+        store.promote_mailbox_bootstrap(&bound, &provider).unwrap();
+        assert_eq!(
+            store.mailbox_lease_authority(&new).unwrap(),
+            Some(successor)
+        );
+        store.check_mailbox(&new).unwrap();
+    }
+
+    #[test]
+    fn delivery_and_title_have_independent_custody_and_provider_mismatch_is_terminal() {
+        let store = fixture();
+        let owner = authority(1);
+        let delivery = store
+            .bind_mailbox_with_lease(&request(), Some(&owner))
+            .unwrap();
+        let title_request = Fence::new("agent/eval.worker", "current", "title");
+        let title = store
+            .bind_mailbox_with_lease(&title_request, Some(&owner))
+            .unwrap();
+        assert_eq!(title.epoch, 1);
+        store.check_mailbox(&delivery).unwrap();
+        store.check_mailbox(&title).unwrap();
+        let mut wrong = authority(2);
+        wrong.provider = "claude".into();
+        assert!(
+            store
+                .bind_mailbox_with_lease(&request(), Some(&wrong))
+                .is_err()
+        );
+        let mut wrong_runtime = request();
+        wrong_runtime.incarnation = "retired".into();
+        assert!(
+            store
+                .bind_mailbox_with_lease(&wrong_runtime, Some(&owner))
+                .is_err()
+        );
+        store.check_mailbox(&delivery).unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE local_mailbox_leases SET revoked=1 WHERE component='delivery'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .bind_mailbox_with_lease(&delivery, Some(&owner))
+                .is_err()
+        );
+        assert!(store.repair_mailbox(&delivery, &owner).is_err());
+        store.check_mailbox(&title).unwrap();
+    }
+
+    #[test]
+    fn intentional_stop_cannot_become_automatic_repair_or_new_admission() {
+        let store = fixture();
+        let owner = authority(1);
+        let fence = store
+            .bind_mailbox_with_lease(&request(), Some(&owner))
+            .unwrap();
+        let stopped =
+            crate::graph::parse_intent("version 2\nstop \"agent/eval.worker\"", "node").unwrap();
+        store
+            .apply_internal(&stopped, "intentional-stop-fixture")
+            .unwrap();
+        assert!(
+            store.check_mailbox(&fence).is_err(),
+            "a live wrapper must not read after intentional stop"
+        );
+        assert!(store.mailbox_session_active(&fence, &owner).is_err());
+        assert!(store.repair_mailbox(&fence, &owner).is_err());
+        assert!(
+            store
+                .bind_mailbox_with_lease(&request(), Some(&authority(2)))
+                .is_err()
+        );
+    }
+}
+
+fn refused(reason: &str) -> St3Error {
+    St3Error::new("stale-mailbox-session", reason)
+}
+
+pub(super) fn check_lease_fence(connection: &Connection, fence: &Fence) -> Result<(), St3Error> {
+    let Some((held, owner, revoked)) = lease(connection, fence)? else {
+        return Ok(());
+    };
+    if revoked
+        || held.token != fence.token
+        || held.epoch != fence.epoch
+        || held.incarnation != fence.incarnation
+    {
+        return Err(refused("the authenticated lease was superseded or revoked"));
+    }
+    let desired = current_desired_row(connection, &fence.subject)
+        .map_err(internal)?
+        .ok_or_else(|| refused("the seat is no longer declared"))?;
+    let member: Option<MemberSpec> = desired
+        .member
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(internal)?;
+    if desired.kind == "stop"
+        || member.as_ref().is_none_or(|member| {
+            member.driver.as_deref() != Some(&owner.provider)
+                || member
+                    .terminal_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.agent_incarnation() != fence.incarnation)
+        })
+    {
+        return Err(refused(
+            "the lease's declared provider was stopped or replaced",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn check_declaration(
+    connection: &Connection,
+    fence: &Fence,
+    authority: &Authority,
+    host: &str,
+) -> Result<(), St3Error> {
+    let declared = current_desired_row(connection, &fence.subject)
+        .map_err(internal)?
+        .ok_or_else(|| refused("the seat is no longer declared"))?;
+    let member: MemberSpec = declared
+        .member
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(internal)?
+        .ok_or_else(|| refused("the seat is intentionally stopped"))?;
+    if declared.kind == "stop"
+        || member.driver.as_deref() != Some(&authority.provider)
+        || member.host != host
+        || member
+            .terminal_binding
+            .as_ref()
+            .is_some_and(|binding| binding.agent_incarnation() != fence.incarnation)
+    {
+        return Err(refused(
+            "the seat is stopped, moved or belongs to another provider",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn admit(
+    connection: &Connection,
+    request: &Fence,
+    authority: &Authority,
+) -> Result<(), St3Error> {
+    admit_with_probe(connection, request, authority, |owner| {
+        st_runtime::process_start_token(owner.pid).is_ok_and(|token| token == owner.process_token)
+    })
+}
+
+fn admit_with_probe(
+    connection: &Connection,
+    request: &Fence,
+    authority: &Authority,
+    alive: impl FnOnce(&Authority) -> bool,
+) -> Result<(), St3Error> {
+    if authority.session.is_empty()
+        || (authority.sequence == 0
+            && (authority.provider != "codex"
+                || request.component != "delivery"
+                || authority.session != format!("runtime:{}", request.incarnation)))
+        || authority.sequence > i64::MAX as u64
+    {
+        return Err(refused("missing authenticated provider ownership"));
+    }
+    let Some((owner, prior, revoked)) = lease(connection, request)? else {
+        return Ok(());
+    };
+    if owner.incarnation != request.incarnation {
+        return Ok(());
+    }
+    if revoked {
+        return Err(refused("the mailbox lease was revoked"));
+    }
+    let bootstrap_promotion = prior.sequence == 0
+        && authority.sequence > 0
+        && prior.provider == authority.provider
+        && prior.pid == authority.pid
+        && prior.process_token == authority.process_token;
+    if request.token == owner.token && (*authority == prior || bootstrap_promotion) {
+        let bound: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_mailbox_bindings WHERE token=?1)",
+                [&request.token],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        return if bound {
+            Ok(())
+        } else {
+            Err(refused("the binding token was revoked"))
+        };
+    }
+    // Only a captured newer provider record, or a provably dead channel process, replaces
+    // custody. A duplicate attachment in the same session cannot silence the live channel.
+    if authority.provider != prior.provider
+        || authority.sequence < prior.sequence
+        || (authority.sequence == prior.sequence
+            && (authority.session != prior.session || alive(&prior)))
+    {
+        return Err(refused(
+            "another live channel holds this provider session's lease",
+        ));
+    }
+    // Old capabilities remain terminal even after the old process disappears.
+    if request.epoch != 0 {
+        return Err(refused(
+            "a retired binding cannot acquire a successor lease",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn record(
+    connection: &Connection,
+    fence: &Fence,
+    authority: &Authority,
+) -> Result<(), St3Error> {
+    connection
+        .execute(
+            "INSERT INTO local_mailbox_leases VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0)
+         ON CONFLICT(subject,component) DO UPDATE SET incarnation=excluded.incarnation,
+         provider=excluded.provider,session=excluded.session,sequence=excluded.sequence,
+         pid=excluded.pid,process_token=excluded.process_token,token=excluded.token,
+         epoch=excluded.epoch,revoked=0",
+            params![
+                fence.subject,
+                fence.component,
+                fence.incarnation,
+                authority.provider,
+                authority.session,
+                authority.sequence,
+                authority.pid,
+                authority.process_token.to_string(),
+                fence.token,
+                fence.epoch
+            ],
+        )
+        .map_err(internal)?;
+    Ok(())
+}
+
+impl Store {
+    pub(crate) fn mailbox_failure_episode(
+        &self,
+        fence: &Fence,
+        episode: &str,
+    ) -> Result<Option<(String, bool)>, St3Error> {
+        let connection = self.readers.get();
+        let latest: Option<String> = connection
+            .prepare_cached(&canonical_sql(
+                "SELECT id FROM claims WHERE subject=?1 AND kind='operational.failure'
+             AND json_extract(body,'$.fields.episode')=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+            ))
+            .map_err(internal)?
+            .query_row(params![fence.subject, episode], |row| row.get(0))
+            .optional()
+            .map_err(internal)?;
+        let Some(failure) = latest else {
+            return Ok(None);
+        };
+        let recovered: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='operational.recovered'
+             AND json_extract(body,'$.fields.failure')=?2)", params![fence.subject, failure], |row| row.get(0),
+        ).map_err(internal)?;
+        Ok(Some((failure, !recovered)))
+    }
+
+    /// The caller holds the provider ownership lock. Recheck physical/declaration and
+    /// canonical custody inside the same Store writer transaction as fault publication.
+    pub(crate) fn append_mailbox_lease_claim(
+        &self,
+        fence: &Fence,
+        owner: &Authority,
+        input: &ClaimInput,
+        repaired: bool,
+    ) -> Result<ClaimRecord, St3Error> {
+        let admission = |connection: &Connection| {
+            check_mailbox_incarnation(connection, fence)?;
+            check_declaration(connection, fence, owner, &self.origin)?;
+            let Some((held, authority, revoked)) = lease(connection, fence)? else {
+                return Err(refused("fault publication lost canonical custody"));
+            };
+            if revoked
+                || held.token != fence.token
+                || held.epoch != fence.epoch
+                || held.incarnation != fence.incarnation
+                || authority != *owner
+            {
+                return Err(refused("fault publication belongs to a retired lease"));
+            }
+            if repaired {
+                check_mailbox_fence(connection, fence)?;
+            }
+            if let Some(revision) = input.fields.get("source_revision").and_then(Value::as_str)
+                && current_desired_row(connection, &fence.subject)
+                    .map_err(internal)?
+                    .is_none_or(|row| row.claim_id != revision)
+            {
+                return Err(refused("the fault's configured owner declaration changed"));
+            }
+            Ok(())
+        };
+        append_claim_with_admission(&self.graph, input, None, None, None, None, Some(&admission))
+            .map(|(claim, _)| claim)
+    }
+    /// The Codex wrapper binds before launching its provider. Promote only its exact
+    /// physical bootstrap custody, under the caller's current provider ownership lock.
+    pub(crate) fn promote_mailbox_bootstrap(
+        &self,
+        fence: &Fence,
+        authority: &Authority,
+    ) -> Result<(), St3Error> {
+        let mut connection = self.connection.write();
+        let tx = connection.transaction().map_err(internal)?;
+        let Some((held, prior, revoked)) = lease(&tx, fence)? else {
+            return Ok(());
+        };
+        if prior.sequence != 0 || authority.sequence == 0 {
+            return Ok(());
+        }
+        if held.incarnation != fence.incarnation
+            || held.token != fence.token
+            || held.epoch != fence.epoch
+        {
+            return Ok(());
+        }
+        if revoked
+            || prior.pid != authority.pid
+            || prior.process_token != authority.process_token
+            || prior.provider != authority.provider
+        {
+            return Err(refused(
+                "bootstrap custody belongs to another physical process",
+            ));
+        }
+        check_mailbox_incarnation(&tx, fence)?;
+        check_mailbox_fence(&tx, fence)?;
+        check_declaration(&tx, fence, authority, &self.origin)?;
+        record(&tx, fence, authority)?;
+        tx.commit().map_err(internal)
+    }
+    pub(crate) fn mailbox_lease_authority(
+        &self,
+        fence: &Fence,
+    ) -> Result<Option<Authority>, St3Error> {
+        Ok(
+            lease(&self.readers.get(), fence)?.and_then(|(held, owner, _)| {
+                (held.incarnation == fence.incarnation
+                    && held.token == fence.token
+                    && held.epoch == fence.epoch)
+                    .then_some(owner)
+            }),
+        )
+    }
+
+    pub(crate) fn mailbox_session_active(
+        &self,
+        fence: &Fence,
+        authority: &Authority,
+    ) -> Result<(), St3Error> {
+        let connection = self.readers.get();
+        check_mailbox_incarnation(&connection, fence)?;
+        check_declaration(&connection, fence, authority, &self.origin)
+    }
+
+    pub(crate) fn has_mailbox_lease(&self, fence: &Fence) -> Result<bool, St3Error> {
+        Ok(lease(&self.readers.get(), fence)?.is_some())
+    }
+
+    /// Captured public-card fault source, bounded to the selected subjects and cut.
+    pub(crate) fn mailbox_faults_for(
+        &self,
+        subjects: &[String],
+        index: u64,
+    ) -> Result<BTreeMap<String, String>> {
+        let connection = self.readers.get();
+        let mut faults = BTreeMap::new();
+        for subject in subjects {
+            let latest: Option<(String, String)> = connection.prepare_cached(&canonical_sql(
+                "SELECT id,body FROM claims WHERE subject=?1 AND kind='operational.failure'
+                 AND store_index<=?2 AND json_extract(body,'$.fields.condition')='mailbox-channel-lost'
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+            ))?.query_row(params![subject,index], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+            let Some((claim, body)) = latest else {
+                continue;
+            };
+            let resolved: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='operational.recovered'
+                 AND store_index<=?2 AND json_extract(body,'$.fields.failure')=?3)",
+                params![subject,index,claim], |row| row.get(0),
+            )?;
+            if !resolved {
+                let body: Value = serde_json::from_str(&body)?;
+                // Faults do not survive genuine runtime replacement on the current card.
+                let runtime: Option<String> = connection
+                    .prepare_cached(&format!(
+                        "{} LIMIT 1",
+                        newest_claims_of_kind_query("claims.body", "runtime.observed"),
+                    ))?
+                    .query_row(params![subject, index], |row| row.get(0))
+                    .optional()?;
+                let runtime: Value = runtime
+                    .map(|body| serde_json::from_str(&body))
+                    .transpose()?
+                    .unwrap_or(Value::Null);
+                let fields = runtime.get("fields").unwrap_or(&runtime);
+                if fields["status"] == "running"
+                    && fields["incarnation_id"] == body["fields"]["incarnation"]
+                {
+                    faults.insert(
+                        subject.clone(),
+                        body["fields"]["reason"]
+                            .as_str()
+                            .unwrap_or("mailbox channel lost")
+                            .into(),
+                    );
+                }
+            }
+        }
+        Ok(faults)
+    }
+
+    pub(crate) fn owns_mailbox_lease(
+        &self,
+        fence: &Fence,
+        authority: &Authority,
+    ) -> Result<bool, St3Error> {
+        Ok(
+            lease(&self.readers.get(), fence)?.is_some_and(|(held, owner, _)| {
+                held.incarnation == fence.incarnation
+                    && held.token == fence.token
+                    && held.epoch == fence.epoch
+                    && owner == *authority
+            }),
+        )
+    }
+
+    /// Repair only the exact canonical lease. Never mint a token or advance an epoch.
+    /// Deleting/revoking a binding is terminal; only displacement of its owner is repairable.
+    pub(crate) fn repair_mailbox(
+        &self,
+        fence: &Fence,
+        authority: &Authority,
+    ) -> Result<bool, St3Error> {
+        let mut connection = self.connection.write();
+        let tx = connection.transaction().map_err(internal)?;
+        check_mailbox_incarnation(&tx, fence)?;
+        check_declaration(&tx, fence, authority, &self.origin)?;
+        let Some((owner, held, revoked)) = lease(&tx, fence)? else {
+            return Err(refused("this binding has no authenticated recovery lease"));
+        };
+        if revoked
+            || owner.token != fence.token
+            || owner.epoch != fence.epoch
+            || owner.incarnation != fence.incarnation
+            || held != *authority
+        {
+            return Err(refused(
+                "the authenticated mailbox lease is superseded or revoked",
+            ));
+        }
+        let binding: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_mailbox_bindings WHERE token=?1 AND
+             subject=?2 AND component=?3 AND incarnation=?4 AND epoch=?5)",
+                params![
+                    fence.token,
+                    fence.subject,
+                    fence.component,
+                    fence.incarnation,
+                    fence.epoch
+                ],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if !binding {
+            return Err(refused("the binding token was revoked"));
+        }
+        if check_mailbox_fence(&tx, fence).is_ok() {
+            return Ok(false);
+        }
+        let owner_epoch: Option<u64> = tx
+            .query_row(
+                "SELECT epoch FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
+                params![fence.subject, fence.component],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        if owner_epoch.is_some() {
+            return Err(refused("a successor owner cannot be rewound by recovery"));
+        }
+        tx.execute(
+            "INSERT INTO local_mailbox_owners VALUES (?1,?2,?3,?4)
+             ON CONFLICT(subject,component) DO UPDATE SET incarnation=excluded.incarnation,epoch=excluded.epoch",
+            params![fence.subject,fence.component,fence.incarnation,fence.epoch],
+        ).map_err(internal)?;
+        check_mailbox_fence(&tx, fence)?;
+        tx.commit().map_err(internal)?;
+        if let Some(wakes) = self.smalltalk.mailbox_wakes.get() {
+            wakes.owner_changed(&fence.subject, &fence.component);
+        }
+        Ok(true)
+    }
+}

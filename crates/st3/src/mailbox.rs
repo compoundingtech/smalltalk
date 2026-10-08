@@ -15,6 +15,17 @@ pub struct Fence {
     pub token: String,
 }
 
+/// Captured by the daemon from its authenticated Unix peer, never from a request body.
+/// Provider ownership comes from the current driver record under the runtime's paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Authority {
+    pub provider: String,
+    pub session: String,
+    pub sequence: u64,
+    pub pid: u32,
+    pub process_token: u64,
+}
+
 impl Fence {
     pub fn new(subject: &str, incarnation: &str, component: &str) -> Self {
         let mut token = [0_u8; 16];
@@ -87,6 +98,8 @@ pub enum Frame {
     Fenced {
         reason: String,
     },
+    /// Ordered after the mailbox snapshot; only its consumer can acknowledge this nonce.
+    Replay { nonce: String },
     /// Ordered after the gated mailbox snapshot. The delivery loop acknowledges consumption.
     Drain {
         operation: Option<String>,
@@ -119,7 +132,8 @@ impl Drop for Subscription {
     }
 }
 impl Subscription {
-    pub fn start(client: crate::client::Client, fence: Fence, report: Value) -> Self {
+    pub fn start(client: crate::client::Client, fence: Fence, mut report: Value) -> Self {
+        report["mailbox_replay_ack"] = serde_json::json!(true);
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let (report_tx, mut report_rx) = tokio::sync::watch::channel(report);
         let task = tokio::spawn(async move {
@@ -155,6 +169,14 @@ impl Subscription {
                         }
                     }
                 }.await;
+                if let Err(error) = &result
+                    && matches!(crate::client::api_error_code(error), Some(
+                        "stale-mailbox-session" | "foreign-mailbox" | "unbound-mailbox" | "invalid-mailbox-token"
+                    ))
+                {
+                    let _ = sender.send(Frame::Fenced { reason: error.to_string() }).await;
+                    return;
+                }
                 if result.is_ok() || sender.is_closed() {
                     return;
                 }
@@ -168,14 +190,21 @@ impl Subscription {
             task,
         }
     }
+    pub fn acknowledge_replay(&self, nonce: String) {
+        self.report.send_modify(|report| report["mailbox_replay_nonce"] = serde_json::json!(nonce));
+    }
     pub fn acknowledge_drain(&self, operation: Option<String>) {
         self.report.send_modify(|report| {
             report["drain_operation"] = serde_json::json!(operation);
         });
     }
     pub fn report(&self, mut value: Value) {
-        value["drain_operation"] = self.report.borrow()["drain_operation"].clone();
-        self.report.send_replace(value);
+        value["mailbox_replay_ack"] = serde_json::json!(true);
+        self.report.send_modify(|current| {
+            value["mailbox_replay_nonce"] = current["mailbox_replay_nonce"].clone();
+            value["drain_operation"] = current["drain_operation"].clone();
+            *current = value;
+        });
     }
 }
 

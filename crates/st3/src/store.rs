@@ -7,6 +7,7 @@ mod arrangements_tests;
 mod glasses;
 pub(crate) mod mailbox_wakes;
 mod mailbox_changes;
+mod mailbox_lease;
 pub mod owned_sets;
 #[cfg(test)]
 mod owned_sets_tests;
@@ -598,6 +599,21 @@ CREATE TABLE IF NOT EXISTS local_mailbox_bindings (
     component TEXT NOT NULL,
     incarnation TEXT NOT NULL,
     epoch INTEGER NOT NULL
+);
+-- Authenticated process/session custody, independent of the connection binding.
+CREATE TABLE IF NOT EXISTS local_mailbox_leases (
+    subject TEXT NOT NULL,
+    component TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    session TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    pid INTEGER NOT NULL,
+    process_token TEXT NOT NULL,
+    token TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(subject, component)
 );
 CREATE TABLE IF NOT EXISTS local_work_lease_renewals (
     subject TEXT PRIMARY KEY,
@@ -15812,11 +15828,27 @@ impl Store {
         &self,
         request: &crate::mailbox::Fence,
     ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_lease(request, None)
+    }
+
+    pub(crate) fn bind_mailbox_with_lease(
+        &self,
+        request: &crate::mailbox::Fence,
+        authority: Option<&crate::mailbox::Authority>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
         let mut connection = self.connection.write();
         let tx = connection.transaction().map_err(internal)?;
         check_mailbox_incarnation(&tx, request)?;
+        if let Some(authority) = authority {
+            mailbox_lease::check_declaration(&tx, request, authority, &self.origin)?;
+            mailbox_lease::admit(&tx, request, authority)?;
+        }
         if request.epoch != 0 {
             check_mailbox_fence(&tx, request)?;
+            if let Some(authority) = authority {
+                mailbox_lease::record(&tx, request, authority)?;
+                tx.commit().map_err(internal)?;
+            }
             return Ok(request.clone());
         }
         if request.token.is_empty() || request.token.len() > 128 {
@@ -15846,6 +15878,10 @@ impl Store {
             bound.epoch = epoch;
             // Retired tokens cannot allocate another epoch and retake their successor's mailbox.
             check_mailbox_fence(&tx, &bound)?;
+            if let Some(authority) = authority {
+                mailbox_lease::record(&tx, &bound, authority)?;
+                tx.commit().map_err(internal)?;
+            }
             return Ok(bound);
         }
         let previous: Option<u64> = tx
@@ -15875,6 +15911,9 @@ impl Store {
         tx.execute("INSERT INTO local_mailbox_owners VALUES (?1,?2,?3,?4)
             ON CONFLICT(subject,component) DO UPDATE SET incarnation=excluded.incarnation, epoch=excluded.epoch",
             params![bound.subject, bound.component, bound.incarnation, bound.epoch]).map_err(internal)?;
+        if let Some(authority) = authority {
+            mailbox_lease::record(&tx, &bound, authority)?;
+        }
         tx.commit().map_err(internal)?;
         if let Some(wakes) = self.smalltalk.mailbox_wakes.get() {
             wakes.owner_changed(&bound.subject, &bound.component);
@@ -21292,6 +21331,7 @@ fn check_mailbox_fence(
     fence: &crate::mailbox::Fence,
 ) -> Result<(), St3Error> {
     check_mailbox_incarnation(connection, fence)?;
+    mailbox_lease::check_lease_fence(connection, fence)?;
     let owner: Option<(String, u64)> = connection
         .prepare_cached(
             "SELECT owner.incarnation, owner.epoch FROM local_mailbox_owners owner
@@ -53740,6 +53780,18 @@ fn append_claim_with_subject_fences(
     expected_subjects: Option<&BTreeMap<String, String>>,
     observer_completion: Option<(&str, &str, &(dyn Fn() -> bool + Sync))>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    append_claim_with_admission(graph, input, fence, event_runtime, expected_subjects, observer_completion, None)
+}
+
+fn append_claim_with_admission(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    fence: Option<&crate::mailbox::Fence>,
+    event_runtime: Option<&str>,
+    expected_subjects: Option<&BTreeMap<String, String>>,
+    observer_completion: Option<(&str, &str, &(dyn Fn() -> bool + Sync))>,
+    admission: Option<&(dyn Fn(&Connection) -> Result<(), St3Error> + Sync)>,
+) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;
     if local_retention(&input.kind)
         || (input.actor.is_none() && system_local_retention(&input.kind))
@@ -53754,6 +53806,7 @@ fn append_claim_with_subject_fences(
     // batch commits.
     graph.connection
         .batched(|transaction| -> Result<(ClaimRecord, bool), St3Error> {
+            if let Some(admission) = admission { admission(transaction)?; }
             if let Some((subject, revision, current)) = observer_completion {
                 check_observer_completion(transaction, subject, revision, Some(current))?;
             }
