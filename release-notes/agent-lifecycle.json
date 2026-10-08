@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Expose explicitly declared agent lifecycle metadata to a client without inferring a default.",
+  "replay": {
+    "status": "none",
+    "detail": "No full claim replay or projection migration is required. Existing agent declarations without lifecycle metadata remain unknown. Declaration replacements update or clear the roster value."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or index change. Agent declarations gain optional lifecycle metadata, and client-v0 roster rows gain an optional lifecycle field with the exact enum standing, owner, or bounded."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Lifecycle metadata does not change runtime state, process behavior, restart policy, or ownership rules. Omission supplies no default and does not infer a value from other settings."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Agent KDL accepts the optional lifecycle child with standing, owner, or bounded. A client receives the selected declaration's value; the roster field is omitted when absent. A client must treat an omitted field, including from an older server, as unknown."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No existing declaration needs modification. Publish lifecycle metadata only when its value is known; omit the child in a replacement declaration to clear it."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No new recovery procedure. Existing declarations without the optional metadata preserve their behavior."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal daemon restart for upgrade; interruption duration has not been measured."
+  }
+}

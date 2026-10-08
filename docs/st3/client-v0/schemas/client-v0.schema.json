@@ -1046,6 +1046,7 @@
             "handoff": {"oneOf": [{"$ref": "#/$defs/AgentHandoff"}, {"type": "null"}], "description": "Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes."},
             "rollout": { "type": ["object", "null"], "description": "Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons." },
             "workspace": { "type": ["string", "null"], "description": "The declared workspace on the owning host." },
+            "lifecycle": { "enum": ["standing", "owner", "bounded"], "description": "The selected agent declaration's optional KDL `lifecycle` child. Declared intent, not observed activity, runtime state, restart policy, or inferred ownership; omitted rather than null when undeclared, and absence means unknown." },
             "checkout": { "oneOf": [{ "$ref": "#/$defs/AgentCheckout" }, { "type": "null" }], "description": "The requested Git worktree repository, base and branch. Present before launch; it does not assert that checkout succeeded." },
             "suspension": { "oneOf": [{ "$ref": "#/$defs/AgentSuspension" }, { "type": "null" }], "description": "The seat's latest suspend or resume and its phase. An older daemon omits the field." }
           }

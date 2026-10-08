@@ -212,6 +212,33 @@ pub(crate) fn authored_launch(launch: &LaunchSpec) -> Vec<&str> {
     authored
 }
 
+/// Authored seat purpose, independent of the runtime's launch/restart lifecycle.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentLifecycle {
+    Standing,
+    Owner,
+    Bounded,
+}
+
+impl AgentLifecycle {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "standing" => Some(Self::Standing),
+            "owner" => Some(Self::Owner),
+            "bounded" => Some(Self::Bounded),
+            _ => None,
+        }
+    }
+}
+
+/// Read only the current declaration; neither runtime state nor environment supplies a default.
+pub fn declared_agent_lifecycle(desired: Option<&Value>) -> Option<AgentLifecycle> {
+    let child = desired?.get("children")?.as_array()?.iter()
+        .find(|child| child.get("name").and_then(Value::as_str) == Some("lifecycle"))?;
+    AgentLifecycle::parse(child.get("arguments")?.as_array()?.first()?.as_str()?)
+}
+
 /// Presentation is independent of the durable seat identity.
 pub fn effective_agent_name<'a>(subject: &'a str, desired: Option<&'a Value>) -> &'a str {
     desired.and_then(|desired| {

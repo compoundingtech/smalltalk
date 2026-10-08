@@ -46,6 +46,7 @@ export type Agent = ResourceHeader & {
   incarnation_id?: string | null;
   kind: "agent";
   last_activity_at?: (Timestamp | null);
+  lifecycle?: "standing" | "owner" | "bounded";
   name: string;
   next_work?: (WorkLabel | null);
   next_work_id?: (Id | null);
