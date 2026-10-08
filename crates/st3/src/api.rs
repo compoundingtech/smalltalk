@@ -149,6 +149,9 @@ struct ClientSnapshot {
     store_index: u64,
     projection_version: String,
     created_at: String,
+    /// For rows a background refresher folded: when it published them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_at: Option<String>,
 }
 
 /// A client page and the snapshot it was read in, which the envelope names.
@@ -1250,6 +1253,7 @@ fn client_snapshot_at(state: &AppState, store_index: u64) -> ClientSnapshot {
         store_index,
         projection_version: CLIENT_PROJECTION_VERSION.into(),
         created_at,
+        published_at: None,
     }
 }
 
@@ -4243,9 +4247,12 @@ async fn client_agents(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<ClientPageResponse, ApiError> {
+    // A daemon's readers never fold the roster: they answer from its refresher's publications.
+    if state.store.agent_roster_refresher_running() {
+        return client_agents_published(state, snapshot, query).await;
+    }
     // A warm request never queues behind a cold projection. Drop the probe's SQLite
     // snapshot before waiting, then recheck all cache fences in the admitted snapshot.
-    let first_current_page = (query.cursor.is_none() && !query.history).then(|| query.clone());
     for admitted in [false, true] {
         let admission = if admitted {
             Some(state.store.admit_agent_resources().await)
@@ -4271,26 +4278,40 @@ async fn client_agents(
         if let Some(page) = result {
             return Ok(page);
         }
-        if let Some(query) = first_current_page.as_ref().filter(|_| !admitted) {
-            wait_for_agent_roster(&state.store).await;
-            let reader = state.clone();
-            let query = query.clone();
-            if let Some(page) =
-                blocking_store(move || Ok(client_agents_published_page(&reader, &query))).await??
-            {
-                return Ok(page);
-            }
-            // A daemon's readers never fold the roster; its refresher publishes one.
-            if state.store.agent_roster_refresher_running() {
-                state.store.request_agent_roster_refresh();
-                return Err(agent_roster_not_ready());
-            }
-        }
     }
     unreachable!("an admitted roster read always builds missing cards")
 }
 
-/// A current roster read before the refresher has published what it needs. Retryable.
+/// An agents page from the refresher's publications. A first page waits briefly for a roster
+/// at or after its own cut, then answers from the newest one, or says not ready. A
+/// continuation answers from the roster published at exactly its first page's cut, or says the
+/// page expired. Neither folds a card.
+async fn client_agents_published(
+    state: AppState,
+    snapshot: ClientSnapshot,
+    query: ClientListQuery,
+) -> Result<ClientPageResponse, ApiError> {
+    if query.cursor.is_some() {
+        let reader = state.clone();
+        return blocking_store(move || Ok(client_agents_published_continuation(&reader, snapshot, &query)))
+            .await?;
+    }
+    wait_for_agent_roster(&state.store, query.history).await;
+    let reader = state.clone();
+    let history = query.history;
+    match blocking_store(move || Ok(client_agents_published_page(&reader, &query))).await?? {
+        Some(page) => Ok(page),
+        None => {
+            if history {
+                state.store.request_agent_roster_history();
+            } else {
+                state.store.request_agent_roster_refresh();
+            }
+            Err(agent_roster_not_ready())
+        }
+    }
+}
+
 fn agent_roster_not_ready() -> ApiError {
     ApiError {
         status: StatusCode::SERVICE_UNAVAILABLE,
@@ -4325,19 +4346,21 @@ fn warm_agent_roster(store: &Store) -> anyhow::Result<()> {
 /// snapshots of at most [`AGENT_ROSTER_WARM_CHUNK`]: each folds the next agents at its own cut
 /// and refolds the already folded cards whose claims changed, so the last step completes a
 /// roster coherent at its cut. Readers keep the previous complete roster meanwhile.
-fn refresh_agent_roster(store: &Store) -> anyhow::Result<()> {
-    if !store.read_snapshot(|index| store.agent_roster_delta_known(index))? {
+fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
+    if !store.read_snapshot(|index| store.agent_roster_delta_known(index, history))? {
         let order = store.read_snapshot(|index| {
-            Ok(client_agent_page_refs(store, false, index)?.iter()
+            Ok(client_agent_page_refs(store, history, index)?.iter()
                 .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
                 .collect::<Vec<_>>())
         })?;
         for chunk in order.chunks(AGENT_ROSTER_WARM_CHUNK) {
             let chunk = chunk.iter().cloned().collect::<BTreeSet<_>>();
-            store.read_snapshot(|index| client_agent_cards_selected(store, false, index, &chunk).map(drop))?;
+            store.read_snapshot(|index| {
+                client_agent_cards_selected(store, history, index, &chunk).map(drop)
+            })?;
         }
     }
-    store.read_snapshot(|index| client_agent_resources_cached(store, false, index).map(drop))
+    store.read_snapshot(|index| client_agent_resources_cached(store, history, index).map(drop))
 }
 
 /// Every current agent's refs, and the cards of as many as the largest window or page shows.
@@ -4351,20 +4374,23 @@ fn client_agent_roster_head(store: &Store, index: u64) -> anyhow::Result<()> {
 
 /// A page read once answers with what was written before it: wait, briefly, for the refresher
 /// to publish a roster at or after the current cut. The read itself folds nothing.
-async fn wait_for_agent_roster(store: &Store) {
-    if !store.agent_roster_refresher_running() {
-        return;
-    }
+async fn wait_for_agent_roster(store: &Store, history: bool) {
     let Ok(wanted) = store.index() else { return };
     let published = |store: &Store| {
         let index = store.index().ok()?;
-        store.published_agent_roster(index).map(|(cut, _)| cut)
-            .or_else(|| store.published_agent_roster_head(index, 1).map(|(cut, _, _)| cut))
+        store.published_agent_roster(index, history).map(|(cut, _, _)| cut).or_else(|| {
+            (!history).then(|| store.published_agent_roster_head(index, 1)).flatten()
+                .map(|(cut, _, _, _)| cut)
+        })
     };
     let mut publications = store.subscribe_agent_roster();
     let _ = tokio::time::timeout(AGENT_ROSTER_READ_WAIT, async {
         while published(store).is_none_or(|cut| cut < wanted) {
-            store.request_agent_roster_refresh();
+            if history {
+                store.request_agent_roster_history();
+            } else {
+                store.request_agent_roster_refresh();
+            }
             if publications.changed().await.is_err() {
                 return;
             }
@@ -4372,34 +4398,45 @@ async fn wait_for_agent_roster(store: &Store) {
     }).await;
 }
 
-/// A first page of the newest published roster, under the snapshot it was folded at, for a
-/// current read that missed its own cut while a refresher keeps the roster published.
+/// The snapshot of a roster published at `cut`: that cut, its time, and when it was folded.
+fn roster_snapshot(state: &AppState, cut: u64, published_at_unix_ms: u128) -> ClientSnapshot {
+    ClientSnapshot {
+        published_at: Some(client_timestamp(published_at_unix_ms)),
+        ..client_snapshot_at(state, cut)
+    }
+}
+
+/// A first page of the newest published roster, under the snapshot it was folded at.
 fn client_agents_published_page(
     state: &AppState,
     query: &ClientListQuery,
 ) -> Result<Option<ClientPageResponse>, ApiError> {
     let store = &state.store;
     let index = store.index().map_err(ApiError::internal)?;
-    let Some((index, cards)) = store.published_agent_roster(index) else {
+    let Some((index, cards, published_at)) = store.published_agent_roster(index, query.history) else {
         // Before the first complete roster, an unfiltered first page can come from its head.
-        if query.status.is_some() {
+        if query.status.is_some() || query.history {
             return Ok(None);
         }
-        let Some((index, refs, head)) =
+        let Some((index, refs, head, published_at)) =
             store.published_agent_roster_head(index, CLIENT_MAX_PAGE_ITEMS + 1)
         else {
             return Ok(None);
         };
         store.request_agent_roster_refresh();
-        let snapshot = client_snapshot_at(state, index);
+        let snapshot = roster_snapshot(state, index, published_at);
         let mut page = client_page_read(state, &snapshot, "agents", (*refs).clone(), query, true)?;
         page.items = client_agent_cards_from_cached(
             store, page_cards(&head, &page.items), &page.items, &snapshot.created_at,
         )?;
         return Ok(Some((Extension(snapshot), Json(page))));
     };
-    store.request_agent_roster_refresh();
-    let snapshot = client_snapshot_at(state, index);
+    if query.history {
+        store.request_agent_roster_history();
+    } else {
+        store.request_agent_roster_refresh();
+    }
+    let snapshot = roster_snapshot(state, index, published_at);
     if let Some(status) = query.status.as_deref() {
         let mut cards = (*cards).clone();
         overlay_agent_resources(store, &mut cards, &snapshot.created_at)
@@ -4409,7 +4446,7 @@ fn client_agents_published_page(
         return Ok(Some((Extension(snapshot), Json(page))));
     }
     // Continuations keep the same membership, order and queue metadata as the exact path's
-    // refs, and fold their own page at this snapshot.
+    // refs, and read their cards from this same publication.
     let refs = cards.iter().map(|card| {
         let mut reference = serde_json::Map::new();
         for field in ["id", "name", "host_id"].into_iter().chain(AGENT_QUEUE_FIELDS) {
@@ -4422,6 +4459,35 @@ fn client_agents_published_page(
         store, page_cards(&cards, &page.items), &page.items, &snapshot.created_at,
     )?;
     Ok(Some((Extension(snapshot), Json(page))))
+}
+
+/// A page continuing a first page served from a publication: its cards come from the roster
+/// published at exactly that page's cut. Once that roster is gone, pagination restarts.
+fn client_agents_published_continuation(
+    state: &AppState,
+    snapshot: ClientSnapshot,
+    query: &ClientListQuery,
+) -> Result<ClientPageResponse, ApiError> {
+    let store = &state.store;
+    let mut page = client_page_read(state, &snapshot, "agents", Vec::new(), query, true)?;
+    let published = store.published_agent_roster_at(snapshot.store_index, query.history);
+    let snapshot = match &published {
+        Some((_, published_at)) => roster_snapshot(state, snapshot.store_index, *published_at),
+        None => snapshot,
+    };
+    // A status-filtered first page kept its whole overlaid cards for its continuations.
+    if query.status.is_some() {
+        return Ok((Extension(snapshot), Json(page)));
+    }
+    let Some((cards, _)) = published else {
+        return Err(client_page_expired(
+            "the roster this page was read from is no longer published; restart pagination",
+        ));
+    };
+    page.items = client_agent_cards_from_cached(
+        store, page_cards(&cards, &page.items), &page.items, &snapshot.created_at,
+    )?;
+    Ok((Extension(snapshot), Json(page)))
 }
 
 /// The cards a page's refs name, from published cards.
@@ -5354,7 +5420,13 @@ pub fn start_agent_roster(state: &AppState) {
                 crate::performance::task("roster/refresh", || if first {
                     reader.read_snapshot(|index| client_agent_roster_head(&reader, index))
                 } else {
-                    reader.answer_agent_roster_requests(|| refresh_agent_roster(&reader))
+                    reader.answer_agent_roster_requests(|| {
+                        refresh_agent_roster(&reader, false)?;
+                        if reader.take_agent_roster_history_request() {
+                            refresh_agent_roster(&reader, true)?;
+                        }
+                        Ok(())
+                    })
                 })
             })
             .await;

@@ -298,19 +298,25 @@ async fn collection_items_with_windows(
                 };
                 // A miss of this exact cut serves the newest published roster under that
                 // roster's own snapshot, past the window cache, and wakes its refresher.
+                // Every served roster says when it was published.
                 let mut published = None;
+                let mut published_at = None;
                 let cached_agents = if collection == "agents" {
-                    match store.agent_resources_cached_at(index, false, None)? {
-                        Some(cards) => Some(cards),
+                    match store.agent_resources_published_at(index, false, None)? {
+                        Some((cards, at)) => {
+                            published_at = Some(at);
+                            Some(cards)
+                        }
                         // Before the first complete roster, an unfiltered window can come
                         // from the head the refresher publishes first.
-                        None => match store.published_agent_roster(index).or_else(|| {
+                        None => match store.published_agent_roster(index, false).or_else(|| {
                             status.is_none().then(|| store.published_agent_roster_head(index, limit + 1))
-                                .flatten().map(|(cut, _, head)| (cut, Arc::new(head)))
+                                .flatten().map(|(cut, _, head, at)| (cut, Arc::new(head), at))
                         }) {
-                            Some((cut, cards)) => {
+                            Some((cut, cards, at)) => {
                                 store.request_agent_roster_refresh();
                                 published = Some(cut);
+                                published_at = Some(at);
                                 Some(cards)
                             }
                             // A daemon's readers never fold the roster: until its refresher
@@ -326,7 +332,10 @@ async fn collection_items_with_windows(
                 } else {
                     None
                 };
-                let snapshot = client_snapshot_at(&state, published.unwrap_or(index));
+                let snapshot = match published_at {
+                    Some(at) => super::roster_snapshot(&state, published.unwrap_or(index), at),
+                    None => client_snapshot_at(&state, index),
+                };
                 let at = snapshot.created_at.clone();
                 let compute = || {
                     let mut items = match collection.as_str() {
@@ -10948,7 +10957,7 @@ mission "queue-parity" state="ready" {
         crate::api::start_agent_roster(&state);
         tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
             .await.expect("the daemon publishes its roster as it starts").unwrap();
-        assert_eq!(state.store.published_agent_roster(first).unwrap().0, first);
+        assert_eq!(state.store.published_agent_roster(first, false).unwrap().0, first);
         // Hold the next refresh back: readers must answer from the publication without it.
         let refresh = state.store.admit_agent_resources().await;
         append("harness.observed", json!({"state":"working", "driver":"codex",
@@ -10993,6 +11002,7 @@ mission "queue-parity" state="ready" {
         let snapshot = next(Duration::from_secs(1)).await;
         assert_eq!(snapshot["kind"], "snapshot", "{snapshot}");
         assert_eq!(snapshot["snapshot"]["store_index"], first, "rows keep their own cut");
+        assert!(snapshot["snapshot"]["published_at"].is_string(), "{snapshot}");
         assert_eq!(snapshot["items"][0]["id"], subject);
         assert!(snapshot["items"][0]["harness_state"].is_null(), "{snapshot}");
 
@@ -11003,6 +11013,7 @@ mission "queue-parity" state="ready" {
                 Query(ClientListQuery::default())))
             .await.expect("an HTTP page must not wait for the held refresh").unwrap();
         assert_eq!(page_snapshot.store_index, first);
+        assert_eq!(page_snapshot.published_at.as_deref(), snapshot["snapshot"]["published_at"].as_str());
         assert_eq!(page.items, snapshot["items"].as_array().unwrap().clone());
 
         // The refresh the readers asked for publishes the current cut; the stream rereads it.
@@ -11111,6 +11122,57 @@ mission "queue-parity" state="ready" {
         server.abort();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_history_and_continuations_answer_from_publications_only() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        for agent in ["page-a", "page-b", "page-c"] {
+            state.store.append_claim(&ClaimInput {
+                subject: format!("agent/{agent}"), kind: "runtime.observed".into(), actor: None,
+                fields: serde_json::from_value(json!({"status":"running", "runtime_id":agent,
+                    "incarnation_id":"one"})).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+        let list = |query: ClientListQuery| client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(query));
+
+        // A history page is folded by the refresher on request, never by the read.
+        let builds = state.store.agent_resources_builds_for_test();
+        let (Extension(history_snapshot), Json(history)) = tokio::time::timeout(
+            Duration::from_secs(5),
+            list(ClientListQuery { history: true, ..ClientListQuery::default() }),
+        ).await.unwrap().unwrap();
+        assert_eq!(history.items.len(), 3);
+        assert!(history_snapshot.published_at.is_some());
+        assert!(state.store.agent_resources_builds_for_test() > builds, "the refresher folded it");
+
+        // A continuation reads the publication at its first page's cut.
+        let (Extension(first_snapshot), Json(first)) =
+            list(ClientListQuery { limit: Some(2), ..ClientListQuery::default() }).await.unwrap();
+        let cursor = first.page.next_cursor.clone().expect("a second page");
+        let continue_query = ClientListQuery { cursor: Some(cursor), limit: Some(2), ..ClientListQuery::default() };
+        let (Extension(next_snapshot), Json(next)) = client_agents(State(state.clone()),
+            Extension(first_snapshot.clone()), Query(continue_query.clone())).await.unwrap();
+        assert_eq!(next.items.len(), 1);
+        assert_eq!(next_snapshot.store_index, first_snapshot.store_index);
+        assert!(next_snapshot.published_at.is_some());
+
+        // Once that roster is no longer published, the continuation restarts; it never folds.
+        // Holding the refresher back keeps it from republishing that cut meanwhile.
+        let _refresh = state.store.admit_agent_resources().await;
+        state.store.forget_current_views();
+        let builds = state.store.agent_resources_builds_for_test();
+        let expired = client_agents(State(state.clone()), Extension(first_snapshot),
+            Query(continue_query)).await.unwrap_err();
+        assert_eq!(expired.code, "page-cursor-expired");
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn agent_roster_head_answers_windows_and_first_pages_before_every_card() {
         let root = tempfile::tempdir().unwrap();
@@ -11143,7 +11205,7 @@ mission "queue-parity" state="ready" {
         let _wake = state.store.start_agent_roster_refresher().unwrap();
         state.store.read_snapshot(|index| crate::api::client_agent_roster_head(&state.store, index))
             .unwrap();
-        assert!(state.store.published_agent_roster(index).is_none());
+        assert!(state.store.published_agent_roster(index, false).is_none());
         let builds = state.store.agent_resources_builds_for_test();
         let from_head = collection_items_with_windows(&state, &session, &request,
             semaphore.acquire_owned().await.unwrap(), None).await.unwrap();

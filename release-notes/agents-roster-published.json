@@ -1,11 +1,32 @@
 {
   "version": 1,
   "summary": "Keep the agents roster published from one background refresher so roster reads and streams never wait for a fold",
-  "replay": {"status": "none", "detail": "No claim replay or stored history changes."},
-  "schema": {"status": "none", "detail": "No database schema, version or stored data changes."},
-  "rules": {"status": "none", "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."},
-  "compatibility": {"status": "changed", "detail": "An agents WS window or first HTTP page that misses its exact cut is answered from the newest published roster, fenced at that roster's own snapshot index, which can be older than the reader's; streams reread once a newer roster is published. Response shapes are unchanged."},
-  "downtime": {"status": "none", "detail": "No additional service interruption or startup migration is required. The daemon folds the roster in the background as it starts."},
-  "manual": {"status": "none", "detail": "No action is required."},
-  "recovery": {"status": "none", "detail": "Only volatile in-memory caches change; reverting restores per-read exact-cut folds."}
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or stored history changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema, version or stored data changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Agents lists and windows are answered from the roster a background refresher publishes, fenced at that roster's own snapshot index, which can be older than the reader's; every served roster's snapshot carries the new optional published_at time. A first page waits up to a second for a roster at its own cut. With nothing published yet the read returns a retryable 503 (WebSocket: resync); a page continuation whose roster is no longer published returns page-cursor-expired. Streams reread when a newer roster is published. Older clients ignore the new field."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption or startup migration is required. The daemon folds the roster in the background as it starts."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Only volatile in-memory caches change; reverting restores per-read exact-cut folds."
+  }
 }

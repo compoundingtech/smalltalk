@@ -906,6 +906,9 @@ pub(crate) struct SubjectCache {
 
 const AGENT_CARD_STATUS_LIMIT: usize = 4096;
 
+/// A roster head: its cut, every agent's refs, the first cards in order, and when published.
+pub(crate) type PublishedRosterHead = (u64, Arc<Vec<Value>>, Vec<Value>, u128);
+
 /// How long a roster refresh request may go unanswered before readers stop serving published
 /// rows and say the roster is not ready.
 const AGENT_ROSTER_OVERDUE_MS: u64 = 30_000;
@@ -2939,10 +2942,10 @@ impl Store {
 
     /// Whether a fold at `index` can start from the newest complete roster and refold only the
     /// cards whose claims changed since, rather than every card.
-    pub(crate) fn agent_roster_delta_known(&self, index: u64) -> Result<bool> {
+    pub(crate) fn agent_roster_delta_known(&self, index: u64, history: bool) -> Result<bool> {
         let previous = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
-            .filter(|entry| !entry.history && entry.covered.is_none() && entry.index <= index)
+            .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
         let Some(previous) = previous else { return Ok(false) };
         Ok(previous.index == index
@@ -2964,6 +2967,17 @@ impl Store {
             );
             wake.notify_one();
         }
+    }
+
+    /// Ask the refresher, if one runs, to also publish the history roster.
+    pub(crate) fn request_agent_roster_history(&self) {
+        self.smalltalk.agent_roster_history_wanted.store(true, std::sync::atomic::Ordering::Release);
+        self.request_agent_roster_refresh();
+    }
+
+    /// Whether a reader asked for the history roster since the last time this was taken.
+    pub(crate) fn take_agent_roster_history_request(&self) -> bool {
+        self.smalltalk.agent_roster_history_wanted.swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Run one refresh, answering the requests made before it began only if it publishes.
@@ -2990,16 +3004,35 @@ impl Store {
     /// index, while a refresher keeps advancing it. A reader serves these rows under that
     /// index's snapshot, never under its own newer one, and wakes the refresher. Without a
     /// refresher there is none: readers then fold exactly their own cut, as before.
-    pub(crate) fn published_agent_roster(&self, index: u64) -> Option<(u64, Arc<Vec<Value>>)> {
+    pub(crate) fn published_agent_roster(
+        &self,
+        index: u64,
+        history: bool,
+    ) -> Option<(u64, Arc<Vec<Value>>, u128)> {
         self.smalltalk.agent_roster_refresh.get()?;
         if self.agent_roster_refresh_overdue() {
             return None;
         }
         self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
-            .filter(|entry| !entry.history && entry.covered.is_none() && entry.index <= index)
+            .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
             .max_by_key(|entry| (entry.index, entry.local))
-            .map(|entry| (entry.index, Arc::clone(&entry.items)))
+            .map(|entry| (entry.index, Arc::clone(&entry.items), entry.published_at_unix_ms))
+    }
+
+    /// The complete roster published at exactly `cut`, for a page continuing from a first page
+    /// served at that cut, with when it was published.
+    pub(crate) fn published_agent_roster_at(
+        &self,
+        cut: u64,
+        history: bool,
+    ) -> Option<(Arc<Vec<Value>>, u128)> {
+        self.smalltalk.agent_roster_refresh.get()?;
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index == cut)
+            .max_by_key(|entry| entry.local)
+            .map(|entry| (Arc::clone(&entry.items), entry.published_at_unix_ms))
     }
 
     /// When no complete roster is published yet: the newest current refs at or before `index`
@@ -3010,7 +3043,7 @@ impl Store {
         &self,
         index: u64,
         count: usize,
-    ) -> Option<(u64, Arc<Vec<Value>>, Vec<Value>)> {
+    ) -> Option<PublishedRosterHead> {
         self.smalltalk.agent_roster_refresh.get()?;
         if self.agent_roster_refresh_overdue() {
             return None;
@@ -3030,8 +3063,9 @@ impl Store {
                 refs.iter().take(count)
                     .map(|reference| cards.get(reference["id"].as_str()?).map(|card| (*card).clone()))
                     .collect::<Option<Vec<_>>>()
+                    .map(|head| (head, entry.published_at_unix_ms))
             })?;
-        Some((cut, refs, head))
+        Some((cut, refs, head.0, head.1))
     }
 
     /// Follows the revision of complete current roster publications: it rises with every one,
@@ -3092,6 +3126,7 @@ impl Store {
             .expect("agent page refs cache poisoned");
         cache.push_back(runtime::AgentResourcesEntry {
             index, local: 0, history, covered: None, valid_until_unix_ms, items: Arc::clone(&items),
+            published_at_unix_ms: now,
         });
         let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
         drop(cache);
@@ -3235,6 +3270,7 @@ impl Store {
                         index, local, history, covered,
                         valid_until_unix_ms,
                         items: Arc::clone(&previous.items),
+                        published_at_unix_ms: now_ms(),
                     });
                 }
                 #[cfg(test)]
@@ -3255,6 +3291,7 @@ impl Store {
                     index, local, history, covered,
                     valid_until_unix_ms,
                     items: Arc::new(items),
+                    published_at_unix_ms: now_ms(),
                 })
             }
             None => {
@@ -3272,6 +3309,7 @@ impl Store {
                     index, local, history, covered: selected.cloned(),
                     valid_until_unix_ms: self.agent_queue_valid_until(now)?,
                     items: Arc::new(items),
+                    published_at_unix_ms: now_ms(),
                 })
             }
         }
@@ -3283,7 +3321,7 @@ impl Store {
         let published = cache.iter().filter(valid).find(|entry| {
             agent_resources_entry_hits(entry, now, index, local, history, selected)
         }).map(|entry| Arc::clone(&entry.items));
-        let complete = !history && entry.covered.is_none();
+        let complete = entry.covered.is_none();
         let items = if let Some(published) = published { published } else {
             cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
             let items = Arc::clone(&entry.items);
@@ -3309,6 +3347,16 @@ impl Store {
         history: bool,
         selected: Option<&BTreeSet<String>>,
     ) -> Result<Option<Arc<Vec<Value>>>> {
+        Ok(self.agent_resources_published_at(index, history, selected)?.map(|(items, _)| items))
+    }
+
+    /// [`Self::agent_resources_cached_at`], with when the rows were published.
+    pub(crate) fn agent_resources_published_at(
+        &self,
+        index: u64,
+        history: bool,
+        selected: Option<&BTreeSet<String>>,
+    ) -> Result<Option<(Arc<Vec<Value>>, u128)>> {
         if index < current_index(&self.readers.get())? {
             return Ok(None);
         }
@@ -3320,7 +3368,7 @@ impl Store {
             .expect("agent resources cache poisoned");
         let hit = cache.iter()
             .find(|entry| agent_resources_entry_hits(entry, now, index, local, history, selected))
-            .map(|entry| Arc::clone(&entry.items));
+            .map(|entry| (Arc::clone(&entry.items), entry.published_at_unix_ms));
         drop(cache);
         Ok(hit.map(|hit| crate::performance::task("roster/cache-hit", || hit)))
     }
