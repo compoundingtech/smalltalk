@@ -550,9 +550,22 @@ batch), and then applies local lease renewals again. Replaying over the rows an 
 left behind made the graph depend on how that projection ran: it could apply a run's old terminal
 state over the revision that reopened the run, so two nodes holding the same claims showed
 different graphs. A rule that reads other claims finds them by subject, never by the batch it
-arrived in, since a writer may put related claims in separate batches. The replay reads every
-claim before it projects any, so a claim that fails to project is quarantined without ending the
-replay.
+arrived in, since a writer may put related claims in separate batches. Each replay read statement
+finishes before its claims are projected, so a claim's savepoint rollback cannot abort a read
+statement that is still stepping. A claim that fails to project is quarantined without ending
+the replay.
+
+The base fold selects only `intent.desired`, `doc.bound` and `mission.published`, copying at most
+256 bodies before each canonical fold page. Event positions are inserted separately without
+decoding message, work or observation bodies; repaired originals and the case-sensitive `glass/`
+prefix remain excluded. Base-stage progress counts those selected bodies, not the whole claim
+log. This bounds copied body count, not body bytes, SQLite work or the full replay transaction.
+The full replay still holds the writer through its commit.
+
+Heal request handlers compare a committed claim-index/graph-generation point to decide whether
+to notify readers. This point does not enumerate peers, envelopes or graph rows, and is an
+invalidation hint only. A replay may notify conservatively even when its final legacy digest
+matches. Heal equality, admission and completion continue to use their existing contracts.
 
 A replay from nothing is not the normal path. A projection extends the graph with the claims it
 admits. A claim that reaches part of the graph out of the replay's order rebuilds only that part

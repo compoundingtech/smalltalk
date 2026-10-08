@@ -7436,9 +7436,9 @@ async fn replication_heal_answer(
     }
     let store = state.store.clone();
     let (answer, changed) = blocking_store(move || {
-        let before = store.replication_status(false, None, &[])?.graph_digest;
+        let before = store.replication_change_point()?;
         let answer = store.heal_answer(&request.peer, &request.query)?;
-        let changed = store.replication_status(false, None, &[])?.graph_digest != before;
+        let changed = store.replication_change_point()? != before;
         Ok((answer, changed))
     })
     .await?;
@@ -7455,9 +7455,9 @@ async fn replication_heal_next(
 ) -> Result<Json<ReplicationHealStep>, ApiError> {
     let store = state.store.clone();
     let (step, changed) = blocking_store(move || {
-        let before = store.replication_status(false, None, &[])?.graph_digest;
+        let before = store.replication_change_point()?;
         let step = store.heal_next(&request.peer, request.answer)?;
-        let changed = store.replication_status(false, None, &[])?.graph_digest != before;
+        let changed = store.replication_change_point()? != before;
         Ok((step, changed))
     })
     .await?;

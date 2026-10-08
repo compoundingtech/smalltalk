@@ -27408,67 +27408,90 @@ fn project_replicated_base_claims_with_progress(
     transaction: &Transaction<'_>,
     progress: &mut dyn FnMut(ReplayProgress),
 ) -> Result<(), St3Error> {
-    let mut statement = transaction
-        .prepare(&canonical_sql(
-            "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
-                    claims.origin, claims.actor, claims.body, claims.predecessors,
-                    claims.accepted_at_unix_ms
-             FROM claims JOIN batches ON batches.id=claims.batch_id
-             WHERE NOT EXISTS (
+    const BATCH: usize = 256;
+    // Event positions do not consume bodies or canonical fold order. Preserve the same
+    // admitted/repaired and case-sensitive glass exclusions without decoding unrelated
+    // observation, message or work bodies just to insert their positions.
+    transaction.execute(
+        "INSERT OR IGNORE INTO event_positions(store_index, subject)
+         SELECT claims.store_index, claims.subject FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE substr(claims.subject,1,6) <> 'glass/' COLLATE BINARY
+           AND NOT EXISTS (SELECT 1 FROM replica_records
+               WHERE replica_records.claim_id=claims.id AND replica_records.state='repaired')",
+        [],
+    ).map_err(internal)?;
+    let selection = "FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.kind IN ('intent.desired','doc.bound','mission.published')
+               AND NOT EXISTS (
                  SELECT 1 FROM replica_records
                  WHERE replica_records.claim_id=claims.id
                    AND replica_records.state='repaired'
-             )
-             ORDER BY CANONICAL_ASC(claims)",
-        ))
+             )";
+    let total: u64 = transaction
+        .query_row(&format!("SELECT COUNT(*) {selection}"), [], |row| {
+            row.get(0)
+        })
         .map_err(internal)?;
-    // Read every claim before projecting any: rolling back one claim's savepoint aborts a
-    // statement that is still stepping, which would fail the whole replay.
-    let claims = statement
-        .query_map([], claim_from_row)
-        .map_err(internal)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(internal)?;
-    drop(statement);
+    let after = format!(
+        "({}) > (SELECT {} FROM claims cursor WHERE cursor.id=?1)",
+        canonical::components("claims").join(", "),
+        canonical::components("cursor").join(", ")
+    );
+    let query = canonical_sql(&format!(
+        "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
+                    claims.origin, claims.actor, claims.body, claims.predecessors,
+                    claims.accepted_at_unix_ms
+             {selection} AND (?1 IS NULL OR {after})
+             ORDER BY CANONICAL_ASC(claims) LIMIT ?2"
+    ));
     clear_quarantined_claims_tx(transaction, "projection:base")?;
-    let total = claims.len() as u64;
     progress(ReplayProgress {
         phase: "full-replay/base-claims",
         processed: Some(0),
         total: Some(total),
     });
-    for (position, claim) in claims.into_iter().enumerate() {
-        insert_event(
-            transaction,
-            claim.store_index,
-            &claim.kind,
-            &claim.subject,
-            &claim.body,
-        )
-        .map_err(internal)?;
-        project_claim_isolated_tx(transaction, "projection:base", &claim, || {
-            match claim.kind.as_str() {
-                "intent.desired" => {
-                    let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
-                        .map_err(internal)?;
-                    select_replicated_desired(transaction, &claim, &desired)?;
-                }
-                "doc.bound" => select_replicated_document(transaction, &claim, claim.store_index)?,
-                "mission.published" => {
-                    select_replicated_mission(transaction, &claim, claim.store_index)?
-                }
-                _ => {}
-            }
-            Ok(())
-        })?;
-        let processed = position as u64 + 1;
-        if processed.is_multiple_of(1000) || processed == total {
-            progress(ReplayProgress {
-                phase: "full-replay/base-claims",
-                processed: Some(processed),
-                total: Some(total),
-            });
+    let mut cursor: Option<String> = None;
+    let mut processed = 0;
+    loop {
+        // Finish/drop the read before any per-claim savepoint can roll back. Bound retained
+        // bodies, and use the same total canonical key as the full fold, including ties.
+        let claims = {
+            let mut statement = transaction.prepare_cached(&query).map_err(internal)?;
+            statement
+                .query_map(params![cursor, BATCH as i64], claim_from_row)
+                .map_err(internal)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(internal)?
+        };
+        if claims.is_empty() {
+            break;
         }
+        cursor = claims.last().map(|claim| claim.id.clone());
+        for claim in claims {
+            project_claim_isolated_tx(transaction, "projection:base", &claim, || {
+                match claim.kind.as_str() {
+                    "intent.desired" => {
+                        let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
+                            .map_err(internal)?;
+                        select_replicated_desired(transaction, &claim, &desired)?;
+                    }
+                    "doc.bound" => {
+                        select_replicated_document(transaction, &claim, claim.store_index)?
+                    }
+                    "mission.published" => {
+                        select_replicated_mission(transaction, &claim, claim.store_index)?
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })?;
+            processed += 1;
+        }
+        progress(ReplayProgress {
+            phase: "full-replay/base-claims",
+            processed: Some(processed),
+            total: Some(total),
+        });
     }
     owned_sets::project_tx(transaction)
 }
@@ -34025,11 +34048,11 @@ agent "test/empty" { command "true" }
                 .iter()
                 .map(|event| event.processed.unwrap())
                 .collect::<Vec<_>>(),
-            [0, 1000, 2000, 2501]
+            [0]
         );
         assert!(claims.iter().all(|event| event.frontier == 0
             && event.target == target
-            && event.total == Some(2501)));
+            && event.total == Some(0)));
         let committed = events.last().unwrap();
         assert_eq!(committed.phase, "projection-committed");
         assert_eq!(committed.frontier, target);
@@ -34045,6 +34068,201 @@ agent "test/empty" { command "true" }
                 .graph_digest,
             digest
         );
+    }
+
+    #[test]
+    fn heal_invalidation_point_is_read_only_and_stays_at_one_committed_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("graph.db"), "node").unwrap());
+        store.apply_internal(&simple("true"), "heal/point").unwrap();
+        let read = || {
+            let statements = STATEMENTS_RUN.with(std::cell::Cell::get);
+            let point = store.replication_change_point().unwrap();
+            (
+                point,
+                STATEMENTS_RUN.with(std::cell::Cell::get) - statements,
+            )
+        };
+        let (first, small) = read();
+        {
+            let mut connection = store.connection.write();
+            let tx = connection.transaction().unwrap();
+            tx.execute("UPDATE desired SET revision='rolled-back'", [])
+                .unwrap();
+            tx.rollback().unwrap();
+        }
+        assert_eq!(
+            read().0,
+            first,
+            "rolled-back graph changes never invalidate committed answers"
+        );
+        store
+            .read_snapshot(|_| {
+                let before = store.replication_change_point()?;
+                let writer = store.clone();
+                std::thread::spawn(move || {
+                    let mut connection = writer.connection.write();
+                    let tx = connection.transaction().unwrap();
+                    for number in 0..3000 {
+                        append_claim_record_tx(
+                            &tx,
+                            "node",
+                            "agent/growth",
+                            "harness.observed",
+                            None,
+                            &json!({"fields":{"sequence":number}}),
+                            &[],
+                            None,
+                        )
+                        .unwrap();
+                    }
+                    tx.execute("UPDATE desired SET revision='committed-change'", [])
+                        .unwrap();
+                    tx.commit().unwrap();
+                })
+                .join()
+                .unwrap();
+                assert_eq!(
+                    store.replication_change_point()?,
+                    before,
+                    "point cannot mix the live graph generation with a preceding source cut"
+                );
+                Ok(())
+            })
+            .unwrap();
+        let (grown, large) = read();
+        assert!(grown.0 > first.0 && grown.1 > first.1);
+        assert_eq!(
+            small, large,
+            "invalidation does not enumerate peers, claims, envelopes or graphs"
+        );
+        assert_eq!(
+            read().0,
+            grown,
+            "the point read writes no observation or repair"
+        );
+    }
+
+    #[test]
+    fn base_replay_batches_selected_bodies_and_preserves_event_and_quarantine_answers() {
+        let store = Store::open_memory("node").unwrap();
+        let mut connection = store.connection.write();
+        let tx = connection.transaction().unwrap();
+        for number in 0..263 {
+            let subject = format!("exec/base-{number}");
+            append_claim_record_tx(
+                &tx,
+                "node",
+                &subject,
+                "intent.desired",
+                None,
+                &json!({"subject":subject,"kind":"exec","desired":{"number":number}}),
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        let malformed = append_claim_record_tx(
+            &tx,
+            "node",
+            "exec/bad",
+            "intent.desired",
+            None,
+            &json!({}),
+            &[],
+            None,
+        )
+        .unwrap();
+        let repaired = append_claim_record_tx(
+            &tx,
+            "node",
+            "exec/repaired",
+            "intent.desired",
+            None,
+            &json!({"subject":"exec/repaired","kind":"exec","desired":{}}),
+            &[],
+            None,
+        )
+        .unwrap();
+        tx.execute("INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,raw,state,claim_id,updated_at_unix_ms)
+            VALUES ('record/repaired','node',1,'test',0,X'','repaired',?1,'1')", [&repaired.id]).unwrap();
+        for number in 0..1500 {
+            append_claim_record_tx(
+                &tx,
+                "node",
+                "agent/events",
+                "harness.observed",
+                None,
+                &json!({"fields":{"number":number,"padding":"x".repeat(1024)}}),
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        for subject in ["glass/hidden", "Glass/visible", "glass-visible"] {
+            append_claim_record_tx(
+                &tx,
+                "node",
+                subject,
+                "harness.observed",
+                None,
+                &json!({"fields":{}}),
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        // Numeric time and batch/position ties cross more than one decode page.
+        tx.execute("UPDATE claims SET accepted_at_unix_ms='1'", [])
+            .unwrap();
+        let expected = tx.prepare("SELECT claims.store_index, claims.subject FROM claims JOIN batches ON batches.id=claims.batch_id
+            WHERE substr(claims.subject,1,6)<>'glass/' COLLATE BINARY
+            AND claims.id<>?1 ORDER BY claims.store_index").unwrap()
+            .query_map([&repaired.id], |row| Ok((row.get::<_,u64>(0)?,row.get::<_,String>(1)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let mut progress = Vec::new();
+        project_replicated_base_claims_with_progress(&tx, &mut |stage| progress.push(stage)).unwrap();
+        assert_eq!(
+            progress
+                .iter()
+                .map(|stage| stage.processed.unwrap())
+                .collect::<Vec<_>>(),
+            [0, 256, 264]
+        );
+        assert!(progress.iter().all(|stage| stage.total == Some(264)));
+        let actual = tx
+            .prepare("SELECT store_index,subject FROM event_positions ORDER BY store_index")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM desired", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            263
+        );
+        let quarantined = tx
+            .query_row(
+                "SELECT aggregate FROM projection_health WHERE aggregate LIKE 'projection:base:%'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, format!("projection:base:{}", malformed.id));
+        // Repeating the same fold retains the same event positions and quarantine identity.
+        project_replicated_base_claims_with_progress(&tx, &mut |_| {}).unwrap();
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM event_positions", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            expected.len()
+        );
+        tx.commit().unwrap();
     }
 
     #[test]
