@@ -153,7 +153,7 @@ test('wire decoding preserves serde defaults and rejects corrupt registers at th
   for (const value of [{ ops: [] }, [place('a', null, 'V', [1, 0x100000000, 'w'])], [{ op: 'future', id: 'f', at: at(1) }], [renameFolder('f', '\ud800', at(1))], [moveFolder('f', 42, 'V', at(1))], [deleteFolder('f', [1, 0, 'w', 'extra'])]]) assert.throws(() => decodeOps(value), FolderValidationError)
 })
 
-test('claim decoding admits person/fleet actors only and skips unrelated or invalid claims', () => {
+test('claim decoding admits person or fleet actors only and skips unrelated or invalid claims', () => {
   const doc = docOf([createFolder('f', 'f', null, 'V', at(1))])
   const claim = { store_index: 1, kind: claimKind, actor: 'person/ada', body: { fields: claimFields(doc) } }
   assert.deepEqual(decodeClaim(claim), doc)

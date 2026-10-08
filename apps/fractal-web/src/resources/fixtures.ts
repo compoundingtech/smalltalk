@@ -402,7 +402,7 @@ export const edgeCases: readonly Case[] = [
       data: {
         title: 'Q4 agent-fleet planning',
         state: 'open',
-        participants: [operator.ref, 'person/priya'],
+        participants: [operator.ref, 'person/reviewer'],
       },
     },
   },
