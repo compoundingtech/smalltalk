@@ -21121,26 +21121,24 @@ fn claude_attachment_fence(
     }))
 }
 
-/// Whether any observation of this runtime epoch of `subject` carries the reason `providerAuth`
-/// or the state `needs-login`, the two ways the observation fold can end in `needs-login`. Today's
-/// claim validation refuses the state `needs-login` in an observation, so only claims written
-/// before that rule can carry it, which is why no test can append one; the probe still asks, so a
-/// store holding such a claim keeps raising its login item:
-/// those that name `incarnation_id`, and those that name no incarnation as text and were accepted
-/// no earlier than the runtime observation (`runtime_accepted_at`), the same two sets the
-/// observation fold reads. The seat's login evidence sits in `claims_harness_login_candidate_index`,
-/// so this reads that partial index, not every observation the seat ever made.
-fn provider_auth_reason_in_epoch(
+/// Whether `subject` has any claim of login evidence in this runtime epoch: a claim in
+/// `claims_harness_login_candidate_index` (a `provider_auth` of false, a reason of `providerAuth`,
+/// a state of `needs-login`, or a `provider-auth-expired` diagnostic) that names `incarnation_id`,
+/// or that names no incarnation as text and was accepted no earlier than the runtime observation
+/// (`runtime_accepted_at`), the same two sets the fold reads. Every way the fold can end in
+/// `needs-login` rests on such a claim: a credential report of false or an expired-login
+/// diagnostic for this incarnation, or an observation of the epoch whose reason is `providerAuth`
+/// or whose own state is `needs-login`. Today's claim validation refuses the state `needs-login`
+/// in an observation, so only claims written before that rule can carry it; the probe still asks,
+/// so a store holding one keeps raising its login item. It reads only that small partial index,
+/// not every observation the seat ever made.
+fn login_evidence_in_epoch(
     connection: &Connection,
     subject: &str,
     at_index: u64,
     incarnation_id: &str,
     runtime_accepted_at: &str,
 ) -> Result<bool> {
-    let reason = "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
-                            THEN '$.reason' ELSE '$.fields.reason' END)";
-    let state = "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
-                            THEN '$.state' ELSE '$.fields.state' END)";
     let sql = format!(
         "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_harness_login_candidate_index
            WHERE claims.subject=?1 AND (
@@ -21152,8 +21150,7 @@ fn provider_auth_reason_in_epoch(
                    THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
              OR (kind='harness.diagnostic'
                AND json_extract(body, '$.fields.code')='provider-auth-expired'))
-           AND kind='harness.observed' AND store_index<=?2
-           AND ({reason}='providerAuth' OR {state}='needs-login')
+           AND store_index<=?2
            AND ({INCARNATION_OF_CLAIM}=?3
                 OR (({INCARNATION_OF_CLAIM} IS NULL OR typeof({INCARNATION_OF_CLAIM})!='text')
                     AND (length(claims.accepted_at_unix_ms)>length(?4)
@@ -21167,10 +21164,10 @@ fn provider_auth_reason_in_epoch(
         })?)
 }
 
-/// `login_only` answers only whether the seat needs a login: it returns as soon as the cheap
-/// fences have spoken and no observation of this runtime epoch says `providerAuth`, which is the
-/// one thing the observation fold below can add to them. Every other view it returns is the one
-/// the full fold would return, and the view it skips is never `needs-login`.
+/// `login_only` answers only whether the seat needs a login: it returns at once, before any
+/// fence, when the seat has no claim of login evidence in this runtime epoch
+/// ([`login_evidence_in_epoch`]). Every view it returns otherwise is the one the full fold would
+/// return, and the view it skips is never `needs-login`.
 fn current_harness_fold_at(
     connection: &Connection,
     subject: &str,
@@ -21197,6 +21194,11 @@ fn current_harness_fold_at(
     let Some(incarnation_id) = runtime_fields.get("incarnation_id").and_then(Value::as_str) else {
         return Ok(None);
     };
+    if login_only
+        && !login_evidence_in_epoch(connection, subject, at_index, incarnation_id, &runtime_key.0.to_string())?
+    {
+        return Ok(None);
+    }
 
     // An admission refusal remains visible even after omp exits, and OpenCode's ready
     // observations cannot claim healthy delivery while its exact build failed the probe.
@@ -21330,12 +21332,6 @@ fn current_harness_fold_at(
 
     if let Some(harness) = claude_attachment_fence(connection, subject, incarnation_id, at_index)? {
         return Ok(Some(harness));
-    }
-
-    if login_only
-        && !provider_auth_reason_in_epoch(connection, subject, at_index, incarnation_id, &runtime_key.0.to_string())?
-    {
-        return Ok(None);
     }
 
     // The observations of this runtime epoch, newest first in canonical order, so every node that
