@@ -41,6 +41,7 @@ import type { TerminalHistoryFactory } from '../terminal/historySource.ts'
 import type { TerminalResizePort } from '../terminal/terminal-resize-port.ts'
 import type { SubjectReads } from './subjectReadPort.ts'
 
+import type { TraceQuery, TraceSeries } from './sessionTrace.ts'
 /**
  * One followed projection as a feature sees it. Fixtures can produce every case (what `AllStates`
  * pins); live derives it from the SDK's `Observed<A>` (`value` + `freshness`) and follow errors.
@@ -248,6 +249,8 @@ export interface DataSource {
   readonly resources?: AgentResourceSource
   /** The monitor's existing port, unchanged: fixtures declare a synthetic source, live the same-origin relay. */
   readonly usage: MonitorSource
+  /** Native default or injected trace provider, bound to the owning live runtime. */
+  readonly sessionTrace?: (query: TraceQuery) => Promise<TraceSeries>
   /** Live client-observed state kept separate from the feature-facing feed projection. */
   readonly sync?: {
     /** Protocol-decoded observations, not merely an open socket. */
