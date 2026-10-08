@@ -399,6 +399,27 @@ mod tests {
     const DAEMON: Option<&str> = Some("new");
 
     #[test]
+    fn malformed_report_does_not_replace_a_beat_or_prove_recording() {
+        let recipient = "agent/malformed-report-control";
+        let mut fence = crate::mailbox::Fence::new(recipient, "current", "delivery");
+        fence.epoch = 1;
+        assert!(record_fenced(
+            &fence,
+            &json!({"transport":"omp-channel", "ready":false}).to_string()
+        ));
+        let mut malformed = fence.clone();
+        malformed.epoch = 2;
+        assert!(!record_fenced(
+            &malformed,
+            &json!({"transport":"omp-channel", "ready":true, "image":42}).to_string()
+        ));
+        let beats = presence().beats.lock().unwrap();
+        let beat = beats.get(recipient).unwrap();
+        assert_eq!(beat.report.ready, Some(false));
+        assert_eq!(beat.fence.as_ref().unwrap().epoch, 1);
+    }
+
+    #[test]
     fn attachment_requires_current_initialized_delivery_and_not_a_title_report() {
         let recipient = "agent/attachment-proof";
         let mut delivery = crate::mailbox::Fence::new(recipient, "current", "delivery");

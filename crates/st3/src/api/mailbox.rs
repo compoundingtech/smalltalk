@@ -818,7 +818,7 @@ async fn stream_with_timers_inner<F, S, H>(
                                 authority::admit_report(&checked_state, &binding, &peer, &raw)
                             }).await, Ok(Ok(())))
                         } else { true };
-                        let recorded = authenticated && delivery_presence::record_fenced(&fence, &report);
+                        let recorded = authenticated && record_admitted_report(&fence, &report);
                         let value = serde_json::from_str::<Value>(&report).unwrap_or(Value::Null);
                         replay_supported |= peer.is_some() && value["mailbox_replay_ack"] == true;
                         if fence.component == "delivery" && replay_supported && !previous_mailbox.is_empty() && !replay_challenge_sent {
@@ -860,6 +860,79 @@ async fn stream_with_timers_inner<F, S, H>(
             },
         }
     }
+}
+
+// The stream checks durable custody and native peer authority before this recorder.
+// Preserve typed recording success separately from ownership admission/drain ACKs.
+fn record_admitted_report(fence: &Fence, report: &str) -> bool {
+    let recorded = delivery_presence::record_fenced(fence, report);
+    #[cfg(feature = "test-support")]
+    if recorded {
+        observe_admitted_report(fence, report);
+    }
+    recorded
+}
+
+#[cfg(test)]
+fn record_checked_report(store: &Store, fence: &Fence, report: &str) -> bool {
+    if store.check_mailbox(fence).is_err() {
+        return false;
+    }
+    record_admitted_report(fence, report);
+    true
+}
+
+/// An isolated fixture can observe daemon acceptance without writing graph state or
+/// sending probe mail. This is deliberately after the durable ownership check.
+#[cfg(feature = "test-support")]
+fn observe_admitted_report(fence: &Fence, raw: &str) {
+    use std::io::Write as _;
+    use std::sync::Mutex;
+
+    let Some(path) = std::env::var_os("ST3_TEST_ADMITTED_REPORTS") else {
+        return;
+    };
+    let Some(mut report) = admitted_report(fence, raw) else {
+        return;
+    };
+    // Sequence and append are ordered together, including reports from other streams.
+    static SEQUENCE: Mutex<u64> = Mutex::new(0);
+    let Ok(mut sequence) = SEQUENCE.lock() else {
+        return;
+    };
+    *sequence += 1;
+    report["sequence"] = json!(*sequence);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{report}");
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn admitted_report(fence: &Fence, raw: &str) -> Option<Value> {
+    use sha2::{Digest as _, Sha256};
+
+    let report: Value = serde_json::from_str(raw).ok()?;
+    if fence.component != "delivery" || report["transport"] != "omp-channel" {
+        return None;
+    }
+    let pid = u32::try_from(report["pid"].as_u64()?).ok()?;
+    let start_ticks = crate::sekrets::identity::process_start(i32::try_from(pid).ok()?)?;
+    Some(json!({
+        "subject": fence.subject,
+        "incarnation": fence.incarnation,
+        "component": fence.component,
+        "epoch": fence.epoch,
+        // Retain binding identity without publishing its credential.
+        "token_sha256": hex::encode(Sha256::digest(fence.token.as_bytes())),
+        "pid": pid,
+        "start_ticks": start_ticks,
+        "transport": report["transport"],
+        "ready": report["ready"],
+    }))
 }
 
 async fn finish_fenced(socket: &mut WebSocket, frame: &Frame) {
@@ -922,6 +995,54 @@ mod tests {
                 }
             }))
             .fallback_service(router(state).layer(Extension(peer)))
+    }
+
+    #[cfg(all(feature = "test-support", target_os = "linux"))]
+    #[test]
+    fn admitted_report_requires_the_current_delivery_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let subject = "agent/report-binding-control";
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":"report-binding-control", "incarnation_id":"current"})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let old = state
+            .store
+            .bind_mailbox(&Fence::new(subject, "current", "delivery"))
+            .unwrap();
+        let report =
+            json!({"transport":"omp-channel", "pid":std::process::id(), "ready":true}).to_string();
+        assert!(record_checked_report(&state.store, &old, &report));
+        let current = state
+            .store
+            .bind_mailbox(&Fence::new(subject, "current", "delivery"))
+            .unwrap();
+        assert!(!record_checked_report(&state.store, &old, &report));
+        for change in ["token", "epoch", "incarnation", "subject"] {
+            let mut foreign = current.clone();
+            match change {
+                "token" => foreign.token = "foreign".into(),
+                "epoch" => foreign.epoch += 1,
+                "incarnation" => foreign.incarnation = "previous".into(),
+                _ => foreign.subject = "agent/foreign-report-control".into(),
+            }
+            assert!(
+                !record_checked_report(&state.store, &foreign, &report),
+                "{change}"
+            );
+        }
+        assert!(record_checked_report(&state.store, &current, &report));
+        let observation = admitted_report(&current, &report).unwrap();
+        assert_eq!(observation["epoch"], current.epoch);
+        assert_eq!(observation["pid"], std::process::id());
+        assert!(observation["start_ticks"].as_u64().is_some());
+        assert!(observation.get("token").is_none());
+        assert_ne!(observation["token_sha256"], current.token);
+        let mut title = current;
+        title.component = "title".into();
+        assert!(admitted_report(&title, &report).is_none());
     }
 
     #[tokio::test]
