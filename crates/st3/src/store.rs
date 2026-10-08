@@ -134,6 +134,7 @@ mod document_index_tests;
 mod lanes;
 mod operations;
 pub(crate) mod mission_ivm;
+pub mod offline_audit;
 mod unread_mail;
 mod agent_messages;
 pub mod agent_view;

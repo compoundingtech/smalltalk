@@ -75,9 +75,9 @@ class OracleTests(unittest.TestCase):
 
     def test_a_failed_handoff_requires_visibility_in_all_three_views(self):
         self.proof.update(case="handoff-failed", failed_path_visible=True,
-                          failed_doctor_visible=True, failed_sender_visible=True)
+                          unchecked_doctor_visible=True, failed_sender_visible=True)
         self.assertEqual([], runner.judge(self.proof))
-        for field in ("failed_path_visible", "failed_doctor_visible", "failed_sender_visible"):
+        for field in ("failed_path_visible", "unchecked_doctor_visible", "failed_sender_visible"):
             proof = copy.deepcopy(self.proof)
             proof[field] = False
             self.assertIn(field, "; ".join(runner.judge(proof)))

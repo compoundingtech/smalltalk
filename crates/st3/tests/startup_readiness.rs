@@ -119,6 +119,7 @@ fn replay_is_visible_before_the_api_serves_and_stale_files_are_ignored() {
     let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
     assert_eq!(report["startup"]["phase"], "full-replay/base-claims");
     assert_eq!(report["startup"]["status"], "starting");
+    assert!(!String::from_utf8_lossy(&doctor.stderr).contains("st setup"), "{doctor:?}");
     let started = Instant::now();
     let ordinary = command(root).args(["agents", "ls"]).output().unwrap();
     assert!(

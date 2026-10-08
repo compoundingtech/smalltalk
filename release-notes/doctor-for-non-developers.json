@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Doctor keeps source-build checks opt-in and gives people setup advice when the local daemon is unavailable.",
+  "replay": {"status": "none", "detail": "No additional projection or replay changes beyond the read-only diagnostic prerequisite."},
+  "schema": {"status": "none", "detail": "No database or migration changes."},
+  "rules": {"status": "none", "detail": "No checkpoint or fleet rule changes."},
+  "compatibility": {"status": "changed", "detail": "The additive doctor --developer flag checks local source-build tool availability without compiling or contacting the daemon or GitHub. Human local connection failures recommend st or st setup; native drivers and seat callers keep their existing recovery text. Doctor JSON includes a failed daemon check on connection failure and retains exit code 5."},
+  "downtime": {"status": "none", "detail": "No additional service interruption."},
+  "manual": {"status": "changed", "detail": "Use doctor --developer for local source-build checks and add --strict to fail on missing tools. Ordinary doctor does not request developer-tool installation. Uncertified platform evidence remains visibly unknown under the read-only diagnostic prerequisite."},
+  "recovery": {"status": "none", "detail": "No persistent state changes; the previous CLI restores its previous flags and error text."}
+}
