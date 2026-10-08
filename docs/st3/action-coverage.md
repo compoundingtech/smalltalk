@@ -1,8 +1,8 @@
 # st action coverage
 
-The inventory covers every offered CLI command, every typed client action, every stui daemon effect, and the palette and local controls. It distinguishes real CLI/Unix transport tests, the live stui adapter, local reducer tests, and shared implementations. A test reference describes its actual layer; a shared implementation test alone is not a claim that the entire interactive UI was driven.
+The inventory covers every offered CLI command, every typed client action, every terminal UI daemon effect, and the palette and local controls. It distinguishes real CLI/Unix transport tests, the live terminal UI adapter, local reducer tests, and shared implementations. A test reference describes its actual layer; a shared implementation test alone is not a claim that the entire interactive UI was driven.
 
-`action-coverage.json` is the machine-readable source. Tests compare its CLI rows with Clap's offered command tree, its 54 typed actions with the generated client contract and real dispatch builders, and its 19 stui effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
+`action-coverage.json` is the machine-readable source. Tests compare its CLI rows with Clap's offered command tree, its 54 typed actions with the generated client contract and real dispatch builders, and its 19 terminal UI effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
 
 ## Restart and stale-state model
 
@@ -12,7 +12,7 @@ For the restart-matrix typed actions, the test first submits a stale applicable 
 
 The CLI drives real public command paths. Reads are compared before and after restart; writes are checked in the reopened graph. Messaging checks explicit idempotency keys, replies, attachments and lifecycle receipts. Review tests use current source cards and inspect the single attributed verdict. Launch tests ask and answer questions, submit/compare variants, preview, approve, request revision, cancel, start approved definitions, and propose a variant against one run generation. Terminal tests send real input, keys and signals to a private PTY, inspect its screen, and reject revoked attachments. Fleet tests cover creation/join/history, mode changes, revoke/remove/leave, migrations, checkpoints and repairs. The GitHub watch/unwatch/list/comment/own test drives real CLI and daemon processes against a private HTTP fixture, including restart, repeated unwatch, comment and review posting, foreign-author refusal and idempotent ownership registration.
 
-The live stui test drives send/attachment upload, discussion, retry, agent/shell/launch creation, launch revision, device revocation and mission cancellation through its real adapter across disk-store restarts. The gate fixture drives the real attention adapter after a changed card and a restart. Terminal key encoding, native attachment/reconnection, visibility/read receipts, palette/layout and local draft/navigation controls retain their own focused tests.
+The live terminal UI test drives send/attachment upload, discussion, retry, agent/shell/launch creation, launch revision, device revocation and mission cancellation through its real adapter across disk-store restarts. The gate fixture drives the real attention adapter after a changed card and a restart. Terminal key encoding, native attachment/reconnection, visibility/read receipts, palette/layout and local draft/navigation controls retain their own focused tests.
 
 Suspension and new-seat readiness tests supply explicit fixture owner acknowledgements. They verify the public request, wait, native identity and durable protocol phases; native process continuation belongs to the runtime canaries and restart suite. GitHub gates use real CLI commands with a private HTTP fixture for pass/wait/broken behavior, obsolete commit refs and malformed-input refusal across daemon restarts; they make no live GitHub API calls. GitHub comment posting offers no public snapshot fence or retry token: tests prove refusal of a foreign seat actor before HTTP posting and durable ownership across restarts; they do not claim exactly-once external posting. Local-only UI operations have no graph fence. Glass base revisions intentionally report last-writer-wins replacement and are not execution fences.
 
@@ -23,8 +23,8 @@ Three declared typed actions are unavailable: `attention.resolve` returns `atten
 - A ready step has no lease incarnation. Comparing a claim's live incarnation against the missing lease rejected every valid typed claim. Claim dispatch now validates the caller's current live harness before acquiring the lease; existing leases still compare their incarnation.
 - A stale mission revision preview reached a legacy handler and was classified as an internal error. Typed dispatch now reports `stale-fence` before approval writes.
 - Legacy CLI launch IDs can themselves start with `launch/`. Later actions stripped that prefix before looking up the stored ID. The lookup now resolves the exact ID first and then accepts the client resource namespace.
-- stui launch review cards identify their source as a planning session and also provide a public launch ID. Approval, cancellation and revision now use that public launch ID rather than constructing an invalid nested resource path.
-- With multiple launch variants, stui selected the last preview by ordinal even when its review card named the default candidate. Approval now filters to the card's variant before choosing a preview.
+- terminal UI launch review cards identify their source as a planning session and also provide a public launch ID. Approval, cancellation and revision now use that public launch ID rather than constructing an invalid nested resource path.
+- With multiple launch variants, terminal UI selected the last preview by ordinal even when its review card named the default candidate. Approval now filters to the card's variant before choosing a preview.
 
 ## Run the checks
 
@@ -304,7 +304,7 @@ edits and removes retired subjects without changing unfiltered reads.
 | `st work update` | real CLI over private Unix socket; disk store reopened between actions | [`cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st work wake` | real CLI over private Unix socket; disk store reopened between actions | [`cli_mission_output_and_manual_wake_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 
-## stui effects
+## Terminal UI effects
 
 | Effect | Verification | Test evidence |
 | --- | --- | --- |

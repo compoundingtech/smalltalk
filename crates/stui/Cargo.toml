@@ -2,7 +2,7 @@
 name = "stui"
 version = "0.1.0"
 edition = "2024"
-description = "Smalltalk terminal UI starter shell"
+description = "Smalltalk terminal UI library"
 license = "MIT"
 # The workspace's build identity stamp, shared with st2 and st-drivers (see src/version.rs).
 build = "../../build.rs"
@@ -37,10 +37,6 @@ alacritty_terminal = { version = "0.26", default-features = false }
 pty-client = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }
 pty-terminal = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }
 pty-core = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }
-
-[[bin]]
-name = "stui"
-path = "src/main.rs"
 
 # Its own tests run with the crate's, so the timing log it writes stays valid JSON.
 [[example]]

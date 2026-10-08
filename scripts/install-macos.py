@@ -41,10 +41,10 @@ def fixed(home):
 
 
 def binaries(app):
-    return {name: Path(app) / 'Contents/MacOS' / name for name in ['st3', 'stui']}
+    return {name: Path(app) / 'Contents/MacOS' / name for name in ['st3']}
 
 
-# stui's speech helper (apps/macos/listen), when built: its own app inside SmallTalk.app, so the
+# The terminal client's speech helper (apps/macos/listen), when built: its own app inside SmallTalk.app, so the
 # microphone prompt names Small Talk with the helper's usage strings.
 HELPER = 'StListen.app'
 
@@ -143,7 +143,7 @@ def prepare(home, job, built):
         # macOS asks on behalf of the outermost app, so its name and usage strings are the ones shown.
         info['CFBundleDisplayName'] = 'Small Talk'
         info['NSMicrophoneUsageDescription'] = (
-            'Small Talk listens while you dictate a message in stui, and transcribes it on this Mac.')
+            'Small Talk listens while you dictate a message in the terminal interface, and transcribes it on this Mac.')
         info['NSSpeechRecognitionUsageDescription'] = 'Small Talk transcribes your dictated messages on this Mac.'
 
     (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
@@ -151,7 +151,7 @@ def prepare(home, job, built):
     metadata.write_text(json.dumps(desired, sort_keys=True) + '\n')
     for name, path in paths.items():
         command(['/usr/bin/codesign', '--force', '--sign', CERTIFICATE or '-', '--identifier',
-                 IDENTIFIER if name == 'st3' else IDENTIFIER + '.stui', '--timestamp=none', path])
+                 IDENTIFIER, '--timestamp=none', path])
     if HELPER in built:
         # Nested code is signed before the app that seals it.
         helper = app / 'Contents/Helpers' / HELPER
@@ -225,6 +225,9 @@ def swap(app, home, job, suffix, expected=None):
 
 
 def install(app, home, job):
+    retired = bin_dir(home) / 'stui'
+    if retired.is_dir():
+        raise RuntimeError('refusing to remove directory: ' + str(retired))
     swap(app, home, job, 'install')
     links = dict(binaries(fixed(home)), st=Path('st3'))
     for name, path in links.items():
@@ -232,6 +235,7 @@ def install(app, home, job):
         link.parent.mkdir(parents=True, exist_ok=True)
         staged = link.parent / ('.' + name + '-' + Path(job).name)
         staged.unlink(missing_ok=True); staged.symlink_to(path); os.replace(staged, link)
+    retired.unlink(missing_ok=True)
     for service in SERVICES:
         path = Path(home) / 'Library/LaunchAgents' / (service + '.plist')
         if not path.exists():
@@ -336,7 +340,7 @@ def main():
             return
         if args.source is None:
             parser.error('--from is required')
-        built = {name: args.source / name for name in ['st3', 'stui']}
+        built = {name: args.source / name for name in ['st3']}
         for path in built.values():
             if not path.is_file() or not os.access(path, os.X_OK):
                 parser.error('missing executable: ' + str(path))

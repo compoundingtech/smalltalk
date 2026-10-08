@@ -10,13 +10,13 @@ while (($#)); do
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
-binaries=(st3 stui st3-migrate pty)
+binaries=(st3 st3-migrate pty)
 for binary in "${binaries[@]}"; do
   [[ -f $source_dir/$binary && -x $source_dir/$binary ]] || {
     echo "missing executable: $binary" >&2; exit 1;
   }
 done
-for name in "${binaries[@]}" st; do
+for name in "${binaries[@]}" st stui; do
   [[ ! -d $bin_dir/$name ]] || { echo "refusing to replace directory: $name" >&2; exit 1; }
 done
 mkdir -p "$bin_dir"
@@ -33,8 +33,10 @@ for binary in "${binaries[@]}"; do
 done
 ln -s st3 "$stage/st"
 for name in "${binaries[@]}" st; do
-  if [[ $macos == true && ($name == st3 || $name == stui) ]]; then continue; fi
+  if [[ $macos == true && $name == st3 ]]; then continue; fi
   mv -f "$stage/$name" "$bin_dir/$name"
 done
-printf 'Installed st3, st -> st3, stui, st3-migrate, and pty in %s\n' "$bin_dir"
+# Retire the old executable; no alias or shim remains.
+rm -f -- "$bin_dir/stui"
+printf 'Installed st3, st -> st3, st3-migrate, and pty in %s\n' "$bin_dir"
 echo 'Running services were not restarted.'

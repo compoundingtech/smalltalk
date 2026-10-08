@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import Speech
 
-// st-listen: the microphone into SpeechAnalyzer's transcriber, on this Mac, for stui's voice mode.
+// st-listen: the microphone into SpeechAnalyzer's transcriber, on this Mac, for the terminal client's voice mode.
 // It writes one JSON object per line to stdout:
 //   {"event":"ready","device":"MacBook Pro Microphone"}  listening, and to what
 //   {"event":"silent","device":"…"}                 nothing but silence for 3 seconds
@@ -16,7 +16,7 @@ import Speech
 // The microphone prompt belongs to the process macOS holds responsible, which for a program run
 // from a terminal is the terminal app. So st-listen first starts itself again disclaimed, which
 // makes it responsible for itself: the prompt then names Small Talk, from this bundle's
-// Info.plist, whatever terminal stui runs in.
+// Info.plist, whatever terminal st runs in.
 
 setvbuf(stdout, nil, _IOLBF, 0)
 

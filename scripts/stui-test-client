@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Run the real stui headless, as a designated test client, for measuring what one attached
+"""Run the real st ui headless, as a designated test client, for measuring what one attached
 client costs the daemon.
 
     scripts/stui-test-client [--binary PATH] [--seconds N] [--label NAME] [--keys HEX_OR_TEXT ...]
 
-It starts the stui binary in a pseudo-terminal (no display), answers the terminal queries stui
+It starts st ui in a pseudo-terminal (no display), answers the terminal queries the UI
 makes, sends any `--keys`, then leaves it idle for `--seconds` and quits it with Ctrl+Q. Everything
-a real stui does at idle happens: the three collection windows, the glasses window, the followed
+a real UI does at idle happens: the three collection windows, the glasses window, the followed
 conversation of the selected agent, and its periodic reads (clients every 10 s, usage every
 60 s, machines and devices). The connection names itself `stui <version> [LABEL]` in the
-`x-st3-client` header, so `st clients` and a profile tell it from a person's stui. Identity is the
-caller's, as for any stui run from this account (`ST3_PERSON`, or the local default); a label is
+`x-st3-client` header, so `st clients` and a profile tell it from a person's UI. Identity is the
+caller's, as for any st ui run from this account (`ST3_PERSON`, or the local default); a label is
 never authority. Prints only a few status lines, never terminal contents.
 
 `--keys` takes text sent as typed, with `\\x1b`, `\\r` and `\\x0b` (Ctrl+K) escapes understood,
@@ -48,9 +48,7 @@ def main() -> None:
     env.pop("ST_AGENT", None)
     if arguments.timing:
         env["STUI_TIMING_LOG"] = arguments.timing
-    command = [arguments.binary]
-    if os.path.basename(arguments.binary) != "stui":
-        command.append("ui")
+    command = [arguments.binary, "ui"]
     process = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, env=env)
     os.close(slave)
     received = 0

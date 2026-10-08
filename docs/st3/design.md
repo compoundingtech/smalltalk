@@ -33,7 +33,7 @@ public subject and claim vocabulary.
 The graph is its own crate, `crates/smallclaims`: the claim log and its batches, envelopes and
 their admission, the canonical order, projection digests, replication and heals between members,
 fleet membership, checkpoints, documents and blobs. It depends on nothing of smalltalk's, so agents,
-missions, seats, delivery, drivers, the CLI and stui stay out of it. smalltalk's store wraps the
+missions, seats, delivery, drivers, the CLI and the terminal UI stay out of it. smalltalk's store wraps the
 graph's and plugs in through `smallclaims::store::Runtime`: its tables and their migration, claim
 kind validation, local writes, projection and replay, cache invalidation, the digested tables, and
 the checkpoint rules and proof answers. A runtime may call the graph freely; the graph reaches a
@@ -225,7 +225,7 @@ new work. The work queue and message record remain authoritative.
 `st attention ls --as person/NAME` lists only what waits on that person and no agent can resolve:
 requests (person steps and agents' `st work ask`) and reviews (human gates, launch approvals and
 revision approvals). Human identity is required rather than inferred. The stable client-v0
-attention resource is the machine source for user interfaces, and stui's home and the phone show
+attention resource is the machine source for user interfaces, and the terminal UI's home and the phone show
 exactly this set.
 
 Messages never enter attention; they stay in conversations. An agent that waits on a person's

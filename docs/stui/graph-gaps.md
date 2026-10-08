@@ -1,15 +1,15 @@
-# What stui needs from the graph
+# What the terminal UI needs from the graph
 
 To: the Smalltalk owner agent (st3 daemon, schema, graph)
-From: the stui rebuild
+From: the terminal UI rebuild
 Status: draft, 2026-09-28. Line references are against `agent/stui-rebuild` at `6589bb70`.
 
 ## 1. Purpose
 
-stui is being rebuilt so the person uses it every day. It has to answer three questions without
+The terminal UI is being rebuilt so the person uses it every day. It has to answer three questions without
 making anything up: what is waiting on me, what is the fleet doing, and where is the work on disk.
-stui renders projections and never infers state it wasn't given. So each gap below is either
-something the person can't see, or something stui would have to guess. The rest of this doc is
+The terminal UI renders projections and never infers state it wasn't given. So each gap below is either
+something the person can't see, or something the terminal UI would have to guess. The rest of this doc is
 about removing those guesses.
 
 Principles this serves:
@@ -17,7 +17,7 @@ Principles this serves:
 - **Every attention kind has its own renderer.** Home shows the thing being decided, not an id.
 - **A decision's words reach whoever acts on it.** If the person types a reason, the agent sees it.
 - **Relationships are data.** "Which agents are in this worktree" is an edge, not a path-string match.
-- **Order comes from the daemon.** stui does not re-rank.
+- **Order comes from the daemon.** The terminal UI does not re-rank.
 
 ## 2. Worktree as a resource
 
@@ -96,7 +96,7 @@ Kinds come from `store.rs:8307-8486`. The actions come from `api.rs:1639-1650`.
 |---|---|---|---|
 | `human-gate` (`store.rs:15166`) | question, what to review (target contents, the step's submitted summary), who did the work, mission/step titles | `detail`=question, `targets`=review target ids, `mission_id`/`step_run_id` | Target contents aren't resolved. The step's `work.submitted` summary isn't attached. There's no worker id. Only approve/reject. |
 | `launch-approval` (`store.rs:15209`) | proposed mission: goal, steps with assignee and depends, agents with harness and host, gate count, diagnostics, what the person asked for | Everything is on `LaunchVariant.normalized_mission`/`visualization` (`api.rs:2160-2230`) | Attention `source_id` is `planning-session/ID`, with no `launch_id` or variant. The title is `Approve mission/ID` and the detail is fixed text (`store.rs:15218-15219`). `Launch.title` is the mission id (`api.rs:2316`). Targets are doc names whose content can't be read by a client. |
-| `revision-approval` (`store.rs:15258`) | old vs new mission, reason, affected running steps | `detail`=reason, target `mission@rev` | No diff on the attention. stui has to find the proposal some other way. |
+| `revision-approval` (`store.rs:15258`) | old vs new mission, reason, affected running steps | `detail`=reason, target `mission@rev` | No diff on the attention. The terminal UI has to find the proposal some other way. |
 | `unread-message` (`store.rs:15306`) | sender, first lines, thread | title, fixed detail `Unread message from X.` | No `message_id` field (it's the `source_id`) and no excerpt. Reading the `Message` separately works. |
 | `fault` from `attention.requested` (`store.rs:15337`) | who is asking, what, why, what the person should do, reply box | title, reason, severity→priority (`api.rs:1653-1660`), target states | **An agent asking for input is labelled a fault.** The requester (`AttentionRequestView.actor`, `model.rs:1601`) is dropped from the projection (`api.rs:1713-1728`). Outcomes are only `resolved`/`dismissed` (`store.rs:8054`). |
 | `fault` from `subscription.mission-failed` (`store.rs:8423-8470`) | what failed, why, fix | `detail`=`code: reason` | Read with no resolution filter, so the item never leaves. The subject is a claim id, so `attention.resolve` fails with not-found (`client_v0.rs:3806-3814`). |
@@ -189,7 +189,7 @@ and `last_progress`. Also add `title`, `assigned_to` and `last_progress` to `Wor
 - **A person cannot fix a broken agent or a stalled step from a client.** `runtime.restart`,
   `runtime.reset` and `runtime.stop` are person actions but are left out of the client's
   `AVAILABLE_ACTIONS` (`crates/st3/src/api/client_v0.rs`, the two action lists near the top), and
-  there is no client action for `st work retry`. stui can only cancel a run or point at the CLI.
+  there is no client action for `st work retry`. The terminal UI can only cancel a run or point at the CLI.
   Offer restart, reset and retry to persons through the client API, fenced like `mission.cancel`.
 
 - **Standing watchers look like running work.** An intake mission keeps its observer and
@@ -217,5 +217,5 @@ Smallest useful change first:
    Then the `Worktree` client resource and list endpoint, with legacy strings resolved on read.
 9. Add agent `last_activity_at`/`silent_since`/`host_id`, and fill `Machine.projects`.
 
-stui can ship Home and Missions after steps 1-6. It will show an honest "unknown" where later
+The terminal UI can ship Home and Missions after steps 1-6. It will show an honest "unknown" where later
 steps haven't landed. The Worktrees tab waits for step 8.

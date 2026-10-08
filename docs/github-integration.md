@@ -219,7 +219,7 @@ st missions start garden/github-intake --id garden/github-intake/main \
   --input "repository=$garden_repo" --workspace "$PWD/github-intake" --as person/ada
 st missions show mission-run/garden/github-intake/main
 st agents queue agent/garden/worker
-stui
+st
 ```
 
 The first observation is a baseline and starts no work. Subsequent new ready PR heads and issues create runs; drafts wait until ready. Requests are remembered across restarts, and a child mission's capacity limit holds pending requests instead of dropping them. One worker runs these jobs serially; separate review and triage seats let independent work run in parallel.

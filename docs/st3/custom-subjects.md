@@ -19,7 +19,7 @@ st subject show custom/garden/review/v1/review-001
 st attention ls --as person/lichen
 ```
 
-The claim pins its registration hash automatically. One card appears for Lichen. stui displays
+The claim pins its registration hash automatically. One card appears for Lichen. The terminal UI displays
 its declared fields and source ID. Open the reply box and enter `keep`, or enter a JSON object
 such as `{"selection":"keep","text":"Retain the provenance."}`. The generic client action
 is `custom.reply`; its parameters come from the card's `action_parameters` and `custom_form`.

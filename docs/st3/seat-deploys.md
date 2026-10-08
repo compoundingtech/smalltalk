@@ -134,7 +134,7 @@ lookup, and receipt publication failures have separate diagnostics and retry wit
 at 30 seconds. Retained handoffs are inspected only to recover missing receipts from exact native
 proof. Boot and reconnect never authorize a fresh offer of delivered-but-unread mail.
 
-`st doctor` and stui count unread (`sent`, `staged`, or `delivered`) messages older than one hour, including
+`st doctor` and the terminal UI count unread (`sent`, `staged`, or `delivered`) messages older than one hour, including
 retained mail for retired seats. Boot never clears that backlog. To deliberately archive it across
 all mailboxes, run `st conversations cleanup --all --older-than 1h`. Add `--dry-run` to list matching
 message IDs first, or replace `--all` with `--as AGENT` to clean one mailbox. Cleanup archives as each

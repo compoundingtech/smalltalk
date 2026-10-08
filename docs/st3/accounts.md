@@ -87,7 +87,7 @@ logins.
 ## Usage and limits per account
 
 A bound seat's limits readings carry the declared account's name (`account_ref`) next to the
-opaque account label, so `st usage` and stui name the account:
+opaque account label, so `st usage` and the terminal UI name the account:
 
 ```
 LIMITS  2 · the freshest reading of each account

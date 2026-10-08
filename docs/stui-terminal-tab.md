@@ -1,7 +1,7 @@
 # Terminal tab input, replies and images
 
 Terminal tabs use the real PTY session daemon for durable terminal state and query
-replies. stui renders text and history with alacritty_terminal, and uses the pinned
+replies. The terminal UI renders text and history with alacritty_terminal, and uses the pinned
 PTY engine for negotiated keyboard/mouse encoding and decoded image placements.
 The outer terminal owns its own input decoding and clipboard. Child queries are
 answered once for the pane; they are not forwarded to the outer screen.
@@ -37,7 +37,7 @@ attached behind other tabs.
 | --- | --- | --- |
 | Wheel with mouse 1000/1002/1003 | Three wheel reports, on main or alternate screen | Alt/Option, Shift and selection mode hold it locally |
 | Wheel without mouse, alternate screen and 1007 enabled | Three arrows; application cursor mode uses SS3 | Disabling 1007 stops this translation |
-| Wheel otherwise | Scrolls stui history | There is no horizontal history axis |
+| Wheel otherwise | Scrolls terminal UI history | There is no horizontal history axis |
 | Click/release, drag, hover | Respect tracking mode; hover only under 1003 | The UI keeps selection overrides |
 | SGR 1006 | CSI <button;x;y M/m with pane cells | Modifiers preserved when program owns mouse |
 | Legacy encoding | X10 byte reports within representable coordinates | Out-of-range positions omitted; use 1006 |
@@ -70,7 +70,7 @@ independently of the outer terminal's modes.
 | Focus 1004 | Outer focus in/out forwarded when requested | Palette and tab focus transitions also update the program |
 | Drag without program mouse | Selects and copies through OSC 52 | Actual clipboard acceptance depends on outer terminal settings |
 | Alt/Option+drag | Selects locally even with program mouse | Works when kitty keeps Shift for itself |
-| Shift+drag | Local selection when delivered to stui | Kitty's default mapping keeps this gesture outside stui |
+| Shift+drag | Local selection when delivered to the terminal UI | Kitty's default mapping keeps this gesture outside the terminal UI |
 | Ctrl+Alt+S | Toggles selection mode, withholding mouse from child | Footer shows how to resume program mouse |
 | Ctrl+Alt+R | Resets input modes and returns to normal screen, retaining normal text/history | Clears both kitty stacks, mouse, focus, paste, keypad and resize-reporting modes |
 | Ctrl+Alt+click on OSC 8 link | Copies destination through OSC 52 | No outer-screen hyperlink coordinates or browser launch |
@@ -83,7 +83,7 @@ records this boundary.
 
 Ctrl+\ always detaches, including through the palette, and is never sent to the
 child. Legacy Ctrl+4 is its crossterm alias. Ctrl+K (or Command+K) opens the palette.
-The selection/reset chords and Shift+PageUp/PageDown stay stui's, including their
+The selection/reset chords and Shift+PageUp/PageDown stay the terminal UI's, including their
 repeat/release events. In an agent terminal Ctrl+C/D require two presses within two
 seconds; a shell receives them immediately. The existing focused-terminal exception
 for other space controls stays: Ctrl+Q/S/H/T/V/X/W/O, plain Tab/Shift+Tab and Alt+arrows
@@ -117,7 +117,7 @@ second answer with different geometry or defaults.
 ## Images and terminal-browser
 
 Inline kitty images are decoded by the same PTY engine used for durable replay.
-stui reads owned image bytes and resolved placements, clips them to the terminal
+The terminal UI reads owned image bytes and resolved placements, clips them to the terminal
 pane, applies source crops and cell/pixel offsets, and remaps child ids to ids it
 owns. Both direct and Unicode-placeholder placements render as outer kitty virtual
 placements. Text-cell frame diffs move and clear the visible placeholders on
@@ -167,7 +167,7 @@ Use the Nix development shell, whose PTY package and Python are CI inputs, and r
 outside an agent seat environment:
 
 ```sh
-cargo nextest run -p stui --bin stui -E 'test(terminal_tab_protocols)'
+cargo nextest run -p stui --lib -E 'test(terminal_tab_protocols)'
 python3 crates/stui/tests/terminal_tab_probe.py --worker TEST_EXECUTABLE --record /tmp/tab.json
 python3 crates/stui/tests/terminal_browser_probe.py --worker TEST_EXECUTABLE \
   --app /path/to/terminal-browser-bundle --record /tmp/browser.json

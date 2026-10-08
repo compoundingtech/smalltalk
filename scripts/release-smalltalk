@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # Build and verify a native Smalltalk archive. Never installs or restarts a service.
-# Usage: scripts/release-smalltalk TARGET OUTPUT_DIRECTORY
+# Usage: scripts/release-smalltalk [--dry-run] TARGET OUTPUT_DIRECTORY
 set -Eeuo pipefail
 
+dry_run=false
+if [[ ${1:-} == --dry-run ]]; then
+  dry_run=true
+  shift
+fi
+binaries=(st3 st3-migrate)
+runtime_binaries=("${binaries[@]}" pty)
 target=${1:?expected Rust target}
 out=${2:?expected output directory}
 case "$target:$(uname -sm)" in
@@ -11,6 +18,13 @@ case "$target:$(uname -sm)" in
 esac
 repo=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo"
+if $dry_run; then
+  printf 'cargo build --release --locked --target %s -p st3 -p st3-migrate\n' "$target"
+  printf 'stage bin/%s\n' "${runtime_binaries[@]}"
+  printf 'link bin/st -> st3\narchive %s/smalltalk-%s.tar.gz\n' "$out" "$target"
+  printf 'verify manifest, install in isolated destination, run st ui PTY smoke\n'
+  exit 0
+fi
 test -z "$(git status --porcelain --untracked-files=no)"
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
@@ -36,9 +50,9 @@ pty_url=$(python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print("ht
 # inherited Nix stamp identify a different source than the release's BUILD.json.
 unset CLI_BUILD_STAMP
 export CARGO_ENCODED_RUSTFLAGS=
-cargo build --release --locked --target "$target" -p st3 -p st3-migrate -p stui
+cargo build --release --locked --target "$target" -p st3 -p st3-migrate
 build_dir=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
-for binary in st3 st3-migrate stui; do
+for binary in "${binaries[@]}"; do
   install -m 0755 "$build_dir/$target/release/$binary" "$work/$package/bin/$binary"
 done
 
@@ -63,8 +77,8 @@ AGENT_SPEC_REVISION="$pty_rev" cargo build --release --locked --manifest-path "$
   --target-dir "$pty_build_dir" --target "$target" -p pty --bin pty
 install -m 0755 "$pty_build_dir/$target/release/pty" "$work/$package/bin/pty"
 if [[ $target == *apple* ]]; then
-  # stui's speech helper needs Swift with the macOS 26 SDK; without one the release ships without
-  # voice in stui, and says so.
+  # The terminal client's speech helper needs Swift with the macOS 26 SDK; without one the release ships without
+  # voice in the terminal interface, and says so.
   speech="$build_dir/$target/release/StListen.app"
   if [ "${CI_BUILD_SNAPSHOT_HIT:-}" = 1 ] && [ -d "$speech" ]; then
     cp -R "$speech" "$work/$package/bin/StListen.app"
@@ -72,7 +86,7 @@ if [[ $target == *apple* ]]; then
     rm -rf "$speech"
     cp -R "$work/$package/bin/StListen.app" "$speech"
   else
-    echo "release-smalltalk: the speech helper did not build here; this release has no voice in stui" >&2
+    echo "release-smalltalk: the speech helper did not build here; this release has no voice in the terminal interface" >&2
     rm -rf "$work/$package/bin/StListen.app" "$speech"
   fi
 fi
@@ -82,7 +96,7 @@ install -m 0755 scripts/install-macos.py "$work/$package/install-macos.py"
 cp docs/st3/binary-releases.md "$work/$package/README.md"
 cp docs/st3/macos-installation.md "$work/$package/macos-installation.md"
 
-for binary in st3 stui st3-migrate pty; do
+for binary in "${runtime_binaries[@]}"; do
   path="$work/$package/bin/$binary"
   file "$path"
   if [[ $target == *linux* ]]; then
@@ -129,8 +143,10 @@ PY_VERSION
 "$work/installed/st" --help >/dev/null
 "$work/installed/st3-migrate" --help >/dev/null
 "$work/installed/pty" --version
-ST3_PERSON=person/release-smoke ST3_ENDPOINT="$work/absent.sock" \
-  python3 crates/stui/tests/pty_smoke.py "$work/installed/stui" --no-panic
+env -u ST_AGENT HOME="$work/install-home" XDG_CONFIG_HOME="$work/install-home/.config" \
+  XDG_CACHE_HOME="$work/install-home/.cache" XDG_STATE_HOME="$work/install-home/.local/state" \
+  ST3_PERSON=person/release-smoke ST3_ENDPOINT="$work/absent.sock" \
+  python3 crates/stui/tests/pty_smoke.py "$work/installed/st" --ui --no-panic
 python3 - "$archive" <<'PY'
 import hashlib, pathlib, sys
 p = pathlib.Path(sys.argv[1])

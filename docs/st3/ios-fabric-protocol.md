@@ -411,7 +411,7 @@ checks, Hello-first ordering, and 15-minute default TTL. Its subsequent review o
 the document confirmed the framing/Hello/admission bytes and supplied corrections
 for teardown/reaping, Ack cadence/backpressure, Close ordering, peer creation,
 ongoing probes, and existing-session revocation. Those corrections are included
-here. The stui owner also required bridge-owned loopback selection and an
+here. The terminal UI owner also required bridge-owned loopback selection and an
 isolated-daemon proof before member provisioning.
 
 The executable proof should establish: unknown NodeID refusal; trusted phone
