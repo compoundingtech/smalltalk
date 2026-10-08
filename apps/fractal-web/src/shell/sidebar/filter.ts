@@ -76,7 +76,8 @@ export const sortMembers = ({
         priority[left.status] - priority[right.status]
       )
     if (sort === 'activity')
-      return (right.agent?.lastActivityAt ?? 0) - (left.agent?.lastActivityAt ?? 0)
+      return (right.agent?.lastActivityAt._tag === 'Known' ? right.agent.lastActivityAt.value : 0) -
+        (left.agent?.lastActivityAt._tag === 'Known' ? left.agent.lastActivityAt.value : 0)
     return sort === 'host'
       ? left.workspace.host.localeCompare(right.workspace.host)
       : left.workspace.title.localeCompare(right.workspace.title)

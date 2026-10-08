@@ -582,7 +582,10 @@ export const sameFolderFleet = (
         (!status ||
           agentStatus({ agent, fleet: left }) === agentStatus({ agent: next, fleet: right })) &&
         (filters.query.trim() === '' || agent.description === next.description) &&
-        (filters.sort !== 'activity' || agent.lastActivityAt === next.lastActivityAt)
+        (filters.sort !== 'activity' ||
+          (agent.lastActivityAt._tag === next.lastActivityAt._tag &&
+            (agent.lastActivityAt._tag === 'Unknown' ||
+              (next.lastActivityAt._tag === 'Known' && agent.lastActivityAt.value === next.lastActivityAt.value))))
       )
     })
   )
@@ -776,7 +779,7 @@ const AgentFolderRow = React.memo(
     const status = agentStatus({ agent, fleet: feed })
     const now = useNow()
     const description = agent?.description?.trim() ?? ''
-    const activityAt = agent?.lastActivityAt
+    const activityAt = agent?.lastActivityAt._tag === 'Known' ? agent.lastActivityAt.value : undefined
     const activate = () => {
       dispatch({ _tag: 'SelectWorkspace', id: workspace.id })
       dispatch({
