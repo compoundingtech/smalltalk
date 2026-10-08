@@ -7222,13 +7222,30 @@ impl Store {
         fleet_id: Option<&str>,
         configured_peers: &[String],
     ) -> Result<ReplicationStatus> {
+        // Inventory, pending local input, peer digests and replica-record state must describe
+        // one database cut. A seal may commit while this read is running.
+        self.read_snapshot(|_| {
+            self.replication_status_sealed_pinned(configured, fleet_id, configured_peers)
+        })
+    }
+
+    fn replication_status_sealed_pinned(
+        &self,
+        configured: bool,
+        fleet_id: Option<&str>,
+        configured_peers: &[String],
+    ) -> Result<ReplicationStatus> {
         let snapshot = self.sealed_replication_snapshot()?;
         let connection = self.readers.get();
         // Projection caches include committed local batches before their envelopes are sealed.
-        // Equal sealed inventories cannot diagnose those pending writes as peer divergence.
+        // Equal sealed inventories cannot diagnose those pending writes as peer divergence. The
+        // committed cursor belongs to this reader's cut; the live Atomic may be ahead of it.
         let unsealed_local: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM batches WHERE rowid>?1 AND origin=?2)",
-            params![self.seeded_batch_rowid.load(Ordering::Acquire), self.origin],
+            "SELECT EXISTS(SELECT 1 FROM batches WHERE rowid>
+                 COALESCE((SELECT CAST(value AS INTEGER) FROM meta
+                           WHERE key='seeded_batch_rowid'),0)
+               AND origin=?1)",
+            [&self.origin],
             |row| row.get(0),
         )?;
         let count = |state: &str| -> Result<u64> {
