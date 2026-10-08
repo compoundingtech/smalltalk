@@ -1,0 +1,612 @@
+{
+  "archive": {
+    "sha256": "05d74c1e350b46b60115fc46e5107d2b877bbecb0f8b665c91cbdb6a62646e00",
+    "package": "smalltalk-x86_64-onboarding-setup-memory-97190ca64",
+    "build": {
+      "version": 1,
+      "source": "97190ca64120057138e1b1bc84b0e49bf753f822",
+      "tree": "0585a96b7b2569ab217d9ce8cbf91444d3d95d6a",
+      "composition": {
+        "foundation": "2959b4d518c11db95f638dea780577e5f9aaa616",
+        "setup": "e12ec02313b9023823c206f3371cf0ebc6ea8bc9",
+        "setup_memory": "fac628632ab97226f0d3358d9f4081f1b1fef372"
+      },
+      "reader_cache_default_kib": 2048,
+      "reader_cache_retained_readers": 128,
+      "doctor_users_pr_included": true,
+      "systemd_older_pr_included": true,
+      "raw_st3_sha256": "65bc45b802fb59e9d371d7d98d6dafcaeccf0ae6e9a84f2801d12232a95325c3",
+      "limits": [
+        "Local proof-only production debug build, not a release archive.",
+        "No supplied loader/libc; host-linked GLIBC_2.39 cannot load stock Ubuntu22.04.",
+        "Memory selection uses page-cache planning targets; not a total RSS ceiling or concurrent-burst guarantee.",
+        "No paid model, native macOS, or real VM claim."
+      ],
+      "binary_sha256": {
+        "st3": "22ed1933dcc1194a675fc6e981804a225747719f12eca37132552775c06d97c8",
+        "pty": "3cc45e96dd90e7bade40a21f66f161e827667d922102432a2d03c97bb15192ab"
+      }
+    }
+  },
+  "initial_runner": "987cb0d26faa6f90e875b039fa14f875c49559a0",
+  "corrected_runner": "74c2f922a2e0656f12c5da3cc89de36e8858f732",
+  "initial": [
+    {
+      "scenario": "setup",
+      "counts": {
+        "PASS": 20
+      },
+      "failed_checks": []
+    },
+    {
+      "scenario": "small-machine",
+      "counts": {
+        "PASS": 24,
+        "FAIL": 1
+      },
+      "failed_checks": [
+        {
+          "id": "small-machine-daemon-serving",
+          "status": "FAIL",
+          "detail": "live daemon API serves the configured machine"
+        }
+      ]
+    },
+    {
+      "scenario": "small-machine-512m",
+      "counts": {
+        "PASS": 25,
+        "FAIL": 1
+      },
+      "failed_checks": [
+        {
+          "id": "small-machine-daemon-serving",
+          "status": "FAIL",
+          "detail": "live daemon API serves the configured machine"
+        }
+      ]
+    }
+  ],
+  "final": [
+    {
+      "scenario": "setup",
+      "memory_bytes": 3221225472,
+      "counts": {
+        "PASS": 20
+      },
+      "checks": [
+        {
+          "id": "fresh-home",
+          "status": "PASS",
+          "detail": "no existing st config or state"
+        },
+        {
+          "id": "guest-release",
+          "status": "PASS",
+          "detail": "actual guest matches requested Ubuntu release"
+        },
+        {
+          "id": "clean-tool-path",
+          "status": "PASS",
+          "detail": "no gh, developer tools or provider binaries initially installed"
+        },
+        {
+          "id": "archive-extracted",
+          "status": "PASS",
+          "detail": "copied bytes match recorded archive; BUILD.json captured"
+        },
+        {
+          "id": "setup-success",
+          "status": "PASS",
+          "detail": "real candidate setup completed"
+        },
+        {
+          "id": "configured-person",
+          "status": "PASS",
+          "detail": "person/ada persisted"
+        },
+        {
+          "id": "configured-node",
+          "status": "PASS",
+          "detail": "node persisted and is not local"
+        },
+        {
+          "id": "config-merge",
+          "status": "PASS",
+          "detail": "existing checkpoint setting preserved"
+        },
+        {
+          "id": "self-install",
+          "status": "PASS",
+          "detail": "st3, relative st link and pty installed"
+        },
+        {
+          "id": "service-active",
+          "status": "PASS",
+          "detail": "user service is active/running"
+        },
+        {
+          "id": "login-path",
+          "status": "PASS",
+          "detail": "st resolves in a fresh login shell"
+        },
+        {
+          "id": "doctor-healthy",
+          "status": "PASS",
+          "detail": "ordinary doctor healthy"
+        },
+        {
+          "id": "doctor-user-tools",
+          "status": "PASS",
+          "detail": "no irrelevant tool warnings"
+        },
+        {
+          "id": "default-cache-override-absent",
+          "status": "PASS",
+          "detail": "main unit and live daemon override None; healthy doctor reader target 2048 KiB (expected 2048)"
+        },
+        {
+          "id": "linger-guidance",
+          "status": "PASS",
+          "detail": "exact command printed when lingering is refused"
+        },
+        {
+          "id": "tui-frame",
+          "status": "PASS",
+          "detail": "first frame, visible Home/Now, Ctrl+Q and terminal restoration"
+        },
+        {
+          "id": "idempotent-setup",
+          "status": "PASS",
+          "detail": "second setup creates no second mission run"
+        },
+        {
+          "id": "default-cache-override-absent",
+          "status": "PASS",
+          "detail": "main unit and live daemon override None; healthy doctor reader target 2048 KiB (expected 2048)"
+        },
+        {
+          "id": "machine-restart",
+          "status": "PASS",
+          "detail": "Docker restart is a container restart; Incus is a real guest restart"
+        },
+        {
+          "id": "linger-reboot-behavior",
+          "status": "PASS",
+          "detail": "manager survives only when lingering enabled"
+        }
+      ],
+      "unit_and_live_environment": [
+        {
+          "title": "Initial default-size daemon unit and live environment",
+          "state": {
+            "pid": 214,
+            "unit_cache_kib": null,
+            "daemon_cache_kib": null,
+            "unit_has_cache_directive": false
+          }
+        },
+        {
+          "title": "Idempotent default-size daemon unit and live environment",
+          "state": {
+            "pid": 214,
+            "unit_cache_kib": null,
+            "daemon_cache_kib": null,
+            "unit_has_cache_directive": false
+          }
+        }
+      ]
+    },
+    {
+      "scenario": "small-machine",
+      "memory_bytes": 1073741824,
+      "counts": {
+        "PASS": 25
+      },
+      "checks": [
+        {
+          "id": "fresh-home",
+          "status": "PASS",
+          "detail": "no existing st config or state"
+        },
+        {
+          "id": "guest-release",
+          "status": "PASS",
+          "detail": "actual guest matches requested Ubuntu release"
+        },
+        {
+          "id": "clean-tool-path",
+          "status": "PASS",
+          "detail": "no gh, developer tools or provider binaries initially installed"
+        },
+        {
+          "id": "archive-extracted",
+          "status": "PASS",
+          "detail": "copied bytes match recorded archive; BUILD.json captured"
+        },
+        {
+          "id": "small-machine-memory-limit",
+          "status": "PASS",
+          "detail": "visible cgroup memory.max is exactly 1024 MiB"
+        },
+        {
+          "id": "setup-success",
+          "status": "PASS",
+          "detail": "real candidate setup completed"
+        },
+        {
+          "id": "configured-person",
+          "status": "PASS",
+          "detail": "person/ada persisted"
+        },
+        {
+          "id": "configured-node",
+          "status": "PASS",
+          "detail": "node persisted and is not local"
+        },
+        {
+          "id": "config-merge",
+          "status": "PASS",
+          "detail": "existing checkpoint setting preserved"
+        },
+        {
+          "id": "self-install",
+          "status": "PASS",
+          "detail": "st3, relative st link and pty installed"
+        },
+        {
+          "id": "service-active",
+          "status": "PASS",
+          "detail": "user service is active/running"
+        },
+        {
+          "id": "login-path",
+          "status": "PASS",
+          "detail": "st resolves in a fresh login shell"
+        },
+        {
+          "id": "doctor-healthy",
+          "status": "PASS",
+          "detail": "ordinary doctor healthy"
+        },
+        {
+          "id": "doctor-user-tools",
+          "status": "PASS",
+          "detail": "no irrelevant tool warnings"
+        },
+        {
+          "id": "small-machine-cache-summary",
+          "status": "PASS",
+          "detail": "setup selects 2048 KiB from default 2048, 128 retained readers and quarter RAM budget; no summary when default fits"
+        },
+        {
+          "id": "small-machine-cache-selected",
+          "status": "PASS",
+          "detail": "main unit and live daemon override None; healthy doctor reader target 2048 KiB (expected 2048)"
+        },
+        {
+          "id": "small-machine-daemon-serving",
+          "status": "PASS",
+          "detail": "live daemon API serves the configured machine"
+        },
+        {
+          "id": "small-machine-restart-cache",
+          "status": "PASS",
+          "detail": "main unit and live daemon override None; healthy doctor reader target 2048 KiB (expected 2048)"
+        },
+        {
+          "id": "small-machine-service-restarted",
+          "status": "PASS",
+          "detail": "service restart creates a different daemon PID with persistent cache settings"
+        },
+        {
+          "id": "linger-guidance",
+          "status": "PASS",
+          "detail": "exact command printed when lingering is refused"
+        },
+        {
+          "id": "tui-frame",
+          "status": "PASS",
+          "detail": "first frame, visible Home/Now, Ctrl+Q and terminal restoration"
+        },
+        {
+          "id": "idempotent-setup",
+          "status": "PASS",
+          "detail": "second setup creates no second mission run"
+        },
+        {
+          "id": "small-machine-idempotent-cache",
+          "status": "PASS",
+          "detail": "main unit and live daemon override None; healthy doctor reader target 2048 KiB (expected 2048)"
+        },
+        {
+          "id": "machine-restart",
+          "status": "PASS",
+          "detail": "Docker restart is a container restart; Incus is a real guest restart"
+        },
+        {
+          "id": "linger-reboot-behavior",
+          "status": "PASS",
+          "detail": "manager survives only when lingering enabled"
+        }
+      ],
+      "unit_and_live_environment": [
+        {
+          "title": "Initial small-machine daemon unit and live environment",
+          "state": {
+            "pid": 214,
+            "unit_cache_kib": null,
+            "daemon_cache_kib": null,
+            "unit_has_cache_directive": false
+          }
+        },
+        {
+          "title": "Restarted small-machine daemon unit and live environment",
+          "state": {
+            "pid": 332,
+            "unit_cache_kib": null,
+            "daemon_cache_kib": null,
+            "unit_has_cache_directive": false
+          }
+        },
+        {
+          "title": "Idempotent small-machine setup unit and live environment",
+          "state": {
+            "pid": 332,
+            "unit_cache_kib": null,
+            "daemon_cache_kib": null,
+            "unit_has_cache_directive": false
+          }
+        }
+      ]
+    },
+    {
+      "scenario": "small-machine-512m",
+      "memory_bytes": 536870912,
+      "counts": {
+        "PASS": 26
+      },
+      "checks": [
+        {
+          "id": "fresh-home",
+          "status": "PASS",
+          "detail": "no existing st config or state"
+        },
+        {
+          "id": "guest-release",
+          "status": "PASS",
+          "detail": "actual guest matches requested Ubuntu release"
+        },
+        {
+          "id": "clean-tool-path",
+          "status": "PASS",
+          "detail": "no gh, developer tools or provider binaries initially installed"
+        },
+        {
+          "id": "archive-extracted",
+          "status": "PASS",
+          "detail": "copied bytes match recorded archive; BUILD.json captured"
+        },
+        {
+          "id": "small-machine-memory-limit",
+          "status": "PASS",
+          "detail": "visible cgroup memory.max is exactly 512 MiB"
+        },
+        {
+          "id": "setup-success",
+          "status": "PASS",
+          "detail": "real candidate setup completed"
+        },
+        {
+          "id": "configured-person",
+          "status": "PASS",
+          "detail": "person/ada persisted"
+        },
+        {
+          "id": "configured-node",
+          "status": "PASS",
+          "detail": "node persisted and is not local"
+        },
+        {
+          "id": "config-merge",
+          "status": "PASS",
+          "detail": "existing checkpoint setting preserved"
+        },
+        {
+          "id": "self-install",
+          "status": "PASS",
+          "detail": "st3, relative st link and pty installed"
+        },
+        {
+          "id": "service-active",
+          "status": "PASS",
+          "detail": "user service is active/running"
+        },
+        {
+          "id": "login-path",
+          "status": "PASS",
+          "detail": "st resolves in a fresh login shell"
+        },
+        {
+          "id": "doctor-healthy",
+          "status": "PASS",
+          "detail": "ordinary doctor healthy"
+        },
+        {
+          "id": "doctor-user-tools",
+          "status": "PASS",
+          "detail": "no irrelevant tool warnings"
+        },
+        {
+          "id": "small-machine-cache-summary",
+          "status": "PASS",
+          "detail": "setup selects 1024 KiB from default 2048, 128 retained readers and quarter RAM budget; no summary when default fits"
+        },
+        {
+          "id": "small-machine-cache-reduced",
+          "status": "PASS",
+          "detail": "512 MiB control selects a strictly smaller cache"
+        },
+        {
+          "id": "small-machine-cache-selected",
+          "status": "PASS",
+          "detail": "main unit and live daemon override 1024; healthy doctor reader target 1024 KiB (expected 1024)"
+        },
+        {
+          "id": "small-machine-daemon-serving",
+          "status": "PASS",
+          "detail": "live daemon API serves the configured machine"
+        },
+        {
+          "id": "small-machine-restart-cache",
+          "status": "PASS",
+          "detail": "main unit and live daemon override 1024; healthy doctor reader target 1024 KiB (expected 1024)"
+        },
+        {
+          "id": "small-machine-service-restarted",
+          "status": "PASS",
+          "detail": "service restart creates a different daemon PID with persistent cache settings"
+        },
+        {
+          "id": "linger-guidance",
+          "status": "PASS",
+          "detail": "exact command printed when lingering is refused"
+        },
+        {
+          "id": "tui-frame",
+          "status": "PASS",
+          "detail": "first frame, visible Home/Now, Ctrl+Q and terminal restoration"
+        },
+        {
+          "id": "idempotent-setup",
+          "status": "PASS",
+          "detail": "second setup creates no second mission run"
+        },
+        {
+          "id": "small-machine-idempotent-cache",
+          "status": "PASS",
+          "detail": "main unit and live daemon override 1024; healthy doctor reader target 1024 KiB (expected 1024)"
+        },
+        {
+          "id": "machine-restart",
+          "status": "PASS",
+          "detail": "Docker restart is a container restart; Incus is a real guest restart"
+        },
+        {
+          "id": "linger-reboot-behavior",
+          "status": "PASS",
+          "detail": "manager survives only when lingering enabled"
+        }
+      ],
+      "unit_and_live_environment": [
+        {
+          "title": "Initial small-machine daemon unit and live environment",
+          "state": {
+            "pid": 214,
+            "unit_cache_kib": "1024",
+            "daemon_cache_kib": "1024",
+            "unit_has_cache_directive": true
+          }
+        },
+        {
+          "title": "Restarted small-machine daemon unit and live environment",
+          "state": {
+            "pid": 332,
+            "unit_cache_kib": "1024",
+            "daemon_cache_kib": "1024",
+            "unit_has_cache_directive": true
+          }
+        },
+        {
+          "title": "Idempotent small-machine setup unit and live environment",
+          "state": {
+            "pid": 332,
+            "unit_cache_kib": "1024",
+            "daemon_cache_kib": "1024",
+            "unit_has_cache_directive": true
+          }
+        }
+      ]
+    }
+  ],
+  "final_counts": {
+    "PASS": 71,
+    "FAIL": 0
+  },
+  "full_receipts": [
+    {
+      "scenario": "24.04-setup",
+      "file": "report.md",
+      "reference": "doc/fleet/smalltalk/onboarding/2026-10-08d/cache24-initial-24.04-setup-report@27870faee19c3a885718c19fae97b4683f291fec6f094480f19f7b683ffda589"
+    },
+    {
+      "scenario": "24.04-setup",
+      "file": "result.json",
+      "reference": "doc/fleet/smalltalk/onboarding/2026-10-08d/cache24-initial-24.04-setup-receipt@0c0588a9f1695451ed749461a4d04d1d54685557a84fecd854c91e917164218f"
+    },
+    {
+      "scenario": "24.04-small-machine",
+      "file": "report.md",
+      "reference": "doc/fleet/smalltalk/onboarding/2026-10-08d/cache24-initial-24.04-small-machine-report@00e4ca933e388c5e7939e4d706526a2d5db45ac38447e197b9d03c6a9e42c314"
+    },
+    {
+      "scenario": "24.04-small-machine",
+      "file": "result.json",
+      "reference": "doc/fleet/smalltalk/onboarding/2026-10-08d/cache24-initial-24.04-small-machine-receipt@c9f2be19c6fb37c65fbc6200f0a288ea47d8d46752a0a83096cecc1ef59a8fbb"
+    },
+    {
+      "scenario": "24.04-small-machine-512m",
+      "file": "report.md",
+      "reference": "doc/fleet/smalltalk/onboarding/2026-10-08d/cache24-initial-24.04-small-machine-512m-report@d497f9c50387b3d8138d82ccdf542649f350b7a7bd94298f4516e3ba506323d3"
+    },
+    {
+      "scenario": "24.04-small-machine-512m",
+      "file": "result.json",
+      "reference": "doc/fleet/smalltalk/onboarding/2026-10-08d/cache24-initial-24.04-small-machine-512m-receipt@6b9d58abb3034e28ff0ee876ae85b4646114246d93fb15079a3f0ff55bea5556"
+    },
+    {
+      "scenario": "24.04-small-machine",
+      "file": "report.md",
+      "reference": "doc/fleet/smalltalk/onboarding/2026-10-08d/cache24-corrected-24.04-small-machine-report@e99a66fd287dc87d97489fe5de00fb2e0240efe238f88d38bd3d74c6b3c58b9c"
+    },
+    {
+      "scenario": "24.04-small-machine",
+      "file": "result.json",
+      "reference": "doc/fleet/smalltalk/onboarding/2026-10-08d/cache24-corrected-24.04-small-machine-receipt@5dd67a3b925eb42989e38814f43a5d186b0da27be41d13db8f4eafd6c61ab0a9"
+    },
+    {
+      "scenario": "24.04-small-machine-512m",
+      "file": "report.md",
+      "reference": "doc/fleet/smalltalk/onboarding/2026-10-08d/cache24-corrected-24.04-small-machine-512m-report@97a9386855451fce43240b33f86410db859b12f9c6b0171a11f76c8ff46dcdbe"
+    },
+    {
+      "scenario": "24.04-small-machine-512m",
+      "file": "result.json",
+      "reference": "doc/fleet/smalltalk/onboarding/2026-10-08d/cache24-corrected-24.04-small-machine-512m-receipt@c14213db6bc01466af0e5b3d295597cadb036d6bd7ff68959ffd3a8398e524d2"
+    }
+  ],
+  "limit_pilot": "doc/fleet/smalltalk/onboarding/2026-10-08d/cache-limit-pilot@0ba715fb6c639f93332381034ec6cb7e71712bb96f6fd65a2883908f2b2b0b35",
+  "cleanup": {
+    "removed_containers": [
+      "st-onboarding-322af90848f8",
+      "st-onboarding-650ea1241560",
+      "st-onboarding-4c361a027b59",
+      "st-onboarding-a54e2b4423d1",
+      "st-onboarding-1cf2598b79be"
+    ],
+    "count": 5
+  },
+  "local_validation": {
+    "rig_checks": 15,
+    "tart_guard_checks": 8,
+    "public_repository_guard": "pass",
+    "effective_merge_upgrade_impact": "pass"
+  },
+  "fixture_correction": "Initial two failures used st machines ls instead of st machines. Only affected1g/512m cases reran; the identical product archive was unchanged.",
+  "limits": [
+    "Sequential native Ubuntu24 Docker,2 CPUs,UID42420,no host mounts or cache env injection.",
+    "Installed host MemTotal is exposed unchanged; enforced cgroup ancestor limits determine small-machine RAM.",
+    "No provider,paid model,expert,content,stock22,nativeMac,TCC or realVM claim.",
+    "Cache planning targets are not a total RSS ceiling or concurrent-burst guarantee."
+  ]
+}
