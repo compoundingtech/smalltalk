@@ -66,6 +66,27 @@ Only an actual replacement page with explicit pagination evidence establishes an
 conversation. Newer deltas do not change the older-history boundary. `hasOlder` reports
 that boundary, not an available fetch operation.
 
+### Web session trace providers
+
+`src/data/sessionTrace.ts` defines the Effect `SessionTraceProvider` service and the
+`TraceSeries` schema. Queries carry a native session ID, range (`1d`, `7d`, `30d`)
+and bucket (`5m`, `15m`, `1h`, `1d`). Native `UsageRow.native_session_id` is the
+root-session join key for an independently injected provider, including its subagents.
+The public schema contains no deployment or provider-specific identifiers.
+
+Every metric is `Known(value)` or `Unknown(reason)`; buckets contain time, input/output
+and cache tokens, cost with currency, and model, with a separate subagent breakdown.
+Responses distinguish `self` from `including_subagents`, carry an explicit `partial`
+flag and observation freshness. An observed read is not a claim of continuous liveness.
+
+The live source installs the st-only layer. It reuses native usage rows and the L3
+agent reader: roster meters are labelled `agent-incarnations`, exclude subagents and
+are always partial. These cumulative meters are neither the requested range's totals
+nor the selected root's totals. Missing values never become zero, and unavailable
+series/subagent coverage remains `Unknown('no-provider')`, not an empty series.
+Consumers use `sessionTrace(query)`; another Effect layer can provide
+`SessionTraceProvider` via `Layer.provide` without changing consumer code.
+
 ### Web follow budgets and synchronization
 
 Conversation follows have a bounded LRU lane. The advertised subscription budget reserves

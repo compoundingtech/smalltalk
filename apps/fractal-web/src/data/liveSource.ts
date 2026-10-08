@@ -52,6 +52,8 @@ import {
   wallClock,
 } from './source.ts'
 import { gatewaySubjectReads, SubjectReadPort, subjectReaderFromAtom } from './subjectReadPort.ts'
+import { gatewaySessionTraceLayer } from './stSessionTrace.ts'
+import type { SessionTraceProvider } from './sessionTrace.ts'
 
 /** The owned source registry and runtime teardown handle. */
 export interface LiveSource {
@@ -92,11 +94,14 @@ export const liveSource = ({
   options,
   telemetryLayer,
   ux,
+  sessionTraceLayer,
 }: {
   readonly options: St3Options
   /** Browser root owns sampling and observers; the SDK shares its scoped tracer/exporter. */
   readonly telemetryLayer?: Layer.Layer<never> | undefined
   readonly ux?: () => UxTelemetry
+  /** Optional independent trace provider; the public default only knows native st meters. */
+  readonly sessionTraceLayer?: Layer.Layer<SessionTraceProvider> | undefined
 }): LiveSource => {
   const { baseUrl } = options
   const origin = typeof location === 'undefined' ? new URL(baseUrl).origin : location.origin
@@ -181,6 +186,9 @@ export const liveSource = ({
     }).pipe(
       Layer.provideMerge(Metric.enableRuntimeMetricsLayer),
       Layer.merge(Layer.succeed(SubjectReadPort, subjectReads)),
+      Layer.merge(sessionTraceLayer ?? gatewaySessionTraceLayer(client).pipe(
+        Layer.provide(Layer.succeed(SubjectReadPort, subjectReads)),
+      )),
       Layer.provideMerge(telemetryLayer ?? Layer.empty),
     ),
   )
