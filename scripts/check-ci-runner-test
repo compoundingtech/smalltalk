@@ -164,4 +164,40 @@ assert 'CI_TEST_PARTITION: "hash:2/2"' in blocks["linux-tests-shard-2"]
 for job in ("linux-tests", "linux-tests-shard-2"):
     assert 'CI_TEST_THREADS: "8"' in blocks[job], "bound each shard's test concurrency"
 assert "vars.CI1_MIN_IDLE || '1'" in picker, "use an idle general slot without requiring the entire pool"
+
+# Exercise the actual generated step predicates, including restoring ordinary behavior.
+cache_conditions = re.findall(
+    r'name: (?:Keep valid same-source build outputs|Save Nix outputs[^\n]*)\n        if: ([^\n]+)', workflow)
+assert cache_conditions, 'optional cache publication steps must remain present'
+for raw in cache_conditions:
+    condition = json.loads(raw) if raw.startswith('"') else raw
+    assert 'vars.CI_OUTAGE_FAST_QUEUE' in condition, condition
+    for event in ('merge_group', 'pull_request', 'push', 'schedule', 'workflow_dispatch'):
+        for switch in ('', 'off', 'on'):
+            for cancelled in (False, True):
+                for succeeded in (False, True):
+                    for local in ('', '1'):
+                        expression = condition
+                        for token, value in {
+                            '!cancelled()': not cancelled,
+                            'success()': succeeded and not cancelled,
+                            'github.event_name': event,
+                            'vars.CI_OUTAGE_FAST_QUEUE': switch,
+                            'env.CI_LOCAL_CACHES': local,
+                        }.items():
+                            expression = expression.replace(token, repr(value))
+                        actual = eval(expression.replace('&&', ' and ').replace('||', ' or '), {'__builtins__': {}})
+                        expected = not cancelled and (event != 'merge_group' or switch != 'on')
+                        if 'success()' in condition:
+                            expected = expected and succeeded and local != '1'
+                        assert actual == expected, (condition, event, switch, cancelled, succeeded, local)
+for job, block in blocks.items():
+    assert 'CI_OUTAGE_FAST_QUEUE' not in block.split('    steps:', 1)[0], (job, 'outage switch must not skip jobs')
+for step in ('Download this run attempt’s successful test build', 'Verify source, hashes and extract test archives',
+             'Publish this run attempt’s exact-source test archives', 'Retain stage logs and timings', 'Report job cache coverage'):
+    tails = workflow.split(f'name: {step}\n')[1:]
+    assert tails, (step, 'artifact/evidence step must remain present')
+    for tail in tails:
+        assert 'CI_OUTAGE_FAST_QUEUE' not in tail.split('\n      - ', 1)[0], (step, 'required artifacts and evidence must remain available')
+print('passed: outage merge-group cache saves skip only while enabled; ordinary events, guards and artifacts unchanged')
 print("passed: bounded test shards, reserved primary lane, idle general slots, Namespace fallback, and required aggregation")
