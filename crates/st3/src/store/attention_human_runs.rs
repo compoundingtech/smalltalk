@@ -42,7 +42,27 @@ impl Family {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct Membership {
     pub run: String,
+    #[serde(with = "eligibility")]
     pub eligible: u128,
+}
+
+// Installer mutations travel through serde_json::Value, which cannot represent an
+// arbitrary u128 numeric token. Keep the full clock domain as decimal source data.
+mod eligibility {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(
+        value: &u128,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<u128, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Empty replacements are meaningful: closing or removing a source retracts its runs.

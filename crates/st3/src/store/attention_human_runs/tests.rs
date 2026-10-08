@@ -504,3 +504,19 @@ fn native_planning_and_revision_runs_survive_public_clock_filter_and_retract_sep
     store.replay_replication_graph().unwrap();
     assert!(refresh(&store, &ns, captured).is_empty());
 }
+
+#[test]
+fn installer_membership_values_preserve_the_entire_clock_domain() {
+    let input = Input {
+        family: Family::Person,
+        source: "step-run/fixture-wide-clock".into(),
+        runs: vec![Membership {
+            run: "mission-run/fixture-wide-clock".into(),
+            eligible: u128::MAX,
+        }],
+    };
+    let value = serde_json::to_value(&input).unwrap();
+    assert_eq!(value["runs"][0]["eligible"], u128::MAX.to_string());
+    let restored: Input = serde_json::from_value(value).unwrap();
+    assert_eq!(restored.runs, input.runs);
+}
