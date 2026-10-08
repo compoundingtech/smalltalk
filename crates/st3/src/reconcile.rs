@@ -24610,6 +24610,83 @@ mission "handoff" state="ready" {
         );
     }
 
+    fn declared_reminder_fixture(timeout: &str) -> (Arc<Store>, Reconciler<FakeRuntime>, String) {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, &format!(r#"version 2
+mission "declaration-reminder" state="ready" {{
+  goal "Deliver one reminder."
+  completion {{ when "all-steps-exhausted" }}
+  step "send" {timeout} {{
+    agentless
+    message "reminder/${{ST_MISSION_RUN}}" {{
+      from "person/test"
+      to "person/test"
+      content "Resume the observation."
+    }}
+  }}
+}}"#), "declaration-reminder-source");
+        let run = store.create_mission_run(&crate::model::MissionRunRequest {
+            mission: "declaration-reminder".into(), revision: None, workspace: "/tmp".into(),
+            requester: Some("person/test".into()), mode: Some("run".into()),
+            inputs: BTreeMap::new(), idempotency_key: "declaration-reminder-run".into(),
+        }).unwrap();
+        let reconciler = Reconciler::new(store.clone(), Arc::new(FakeRuntime::default()),
+            "node".into(), Arc::new(Notify::new()));
+        (store, reconciler, run.id)
+    }
+
+    #[test]
+    fn a_declaration_only_step_reports_its_wait_until_actual_delivery() {
+        let (store, reconciler, run) = declared_reminder_fixture("");
+        for _ in 0..3 { reconciler.reconcile_once().unwrap(); }
+        let waiting = store.mission_run(&run).unwrap().unwrap().steps.remove(0);
+        assert_eq!(waiting.status, "blocked");
+        let reason = waiting.blocked_reason.as_deref().unwrap();
+        assert!(reason.contains("waiting for declared message `message/reminder/"), "{reason}");
+        assert!(reason.contains("to be delivered"), "{reason}");
+        let runtime_view = store.mission_run_for_reconcile(&run).unwrap();
+        assert_eq!(runtime_view.steps[0].status, "working");
+        assert_eq!(runtime_view.steps[0].blocked_reason, None);
+        assert!(waiting.execution_started_at_unix_ms.is_some());
+        let message = store.desired_subjects_for_owner_step(&waiting.subject).unwrap().remove(0);
+        assert_eq!(message.kind, "message");
+        assert!(store.latest_actual_value(&message.subject).unwrap().is_none());
+        assert!(store.claims_for(&message.subject, Some("message.sent")).unwrap().is_empty());
+        let quiet = store.index().unwrap();
+        for _ in 0..3 { reconciler.reconcile_once().unwrap(); }
+        assert_eq!(store.index().unwrap(), quiet, "a stable wait must not publish repeatedly");
+        // A simulated recipient acknowledgement is admitted through the normal lifecycle
+        // validator. Materialization and reconciliation never manufacture this evidence.
+        store.append_claim(&ClaimInput {
+            subject: message.subject.clone(), kind: "message.delivered".into(),
+            actor: Some("person/test".into()),
+            fields: BTreeMap::from([("status".into(), serde_json::json!("delivered"))]),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        for _ in 0..5 { reconciler.reconcile_once().unwrap(); }
+        let terminal = store.mission_run(&run).unwrap().unwrap();
+        assert_eq!(terminal.steps[0].status, "completed");
+        assert_eq!(terminal.steps[0].blocked_reason, None);
+        assert_eq!(terminal.status, "completed");
+        assert_eq!(store.claims_for(&message.subject, Some("message.delivered")).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_declaration_wait_still_uses_its_execution_timeout() {
+        let (store, reconciler, run) = declared_reminder_fixture("timeout=\"1ms\"");
+        for _ in 0..2 { reconciler.reconcile_once().unwrap(); }
+        let waiting = store.mission_run(&run).unwrap().unwrap().steps.remove(0);
+        assert_eq!(waiting.status, "blocked");
+        assert!(waiting.execution_started_at_unix_ms.is_some());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        for _ in 0..5 { reconciler.reconcile_once().unwrap(); }
+        let terminal = store.mission_run(&run).unwrap().unwrap();
+        assert_eq!(terminal.steps[0].status, "failed");
+        assert_eq!(terminal.status, "failed");
+        let message = store.desired_subjects_for_owner_step(&waiting.subject).unwrap().remove(0);
+        assert!(store.claims_for(&message.subject, Some("message.delivered")).unwrap().is_empty());
+    }
+
     #[test]
     fn cancellation_recovers_legacy_gates_and_preserves_final_failure() {
         let store = Arc::new(Store::open_memory("node").unwrap());

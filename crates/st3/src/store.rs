@@ -12312,6 +12312,30 @@ impl Store {
             .transpose()
     }
 
+    /// Native mail can be admitted by a send or a KDL declaration. A declaration is
+    /// queued mail, never proof of transport acceptance or recipient consumption.
+    pub(crate) fn message_acceptance(&self, subject: &str) -> Result<Option<ClaimRecord>> {
+        if let Some(sent) = self.latest_claim(subject, Some("message.sent"))? {
+            return Ok(Some(sent));
+        }
+        let connection = self.readers.get();
+        let Some(desired) = current_desired_row(&connection, subject)?
+            .filter(|desired| desired.kind == "message")
+        else {
+            return Ok(None);
+        };
+        claim_by_id_tx(&connection, &desired.claim_id)
+    }
+
+    pub(crate) fn message_has_waiting_step(&self, subject: &str) -> Result<bool> {
+        self.readers.get().prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM desired
+             JOIN step_runs ON step_runs.subject=desired.owner_step
+             WHERE desired.subject=?1 AND desired.kind='message'
+               AND step_runs.status IN ('ready','claimed','working','verifying','blocked'))"
+        )?.query_row([subject], |row| row.get(0)).map_err(Into::into)
+    }
+
     fn message_view_cached(
         &self,
         connection: &Connection,
@@ -30219,7 +30243,46 @@ fn enrich_step_queue_at(
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
     enrich_step_definition(connection, view)?;
     adhoc_work::enrich_handoff(connection, view, snapshot_unix_ms)?;
-    person_work::enrich_responses(connection, view)
+    person_work::enrich_responses(connection, view)?;
+    enrich_declaration_wait(connection, view, snapshot_unix_ms)
+}
+
+/// A missing receipt is a presentation wait, not a new canonical step state.
+/// Keep reconciliation and the shared timing fold on the persisted working state.
+fn enrich_declaration_wait(
+    connection: &Connection,
+    view: &mut StepRunView,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<()> {
+    if !view.agentless || view.status != "working" {
+        return Ok(());
+    }
+    let mut statement = connection.prepare_cached(
+        "SELECT desired.subject, claims.accepted_at_unix_ms FROM desired
+         JOIN claims ON claims.id=desired.claim_id
+         WHERE desired.owner_step=?1 AND desired.kind='message' ORDER BY desired.subject",
+    )?;
+    let messages = statement.query_map([&view.subject], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (subject, accepted) in messages {
+        let actual = latest_actual(connection, &subject).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0, rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(error.to_string())),
+            )
+        })?;
+        let status = actual.as_ref().and_then(|actual| actual.get("status")).and_then(Value::as_str);
+        if !matches!(status, Some("delivered" | "read" | "closed")) {
+            let age = snapshot_unix_ms.saturating_sub(accepted.parse().unwrap_or(snapshot_unix_ms));
+            view.status = "blocked".into();
+            view.blocked_reason = Some(format!(
+                "waiting for declared message `{subject}` to be delivered (waiting {age} ms)"
+            ));
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 /// Copies the worker's latest progress summary and its completion summary for the
@@ -44749,6 +44812,70 @@ version 2
         assert!(view.claimant.is_none());
         assert!(view.claim_incarnation.is_none());
         assert!(view.claim_expires_at_unix_ms.is_none());
+    }
+
+    #[test]
+    fn declaration_wait_timing_survives_checkpoint_replay() {
+        let store = Store::open_memory("source").unwrap();
+        let intent = crate::graph::parse_test_intent(r#"version 2
+mission "declaration-timing" state="ready" {
+  goal "Keep declaration waits within their execution budget."
+  step "send" timeout="1h" { agentless }
+}"#, "source").unwrap();
+        store.apply_internal(&intent, "declaration-timing-mission").unwrap();
+        let run = store.create_mission_run(&MissionRunRequest {
+            mission: "declaration-timing".into(), revision: None, workspace: "/tmp".into(),
+            requester: Some("person/test".into()), mode: Some("run".into()),
+            inputs: BTreeMap::new(), idempotency_key: "declaration-timing-run".into(),
+        }).unwrap();
+        let step = &run.steps[0].subject;
+        store.set_step_state(step, "working", None).unwrap();
+        let mut declaration = crate::graph::parse_test_intent(r#"version 2
+message "timing-reminder" { from "person/test"; to "person/test"; content "Resume." }
+"#, "source").unwrap();
+        let message = declaration.subjects.values_mut().next().unwrap();
+        message.owner_step = Some(step.clone());
+        message.owner_run = Some(run.subject.clone());
+        message.owner_generation = Some(run.generation.clone());
+        store.apply_internal(&declaration, "timing-reminder").unwrap();
+        let before_read = graph_digest_of(&store);
+        let before_index = store.index().unwrap();
+        let cut = now_ms() + 1_000;
+        let original = {
+            let connection = store.readers.get();
+            let mut view = step_run_row_tx(&connection, step).unwrap().unwrap();
+            enrich_step_queue_at(&connection, &mut view, cut).unwrap();
+            view
+        };
+        assert_eq!(original.status, "blocked");
+        assert!(original.blocked_reason.as_ref().unwrap().contains("message/timing-reminder"));
+        assert_eq!(store.index().unwrap(), before_index);
+        assert_eq!(graph_digest_of(&store), before_read);
+        assert_eq!(step_run_row_tx(&store.readers.get(), step).unwrap().unwrap().status, "working");
+        assert!(original.execution_started_at_unix_ms.is_some());
+        assert!(original.execution_elapsed_ms >= 1_000);
+        let root = tempfile::tempdir().unwrap();
+        let copy = root.path().join("checkpoint-replay.sqlite3");
+        store.copy_store_to(&copy).unwrap();
+        let mut connection = Connection::open(copy).unwrap();
+        projection_digest::register(&connection).unwrap();
+        let transaction = connection.transaction().unwrap();
+        checkpoint_rules::replay_from_nothing(&transaction).unwrap();
+        transaction.commit().unwrap();
+        let mut restored = step_run_row_tx(&connection, step).unwrap().unwrap();
+        enrich_step_queue_at(&connection, &mut restored, cut).unwrap();
+        assert_eq!(restored.status, original.status);
+        assert_eq!(restored.blocked_reason, original.blocked_reason);
+        assert_eq!(restored.execution_started_at_unix_ms, original.execution_started_at_unix_ms);
+        assert_eq!(restored.execution_elapsed_ms, original.execution_elapsed_ms);
+        assert_eq!(graph_digest_of(&store), projection_digest::root(&projection_digest::tables(&connection).unwrap()));
+        // Ordinary durable blockers still close their interval. Read-time waits
+        // leave the existing canonical timing fold unchanged.
+        let events = vec![
+            ("step-run.state".into(), json!({"fields":{"status":"working"}}), 100),
+            ("step-run.state".into(), json!({"fields":{"status":"blocked","reason":"provider approval"}}), 200),
+        ];
+        assert_eq!(fold_step_timing(&events, 1, 500, false), (None, 100));
     }
 
     #[test]

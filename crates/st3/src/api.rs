@@ -203,13 +203,20 @@ fn signal_changed(state: &AppState) {
     signal_visible_change(state);
 }
 
-/// The reconciler reads a message only when it is a work wake, tagged `st3-work:`.
+/// Work wake messages carry the attempt and readiness epoch in their tag.
 pub(crate) fn is_work_wake(tags: &[String]) -> bool {
     tags.iter().any(|tag| tag.starts_with("st3-work:"))
 }
 
-/// A message write wakes the reconciler only for a work wake, since the reconciler reads no other
-/// message. Agents' and people's conversations and the delivery probes write five claims for each
+fn message_wakes_reconciler(store: &Store, message: Option<&MessageView>) -> bool {
+    message.is_none_or(|message| {
+        is_work_wake(&message.tags)
+            || store.message_has_waiting_step(&message.subject).unwrap_or(true)
+    })
+}
+
+/// A message write wakes the reconciler for work wakes and declarations owned by an active step.
+/// Agents' and people's conversations and the delivery probes write five claims for each
 /// message, and each woke a reconcile pass on every member. Clients, mailboxes and peers still
 /// hear of every message.
 pub(crate) fn signal_message_changed(state: &AppState, kind: &str, work_wake: bool) {
@@ -3445,7 +3452,11 @@ async fn message_delivery(
         let message = state.store.message(&subject).map_err(ApiError::internal)?
             .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))?;
         let claims = state.store.claims_for(&subject, Some("message.sent")).map_err(ApiError::internal)?;
-        let sent_at = claims.first().map(|claim| claim.accepted_at_unix_ms).unwrap_or_default();
+        let sent_at = match claims.first() {
+            Some(claim) => claim.accepted_at_unix_ms,
+            None => state.store.message_acceptance(&subject).map_err(ApiError::internal)?
+                .map(|claim| claim.accepted_at_unix_ms).unwrap_or_default(),
+        };
         Ok(Json(json!({ "id": subject, "from": message.from, "to": message.to,
             "delivery": message_delivery_value(&message.to, &message.status, sent_at, client_now_ms()) })))
     }).await
@@ -10741,11 +10752,10 @@ async fn finish_claim_publication(
             let store = state.store.clone();
             let subject = response.subject.clone();
             // A message this store cannot read is treated as a work wake.
-            let work_wake = blocking_store(move || store.message(&subject))
-                .await
-                .ok()
-                .flatten()
-                .is_none_or(|message| is_work_wake(&message.tags));
+            let work_wake = blocking_store(move || {
+                let message = store.message(&subject)?;
+                Ok(message_wakes_reconciler(&store, message.as_ref()))
+            }).await.unwrap_or(true);
             signal_message_changed(state, kind, work_wake);
         } else {
             signal_claim_changed(state, kind);
@@ -11712,11 +11722,8 @@ fn accept_message_receipt_with_upload_owner(
     let mut work_wake = is_work_wake(&request.tags);
     if let Some(parent) = request.in_reply_to.as_deref() {
         // Settling the parent writes its lifecycle claims too.
-        work_wake |= state
-            .store
-            .message(&message_subject(parent))
-            .map_err(ApiError::internal)?
-            .is_none_or(|message| is_work_wake(&message.tags));
+        let parent_message = state.store.message(&message_subject(parent)).map_err(ApiError::internal)?;
+        work_wake |= message_wakes_reconciler(&state.store, parent_message.as_ref());
         settle_answered_message(&state.store, parent, &from, &to, &subject, &record.id)?;
     }
     signal_message_changed(state, "message.sent", work_wake);
@@ -12033,7 +12040,7 @@ async fn post_message_claim(
                 idempotency_key: Some(request.idempotency_key),
             })
             .map_err(ApiError::bad)?;
-        Ok((record, appended, is_work_wake(&message.tags)))
+        Ok((record, appended, message_wakes_reconciler(&store, Some(&message))))
     })
     .await?;
     let (record, appended, work_wake) = record;
@@ -17603,6 +17610,71 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         .await;
         assert_eq!(status, StatusCode::OK, "{sent}");
         assert!(woke().await, "a work wake did not wake the reconciler");
+    }
+
+    #[tokio::test]
+    async fn declared_message_receipts_wake_the_waiting_step_and_no_op_repeats_stay_quiet() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let intent = crate::graph::parse_execution_intent(
+            r#"version 2
+mission "receipt-wait" state="ready" {
+  goal "Wait for a declared message."
+  step "send" { agentless }
+}"#, "node", "fixture").unwrap();
+        state.store.apply_internal(&intent, "receipt-wait-mission").unwrap();
+        let run = state.store.create_mission_run(&crate::model::MissionRunRequest {
+            mission: "receipt-wait".into(), revision: None, workspace: "/tmp".into(),
+            requester: Some("person/test".into()), mode: Some("run".into()),
+            inputs: BTreeMap::new(), idempotency_key: "receipt-wait-run".into(),
+        }).unwrap();
+        let step = &run.steps[0].subject;
+        state.store.set_step_state(step, "working", None).unwrap();
+        let app = router(state.clone());
+        for generic in [false, true] {
+            let id = if generic { "declared-generic" } else { "declared-lifecycle" };
+            let mut intent = crate::graph::parse_execution_intent(&format!(
+                "version 2\nmessage \"{id}\" {{ from \"person/test\"; to \"person/test\"; content \"Resume.\" }}"
+            ), "node", "fixture").unwrap();
+            let declaration = intent.subjects.values_mut().next().unwrap();
+            declaration.owner_step = Some(step.clone());
+            declaration.owner_run = Some(run.subject.clone());
+            declaration.owner_generation = Some(run.generation.clone());
+            state.store.apply_internal(&intent, id).unwrap();
+            let (path, body) = if generic {
+                ("/v1/claims".to_owned(), serde_json::to_value(ClaimInput {
+                    subject: format!("message/{id}"), kind: "message.delivered".into(),
+                    actor: Some("person/test".into()),
+                    fields: BTreeMap::from([("status".into(), json!("delivered"))]),
+                    evidence: vec![], expected_subject: None, idempotency_key: Some(format!("receipt:{id}")),
+                }).unwrap())
+            } else {
+                (format!("/v1/messages/{id}/claims"),
+                 json!({"lifecycle":"delivered","actor":"person/test","idempotency_key":format!("receipt:{id}")}))
+            };
+            let (status, receipt) = json_request(app.clone(), &path, body.clone()).await;
+            if generic {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{receipt}");
+                assert_eq!(receipt["code"], "claim-write-forbidden");
+                assert!(tokio::time::timeout(Duration::from_millis(50), state.notify.notified()).await.is_err());
+                assert!(state.store.latest_claim(&format!("message/{id}"), Some("message.delivered")).unwrap().is_none());
+                continue;
+            }
+            assert_eq!(status, StatusCode::OK, "{receipt}");
+            tokio::time::timeout(Duration::from_millis(50), state.notify.notified()).await
+                .expect("actual declared-message delivery must wake the waiting step");
+            let (status, receipt) = json_request(app.clone(), &path, body).await;
+            assert_eq!(status, StatusCode::OK, "{receipt}");
+            assert!(tokio::time::timeout(Duration::from_millis(50), state.notify.notified()).await.is_err(),
+                "a duplicate receipt must stay quiet");
+            let delivery = message_delivery(State(state.clone()), AxumPath(format!("message/{id}"))).await.unwrap().0;
+            assert!(delivery["delivery"]["age_ms"].as_u64().unwrap() < 60_000,
+                "declared-mail age must start at its admission, not the Unix epoch");
+        }
+        state.store.set_step_state(step, "completed", None).unwrap();
+        let delivered = state.store.message("message/declared-lifecycle").unwrap().unwrap();
+        assert!(!message_wakes_reconciler(&state.store, Some(&delivered)),
+            "terminal work is no longer a declaration waiter");
     }
 
     #[tokio::test]
