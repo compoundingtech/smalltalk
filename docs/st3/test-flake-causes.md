@@ -28,6 +28,28 @@ Performance job measures elapsed time. The counter is available in every unit-te
 `store::STATEMENTS_RUN` is exported under `cfg(test)`, and the `smallclaims` dev-dependency
 enables its `test-support` counter independent of optimization level.
 
+## Exec exit-code field gate wake-up
+
+`broken_gates::a_terminal_exec_fails_its_unsatisfied_field_gate` intermittently
+waited for its 60-second deadline even though its command exited with code 2.
+The exec driver reports the provider result before its own wrapper process exits.
+A reconcile pass awakened by that claim can still observe the wrapper running,
+record that state, and go quiet. The later process exit is not a new graph claim.
+Without a pending-gate poll, the next full pass can arrive after the fixture deadline.
+
+Delaying the wrapper's `exit_group` syscall by three seconds reproduces this ordering
+on merge-group source `575d461e555f8705b2fa679d8e631f5de645e65a`: the gate stayed
+working after the process exited and recovered only at 64.99 seconds. A paused-time
+regression checks a driver receipt followed by a quiet wrapper exit. This schedule
+demonstrates the wake-up defect; hosted timeout logs alone do not prove every prior
+timeout followed the same ordering.
+
+Pending exit-code field gates now use the existing gate-runner poll for a locally
+owned exec. The poll wakes reconciliation when the process ends; the predicate still
+reads durable observations and selected-launch evidence to decide pass or failure.
+Remote execs are not polled by a replica. The fixture deadline, failure reason, and
+downstream-step assertions remain unchanged, with no test failure retry.
+
 ## Concurrent quick-agent responses
 
 `api::tests::retention_quick_concurrent_calls_share_the_response` used the generic API

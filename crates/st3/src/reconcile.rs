@@ -13000,6 +13000,20 @@ impl<R: RuntimeControl> Reconciler<R> {
                 {
                     GateOutcome::Fail(reason)
                 } else {
+                    // The driver can report its provider's exit while its wrapper still
+                    // runs. That claim wakes a pass, but the later process exit does not.
+                    // Watch the owner's exec until it ends so this pending predicate does
+                    // not wait for the minute-long fallback pass. Verdicts stay graph-only.
+                    if path == "exit_code"
+                        && subject.starts_with("exec/")
+                        && let Some((desired, _)) =
+                            self.store.desired_subject_with_writer(subject)?
+                        && let Some(member) = desired.member
+                        && member.kind == MemberKind::Exec
+                        && member.host == self.host
+                    {
+                        self.arm_gate_poll(&member.runtime_id);
+                    }
                     GateOutcome::Pending
                 }
             }
@@ -16242,6 +16256,99 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
                 "an older exit must not use a newer launch's evidence"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exit_code_field_gate_wakes_after_the_driver_receipt_precedes_process_exit() {
+        use serde_json::json;
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            "version 2\nexec \"orchid/probe\" { workspace \"/tmp\"; command \"exit 2\"; restart \"never\" }",
+            "exec",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        let notify = Arc::new(Notify::new());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            notify.clone(),
+        );
+        reconciler.reconcile_once().unwrap();
+        let desired = store
+            .desired_subject_with_writer("exec/orchid/probe")
+            .unwrap()
+            .unwrap()
+            .0;
+        let runtime_id = desired.member.as_ref().unwrap().runtime_id.clone();
+        runtime.execs.lock().unwrap().insert(
+            runtime_id.clone(),
+            RuntimeObservation {
+                runtime_id: runtime_id.clone(),
+                terminal: false,
+                status: "running".into(),
+                exit_code: None,
+                incarnation_id: Some("wrapper-one".into()),
+            },
+        );
+        // The driver publishes its provider's result before its own process exits. A
+        // reconcile pass still sees the wrapper running and settles without another write.
+        store
+            .append_claim(&ClaimInput {
+                subject: desired.subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: Some(desired.subject.clone()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("exited")),
+                    ("exit_code".into(), json!(2)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        let gate = GateSpec::Field {
+            name: "prepared".into(),
+            path: "exit_code".into(),
+            subject: desired.subject.clone(),
+            operator: "is".into(),
+            value: json!(0),
+        };
+        let stage = GateContext {
+            subject: "step-run/orchid/prepare".into(),
+            name: "prepare".into(),
+            started_at_unix_ms: 0,
+            attempt: 1,
+            run: "mission-run/orchid".into(),
+            generation: "run-generation/orchid".into(),
+            eval: false,
+        };
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &gate).unwrap(),
+            GateOutcome::Pending
+        ));
+        // Consume prior writes' wake, then exit with no new graph claim.
+        notify.notified().await;
+        let mut exited = runtime
+            .execs
+            .lock()
+            .unwrap()
+            .get(&runtime_id)
+            .unwrap()
+            .clone();
+        exited.status = "exited".into();
+        exited.exit_code = Some(2);
+        runtime.execs.lock().unwrap().insert(runtime_id, exited);
+        tokio::time::timeout(Duration::from_secs(11), notify.notified())
+            .await
+            .expect("the pending field gate must wake for the wrapper's later process exit");
+        reconciler.reconcile_once().unwrap();
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &gate).unwrap(),
+            GateOutcome::Fail(_)
+        ));
     }
 
     #[test]
