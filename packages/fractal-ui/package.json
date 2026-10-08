@@ -27,7 +27,8 @@
     "@assistant-ui/react": "0.15.25",
     "@stylexjs/stylex": "0.19.0",
     "react-markdown": "10.1.0",
-    "remark-gfm": "4.0.1"
+    "remark-gfm": "4.0.1",
+    "refractor": "5.0.0"
   },
   "devDependencies": {
     "storybook": "10.6.1",
@@ -39,6 +40,7 @@
     "tailwindcss": "4.2.2",
     "typescript": "6.0.3",
     "@types/node": "26.6.4",
+    "@types/hast": "3.0.5",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "vite": "8.0.5"
