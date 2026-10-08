@@ -61,4 +61,11 @@ cp "$FIXTURES/${url##*/}" "$out"
     assert result.returncode != 0 and 'supported platforms' in result.stderr, result
     result = install('--tag', '../other')
     assert result.returncode != 0 and 'invalid release tag' in result.stderr, result
+    # Retained releases predate --quiet. Their notices stay out of the root installer's output.
+    payload_installer = payload / 'install.sh'
+    payload_installer.write_text(payload_installer.read_text().replace('    --quiet) quiet=true; shift ;;\n', ''))
+    with tarfile.open(archive, 'w:gz') as t: t.add(payload, arcname=payload.name)
+    checksum.write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + archive.name + '\n')
+    result = install('--no-run')
+    assert result.returncode == 0 and result.stdout == '' and result.stderr == '', result
 print('Download installer integrity, quiet install, launch and platform controls passed')

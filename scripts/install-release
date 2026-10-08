@@ -24,7 +24,11 @@ done
 mkdir -p "$bin_dir"
 macos=false
 if [[ $(uname -s) == Darwin ]]; then
-  python3 "$(cd "$(dirname "$0")" && pwd)/install-macos.py" --from "$source_dir" --bin-dir "$bin_dir"
+  if $quiet; then
+    python3 "$(cd "$(dirname "$0")" && pwd)/install-macos.py" --from "$source_dir" --bin-dir "$bin_dir" >/dev/null
+  else
+    python3 "$(cd "$(dirname "$0")" && pwd)/install-macos.py" --from "$source_dir" --bin-dir "$bin_dir"
+  fi
   macos=true
 fi
 stage=$(mktemp -d "$bin_dir/.smalltalk-install.XXXXXX")

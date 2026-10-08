@@ -105,10 +105,6 @@ for binary in "${runtime_binaries[@]}"; do
   if command -v file >/dev/null 2>&1; then file "$path"; fi
   if [[ $target == *linux* ]]; then
     python3 scripts/check-linux-release.py "$path"
-    readelf --program-headers "$path" > "$work/headers"
-    if grep -F '/nix/store/' "$work/headers"; then exit 1; fi
-    ldd "$path" > "$work/links"
-    if grep -E 'not found|/nix/store/' "$work/links"; then exit 1; fi
   else
     otool -L "$path" > "$work/links"
     # Standalone archives may link only Apple's system libraries.

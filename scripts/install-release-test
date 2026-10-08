@@ -34,6 +34,26 @@ cp "$work/package/bin/st3" "$work/package/bin/pty"
 mkdir -p "$work/blocked/st"
 if "$work/package/install.sh" --bin-dir "$work/blocked"; then exit 1; fi
 test ! -e "$work/blocked/st3"
+# A macOS helper receipt is a notice: quiet installs suppress it, errors survive.
+# This fixture checks the caller; real app transactions are tested separately.
+printf '#!/bin/sh\necho Darwin\n' > "$work/platform-bin/uname"
+cat > "$work/package/install-macos.py" <<'PY'
+import os
+import sys
+if os.environ.get('INSTALL_HELPER_FAIL'):
+    print('helper failure', file=sys.stderr)
+    raise SystemExit(1)
+print('app receipt')
+PY
+"$work/package/install.sh" --bin-dir "$work/installed" --quiet > "$work/quiet.out" 2> "$work/quiet.err"
+test ! -s "$work/quiet.out"
+test ! -s "$work/quiet.err"
+"$work/package/install.sh" --bin-dir "$work/installed" > "$work/notices.out"
+grep -q 'app receipt' "$work/notices.out"
+if INSTALL_HELPER_FAIL=1 "$work/package/install.sh" --bin-dir "$work/installed" --quiet > "$work/failure.out" 2> "$work/failure.err"; then exit 1; fi
+test ! -s "$work/failure.out"
+grep -q 'helper failure' "$work/failure.err"
+printf '#!/bin/sh\necho Linux\n' > "$work/platform-bin/uname"
 echo 'Release installer tests passed'
 
 "$repo/scripts/download-install-test"

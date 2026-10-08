@@ -59,7 +59,9 @@ while IFS= read -r member; do
     case "/$member/" in */../*) printf 'install: archive contains a parent path\n' >&2; exit 1 ;; esac
 done < "$work/members"
 tar -xzf "$work/$archive" -C "$work"
-"$work/$package/install.sh" --bin-dir "$bin_dir" --quiet
+# Older retained releases predate --quiet; keep their installer spelling and
+# suppress notices here while preserving failures and stderr.
+"$work/$package/install.sh" --bin-dir "$bin_dir" >/dev/null
 bin_dir=$(cd "$bin_dir" && pwd)
 rm -rf "$work"
 trap - EXIT HUP INT TERM

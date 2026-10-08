@@ -15,6 +15,11 @@ on:
       - .gitignore
       - build.rs
       - crates/st-drivers/src/version.rs
+      - install.sh
+      - scripts/download-install-test
+      - scripts/linux-release-cc
+      - scripts/check-linux-release.py
+      - scripts/release-build-stamp.py
       - scripts/release-smalltalk*
       - scripts/release_notes*
       - scripts/ci-build-snapshot*
