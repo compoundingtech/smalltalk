@@ -51,10 +51,24 @@ fn uuid(value: &Value) -> Result<String, ApiError> {
     uuid::Uuid::parse_str(text).map(|id| id.hyphenated().to_string()).map_err(|_| invalid())
 }
 
+fn metadata_token(text: &str) -> bool {
+    text.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && text.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 fn metadata(value: &Value, max: usize) -> Result<String, ApiError> {
     let text = value.as_str().filter(|text| !text.is_empty() && text.len() <= max).ok_or_else(invalid)?;
-    let safe = text.as_bytes()[0].is_ascii_alphanumeric()
-        && text.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    Ok(if metadata_token(text) { text } else { "unknown" }.to_owned())
+}
+
+fn runtime_metadata(value: &Value) -> Result<String, ApiError> {
+    let text = value.as_str().filter(|text| !text.is_empty() && text.len() <= 128).ok_or_else(invalid)?;
+    // Match the iOS safeRuntime grammar, including Expo nativeVersion's build suffix.
+    let safe = match text.split_once('(') {
+        Some((version, build)) => metadata_token(version)
+            && build.strip_suffix(')').is_some_and(metadata_token),
+        None => metadata_token(text),
+    };
     Ok(if safe { text } else { "unknown" }.to_owned())
 }
 
@@ -132,7 +146,7 @@ fn sanitize_batch(batch: &Value, device: &str, person: &str, grant: &str, now: u
             ("captured_at_unix_ms".into(),json!(captured)),
             ("app_version".into(),json!(metadata(&event["app_version"],64)?)),
             ("native_build".into(),json!(metadata(&event["native_build"],64)?)),
-            ("runtime_version".into(),json!(metadata(&event["runtime_version"],128)?)),
+            ("runtime_version".into(),json!(runtime_metadata(&event["runtime_version"])?)),
             ("update_id".into(),json!(update)),
             ("os_version".into(),json!(metadata(&event["os_version"],32)?)),
             ("payload".into(),payload),
@@ -182,7 +196,7 @@ mod tests {
         let now = client_now_ms() as u64;
         json!({"event_id":uuid::Uuid::from_u128(id).to_string(),"launch_id":uuid::Uuid::from_u128(42).to_string(),"sequence":1,
             "occurred_at_unix_ms":now-1000,"captured_at_unix_ms":now,"occurrence_time_basis":"exact","launch_id_basis":"process",
-            "app_version":"1.0","native_build":"1","runtime_version":"1-1","update_id":"embedded","platform":"ios","os_version":"27.0",
+            "app_version":"1.0","native_build":"1","runtime_version":"0.1.0(1)","update_id":"embedded","platform":"ios","os_version":"27.0",
             "severity":"error","capture_source":"js","payload":{"kind":"js-error","name":"TypeError","fatal":false,"frames":[]}})
     }
     async fn post(app: Router, credential: Option<&str>, body: Value) -> (StatusCode,Value) {
@@ -192,6 +206,29 @@ mod tests {
         let status = response.status();
         let bytes = to_bytes(response.into_body(),super::MAX_REQUEST_BYTES * 2).await.unwrap();
         (status,serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+    #[test]
+    fn diagnostics_runtime_metadata_matches_expo_native_version() {
+        for (runtime, expected) in [
+            ("0.1.0(1)", "0.1.0(1)"),
+            ("ios-42", "ios-42"),
+            ("0.1.0(1)/private", "unknown"),
+            ("0.1.0(secret message)", "unknown"),
+            ("0.1.0(1)\n", "unknown"),
+            ("0.1.0((1))", "unknown"),
+            ("0.1.0()", "unknown"),
+        ] {
+            let mut report = event(1);
+            report["runtime_version"] = json!(runtime);
+            let inputs = sanitize_batch(&json!({"version":1,"events":[report]}),
+                "client/one","person/ada","custom/client/one",client_now_ms() as u64).unwrap();
+            assert_eq!(inputs[0].fields["runtime_version"], json!(expected));
+        }
+        let max = "x".repeat(128);
+        assert_eq!(runtime_metadata(&json!(max)).unwrap(), max);
+        assert!(runtime_metadata(&json!(format!("{}(1)", "x".repeat(126)))).is_err());
+        // The broader runtime grammar must not loosen app/build/OS metadata.
+        assert_eq!(metadata(&json!("0.1.0(1)"), 64).unwrap(), "unknown");
     }
     #[tokio::test]
     async fn diagnostics_auth_scope_expiry_and_revocation() {
@@ -222,6 +259,7 @@ mod tests {
         assert_eq!(status,StatusCode::OK,"{ack}");assert_eq!(ack["value"]["acknowledged_event_ids"],json!([uuid::Uuid::from_u128(1).to_string()]));
         let records = state.store.local_observations_after(0,10).unwrap(); assert_eq!(records.len(),1);
         let fields = &records[0].body["fields"]; assert_eq!(fields["paired_device"],"client/one");assert_eq!(fields["person_id"],"person/ada");assert_eq!(fields["native_build"],"unknown");
+        assert_eq!(fields["runtime_version"], "0.1.0(1)");
         let serialized = records[0].body.to_string(); for secret in ["private","forged","person/alex","Authorization","https://","/work/"] {assert!(!serialized.contains(secret),"{serialized}");}
         assert_eq!(post(app.clone(),Some("one"),body.clone()).await.0,StatusCode::OK);
         // IDs deduplicate across discriminants, not just within one observation kind.
