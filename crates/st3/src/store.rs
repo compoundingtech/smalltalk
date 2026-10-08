@@ -43995,17 +43995,45 @@ version 2
         let fleet = "fleet/example";
         let source = Store::open_memory("source").unwrap();
         let target = Store::open_memory("target").unwrap();
+        source
+            .append_client_claim(&ClaimInput {
+                subject: "resource/modern-receipt".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.replication".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("modern-receipt".into()),
+            })
+            .unwrap();
         source.bind_fleet(fleet).unwrap();
         target.bind_fleet(fleet).unwrap();
-        let exchange = source.export_replication_summary_modern(fleet).unwrap();
+        let exchange = source
+            .export_replication_exchange_answering_modern(
+                fleet,
+                &target.replication_inventory().unwrap(),
+                &[],
+            )
+            .unwrap();
         assert!(exchange.graph_digest.is_empty());
         assert!(!exchange.projection_digests.is_empty());
+        assert_eq!(exchange.envelopes.len(), 1);
         GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(0));
-        target
+        let receipt = target
             .receive_replication_exchange("source", fleet, &exchange)
             .unwrap();
-        target.validate_replication_backlog().unwrap();
+        assert_eq!(receipt.received, 1);
+        let admission = target.validate_replication_backlog().unwrap();
+        assert!(admission.changed);
         assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 0);
+        target.project_replication_backlog().unwrap();
+        assert_eq!(
+            target.claims_for("resource/modern-receipt", None).unwrap().len(),
+            1
+        );
         let legacy = target.export_replication_summary(fleet).unwrap();
         assert!(!legacy.graph_digest.is_empty());
         assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 1);

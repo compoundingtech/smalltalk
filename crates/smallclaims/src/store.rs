@@ -6077,12 +6077,24 @@ impl Store {
         if received != 0 {
             self.replica_generation.fetch_add(1, Ordering::AcqRel);
         }
-        let snapshot = if input.projection_digests.is_empty() {
+        let mut snapshot = if input.projection_digests.is_empty() {
             self.replication_snapshot()
         } else {
             self.replication_snapshot_modern()
         }
         .map_err(internal)?;
+        let modern_comparable = comparable_projection_digest_domains(
+            &snapshot.projection_digests,
+            &input.projection_digests,
+        );
+        if !modern_comparable
+            && !input.graph_digest.is_empty()
+            && snapshot.legacy_graph_digest.is_empty()
+        {
+            // A mixed build supplied an exact old digest with an incomplete modern map.
+            // Compute the matching old digest only for that compatibility comparison.
+            snapshot = self.replication_snapshot().map_err(internal)?;
+        }
         let difference = replication_inventory_difference(
             &snapshot.inventory,
             &snapshot.buckets,
@@ -6091,15 +6103,15 @@ impl Store {
         // Each graph projects the envelopes its node holds, so the digests are comparable only
         // while both nodes hold the same ones, and only once this node has projected them all:
         // nothing new arrived that still waits for admission, and no projection is deferred.
-        let (local_graph, remote_graph) = if input.projection_digests.is_empty() {
-            (
-                snapshot.legacy_graph_digest.clone(),
-                input.graph_digest.clone(),
-            )
-        } else {
+        let (local_graph, remote_graph) = if modern_comparable {
             (
                 snapshot.graph_digest.clone(),
                 projection_digest::root(&input.projection_digests),
+            )
+        } else {
+            (
+                snapshot.legacy_graph_digest.clone(),
+                input.graph_digest.clone(),
             )
         };
         // Registries from different builds may legitimately produce different projections.
@@ -6118,7 +6130,7 @@ impl Store {
             && !waiting
             && !input.inventory.digest.is_empty()
             && input.inventory.digest == snapshot.inventory.digest
-            && (!input.projection_digests.is_empty() || !input.graph_digest.is_empty())
+            && (modern_comparable || !input.graph_digest.is_empty())
             && received == 0
             && signatures == 0
             && !self.replication_projection_deferred())

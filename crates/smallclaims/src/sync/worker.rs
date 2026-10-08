@@ -34,6 +34,7 @@ use crate::fleet::{Acceptance, FleetFile, FleetView, MemberKey, PeerConfig, Refu
 use crate::replication::{
     InventoryCheckpoint, ReplicationExchange, ReplicationHealAnswer, ReplicationHealQuery,
     ReplicationHealRequest, ReplicationHealStep, ReplicationInventory,
+    comparable_projection_digest_domains, valid_projection_digest_map,
 };
 use crate::store::{CheckpointManifest, CheckpointManifestPage, CheckpointManifestRequest};
 
@@ -1600,7 +1601,7 @@ async fn receive_exchange<B: Backend>(
                             .send_modify(|generation| *generation = generation.saturating_add(1));
                     }
                     let response = if !request.graph_digest.is_empty()
-                        || !valid_projection_map(&request.projection_digests)
+                        || !valid_projection_digest_map(&request.projection_digests)
                     {
                         state
                             .backend
@@ -2136,25 +2137,16 @@ pub fn signed_error_response_for<B: Backend>(
     Ok(response)
 }
 
-fn valid_projection_map(map: &BTreeMap<String, String>) -> bool {
-    !map.is_empty()
-        && map.values().all(|digest| {
-            digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-}
-
 /// Empty compatibility digests opt into the current projection-digest domain. Exact table keys
 /// and valid SHA-256 values make the two advertised roots comparable; a mixed build falls back.
 fn comparable_modern_exchange(local: &ReplicationExchange, remote: &ReplicationExchange) -> bool {
     local.graph_digest.is_empty()
         && remote.graph_digest.is_empty()
         && local.schema_digest == remote.schema_digest
-        && valid_projection_map(&local.projection_digests)
-        && valid_projection_map(&remote.projection_digests)
-        && local.projection_digests.keys().eq(remote.projection_digests.keys())
+        && comparable_projection_digest_domains(
+            &local.projection_digests,
+            &remote.projection_digests,
+        )
 }
 
 fn needs_legacy_retry(

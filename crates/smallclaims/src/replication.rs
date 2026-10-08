@@ -68,6 +68,29 @@ pub struct ReplicationExchange {
     pub signatures: Vec<ReplicaEnvelopeSignature>,
 }
 
+/// A modern projection map names each table and its lowercase SHA-256 digest. An empty map or
+/// malformed value cannot establish a comparable graph root.
+pub fn valid_projection_digest_map(map: &BTreeMap<String, String>) -> bool {
+    !map.is_empty()
+        && map.values().all(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+/// Compare only maps over the same complete table domain. Each local map comes from the
+/// registered projection tables; a peer with a partial or different set takes the legacy path.
+pub fn comparable_projection_digest_domains(
+    local: &BTreeMap<String, String>,
+    remote: &BTreeMap<String, String>,
+) -> bool {
+    valid_projection_digest_map(local)
+        && valid_projection_digest_map(remote)
+        && local.keys().eq(remote.keys())
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReplicationReceipt {
     pub received: usize,

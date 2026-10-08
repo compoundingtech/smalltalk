@@ -238,11 +238,14 @@ fn modern_projection_comparison_needs_alignment_but_not_a_legacy_digest() {
         let source = node("birch");
         let target = node("cedar");
         let mut summary = source.export_replication_summary(FLEET).unwrap();
-        summary.projection_digests.clear();
         if modern {
-            summary
+            *summary
                 .projection_digests
-                .insert("documents".into(), "different".into());
+                .values_mut()
+                .next()
+                .expect("the Plain runtime registers projection tables") = "a".repeat(64);
+        } else {
+            summary.projection_digests.clear();
         }
         if !legacy {
             summary.graph_digest.clear();
@@ -257,6 +260,37 @@ fn modern_projection_comparison_needs_alignment_but_not_a_legacy_digest() {
         assert_eq!(
             progress["birch"].graph_compared_at_unix_ms.is_some(),
             compared
+        );
+    }
+}
+
+#[test]
+fn partial_or_malformed_modern_projection_maps_do_not_complete_comparison() {
+    for (malformed, legacy, compared) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, true),
+    ] {
+        let source = node("birch");
+        let target = node("cedar");
+        let mut summary = source.export_replication_summary(FLEET).unwrap();
+        if malformed {
+            *summary.projection_digests.values_mut().next().unwrap() = String::new();
+        } else {
+            let key = summary.projection_digests.keys().next().unwrap().clone();
+            summary.projection_digests.remove(&key);
+        }
+        if !legacy {
+            summary.graph_digest.clear();
+        }
+        target
+            .receive_replication_exchange("birch", FLEET, &summary)
+            .unwrap();
+        let progress = target.replication_sync.lock().unwrap();
+        assert_eq!(
+            progress["birch"].graph_compared_at_unix_ms.is_some(),
+            compared,
+            "malformed={malformed} legacy={legacy}"
         );
     }
 }
