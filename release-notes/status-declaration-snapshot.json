@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep status declaration, runtime and conflict reads in one SQLite snapshot",
+  "replay": {
+    "status": "none",
+    "detail": "This read consistency repair does not change claim projection, replay or recovery admission."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, migrations or schema versions change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes; no coordinated fleet upgrade is required."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Status fields, declaration selection and start/stop admission are unchanged. A raw status read now joins one SQLite snapshot so a concurrent serial declaration cannot appear as a false conflict. No new client, peer or harness capability is introduced; mixed-version pairs were not newly exercised."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption or runtime restart requirement is introduced by this bounded read transaction."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No existing-store conversion or manual action is required. Real declaration forks and stale start tokens remain rejected."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Binary swap-back requires no state conversion or rollback migration; older binaries retain the torn status-read risk."
+  }
+}

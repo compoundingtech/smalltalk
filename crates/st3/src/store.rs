@@ -10892,6 +10892,27 @@ impl Store {
         include_history: bool,
         selected_names: Option<BTreeSet<String>>,
     ) -> Result<StatusResponse> {
+        // A request reader loan alone can see a commit between statements. Keep the
+        // selected declaration, runtime observation and conflict leaves in one snapshot.
+        self.read_snapshot(|_| {
+            self.status_at_view_for_names_in_snapshot(
+                selected,
+                selected_owner_run,
+                at_index,
+                include_history,
+                selected_names,
+            )
+        })
+    }
+
+    fn status_at_view_for_names_in_snapshot(
+        &self,
+        selected: Option<&str>,
+        selected_owner_run: Option<&str>,
+        at_index: Option<u64>,
+        include_history: bool,
+        selected_names: Option<BTreeSet<String>>,
+    ) -> Result<StatusResponse> {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
