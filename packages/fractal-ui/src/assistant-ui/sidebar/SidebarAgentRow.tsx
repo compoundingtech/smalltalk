@@ -80,7 +80,7 @@ export function AgentRowDetails({ row, ...clock }: { readonly row: Row } & Sideb
     {row.harness !== undefined && <><dt {...stylex.props(styles.detailLabel)}>Harness</dt><dd {...stylex.props(styles.detailValue)}>{row.harness}</dd></>}
     {row.model !== undefined && <><dt {...stylex.props(styles.detailLabel)}>Model</dt><dd {...stylex.props(styles.detailValue)}>{row.model}</dd></>}
     {row.usage._tag === 'Known' && <><dt {...stylex.props(styles.detailLabel)}>Usage</dt><dd {...stylex.props(styles.detailValue)}>{usageText(row.usage)}</dd></>}
-    {row.duration._tag === 'Known' && <><dt {...stylex.props(styles.detailLabel)}>Duration</dt><dd {...stylex.props(styles.detailValue)}><SidebarDuration row={row} /></dd></>}
+    {row.duration._tag === 'Known' && <><dt {...stylex.props(styles.detailLabel)}>Duration</dt><dd {...stylex.props(styles.detailValue)}><SidebarDuration duration={row.duration} /></dd></>}
     {row.lastTurn._tag === 'Known' && <><dt {...stylex.props(styles.detailLabel)}>Last turn or activity</dt><dd {...stylex.props(styles.detailValue)}><SidebarTime at={row.lastTurn.at} {...clock} kind={row.lastTurn.kind === 'turn-completed' ? 'turn' : 'activity'} showKind /></dd></>}
     {row.branch !== undefined && <><dt {...stylex.props(styles.detailLabel)}>Branch</dt><dd {...stylex.props(styles.detailValue)}>{row.branch}</dd></>}
     {row.worktree !== undefined && <><dt {...stylex.props(styles.detailLabel)}>Worktree</dt><dd {...stylex.props(styles.detailValue)}>{row.worktree}</dd></>}
@@ -104,7 +104,7 @@ export function AgentHoverCard({ row, ...clock }: { readonly row: Row } & Sideba
     {row.description !== undefined && <p {...stylex.props(styles.cardWork)}><Icon name="message" size={12} />{row.description}</p>}
     <dl {...stylex.props(styles.details)}>
       {row.usage._tag === 'Known' && <><dt {...stylex.props(styles.cardLabel)}><Icon name="dot" size={12} />Spend</dt><dd {...stylex.props(styles.detailValue)}>{spendCount.format(row.usage.usd)} · {tokenCount.format(row.usage.tokens)} tokens<div {...stylex.props(styles.cardScope)}>{row.usage.scope === '24h-root-and-subagents' ? '24h · includes subagents' : 'Lifetime · includes subagents'}</div></dd></>}
-      {row.duration._tag === 'Known' && <><dt {...stylex.props(styles.cardLabel)}><Icon name="clock" size={12} />Duration</dt><dd {...stylex.props(styles.detailValue)}><SidebarDuration row={row} /></dd></>}
+      {row.duration._tag === 'Known' && <><dt {...stylex.props(styles.cardLabel)}><Icon name="clock" size={12} />Duration</dt><dd {...stylex.props(styles.detailValue)}><SidebarDuration duration={row.duration} /></dd></>}
       {row.lastTurn._tag === 'Known' && <><dt {...stylex.props(styles.cardLabel)}><Icon name="clock" size={12} />{row.lastTurn.kind === 'turn-completed' ? 'Last turn' : 'Last activity'}</dt><dd {...stylex.props(styles.detailValue)}><SidebarTime at={row.lastTurn.at} {...clock} kind={row.lastTurn.kind === 'turn-completed' ? 'turn' : 'activity'} /></dd></>}
       {row.model !== undefined && <><dt {...stylex.props(styles.cardLabel)}><Icon name="gear" size={12} />Model</dt><dd {...stylex.props(styles.detailValue)}>{row.model}</dd></>}
       {row.pullRequest !== undefined && <><dt {...stylex.props(styles.cardLabel)}><Icon name="swap" size={12} />PR</dt><dd {...stylex.props(styles.detailValue)}>#{row.pullRequest.number} · {row.pullRequest.title}</dd></>}
@@ -144,7 +144,7 @@ export const SidebarAgentRow = React.memo(function SidebarAgentRow({ item, varia
   const open = () => { callbacks?.select?.(item.id, item.parentRef?.replace(/^agent\//, '')); onOpen?.(item) }
   const quickOpen = canOpen && rowHovered
   const spendFields = item.usage._tag === 'Unknown' ? null : <span {...stylex.props(styles.metric)}><span data-row-field="total-usd" title={`${usageScope}: $${usd}`} aria-label={`${usageScope}: $${usd}`}>{spendCount.format(item.usage.usd)}</span><span data-row-field="total-tokens" data-line1-drop="tokens" title={`${usageScope}: ${tokens} tokens`} aria-label={`${usageScope}: ${tokens} tokens`}>{tokenCount.format(item.usage.tokens)}</span></span>
-  const durationField = item.duration._tag === 'Unknown' ? null : <span data-row-field="total-duration"><SidebarDuration row={item} /></span>
+  const durationField = item.duration._tag === 'Unknown' ? null : <span data-row-field="total-duration"><SidebarDuration duration={item.duration} /></span>
   const lastTurnField = item.lastTurn._tag === 'Unknown' ? null : <span data-row-field="last-turn"><SidebarTime at={item.lastTurn.at} {...clock} kind={item.lastTurn.kind === 'turn-completed' ? 'turn' : 'activity'} compact /></span>
   const content = <>
     <span data-row-column="title" {...stylex.props(styles.title, variant === 'SR-2' && item.children.length > 0 && styles.hasChildren)} title={metadata}>{rowGlyph === 'SG-2' && <span {...stylex.props(styles.statusWord)}>{item.statusLabel}</span>}<span data-row-column="title-text" {...stylex.props(styles.name)}><Highlight value={title} query={query} /></span></span>
@@ -191,7 +191,9 @@ const styles = stylex.create({
   wrapper: { minWidth: 0, width: '100%', containerType: 'inline-size' },
   rowWrapLeaf: { gridTemplateColumns: `${g.icon} minmax(0, 1fr) 0px var(--sidebar-metric-track, ${g.sidebarMetric}) max-content` },
   rowWrapParent: { gridTemplateColumns: `${g.icon} minmax(0, 1fr) ${g.icon} var(--sidebar-metric-track, ${g.sidebarMetric}) max-content` },
-  rowWrap: { display: 'grid', gridTemplateColumns: `${g.icon} minmax(0, 1fr) ${g.controlSm} var(--sidebar-metric-track, ${g.sidebarMetric}) max-content`, alignContent: 'center', alignItems: 'center', columnGap: s.xs2, rowGap: s.xs2, minWidth: 0, width: '100%', boxSizing: 'border-box', paddingInline: s.sm, borderRadius: r.sm, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading, color: ink.fg, ':hover': { backgroundColor: surface.rowHover } },
+  // The row is the containing block for its visually hidden details trigger; without it the
+  // absolutely positioned trigger escapes every scroll clip and extends the document.
+  rowWrap: { position: 'relative', display: 'grid', gridTemplateColumns: `${g.icon} minmax(0, 1fr) ${g.controlSm} var(--sidebar-metric-track, ${g.sidebarMetric}) max-content`, alignContent: 'center', alignItems: 'center', columnGap: s.xs2, rowGap: s.xs2, minWidth: 0, width: '100%', boxSizing: 'border-box', paddingInline: s.sm, borderRadius: r.sm, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading, color: ink.fg, ':hover': { backgroundColor: surface.rowHover } },
   row: { display: 'grid', gridColumn: '2 / -1', gridRow: '1 / -1', gridTemplateColumns: 'subgrid', gridTemplateRows: 'subgrid', alignItems: 'center', minWidth: 0, width: '100%', height: '100%', padding: s.zero, borderWidth: 0, borderRadius: r.sm, backgroundColor: surface.transparent, color: ink.fg, fontFamily: t.fontSans, fontSize: t.uiSize, lineHeight: t.uiLeading, textAlign: 'start', cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: '-2px' } },
   'SR-1': { height: g.controlLg, gridTemplateRows: '1fr' }, 'SR-2': { height: g.sidebarRow, gridTemplateRows: `${g.controlSm} ${g.controlSm}`, rowGap: s.zero }, 'SR-3': { height: g.sidebarThree, gridTemplateRows: `${t.uiLeading} ${g.controlSm} ${t.metaLeading}` },
   active: { backgroundColor: surface.rowActive },

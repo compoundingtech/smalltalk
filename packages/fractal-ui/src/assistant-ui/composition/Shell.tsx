@@ -122,7 +122,8 @@ export function ThreadHeader({
   sidebarCollapsed = false,
   onToggleSidebar,
 }: {
-  folder: string
+  /** Reported folder for the breadcrumb; omitted entirely when the host knows none. */
+  folder?: string
   title: string
   /** Observed agent status, never inferred from conversation lifecycle. */
   status?: AgentStatus
@@ -157,8 +158,10 @@ export function ThreadHeader({
         </button>
       ) : null}
       <nav aria-label="Breadcrumb" {...stylex.props(styles.breadcrumb)}>
-        <span {...stylex.props(styles.crumbFolder)}>{folder}</span>
-        <span aria-hidden="true" {...stylex.props(styles.crumbSlash)}>/</span>
+        {folder !== undefined ? <>
+          <span {...stylex.props(styles.crumbFolder)}>{folder}</span>
+          <span aria-hidden="true" {...stylex.props(styles.crumbSlash)}>/</span>
+        </> : null}
         <span {...stylex.props(styles.crumbTitle)}>{title}</span>
       </nav>
       <div {...stylex.props(styles.actions)}>
