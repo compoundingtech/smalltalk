@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Reduce checkpoint capture and replay memory, and keep proof rollback journals on disk.",
+  "replay": {
+    "status": "changed",
+    "detail": "Mission-run and planning replay retain ordered claim IDs and decode one body at a time instead of retaining every body. Existing bounded base-replay pages remain unchanged. Projection ordering, per-claim quarantine and proof comparisons are unchanged; no replay is forced on upgrade."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers or schema-version change. Proof copies use a disk-backed rollback journal and temporary storage with a fixed 2 MiB page-cache target."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest change. Sealed envelope cuts and canonical ordering remain unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No wire or response-shape change. Checkpoint agreement and reader-equivalence contracts are unchanged."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Requires the normal daemon binary restart. Restart-to-API and restart-to-health duration have not been measured for this change."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "The checkpoint scratch directory needs disk space for both the database copy and its rollback journal. No setting, identity migration or store repair is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No on-disk migration. A binary rollback restores prior memory behavior. Proof scratch files are removed on completion or error."
+  }
+}

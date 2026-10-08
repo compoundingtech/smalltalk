@@ -402,12 +402,16 @@ fn a_sealed_set_read_in_pages_is_the_same_set_whatever_the_page() {
         .unwrap();
     let paged_order: Vec<String> = whole.claims.iter().map(|sealed| sealed.claim.id.clone()).collect();
     assert_eq!(paged_order, sql_order, "the pages sort as ORDER BY canonical sorts");
+    assert!(
+        !sealed_records_page_sql().contains("body"),
+        "record windows must not decode JSON bodies before the cut and canonical sort"
+    );
     // The record page query is driven from replica_records by its rowid range. A plan that
     // drove from claims would read every claim for every window.
     let plan: Vec<String> = connection
         .prepare(&format!("EXPLAIN QUERY PLAN {}", sealed_records_page_sql()))
         .unwrap()
-        .query_map([0_i64, 1_000_i64], |row| row.get::<_, String>(3))
+        .query_map(params![0_i64, 1_000_i64, i64::try_from(cut).unwrap(), whole.seal_rowid], |row| row.get::<_, String>(3))
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
@@ -428,6 +432,43 @@ fn a_sealed_set_read_in_pages_is_the_same_set_whatever_the_page() {
     assert_eq!(
         store.checkpoint_sealed_identities(cut, None).unwrap(),
         SealedIdentities::of(&whole)
+    );
+}
+
+#[test]
+fn sealed_record_windows_leave_later_envelopes_out_before_reading_bodies() {
+    let store = Store::open_memory("alder").unwrap();
+    let append = |at, incarnation: &str| {
+        store.set_write_clock_at(at).unwrap();
+        let claim = store.append_claim(&input(
+            AGENT,
+            "harness.observed",
+            Some(AGENT),
+            json!({"state":"idle", "incarnation_id":incarnation}),
+            incarnation,
+        )).unwrap();
+        store.seal_local_batches().unwrap();
+        claim.id
+    };
+    let older = append(100, "older");
+    let through = store.checkpoint_sealed_set(150).unwrap().seal_rowid;
+    let later = append(200, "later");
+    let sealed = store.checkpoint_sealed_set_paged(150, None, 1, 1).unwrap();
+    assert_eq!(
+        sealed.claims.iter().map(|claim| claim.claim.id.as_str()).collect::<Vec<_>>(),
+        vec![older.as_str()]
+    );
+    let connection = store.readers.get();
+    let record_ids = connection.prepare(&sealed_records_page_sql()).unwrap()
+        .query_map(params![0_i64, i64::MAX, 150_i64, sealed.seal_rowid], |row| row.get::<_, String>(6))
+        .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert_eq!(record_ids, vec![older.clone()], "the later body is not part of the metadata window");
+    drop(connection);
+    let through_set = store.checkpoint_sealed_set_paged(250, Some(through), 1, 1).unwrap();
+    assert!(through_set.claims.iter().all(|claim| claim.claim.id != later));
+    assert_eq!(
+        SealedIdentities::of(&sealed),
+        store.checkpoint_sealed_identities_paged(150, None, 1).unwrap()
     );
 }
 
