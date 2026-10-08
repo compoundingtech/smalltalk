@@ -34,25 +34,6 @@ macos_lock=
 macos_home=
 macos_app=
 macos_helper="$(cd "$(dirname "$0")" && pwd)/install-macos.py"
-macos_snapshot() {
-  python3 - "$macos_home" "$macos_app" "$bin_dir" <<'PY'
-import json
-from pathlib import Path
-import sys
-home, app, bin_dir = map(Path, sys.argv[1:])
-paths = [app, app / 'Contents/MacOS/st3']
-paths += [home / 'Library/LaunchAgents' / (s + '.plist') for s in
-          ['com.compoundingtech.st3', 'com.compoundingtech.st3.replication']]
-def generation(path):
-    try:
-        s = path.lstat()
-        return [s.st_dev, s.st_ino, s.st_mtime_ns, s.st_size]
-    except FileNotFoundError:
-        return None
-print(json.dumps({'home': str(home), 'app': str(app), 'bin_dir': str(bin_dir),
-                  'files': {str(p): generation(p) for p in paths}}, sort_keys=True))
-PY
-}
 cleanup() {
   status=$?
   trap - EXIT
@@ -61,17 +42,12 @@ cleanup() {
   restore_bins=true
   if $rollback_ready && ! $committed; then
     if [[ -n $macos_job && -f $macos_job/previous.json ]]; then
-      # Only a completed helper call supplies a generation witness. Never use a
-      # late restore to overwrite another install or an unconfirmed partial app.
-      if [[ -f $macos_job/caller-owner.json ]] && \
-          [[ $(macos_snapshot) == "$(cat "$macos_job/caller-owner.json")" ]]; then
-        python3 "$macos_helper" --restore-app --job "$macos_job" \
-          --home "$macos_home" --app "$macos_app" --bin-dir "$bin_dir" >/dev/null || restored=false
-      else
-        printf 'install: macOS transaction ownership changed or is unconfirmed; current app and links left intact\n' >&2
-        restored=false
-        restore_bins=false
-      fi
+      # Historical/source callers only take the helper's flock. Its restore API
+      # cannot compare ownership under that lock, so even a matching snapshot
+      # cannot authorize a late restore. Preserve app, links and recovery files.
+      printf 'install: macOS ownership cannot be established atomically; current app and links left intact\n' >&2
+      restored=false
+      restore_bins=false
     fi
     if $restore_bins; then
       mkdir -p "$stage/restore" || restored=false
@@ -147,7 +123,6 @@ PY
     python3 "$macos_helper" --from "$source_dir" --bin-dir "$bin_dir" --job "$macos_job" \
       --home "$macos_home" --app "$macos_app"
   fi
-  macos_snapshot > "$macos_job/caller-owner.json"
   macos=true
 fi
 rollback_ready=true
