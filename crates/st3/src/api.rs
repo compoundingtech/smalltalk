@@ -2838,11 +2838,13 @@ fn managed_session_id(owner: &str, identity: &str) -> String {
     format!("session/{}", &digest[..24])
 }
 
+type ManagedSessionOwner = (String, Option<String>, Option<String>);
+
 fn managed_session_owner_at(
     store: &Store,
     snapshot_index: u64,
     session_id: &str,
-) -> anyhow::Result<Option<(String, Option<String>, Option<String>)>> {
+) -> anyhow::Result<Option<ManagedSessionOwner>> {
     crate::performance::task("conversation/owner", || {
         let owners = store.conversation_owners_at(snapshot_index)?;
         for owner in owners.values() {
@@ -2854,6 +2856,27 @@ fn managed_session_owner_at(
             }
         }
         Ok(None)
+    })
+}
+
+fn managed_session_owner_for_subject_at(
+    store: &Store,
+    snapshot_index: u64,
+    session_id: &str,
+    owner: &str,
+) -> anyhow::Result<Option<ManagedSessionOwner>> {
+    crate::performance::task("conversation/owner", || {
+        let owners = store.conversation_owners_at(snapshot_index)?;
+        let Some(owner) = owners.get(owner) else {
+            return Ok(None);
+        };
+        let Some(identity) = owner.incarnation.as_deref().or(owner.runtime.as_deref()) else {
+            return Ok(None);
+        };
+        if managed_session_id(&owner.subject, identity) != session_id {
+            return Ok(None);
+        }
+        Ok(Some((owner.subject.clone(), owner.incarnation.clone(), owner.origin.clone())))
     })
 }
 
