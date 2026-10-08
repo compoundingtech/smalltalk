@@ -34,7 +34,7 @@ class RuntimeTests(unittest.TestCase):
                         pty_root = Path(case) / "cobalt" / "pty"
                         pty_root.mkdir(parents=True)
                         socket_path = pty_root / "eval.fault-probe.sock"
-                        # Match pty-core's conservative 104-byte limit as well as
+                        # Preserve the PTY implementation's portable 104-byte bound;
                         # exercising an actual Unix bind at the complete fixture path.
                         self.assertLessEqual(len(os.fsencode(socket_path)), 104)
                         with socket.socket(socket.AF_UNIX) as listener:
