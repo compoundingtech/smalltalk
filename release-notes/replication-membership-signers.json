@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Read fleet membership envelope signers in one joined query instead of one query per claim",
+  "replay": {
+    "status": "none",
+    "detail": "No startup or heal replay is added."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, index, trigger or persisted format changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "The existing membership fold receives the same claim facts and exact envelope signer union, including forks and unsealed local fallback."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Client, peer, signature and certificate formats remain unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal binary restart only; no production latency acceptance is established."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual repair or coordinated fleet conversion is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Older binaries read the unchanged store; no migration or new durable state is introduced."
+  }
+}
