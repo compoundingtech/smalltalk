@@ -44,5 +44,26 @@ archive integrity/traversal, the CI VM guard, run identity and consent-before-st
 Incus CLI absence and lack of read/write /dev/kvm access were separately confirmed;
 the runner exits 2 before creating output or a guest when those prerequisites are
 absent. Real Incus/Tart boot, polkit and SSH login remain untested. Candidate
-provider/mission scenarios and the default image build are not claimed by these
-baseline receipts. See docs/onboarding-vm-runbook.md for the manual next pass.
+provider/mission scenarios are not claimed by these baseline receipts. See
+docs/onboarding-vm-runbook.md for the manual next pass.
+
+## Composed candidate setup on Ubuntu 24.04
+
+The core2959b4d518c11db95f638dea780577e5f9aaa616 archive (SHA256
+ebacde8508d9e5c6510f1b45766716ed8300d67d34bd21bb994286e750da533c) passed
+all **18 setup assertions**, exit0, with the embedded clean24 image recipe built
+by the runner. setup-core24.txt is its exact runner output; setup-core24-summary.json
+records the checks and composition. The source path of the host pty is omitted
+from this public summary. Full exact commands/stdout/stderr and unmodified BUILD.json
+are retained privately in:
+
+- doc/fleet/smalltalk/onboarding/2026-10-08d/setup-core24-report@635bf7606ae9b5c41db5f14130c6387c03e8172b201d612282a13c67a82394b6
+- doc/fleet/smalltalk/onboarding/2026-10-08d/setup-core24-receipt@6aa08885f472f877b8f15853da3ae70c593a02a0b2c9c938021ec56d222626f1
+
+This proves config merge, person and node, self-install/link/pty, service, fresh
+login PATH, doctor without development tools, visible Home/Now, Ctrl+Q/restoration,
+idempotence, the refused-linger command and manager-down behavior before user login
+after a container restart. The guest was removed. No harness/expert/mission-content,
+release-version, stock22 native compatibility or real-VM pass is implied. The
+candidate is a proof-only dev composition with no bundled loader/libc; native22
+is known to fail before main and remains install-story work.

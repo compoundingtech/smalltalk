@@ -1,0 +1,134 @@
+{
+  "ubuntu": "24.04",
+  "scenario": "setup",
+  "backend": "docker",
+  "machine": "st-onboarding-baa5eb44b345",
+  "archive": {
+    "sha256": "ebacde8508d9e5c6510f1b45766716ed8300d67d34bd21bb994286e750da533c",
+    "package": "smalltalk-x86_64-onboarding-core-2959b4d51",
+    "build": {
+      "source": "2959b4d518c11db95f638dea780577e5f9aaa616",
+      "target": "x86_64-unknown-linux-gnu",
+      "profile": "dev (debug sections stripped from packaged copy)",
+      "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+      "composition": {
+        "setup": "56bf4dda4b27296c64982a39030f3d35c03e1071",
+        "ui": "4c224840f8a2105d2b185e95f5827273b831f98e",
+        "ui_help": "7091e8d867f2fec08000b55bccf775010748e395",
+        "doctor_users": "6a7bb88f8d77ef0ba79c1135fc6f0b6ddd829322",
+        "doctor_prerequisite": "f0abf2332dc719e28590fbe977096894181b11ab",
+        "systemd_older": [
+          "07799ecec",
+          "b61d61d25208b3276717d36e8bb054024eb038f0",
+          "c73ee1ef5"
+        ]
+      },
+      "binary_sha256": {
+        "st3": "c8a44aa7a4fceb1d2b31259bb071ecbebca74efcff5468ccfa3496e516d108f6",
+        "pty": "3cc45e96dd90e7bade40a21f66f161e827667d922102432a2d03c97bb15192ab"
+      },
+      "limits": [
+        "Proof-only source composition; not a release artifact.",
+        "No bundled loader or libc. Native Ubuntu22.04 cannot load the host-linked st3 (missing GLIBC_2.39), independently observed by platform.",
+        "Ubuntu24.04 is the intended setup-core container proof.",
+        "No macOS or real VM proof in this package."
+      ]
+    }
+  },
+  "checks": [
+    {
+      "id": "fresh-home",
+      "status": "PASS",
+      "detail": "no existing st config or state"
+    },
+    {
+      "id": "guest-release",
+      "status": "PASS",
+      "detail": "actual guest matches requested Ubuntu release"
+    },
+    {
+      "id": "clean-tool-path",
+      "status": "PASS",
+      "detail": "no gh, developer tools or provider binaries initially installed"
+    },
+    {
+      "id": "archive-extracted",
+      "status": "PASS",
+      "detail": "copied bytes match recorded archive; BUILD.json captured"
+    },
+    {
+      "id": "setup-success",
+      "status": "PASS",
+      "detail": "real candidate setup completed"
+    },
+    {
+      "id": "configured-person",
+      "status": "PASS",
+      "detail": "person/ada persisted"
+    },
+    {
+      "id": "configured-node",
+      "status": "PASS",
+      "detail": "node persisted and is not local"
+    },
+    {
+      "id": "config-merge",
+      "status": "PASS",
+      "detail": "existing checkpoint setting preserved"
+    },
+    {
+      "id": "self-install",
+      "status": "PASS",
+      "detail": "st3, relative st link and pty installed"
+    },
+    {
+      "id": "service-active",
+      "status": "PASS",
+      "detail": "user service is active/running"
+    },
+    {
+      "id": "login-path",
+      "status": "PASS",
+      "detail": "st resolves in a fresh login shell"
+    },
+    {
+      "id": "doctor-healthy",
+      "status": "PASS",
+      "detail": "ordinary doctor healthy"
+    },
+    {
+      "id": "doctor-user-tools",
+      "status": "PASS",
+      "detail": "no irrelevant tool warnings"
+    },
+    {
+      "id": "linger-guidance",
+      "status": "PASS",
+      "detail": "exact command printed when lingering is refused"
+    },
+    {
+      "id": "tui-frame",
+      "status": "PASS",
+      "detail": "first frame, visible Home/Now, Ctrl+Q and terminal restoration"
+    },
+    {
+      "id": "idempotent-setup",
+      "status": "PASS",
+      "detail": "second setup creates no second mission run"
+    },
+    {
+      "id": "machine-restart",
+      "status": "PASS",
+      "detail": "Docker restart is a container restart; Incus is a real guest restart"
+    },
+    {
+      "id": "linger-reboot-behavior",
+      "status": "PASS",
+      "detail": "manager survives only when lingering enabled"
+    }
+  ],
+  "limits": [
+    "Summary receipt; private immutable report and JSON retain every exact command and complete BUILD.json.",
+    "Native Ubuntu24.04 foundation setup only; no expert, provider, mission content, paid model, real VM or stock22 proof."
+  ]
+}
