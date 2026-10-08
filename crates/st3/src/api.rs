@@ -72,6 +72,7 @@ mod mail_backlog;
 mod read_deadline;
 mod owned_sets;
 mod terminal_view;
+mod work_response;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
 pub(crate) use client_v0::raw_terminal::{
@@ -10661,16 +10662,18 @@ async fn finish_claim_publication(
     harness_transition: Option<bool>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
     // Publish only the cumulative buckets. The response detail and turn ID remain local.
-    let store = state.store.clone();
-    let rollup_response = response.clone();
-    if let Some(rollup) =
-        blocking_store(move || store.usage_rollup_for_timeline(&rollup_response)).await?
-    {
+    if response.kind == "harness.timeline" {
         let store = state.store.clone();
-        let (_, updated) =
-            blocking_action(move || store.append_client_claim_outcome(&rollup)).await?;
-        if updated {
-            signal_visible_change(state);
+        let rollup_response = response.clone();
+        if let Some(rollup) =
+            blocking_store(move || store.usage_rollup_for_timeline(&rollup_response)).await?
+        {
+            let store = state.store.clone();
+            let (_, updated) =
+                blocking_action(move || store.append_client_claim_outcome(&rollup)).await?;
+            if updated {
+                signal_visible_change(state);
+            }
         }
     }
     if appended {
@@ -13697,34 +13700,17 @@ async fn work_action_response(
     }
     let quiet_renewal = action == "renew";
     let store = state.store.clone();
-    let (mut response, desired) = blocking_action(move || {
-        let response = if let Some(input) = handoff {
+    let response = blocking_action(move || {
+        let mut response = if let Some(input) = handoff {
             store.handoff_work(&subject, &input)?
         } else {
             store.work_action_extending(&subject, &action, &request, extend_ms)?
         };
 
-        let desired = store.desired_subjects().map_err(|error| {
-            St3Error::new("store-read-failed", format!("read desired agents: {error}"))
-        })?;
-        Ok((response, desired))
+        work_response::enrich_under(&store, &mut response)?;
+        Ok(response)
     })
     .await?;
-    if let Some(assignee) = response
-        .claimant
-        .as_ref()
-        .or(response.assigned_to.as_ref())
-        .or_else(|| (response.available_to.len() == 1).then(|| &response.available_to[0]))
-    {
-        response.under = desired
-            .into_iter()
-            .filter(|subject| subject.kind == "agent")
-            .map(|subject| (subject.subject, crate::graph::agent_under(&subject.desired)))
-            .collect::<BTreeMap<_, _>>()
-            .get(assignee)
-            .cloned()
-            .unwrap_or_default();
-    }
     if quiet_renewal {
         signal_visible_change(&state);
     } else {
