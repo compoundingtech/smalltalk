@@ -1,5 +1,5 @@
 //! Observed status is separate from desired state and agent-declared work status.
-//! Claims provide the replicated history; local receipts only improve current freshness.
+//! Owner-bound registers provide current freshness; historical claims remain readable for legacy seats.
 use super::*;
 
 pub(crate) const WINDOW_MS: u128 = 7 * 24 * 60 * 60 * 1000;
@@ -135,7 +135,11 @@ pub(super) fn state_run_since(
     state: &str,
     index: u64,
 ) -> Result<Option<u128>> {
-    let mut statement = connection.prepare_cached(&harness_observations_of_incarnation_query())?;
+    let mut statement = connection.prepare_cached(&harness_sql(
+        connection,
+        subject,
+        &harness_observations_of_incarnation_query(),
+    )?)?;
     let mut rows = statement.query(params![subject, index, incarnation])?;
     let mut since = None;
     while let Some(row) = rows.next()? {
@@ -164,6 +168,11 @@ pub(super) fn enrich_harness(
 ) -> Result<()> {
     let index = at_index.unwrap_or(i64::MAX as u64);
     let claim = claim_by_id_tx(connection, &view.claim)?;
+    if let Some(claim) = claim.as_ref()
+        && claim.kind == "harness.observed"
+    {
+        view.observed_at_unix_ms = observation_time(claim);
+    }
     if claim
         .as_ref()
         .is_some_and(|claim| matches!(claim.kind.as_str(), "work.claimed" | "work.progress"))
@@ -214,7 +223,7 @@ pub(super) fn enrich_harness(
             AND (claims.kind!='harness.observed' OR json_extract(claims.body,'$.fields.status_transition') IS NOT 0)
             ORDER BY {CANONICAL_ORDER}");
         let claims = connection
-            .prepare_cached(&query)?
+            .prepare_cached(&current_sql(&query))?
             .query_map(params![subject, index, view.incarnation_id], claim_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let refs = claims.iter().collect::<Vec<_>>();
@@ -227,6 +236,23 @@ pub(super) fn enrich_harness(
                 })
         {
             view.since_unix_ms = observation_time(&claims[entry.0]);
+        }
+    }
+    if claim
+        .as_ref()
+        .is_some_and(|claim| claim.id.starts_with(LOCAL_OBSERVATION_ID_PREFIX))
+        && !matches!(
+            view.state.as_str(),
+            "blocked" | "needs-login" | "indeterminate"
+        )
+    {
+        let restored: Option<String> = connection.query_row(&canonical_sql(
+            "SELECT accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='harness.diagnostic'
+             AND json_extract(body,'$.fields.incarnation_id')=?2
+             AND json_extract(body,'$.fields.code') IN ('provider-auth-restored','provider-update-restored')
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1"), params![subject,view.incarnation_id], |row| row.get(0)).optional()?;
+        if let Some(restored) = restored {
+            view.since_unix_ms = view.since_unix_ms.max(restored.parse()?);
         }
     }
     Ok(())
@@ -324,6 +350,17 @@ pub(super) fn history_at(
     index: u64,
 ) -> Result<Value> {
     let cutoff = now.saturating_sub(WINDOW_MS);
+    let current: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM latest_values WHERE subject=?1 AND kind='harness.observed')",
+        [subject],
+        |row| row.get(0),
+    )?;
+    if current {
+        // Keep the existing envelope for installed clients. The empty, incomplete history
+        // explicitly stops promising retained transitions; current status carries its own age.
+        return Ok(json!({"kind":"status-history", "seat":subject, "items":[],
+            "retained_from":crate::api::client_timestamp(now), "complete":false}));
+    }
     // Seek each kind by acceptance time. Read a single older baseline per prompt channel, rather
     // than decoding a seat's lifetime observations on every history request.
     let mut keyed = Vec::new();
@@ -351,7 +388,7 @@ pub(super) fn history_at(
         };
         let query = newest_claims_of_kind_query(&columns, kind)
             .replace(" ORDER BY", &format!("{filter} ORDER BY"));
-        let mut statement = connection.prepare_cached(&query)?;
+        let mut statement = connection.prepare_cached(&current_sql(&query))?;
         let mut rows = statement.query(params![subject, index])?;
         while let Some(row) = rows.next()? {
             let claim = claim_from_row(row)?;
@@ -476,6 +513,18 @@ mod tests {
         store.append_latest_observation(&input("harness.observed", json!({
             "state":state, "incarnation_id":incarnation, "observed_at_ms":at as u64, "reason":reason
         })), at).unwrap().0
+    }
+
+    fn observe_legacy(
+        store: &Store,
+        incarnation: &str,
+        state: &str,
+        at: u128,
+        reason: &str,
+    ) -> ClaimRecord {
+        append_legacy_graph_observation_fenced(&store.graph, &input("harness.observed", json!({
+            "state":state,"incarnation_id":incarnation,"observed_at_ms":at as u64,"reason":reason
+        })), at, None).unwrap().0
     }
 
     #[test]
@@ -676,15 +725,8 @@ mod tests {
             "missing"
         );
         let history = store.seat_status_history("agent/cedar", at + 3).unwrap();
-        assert_eq!(
-            history["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|item| item["state"] == "idle")
-                .count(),
-            1
-        );
+        assert_eq!(history["items"], json!([]));
+        assert_eq!(history["complete"], false);
         observe(&store, "one", "working", at + 4, "turn");
         assert!(
             store
@@ -701,13 +743,13 @@ mod tests {
         let store = Store::open_memory("cedar").unwrap();
         runtime(&store, "one");
         let at = now_ms() - 1_000;
-        let first = observe(&store, "one", "idle", at, "ready");
+        let first = observe_legacy(&store, "one", "idle", at, "ready");
         store.connection.lock().unwrap().execute(
             "UPDATE claims SET body=json_remove(body, '$.fields.observed_since_ms', '$.fields.status_transition') WHERE id=?1",
             [first.id],
         ).unwrap();
         let before = store.current_harness("agent/cedar").unwrap().unwrap();
-        observe(&store, "one", "idle", at + 1, "waiting");
+        observe_legacy(&store, "one", "idle", at + 1, "waiting");
         let after = store.current_harness("agent/cedar").unwrap().unwrap();
         assert_eq!(before.since_unix_ms, at);
         assert_eq!(after.since_unix_ms, before.since_unix_ms);
@@ -718,7 +760,7 @@ mod tests {
         let store = Store::open_memory("cedar").unwrap();
         runtime(&store, "one");
         let at = now_ms();
-        observe(&store, "one", "idle", at, "ready");
+        observe_legacy(&store, "one", "idle", at, "ready");
         runtime(&store, "two");
         assert!(store.current_harness("agent/cedar").unwrap().is_none());
         let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
@@ -736,7 +778,7 @@ mod tests {
         runtime(&store, "one");
         let at = now_ms();
         for index in 0..205 {
-            observe(
+            observe_legacy(
                 &store,
                 "one",
                 if index % 2 == 0 { "working" } else { "idle" },
@@ -760,7 +802,7 @@ mod tests {
         let store = Store::open_memory("cedar").unwrap();
         runtime(&store, "one");
         let at = now_ms();
-        let first = observe(&store, "one", "idle", at, "ready");
+        let first = observe_legacy(&store, "one", "idle", at, "ready");
         // Move the previous publication's acceptance time to simulate the publish interval.
         store
             .connection
@@ -771,7 +813,7 @@ mod tests {
                 params![(at - 60_000).to_string(), first.id],
             )
             .unwrap();
-        let heartbeat = observe(&store, "one", "idle", at + 1, "ready");
+        let heartbeat = observe_legacy(&store, "one", "idle", at + 1, "ready");
         assert!(local_observation_position(&heartbeat).is_none());
         assert_eq!(heartbeat.body["fields"]["status_transition"], false);
         assert_eq!(
@@ -784,11 +826,11 @@ mod tests {
         let store = Store::open_memory("cedar").unwrap();
         runtime(&store, "one");
         let at = now_ms() - 1_000;
-        observe(&store, "one", "idle", at, "ready");
+        observe_legacy(&store, "one", "idle", at, "ready");
         runtime(&store, "two");
-        observe(&store, "two", "working", at + 1, "turn");
-        observe(&store, "one", "working", at + 2, "historical turn");
-        observe(&store, "two", "working", at + 3, "turn");
+        observe_legacy(&store, "two", "working", at + 1, "turn");
+        observe_legacy(&store, "one", "working", at + 2, "historical turn");
+        observe_legacy(&store, "two", "working", at + 3, "turn");
         let current = store.current_harness("agent/cedar").unwrap().unwrap();
         assert_eq!(current.since_unix_ms, at + 1);
         let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
@@ -805,9 +847,9 @@ mod tests {
     fn status_history_restores_the_auth_fence_that_predates_the_window() {
         let store = Store::open_memory("cedar").unwrap();
         runtime(&store, "one");
-        observe(&store, "one", "idle", now_ms(), "ready");
+        observe_legacy(&store, "one", "idle", now_ms(), "ready");
         let diagnostic = |code| {
-            store.append_claim(&input("harness.diagnostic", json!({
+            store.append_legacy_claim(&input("harness.diagnostic", json!({
             "incarnation_id":"one", "code":code, "driver":"codex", "reason":"fixture", "severity":"warning"
         }))).unwrap()
         };
@@ -853,13 +895,8 @@ mod tests {
         assert_eq!(idle.state, "idle");
         assert_eq!(idle.since_unix_ms, restored.accepted_at_unix_ms);
         let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
-        let states = history["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|entry| entry["state"].as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(states, ["idle", "unauthenticated", "blocked", "idle"]);
+        assert_eq!(history["items"], json!([]));
+        assert_eq!(history["complete"], false);
     }
 
     #[test]
@@ -890,15 +927,7 @@ mod tests {
         assert_eq!(blocked.state, "needs-login");
         assert_eq!(blocked.since_unix_ms, at);
         let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
-        assert_eq!(
-            history["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|item| item["state"] == "unauthenticated")
-                .count(),
-            1
-        );
+        assert_eq!(history["items"], json!([]));
         publish(json!(true), 2, at + 2);
         let recovered = store.current_harness("agent/cedar").unwrap().unwrap();
         assert_eq!(recovered.state, "idle");
@@ -940,13 +969,7 @@ mod tests {
             u128::from(restored.body["fields"]["observed_at_ms"].as_u64().unwrap())
         );
         let history = store.seat_status_history("agent/cedar", now_ms()).unwrap();
-        let states = history["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|entry| entry["state"].as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(states, ["unauthenticated", "idle"]);
+        assert_eq!(history["items"], json!([]));
     }
 
     #[test]
@@ -954,9 +977,9 @@ mod tests {
         let store = Store::open_memory("cedar").unwrap();
         runtime(&store, "one");
         let at = now_ms();
-        observe(&store, "one", "idle", at, "ready");
+        observe_legacy(&store, "one", "idle", at, "ready");
         let diagnostic = |code| {
-            store.append_claim(&input("harness.diagnostic", json!({
+            store.append_legacy_claim(&input("harness.diagnostic", json!({
             "incarnation_id":"one", "code":code, "reason":"fixture", "severity":"warning"
         }))).unwrap()
         };

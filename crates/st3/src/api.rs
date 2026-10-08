@@ -68,6 +68,7 @@ mod delivery_probes;
 mod github_watch;
 mod harness_events;
 mod mailbox;
+mod native_process_identity;
 mod mail_backlog;
 mod owned_sets;
 mod terminal_view;
@@ -661,6 +662,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(fleet_publish_endpoints),
         )
         .route("/v1/internal/replication-wake", post(replication_wake))
+        .route("/v1/internal/current-value", post(receive_current_value))
         .route(
             crate::peer::CLIENT_READ_FORWARD_PATH,
             post(forward_client_read).layer(DefaultBodyLimit::max(16_384)),
@@ -5149,6 +5151,8 @@ fn harness_ancestor(_pid: u32) -> Option<String> {
 
 #[derive(Clone)]
 struct NativeDeliveryPeer {
+    /// Kernel process birth captured with the authenticated Unix peer.
+    start_token: Option<u64>,
     agent: String,
     transport: &'static str,
     pid: u32,
@@ -5156,8 +5160,15 @@ struct NativeDeliveryPeer {
 }
 
 fn native_delivery_peer(pid: u32) -> Option<NativeDeliveryPeer> {
+    let start_token = native_process_identity::birth(pid)?;
     let (args, env) = local_process_arguments(pid)?;
-    native_delivery_identity(pid, &args, &env)
+    let mut peer = native_delivery_identity(pid, &args, &env)?;
+    // Do not authenticate argv/environment from one process as a reused PID's caller.
+    if native_process_identity::birth(pid)? != start_token {
+        return None;
+    }
+    peer.start_token = Some(start_token);
+    Some(peer)
 }
 
 fn native_delivery_identity(
@@ -5189,6 +5200,7 @@ fn native_delivery_identity(
         transport,
         pid,
         archives_inbox,
+        start_token: None,
     })
 }
 
@@ -7096,6 +7108,7 @@ async fn replication_receive(
     State(state): State<AppState>,
     Json(request): Json<ReplicationReceiveRequest>,
 ) -> Result<Json<ReplicationReceiveResponse>, ApiError> {
+    let transport_peer = request.peer.clone();
     let store = state.store.clone();
     let (response, reconcile_changed) = blocking_action(move || {
         let before_index = store
@@ -7178,7 +7191,21 @@ async fn replication_receive(
             .event_notify
             .send_modify(|generation| *generation = generation.saturating_add(1));
     }
+    publish_transport_current(&state, transport_peer);
     Ok(Json(response))
+}
+
+fn publish_transport_current(state: &AppState, peer: String) {
+    let state = state.clone();
+    let store = state.store.clone();
+    tokio::spawn(async move {
+        if let Ok(Some(record)) = blocking_store(move || store.own_transport_value(&peer)).await {
+            signal_local_change(&state);
+            if let Some(relay) = &state.client_relay {
+                relay.publish_current_value(record).await;
+            }
+        }
+    });
 }
 
 /// Answer a peer's heal question. A swap or a replay can change the graph.
@@ -7254,9 +7281,9 @@ async fn replication_peer_failure(
     State(state): State<AppState>,
     Json(request): Json<ReplicationPeerFailureRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    let transport_peer = request.peer.clone();
     let store = state.store.clone();
     let changed = blocking_store(move || {
-        let before_index = store.index()?;
         let stale = store.record_peer_failure(&request.peer, &request.status, &request.error)?;
         if stale && store.observes_transport_to(&request.peer)? {
             store.record_transport_observation(
@@ -7266,15 +7293,29 @@ async fn replication_peer_failure(
                 None,
             )?;
         }
-        // A peer that fails mid-sync sends no more exchanges, so project what it delivered.
-        let projected = store.replication_projection_deferred()
-            && store.project_replication_backlog_unless_catching_up()? == Some(true);
-        Ok(store.index()? != before_index || projected)
+        Ok(stale)
     })
     .await?;
     if changed {
-        signal_changed(&state);
+        signal_local_change(&state);
     }
+    publish_transport_current(&state, transport_peer);
+    // Preserve already admitted durable inventory recovery independently of the current hint.
+    // A reachability POST never waits for that ordered projection.
+    let recovery = state.clone();
+    tokio::spawn(async move {
+        let store = recovery.store.clone();
+        if matches!(
+            blocking_store(move || {
+                Ok(store.replication_projection_deferred()
+                    && store.project_replication_backlog_unless_catching_up()? == Some(true))
+            })
+            .await,
+            Ok(true)
+        ) {
+            signal_changed(&recovery);
+        }
+    });
     Ok(Json(json!({ "recorded": true, "changed": changed })))
 }
 
@@ -10376,8 +10417,33 @@ async fn post_delivery_hold(
 }
 async fn post_claim(
     State(state): State<AppState>,
+    peer: Option<Extension<NativeDeliveryPeer>>,
     Json(request): Json<ClaimInput>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
+    if crate::store::is_current_input(&request)
+        && matches!(
+            request.kind.as_str(),
+            "harness.observed" | "harness.usage" | "harness.todo.observed"
+        )
+        && request.subject.starts_with("agent/")
+    {
+        let runtime_incarnation = request
+            .fields
+            .get("incarnation_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        return harness_events::publish(
+            State(state),
+            peer,
+            Json(crate::harness_events::Publication {
+                runtime_incarnation,
+                sequence: 0,
+                claim: request,
+            }),
+        )
+        .await;
+    }
     // A write can wait for the store's writer. It waits on the blocking pool, so the API's
     // workers keep answering other requests meanwhile.
     let store = state.store.clone();
@@ -10385,6 +10451,23 @@ async fn post_claim(
     let (response, appended) =
         blocking_action(move || store.append_client_claim_outcome(&request)).await?;
     finish_claim_publication(&state, &kind, response, appended).await
+}
+
+async fn receive_current_value(
+    State(state): State<AppState>,
+    Json(record): Json<ClaimRecord>,
+) -> Result<Json<Value>, ApiError> {
+    let store = state.store.clone();
+    let transition =
+        record.kind == "harness.observed" && record.body["fields"]["status_transition"] != false;
+    let changed = blocking_action(move || store.receive_current_value(&record)).await?;
+    if changed {
+        signal_local_change(&state);
+        if transition {
+            state.notify.notify_one();
+        }
+    }
+    Ok(Json(json!({"changed":changed})))
 }
 
 // Both claim transports must publish response-usage rollups, even on replay after the original
@@ -10395,6 +10478,43 @@ async fn finish_claim_publication(
     response: ClaimRecord,
     appended: bool,
 ) -> Result<Json<ClaimRecord>, ApiError> {
+    if crate::store::is_current_value(kind)
+        && (kind != "harness.usage" || response.body["fields"]["semantics"] == "context_occupancy")
+    {
+        if appended {
+            signal_local_change(state);
+            if kind == "harness.observed" && response.body["fields"]["status_transition"] != false {
+                state.notify.notify_one();
+            }
+            if kind == "harness.observed" && response.body["fields"]["state"] != "working" {
+                // Numeric accounting is explicitly durable. Its final flush may wait for the
+                // graph writer, independently of the already accepted current status.
+                let state = state.clone();
+                let subject = response.subject.clone();
+                let incarnation = response.body["fields"]["incarnation_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                tokio::spawn(async move {
+                    let store = state.store.clone();
+                    if matches!(
+                        blocking_action(move || store.flush_pending_usage(&subject, &incarnation))
+                            .await,
+                        Ok(true)
+                    ) {
+                        signal_visible_change(&state);
+                    }
+                });
+            }
+            if let Some(relay) = state.client_relay.clone() {
+                let record = response.clone();
+                tokio::spawn(async move {
+                    relay.publish_current_value(record).await;
+                });
+            }
+        }
+        return Ok(Json(response));
+    }
     // Publish only the cumulative buckets. The response detail and turn ID remain local.
     let store = state.store.clone();
     let rollup_response = response.clone();
@@ -15487,6 +15607,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             transport: "omp-channel",
             pid: 37,
             archives_inbox: false,
+            start_token: None,
         };
         record_legacy_poll(Some(&peer), Some("agent/eval/other-mailbox"), false);
         record_legacy_poll(Some(&peer), Some(recipient), true);
@@ -15922,12 +16043,101 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
     }
 
     #[tokio::test]
+    async fn current_status_requires_kernel_seat_identity_and_running_incarnation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let input = ClaimInput {
+            subject: "agent/example/seat".into(),
+            kind: "harness.observed".into(),
+            actor: Some("agent/example/seat".into()),
+            fields: serde_json::from_value(
+                json!({"state":"working","driver":"codex","incarnation_id":"one"}),
+            )
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        assert!(
+            post_claim(State(state.clone()), None, Json(input.clone()))
+                .await
+                .is_err()
+        );
+        let peer = |agent: &str| {
+            Some(Extension(NativeDeliveryPeer {
+                agent: agent.into(),
+                transport: "app-server",
+                pid: 1,
+                archives_inbox: true,
+                start_token: None,
+            }))
+        };
+        assert!(
+            post_claim(
+                State(state.clone()),
+                peer("agent/example/other"),
+                Json(input.clone())
+            )
+            .await
+            .is_err()
+        );
+        let mut starting = input.clone();
+        starting.fields.insert("state".into(), json!("starting"));
+        let _ = post_claim(State(state.clone()), peer(&input.subject), Json(starting))
+            .await
+            .unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: input.subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: input.actor.clone(),
+                fields: serde_json::from_value(
+                    json!({"status":"running","runtime_id":"example/seat","incarnation_id":"two"}),
+                )
+                .unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert!(
+            post_claim(
+                State(state.clone()),
+                peer(&input.subject),
+                Json(input.clone())
+            )
+            .await
+            .is_err()
+        );
+        let mut live = input.clone();
+        live.fields.insert("incarnation_id".into(), json!("two"));
+        let _ = post_claim(State(state.clone()), peer(&input.subject), Json(live))
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .store
+                .current_harness(&input.subject)
+                .unwrap()
+                .unwrap()
+                .incarnation_id,
+            "two"
+        );
+    }
+
+    #[tokio::test]
     async fn a_local_only_harness_observation_wakes_only_the_client_feed() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let wake_file = root.path().join("replication.wake");
         let mut client_feed = state.event_notify.subscribe();
         let subject = "agent/node.worker";
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running","runtime_id":"node.worker","incarnation_id":"inc-1"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
         let observed = |state_name: &str, observed_at_ms: u64| ClaimInput {
             subject: subject.into(),
             kind: "harness.observed".into(),
@@ -15958,7 +16168,19 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             expected_subject: None,
             idempotency_key: Some(format!("wake-usage-{tokens}")),
         };
-        let post = |input: ClaimInput| post_claim(State(state.clone()), Json(input));
+        let post = |input: ClaimInput| {
+            post_claim(
+                State(state.clone()),
+                Some(Extension(NativeDeliveryPeer {
+                    agent: subject.into(),
+                    transport: "app-server",
+                    pid: 1,
+                    archives_inbox: true,
+                    start_token: None,
+                })),
+                Json(input),
+            )
+        };
         let reconciler_woke = || async {
             tokio::time::timeout(Duration::from_millis(20), state.notify.notified())
                 .await
@@ -15971,11 +16193,10 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         };
 
         let change = post(observed("working", 1)).await.unwrap().0;
-        assert!(crate::store::local_observation_position(&change).is_none());
+        assert!(crate::store::local_observation_position(&change).is_some());
         assert!(reconciler_woke().await);
-        assert!(wake_file.exists());
+        assert!(!wake_file.exists());
         assert!(client_feed_woke());
-        fs::remove_file(&wake_file).unwrap();
 
         let heartbeat = post(observed("working", 300_001)).await.unwrap().0;
         assert!(crate::store::local_observation_position(&heartbeat).is_some());
@@ -15984,11 +16205,10 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         assert!(client_feed_woke(), "clients still see the observation");
 
         let first_usage = post(usage(10)).await.unwrap().0;
-        assert!(crate::store::local_observation_position(&first_usage).is_none());
-        assert!(wake_file.exists(), "replicated usage wakes replication");
+        assert!(crate::store::local_observation_position(&first_usage).is_some());
+        assert!(!wake_file.exists(), "context is a current value");
         assert!(!reconciler_woke().await, "usage never reconciles");
         assert!(client_feed_woke());
-        fs::remove_file(&wake_file).unwrap();
 
         let throttled = post(usage(20)).await.unwrap().0;
         assert!(crate::store::local_observation_position(&throttled).is_some());
@@ -16123,9 +16343,12 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
     fn probe_claim(key: &str, state: &str) -> ClaimInput {
         ClaimInput {
             subject: "agent/probe".into(),
-            kind: "harness.observed".into(),
+            kind: "runtime.observed".into(),
             actor: Some("agent/probe".into()),
-            fields: BTreeMap::from([("state".into(), Value::String(state.into()))]),
+            fields: BTreeMap::from([
+                ("status".into(), Value::String(state.into())),
+                ("runtime_id".into(), json!("probe")),
+            ]),
             evidence: Vec::new(),
             expected_subject: None,
             idempotency_key: Some(key.into()),
@@ -20766,7 +20989,7 @@ mission "wake" state="ready" {
     }
 
     #[test]
-    fn agent_cards_advance_locally_and_keep_historical_snapshots() {
+    fn agent_cards_advance_when_current_registers_change() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let store = &state.store;
@@ -20870,8 +21093,8 @@ mission "wake" state="ready" {
                 );
             }
         }
-        // Evicted old snapshots rebuild independently of the newest cache.
-        assert_eq!(checked_agent_cache(store, false, before), original);
+        // Register updates are current even when the durable graph snapshot stays fixed.
+        assert_ne!(checked_agent_cache(store, false, before), original);
         append(
             "agent/node.cobalt",
             "runtime.observed",
@@ -21267,11 +21490,13 @@ mission "agent-human" state="ready" {
         // Before a new incarnation's first observation, the previous ask is fenced out.
         assert_eq!(agent()["state"], "starting", "{}", agent());
         assert!(agent()["blocked_on"].is_null());
-        append("harness.observed", json!({
-            "state": "idle", "driver": "omp", "incarnation_id": "human-2",
-            "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
-        }));
-        observe_harness("working");
+        append(
+            "harness.observed",
+            json!({
+                "state": "idle", "driver": "omp", "incarnation_id": "human-2",
+                "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
+            }),
+        );
         let resumed: st3_client::Agent = serde_json::from_value(agent()).unwrap();
         assert_eq!(resumed.state, "running");
         assert_eq!(resumed.harness_state.as_deref(), Some("idle"));
@@ -22103,14 +22328,17 @@ version 2
     async fn claims_endpoint_returns_bounded_cursor_pages() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
-        for (subject, key) in [("host/one", "one"), ("host/two", "two")] {
+        for (subject, key) in [("agent/one", "one"), ("agent/two", "two")] {
             state
                 .store
                 .append_claim(&ClaimInput {
                     subject: subject.into(),
-                    kind: "transport.observed".into(),
+                    kind: "runtime.observed".into(),
                     actor: None,
-                    fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                    fields: BTreeMap::from([
+                        ("status".into(), json!("running")),
+                        ("runtime_id".into(), json!("cursor")),
+                    ]),
                     evidence: Vec::new(),
                     expected_subject: None,
                     idempotency_key: Some(key.into()),
@@ -22136,7 +22364,7 @@ version 2
         assert_eq!(status, StatusCode::OK, "{descending}");
         assert_eq!(
             descending["claims"][0]["subject"].as_str(),
-            Some("host/two")
+            Some("agent/two")
         );
     }
 
@@ -23156,6 +23384,7 @@ agent "seat" { workspace "/tmp"; command "true" }
             transport: "claude-channel",
             pid: 7,
             archives_inbox: true,
+            start_token: None,
         };
         let (status, _) = json_request(
             app.clone().layer(Extension(peer)),
@@ -23169,6 +23398,7 @@ agent "seat" { workspace "/tmp"; command "true" }
             transport: "claude-channel",
             pid: 7,
             archives_inbox: true,
+            start_token: None,
         };
         let app = app.layer(Extension(peer));
         let (status, first) =
@@ -23177,7 +23407,10 @@ agent "seat" { workspace "/tmp"; command "true" }
         let (status, replay) =
             json_request(app.clone(), "/v1/harness-events", request.clone()).await;
         assert_eq!(status, StatusCode::OK, "{replay}");
-        assert_eq!(first["body"]["fields"], replay["body"]["fields"]);
+        assert_eq!(
+            first["body"]["fields"]["state"],
+            replay["body"]["fields"]["state"]
+        );
         let mut usage = request.clone();
         usage["sequence"] = json!(2);
         usage["claim"]["kind"] = json!("harness.timeline");

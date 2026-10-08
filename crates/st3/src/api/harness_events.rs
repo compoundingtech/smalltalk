@@ -23,6 +23,14 @@ pub(super) async fn publish(
     }
     let store = state.store.clone();
     let kind = request.claim.kind.clone();
-    let (record, changed) = blocking_action(move || store.append_harness_event(&request)).await?;
+    let current = crate::store::is_current_input(&request.claim);
+    let (record, changed) = blocking_action(move || {
+        if current {
+            store.append_bound_current(&request.claim, &request.runtime_incarnation)
+        } else {
+            store.append_harness_event(&request)
+        }
+    })
+    .await?;
     finish_claim_publication(&state, &kind, record, changed).await
 }

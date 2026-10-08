@@ -70,6 +70,14 @@ fn every_persistent_table_has_a_projection_scope() {
         "account_limit_readings",
         "account_limit_seats",
         "local_latest_slots",
+        "latest_values",
+        "latest_readiness",
+        // Pre-cutover numeric reader indexes derive from admitted compatibility claims.
+        // Their source facts remain covered by graph digests; a future numeric wire
+        // cutover needs its own authenticated source completeness contract.
+        "numeric_values",
+        "numeric_account_windows",
+        "numeric_limit_seats",
         "local_resource_projection_pending",
         "local_glass_head_pending",
         "local_glass_head_dirty",
@@ -398,12 +406,24 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
 }
 
 fn write_audit_history(source: &Store) {
-    source.register_custom_kind(&custom::RegistrationRequest {
-        manifest: serde_json::from_str(include_str!("../../../../examples/st3/custom-review.json")).unwrap(),
-        actor: "agent/garden/seed".into(),
-    }).unwrap();
-    source.put_document("doc/garden/audit", b"Immutable audit context", &None, "garden-audit-context").unwrap();
-    source.append_claim(&ClaimInput {
+    source
+        .register_custom_kind(&custom::RegistrationRequest {
+            manifest: serde_json::from_str(include_str!(
+                "../../../../examples/st3/custom-review.json"
+            ))
+            .unwrap(),
+            actor: "agent/garden/seed".into(),
+        })
+        .unwrap();
+    source
+        .put_document(
+            "doc/garden/audit",
+            b"Immutable audit context",
+            &None,
+            "garden-audit-context",
+        )
+        .unwrap();
+    source.append_legacy_claim(&ClaimInput {
         subject: "custom/garden/review/v1/audit".into(),
         kind: "custom.garden.review.v1.requested".into(),
         actor: Some("agent/garden/seed".into()),
@@ -418,12 +438,12 @@ fn write_audit_history(source: &Store) {
         ),
         "audit-desired",
     );
-    source.append_claim(&ClaimInput {
+    source.append_legacy_claim(&ClaimInput {
         subject:"glass/person/ada/019a0000-0000-7000-8000-000000000001".into(), kind:"glass.upserted".into(), actor:Some("person/ada".into()),
         fields: serde_json::from_value(json!({"body":{"name":"Audit workspace","layout":{"tabs":[{"pane":"opaque:anything"}]}}, "base_revision":null})).unwrap(), evidence:vec![], expected_subject:None, idempotency_key:None,
     }).unwrap();
     source
-        .append_claim(&ClaimInput {
+        .append_legacy_claim(&ClaimInput {
             subject: "arrangement/person/ada/019a0000-0000-7000-8000-000000000001".into(),
             kind: "arrangement.edited".into(),
             actor: Some("person/ada".into()),
@@ -739,7 +759,7 @@ message "audit-declared" {
     }
     for (state, observed_at) in [("idle", 1000), ("working", 2000), ("idle", 3000)] {
         source
-            .append_claim_outcome(&harness_state("agent/alder.worker", state, observed_at))
+            .append_legacy_claim_outcome(&harness_state("agent/alder.worker", state, observed_at))
             .unwrap();
     }
     source.replay_replication_graph().unwrap();
@@ -885,7 +905,7 @@ fn equal_time_writers_choose_the_same_shared_source() {
     for (writer, state) in writers.iter().zip(["unreachable", "healthy"]) {
         writer.set_write_clock_at(at).unwrap();
         writer
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "observer/audit".into(),
                 kind: "observer.state".into(),
                 actor: None,
@@ -1271,7 +1291,7 @@ fn pending_local_claims_do_not_report_divergence_at_equal_sealed_inventory() {
     let exchange = exchange_from(&source, &ReplicationInventory::default());
     receive_and_project(&target, "alder", &exchange);
     target
-        .append_claim(&ClaimInput {
+        .append_legacy_claim(&ClaimInput {
             subject: "observer/audit-pending".into(),
             kind: "observer.state".into(),
             actor: None,

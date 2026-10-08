@@ -71,6 +71,8 @@ struct FollowTest {
     messages: Vec<String>,
 }
 
+pub const LATEST_VALUE_TIMEOUT: Duration = Duration::from_millis(100);
+
 const FOLLOW_OUTAGE_LIMIT: Duration = Duration::from_secs(5 * 60);
 const FOLLOW_DEADLINE_PAUSE: Duration = Duration::from_secs(10);
 const FOLLOW_DEADLINE_CAP: Duration = Duration::from_secs(60);
@@ -443,6 +445,23 @@ impl Client {
     }
 
     pub async fn post<I: Serialize, O: DeserializeOwned>(&self, path: &str, body: &I) -> Result<O> {
+        if path == "/v1/claims" {
+            let value = serde_json::to_value(body)?;
+            if value.get("kind").and_then(serde_json::Value::as_str)
+                .is_some_and(crate::store::is_current_value)
+                && (value["kind"] != "harness.usage"
+                    || value["fields"]["semantics"] == "context_occupancy")
+            {
+                return tokio::time::timeout(
+                    LATEST_VALUE_TIMEOUT,
+                    self.clone()
+                        .with_outage_wait(Duration::ZERO, false)
+                        .request("POST", path, Some(body)),
+                )
+                .await
+                .context("current value POST timed out")?;
+            }
+        }
         self.request("POST", path, Some(body)).await
     }
 

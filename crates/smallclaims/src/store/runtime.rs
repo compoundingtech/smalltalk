@@ -60,6 +60,13 @@ pub trait Runtime: Send + Sync {
     /// project the same claims differently, so they compare their logs instead of their graphs.
     fn schema_digest(&self) -> String;
 
+    /// Current observations may live outside immutable claim authority. Let the runtime
+    /// select their read sources while the graph retains its existing fold and timestamps.
+    /// Immutable runtimes use the original indexed query unchanged.
+    fn current_observation_sql(&self, _kind: &str, sql: &str) -> String {
+        sql.to_owned()
+    }
+
     /// Check a replicated claim's kind and fields once the graph has verified its hash and batch.
     fn classify_replicated_claim(
         &self,

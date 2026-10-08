@@ -6564,7 +6564,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             return Ok(());
         }
-        let record = self.store.append_claim(&ClaimInput {
+        let input = ClaimInput {
             subject: subject.into(),
             kind: kind.into(),
             actor: None,
@@ -6572,7 +6572,20 @@ impl<R: RuntimeControl> Reconciler<R> {
             evidence,
             expected_subject: None,
             idempotency_key: None,
-        })?;
+        };
+        let record = match self.store.append_claim(&input) {
+            Ok(record) => record,
+            Err(_) if crate::store::is_current_input(&input) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if crate::store::is_current_input(&input)
+            && let Some(relay) = self.client_relay.clone()
+        {
+            let current = record.clone();
+            tokio::spawn(async move {
+                relay.publish_current_value(current).await;
+            });
+        }
         if crate::store::local_observation_position(&record).is_some() {
             // Only this node reads a local observation, and it cannot advance a mission.
             self.event_notify
@@ -32903,35 +32916,39 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
         );
         reconciler.reconcile_once().unwrap();
         *runtime.ptys.lock().unwrap() = vec![claude_seat_pty("seat", "running", "one")];
+        reconciler.reconcile_once().unwrap();
         let publish = |accepted: bool, sequence: u64, epoch: &str, owner: u64| {
-            store
-                .append_claim(&ClaimInput {
-                    subject: "agent/node.seat".into(),
-                    kind: "harness.observed".into(),
-                    actor: Some("agent/node.seat".into()),
-                    fields: BTreeMap::from([
-                        ("state".into(), Value::String("idle".into())),
-                        ("incarnation_id".into(), Value::String(epoch.into())),
-                        ("provider_auth".into(), Value::Bool(accepted)),
-                        ("provider_auth_sequence".into(), Value::from(sequence)),
-                        ("ownership_sequence".into(), Value::from(owner)),
-                        (
-                            "reason".into(),
-                            if accepted {
-                                Value::Null
-                            } else {
-                                Value::String("providerAuth".into())
-                            },
-                        ),
-                    ])
-                    .into_iter()
-                    .filter(|(_, v)| !v.is_null())
-                    .collect(),
-                    evidence: vec![],
-                    expected_subject: None,
-                    idempotency_key: None,
-                })
-                .unwrap();
+            let result = store.append_claim(&ClaimInput {
+                subject: "agent/node.seat".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/node.seat".into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("incarnation_id".into(), Value::String(epoch.into())),
+                    ("provider_auth".into(), Value::Bool(accepted)),
+                    ("provider_auth_sequence".into(), Value::from(sequence)),
+                    ("ownership_sequence".into(), Value::from(owner)),
+                    (
+                        "reason".into(),
+                        if accepted {
+                            Value::Null
+                        } else {
+                            Value::String("providerAuth".into())
+                        },
+                    ),
+                ])
+                .into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .collect(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            });
+            if epoch == "stale" {
+                assert_eq!(result.unwrap_err().code, "stale-harness-event-session");
+            } else {
+                result.unwrap();
+            }
         };
         publish(false, 1, "one", 1);
         store
@@ -34721,7 +34738,7 @@ mission "work-alert" state="ready" {
                 expected_subject: None,
                 idempotency_key: Some("worker-three-idle".into()),
             })
-            .unwrap();
+            .unwrap_err();
         let historical_wake = store
             .step_run(&step.subject)
             .unwrap()

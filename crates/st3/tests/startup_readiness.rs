@@ -48,13 +48,16 @@ fn replay_is_visible_before_the_api_serves_and_stale_files_are_ignored() {
     let database = root.join("state/claims.sqlite3");
     {
         let store = Store::open(&database, "studio").unwrap();
-        for state in ["ready", "idle", "ready"] {
+        // Replay exercises durable lifecycle evidence, independent of current status registers.
+        for status in ["starting", "running", "stopped"] {
             store
                 .append_claim(&ClaimInput {
                     subject: "agent/studio.test".into(),
-                    kind: "harness.observed".into(),
+                    kind: "runtime.observed".into(),
                     actor: None,
-                    fields: BTreeMap::from([("state".into(), json!(state))]),
+                    fields: BTreeMap::from([("status".into(), json!(status)),
+                        ("runtime_id".into(), json!("studio.test")),
+                        ("incarnation_id".into(), json!("one"))]),
                     evidence: vec![],
                     expected_subject: None,
                     idempotency_key: None,
