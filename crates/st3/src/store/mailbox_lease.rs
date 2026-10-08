@@ -70,6 +70,46 @@ mod tests {
     }
 
     #[test]
+    fn fault_capture_keeps_exact_recovery_and_runtime_fences_at_each_cut() {
+        let store = fixture();
+        let subject = "agent/eval.worker";
+        let subjects = vec![subject.into(), "agent/absent".into(), subject.into()];
+        let failure = |reason: &str| store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "operational.failure".into(),
+            actor: Some("daemon/runtime".into()),
+            fields: serde_json::from_value(json!({"condition":"mailbox-channel-lost",
+                "incarnation":"current", "reason":reason, "reviewer":subject,
+                "title":"Mailbox lost", "severity":"error", "targets":[subject]})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let first = failure("first loss");
+        let first_cut = store.index().unwrap();
+        assert_eq!(store.mailbox_faults_for(&subjects, first_cut).unwrap(),
+            BTreeMap::from([(subject.into(), "first loss".into())]));
+        store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "operational.recovered".into(),
+            actor: Some("daemon/runtime".into()),
+            fields: serde_json::from_value(json!({"failure":first.id, "reason":"replay consumed"})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        assert!(store.mailbox_faults_for(&subjects, store.index().unwrap()).unwrap().is_empty());
+        assert_eq!(store.mailbox_faults_for(&subjects, first_cut).unwrap()[subject], "first loss");
+        failure("second loss");
+        let second_cut = store.index().unwrap();
+        assert_eq!(store.mailbox_faults_for(&subjects, second_cut).unwrap()[subject], "second loss",
+            "an old recovery must not quiet a new interruption");
+        crate::mailbox::tests::ready(&store, "replacement");
+        assert!(store.mailbox_faults_for(&subjects, store.index().unwrap()).unwrap().is_empty());
+        assert_eq!(store.mailbox_faults_for(&subjects, second_cut).unwrap()[subject], "second loss");
+        assert!(store.mailbox_faults_for(&[], second_cut).unwrap().is_empty());
+        let before = store.index().unwrap();
+        let budget = smallclaims::read_budget::ReadBudget::new("expired-card-cut", std::time::Duration::ZERO);
+        assert!(smallclaims::read_budget::with(Some(budget), ||
+            store.mailbox_faults_for(&subjects, second_cut)).is_err());
+        assert_eq!(store.index().unwrap(), before, "failure cannot backfill or return a partial fault map");
+    }
+
+    #[test]
     fn live_duplicates_and_pid_reuse_cannot_replace_or_receive_the_lease() {
         let store = fixture();
         let authority = authority(1);
@@ -1143,51 +1183,59 @@ impl Store {
         subjects: &[String],
         index: u64,
     ) -> Result<BTreeMap<String, String>> {
-        let connection = self.readers.get();
-        let mut faults = BTreeMap::new();
-        for subject in subjects {
-            let latest: Option<(String, String)> = connection.prepare_cached(&canonical_sql(
-                "SELECT id,body FROM claims WHERE subject=?1 AND kind='operational.failure'
-                 AND store_index<=?2 AND json_extract(body,'$.fields.condition')='mailbox-channel-lost'
-                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-            ))?.query_row(params![subject,index], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
-            let Some((claim, body)) = latest else {
-                continue;
-            };
-            let resolved: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='operational.recovered'
-                 AND store_index<=?2 AND json_extract(body,'$.fields.failure')=?3)",
-                params![subject,index,claim], |row| row.get(0),
-            )?;
-            if !resolved {
-                let body: Value = serde_json::from_str(&body)?;
-                // Faults do not survive genuine runtime replacement on the current card.
-                let runtime: Option<String> = connection
-                    .prepare_cached(&format!(
-                        "{} LIMIT 1",
-                        newest_claims_of_kind_query("claims.body", "runtime.observed"),
-                    ))?
-                    .query_row(params![subject, index], |row| row.get(0))
-                    .optional()?;
-                let runtime: Value = runtime
-                    .map(|body| serde_json::from_str(&body))
-                    .transpose()?
-                    .unwrap_or(Value::Null);
+        if subjects.is_empty() { return Ok(BTreeMap::new()); }
+        // One captured statement, rather than up to three round trips per actor. This
+        // local query bound also applies to non-HTTP captures and never extends a parent.
+        let duration = std::time::Duration::from_millis(25);
+        let budget = smallclaims::read_budget::current().map_or_else(
+            || smallclaims::read_budget::ReadBudget::new("mailbox/card-faults", duration),
+            |parent| parent.child(duration),
+        );
+        smallclaims::read_budget::with(Some(budget), || {
+            let connection = self.readers.get();
+            let query = canonical_sql(
+                "WITH selected(subject) AS (SELECT DISTINCT value FROM json_each(?1)),
+                 failures AS MATERIALIZED (
+                   SELECT subject, (SELECT id FROM claims INDEXED BY claims_subject_kind_accepted_index
+                     WHERE claims.subject=selected.subject AND kind='operational.failure'
+                     AND +store_index<=?2
+                     AND json_extract(body,'$.fields.condition')='mailbox-channel-lost'
+                     ORDER BY CANONICAL_DESC(claims) LIMIT 1) AS failure FROM selected
+                 ), unresolved AS MATERIALIZED (
+                   SELECT subject,failure FROM failures WHERE failure IS NOT NULL
+                   AND NOT EXISTS(SELECT 1 FROM claims INDEXED BY claims_subject_kind_index
+                     WHERE claims.subject=failures.subject AND kind='operational.recovered'
+                     AND store_index<=?2 AND json_extract(body,'$.fields.failure')=failures.failure)
+                 )
+                 SELECT unresolved.subject, fault.body,
+                   (SELECT body FROM claims INDEXED BY claims_subject_kind_accepted_index
+                    WHERE claims.subject=unresolved.subject AND kind='runtime.observed'
+                    AND +store_index<=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1)
+                 FROM unresolved JOIN claims fault ON fault.id=unresolved.failure",
+            );
+            let mut statement = connection.prepare_cached(&query)?;
+            let rows = statement.query_map(params![serde_json::to_string(subjects)?, index], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+            })?;
+            let mut faults = BTreeMap::new();
+            for row in rows {
+                smallclaims::read_budget::check()?;
+                let (subject, fault, runtime) = row?;
+                let body: Value = serde_json::from_str(&fault)?;
+                let runtime: Value = runtime.map(|body| serde_json::from_str(&body))
+                    .transpose()?.unwrap_or(Value::Null);
                 let fields = runtime.get("fields").unwrap_or(&runtime);
+                // A fault's exact runtime must still be the running one at this same cut.
                 if fields["status"] == "running"
                     && fields["incarnation_id"] == body["fields"]["incarnation"]
                 {
-                    faults.insert(
-                        subject.clone(),
-                        body["fields"]["reason"]
-                            .as_str()
-                            .unwrap_or("mailbox channel lost")
-                            .into(),
-                    );
+                    faults.insert(subject, body["fields"]["reason"].as_str()
+                        .unwrap_or("mailbox channel lost").into());
                 }
             }
-        }
-        Ok(faults)
+            smallclaims::read_budget::check()?;
+            Ok(faults)
+        })
     }
 
     pub(crate) fn owns_mailbox_lease(

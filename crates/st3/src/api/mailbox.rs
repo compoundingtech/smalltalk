@@ -204,6 +204,9 @@ type Snapshot = (
     Vec<crate::model::MessageView>,
 );
 
+type MaintenanceIds = std::collections::BTreeSet<String>;
+type SnapshotUpdate = (crate::store::MailboxWatermark, Snapshot, bool, MaintenanceIds);
+
 /// Recover only recent mail which has never been offered. A prior staging claim is
 /// already an offer attempt, even when its delivered receipt has not arrived yet.
 fn never_offered(store: &Store, message: &crate::model::MessageView) -> anyhow::Result<bool> {
@@ -307,9 +310,7 @@ fn raw_snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
 #[cfg(test)]
 fn snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
     let (seat, mut messages) = raw_snapshot(store, binding)?;
-    if filter_messages(store, binding, &mut messages, &mut Default::default())? {
-        store.close_own_post_wakes(&binding.subject)?;
-    }
+    let _ = filter_messages(store, binding, &mut messages, &mut Default::default())?;
     Ok((seat, messages))
 }
 
@@ -319,9 +320,9 @@ fn filter_messages(
     binding: &Fence,
     messages: &mut Vec<crate::model::MessageView>,
     policy_rechecks: &mut std::collections::BTreeSet<String>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<MaintenanceIds> {
     let mut allowed = Vec::new();
-    let mut close_own = false;
+    let mut close_own = std::collections::BTreeSet::new();
     for message in messages.drain(..) {
         if message.to != binding.subject
             || !matches!(message.status.as_str(), "sent" | "staged" | "delivered")
@@ -343,7 +344,7 @@ fn filter_messages(
             if store.github_post_agent(&locator, &kind, id)?.as_deref()
                 == Some(binding.subject.as_str())
             {
-                close_own = true;
+                close_own.insert(message.subject.clone());
                 policy_rechecks.remove(&message.subject);
                 continue;
             }
@@ -369,12 +370,12 @@ fn update_snapshot<F>(
     floor: (u128, u64),
     admitted: &mut std::collections::BTreeSet<String>,
     policy_rechecks: &mut std::collections::BTreeSet<String>,
-) -> anyhow::Result<(crate::store::MailboxWatermark, Snapshot, bool)>
+) -> anyhow::Result<SnapshotUpdate>
 where
     F: FnOnce(&Store, &Fence) -> anyhow::Result<Snapshot>,
 {
     let (since, through) = floor;
-    let mut close_own = false;
+    let mut close_own = std::collections::BTreeSet::new();
     let result = store.read_snapshot(|_| {
         let (mark, seat, mut messages) = if let Some((mark, (mut seat, mut messages))) = previous {
             let changes = store.mailbox_changes(binding, &mark, &messages)?;
@@ -408,7 +409,7 @@ where
                         Some(through),
                         &mut admitted.clone(),
                     )?;
-                    close_own |= filter_messages(store, binding, &mut changed, policy_rechecks)?;
+                    close_own.extend(filter_messages(store, binding, &mut changed, policy_rechecks)?);
                     retain_live_mail(store, &mut changed, since, Some(through), admitted)?;
                     if serde_json::to_value(old)? != serde_json::to_value(changed.first())? {
                         messages.retain(|message| message.subject != subject);
@@ -430,7 +431,7 @@ where
         };
         policy_rechecks.clear();
         // Policy rechecks retain only identities eligible for this connection. The full
-        // snapshot still applies its original filtering/close side effects before recovery.
+        // snapshot applies the same filtering and only captures maintenance identities.
         let mut eligible = messages.clone();
         retain_live_mail(
             store,
@@ -443,17 +444,41 @@ where
             .into_iter()
             .map(|message| message.subject)
             .collect::<std::collections::BTreeSet<_>>();
-        close_own |= filter_messages(store, binding, &mut messages, policy_rechecks)?;
+        close_own.extend(filter_messages(store, binding, &mut messages, policy_rechecks)?);
         policy_rechecks.retain(|subject| eligible.contains(subject));
         retain_live_mail(store, &mut messages, since, Some(through), admitted)?;
         Ok((mark, (seat, messages), true))
     });
-    // Policy reads may request automatic closures, but the writer must never run under the
-    // pinned reader. Those commits remain beyond `mark` and are captured by the next delta.
-    if result.is_ok() && close_own {
-        store.close_own_post_wakes(&binding.subject)?;
-    }
-    result
+    // Reading never commits a closure or builds persistent derived state. The background
+    // reactor revalidates these identities separately; its commits follow this read's cut.
+    result.map(|(mark, snapshot, changed)| (mark, snapshot, changed, close_own))
+}
+
+/// Bounded maintenance for a connection's own-post identities, independent of socket reads.
+/// One claim finishes (including COMMIT) before another starts; no reader spans the writer.
+fn own_post_reactor(state: &AppState, fence: &Fence) -> tokio::sync::mpsc::Sender<String> {
+    let (sender, mut pending) = tokio::sync::mpsc::channel::<String>(64);
+    let state = state.clone();
+    let fence = fence.clone();
+    tokio::spawn(async move {
+        while let Some(subject) = pending.recv().await {
+            let store = state.store.clone();
+            let binding = fence.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                store.close_mailbox_own_post_wake(&binding, &subject)
+            }).await;
+            match result {
+                Ok(Ok(true)) => signal_local_change(&state),
+                Ok(Ok(false)) => {},
+                // A changed message or retired connection cannot authorize maintenance.
+                // Durable notifications/timer rechecks handle later eligible identities.
+                Ok(Err(error)) => eprintln!("st3: mailbox own-post maintenance refused: {error}"),
+                Err(_) => return,
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    sender
 }
 
 /// Maximum gap between durable change checks, including when a notification is missed.
@@ -613,6 +638,7 @@ async fn stream_with_timers_inner<F, S, H>(
     let mut replay_proven = false;
     let mut recovered = std::collections::BTreeSet::new();
     let mut policy_rechecks = std::collections::BTreeSet::new();
+    let own_posts = own_post_reactor(&state, &fence);
     let mut dirty = true;
     let mut last: Option<(crate::store::MailboxWatermark, Snapshot)> = None;
     loop {
@@ -633,25 +659,25 @@ async fn stream_with_timers_inner<F, S, H>(
             let mut admitted = recovered.clone();
             let mut policies = policy_rechecks.clone();
             let mut previous = last.take();
-            let repair_state = state.clone();
-            let repair_peer = peer.clone();
+            // This watch actor owns reconnection control. Finish that explicit command
+            // before entering the read worker; snapshots never perform lease/fault writes.
+            let repaired = if let Some(peer) = peer.clone() {
+                let repair_state = state.clone();
+                let repair_fence = fence.clone();
+                match tokio::task::spawn_blocking(move || {
+                    if repair_state.store.check_mailbox(&repair_fence).is_ok() { return false; }
+                    let _ = authority::loss_if_current(&repair_state, &repair_fence, &peer);
+                    matches!(authority::with_authority(&repair_state, &repair_fence, &peer, |owner, validate| {
+                        repair_state.store.repair_mailbox_checked(&repair_fence, owner, validate)
+                    }), Ok(true))
+                }).await {
+                    Ok(repaired) => repaired,
+                    Err(_) => return,
+                }
+            } else { false };
+            if repaired { previous = None; }
             let result = crate::api::read_deadline::spawn_blocking(move || {
                 crate::profile::task("task mailbox-update", || {
-                    let mut repaired = false;
-                    if let Some(peer) = &repair_peer
-                        && store.check_mailbox(&binding).is_err()
-                    {
-                        let _ = authority::loss_if_current(&repair_state, &binding, peer);
-                        let repair = authority::with_authority(&repair_state, &binding, peer, |owner, validate| {
-                            store.repair_mailbox_checked(&binding, owner, validate)
-                        });
-                        if matches!(repair, Ok(true)) {
-                            repaired = true;
-                            // Keep the original connection admission floor and stable mail keys.
-                            // Rebuild only the durable snapshot after canonical lease restoration.
-                            previous = None;
-                        }
-                    }
                     let result = update_snapshot(
                         &store,
                         &binding,
@@ -661,12 +687,12 @@ async fn stream_with_timers_inner<F, S, H>(
                         &mut admitted,
                         &mut policies,
                     );
-                    (result, admitted, policies, repaired)
+                    (result, admitted, policies)
                 })
             })
             .await;
-            let (mark, (seat, mut messages), updated) = match result {
-                Ok((Ok(snapshot), admitted, policies, repaired)) => {
+            let (mark, (seat, mut messages), updated, closures) = match result {
+                Ok((Ok(snapshot), admitted, policies)) => {
                     if repaired {
                         previous_mailbox.clear();
                         replay_nonce = Fence::new(&fence.subject, &fence.incarnation, "replay").token;
@@ -677,7 +703,7 @@ async fn stream_with_timers_inner<F, S, H>(
                     policy_rechecks = policies;
                     snapshot
                 }
-                Ok((Err(error), _, _, _)) => {
+                Ok((Err(error), _, _)) => {
                     if error
                         .downcast_ref::<St3Error>()
                         .is_some_and(|error| error.code == "stale-mailbox-session")
@@ -694,6 +720,13 @@ async fn stream_with_timers_inner<F, S, H>(
                 }
                 Err(_) => return,
             };
+            for subject in closures {
+                if let Err(error) = own_posts.try_send(subject) {
+                    // A full bounded queue never blocks delivery or loses its maintenance
+                    // identity: the normal safety tick will reconsider the held subject.
+                    policy_rechecks.insert(error.into_inner());
+                }
+            }
             if !updated {
                 last = Some((mark, (seat, messages)));
                 dirty = false;
@@ -2529,7 +2562,7 @@ mod tests {
         );
         let mut admitted = Default::default();
         let mut policies = Default::default();
-        let (mark, view, _) = update_snapshot(
+        let (mark, view, _, _) = update_snapshot(
             &store,
             &fence,
             read,
@@ -2567,7 +2600,7 @@ mod tests {
             .unwrap();
         let committed = store.index().unwrap();
         store.committed_index.store(previous_committed, Ordering::Release);
-        let (mark, view, _) = update_snapshot(
+        let (mark, view, _, _) = update_snapshot(
             &store,
             &fence,
             read,
@@ -2588,7 +2621,7 @@ mod tests {
             "resync must include commits beyond the atomic"
         );
         store.committed_index.store(committed, Ordering::Release);
-        let (_, view, updated) = update_snapshot(
+        let (_, view, updated, _) = update_snapshot(
             &store,
             &fence,
             read,
@@ -2619,7 +2652,7 @@ mod tests {
         let through = store.index().unwrap();
         let mut admitted = std::collections::BTreeSet::new();
         let mut policies = std::collections::BTreeSet::new();
-        let (mark, view, _) = update_snapshot(
+        let (mark, view, _, _) = update_snapshot(
             &store,
             &fence,
             read,
@@ -2677,7 +2710,7 @@ mod tests {
                     "",
                 );
             }
-            let (mark, view, updated) = update_snapshot(
+            let (mark, view, updated, _) = update_snapshot(
                 &store,
                 &fence,
                 read,
@@ -2698,7 +2731,7 @@ mod tests {
         }
         // An idle cursor check performs no full read and produces no mailbox frame.
         for _ in 0..4 {
-            let (mark, view, updated) = update_snapshot(
+            let (mark, view, updated, _) = update_snapshot(
                 &store,
                 &fence,
                 read,
@@ -2713,7 +2746,7 @@ mod tests {
         }
         // Unrelated graph traffic advances the cursor without reconstructing this mailbox.
         append("message/unrelated", "sent", "agent/other");
-        let (mark, view, updated) = update_snapshot(
+        let (mark, view, updated, _) = update_snapshot(
             &store,
             &fence,
             read,
@@ -2741,7 +2774,7 @@ mod tests {
                 idempotency_key: Some("seat-refresh".into()),
             })
             .unwrap();
-        let (_, view, updated) = update_snapshot(
+        let (_, view, updated, _) = update_snapshot(
             &store,
             &fence,
             read,
@@ -2805,7 +2838,7 @@ mod tests {
         };
         let mut admitted = Default::default();
         let mut policies = Default::default();
-        let (mark, view, _) = update_snapshot(
+        let (mark, view, _, _) = update_snapshot(
             &store,
             &fence,
             read,
@@ -2820,7 +2853,7 @@ mod tests {
         let index = store.index().unwrap();
         drop(post);
         assert_eq!(store.index().unwrap(), index);
-        let (mark, view, updated) = update_snapshot(
+        let (mark, view, updated, _) = update_snapshot(
             &store,
             &fence,
             read,
@@ -2832,7 +2865,7 @@ mod tests {
         .unwrap();
         assert!(updated);
         assert_eq!(view.1.len(), 1);
-        let (_, view, updated) = update_snapshot(
+        let (_, view, updated, _) = update_snapshot(
             &store,
             &fence,
             read,
@@ -2852,7 +2885,7 @@ mod tests {
     }
 
     #[test]
-    fn an_own_post_wake_closes_after_the_pinned_read_without_a_receipt() {
+    fn an_own_post_read_is_pure_and_background_closure_has_no_receipt() {
         let store = Store::open_memory("node").unwrap();
         crate::mailbox::tests::ready(&store, "session-1");
         let fence = store
@@ -2869,8 +2902,7 @@ mod tests {
                 "fixture",
             )
             .unwrap();
-        store
-            .append_claim(&ClaimInput {
+        let mut wake = ClaimInput {
                 subject: "message/own-post".into(),
                 kind: "message.sent".into(),
                 actor: Some("daemon/runtime".into()),
@@ -2890,12 +2922,13 @@ mod tests {
                 evidence: vec![],
                 expected_subject: None,
                 idempotency_key: None,
-            })
-            .unwrap();
+            };
+        store.append_claim(&wake).unwrap();
         let floor = (client_now_ms(), store.index().unwrap());
         let mut admitted = Default::default();
         let mut policies = Default::default();
-        let (_, view, _) = update_snapshot(
+        let before = store.index().unwrap();
+        let (_, view, _, closures) = update_snapshot(
             &store,
             &fence,
             raw_snapshot,
@@ -2906,10 +2939,11 @@ mod tests {
         )
         .unwrap();
         assert!(view.1.is_empty());
-        assert_eq!(
-            store.message("message/own-post").unwrap().unwrap().status,
-            "closed"
-        );
+        assert_eq!(store.index().unwrap(), before, "a mailbox read must not write");
+        assert_eq!(store.message("message/own-post").unwrap().unwrap().status, "sent");
+        assert_eq!(closures, std::collections::BTreeSet::from(["message/own-post".into()]));
+        assert!(store.close_mailbox_own_post_wake(&fence, "message/own-post").unwrap());
+        assert_eq!(store.message("message/own-post").unwrap().unwrap().status, "closed");
         assert_eq!(
             store
                 .claims_for("message/own-post", Some("message.closed"))
@@ -2923,6 +2957,19 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // A queued identity cannot let a superseded channel close a successor's mailbox.
+        wake.subject = "message/own-post-after-takeover".into();
+        store.append_claim(&wake).unwrap();
+        let successor = store.bind_mailbox(&Fence::new(
+            &fence.subject, &fence.incarnation, "delivery",
+        )).unwrap();
+        let before = store.index().unwrap();
+        assert_eq!(store.close_mailbox_own_post_wake(&fence, &wake.subject).unwrap_err().code,
+            "stale-mailbox-session");
+        assert_eq!(store.index().unwrap(), before);
+        assert_eq!(store.message(&wake.subject).unwrap().unwrap().status, "sent");
+        assert!(store.close_mailbox_own_post_wake(&successor, &wake.subject).unwrap());
+
     }
 
     #[tokio::test]
