@@ -143,7 +143,14 @@ async fn checkpoint_tombstones_do_not_starve_later_live_ranges() {
     }
 
     let state = PeerState {
-        backend: Local(right.clone()),
+        // This backend predates modern-only export: its default export_modern method
+        // still sends the exact legacy graph digest even though it knows projection digests.
+        backend: SlowExport {
+            local: Local(right.clone()),
+            slow: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_next: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            receives: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        },
         node: right.origin.clone(),
         auth: auth.clone(),
         fleet: FleetContext::legacy(BTreeSet::from([left.origin.clone()])),
@@ -213,7 +220,7 @@ async fn checkpoint_tombstones_do_not_starve_later_live_ranges() {
         );
         assert!(
             requests.windows(2).any(|pair| pair[0].3 && !pair[1].3),
-            "a peer without projection digests must receive an exact legacy retry"
+            "a peer without modern-only support must receive an exact legacy retry: {requests:?}"
         );
     }
     for store in [&left, &right] {
