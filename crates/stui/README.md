@@ -58,3 +58,19 @@ QA scripts need a live daemon and the `pty` executable: one opens an agent from 
 it and drags to copy; the other attaches the agent's terminal and leaves it by `Ctrl+\` and by a
 click on its header. Use a person of their own (such as `person/<qa-name>`) so they mark nothing
 read for anyone.
+
+Setup callers can opt into a fresh shell with
+`Args::default().with_setup_command("printf setup-ready")?`. This programmatic entry point
+stages a nonempty command with no control characters; it never adds Enter. It waits for the
+live space and native terminal attachment, and navigation while either is pending cancels
+prefill. The command is consumed once and never repeated on reconnect. Paired-device clients
+ignore this entry point. Setup fact discovery and Home checklist rows are separate upstream work.
+
+The fixture exercises the real library, an isolated daemon, and a real shell. It checks the
+rendered command, an unchanged sentinel while idle, execution only after Enter, and terminal
+restoration after leaving the shell with Ctrl+\ and quitting with Ctrl+Q:
+
+```sh
+cargo build -p stui --example setup_terminal -j2
+python3 scripts/tests/test-setup-terminal.py target/debug/examples/setup_terminal target/debug/st3 "$(command -v pty)"
+```
