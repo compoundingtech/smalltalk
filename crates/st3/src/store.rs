@@ -140,6 +140,7 @@ pub(crate) mod client_summary;
 mod unread_mail;
 mod agent_messages;
 pub mod agent_view;
+pub(crate) mod collection_reactor;
 mod conversation_reads;
 mod runtime;
 #[cfg(test)]
@@ -2660,6 +2661,27 @@ impl Store {
         self.smalltalk.ivm_views.clone()
     }
 
+    pub(crate) fn collection_sources(&self) -> Option<Arc<collection_reactor::Registry>> {
+        self.smalltalk.collection_sources.clone()
+    }
+
+    #[allow(dead_code)] // Installed source factories consume this explicit shared owner.
+    pub(crate) fn ivm_installer(&self) -> Option<Arc<smallclaims::ivm::install::Installer>> {
+        self.collection_sources().map(|registry| registry.cx.installer.clone())
+    }
+
+    /// Start one bounded scheduler after explicit source installation. Readers never start
+    /// a reactor or wait for it. Its observer and task have the Store's lifetime.
+    #[allow(dead_code)] // Sources start this only after their explicit installation.
+    pub(crate) fn start_collection_reactor(self: &Arc<Self>) -> Result<bool> {
+        let Some(registry) = self.collection_sources() else { return Ok(false); };
+        let mut held = self.smalltalk.collection_reactor.lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if held.is_some() { return Ok(false); }
+        *held = Some(collection_reactor::Reactor::start(self, registry)?);
+        Ok(true)
+    }
+
     /// Lazily attach the one Store publisher shared by receipt waits and collection
     /// consumers. Registration and journal installation happen when the Store opens.
     /// Attachment errors are returned on each call until attachment succeeds; failures
@@ -2702,6 +2724,22 @@ impl Store {
     ) -> Result<Self> {
         let smalltalk = Arc::new(SmalltalkRuntime::with_ivm_views(views));
         let graph = GraphStore::open(path, origin, smalltalk.clone())?;
+        Ok(Self { graph, smalltalk })
+    }
+
+    /// Explicit independent native sources beside the existing authority runtime. Each
+    /// source owns bounded installation and coverage; registration does not make rows Ready.
+    #[allow(dead_code)] // Default production registration follows the independent sources.
+    pub(crate) fn open_with_collection_sources(
+        path: &Path,
+        origin: impl Into<String>,
+        sources: Vec<Arc<dyn collection_reactor::Source>>,
+    ) -> Result<Self> {
+        let origin = origin.into();
+        let registry = collection_reactor::Registry::new(origin.clone(), sources)?;
+        let smalltalk = Arc::new(SmalltalkRuntime::with_collection_sources(registry.clone()));
+        let graph = GraphStore::open(path, origin, smalltalk.clone())?;
+        registry.install_hooks(&graph.connection)?;
         Ok(Self { graph, smalltalk })
     }
 

@@ -7,6 +7,7 @@ use smallclaims::ivm::{Readiness, events};
 use std::cell::RefCell;
 
 type Window = (ClientSnapshot, Vec<Value>, bool);
+type CoverageReader = dyn Fn(&rusqlite::Connection) -> anyhow::Result<bool> + Send + Sync;
 type RowReader = dyn Fn(
         &AppState,
         &ClientSession,
@@ -20,6 +21,8 @@ type RowReader = dyn Fn(
     + Sync;
 
 pub(super) struct Adapter {
+    /// Independent source-owner coverage, checked even when no key changed.
+    pub(super) coverage: Arc<CoverageReader>,
     pub(super) view: &'static str,
     // Keys are hints, never proof that other retained rows are current. The adapter
     // selects bounded authorized IDs first and verifies every reused row's generation
@@ -157,6 +160,8 @@ pub(super) async fn read(
                 let cut = smallclaims::ivm::source_cut(connection)?;
                 anyhow::ensure!(cut.is_some_and(|cut|cut.admitted == index),
                     "collection source admission coverage is pending");
+                anyhow::ensure!((adapter.coverage)(connection)?,
+                    "collection native source coverage is pending");
                 Ok(())
             }
             Err(error) => {
@@ -406,6 +411,7 @@ mod tests {
         let rows = Arc::new(AtomicUsize::new(0));
         let observed = rows.clone();
         let adapter = Arc::new(Adapter {
+            coverage: Arc::new(|_| Ok(true)),
             view: "fixture.socket",
             rows: Arc::new(move |_, session, request, conn, _, _, _| {
                 rows.fetch_add(1, Ordering::SeqCst);
@@ -552,6 +558,58 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn native_coverage_gap_refuses_a_silent_page_without_reading_rows() {
+        use std::sync::atomic::AtomicBool;
+        let root = tempfile::tempdir().unwrap();
+        let views = Arc::new(Views::new(vec![Box::new(FixtureView)]).unwrap());
+        let mut state = super::super::tests::test_state_named(root.path(), "alder");
+        state.store = Arc::new(Store::open_with_ivm_views(
+            &root.path().join("ivm.db"), "alder", views.clone(),
+        ).unwrap());
+        replace(&state.store, &views, "row/a", 1, Some("a1"));
+        let covered = Arc::new(AtomicBool::new(true));
+        let coverage = covered.clone();
+        let count = Arc::new(AtomicUsize::new(0));
+        let rows = count.clone();
+        let adapter = Arc::new(Adapter {
+            view: "fixture.socket",
+            coverage: Arc::new(move |_| Ok(coverage.load(Ordering::SeqCst))),
+            rows: Arc::new(move |_, _, _, _, _, _, _| {
+                rows.fetch_add(1, Ordering::SeqCst);
+                Ok((vec![json!({"id":"row/a","value":"a1"})], false))
+            }),
+        });
+        let sources = Sources::from_store(state.store.clone(),
+            BTreeMap::from([("work".into(), adapter.clone())])).unwrap().unwrap();
+        let request: CollectionSubscribe = serde_json::from_value(
+            json!({"kind":"subscribe","id":"held","collection":"work"}),
+        ).unwrap();
+        let session = ClientSession::local(Some("person/avery")).unwrap();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let initial = read(state.clone(), session.clone(), request.clone(),
+            slots.clone().acquire_owned().await.unwrap(), sources.clone(), adapter.clone(),
+            Held::default()).await.unwrap();
+        assert!(matches!(initial.output, Output::Window(_)));
+        let cursor = initial.delivered.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        // Registry and graph prefix are unchanged and Ready. Only the source owner's
+        // independent native coverage now refuses this cut, which has no changed keys.
+        covered.store(false, Ordering::SeqCst);
+        let refused = read(state.clone(), session.clone(), request.clone(),
+            slots.clone().acquire_owned().await.unwrap(), sources.clone(), adapter.clone(),
+            Held { cursor: Some(cursor.clone()), rows: Arc::new(BTreeMap::new()) }).await;
+        assert!(refused.is_err(), "a silent cut must not acknowledge uncovered native state");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        covered.store(true, Ordering::SeqCst);
+        let restored = read(state, session, request, slots.acquire_owned().await.unwrap(),
+            sources, adapter, Held { cursor: Some(cursor), rows: Arc::new(BTreeMap::new()) })
+            .await.unwrap();
+        assert!(matches!(restored.output, Output::Silent));
+        assert!(restored.delivered.is_some());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn source_admission_gap_and_person_refusal_never_read_rows() {
         let root = tempfile::tempdir().unwrap();
         let views = Arc::new(Views::new(vec![Box::new(FixtureView)]).unwrap());
@@ -563,6 +621,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let rows = count.clone();
         let adapter = Arc::new(Adapter {
+            coverage: Arc::new(|_| Ok(true)),
             view: "fixture.socket",
             rows: Arc::new(move |_, _, _, _, _, _, _| {
                 rows.fetch_add(1, Ordering::SeqCst);
