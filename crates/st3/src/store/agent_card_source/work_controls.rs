@@ -30,6 +30,11 @@ fn counted_clock_spends_one_shared_page_and_rollback_restores_work() {
         .unwrap();
     assert_eq!(first.namespace, ns);
     assert_eq!(first.used, WORK);
+    let pending = diagnostic(&tx, &ns).unwrap();
+    assert_eq!(pending["card_pending"], true);
+    assert_eq!(pending["authority"]["closed"], true);
+    assert_eq!(pending["lifecycle"]["closed"], true);
+    assert_eq!(pending["launch"]["closed"], true);
     let stamp = first.clock.unwrap();
     let row = clock.new.as_ref().unwrap();
     assert_eq!(stamp.revision, row["revision"].as_u64().unwrap());
@@ -59,6 +64,7 @@ fn counted_clock_spends_one_shared_page_and_rollback_restores_work() {
         tx.commit().unwrap();
     }
     assert!(!card_work(&writer, &ns).unwrap());
+    assert_eq!(diagnostic(&writer, &ns).unwrap()["card_pending"], false);
     assert!(
         kernel
             .apply_with_work(&writer.transaction().unwrap(), &ns, &[])

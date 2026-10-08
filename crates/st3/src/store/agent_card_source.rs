@@ -1474,6 +1474,40 @@ pub(crate) fn certify_coverage_for_source(
     Ok(())
 }
 
+/// Fixture-only closure diagnostics for a genuine Installer namespace. These checks expose
+/// the existing fences; they neither reconstruct namespace identities nor certify coverage.
+#[cfg(test)]
+pub(crate) fn diagnostic(c: &Connection, ns: &Namespace) -> Result<Value> {
+    fn state(result: Result<bool>) -> Value {
+        match result {
+            Ok(closed) => json!({"closed":closed}),
+            Err(error) => json!({"error":error.to_string()}),
+        }
+    }
+    let at = current_at(c, ns)?;
+    let local_cut: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_agent_card_source_local_cut WHERE namespace=?1)",
+        [ns.as_str()],
+        |r| r.get(0),
+    )?;
+    let other_work: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_agent_card_source_work WHERE namespace=?1 AND kind<>'card')",
+        [ns.as_str()], |r| r.get(0),
+    )?;
+    Ok(json!({
+        "at":at.to_string(), "snapshot_index":captured_index(c,ns)?,
+        "shadow":state(shadow::clean(c,ns)),
+        "base":state(agent_card_base::clean(c,ns)),
+        "usage":state(agent_card_usage::clean(c,ns)),
+        "queue":state(agent_queue::clean(c,ns,at)),
+        "authority":state(agent_authority_ivm::ensure_closed(c,ns).map(|_|true)),
+        "lifecycle":state(agent_card_lifecycle::ensure_closed(c,ns).map(|_|true)),
+        "launch":state(agent_card_launch::ensure_closed(c,ns).map(|_|true)),
+        "card_pending":card_work(c,ns)?, "other_work_pending":other_work,
+        "local_cut_pending":local_cut, "public_queue_pending":queue_public_pending(c,ns)?,
+    }))
+}
+
 fn reclaim_remaining(tx: &Transaction<'_>, ns: &Namespace, limit: usize) -> Result<bool> {
     const PAGES: &[&str] = &[
         "DELETE FROM local_agent_card_rows WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_rows WHERE namespace=?1 LIMIT ?2)",
