@@ -161,9 +161,6 @@ class Node:
         self.binary = binary_root / name / "bin/st3"
         self.binary.parent.mkdir(parents=True)
         shutil.copy2(binary, self.binary)
-        hostname = self.root / "bin/hostname"
-        hostname.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(name)}\n")
-        hostname.chmod(0o755)
         self.endpoint = self.root / "run/st3.sock"
         self.env = {**env, "HOME": str(self.root / "home"),
                     "XDG_STATE_HOME": str(self.root / "home/state"),
