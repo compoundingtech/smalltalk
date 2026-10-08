@@ -24,13 +24,12 @@ export function HomeScreen() {
   const refresh = useRefresh();
   const agentOf = (row: HomeRow) => [row.item.requester_id, row.item.source_id].find(id => id?.startsWith('agent/'));
   const rows = useMemo(() => homeRows(data.attention, caps?.session_actor), [data.attention, caps?.session_actor]);
-  // Start something, as stui's launcher does: an agent with its first message, or a shell.
+  // Start something, as stui's launcher does: a shell or a mission.
   useLayoutEffect(() => {
     navigation.setOptions({
       unstable_headerRightItems: () => [{
         type: 'menu', label: 'New', icon: { type: 'sfSymbol', name: 'plus' },
         menu: { items: [
-          { type: 'action', label: 'New agent', icon: { type: 'sfSymbol', name: 'person.badge.plus' }, onPress: () => navigation.navigate('NewAgent') },
           { type: 'action', label: 'New terminal', icon: { type: 'sfSymbol', name: 'terminal' }, onPress: () => void actions.createTerminal(randomName()).then(terminalId => { if (terminalId) navigation.navigate('Terminal', { terminalId, title: 'shell' }); }) },
           { type: 'action', label: 'New mission', icon: { type: 'sfSymbol', name: 'point.3.connected.trianglepath.dotted' }, onPress: () => navigation.navigate('NewMission') },
         ] },
@@ -113,7 +112,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
         <T><T bold color={theme[row.color]}>{row.glyph} {row.kind}</T><T dim>  {row.age} ago</T></T>
         <T bold selectable>{row.title}</T>
         {item.detail ? <Markdown text={item.detail} color={theme.subtext0} /> : null}
-        <T dim>This was closed elsewhere. It stays until you clear it.</T>
+        <T dim>This was closed. It stays under Recently closed until you clear it.</T>
         <Button label="clear from Home" onPress={() => { actions.clearClosed(item.id); navigation.goBack(); }} />
         <T dim selectable>{item.id}</T>
       </ScrollView>
@@ -132,7 +131,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
         {item.update.subjects?.map((subject, index) => subject.url
           ? <Pressable key={index} onPress={() => void Linking.openURL(subject.url!)}><T color={theme.accent}>↗ {subject.label}</T></Pressable>
           : <T key={index} dim>↗ {subject.label}  {subject.ref ?? ''}</T>)}
-        <T dim>{item.closedElsewhere ? 'This was closed elsewhere. It stays until you clear it.' : 'Nothing waits on this. It stays on Home until you mark it read.'}</T>
+        <T dim>{item.closedElsewhere ? 'This was closed. It stays under Recently closed until you clear it.' : 'Nothing waits on this. It stays on Home until you mark it read.'}</T>
         {item.closedElsewhere
           ? <Button label="clear from Home" onPress={() => { actions.clearClosed(item.id); navigation.goBack(); }} />
           : item.actions.includes('work.done') ? <Button label="mark read" disabled={busy || status !== 'online'} onPress={() => void actions.done(item, 'Read', 'read').then(done => { if (done) navigation.goBack(); })} /> : null}

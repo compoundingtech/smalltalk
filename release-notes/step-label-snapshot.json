@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Expose selected step labels on the caller's captured snapshot",
+  "replay": {"status": "none", "detail": "No source replay or backfill. The existing indexed selected-label query is shared."},
+  "schema": {"status": "none", "detail": "No tables, triggers, schema versions or view registrations."},
+  "rules": {"status": "none", "detail": "Existing raw label semantics and parse errors are preserved; labels grant no source or authority certificate."},
+  "compatibility": {"status": "none", "detail": "Public Store reader retains its batch behavior and fields. A new internal bounded accessor reuses an existing Connection."},
+  "downtime": {"status": "none", "detail": "No activation or restart requirement."},
+  "manual": {"status": "changed", "detail": "Consumers can compose labels in their existing authorized snapshot, after separately verifying complete source and card dependencies."},
+  "recovery": {"status": "none", "detail": "No derived state or recovery changes."}
+}

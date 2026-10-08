@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Home lists the latest five closed items under Recently closed in stui and the phone",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change. Only the stui and phone Home lists change."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to recover. Items closed while shown stay until cleared with x, and only the five latest stay listed."}
+}

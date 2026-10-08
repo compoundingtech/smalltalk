@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Fence backward source insertion without a frontier advance",
+  "replay": {
+    "status": "none",
+    "detail": "No automatic open/read/repair replay; explicit pages drain a captured delta queue."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Explicit asynchronous source capture refuses to certify inputs inserted behind its already applied prefix."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Canonical/admission/checkpoint rules unchanged. Unsupported rank/repair and local adapters fence or are refused."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Ordinary append/replication allocation remains unchanged; unsupported direct source insertion marks the opt-in async source unavailable."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No live restart or existing-store conversion."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No production activation or data migration."
+  },
+  "recovery": {
+    "status": "unknown",
+    "detail": "Quota overflow, capture loss, incompatible metadata and unsupported mutation require explicit recovery; no automatic rebuild. Production authority, checkpoint, retention and ordered operators remain gates."
+  }
+}

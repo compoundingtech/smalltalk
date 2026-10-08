@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Open authenticated raw PEEK directly and keep browser PEEK capabilities in memory, with zero durable PEEK claims",
+  "replay": { "status": "none", "detail": "Existing durable claims remain readable; PEEK issue/consume no longer append attachment or consumption claims. ATTACH claims are unchanged." },
+  "schema": { "status": "none", "detail": "No database migration or schema change." },
+  "rules": { "status": "none", "detail": "No checkpoint rule inputs change." },
+  "compatibility": { "status": "changed", "detail": "New Rust raw_terminal_peek returns the existing controlled stream on one authenticated upgrade. Browser PEEK keeps its capability API but capabilities are daemon-local, single-use and invalid after restart; reacquire outstanding PEEK capabilities on upgrade. The daemon bounds outstanding PEEK capabilities to 4096 and returns HTTP 429 rate-limited when full; expired entries are pruned on issuance and consumption. ATTACH is unchanged. Per-open authorization and revocable leases remain required." },
+  "downtime": { "status": "none", "detail": "Only normal daemon restart; active observation streams reconnect." },
+  "manual": { "status": "none", "detail": "No configuration changes. Native clients can adopt raw_terminal_peek after upgrading their SDK." },
+  "recovery": { "status": "none", "detail": "PEEK who-looked-when is observability data, not durable store audit. No database recovery changes." }
+}

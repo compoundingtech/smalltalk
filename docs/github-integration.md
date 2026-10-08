@@ -30,11 +30,35 @@ credential acquisition, caches the contents, and reloads when the mtime changes.
 replacement is detected even when the mtime is preserved. An unreadable, unsafe or malformed
 file fails authentication rather than selecting another source.
 
-`github.sekrets_profile` is reserved for the pending authorized-request gateway client.
-Setting it currently fails with an explicit unsupported-configuration error, before any
-file, environment or `gh` credential lookup. Setting it together with `github.token_file`
-is a configuration error. Configured gateway routing is not delivered by this change.
-With neither option set, the existing environment/CLI source precedence applies.
+## Gateway-authorized configuration
+
+To keep the GitHub token at the sekrets gateway, configure the daemon:
+
+```toml
+[github]
+sekrets_profile = "owner/daemon-gh"
+```
+
+Grant the profile to the daemon's node with the `github-api` preset (see
+[sekrets](st3/sekrets.md)). The gateway client reads the daemon or gate CLI's Config and
+existing node key; no initializer or token handoff is needed. Every daemon GitHub HTTP
+request uses the gateway's authorized-request operation, including GraphQL, pagination,
+conditional reads and comment/review mutations. The profile path never resolves local
+files, exported tokens or `gh auth token`; it never receives the profile token.
+
+A missing gateway, identity, grant or refused URL errors without selecting another source.
+The gateway authorizes only `https://api.github.com`, rejects a request's own Authorization,
+and adds the profile credential there. It follows no redirect and retries no request. The
+client runs off the async worker threads and returns the original status, headers and body,
+including 3xx, 401, ETag, Link, rate limits and Retry-After. HTTP errors remain responses;
+transport and policy errors remain failures. Request/response limits are 16 MiB/64 MiB,
+with the gateway's 60-second HTTP timeout. Local API overrides pointing elsewhere are
+refused in profile mode. The caller also rejects foreign origins, userinfo, non-default ports
+and an Authorization header before the RPC. It refuses streamed bodies and buffered request
+bodies above 16 MiB, and checks the 64 MiB response bound before constructing its HTTP response.
+
+Setting `github.sekrets_profile` together with `github.token_file` is a configuration error.
+With neither option set, the existing environment/CLI source precedence and cache apply.
 
 ## Daemon GitHub callers
 
@@ -52,6 +76,54 @@ REST listings follow GitHub's `Link` pagination. Conditional reads retain ETags 
 complete cached body and pagination link after a 304. Response status and rate-limit headers
 remain available to the caller. Credential invalidation changes future authentication;
 it does not retry any of these HTTP requests.
+
+## Main Performance failure messages
+
+A direct message subscription on `main_performance_failures` adds that field to an existing
+`github.repository` observer's scheduled request. No second observer or polling loop is needed:
+
+```kdl
+version 2
+subscription "main-performance-p0" {
+  observer "observer/github/acme/garden"
+  on "main_performance_failures"
+  to "agent/example/speed"
+  delivery "message"
+}
+```
+
+The existing observer and agent recipient must already be declared, and the observer must be
+live. This simple direct-message declaration supports standalone `st apply --dry-run` and
+`st apply --as RECIPIENT` when the declared agent recipient publishes as itself. An agent-bound
+client must publish as itself; another actor cannot subscribe the recipient. The public event field
+is limited to `main_performance_failures`, and an existing registration can only be re-registered
+by its original author with the same spec. This path cannot create an observer, start a mission, batch
+delivery or publish unrelated top-level runtime declarations. Publish only this subscription;
+leave existing declarations and owned sets intact. This narrow field reads workflow-run metadata for
+`perf.yml`, branch `main`, event `push`, then verifies the workflow name `Performance`, path
+`.github/workflows/perf.yml`, status `completed` and conclusion `failure`. Other events, branches,
+workflows, successes, cancellations and timeouts produce no P0 delivery. It fetches no logs or
+artifacts and never dispatches a workflow.
+
+Each message has a P0 title and tag, and JSON content with `priority`, `repository`, `run_id`,
+`run_attempt`, `head_sha`, `workflow`, `workflow_path`, `url` and the selected status/event/branch.
+One message names one failed run attempt. The first successful snapshot for each recipient and
+repository establishes a baseline without sending old failures, including when the first listing
+is empty. Later attempts and heads have separate delivery keys;
+metadata edits, repeated reads, restarts and replacement subscriptions to the same recipient do
+not send the same repository/run/attempt/head again. The repository ID keeps that identity across
+renames; a missing ID falls back to the name. Re-adding the field after an observation gap
+re-baselines the current listing and suppresses failures first observed during that gap.
+Baseline and delivery receipts are graph resources committed atomically with the observation and message, using existing checkpoint rules.
+
+This field uses the observer's normal schedule and conditional HTTP cache, including paginated
+304 reuse. It reads at most ten pages of 100 runs and fails rather than silently truncates a larger
+listing. The shared repository observation must succeed, including any other selected fields;
+an existing GraphQL or authentication failure prevents delivery. Deploy supporting daemon source
+before registration, then check the observer's successful field observation and message receipts.
+An installed subscription alone does not prove healthy delivery. Upgrade participating readers
+before enabling this field: older schemas quarantine the new fact field. Removing the subscription
+does not erase its historical claims for a later downgrade.
 
 ## Prepare finite review and triage work
 
