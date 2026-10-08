@@ -5908,7 +5908,8 @@ impl Store {
                  FROM replica_envelopes AS envelopes
                  WHERE envelopes.writer=?1 AND envelopes.sequence=?2 AND envelopes.envelope_hash=?3",
         )?;
-        let mut envelopes = Vec::with_capacity(missing.len());
+        // A byte-limited page may stop after one record even when the peer lacks thousands.
+        let mut envelopes = Vec::with_capacity(missing.len().min(16));
         let mut wire_bytes = 0usize;
         for identity in missing {
             if let Some(budget) = wire_budget {

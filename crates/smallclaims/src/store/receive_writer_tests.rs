@@ -101,6 +101,32 @@ fn export_payload_budget_counts_legacy_text_past_nul_and_utf8_escapes() {
     }
 }
 
+#[test]
+fn export_payload_page_sql_work_ignores_the_unfetched_tail() {
+    let measure = |count| {
+        let source = node("birch");
+        let target = node("cedar");
+        page(&source, &target, count);
+        let identities = source.replication_inventory().unwrap().envelopes;
+        let first = source.replica_envelopes(identities[..2].to_vec()).unwrap();
+        let first_wire = serde_json::to_vec(&first[0].payload).unwrap().len();
+        let second_wire = serde_json::to_vec(&first[1].payload).unwrap().len();
+        let before = crate::sqlite::work::total();
+        let selected = source
+            .replica_envelopes_with_wire_budget(identities, Some(first_wire + second_wire - 1))
+            .unwrap();
+        let work = crate::sqlite::work::total() - before;
+        assert_eq!(selected.len(), 1);
+        work
+    };
+    let small = measure(32);
+    let large = measure(256);
+    assert!(
+        large.vm_steps <= small.vm_steps + 100,
+        "export payload paging traversed the unfetched tail: small={small:?} large={large:?}"
+    );
+}
+
 /// The injected SQL cost represents a populated runtime's per-claim admission work. The
 /// queued write must commit before the remainder of the page, and its ACK has a 100ms CI
 /// budget (including scheduler/commit overhead), separately from production's 50ms p99.
