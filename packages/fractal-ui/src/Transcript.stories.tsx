@@ -21,7 +21,7 @@ function fixture(state: State, prefix: string): TranscriptStoryData {
   const running = state === 'streaming', failed = state === 'failed', interrupted = state === 'interrupted'
   const prompt: TextItem & { role: 'user' } = { _tag: 'Text', id: `${prefix}/prompt`, role: 'user', text: 'Keep the row projection readable and verify that selection survives the change.', attachments: [], streaming: false, at, sender: { kind: 'human', label: 'Operator' }, sendState: state === 'pending-send' ? { _tag: 'Pending' } : state === 'failed-send' ? { _tag: 'Failed', reason: 'Message was not delivered', detail: 'The connection dropped while sending. Your draft is still saved; try again in a moment.' } : undefined }
   const calls: ConversationItem[] = [
-    { _tag: 'ToolCall', id: `${prefix}/read`, callId: `${prefix}/read`, name: 'read', input: { path: 'src/rows.ts' }, status: 'success', result: { content: source, mediaType: 'text/typescript', isError: false, at: '2026-01-15T12:00:03Z' }, callSeen: true, at: '2026-01-15T12:00:01Z' },
+    { _tag: 'ToolCall', id: `${prefix}/read`, callId: `${prefix}/read`, name: 'read', input: { path: 'src/rows.ts' }, status: 'success', result: { content: source, mediaType: 'text/plain', isError: false, at: '2026-01-15T12:00:03Z' }, callSeen: true, at: '2026-01-15T12:00:01Z' },
     { _tag: 'ToolCall', id: `${prefix}/run`, callId: `${prefix}/run`, name: 'run', input: { command: 'pnpm test rows' }, status: failed ? 'error' : interrupted ? 'interrupted' : running ? 'running' : 'success', result: running ? undefined : { content: failed ? 'The row assertion did not match the observed selection.' : interrupted ? 'Stopped before the checks completed.' : '✓ selection retained\n✓ visible count matches\n✓ empty rows handled', mediaType: 'text/x-shellscript', isError: failed, at: '2026-01-15T12:00:18Z' }, callSeen: true, at: '2026-01-15T12:00:05Z' },
     { _tag: 'ToolCall', id: `${prefix}/empty`, callId: `${prefix}/empty`, name: 'read', input: { path: 'src/empty.ts' }, status: 'success', result: { content: '', isError: false, at: '2026-01-15T12:00:19Z' }, callSeen: true, at: '2026-01-15T12:00:19Z' },
   ]
@@ -68,6 +68,7 @@ export const Expanded: Story = { args: { state: 'expanded' }, play: async ({ can
   await userEvent.click(fold)
   await expect(fold).toHaveAttribute('aria-expanded', 'true')
   await expect(canvas.getByTestId('tool-preview-remaining')).toHaveTextContent('+2 lines')
+  await waitFor(() => expect(canvas.getByTestId('tool-detail-preview').querySelector('[data-syntax-token~="keyword"]')).not.toBeNull())
   await expect(canvas.getByTestId('work-log-divider')).toBeInTheDocument()
   await expect(canvas.getByRole('button', { name: 'Thinking' })).toHaveAttribute('aria-expanded', 'false')
   const empty = canvasElement.querySelector('[data-tool-status="success"]:last-child')!
@@ -92,6 +93,9 @@ export const Failed: Story = { args: { state: 'failed' }, play: async ({ canvasE
   const canvas = within(canvasElement)
   const notice = await canvas.findByRole('alert')
   await expect(notice).toHaveTextContent('Command did not complete')
+  await expect(canvas.getByTestId('transcript-turn')).toContainElement(notice)
+  await expect(canvas.getByTestId('transcript-scroll')).toContainElement(notice)
+  await expect(notice.closest('[data-error-overlay-layer]')).toBeNull()
   await userEvent.click(canvas.getByRole('button', { name: 'Open output' }))
   await expect(canvas.getByRole('region', { name: 'Opened tool detail' })).toHaveTextContent('assertion did not match')
   await userEvent.click(canvas.getByRole('button', { name: 'Dismiss: Command did not complete' }))
@@ -198,13 +202,61 @@ export const SendIdentity: Story = { render: args => <SendIdentityStory scheme={
   const selector = '[data-testid="user-message"][data-item-id="identity/prompt"]'
   await expect(await canvas.findByTestId('user-message')).toHaveAttribute('data-send-state', 'pending')
   const pending = canvasElement.querySelector(selector)
-  await userEvent.click(canvas.getByRole('button', { name: 'Deliver echo' }))
-  await waitFor(() => expect(canvasElement.querySelector(selector)).toHaveAttribute('data-send-state', 'sent'))
-  await expect(canvasElement.querySelector(selector)).toBe(pending)
-  await expect(canvasElement.querySelectorAll(selector)).toHaveLength(1)
-  await expect(canvasElement.querySelectorAll('[data-testid="user-message"]')).toHaveLength(1)
+  const fold = await canvas.findByRole('button', { name: /Worked for 24s/ })
+  await userEvent.click(fold)
+  await expect(fold).toHaveAttribute('aria-expanded', 'true')
+  const removed: Node[] = []
+  const recordRemovals = (records: MutationRecord[]) => {
+    for (const record of records) for (const node of record.removedNodes) {
+      if (node instanceof Element && (node.matches('[data-testid="user-message"], [data-testid="transcript-turn"]') || node.querySelector('[data-testid="user-message"], [data-testid="transcript-turn"]') !== null)) removed.push(node)
+    }
+  }
+  const observer = new MutationObserver(recordRemovals)
+  observer.observe(canvasElement, { subtree: true, childList: true })
+  try {
+    await userEvent.click(canvas.getByRole('button', { name: 'Deliver echo' }))
+    await waitFor(() => expect(canvasElement.querySelector(selector)).toHaveAttribute('data-send-state', 'sent'))
+    recordRemovals(observer.takeRecords())
+    await expect(removed).toHaveLength(0)
+    await expect(canvasElement.querySelector(selector)).toBe(pending)
+    await expect(canvas.getByRole('button', { name: /Worked for 24s/ })).toHaveAttribute('aria-expanded', 'true')
+    await expect(canvasElement.querySelectorAll(selector)).toHaveLength(1)
+    await expect(canvasElement.querySelectorAll('[data-testid="user-message"]')).toHaveLength(1)
+  } finally { observer.disconnect() }
 } }
 export const SendIdentityLight: Story = { ...SendIdentity, args: { scheme: 'light' } }
+const semanticItems: readonly ConversationItem[] = [
+  { _tag: 'Text', id: 'semantic/system', role: 'system', text: 'System context retained.', attachments: [], streaming: false, at },
+  { _tag: 'Notice', id: 'semantic/notice', kind: 'redaction', text: 'Notice content retained.', at },
+  { _tag: 'Message', id: 'semantic/message', messageId: 'handoff', title: 'Message handoff retained.', at },
+  { _tag: 'Event', id: 'semantic/event', kind: 'harness-message', title: 'Event title retained.', text: 'Event body retained.', sender: { kind: 'harness', label: 'Host' }, data: {}, at },
+  { _tag: 'UnknownEvent', id: 'semantic/unknown', eventType: 'future.semantic.event', data: {}, at },
+  { _tag: 'Status', id: 'semantic/status', status: 'completed', detail: 'Status detail retained.', at },
+  { _tag: 'Usage', id: 'semantic/usage', semantics: 'response', inputTokens: 123, outputTokens: 45, at },
+  { _tag: 'ToolCall', id: 'semantic/read', callId: 'semantic/read', name: 'read', input: { path: 'src/semantic.ts' }, status: 'success', result: { content: 'export const semantic = true', mediaType: 'text/plain', isError: false, at }, callSeen: true, at },
+  { _tag: 'Reasoning', id: 'semantic/reasoning', text: 'Reasoning content retained.', streaming: false, at },
+  { _tag: 'Text', id: 'semantic/answer', role: 'assistant', text: 'Assistant content retained.', attachments: [], streaming: false, at },
+]
+const semanticData: TranscriptStoryData = {
+  sync: { _tag: 'Live', since: now },
+  turns: [{
+    id: 'semantic',
+    prompt: { _tag: 'Text', id: 'semantic/prompt', role: 'user', text: 'User content retained.', attachments: [], streaming: false, at },
+    items: semanticItems,
+    work: workLogTurnFromItems(semanticItems, { kindFor: () => 'read', running: false, failed: false, interrupted: false, durationMs: 24000, completeHistory: true }),
+  }],
+}
+export const SemanticItems: Story = { render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><RuntimeTranscript data={semanticData} onOpenTool={() => {}} onRetry={() => {}} /></main>, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  await userEvent.click(await canvas.findByRole('button', { name: /Worked for 24s/ }))
+  await userEvent.click(canvas.getByRole('button', { name: 'Thinking' }))
+  await expect(canvas.getByTestId('tool-detail-preview')).toBeVisible()
+  await expect(canvas.getByTestId('tool-detail-preview')).toHaveTextContent('export const semantic = true')
+  for (const text of ['User content retained.', 'System context retained.', 'Notice content retained.', 'Message handoff retained.', 'Event title retained.', 'Event body retained.', 'future.semantic.event', 'Status detail retained.', 'Usage · response · 123 input · 45 output', 'Reasoning content retained.', 'Assistant content retained.']) {
+    await expect(canvas.getByText(text, { exact: false })).toBeVisible()
+  }
+} }
+export const SemanticItemsLight: Story = { ...SemanticItems, args: { scheme: 'light' } }
 export const ReadableEmpty: Story = { args: { state: 'empty', emptyState: { title: 'No messages in this conversation', body: 'Send a message to start working with the agent.' } }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   await expect(canvas.getByTestId('transcript-empty')).toBeInTheDocument()
