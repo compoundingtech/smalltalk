@@ -128,9 +128,7 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
     if (!connection.open || connection.closed) return
     if (!connection.legacy) connection.socket.onmessage?.({ data: JSON.stringify(frame) })
     else if (frame.kind === 'screen') connection.socket.onmessage?.({ data: JSON.stringify(envelope(frame.value)) })
-    else if (frame.kind === 'error') connection.socket.onmessage?.({ data: JSON.stringify(errorEnvelope(
-      frame.code === 'stale-fence' ? 'stale-fence' : frame.code === 'terminal-ended' ? 'terminal-ended' : 'terminal-unavailable', frame.message, frame.retryable,
-    )) })
+    else if (frame.kind === 'error') connection.socket.onmessage?.({ data: JSON.stringify(errorEnvelope(frame.code ?? 'terminal-unavailable', frame.message, frame.retryable)) })
   }
   const refuse = (connection: Connection, sub: Subscription, code: string, retryable: boolean) => {
     emit(connection, { kind: 'error', id: sub.id, collection: sub.collection, code, message: code, retryable })
