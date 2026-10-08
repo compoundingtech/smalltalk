@@ -9,10 +9,12 @@
  */
 import {
   ClientError,
+  type St3Client,
+  type Capabilities,
+  type EnvelopeOf,
   type CollectionFrame,
   type CollectionSocketFactory,
   type CollectionStream,
-  type St3Client,
 } from '@smalltalk/st3-client'
 import * as Cause from 'effect/Cause'
 import * as Data from 'effect/Data'
@@ -23,20 +25,27 @@ import type * as Fiber from 'effect/Fiber'
 import * as Result from 'effect/Result'
 import type * as Scope from 'effect/Scope'
 import * as SubscriptionRef from 'effect/SubscriptionRef'
+import type { SyncStatus } from './sync-status.ts'
 
 /** The gateway connection as the UI shows it. */
 export type ConnectionState =
   | { readonly _tag: 'Idle' }
   | { readonly _tag: 'Connecting'; readonly attempt: number }
   | { readonly _tag: 'Live' }
-  | { readonly _tag: 'Reconnecting'; readonly attempt: number; readonly issue: string }
-  | { readonly _tag: 'Rejected'; readonly message: string }
+  | { readonly _tag: 'Reconnecting'; readonly attempt: number; readonly issue: string; readonly nextAt?: number }
+  | { readonly _tag: 'Rejected'; readonly message: string; readonly code?: string }
   | { readonly _tag: 'Closed' }
 
 /** Optional transport observations; the SDK does not depend on a telemetry backend. */
 export type St3Diagnostic =
   | { readonly _tag: 'Connection'; readonly state: ConnectionState }
-  | { readonly _tag: 'Follows'; readonly active: number; readonly cap: number }
+  /** Locally admitted slots; neither socket send nor server admission/first observation. */
+  | {
+      readonly _tag: 'Follows'
+      readonly active: number
+      readonly cap: number
+      readonly conversationSlots: number | undefined
+    }
   | { readonly _tag: 'Frame' }
   | { readonly _tag: 'Resync' }
   /** An actual reconnect or live-socket resubscribe attempt, not a scheduled timer. */
@@ -52,11 +61,16 @@ export interface Subscriber {
   readonly onFrame: (frame: CollectionFrame) => void
   /** The socket ended; a fresh subscribe follows once a new one is live. */
   readonly onDrop: () => void
+  /** The credential was refused permanently; end this follow instead of waiting for a retry. */
+  readonly onRejected: (message: string, code?: string) => void
 }
 
 /** Subscription routing and connection state for the shared collections socket. */
 export interface Channel {
   readonly connection: SubscriptionRef.SubscriptionRef<ConnectionState>
+  readonly syncStatus: SubscriptionRef.SubscriptionRef<SyncStatus>
+  /** A subscription has successfully decoded a data frame from this socket. */
+  readonly onDecodedFrame: () => void
   /** Register and, when a socket is live, subscribe now. */
   readonly register: (args: {
     readonly id: string
@@ -79,19 +93,64 @@ export const makeChannel = ({
   socket,
   onDiagnostics,
   onSubscribeSent,
+  onCapabilities,
+  onProbeFailure,
 }: {
   readonly client: St3Client
   readonly socket?: CollectionSocketFactory
   readonly onDiagnostics?: (event: St3Diagnostic) => void
   readonly onSubscribeSent?: (id: string) => void
+  /** The connect probe's capabilities response envelope, before the socket is opened. */
+  readonly onCapabilities?: (envelope: EnvelopeOf<Capabilities>) => void
+  /** A completed failed probe (including permanent 401/403), before rejection/backoff. */
+  readonly onProbeFailure?: () => void
 }): Effect.Effect<Channel, never, Scope.Scope> =>
   Effect.gen(function* () {
     const scope = yield* Effect.scope
     const connection = yield* SubscriptionRef.make<ConnectionState>({ _tag: 'Idle' })
+    const syncStatus = yield* SubscriptionRef.make<SyncStatus>({ _tag: 'Connecting', attempt: 1, since: Date.now() })
+    let gatewayStatus: SyncStatus = { _tag: 'Connecting', attempt: 1, since: Date.now() }
+    let lastLiveAt: number | undefined
+    const setSync = (status: SyncStatus) => {
+      gatewayStatus = status
+      return SubscriptionRef.set(syncStatus, status)
+    }
     onDiagnostics?.({ _tag: 'Connection', state: { _tag: 'Idle' } })
     const setConnection = (state: ConnectionState) =>
       SubscriptionRef.set(connection, state).pipe(
         Effect.tap(() => Effect.sync(() => onDiagnostics?.({ _tag: 'Connection', state }))),
+        Effect.tap(() => {
+          const now = Date.now()
+          switch (state._tag) {
+            case 'Idle':
+            case 'Connecting':
+              return setSync({ _tag: 'Connecting', attempt: state._tag === 'Idle' ? 1 : state.attempt, since: now })
+            case 'Live':
+              // Open proves transport reachability, not decoded-data freshness.
+              return setSync({ _tag: 'Requested', since: now })
+            case 'Reconnecting':
+              return setSync({
+                _tag: 'Stale',
+                reason: state.nextAt === undefined
+                  ? { _tag: 'Unknown' }
+                  : { _tag: 'Reconnecting', attempt: state.attempt, nextAt: state.nextAt, issue: state.issue },
+                ...(lastLiveAt === undefined ? {} : { lastLiveAt }),
+              })
+            case 'Rejected':
+              return setSync({
+                _tag: 'Failed',
+                cause: state.code === undefined || state.code.length === 0
+                  ? { _tag: 'Unknown' }
+                  : { _tag: 'Server', code: state.code, message: state.message },
+              })
+            case 'Closed':
+              return setSync({ _tag: 'Stale', reason: { _tag: 'Unknown' }, ...(lastLiveAt === undefined ? {} : { lastLiveAt }) })
+          }
+        }),
+        Effect.tap(() => Effect.sync(() => {
+          if (state._tag === 'Rejected')
+            for (const entry of subscribers.values()) entry.subscriber.onRejected(state.message, state.code)
+        })),
       )
     const subscribers = new Map<
       string,
@@ -177,7 +236,7 @@ export const makeChannel = ({
         yield* setConnection(
           issue === undefined
             ? { _tag: 'Connecting', attempt }
-            : { _tag: 'Reconnecting', attempt, issue },
+            : { _tag: 'Reconnecting', attempt, issue, nextAt: Date.now() },
         )
         // An HTTP read first: the browser cannot see a refused WebSocket upgrade's status.
         const probe = yield* Effect.result(
@@ -191,20 +250,22 @@ export const makeChannel = ({
           }),
         )
         if (Result.isFailure(probe)) {
+          onProbeFailure?.()
           const error = probe.failure
           if (isRejection(error.cause)) {
-            yield* setConnection({ _tag: 'Rejected', message: error.message })
+            yield* setConnection({ _tag: 'Rejected', message: error.message, code: error.cause.response.code })
             return
           }
           const reason = error.message
-          yield* setConnection({ _tag: 'Reconnecting', attempt, issue: reason })
+          yield* setConnection({ _tag: 'Reconnecting', attempt, issue: reason, nextAt: Date.now() + backoffMillis(attempt) })
           yield* Effect.sleep(backoffMillis(attempt))
           return yield* connect({ attempt: attempt + 1, issue: reason })
         }
+        if (Result.isSuccess(probe)) onCapabilities?.(probe.success)
         const ended = yield* runSocket.pipe(
           Effect.catchCause((cause) => Effect.succeed(String(Cause.squash(cause)))),
         )
-        yield* setConnection({ _tag: 'Reconnecting', attempt: 1, issue: ended })
+        yield* setConnection({ _tag: 'Reconnecting', attempt: 1, issue: ended, nextAt: Date.now() + backoffMillis(1) })
         yield* Effect.sleep(backoffMillis(1))
         return yield* connect({ attempt: 2, issue: ended })
       })
@@ -222,8 +283,19 @@ export const makeChannel = ({
 
     return {
       connection,
+      syncStatus,
+      onDecodedFrame: () => {
+        if (live === undefined || gatewayStatus._tag === 'Live') return
+        lastLiveAt = Date.now()
+        Effect.runFork(setSync({ _tag: 'Live', since: lastLiveAt }))
+      },
       register: ({ id, subscriber }) =>
         Effect.gen(function* () {
+          const state = yield* SubscriptionRef.get(connection)
+          if (state._tag === 'Rejected') {
+            subscriber.onRejected(state.message, state.code)
+            return
+          }
           subscribers.set(id, { subscriber, fiber: undefined })
           yield* subscribe(id)
         }),

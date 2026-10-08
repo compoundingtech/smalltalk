@@ -2,14 +2,22 @@
  * Follow admission through the real SDK against a scripted collections socket: which follows
  * keep their slot, which one is evicted, and what each consumer's stream sees.
  */
-import type { CollectionFrame, CollectionSocket } from '@smalltalk/st3-client'
+import type { Capability, CollectionFrame, CollectionSocket } from '@smalltalk/st3-client'
 import type { CollectionName, Snapshot } from '@smalltalk/st3-client'
 import * as Effect from 'effect/Effect'
 import * as Fiber from 'effect/Fiber'
 import * as Stream from 'effect/Stream'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { type FollowEvent, type FollowSpec, followKey, St3, St3Live, type WindowValue } from './mod.ts'
+import {
+  advertisedSubscriptionLimit,
+  type FollowEvent,
+  type FollowSpec,
+  followKey,
+  St3,
+  St3Live,
+  type WindowValue,
+} from './mod.ts'
 
 const API_VERSION = 'st3.client.v0'
 const snapshot: Snapshot = {
@@ -528,4 +536,23 @@ describe('follow admission', () => {
         expect(gateway.subscribes('missions')).toBe(0)
       }),
     ))
+})
+
+describe('advertised subscription limit', () => {
+  it('reads the collections capability: v1 grants 16, anything else holds 8', () => {
+    const envelope = (capabilities: Capability[]) =>
+      ({ value: { capabilities } })
+    expect(
+      advertisedSubscriptionLimit(envelope([{ id: 'collections', state: 'granted', version: 1 }])),
+    ).toBe(16)
+    expect(
+      advertisedSubscriptionLimit(envelope([{ id: 'work.done', state: 'granted', version: 0 }])),
+    ).toBe(8)
+    expect(
+      advertisedSubscriptionLimit(envelope([{ id: 'collections', state: 'ungranted', version: 1 }])),
+    ).toBe(8)
+    expect(
+      advertisedSubscriptionLimit(envelope([{ id: 'collections', state: 'granted', version: 0 }])),
+    ).toBe(8)
+  })
 })
