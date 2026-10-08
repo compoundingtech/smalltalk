@@ -20,12 +20,12 @@ export function projectAgentRow(agent: Native.Agent, attention: readonly Native.
   const status: AgentStatus = agent.observation === 'missing' ? 'unobserved'
     : agent.observation === 'stale' ? 'stale'
     : agent.state === 'suspended' ? 'suspended'
-    : agent.state === 'retired' ? 'retired'
+    : agent.state === 'failed' || Option.isSome(agent.fault) ? 'stale'
     : agent.state === 'stopped' ? 'ended'
     : agent.reachability === 'unreachable' ? 'offline'
-    : agent.state === 'waiting' || Option.getOrUndefined(agent.blocked_on) === 'human' ? 'waiting'
+    : agent.state === 'waiting' || harnessState === 'waiting' || Option.getOrUndefined(agent.blocked_on) === 'human' ? 'waiting'
     : agent.state === 'running' || harnessState === 'working' ? 'working'
-    : agent.state === 'starting' ? 'pending' : 'idle'
+    : agent.state === 'starting' || agent.state === 'desired' ? 'pending' : 'idle'
   const work = agent.current_work?.[0]
   const activity = Option.getOrUndefined(agent.last_activity_at)
   const since = Option.getOrUndefined(agent.since)
@@ -40,9 +40,10 @@ export function projectAgentRow(agent: Native.Agent, attention: readonly Native.
     branch: Option.getOrUndefined(agent.checkout)?.branch,
     statusSince: since === undefined ? undefined : DateTime.toEpochMillis(since),
     lastActivityAt: activity === undefined ? undefined : DateTime.toEpochMillis(activity),
-    needsMe, unread: attention.filter(card => card.state === 'open' && card.attention_kind === 'unread-message' && card.source_id === agent.id).length,
+    needsMe,
     freshness: agent.observation === 'stale' ? 'stale' : agent.observation === 'missing' ? 'unobserved' : 'live',
-    usage: usage?.cost !== undefined && usage.currency === 'USD' ? { _tag: 'Known', scope: 'lifetime-incl-subagents', tokens: usage.total_tokens, usd: usage.cost } : unknown,
+    // Native usage has no sidebar lifetime/subagent scope; retain the app's Unknown projection.
+    usage: unknown,
     duration: unknown,
     lastTurn: activity === undefined ? unknown : { _tag: 'Known', kind: 'activity', at: DateTime.toEpochMillis(activity) },
     childrenKnown: agent.subagents?.length === 0, children: [],
