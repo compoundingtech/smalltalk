@@ -283,6 +283,25 @@ malformed operation metadata, an operation conflict, and `incremental-error:CODE
 incremental chunks produce no fallback log. The target is the admitted index observed at entry;
 a full replay can also include claims admitted since that observation.
 
+The daemon binds both Unix listeners immediately after acquiring its startup lock, before
+opening SQLite. Each listener requests a 1024-connection kernel backlog (subject to the OS
+limit). New connections wait there; no HTTP request is accepted until migrations, admission,
+canonical projection catch-up and application initialization finish. Local readiness stays
+`starting` until both accept loops are ready. A second daemon never unlinks a live listener.
+
+Early binding does not preserve an exited process's established streams or remove the
+stop-to-bind connection-refusal window. Existing client request deadlines still apply while
+initialization runs, and a full backlog cannot queue more connections. There is no client-side
+grace period. Zero-refusal restarts require a service-manager-owned socket that survives the
+writer handoff, with the replacement accepting only after SQLite is ready.
+
+Startup claim judging is already incremental: persisted fresh-signature and dependency queues
+select work, while a persisted trust-root digest invalidates only root-dependent verdicts when
+membership or the local signing key changes. Reopening with unchanged roots and empty queues
+does not re-judge historical claims. Benchmark a normal restart with the same private state and
+keys: a fresh database copy paired with a newly generated signing key legitimately invalidates
+the root-dependent cache and measures a different workload.
+
 ## Initial targeted mailbox wake comparison (2026-10-05)
 
 This comparison measured the initial implementation at `d9bcabb9b619895a73809038f2e429d599a580cd`

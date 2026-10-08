@@ -5099,7 +5099,7 @@ pub async fn serve_unix_bound(
     serve_unix_bound_with_ready(socket, state_socket, app, || {}).await
 }
 
-/// Readiness is published only once the local API is bound and discoverable.
+/// Readiness is published only once the initialized local API can accept requests.
 pub async fn serve_unix_bound_with_ready(
     socket: &Path,
     state_socket: &Path,
@@ -5139,12 +5139,16 @@ async fn serve_unix_with_ancestor_ready(
     ancestor: fn(u32) -> Option<String>,
     ready: impl FnOnce(),
 ) -> anyhow::Result<()> {
-    // Only st3-fixture initializes this process-local state. Disable host ancestry while
-    // retaining native-driver identification, which mailbox subscriptions require.
-    #[cfg(feature = "test-support")]
-    let bind_ancestry = bind_harness && crate::test_support::login_shell().is_none();
-    #[cfg(not(feature = "test-support"))]
-    let bind_ancestry = bind_harness;
+    let listener = bind_unix_listener(socket, state_socket).await?;
+    serve_unix_listener_with_ancestor_ready(listener, app, bind_harness, ancestor, ready).await
+}
+
+/// Reserve a discoverable listener before opening the store. Connections queue in the kernel;
+/// the caller must not enter the accept loop until migrations and application setup finish.
+pub async fn bind_unix_listener(
+    socket: &Path,
+    state_socket: Option<&Path>,
+) -> anyhow::Result<UnixListener> {
     crate::config::validate_unix_socket_path(socket, "--socket or --client-gateway-socket")?;
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
@@ -5161,11 +5165,39 @@ async fn serve_unix_with_ancestor_ready(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let listener = UnixListener::bind(socket)?;
+    let listener = tokio::net::UnixSocket::new_stream()?;
+    listener.bind(socket)?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+    let listener = listener.listen(1024)?;
     if let Some(state_socket) = state_socket {
         publish_state_socket(socket, state_socket)?;
     }
+    Ok(listener)
+}
+
+/// Start accepting on a previously reserved listener with a fully initialized router.
+pub async fn serve_unix_listener_with_ready(
+    listener: UnixListener,
+    app: Router,
+    bind_harness: bool,
+    ready: impl FnOnce(),
+) -> anyhow::Result<()> {
+    serve_unix_listener_with_ancestor_ready(listener, app, bind_harness, harness_ancestor, ready).await
+}
+
+async fn serve_unix_listener_with_ancestor_ready(
+    listener: UnixListener,
+    app: Router,
+    bind_harness: bool,
+    ancestor: fn(u32) -> Option<String>,
+    ready: impl FnOnce(),
+) -> anyhow::Result<()> {
+    // Only st3-fixture initializes this process-local state. Disable host ancestry while
+    // retaining native-driver identification, which mailbox subscriptions require.
+    #[cfg(feature = "test-support")]
+    let bind_ancestry = bind_harness && crate::test_support::login_shell().is_none();
+    #[cfg(not(feature = "test-support"))]
+    let bind_ancestry = bind_harness;
     ready();
     let mut accept_failures = AcceptFailures::default();
     loop {
@@ -5302,6 +5334,44 @@ mod gateway_listener_tests {
         );
         assert!(tokio::net::UnixStream::connect(&socket).await.is_ok());
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn a_connection_queues_until_the_initialized_router_starts_serving() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("api.sock");
+        let discovery = root.path().join("state/run/st3.sock");
+        let listener = super::bind_unix_listener(&socket, Some(&discovery)).await.unwrap();
+        let mut stream = tokio::net::UnixStream::connect(&discovery).await.unwrap();
+        stream
+            .write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let error = stream.try_read(&mut [0; 1]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+
+        let (ready, serving) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(super::serve_unix_listener_with_ready(
+            listener,
+            axum::Router::new().route("/ready", axum::routing::get(|| async { "initialized" })),
+            false,
+            move || ready.send(()).unwrap(),
+        ));
+        serving.await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("initialized"), "{response}");
+        task.abort();
+        let _ = task.await;
     }
 }
 

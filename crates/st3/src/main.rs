@@ -5669,6 +5669,14 @@ async fn run_up(args: UpArgs) -> Result<()> {
     validate_unix_socket_path(&config.client_gateway_socket, "--client-gateway-socket")?;
     fs::create_dir_all(&config.state_dir)?;
     let startup = Arc::new(st3::startup::Startup::begin(&config.socket)?);
+    startup.phase("bind-listeners");
+    let state_socket = config.state_dir.join("run/st3.sock");
+    let (local_listener, client_gateway_listener) = tokio::try_join!(
+        st3::api::bind_unix_listener(&config.socket, Some(&state_socket)),
+        st3::api::bind_unix_listener(&config.client_gateway_socket, None),
+    )?;
+    // Keep both accept queues closed to application code until all store migrations,
+    // projection catch-up and runtime initialization have completed.
     startup.phase("install-hooks");
     st3::hooks::ensure_installed(&st3::hooks::root(&config.state_dir)).context(
         "publishing this st binary's required lifecycle hook set before starting the daemon",
@@ -5894,17 +5902,14 @@ async fn run_up(args: UpArgs) -> Result<()> {
             .await;
         }
     });
-    let local_socket = config.socket.clone();
-    let state_socket = config.state_dir.join("run/st3.sock");
-    let client_gateway_socket = config.client_gateway_socket.clone();
     // The first diagnostic report reads the whole claim log; no read waits for it.
     st3::api::start_operation_report(&state);
     // Nor does the first session list wait to read every native transcript's header.
     st3::api::start_native_session_discovery(&state);
-    startup.phase("bind-listeners");
-    let bound = std::sync::atomic::AtomicUsize::new(0);
+    startup.phase("start-serving");
+    let accepting = std::sync::atomic::AtomicUsize::new(0);
     let ready = || {
-        if bound.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+        if accepting.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 1 {
             startup.serving();
             eprintln!("st: local API listening at {}", config.socket.display());
             eprintln!(
@@ -5914,13 +5919,18 @@ async fn run_up(args: UpArgs) -> Result<()> {
         }
     };
     tokio::try_join!(
-        st3::api::serve_unix_bound_with_ready(
-            &local_socket,
-            &state_socket,
+        st3::api::serve_unix_listener_with_ready(
+            local_listener,
             router(state.clone()),
+            true,
             ready
         ),
-        st3::api::serve_unix_with_ready(&client_gateway_socket, fabric_router(state), ready),
+        st3::api::serve_unix_listener_with_ready(
+            client_gateway_listener,
+            fabric_router(state),
+            false,
+            ready
+        ),
     )?;
     Ok(())
 }
