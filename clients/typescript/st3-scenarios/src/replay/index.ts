@@ -60,6 +60,9 @@ const filtered = (items: Resource[], filters: Filters): Resource[] => items.filt
 })
 const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null
 const stringField = (value: Record<string, unknown>, key: string): string | undefined => typeof value[key] === 'string' ? value[key] : undefined
+/** A conversation subscription names its thread by agent id, session id, or session id without `session/`. */
+const followsThread = (sub: Subscription, thread: { agent: string; session_id: string }): boolean =>
+  sub.conversation === thread.agent || sub.conversation === thread.session_id || `session/${sub.conversation}` === thread.session_id
 
 /** Socket opens are clock tasks, not microtasks: manual-clock callers release them with advance(0). */
 export const createReplay = (world: World, { clock }: { readonly clock: Clock }): Replay => {
@@ -142,7 +145,7 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
     if (kind !== undefined) consumed.add(kind)
     switch (sub.collection) {
       case 'conversation': {
-        const thread = state('conversation').threads.find((thread) => thread.agent === sub.conversation || thread.session_id === sub.conversation || thread.session_id.replace(/^session\//, '') === sub.conversation)
+        const thread = state('conversation').threads.find((thread) => followsThread(sub, thread))
         if (thread === undefined) return refuse(connection, sub, 'not-found', false)
         emit(connection, { kind: 'conversation', id: sub.id, collection: 'conversation', session_id: thread.session_id,
           replace: true, items: thread.items.slice(-thread.page_size), has_more: thread.has_more || thread.items.length > thread.page_size })
@@ -193,7 +196,7 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
         const thread = state('conversation').threads.find((thread) => thread.agent === event.agent)
         if (thread === undefined) return
         for (const connection of connections) for (const sub of connection.subscriptions.values()) {
-          if (!sub.ready || sub.collection !== 'conversation' || (sub.conversation !== event.agent && sub.conversation !== thread.session_id)) continue
+          if (!sub.ready || sub.collection !== 'conversation' || !followsThread(sub, thread)) continue
           emit(connection, { kind: 'conversation', id: sub.id, collection: 'conversation', session_id: thread.session_id,
             replace: event._tag === 'replace', items: event._tag === 'replace' ? thread.items.slice(-thread.page_size) : event.items,
             ...(event._tag === 'replace' ? { has_more: thread.has_more || thread.items.length > thread.page_size } : {}) })
