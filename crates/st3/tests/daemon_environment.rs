@@ -402,7 +402,7 @@ fn a_profile_configured_gate_uses_the_gateway_and_node_identity_without_local_cr
         }
     });
     for expected_code in [0, 3] {
-        let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+        let output = st3::test_support::command(test_bin!("st3-fixture"))
             .env_clear().env("HOME", &home).env("PATH", &bin)
             .env("GH_TOKEN", "fixture-local-credential").env("GITHUB_TOKEN", "fixture-secondary")
             .env("ST_SEKRETS_SOCKET", &socket).env("XDG_CONFIG_HOME", root.path().join("config"))

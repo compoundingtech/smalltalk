@@ -18,5 +18,7 @@ for crate in (ROOT / 'crates').iterdir():
             if pattern.search(line.replace('test_env!', 'relocated!')):
                 violations.append(f'{path.relative_to(ROOT)}:{number}')
 if violations:
-    raise SystemExit('unrelocated test paths: ' + ', '.join(violations))
+    raise SystemExit('unrelocated test paths: ' + ', '.join(violations)
+                     + '. Use test_env! for binary/manifest/temp paths or test_bin! instead '
+                     + 'of cargo_bin!; see docs/ci.md for helper imports and fixture suffixes.')
 print('Test path guard passed: no raw cargo_bin!/compiled manifest/binary/temp paths')

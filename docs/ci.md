@@ -113,6 +113,9 @@ the fallback. Archive mode rejects missing or mismatched roots/binaries. Tests, 
 partitions, retries, eight test threads, real VM checks and required contexts are unchanged.
 Local and macOS runs still use the existing build selection unless `CI_TEST_PARTITION` is set.
 
+New test files and paths are checked automatically by `genie-freshness` on each PR and
+merge group. A guard failure names each file and line and points its author to `test_env!`
+and these repair instructions; it does not allow the raw path through.
 If `genie-freshness` reports `unrelocated test paths: FILE:LINE`, replace the raw test path
 at that location with `test_env!("CARGO_BIN_EXE_st3-fixture")`,
 `test_env!("CARGO_MANIFEST_DIR")` or `test_env!("CARGO_TARGET_TMPDIR")`, as appropriate.
