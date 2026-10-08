@@ -1,0 +1,114 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "format": "st3.scenario.index.v1",
+  "worlds": [
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "fleet-mid-refactor",
+      "narrative": "Four agents rename an API across a monorepo. One is blocked on a typecheck, one waits for review, one streams diffs, one is idle.",
+      "seed": 1,
+      "slices": {
+        "attention": "fleet-mid-refactor/attention.json",
+        "conversation": "fleet-mid-refactor/conversation.json",
+        "details": "fleet-mid-refactor/details.json",
+        "roster": "fleet-mid-refactor/roster.json",
+        "sync": "fleet-mid-refactor/sync.json",
+        "terminal": "fleet-mid-refactor/terminal.json"
+      },
+      "title": "Fleet mid-refactor"
+    },
+    {
+      "cast": {
+        "agents": [
+          {
+            "id": "agent/example/atlas/builder",
+            "name": "Atlas Builder"
+          },
+          {
+            "id": "agent/example/atlas/reviewer",
+            "name": "Atlas Reviewer"
+          },
+          {
+            "id": "agent/example/atlas/migrator",
+            "name": "Atlas Migrator"
+          },
+          {
+            "id": "agent/example/atlas/docs",
+            "name": "Atlas Docs"
+          }
+        ],
+        "hosts": [
+          {
+            "id": "host/meadow",
+            "name": "meadow"
+          },
+          {
+            "id": "host/foundry",
+            "name": "foundry"
+          }
+        ],
+        "people": [
+          {
+            "id": "person/ada",
+            "name": "Ada"
+          },
+          {
+            "id": "person/robin",
+            "name": "Robin"
+          }
+        ]
+      },
+      "id": "failed-sync-socket-dropped",
+      "narrative": "The fleet mid-refactor, seen while the collections socket is down and every reopen fails.",
+      "seed": 1,
+      "slices": {
+        "attention": "failed-sync-socket-dropped/attention.json",
+        "conversation": "failed-sync-socket-dropped/conversation.json",
+        "details": "failed-sync-socket-dropped/details.json",
+        "roster": "failed-sync-socket-dropped/roster.json",
+        "sync": "failed-sync-socket-dropped/sync.json",
+        "terminal": "failed-sync-socket-dropped/terminal.json"
+      },
+      "title": "Failed sync: socket dropped"
+    }
+  ]
+}

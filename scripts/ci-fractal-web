@@ -37,3 +37,8 @@ lane "Toolchain and Buck root" toolchain
 lane "Frozen install" pnpm install --frozen-lockfile
 lane "Dependency licenses" python3 scripts/ci-fractal-web-licenses --check
 lane "Buck typecheck" buck2 build //:typecheck
+lane "Scenario typecheck" pnpm --filter @smalltalk/st3-scenarios typecheck
+lane "Scenario tests" pnpm --filter @smalltalk/st3-scenarios test
+lane "Scenario freshness" pnpm --filter @smalltalk/st3-scenarios emit:check
+lane "Scenario decode" pnpm --filter @smalltalk/st3-scenarios decode
+lane "Scenario privacy" pnpm --filter @smalltalk/st3-scenarios scan

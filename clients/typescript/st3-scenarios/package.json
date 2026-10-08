@@ -1,0 +1,51 @@
+{
+  "name": "@smalltalk/st3-scenarios",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./replay": "./src/replay/index.ts",
+    "./react": "./src/react/index.ts",
+    "./storybook": "./src/storybook/index.ts"
+  },
+  "scripts": {
+    "emit": "node --experimental-transform-types --no-warnings scripts/emit.ts",
+    "emit:check": "node --experimental-transform-types --no-warnings scripts/emit.ts --check",
+    "decode": "node --experimental-transform-types --no-warnings scripts/decode.ts",
+    "scan": "node --experimental-transform-types --no-warnings scripts/scan.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@smalltalk/st3-client": "workspace:*"
+  },
+  "peerDependencies": {
+    "@storybook/react": "^10.6.1",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
+  "peerDependenciesMeta": {
+    "@storybook/react": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@effect/vitest": "4.0.0-rc.118",
+    "@storybook/react": "10.6.1",
+    "@types/node": "26.6.4",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "effect": "4.0.0-rc.118",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "typescript": "6.0.3",
+    "vitest": "4.1.9"
+  }
+}
