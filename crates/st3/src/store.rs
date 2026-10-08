@@ -7,6 +7,8 @@ mod arrangements_tests;
 mod glasses;
 pub(crate) mod mailbox_wakes;
 mod mailbox_changes;
+#[cfg(test)]
+mod message_send_tests;
 pub mod owned_sets;
 #[cfg(test)]
 mod owned_sets_tests;
@@ -9796,6 +9798,21 @@ impl Store {
             &self.graph, input, None, None, None,
             Some((&input.subject, desired_revision, current)),
         ).map(|(claim, _)| claim)
+    }
+
+    /// The API has verified this device signature. Stage, admit and consume it in the
+    /// same writer savepoint as the message; retries keep the first committed signature.
+    pub(crate) fn append_signed_message(
+        &self,
+        input: &ClaimInput,
+        signature: &smallclaims::principal::ClaimSignature,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        if input.kind != "message.sent" || input.actor.is_none() {
+            return Err(St3Error::new("invalid-signature", "a signed message names its actor"));
+        }
+        self.graph.ensure_principal_key(input.actor.as_deref().unwrap())?;
+        let signature = serde_json::to_string(signature).map_err(internal)?;
+        append_claim_with_signature(&self.graph, input, None, None, None, None, Some(&signature))
     }
 
     pub(crate) fn append_claim_outcome(
@@ -53740,6 +53757,18 @@ fn append_claim_with_subject_fences(
     expected_subjects: Option<&BTreeMap<String, String>>,
     observer_completion: Option<(&str, &str, &(dyn Fn() -> bool + Sync))>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    append_claim_with_signature(graph, input, fence, event_runtime, expected_subjects, observer_completion, None)
+}
+
+fn append_claim_with_signature(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    fence: Option<&crate::mailbox::Fence>,
+    event_runtime: Option<&str>,
+    expected_subjects: Option<&BTreeMap<String, String>>,
+    observer_completion: Option<(&str, &str, &(dyn Fn() -> bool + Sync))>,
+    signature: Option<&str>,
+) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;
     if local_retention(&input.kind)
         || (input.actor.is_none() && system_local_retention(&input.kind))
@@ -53756,6 +53785,12 @@ fn append_claim_with_subject_fences(
         .batched(|transaction| -> Result<(ClaimRecord, bool), St3Error> {
             if let Some((subject, revision, current)) = observer_completion {
                 check_observer_completion(transaction, subject, revision, Some(current))?;
+            }
+            if let Some(signature) = signature {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO expected_claim_signatures(subject,kind,actor,signature) VALUES (?1,?2,?3,?4)",
+                    params![input.subject,input.kind,input.actor,signature],
+                ).map_err(internal)?;
             }
             let outcome = (|| {
             check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
@@ -54003,6 +54038,14 @@ fn append_claim_with_subject_fences(
             })()?;
             if let Some((subject, revision, current)) = observer_completion {
                 check_observer_completion(transaction, subject, revision, Some(current))?;
+            }
+            if signature.is_some() {
+                // An idempotent repeat does not append/consume a signature. Remove its
+                // temporary expectation before commit; any failure rolls it back with the message.
+                transaction.execute(
+                    "DELETE FROM expected_claim_signatures WHERE subject=?1 AND kind=?2 AND actor=?3",
+                    params![input.subject,input.kind,input.actor],
+                ).map_err(internal)?;
             }
             Ok(outcome)
         })
