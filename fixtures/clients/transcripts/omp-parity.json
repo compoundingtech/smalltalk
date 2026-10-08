@@ -79,7 +79,9 @@
               "type": "write",
               "tool": "write",
               "path": "demo.txt",
-              "bytes": 4
+              "bytes": 4,
+              "content": "demo",
+              "line_count": 1
             }
           }
         ]
@@ -274,10 +276,12 @@
                   "question": "Which mode?",
                   "options": [
                     {
-                      "label": "Full"
+                      "label": "Full",
+                      "description": "Keep all synthetic details"
                     },
                     {
-                      "label": "Simple"
+                      "label": "Simple",
+                      "description": "Keep a compact synthetic view"
                     }
                   ],
                   "multi": false
@@ -309,6 +313,7 @@
             "view": {
               "type": "task",
               "tool": "task",
+              "context": "Synthetic parent context\nContract: keep every detail",
               "tasks": [
                 {
                   "name": "Review",
@@ -596,8 +601,9 @@
                 {
                   "id": "child",
                   "agent": "reviewer",
+                  "name": "Review",
                   "status": "completed",
-                  "task": "Review synthetic code",
+                  "task": "Review synthetic code\nReport all findings",
                   "duration_ms": 1200,
                   "tokens": 80,
                   "cost_usd": 0.02,

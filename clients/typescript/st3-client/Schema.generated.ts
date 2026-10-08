@@ -2074,7 +2074,7 @@ export type TimelineAskAnswerEncoded = typeof TimelineAskAnswer.Encoded
 export const TimelineAskQuestion = /*#__PURE__*/ (() => Schema.Struct({
   "id": Schema.String,
   "multi": Schema.Boolean,
-  "options": Schema.Array(Schema.Struct({ "label": Schema.String })),
+  "options": Schema.Array(Schema.Struct({ "description": optionalKey(Schema.String), "label": Schema.String })),
   "question": Schema.String,
   "recommended": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))
 }).annotate({ identifier: "TimelineAskQuestion" }))()
@@ -2093,6 +2093,24 @@ export const TimelineViewAsk = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "TimelineViewAsk", description: "tool_call fields: questions; tool_output fields: answers." }))()
 export type TimelineViewAsk = typeof TimelineViewAsk.Type
 export type TimelineViewAskEncoded = typeof TimelineViewAsk.Encoded
+
+/** Assistant error from the native session record and its persisted retry marker; no retry state is inferred. */
+export const TimelineViewAssistantError = /*#__PURE__*/ (() => Schema.Struct({
+  "api": optionalKey(Schema.String),
+  "error_id": optionalKey(Schema.Int),
+  "is_error": Schema.Boolean,
+  "label": Schema.String,
+  "message": Schema.String,
+  "model": optionalKey(Schema.String),
+  "presentation": Schema.Literals(["full","compact-recovered","none"]),
+  "provider": optionalKey(Schema.String),
+  "retry": optionalKey(Schema.Struct({ "attempt": optionalKey(Schema.Int), "kind": optionalKey(Schema.String), "note": optionalKey(Schema.String), "recovered_at": optionalKey(Timestamp), "recovery": optionalKey(Schema.String), "status": optionalKey(Schema.String), "superseded_by": optionalKey(Schema.Struct({ "model": optionalKey(Schema.String), "provider": optionalKey(Schema.String), "response_id": optionalKey(Schema.String), "timestamp": optionalKey(Schema.Int) })) })),
+  "status": Schema.Literals(["failed","recovered","superseded"]),
+  "stop_reason": optionalKey(Schema.String),
+  "type": Schema.Literal("assistant_error")
+}).annotate({ identifier: "TimelineViewAssistantError", description: "Assistant error from the native session record and its persisted retry marker; no retry state is inferred." }))()
+export type TimelineViewAssistantError = typeof TimelineViewAssistantError.Type
+export type TimelineViewAssistantErrorEncoded = typeof TimelineViewAssistantError.Encoded
 
 /** tool_call fields: command, cwd, timeout_s, env_keys, background; tool_output fields: call_id, is_error, exit_code, wall_ms, timed_out. */
 export const TimelineViewBash = /*#__PURE__*/ (() => Schema.Struct({
@@ -2115,14 +2133,15 @@ export const TimelineViewBash = /*#__PURE__*/ (() => Schema.Struct({
 export type TimelineViewBash = typeof TimelineViewBash.Type
 export type TimelineViewBashEncoded = typeof TimelineViewBash.Encoded
 
-/** On a `status` block; the summary text stays in the block payload as today. */
+/** On a status block; summary is bounded with an owner continuation. */
 export const TimelineViewCompaction = /*#__PURE__*/ (() => Schema.Struct({
   "method": optionalKey(Schema.String),
   "short_summary": optionalKey(Schema.String),
+  "summary": optionalKey(Schema.String),
   "tokens_after": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "tokens_before": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "type": Schema.Literal("compaction")
-}).annotate({ identifier: "TimelineViewCompaction", description: "On a `status` block; the summary text stays in the block payload as today." }))()
+}).annotate({ identifier: "TimelineViewCompaction", description: "On a status block; summary is bounded with an owner continuation." }))()
 export type TimelineViewCompaction = typeof TimelineViewCompaction.Type
 export type TimelineViewCompactionEncoded = typeof TimelineViewCompaction.Encoded
 
@@ -2152,9 +2171,12 @@ export type TimelineViewEdit = typeof TimelineViewEdit.Type
 export type TimelineViewEditEncoded = typeof TimelineViewEdit.Encoded
 
 export const TimelineViewEval = /*#__PURE__*/ (() => Schema.Struct({
+  "code": optionalKey(Schema.String),
   "code_bytes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "intent": optionalKey(Schema.String),
   "language": Schema.String,
+  "reset": optionalKey(Schema.Boolean),
+  "timeout_s": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "title": optionalKey(Schema.String),
   "tool": Schema.String,
   "type": Schema.Literal("eval")
@@ -2189,12 +2211,13 @@ export const JobSummary = /*#__PURE__*/ (() => Schema.Struct({
 export type JobSummary = typeof JobSummary.Type
 export type JobSummaryEncoded = typeof JobSummary.Encoded
 
-/** tool_call fields: op, name, target, timeout_s; tool_output fields: timed_out, jobs, state. */
+/** tool_call fields: op, name, target, message, timeout_s; tool_output fields: timed_out, jobs, state. */
 export const TimelineViewHub = /*#__PURE__*/ (() => Schema.Struct({
   "call_id": optionalKey(Schema.String),
   "intent": optionalKey(Schema.String),
   "is_error": optionalKey(Schema.Boolean),
   "jobs": optionalKey(Schema.Array(JobSummary)),
+  "message": optionalKey(Schema.String),
   "name": optionalKey(Schema.String),
   "op": Schema.String,
   "state": optionalKey(Schema.String),
@@ -2203,7 +2226,7 @@ export const TimelineViewHub = /*#__PURE__*/ (() => Schema.Struct({
   "timeout_s": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "tool": Schema.String,
   "type": Schema.Literal("hub")
-}).annotate({ identifier: "TimelineViewHub", description: "tool_call fields: op, name, target, timeout_s; tool_output fields: timed_out, jobs, state." }))()
+}).annotate({ identifier: "TimelineViewHub", description: "tool_call fields: op, name, target, message, timeout_s; tool_output fields: timed_out, jobs, state." }))()
 export type TimelineViewHub = typeof TimelineViewHub.Type
 export type TimelineViewHubEncoded = typeof TimelineViewHub.Encoded
 
@@ -2253,13 +2276,26 @@ export type TimelineViewResetBoundary = typeof TimelineViewResetBoundary.Type
 export type TimelineViewResetBoundaryEncoded = typeof TimelineViewResetBoundary.Encoded
 
 export const TimelineViewSearch = /*#__PURE__*/ (() => Schema.Struct({
+  "call_id": optionalKey(Schema.String),
+  "case": optionalKey(Schema.Boolean),
   "engine": Schema.Literals(["grep","glob","web"]),
+  "file_count": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "file_limit_reached": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "gitignore": optionalKey(Schema.Boolean),
+  "hidden": optionalKey(Schema.Boolean),
   "intent": optionalKey(Schema.String),
+  "is_error": optionalKey(Schema.Boolean),
+  "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "match_count": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "path": optionalKey(Schema.String),
   "pattern": optionalKey(Schema.String),
+  "per_file_limit_reached": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "query": optionalKey(Schema.String),
+  "skip": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "tool": Schema.String,
-  "type": Schema.Literal("search")
+  "truncated": optionalKey(Schema.Boolean),
+  "type": Schema.Literal("search"),
+  "warning": optionalKey(Schema.String)
 }).annotate({ identifier: "TimelineViewSearch" }))()
 export type TimelineViewSearch = typeof TimelineViewSearch.Type
 export type TimelineViewSearchEncoded = typeof TimelineViewSearch.Encoded
@@ -2282,34 +2318,36 @@ export const TimelineViewSkill = /*#__PURE__*/ (() => Schema.Struct({
 export type TimelineViewSkill = typeof TimelineViewSkill.Type
 export type TimelineViewSkillEncoded = typeof TimelineViewSkill.Encoded
 
-/** One subagent of a task tool output. conversation.session_id is filled only when the child transcript exists at <parent transcript without .jsonl>/<id>.jsonl and is readable; that id opens through the normal conversation routes. */
+/** One subagent of a task tool output. name is the OMP name (id when no separate name exists), agent is the type, task is the full assignment. conversation.session_id opens the readable child transcript. */
 export const SubagentSummary = /*#__PURE__*/ (() => Schema.Struct({
   "agent": optionalKey(Schema.String),
   "conversation": optionalKey(Schema.Struct({ "session_id": Id })),
   "cost_usd": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))),
   "duration_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "id": Schema.String,
+  "name": optionalKey(Schema.String),
   "requests": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "status": Schema.String,
   "task": optionalKey(Schema.String),
   "tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "tool_count": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))
-}).annotate({ identifier: "SubagentSummary", description: "One subagent of a task tool output. conversation.session_id is filled only when the child transcript exists at <parent transcript without .jsonl>/<id>.jsonl and is readable; that id opens through the normal conversation routes." }))()
+}).annotate({ identifier: "SubagentSummary", description: "One subagent of a task tool output. name is the OMP name (id when no separate name exists), agent is the type, task is the full assignment. conversation.session_id opens the readable child transcript." }))()
 export type SubagentSummary = typeof SubagentSummary.Type
 export type SubagentSummaryEncoded = typeof SubagentSummary.Encoded
 
-/** tool_call fields: tasks; tool_output fields: async, total_ms, agents. */
+/** tool_call fields: context, tasks; tool_output fields: async, total_ms, agents. */
 export const TimelineViewTask = /*#__PURE__*/ (() => Schema.Struct({
   "agents": optionalKey(Schema.Array(SubagentSummary)),
   "async": optionalKey(Schema.Boolean),
   "call_id": optionalKey(Schema.String),
+  "context": optionalKey(Schema.String),
   "intent": optionalKey(Schema.String),
   "is_error": optionalKey(Schema.Boolean),
   "tasks": optionalKey(Schema.Array(Schema.Struct({ "agent": optionalKey(Schema.String), "name": optionalKey(Schema.String), "task": Schema.String }))),
   "tool": Schema.String,
   "total_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "type": Schema.Literal("task")
-}).annotate({ identifier: "TimelineViewTask", description: "tool_call fields: tasks; tool_output fields: async, total_ms, agents." }))()
+}).annotate({ identifier: "TimelineViewTask", description: "tool_call fields: context, tasks; tool_output fields: async, total_ms, agents." }))()
 export type TimelineViewTask = typeof TimelineViewTask.Type
 export type TimelineViewTaskEncoded = typeof TimelineViewTask.Encoded
 
@@ -2365,7 +2403,9 @@ export type TimelineViewToolStartEncoded = typeof TimelineViewToolStart.Encoded
 
 export const TimelineViewWrite = /*#__PURE__*/ (() => Schema.Struct({
   "bytes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "content": optionalKey(Schema.String),
   "intent": optionalKey(Schema.String),
+  "line_count": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "path": Schema.String,
   "tool": Schema.String,
   "type": Schema.Literal("write")
@@ -2373,7 +2413,7 @@ export const TimelineViewWrite = /*#__PURE__*/ (() => Schema.Struct({
 export type TimelineViewWrite = typeof TimelineViewWrite.Type
 export type TimelineViewWriteEncoded = typeof TimelineViewWrite.Encoded
 
-/** Parsed typed projection of a block, discriminated by `type`. Additive and optional: every definition is closed per type and an unknown type keeps its JSON through the fallback branch. `view` holds parsed fields only; the full native arguments or output stay in the block payload. */
+/** Parsed typed projection of a block, discriminated by type. Known types are closed; future types keep JSON through the fallback. */
 export const TimelineView = /*#__PURE__*/ (() => Schema.Union([
   TimelineViewBash,
   TimelineViewEdit,
@@ -2390,6 +2430,7 @@ export const TimelineView = /*#__PURE__*/ (() => Schema.Union([
   TimelineViewJob,
   TimelineViewSkill,
   TimelineViewCompaction,
+  TimelineViewAssistantError,
   TimelineViewModelChange,
   TimelineViewThinkingLevel,
   TimelineViewTitle,
@@ -2397,8 +2438,8 @@ export const TimelineView = /*#__PURE__*/ (() => Schema.Union([
   TimelineViewToolStart,
   TimelineViewResetBoundary,
   TimelineViewCredentialPin,
-  Schema.Struct({ "type": unknownCase(["bash","edit","write","read","search","todo","ask","task","hub","eval","generic","irc","job","skill","compaction","model_change","thinking_level","title","session_exit","tool_start","reset_boundary","credential_pin"]) })
-], { mode: "oneOf" }).annotate({ identifier: "TimelineView", description: "Parsed typed projection of a block, discriminated by `type`. Additive and optional: every definition is closed per type and an unknown type keeps its JSON through the fallback branch. `view` holds parsed fields only; the full native arguments or output stay in the block payload." }))()
+  Schema.Struct({ "type": unknownCase(["bash","edit","write","read","search","todo","ask","task","hub","eval","generic","irc","job","skill","compaction","assistant_error","model_change","thinking_level","title","session_exit","tool_start","reset_boundary","credential_pin"]) })
+], { mode: "oneOf" }).annotate({ identifier: "TimelineView", description: "Parsed typed projection of a block, discriminated by type. Known types are closed; future types keep JSON through the fallback." }))()
 export type TimelineView = typeof TimelineView.Type
 export type TimelineViewEncoded = typeof TimelineView.Encoded
 

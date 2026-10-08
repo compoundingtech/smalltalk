@@ -22,7 +22,7 @@ export type ConversationEntry = { id: string; at: string; timestamp: string; bod
 /** A typed view on a block: the discriminator is `type`; parsed fields only, the native data
  * stays in the block's `payload` (contract: OMP parity, stacked on #1574). */
 export type BlockView = { type: string } & Record<string, unknown>;
-export type SubagentSummary = { id: string; agent?: string; status: string; task?: string; duration_ms?: number; tokens?: number; cost_usd?: number; requests?: number; tool_count?: number; conversation?: { session_id: string } };
+export type SubagentSummary = { id: string; name?: string; agent?: string; status: string; task?: string; duration_ms?: number; tokens?: number; cost_usd?: number; requests?: number; tool_count?: number; conversation?: { session_id: string } };
 export type JobSummary = { id: string; name?: string; type?: string; state: string; exit_code?: number; started_at?: string; ended_at?: string; duration_ms?: number; output_bytes?: number };
 /** One field of the conversation header: its value, whether the live register (`register`) or
  * the transcript window (`transcript`) holds it, and when that was true. */
@@ -370,7 +370,7 @@ function viewTitle(view: BlockView, tool: string, args: unknown): string {
     switch (view.type) {
       case 'bash': return str(view.command) !== undefined ? `$ ${str(view.command)}` : undefined;
       case 'edit': return str(view.path) !== undefined ? `edit ${str(view.path)}` : undefined;
-      case 'write': return `write ${str(view.path) ?? ''}${bytes !== undefined ? ` · ${bytes} bytes` : ''}`.trim();
+      case 'write': return `write ${str(view.path) ?? ''}${typeof view.line_count === 'number' ? ` · ${view.line_count} lines` : ''}${bytes !== undefined ? ` · ${bytes} bytes` : ''}`.trim();
       case 'read': return `read ${str(view.path) ?? ''}${str(view.range) ? `:${str(view.range)}` : ''}`.trim();
       case 'search': return [str(view.engine), str(view.pattern) ?? str(view.query), str(view.path)].filter(Boolean).join(' ');
       case 'todo': return `todo ${str(view.op) ?? ''}`.trim();
@@ -383,6 +383,53 @@ function viewTitle(view: BlockView, tool: string, args: unknown): string {
     }
   })();
   return title || toolTitle(tool, args);
+}
+
+function viewCallLines(view: BlockView): string[] {
+  const lines: string[] = [];
+  const fields = view.type === 'bash' ? ['cwd', 'timeout_s']
+    : view.type === 'search' ? ['case', 'hidden', 'gitignore', 'limit', 'skip']
+    : view.type === 'eval' ? ['language', 'timeout_s', 'reset'] : [];
+  for (const field of fields) {
+    const value = view[field];
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      lines.push(`${field === 'timeout_s' ? 'timeout' : field}: ${value}${field === 'timeout_s' ? 's' : ''}`);
+    }
+  }
+  if (view.type === 'write') lines.push(...(str(view.content)?.split('\n') ?? []));
+  if (view.type === 'eval') lines.push(...(str(view.code)?.split('\n') ?? []));
+  if (view.type === 'hub') lines.push(...(str(view.message)?.split('\n') ?? []));
+  if (view.type === 'task') {
+    if (str(view.context)) lines.push('parent context / contract:', ...str(view.context)!.split('\n'));
+    for (const task of Array.isArray(view.tasks) ? view.tasks : []) {
+      const value = record(task);
+      lines.push([str(value.name), str(value.agent)].filter(Boolean).join(' · '), ...(str(value.task)?.split('\n') ?? []));
+    }
+  }
+  if (view.type === 'ask') {
+    for (const question of Array.isArray(view.questions) ? view.questions : []) {
+      const value = record(question);
+      lines.push(str(value.question) ?? '');
+      for (const [index, option] of (Array.isArray(value.options) ? value.options : []).entries()) {
+        const alternative = record(option);
+        lines.push(`  ${index + 1}. ${str(alternative.label) ?? ''}`);
+        if (str(alternative.description)) lines.push(...str(alternative.description)!.split('\n').map(line => `     ${line}`));
+      }
+    }
+  }
+  return lines;
+}
+
+function markSelected(lines: readonly string[], view: BlockView | undefined): string[] {
+  if (view?.type !== 'ask') return [...lines];
+  const selected = new Set((Array.isArray(view.answers) ? view.answers : []).flatMap(answer => {
+    const values = record(answer).selected;
+    return Array.isArray(values) ? values.filter((value): value is string => typeof value === 'string') : [];
+  }));
+  return lines.map(line => {
+    const label = /^\s+\d+\. (.*)$/.exec(line)?.[1];
+    return label !== undefined && selected.has(label) ? `${line} [selected]` : line;
+  });
 }
 
 /** One background job as a person reads it: `name · state · exit N · Nms`. */
@@ -438,6 +485,20 @@ function viewOutput(view: BlockView, content: unknown, full = false): string[] |
       const line = bashLine(view);
       return line ? [...toolOutput(content, full), line] : toolOutput(content, full);
     }
+    case 'search': {
+      const summary = [
+        typeof view.match_count === 'number' ? `${view.match_count} matches` : undefined,
+        typeof view.file_count === 'number' ? `${view.file_count} files` : undefined,
+      ].filter(Boolean).join(' / ');
+      return [
+        ...(summary ? [summary] : []),
+        ...(view.truncated === true ? ['warning: search results truncated'] : []),
+        ...(typeof view.file_limit_reached === 'number' ? [`warning: file limit reached (${view.file_limit_reached})`] : []),
+        ...(typeof view.per_file_limit_reached === 'number' ? [`warning: per-file limit reached (${view.per_file_limit_reached})`] : []),
+        ...(str(view.warning)?.split('\n') ?? []),
+        ...toolOutput(content, full),
+      ];
+    }
     case 'edit': return str(view.diff) !== undefined ? str(view.diff)!.split('\n') : toolOutput(content, full);
     case 'todo': return Array.isArray(view.phases) ? todoLines(view) : undefined;
     case 'ask': return Array.isArray(view.answers) ? askLines(view) : undefined;
@@ -453,13 +514,13 @@ function subagentCard(agent: unknown, state: ToolState): { id: string; title: st
   const value = record(agent);
   const lines: string[] = [];
   const task = str(value.task);
-  if (task) lines.push(task.split('\n')[0]);
+  if (task) lines.push(...task.split('\n'));
   if (typeof value.duration_ms === 'number') lines.push(`duration ${value.duration_ms}ms`);
   if (typeof value.tokens === 'number') lines.push(`tokens ${value.tokens}`);
   if (typeof value.cost_usd === 'number') lines.push(`cost $${value.cost_usd.toFixed(2)}`);
   const session = str(record(value.conversation).session_id);
   if (session) lines.push(`open ${session}`);
-  return { id: str(value.id) ?? '', title: [str(value.agent) ?? str(value.id), str(value.status)].filter(Boolean).join(' · '), output: lines };
+  return { id: str(value.id) ?? '', title: [str(value.name) ?? str(value.agent) ?? str(value.id), str(value.status), ...(str(value.name) && str(value.agent) ? [str(value.agent)] : [])].filter(Boolean).join(' · '), output: lines };
 }
 
 /** The child conversation a subagent card opens, when it has one. */
@@ -507,6 +568,15 @@ function extensionBodies(blocks: unknown): Body[] | 'skip' | undefined {
       bodies.push({ kind: 'mail', from: str(view.from) ?? 'someone', to: '', subject: '', text: str(view.message) ?? '', delivered: false });
     } else if (value.kind === 'job' && view.type === 'job' && Array.isArray(view.jobs)) {
       for (const job of view.jobs) bodies.push({ kind: 'event', tone: 'quiet', text: jobLine(job) });
+    } else if (value.kind === 'error' && view.type === 'assistant_error') {
+      if (view.presentation !== 'none') bodies.push({
+        kind: 'tool', title: `assistant error · ${str(view.status) ?? 'failed'} · ${str(view.label) ?? ''}`,
+        state: view.is_error === true ? 'failed' : 'ok',
+        output: [...(str(view.message)?.split('\n') ?? []), ...(str(record(view.retry).note)?.split('\n') ?? [])],
+      });
+      else skip = true;
+    } else if (value.kind === 'status' && view.type === 'compaction') {
+      bodies.push({ kind: 'tool', title: statusLine(view as BlockView) ?? 'compaction', state: 'ok', output: str(view.summary)?.split('\n') ?? [] });
     } else if (value.kind === 'status') {
       const line = statusLine(view as BlockView);
       if (line === null) skip = true;
@@ -675,6 +745,7 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
   const name = (id: string): string => names.get(id) ?? (id === 'daemon/runtime' ? 'st' : id.startsWith('person/') ? id.slice('person/'.length) : short(id));
   const stamped: ConversationEntry[] = [];
   const tools = new Map<string, number>();
+  const callSources = new Map<string, Entry>();
   const shown = new Set(timeline.filter(entry => entry.type === 'message').map(entry => str(record(entry.body).message_id) ?? '').filter(id => id.startsWith('message/')));
   const delivered = new Set<string>();
   let mail: Record<string, unknown> | undefined;
@@ -753,9 +824,9 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
       }
       case 'tool_call': {
         const call = str(body.call_id);
-        if (call) tools.set(call, stamped.length);
+        if (call) { tools.set(call, stamped.length); callSources.set(call, entry); }
         const view = blockView(body.blocks, 'tool_call');
-        push(entry, entry.id, { kind: 'tool', title: view ? viewTitle(view, str(body.name) ?? 'tool', body.arguments) : toolTitle(str(body.name) ?? 'tool', body.arguments), state: 'running', output: [] });
+        push(entry, entry.id, { kind: 'tool', title: view ? viewTitle(view, str(body.name) ?? 'tool', body.arguments) : toolTitle(str(body.name) ?? 'tool', body.arguments), state: 'running', output: view ? viewCallLines(view) : [] });
         break;
       }
       case 'tool_result': {
@@ -765,11 +836,12 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
         const index = tools.get(str(body.call_id) ?? '');
         const call = index === undefined ? undefined : stamped[index];
         if (call?.body.kind === 'tool') {
-          call.body = { ...call.body, state, output };
+          call.body = { ...call.body, state, output: view?.type === 'todo' ? output : [...markSelected(call.body.output, view), ...output] };
           const content = contentReferences(entry.body);
           if (content.length) {
             call.content = [...(call.content ?? []), ...content];
-            call.contentSources = [...(call.contentSources ?? []), entry];
+            const source = callSources.get(str(body.call_id) ?? '');
+            call.contentSources = [...(call.contentSources ?? (source ? [source] : [])), entry];
           }
         }
         else push(entry, entry.id, { kind: 'tool', title: 'tool result', state, output });
@@ -863,8 +935,10 @@ export function folds(body: Body): boolean {
 }
 /** The lines a tool box shows: all when open, failed, or short; otherwise its last five. */
 export function shownToolLines(body: Extract<Body, { kind: 'tool' }>, open: boolean): { hidden: number; lines: string[] } {
+  if (!open && body.title.startsWith('assistant error · recovered')) return { hidden: body.output.length, lines: [] };
   if (open || body.output.length <= COLLAPSED_TOOL_LINES) return { hidden: 0, lines: body.output };
-  return { hidden: body.output.length - COLLAPSED_TOOL_LINES, lines: body.output.slice(-COLLAPSED_TOOL_LINES) };
+  const head = body.title.startsWith('write ') || body.title.startsWith('compaction');
+  return { hidden: body.output.length - COLLAPSED_TOOL_LINES, lines: head ? body.output.slice(0, COLLAPSED_TOOL_LINES) : body.output.slice(-COLLAPSED_TOOL_LINES) };
 }
 
 /** What a problem means for what is shown: how old it is and that the phone keeps trying. */
@@ -881,8 +955,8 @@ const hasClippedValue = (value: unknown): boolean => typeof value === 'string'
   : Array.isArray(value) ? value.some(hasClippedValue)
   : value !== null && typeof value === 'object' ? Object.values(value).some(hasClippedValue) : false;
 
-/** Use the normal typed projection for an identifiable full body or an
- * unambiguous clipped payload. Metadata/view subtrees and unknown JSON stay raw. */
+/** Use the normal typed projection for an identifiable full body, a typed view
+ * continuation, or an unambiguous clipped payload; unknown metadata stays raw. */
 export const fetchedConversationEntries = (
   entry: ConversationEntry, reference: ConversationContentRef, value: unknown,
 ): ConversationEntry[] | undefined => {
@@ -898,7 +972,13 @@ export const fetchedConversationEntries = (
   const payload = hasClippedValue(block.payload) && !hasClippedValue(block.metadata) && !hasClippedValue(block.view);
   const full = record(value);
   let body: unknown;
-  if (source.type === 'tool_result') {
+  const sourceBlock = record(block);
+  const fetchedView = !hasClippedValue(value) && typeof full.type === 'string' && full.type === record(sourceBlock.view).type && hasClippedValue(sourceBlock.view);
+  if (fetchedView && !hasClippedValue(sourceBlock.metadata) && !hasClippedValue(sourceBlock.payload)) {
+    const blocks = Array.isArray(original.blocks) ? original.blocks.map(candidate => candidate === block ? { ...sourceBlock, view: value } : candidate) : [];
+    body = { ...original, blocks };
+  }
+  else if (source.type === 'tool_result') {
     if (full.call_id === original.call_id && typeof full.media_type === 'string'
       && ['success', 'error', 'unknown'].includes(String(full.status)) && 'content' in full) body = full;
     else if (payload) body = { ...original, content: value };
@@ -907,12 +987,13 @@ export const fetchedConversationEntries = (
     if (full.call_id === original.call_id && full.name === original.name && 'arguments' in full) body = full;
     else if (payload) body = { ...original, arguments: value };
     else return undefined;
-  } else if (source.type === 'content' && ['text', 'reasoning'].includes(String(block.kind))) {
+  } else if (source.type === 'content' && (['text', 'reasoning'].includes(String(block.kind)) || record(block.view).type === 'compaction')) {
     if (typeof full.media_type === 'string' && typeof full.text === 'string') body = full;
     else if (payload && typeof value === 'string') body = { ...original, text: value };
     else return undefined;
   } else return undefined;
-  return conversationEntries([{ ...source, body }], new Map(), DEFAULT_FILTERS, true).map(shown => {
+  const call = source.type === 'tool_result' ? entry.contentSources?.find(candidate => candidate.type === 'tool_call' && record(candidate.body).call_id === original.call_id) : undefined;
+  return conversationEntries([...(call ? [call] : []), { ...source, body }], new Map(), DEFAULT_FILTERS, true).map(shown => {
     const body = shown.body.kind === 'tool' && entry.body.kind === 'tool'
       ? { ...shown.body, title: entry.body.title } : shown.body;
     return { id: shown.id, at: shown.at, timestamp: shown.timestamp, body };

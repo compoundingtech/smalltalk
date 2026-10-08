@@ -116,13 +116,13 @@ impl Cache {
             // A run of tool calls, or one other entry drawn as in full.
             let run = entries[index..]
                 .iter()
-                .take_while(|entry| matches!(entry.body, Body::Tool { .. }))
+                .take_while(|entry| matches!(&entry.body, Body::Tool { title, .. } if !title.starts_with("assistant error") && !title.starts_with("compaction") && !title.starts_with("write ")))
                 .count();
             if run == 0 {
                 let entry = &entries[index];
                 doc.entries.push((entry.id.clone(), doc.lines.len()));
                 // Mail between others is two lines until opened (Nathan, 2026-10-02).
-                if folds(&entry.body) && !expanded.contains(&entry.id) {
+                if matches!(&entry.body, Body::Mail { .. }) && folds(&entry.body) && !expanded.contains(&entry.id) {
                     doc.append(mail_lines(entry, width, theme), 0);
                     index += 1;
                     continue;
@@ -413,6 +413,9 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 title_style = title_style.add_modifier(Modifier::BOLD);
             }
             let row_style = fg(look.rows, theme);
+            let preview_head = title.starts_with("write ") || title.starts_with("compaction");
+            let child_name = title.split(" · ").next().unwrap_or(title);
+            let recovered = title.starts_with("assistant error · recovered");
             let title = text::truncate(&text::sanitize(title), width.saturating_sub(6));
             doc.targets.push(Target {
                 line: 0,
@@ -432,7 +435,11 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             for line in output {
                 let opens = line.starts_with("open ") && open_row.is_none();
                 let before = rows.len();
-                let line = text::sanitize(line);
+                let line = if opens {
+                    text::sanitize(&format!("open {child_name}"))
+                } else {
+                    text::sanitize(line)
+                };
                 let style = if line.starts_with('+') {
                     fg(rules.added, theme)
                 } else if line.starts_with('-') || line.contains("error") {
@@ -459,6 +466,8 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             let total = rows.len();
             let hidden = if open {
                 0
+            } else if recovered {
+                total
             } else {
                 total.saturating_sub(COLLAPSED_TOOL_LINES)
             };
@@ -472,13 +481,17 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             if open && total > COLLAPSED_TOOL_LINES {
                 control(&mut doc, rules.collapse.text.into());
             }
-            doc.lines(rows.into_iter().skip(hidden));
+            if preview_head {
+                doc.lines(rows.into_iter().take(total - hidden));
+            } else {
+                doc.lines(rows.into_iter().skip(hidden));
+            }
             if let (Some(row), Some(session)) = (
-                open_row.filter(|row| *row >= hidden),
+                open_row.filter(|row| if preview_head { *row < total - hidden } else { *row >= hidden }),
                 crate::header::open_session(output),
             ) {
                 doc.targets.push(Target {
-                    line: row - hidden + 1,
+                    line: if preview_head { row + 1 } else { row - hidden + 1 },
                     column: 0,
                     width: width as u16,
                     hit: PaneIntent::Open(session.to_owned()),

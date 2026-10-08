@@ -1683,6 +1683,22 @@ has it, and `working` comes only from the register. The full mapping tables live
 clients model `view` and `header` as optional loose JSON; `timeline-views.json` is the
 wire fixture.
 
+The pre-approval parity audit adds these parsed contract fields explicitly:
+`TimelineViewTask.context`, `SubagentSummary.name` (OMP name, distinct from agent
+type), `TimelineViewWrite.content` and `line_count`, search flags `case`, `hidden`,
+`gitignore`, `limit`, `skip` and output fields `call_id`, `is_error`, `match_count`,
+`file_count`, `truncated`, `file_limit_reached`, `per_file_limit_reached`, `warning`;
+ask option `description`; hub `message`; eval `code`, `timeout_s`, `reset`; and
+compaction `summary`. Existing bash `cwd` and `timeout_s` now render on both clients.
+Assistant session errors add `TimelineViewAssistantError` with `status`,
+`presentation`, `is_error`, `label`, original `message`, optional `stop_reason`,
+`error_id`, `api`, `provider`, `model`, and optional persisted `retry`
+(`kind`, `status`, `attempt`, `recovery`, `note`, ISO-string `recovered_at`,
+`superseded_by` with epoch-ms `timestamp`, `response_id`, `provider`, `model`).
+Recovery markers do not invent live retry state. Recovered errors start compact,
+retain original errors on expansion, and superseded errors are not drawn.
+
+
 `read.projections` authorizes **raw native conversation content**, including full
 arguments, output, reasoning shown by the harness, unknown JSON and images. It is
 the existing scope for pages, deltas and owner forwarding, and also governs
@@ -1708,9 +1724,11 @@ the assembled JSON is the complete original value, not a suffix to splice into t
 clipped preview. A ref may cover a payload, an open metadata/view subtree, or the
 complete native body. An identifiable full tool body (same call identity), or a
 payload whose preview was clipped while metadata/view were not, uses the existing
-typed output adapter without its preview line limit. Ambiguous metadata/view
-subtrees and unknown values keep a lossless raw JSON fallback. Loading is explicit
-for that block or through stui's expand-all keypress. Expand-all loads only visible
+typed output adapter without its preview line limit. Identifiable view-only refs
+are reattached to the original block and use that same adapter, including written
+content and compaction summaries. Metadata and unknown values keep a lossless raw
+JSON fallback. Loading non-image content is explicit for that block or through
+stui's expand-all keypress. Expand-all loads only visible
 clipped tool values, with one owner content read active at a time; newly visible
 rows load next without prefetching offscreen rows. Loaded values remain in memory
 when scrolled away and are released on collapse. Restoring saved expansion state
@@ -1721,6 +1739,17 @@ fetched chunks report the detected passive image media type and exact byte count
 Clients keep expanded values, image bytes and inline image data URIs/protocols in
 memory only, scoped to the conversation and reference. Loading does not create a
 temporary file, persistent cache, stored conversation history or outbox.
+
+Native images load automatically when their image box is visible on the phone, or
+their image label is visible in a graphics-capable stui terminal. Phone overscan,
+inactive screens, offscreen terminal entries and covered panes do not authorize
+automatic reads. stui uses the same one-read-at-a-time queue, and Ctrl+U explicitly
+hides/shows a tool's images; hidden images stay hidden through redraws and scrolls.
+Unsupported terminals retain explicit loading instead of automatic fetching.
+Phone shows a Load/Retry action only after failure. Image reads and decoded pixels
+remain memory-only and are released with their retained timeline entries; late
+responses cannot resurrect a hidden or discarded image.
+
 
 Edited records, replacement, managed binding changes and owner restarts invalidate references;
 append-only growth preserves existing refs:

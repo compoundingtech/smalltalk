@@ -418,7 +418,12 @@ fn conversation_with_output_mode(
                     *slot = state;
                     // Transcript revisions can put the result after the expansion.
                     if !expanded_skills.contains(&index) {
-                        *out = output;
+                        if view.is_some_and(|view| view["type"] == "todo") {
+                            *out = output;
+                        } else {
+                            if let Some(view) = view { mark_selected(out, view); }
+                            out.extend(output);
+                        }
                     }
                     continue;
                 }
@@ -1334,11 +1339,11 @@ fn typed_call(
             "" => "edit".into(),
             path => format!("edit {path}"),
         },
-        "write" => format!(
-            "write {} · {} bytes",
-            string("path"),
-            view.get("bytes").and_then(Value::as_u64).unwrap_or(0)
-        ),
+        "write" => {
+            let lines = view.get("line_count").and_then(Value::as_u64)
+                .map_or_else(String::new, |count| format!(" · {count} lines"));
+            format!("write {}{lines} · {} bytes", string("path"), view.get("bytes").and_then(Value::as_u64).unwrap_or(0))
+        },
         "read" => match string("range") {
             "" => format!("read {}", string("path")),
             range => format!("read {}:{range}", string("path")),
@@ -1391,6 +1396,40 @@ fn typed_call(
         _ => return (tool_title(name, arguments), Vec::new()),
     };
     let output = match kind {
+        "bash" | "search" | "eval" => {
+            let mut rows = Vec::new();
+            for field in match kind {
+                "bash" => &["cwd", "timeout_s"][..],
+                "search" => &["case", "hidden", "gitignore", "limit", "skip"][..],
+                _ => &["language", "timeout_s", "reset"][..],
+            } {
+                if let Some(value) = view.get(*field) {
+                    let label = if *field == "timeout_s" { "timeout" } else { field };
+                    let value = value.as_str().map_or_else(|| value.to_string(), str::to_owned);
+                    rows.push(format!("{label}: {value}{}", if *field == "timeout_s" { "s" } else { "" }));
+                }
+            }
+            if kind == "eval" {
+                rows.extend(string("code").lines().map(str::to_owned));
+            }
+            rows
+        }
+        "write" => string("content").lines().map(str::to_owned).collect(),
+        "hub" => string("message").lines().map(str::to_owned).collect(),
+        "task" => {
+            let mut rows = Vec::new();
+            if !string("context").is_empty() {
+                rows.push("parent context / contract:".into());
+                rows.extend(string("context").lines().map(str::to_owned));
+            }
+            for task in view.get("tasks").and_then(Value::as_array).into_iter().flatten() {
+                let named = task.get("name").and_then(Value::as_str).unwrap_or("");
+                let agent = task.get("agent").and_then(Value::as_str).unwrap_or("");
+                rows.push(format!("{named} · {agent}"));
+                rows.extend(task.get("task").and_then(Value::as_str).unwrap_or("").lines().map(str::to_owned));
+            }
+            rows
+        }
         "todo" => view
             .get("items")
             .and_then(Value::as_array)
@@ -1434,6 +1473,30 @@ fn typed_result(view: &Value, fallback: Vec<String>) -> (Vec<String>, Option<Too
                     .and_then(Value::as_i64)
                     .is_some_and(|code| code != 0);
             (rows, failed.then_some(ToolState::Failed))
+        }
+        "search" => {
+            let mut rows = Vec::new();
+            let mut summary = Vec::new();
+            if let Some(count) = view.get("match_count").and_then(Value::as_u64) {
+                summary.push(format!("{count} matches"));
+            }
+            if let Some(count) = view.get("file_count").and_then(Value::as_u64) {
+                summary.push(format!("{count} files"));
+            }
+            if !summary.is_empty() { rows.push(summary.join(" / ")); }
+            if view.get("truncated").and_then(Value::as_bool) == Some(true) {
+                rows.push("warning: search results truncated".into());
+            }
+            for (field, label) in [("file_limit_reached", "file limit reached"), ("per_file_limit_reached", "per-file limit reached")] {
+                if let Some(count) = view.get(field).and_then(Value::as_u64) {
+                    rows.push(format!("warning: {label} ({count})"));
+                }
+            }
+            if let Some(warning) = view.get("warning").and_then(Value::as_str) {
+                rows.extend(warning.lines().map(str::to_owned));
+            }
+            rows.extend(fallback);
+            (rows, None)
         }
         "edit" => match view.get("diff").and_then(Value::as_str) {
             Some(diff) => (diff.lines().map(str::to_owned).collect(), None),
@@ -1543,6 +1606,18 @@ fn typed_content(content: &st3_client::TimelineContentBody) -> Option<Vec<Body>>
                 .map(|job| Body::Event(job_line(job)))
                 .collect(),
         ),
+        "assistant_error" => {
+            if string("presentation") == "none" { return Some(Vec::new()); }
+            let mut output: Vec<String> = string("message").lines().map(str::to_owned).collect();
+            if let Some(note) = view.pointer("/retry/note").and_then(Value::as_str) {
+                output.extend(note.lines().map(str::to_owned));
+            }
+            Some(vec![Body::Tool {
+                title: format!("assistant error · {} · {}", string("status"), string("label")),
+                state: if view.get("is_error").and_then(Value::as_bool) == Some(true) { ToolState::Failed } else { ToolState::Ok },
+                output,
+            }])
+        }
         "compaction" => {
             let mut parts = vec!["compaction".to_owned(), string("method").to_owned()];
             if let (Some(before), Some(after)) = (
@@ -1551,7 +1626,11 @@ fn typed_content(content: &st3_client::TimelineContentBody) -> Option<Vec<Body>>
             ) {
                 parts.push(format!("{before} → {after} tokens"));
             }
-            event(parts)
+            Some(vec![Body::Tool {
+                title: parts.into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" · "),
+                state: ToolState::Ok,
+                output: string("summary").lines().map(str::to_owned).collect(),
+            }])
         }
         "model_change" => {
             let mut parts = vec!["model".to_owned(), string("model").to_owned()];
@@ -1625,6 +1704,9 @@ fn question_rows(question: &Value) -> Vec<String> {
             index + 1,
             option.get("label").and_then(Value::as_str).unwrap_or_default()
         ));
+        if let Some(description) = option.get("description").and_then(Value::as_str) {
+            rows.extend(description.lines().map(|line| format!("     {line}")));
+        }
     }
     rows
 }
@@ -1654,9 +1736,9 @@ fn job_line(job: &Value) -> String {
 fn agent_card(agent: &Value) -> Body {
     let string = |field: &str| agent.get(field).and_then(Value::as_str).unwrap_or("");
     let named = {
-        let agent_name = string("agent");
+        let agent_name = string("name");
         if agent_name.is_empty() {
-            string("name")
+            string("agent")
         } else {
             agent_name
         }
@@ -1669,7 +1751,7 @@ fn agent_card(agent: &Value) -> Body {
     let status = string("status");
     let mut output = Vec::new();
     if let Some(task) = agent.get("task").and_then(Value::as_str) {
-        output.push(first_line(task).to_owned());
+        output.extend(task.lines().map(str::to_owned));
     }
     if let Some(ms) = agent.get("duration_ms").and_then(Value::as_u64) {
         output.push(format!("duration {ms}ms"));
@@ -1691,7 +1773,9 @@ fn agent_card(agent: &Value) -> Body {
         ToolState::Ok
     };
     Body::Tool {
-        title: format!("{who} · {status}"),
+        title: if !string("name").is_empty() && !string("agent").is_empty() {
+            format!("{who} · {status} · {}", string("agent"))
+        } else { format!("{who} · {status}") },
         state,
         output,
     }
@@ -1703,6 +1787,19 @@ fn agent_id(agent: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned()
+}
+
+fn mark_selected(rows: &mut [String], view: &Value) {
+    if view.get("type").and_then(Value::as_str) != Some("ask") { return; }
+    for answer in view.get("answers").and_then(Value::as_array).into_iter().flatten() {
+        for selected in answer.get("selected").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+            for row in rows.iter_mut() {
+                if row.trim_start().split_once(". ").is_some_and(|(number, label)| number.chars().all(|c| c.is_ascii_digit()) && label == selected) {
+                    row.push_str(" [selected]");
+                }
+            }
+        }
+    }
 }
 
 fn first_line(text: &str) -> &str {
