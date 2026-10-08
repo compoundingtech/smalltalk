@@ -20,13 +20,18 @@ output. **o** in the classic view, or **Ctrl+E** in glasses, expands all tool ro
 loads visible clipped output one value at a time. Scrolling another clipped row into
 view loads it next; offscreen rows are not prefetched. Already loaded rows stay in
 memory when scrolled away, until collapsed. Restoring saved expansion state does not
-start loading. **Ctrl+U**, outside the composer, loads or hides native images inline
-using the terminal's image renderer. **Ctrl+O** keeps its pane-zoom action. On the phone,
-**Show all** loads the clipped result and **Show less** collapses it; **Load image**
-displays the fetched image inline. Image media type and byte size
-become exact after loading. Expanded native output and fetched native images stay
-in memory only, and collapsing output or hiding an image releases the fetched data.
-Reopening loads it again. This does not change mail attachment opening: stui still saves a
+start loading full output. Native images load automatically when their image row is
+visible, without prefetching offscreen images. stui does this only on terminals known
+to support graphics and shares the one-value-at-a-time content reader. **Ctrl+U**,
+outside the composer, still loads or hides images explicitly; a hidden image stays
+hidden when scrolled back into view. Other terminals keep explicit loading through
+the half-block renderer. **Ctrl+O** keeps its pane-zoom action. On the phone,
+**Show all** loads the clipped result and **Show less** collapses it; visible image
+boxes load automatically, and a failed image offers **Retry loading image**.
+Image media type and byte size become exact after loading. Expanded native output
+and fetched native images stay in memory only; collapsing output or hiding an image
+releases the fetched data, as does leaving the retained timeline. Reopening explicitly
+loads it again. This does not change mail attachment opening: stui still saves a
 received mail image under its attachment directory and opens the machine's viewer.
 
 ## From the CLI
