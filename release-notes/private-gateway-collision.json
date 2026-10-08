@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Private --state-dir takes precedence over --socket when deriving the paired gateway. Socket-only startup refuses if its derived gateway equals the shared default, resolving existing parent-directory symlinks. Explicit --client-gateway-socket and default startup are unchanged."
+    "detail": "Private --state-dir takes precedence over --socket when deriving the paired gateway. Socket-only startup refuses if its derived gateway equals the shared default, resolving the nearest existing ancestor even when the runtime directory does not yet exist. Explicit --client-gateway-socket and default startup are unchanged."
   },
   "manual": {
     "status": "changed",

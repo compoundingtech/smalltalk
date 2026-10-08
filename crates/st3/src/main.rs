@@ -5590,10 +5590,17 @@ impl std::error::Error for PrivateGatewayCollision {}
 fn gateway_path_for_comparison(socket: &Path) -> Result<PathBuf> {
     let socket = std::path::absolute(socket)?;
     let parent = socket.parent().context("gateway socket has no parent")?;
-    let parent = match fs::canonicalize(parent) {
-        Ok(parent) => parent,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => parent.to_path_buf(),
-        Err(error) => return Err(error).context("resolve gateway socket parent"),
+    let mut ancestor = parent;
+    let parent = loop {
+        match fs::canonicalize(ancestor) {
+            Ok(resolved) => break resolved.join(parent.strip_prefix(ancestor)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor
+                    .parent()
+                    .context("gateway socket has no existing ancestor")?;
+            }
+            Err(error) => return Err(error).context("resolve gateway socket parent"),
+        }
     };
     Ok(parent.join(
         socket
@@ -5704,6 +5711,20 @@ mod private_gateway_tests {
             gateway_path_for_comparison(&alias.join("st3-client.sock")).unwrap()
         );
         assert!(!runtime.join("st3-client.sock").exists());
+    }
+
+    #[test]
+    fn gateway_comparison_resolves_ancestor_above_missing_runtime_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert_eq!(
+            gateway_path_for_comparison(&real.join("missing/run/st3-client.sock")).unwrap(),
+            gateway_path_for_comparison(&alias.join("missing/run/st3-client.sock")).unwrap()
+        );
+        assert!(!real.join("missing").exists());
     }
 }
 

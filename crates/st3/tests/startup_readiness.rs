@@ -67,6 +67,38 @@ fn private_runtime_socket_refuses_shared_gateway_before_creating_state() {
 }
 
 #[test]
+fn private_runtime_socket_refuses_shared_gateway_before_creating_state_with_missing_runtime_directory()
+{
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let output = command(root.path())
+        .env("XDG_RUNTIME_DIR", real.join("run"))
+        .arg("up")
+        .arg("--socket")
+        .arg(alias.join("run/private-st.sock"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("pass --client-gateway-socket; the derived private gateway"),
+        "{error}"
+    );
+    assert!(
+        error.contains("equals the shared default gateway"),
+        "{error}"
+    );
+    assert!(!root.path().join("home/.local/state").exists());
+    assert!(!real.join("run").exists());
+}
+
+#[test]
 fn replay_is_visible_before_the_api_serves_and_stale_files_are_ignored() {
     if st3::test_support::supervise_test() {
         return;
