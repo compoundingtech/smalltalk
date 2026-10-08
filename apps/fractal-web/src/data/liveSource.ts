@@ -26,7 +26,6 @@ import { unavailableTerminalHistory } from '../terminal/historySource.ts'
 import { gatewayTerminalResize } from '../terminal/terminal-resize-port.ts'
 import { makeFrameIngest } from './frameIngest.ts'
 import { nativeAgentFetch } from './nativeAgentFetch.ts'
-import type { CachedProjection, ReloadCache } from './reloadCache.ts'
 import {
   initialFeedSync,
   observeFeedSync,
@@ -67,11 +66,9 @@ interface RetainedFeed<A> {
 /** Connect retained workbench projections through one SDK runtime and frame writer. */
 export const liveSource = ({
   options,
-  cache,
   telemetryLayer,
 }: {
   readonly options: St3Options
-  readonly cache?: ReloadCache | undefined
   /** Browser root owns sampling and observers; the SDK shares its scoped tracer/exporter. */
   readonly telemetryLayer?: Layer.Layer<never> | undefined
 }): LiveSource => {
@@ -134,7 +131,6 @@ export const liveSource = ({
             if (event.state._tag === 'Rejected') {
               readRejection = event.state.message
               registry.set(readRefusal, event.state.message)
-              void cache?.clear()
               for (const deny of deniedReaders) deny(event.state.message)
             }
             if (event.state._tag === 'Rejected' || event.state._tag === 'Reconnecting')
@@ -173,7 +169,7 @@ export const liveSource = ({
     keepAlive = true,
     onCommit,
     explicitInterest = false,
-    cached,
+    onVisibilityChange,
   }: {
     readonly resolve: (get: Atom.AtomContext) => Effect.Effect<TSpec, AttachFailure>
     readonly follow: (args: {
@@ -183,7 +179,7 @@ export const liveSource = ({
     readonly keepAlive?: boolean
     readonly onCommit?: (value: A) => void
     readonly explicitInterest?: boolean
-    readonly cached?: CachedProjection<A> | undefined
+    readonly onVisibilityChange?: (visible: boolean) => void
   }) => {
     let visible = false
     let ended = false
@@ -210,7 +206,6 @@ export const liveSource = ({
         latest = unavailable({ reason: 'ungranted', detail: readRejection })
       else if (latest._tag === 'Observed') latest = { ...latest, freshness: 'stale' }
       registry.set(data, latest)
-      let cacheEligible = latest._tag === 'Waiting'
       const commit = () => {
         if (active) {
           if (latest._tag === 'Observed') onCommit?.(latest.value)
@@ -227,15 +222,7 @@ export const liveSource = ({
         readonly requested: () => void
         readonly failed: (failure: FeedSyncFailure) => void
       } | undefined
-      if (cacheEligible && cached !== undefined)
-        void cached.read().then((value) => {
-          // A slow IDB read may never overwrite an observation, refusal, failure or new atom run.
-          if (!active || !cacheEligible || value === undefined) return
-          latest = observed({ value, freshness: 'stale' })
-          ingest.accept({ key: commit, value: commit })
-        })
       const deny = (message: string) => {
-        cacheEligible = false
         latest = unavailable({ reason: 'ungranted', detail: message })
         ingest.accept({ key: commit, value: commit })
       }
@@ -271,15 +258,11 @@ export const liveSource = ({
               Effect.sync(() => {
                 if (!active || readRejection !== undefined) return
                 if (event._tag === 'Observed') {
-                  cacheEligible = false
                   latest = observed({ value: event.value })
                   syncLatest = observeFeedSync(syncLatest, event.value, Date.now())
-                  cached?.write(event.value)
                 } else if (event._tag === 'Failed') {
                   syncLatest = transitionFeedSync(syncLatest, { _tag: 'Failed', failure: event.error }, Date.now())
                   terminalFailure = true
-                  cacheEligible = false
-                  void cached?.remove()
                   // Keep only previously decoded rows, never fabricate missing claims.
                   // The daemon's integrity failure stays visible and remains non-retryable.
                   const incompleteHistory =
@@ -321,8 +304,6 @@ export const liveSource = ({
 
               terminalFailure = true
               latest = unavailable({ reason: 'failed', detail: error.message })
-              cacheEligible = false
-              void cached?.remove()
               ingest.accept({ key: commit, value: commit })
             }),
           ),
@@ -348,6 +329,7 @@ export const liveSource = ({
     let retained: RetainedFeed<A>
     const interest = Atom.make((get) => {
       visible = true
+      onVisibilityChange?.(true)
       if (explicitInterest) unmount ??= registry.mount(following)
       if (ended && !terminalFailure) {
         ingest.flush()
@@ -358,6 +340,7 @@ export const liveSource = ({
         runtime.runFork(Effect.flatMap(St3, (st3) => st3.setVisible(current, true)))
       get.addFinalizer(() => {
         visible = false
+        onVisibilityChange?.(false)
         const hidden = spec
         if (hidden !== undefined)
           runtime.runFork(Effect.flatMap(St3, (st3) => st3.setVisible(hidden, false)))
@@ -396,7 +379,6 @@ export const liveSource = ({
   }
 
   const agentsRetained = retain<readonly Agent[], Extract<FollowSpec, { _tag: 'Window' }>>({
-    cached: cache?.agents,
     resolve: () => Effect.succeed({ _tag: 'Window', collection: 'agents', limit: 100 }),
     follow: ({ st3, spec }) =>
       st3.followWindow(spec).pipe(
@@ -445,18 +427,25 @@ export const liveSource = ({
   const attention = attentionRetained.atom
 
   // Atom.family is weakly memoized. Keep the 24 recent snapshot controllers explicitly.
+  const visibleConversations = new Map<string, boolean>()
   const conversationFamily = Atom.family((ref: string) => {
     const timeline = new LiveTimeline()
+    let painted = false
     let publishedItems: ConversationPage['items'] = []
     let changedFrom = Infinity
     return retain<ConversationPage, Extract<FollowSpec, { _tag: 'Conversation' }>>({
       keepAlive: false,
       explicitInterest: true,
-      cached: cache?.conversation(ref),
       resolve: () => Effect.succeed({ _tag: 'Conversation', ref }),
       onCommit: (page) => {
         publishedItems = page.items
         changedFrom = Infinity
+        painted = true
+        if (visibleConversations.has(ref)) visibleConversations.set(ref, true)
+      },
+      onVisibilityChange: (visible) => {
+        if (visible) visibleConversations.set(ref, painted)
+        else visibleConversations.delete(ref)
       },
       follow: ({ st3, spec }) =>
         st3.followConversation(spec).pipe(
@@ -606,6 +595,11 @@ export const liveSource = ({
       conversation,
       conversationInterest: (ref) => retainConversation(ref).interest,
       prefetchConversation: (ref) => {
+        // Explicit intent never competes with the selected thread's cold first page.
+        // Only the frame writer marks a real observed page as painted.
+        if (visibleConversations.size === 0) return
+        for (const painted of visibleConversations.values())
+          if (!painted) return
         retainConversation(ref).prefetch()
       },
       resources,
@@ -642,7 +636,6 @@ export const liveSource = ({
       recentConversations.clear()
       registry.dispose()
       await runtime.dispose()
-      await cache?.dispose()
       setDebug('Wf.conversationEntries', 0)
     },
   }

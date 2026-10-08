@@ -138,7 +138,7 @@ export interface DataSource {
   readonly conversation: (agentRef: string) => Atom.Atom<Feed<ConversationPage>>
   /** Mounted by visible surfaces in an effect; reading a hidden snapshot never acquires demand. */
   readonly conversationInterest?: (agentRef: string) => Atom.Atom<void>
-  /** Start an invisible retained follow on pointer intent or keyboard focus. */
+  /** Explicit pointer/focus intent; live admits it only after a visible thread's first-page frame. */
   readonly prefetchConversation?: (agentRef: string) => void
   /** Keyed by terminal ref; live attaches a read-only viewer. */
   readonly terminal: (terminalRef: string) => Atom.Atom<Feed<TerminalScreen>>
