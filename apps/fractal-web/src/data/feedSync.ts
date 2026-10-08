@@ -1,6 +1,12 @@
+import type { SyncStatus as KitSyncStatus } from '@smalltalk/fractal-ui/assistant-ui/sync'
 import type { SyncStatus } from '@st3/sdk/effect'
 import * as Equal from 'effect/Equal'
 import * as Option from 'effect/Option'
+
+type Same<TA, TB> = (<T>() => T extends TA ? 1 : 2) extends (<T>() => T extends TB ? 1 : 2) ? true : false
+type Assert<T extends true> = T
+/** The kit owns the portable union; the standalone SDK mirrors it exactly. */
+export type SdkSyncStatusMatchesKit = Assert<Same<SyncStatus, KitSyncStatus>>
 
 export interface FeedSyncObservation {
   readonly status: SyncStatus
