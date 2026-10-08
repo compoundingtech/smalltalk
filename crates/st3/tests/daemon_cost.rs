@@ -568,7 +568,7 @@ const PROBES: &[Probe] = &[
     ),
     get(
         "GET /v1/client/publication-definition",
-        "/v1/client/publication-definition?subject={seat}",
+        "/v1/client/publication-definition?subject=agent%2Fbench%2Fcost%2Fmover",
     ),
     get("GET /v1/client/now", "/v1/client/now"),
     get("GET /v1/client/machines", "/v1/client/machines"),
@@ -1776,12 +1776,20 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     assert_eq!(delivery["items"][0]["in_reply_to"], incoming["subject"]);
     // An offline source needs no live runtime: publish its exact departure before measuring
     // the operator's recorded exception, against both generated store sizes.
+    let mut expected_publication = None;
+    let mut expected_publication_revision = None;
     for host in ["amber", "cobalt"] {
         let kdl = format!(
             "version 2\nagent \"bench/cost/mover\" {{\n host \"{host}\"\n workspace {:?}\n command \"sleep 1000\"\n restart always\n}}\n",
             root.to_str().unwrap()
         );
         let intent = st3::parse_intent(&kdl, NODE).unwrap();
+        if host == "cobalt" {
+            expected_publication = Some(
+                serde_json::to_value(intent.subjects.get("agent/bench/cost/mover").unwrap())
+                    .unwrap(),
+            );
+        }
         let preview = store
             .mission(
                 &intent,
@@ -1791,6 +1799,17 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                 },
             )
             .unwrap();
+        if host == "cobalt" {
+            expected_publication_revision = Some(
+                preview
+                    .changes
+                    .iter()
+                    .find(|change| change.subject == "agent/bench/cost/mover")
+                    .expect("the cobalt declaration must change the desired revision")
+                    .new_revision
+                    .clone(),
+            );
+        }
         store
             .apply_as(
                 &intent,
@@ -1806,6 +1825,21 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
             .selected_desired_token("agent/bench/cost/mover")
             .unwrap()
             .unwrap(),
+    );
+    let publication: Value = person
+        .get("/v1/client/publication-definition?subject=agent%2Fbench%2Fcost%2Fmover")
+        .await
+        .expect("the publication definition cost probe must read the applied fixture");
+    assert_eq!(publication["kind"], "publication-definition");
+    assert_eq!(publication["subject"], "agent/bench/cost/mover");
+    assert_eq!(publication["declaration"], expected_publication.unwrap());
+    assert_eq!(
+        publication["token"].as_str(),
+        Some(fixture.items["placement_token"].as_str())
+    );
+    assert_eq!(
+        publication["revision"].as_str(),
+        Some(expected_publication_revision.as_deref().unwrap())
     );
     client
         .post::<_, Value>("/v1/sets/apply", &owned_set_request("fixture"))
@@ -1879,11 +1913,19 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                 } else {
                     client.clone()
                 };
+                let expected_publication = &publication;
                 counted(|| async move {
                     let answer = match &body {
                         None => client.get::<Value>(&path).await,
                         Some(body) => client.post::<_, Value>(&path, body).await,
                     };
+                    if probe.route == "GET /v1/client/publication-definition" {
+                        assert_eq!(
+                            answer.as_ref().expect("the measured publication read must succeed"),
+                            expected_publication,
+                            "the measured publication must retain the exact selected definition"
+                        );
+                    }
                     answer.map_err(|error| error.to_string().chars().take(200).collect())
                 })
                 .await
