@@ -12,8 +12,8 @@ const PERSON_CLOCK: &str = "st3.attention.person.clock";
 const CUSTOM_CLOCK: &str = "st3.attention.custom.clock";
 
 const SCHEMA: &str = r#"
-CREATE INDEX IF NOT EXISTS attention_open_person_sources ON step_runs(subject)
- WHERE assignee LIKE 'person/%';
+CREATE INDEX IF NOT EXISTS attention_open_person_sources_v3 ON step_runs(subject)
+ WHERE assignee>='person/' AND assignee<'person0';
 CREATE TABLE IF NOT EXISTS local_attention_open (
  family TEXT NOT NULL, source TEXT NOT NULL, id TEXT NOT NULL, person TEXT NOT NULL,
  priority INTEGER NOT NULL, requested TEXT NOT NULL, eligible TEXT NOT NULL,
@@ -73,7 +73,7 @@ impl View for Family {
     fn definition(&self) -> Definition {
         Definition {
             name: self.view(),
-            fingerprint: "projected-source.v1;canonical-person-fences.v2.ascii-like;custom-source.v1;u128-time.v1;public-row.v1",
+            fingerprint: "projected-source.v1;canonical-person-fences.v3.lowercase-range;custom-source.v1;u128-time.v1;public-row.v1",
             kinds: &[],
             local_kinds: match self {
                 Self::Person => &[PERSON_CHANGE, PERSON_CLOCK],
@@ -108,7 +108,7 @@ impl View for Family {
                 } {
                     body.push_str(&format!("INSERT INTO local_attention_open_dirty SELECT family,source FROM local_attention_open_dependencies WHERE dependency={} ON CONFLICT DO NOTHING;", dependency(which)));
                     if table == "step_runs" {
-                        body.push_str(&format!("INSERT INTO local_attention_open_dirty SELECT 'person',{which}.subject WHERE {which}.assignee LIKE 'person/%' ON CONFLICT DO NOTHING;"));
+                        body.push_str(&format!("INSERT INTO local_attention_open_dirty SELECT 'person',{which}.subject WHERE {which}.assignee>='person/' AND {which}.assignee<'person0' ON CONFLICT DO NOTHING;"));
                     }
                 }
                 connection.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS attention_open_{table}_{action} AFTER {action} ON {table} BEGIN {body} END;"))?;
@@ -241,10 +241,11 @@ fn person_row(
     let Some(step) = person_work::step(tx, source)? else {
         return Ok(None);
     };
-    if step.assigned_to.as_deref().is_none_or(|a| {
-        !a.get(..7)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("person/"))
-    }) {
+    if step
+        .assigned_to
+        .as_deref()
+        .is_none_or(|a| !a.starts_with("person/"))
+    {
         return Ok(None);
     }
     run_dependencies(tx, source, &step.run)?;
@@ -470,7 +471,7 @@ pub(crate) fn seed_page(
     let family = family(view)?;
     let query = match family {
         Family::Person => {
-            "SELECT subject FROM step_runs WHERE assignee LIKE 'person/%' AND subject>?1 ORDER BY subject LIMIT ?2"
+            "SELECT subject FROM step_runs WHERE assignee>='person/' AND assignee<'person0' AND subject>?1 ORDER BY subject LIMIT ?2"
         }
         Family::Custom => {
             "SELECT subject FROM custom_sources WHERE subject>?1 ORDER BY subject LIMIT ?2"

@@ -733,12 +733,22 @@ fn checkpoint_trim_preserves_canonical_custom_episode_and_fences_indexed_reads()
 }
 
 #[test]
-fn authored_person_assignee_matches_the_full_readers_ascii_sql_like() {
+fn authored_person_assignee_matches_the_full_readers_lowercase_range() {
     let (store, _, _) = person_work::tests::fixture();
-    // Sparse/legacy projected assignments can predate current input validation. Preserve
-    // the full reader's ASCII-insensitive SQL LIKE selection rather than dropping a card.
+    // The full reader's indexed lowercase range excludes legacy uppercase assignees.
+    // Neither an upper-case request nor a lower-case request may revive that row.
     let registry = views(&store);
     install(&store, &registry);
+    store
+        .connection
+        .write()
+        .execute(
+            "UPDATE step_runs SET status='ready' WHERE assignee='person/avery'",
+            [],
+        )
+        .unwrap();
+    maintain(&store, &registry);
+    assert!(!parity(&store, &registry, PERSON_VIEW, "person/avery", u128::MAX).is_empty());
     store
         .connection
         .write()
@@ -748,8 +758,8 @@ fn authored_person_assignee_matches_the_full_readers_ascii_sql_like() {
         )
         .unwrap();
     maintain(&store, &registry);
-    let cards = parity(&store, &registry, PERSON_VIEW, "PERSON/avery", u128::MAX);
-    assert!(!cards.is_empty());
+    assert!(parity(&store, &registry, PERSON_VIEW, "PERSON/avery", u128::MAX).is_empty());
+    assert!(parity(&store, &registry, PERSON_VIEW, "person/avery", u128::MAX).is_empty());
     assert!(
         window(
             &store.readers.get(),

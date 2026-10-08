@@ -80,5 +80,8 @@ The installer must also capture late `run_generations`, `mission_run_deadlines` 
 `mission_run_after` rows used by the joined run header; the current operator triggers
 do not cover those tables. Deferred dirty sources need a continuation that can pass
 a fenced family's first page. These are certification requirements before activation.
-Legacy ASCII case variants in person assignments retain the full reader's SQL LIKE
-selection, while person row reads continue to require an exact recipient match.
+The person family follows the current full reader's indexed lowercase assignee
+range (`person/` through, but excluding, `person0`). Legacy uppercase `PERSON/`
+assignments produce no person attention row, including after a lowercase row is
+reassigned. This is a fingerprint successor; the former ASCII LIKE membership
+cannot certify the current reader.
