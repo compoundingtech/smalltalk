@@ -40,10 +40,10 @@ function fixture(state: State, prefix: string): TranscriptStoryData {
 const cases: Readonly<Record<State, TranscriptStoryData>> = {
   settled: fixture('settled', 'settled'), expanded: fixture('expanded', 'expanded'), streaming: fixture('streaming', 'streaming'), failed: fixture('failed', 'failed'), interrupted: fixture('interrupted', 'interrupted'), unknown: fixture('unknown', 'unknown'), loading: fixture('loading', 'loading'), 'catching-up': fixture('catching-up', 'catching-up'), reconnecting: fixture('reconnecting', 'reconnecting'), 'sync-failed': fixture('sync-failed', 'sync-failed'), 'pending-send': fixture('pending-send', 'pending-send'), 'failed-send': fixture('failed-send', 'failed-send'), empty: fixture('empty', 'empty'),
 }
-function RuntimeTranscript({ data, onOpenTool, onRetry, availability, history, emptyState }: { data: TranscriptStoryData; onOpenTool: (call: WorkLogCall) => void; onRetry: () => void; availability?: TranscriptAvailability; history?: TranscriptHistory; emptyState?: React.ReactNode | TranscriptEmptyState }) {
+function RuntimeTranscript({ data, onOpenTool, onRetry, onRetrySend, availability, history, emptyState }: { data: TranscriptStoryData; onOpenTool: (call: WorkLogCall) => void; onRetry: () => void; onRetrySend?: (itemId: string) => void; availability?: TranscriptAvailability; history?: TranscriptHistory; emptyState?: React.ReactNode | TranscriptEmptyState }) {
   const messages = React.useMemo(() => data.turns.flatMap(turn => [turn.prompt, ...turn.items]), [data])
   const options = React.useMemo(() => ({ messages, isRunning: data.turns.some(turn => turn.work.running), onNew: async () => {} }), [messages, data])
-  return <EmbraceRuntimeProvider options={options}><Transcript title="Row projection" turns={data.turns} sync={data.sync} now={now} observedAt={now - 8000} onOpenTool={onOpenTool} onRetryRun={onRetry} onRetrySync={onRetry} availability={availability} history={history} emptyState={emptyState} /></EmbraceRuntimeProvider>
+  return <EmbraceRuntimeProvider options={options}><Transcript title="Row projection" turns={data.turns} sync={data.sync} now={now} observedAt={now - 8000} onOpenTool={onOpenTool} onRetryRun={onRetry} onRetrySync={onRetry} onRetrySend={onRetrySend} availability={availability} history={history} emptyState={emptyState} /></EmbraceRuntimeProvider>
 }
 function TranscriptStory({ scheme = 'dark', state = 'settled', availability, history, emptyState }: { scheme?: Scheme; state?: State; availability?: TranscriptAvailability; history?: TranscriptHistory; emptyState?: React.ReactNode | TranscriptEmptyState }) {
   const [opened, setOpened] = React.useState<WorkLogCall | undefined>(undefined)
@@ -226,6 +226,32 @@ export const SendIdentity: Story = { render: args => <SendIdentityStory scheme={
   } finally { observer.disconnect() }
 } }
 export const SendIdentityLight: Story = { ...SendIdentity, args: { scheme: 'light' } }
+
+const retrySend = fn<(itemId: string) => void>()
+function FailedRetryStory({ scheme = 'dark' }: { scheme?: Scheme }) {
+  const [state, setState] = React.useState<State>('failed-send')
+  const data = React.useMemo(() => fixture(state, 'retry'), [state])
+  const retry = (itemId: string) => { retrySend(itemId); setState('pending-send') }
+  return <main data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><h1>Failed → Retry</h1><button type="button" onClick={() => setState('settled')}>Deliver echo</button><div {...stylex.props(styles.frame)}><RuntimeTranscript data={data} onOpenTool={() => {}} onRetry={() => {}} onRetrySend={retry} /></div></main>
+}
+export const FailedRetry: Story = { name: 'Failed → Retry', render: args => <FailedRetryStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
+  retrySend.mockClear()
+  const canvas = within(canvasElement)
+  const selector = '[data-testid="user-message"][data-item-id="retry/prompt"]'
+  const row = await canvas.findByTestId('user-message')
+  await expect(row).toHaveAttribute('data-send-state', 'failed')
+  await userEvent.click(canvas.getByRole('button', { name: 'Retry', exact: true }))
+  await expect(retrySend).toHaveBeenCalledExactlyOnceWith('retry/prompt')
+  await waitFor(() => expect(row).toHaveAttribute('data-send-state', 'pending'))
+  await expect(canvasElement.querySelectorAll(selector)).toHaveLength(1)
+  await expect(canvasElement.querySelector(selector)).toBe(row)
+  await expect(canvas.queryByRole('button', { name: 'Retry', exact: true })).toBeNull()
+  await userEvent.click(canvas.getByRole('button', { name: 'Deliver echo' }))
+  await waitFor(() => expect(row).toHaveAttribute('data-send-state', 'sent'))
+  await expect(canvasElement.querySelectorAll(selector)).toHaveLength(1)
+  await expect(canvasElement.querySelector(selector)).toBe(row)
+} }
+export const FailedRetryLight: Story = { ...FailedRetry, args: { scheme: 'light' } }
 const semanticItems: readonly ConversationItem[] = [
   { _tag: 'Text', id: 'semantic/system', role: 'system', text: 'System context retained.', attachments: [], streaming: false, at },
   { _tag: 'Notice', id: 'semantic/notice', kind: 'redaction', text: 'Notice content retained.', at },
