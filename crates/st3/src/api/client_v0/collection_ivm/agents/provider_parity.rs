@@ -10,6 +10,7 @@ use axum::{
     routing::get,
 };
 use futures_util::{SinkExt as _, StreamExt as _};
+use rusqlite::OptionalExtension as _;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 use tokio::sync::{Notify, Semaphore, oneshot, watch};
@@ -121,6 +122,15 @@ impl Fixture {
         self.state.store.read_snapshot(|_| {
             let c = self.state.store.readers.get();
             let cut = smallclaims::ivm::source_cut(&c)?;
+            let deferred = self.state.store.replication_projection_deferred();
+            let sql_index = smallclaims::store::current_index(&c)?;
+            let graph_health: Option<(String,u64)> = c.query_row(
+                "SELECT status,last_good_store_index FROM projection_health WHERE aggregate='graph'",
+                [], |r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            // Source owns the genuine staging Namespace handle. Its diagnostic performs
+            // readonly footprint checks without manufacturing an identity or certificate.
+            let source_diagnostic = self.state.store.smalltalk.ivm_agent_service.get()
+                .map(|service| service.diagnostic(&self.state.store));
             let views = self.state.store.ivm_views().unwrap();
             let installer = self.state.store.ivm_installer().unwrap();
             let root = installer.root(&c, super::cards::VIEW);
@@ -137,7 +147,7 @@ impl Fixture {
             for table in ["local_agent_source_dirty","local_agent_source_fanout","local_agent_queue_dirty","local_agent_card_source_work","local_agent_card_rows"] {
                 counts.push((table,c.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get::<_,u64>(0))?));
             }
-            Ok(format!("cut={cut:?}, readiness={:?}, root={root:?}, footprint={footprint:?}, work={pending:?}, capture={:?}, position={:?}, jobs={jobs:?}, clocks={clocks:?}, counts={counts:?}",
+            Ok(format!("deferred={deferred}, sql_index={sql_index}, graph_health={graph_health:?}, source={source_diagnostic:?}, cut={cut:?}, readiness={:?}, root={root:?}, footprint={footprint:?}, work={pending:?}, capture={:?}, position={:?}, jobs={jobs:?}, clocks={clocks:?}, counts={counts:?}",
                 views.readiness(&c,super::cards::VIEW,cut.map_or(0,|cut|cut.epoch)),
                 crate::store::collection_ivm::status(&c), installer.position(&c,super::cards::SOURCE)))
         }).unwrap()
