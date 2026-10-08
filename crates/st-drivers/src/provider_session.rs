@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::{harness_state, status};
 
 /// Refresh cadence for session-owned observed records.
-pub(crate) const SESSION_REFRESH: Duration = harness_state::HARNESS_STATE_REFRESH;
+pub(crate) const SESSION_REFRESH: Duration = Duration::from_secs(5 * 60);
 
 pub(crate) const PROVIDER_POLL: Duration = Duration::from_millis(250);
 const STOP_GRACE: Duration = Duration::from_secs(5);

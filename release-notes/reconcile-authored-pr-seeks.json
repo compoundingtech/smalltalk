@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Seek authored pull-request ownership and skip unchanged GitHub-watch maintenance",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or projection fold change. The lookup retains URL-or-repository/number matching, canonical order, optional head filtering and run deduplication. GitHub-watch maintenance now retains its recorded declaration/watch/seat reads and next deadline between evaluations, with a 60-second safety pass. New or changed dependencies, local fresh-context requests, repairs and due work reselect it. A clean stage does not publish fault recovery; actual successful evaluation still does."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Adds two partial expression indexes over retained resource.observed claims for resource/mission-run/*/pull-request, keyed by URL and repository/number. Existing databases build these additive indexes on first open. Numeric schema version remains 17; no table, trigger or claim format changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No daemon API, client, wire, authority or admission contract change. Query results retain the existing semantics. Watch ownership, observer union across local and remote subscriptions, stopped-seat watches and final deadline wake semantics are retained."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "The ordinary binary swap restarts the service. Building the two indexes at first open reads existing claim history and adds startup work; fleet-sized startup duration has not been measured."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing installations create the indexes automatically on open; no manual migration or identity change is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Older schema-17 binaries can open stores containing these additive indexes; swapping back leaves the indexes in place and restores the older lookup. No durable claims or projections are rewritten."
+  }
+}

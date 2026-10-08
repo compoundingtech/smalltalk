@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Require matching checkpoint rules before ending a person excusal",
+  "replay": {
+    "status": "none",
+    "detail": "No startup or request-time replay is added."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema, registry, wire field or stored claim changes."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Current voter selection changes without changing the Rules14 digest, drop planning, retention, proof digests or canonical ordering. A runtime now resumes an excused writer only after coherent self-including seal/verification terms with its current rules digest; incompatible work remains retained. Upgrade members together to avoid older binaries selecting a different current voter roster. First verifications and certificates remain immutable."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Current participant/status/attention readers reject incompatible or incomplete checkpoint work as reentry evidence. Legacy standalone helper semantics remain available. Person-only checkpoint.excused authority is unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Uses the normal binary restart; no extra restart, index construction or backfill is added."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "A returning matching runtime follows ordinary certificate/manifest catch-up and publishes a coherent seal. No new operator action or person impersonation is needed."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Older supported binaries may again interpret any stale checkpoint work as ending an excusal. No source rows, excusals or certificates are rewritten, and this change does not restore a trimmed checkpoint."
+  }
+}

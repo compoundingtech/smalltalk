@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep the malformed work hierarchy read fixture compatible with declaration-edge write validation",
+  "replay": {
+    "status": "none",
+    "detail": "Only a cfg(test) fixture changes; claim replay and shared projections are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Production schemas, indexes and triggers are unchanged. The isolated test uses a reader-local temporary table."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Production admission, authority and managed transaction guards are unchanged. The fixture restores query-only mode before read assertions."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No production API or response change. Tests retain hierarchy selection, the existing malformed-JSON null fallback and the keyed SQL budget."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No runtime change or migration."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No new production state or recovery path."
+  }
+}

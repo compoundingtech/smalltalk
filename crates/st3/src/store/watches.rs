@@ -9,6 +9,22 @@ use crate::model::ObserverSpec;
 const ENDED_SHOWN_FOR_MS: u128 = 24 * 60 * 60 * 1000;
 
 impl Store {
+    /// The complete declaration union consumed by watch maintenance, including remote
+    /// subscriptions and observers. Read it only after selecting the stage: a pass-start
+    /// roster can predate changes the preceding stages wrote and the change feed observed.
+    pub(crate) fn github_watch_declarations(&self) -> Result<Vec<DesiredSubject>> {
+        smallclaims::touched::note_read(|| "kind:intent.desired".into());
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
+             FROM desired WHERE kind IN ('observer', 'subscription') ORDER BY subject",
+        )?;
+        statement
+            .query_map([], desired_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// Declare a seat's watch on one thread, from now, and the repository's standing observer when
     /// it is not running. Watching a thread the seat already watches keeps that watch and takes
     /// the new deadline; watching one whose watch ended begins a new watch.

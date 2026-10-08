@@ -111,6 +111,8 @@ const MIX: &[Load] = &[
     load("replication wake", 0.2, 1_000),
     load("message send", 0.1, 250),
     load("person read", 0.5, 250),
+    // Enough samples to measure usage separately from the rotating person-read mix.
+    load("client usage", 0.5, 300),
 ];
 
 /// What a person reads while moving through stui, one after another, and each read's p99 budget.
@@ -1537,6 +1539,7 @@ async fn send_one(context: &Context, name: &str) -> Result<(), String> {
         }
         "seat status" => get(format!("/v1/status?subject={encoded}")).await,
         "seat work" => get(format!("/v1/work?actor={encoded}")).await,
+        "client usage" => get("/v1/client/usage".into()).await,
         "lease renewal" => {
             let (agent, step, incarnation) =
                 context.subjects.held[turn % context.subjects.held.len()].clone();

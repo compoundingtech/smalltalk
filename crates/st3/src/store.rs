@@ -4,6 +4,8 @@ mod glass_heads;
 mod arrangements;
 #[cfg(test)]
 mod arrangements_tests;
+#[cfg(test)]
+mod authored_pull_requests_tests;
 mod glasses;
 pub(crate) mod mailbox_wakes;
 mod mailbox_changes;
@@ -142,6 +144,7 @@ mod unread_mail;
 mod agent_messages;
 pub mod agent_view;
 mod conversation_reads;
+mod usage_period;
 mod runtime;
 #[cfg(test)]
 mod tombstones_tests;
@@ -216,10 +219,6 @@ WHERE kind IN ('mission-run.state','step-run.state','work.failed')
 CREATE INDEX IF NOT EXISTS claims_terminal_capability_hash_index
 ON claims(json_extract(body, '$.fields.capability_hash'), store_index)
 WHERE kind='custom.client.terminal-attached';
--- The period usage report reads response rollups only: 8,700 of the 90,000 harness.usage claims
--- on a real store (the rest are context occupancy and session totals, written every few seconds).
-CREATE INDEX IF NOT EXISTS claims_usage_rollup_index ON claims(store_index)
-WHERE kind='harness.usage' AND json_extract(body,'$.fields.semantics')='response_rollup';
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
@@ -277,6 +276,14 @@ WHERE kind='subscription.mission-started';
 CREATE INDEX IF NOT EXISTS claims_subscription_mission_resource_index
 ON claims(json_extract(body, '$.fields.mission'), json_extract(body, '$.fields.resource'))
 WHERE kind='subscription.mission-requested';
+-- Authored PR ownership is looked up by URL or repository/number. Keep ordinary observed
+-- resources out of both indexes; the lookup unions two seeks before canonical ordering.
+CREATE INDEX IF NOT EXISTS claims_authored_pull_request_url_index
+ON claims(json_extract(body, '$.fields.facts.url'))
+WHERE kind='resource.observed' AND subject LIKE 'resource/mission-run/%/pull-request';
+CREATE INDEX IF NOT EXISTS claims_authored_pull_request_number_index
+ON claims(json_extract(body, '$.fields.facts.repository'), json_extract(body, '$.fields.facts.number'))
+WHERE kind='resource.observed' AND subject LIKE 'resource/mission-run/%/pull-request';
 CREATE INDEX IF NOT EXISTS claims_subscription_deferred_request_index
 ON claims(subject, json_extract(body, '$.fields.request'), store_index)
 WHERE kind='subscription.mission-deferred';
@@ -2100,6 +2107,7 @@ pub(crate) fn watch_ended_tx(
     subject: &str,
     watch: &crate::model::WatchSpec,
 ) -> Result<Option<Value>, St3Error> {
+    smallclaims::touched::note_read(|| subject.to_owned());
     let since = watch.since_unix_ms.to_string();
     let mut statement = connection
         .prepare_cached(
@@ -2556,6 +2564,18 @@ fn new_mentions(prior: Option<&(Value, u128)>, facts: &Value) -> Vec<Value> {
 /// The mission runs that published a `resource/mission-run/RUN/pull-request` naming this pull
 /// request, by URL or by repository and number, at the same head when both name one. An
 /// authoring mission publishes that resource when it opens the pull request.
+const AUTHORING_PULL_REQUEST_RUNS_QUERY: &str =
+    "SELECT subject, body FROM claims WHERE id IN (
+         SELECT id FROM claims WHERE kind='resource.observed'
+           AND subject LIKE 'resource/mission-run/%/pull-request'
+           AND json_extract(body, '$.fields.facts.url')=?1
+         UNION
+         SELECT id FROM claims WHERE kind='resource.observed'
+           AND subject LIKE 'resource/mission-run/%/pull-request'
+           AND json_extract(body, '$.fields.facts.repository')=?2
+           AND json_extract(body, '$.fields.facts.number')=?3
+     ) ORDER BY CANONICAL_ASC(claims)";
+
 fn authoring_pull_request_runs_tx(
     connection: &Connection,
     facts: &Value,
@@ -2567,14 +2587,11 @@ fn authoring_pull_request_runs_tx(
         return Ok(Vec::new());
     }
     let head = facts.get("head_sha").and_then(Value::as_str);
-    let mut statement = connection.prepare(&canonical_sql(
-        "SELECT subject, body FROM claims WHERE kind='resource.observed'
-         AND subject LIKE 'resource/mission-run/%/pull-request'
-         AND (json_extract(body, '$.fields.facts.url')=?1
-           OR (json_extract(body, '$.fields.facts.repository')=?2
-               AND json_extract(body, '$.fields.facts.number')=?3))
-         ORDER BY CANONICAL_ASC(claims)",
-    ))?;
+    // An OR can scan the whole partial index. UNION locates matching claim IDs with one
+    // expression-index seek per identity, deduplicates dual matches, then orders only those
+    // claims with the same canonical order as the original query.
+    let mut statement =
+        connection.prepare_cached(&canonical_sql(AUTHORING_PULL_REQUEST_RUNS_QUERY))?;
     let candidates = statement
         .query_map(params![url, repository, number], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -15271,6 +15288,21 @@ impl Store {
         since_ms: u64,
         until_ms: u64,
     ) -> Result<(Vec<Value>, Vec<agent_messages::DailyUsage>)> {
+        self.read_snapshot(|_| {
+            let mut boundaries = BTreeSet::from([since_ms, until_ms]);
+            for (since, until) in agent_messages::windows(since_ms, until_ms) {
+                boundaries.extend([since, until]);
+            }
+            let rows = usage_period::boundary_rows(&self.readers.get(), &boundaries)?;
+            Self::usage_period_data_from_rows(rows.into_iter().map(Ok), since_ms, until_ms)
+        })
+    }
+
+    fn usage_period_data_from_rows(
+        rows: impl IntoIterator<Item = rusqlite::Result<(String, u64, String)>>,
+        since_ms: u64,
+        until_ms: u64,
+    ) -> Result<(Vec<Value>, Vec<agent_messages::DailyUsage>)> {
         #[derive(Clone, Default)]
         struct Snapshot {
             at: u64,
@@ -15284,20 +15316,6 @@ impl Store {
             at: u64,
             buckets: [u64; USAGE_BUCKETS.len()],
         }
-        let connection = self.readers.get();
-        let mut statement = connection.prepare(&canonical_sql(
-            "SELECT subject, store_index, body FROM claims INDEXED BY claims_usage_rollup_index
-             WHERE kind='harness.usage'
-             AND json_extract(body, '$.fields.semantics')='response_rollup'
-             ORDER BY CANONICAL_ASC(claims)",
-        ))?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, u64>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
         type Key = (String, String, String, String, String, String, String);
         let mut days = agent_messages::windows(since_ms, until_ms)
             .into_iter()
