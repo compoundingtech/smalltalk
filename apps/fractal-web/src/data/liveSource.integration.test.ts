@@ -726,4 +726,35 @@ describe('optimistic conversation sends', () => {
       }),
     ),
   )
+
+  it.live('settles a completed send whose mailbox echo never enters the window', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        const conversation = live.source.conversation(agent.id)
+        live.registry.mount(conversation)
+        yield* settle
+        gateway.sendGate = Promise.resolve()
+        yield* Effect.promise(() => live.source.attachments!.send(request))
+        yield* settle
+        // Completed authoritatively, but no mailbox frame ever repeats it: the row stays,
+        // visibly settled rather than pending forever.
+        expect(live.registry.get(conversation)).toMatchObject({
+          _tag: 'Observed', value: { items: [
+            { _tag: 'Text', role: 'user', text: 'hello', sendState: { _tag: 'Sent' } },
+          ] },
+        })
+        // A later in-window echo still replaces the settled row exactly once.
+        yield* Effect.promise(() => gateway.nextAction())
+        gateway.mailEcho()
+        yield* settle
+        const feed = live.registry.get(conversation)
+        expect(feed).toMatchObject({ _tag: 'Observed' })
+        if (feed._tag !== 'Observed') return
+        expect(feed.value.items.filter((item) => item._tag === 'Text')).toEqual([
+          expect.objectContaining({ id: 'timeline-entry/echo/content', text: 'hello' }),
+        ])
+      }),
+    ),
+  )
 })
