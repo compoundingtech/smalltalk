@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Skip presence source bookkeeping before its first installation",
+  "replay": {
+    "status": "none",
+    "detail": "No canonical projection or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or admission rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "The never-installed producer uses one atomic installation check under its existing memory lock; after first installation all source scope, revision and acknowledgement checks remain active even after uninstall."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new action or opt-in flag."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Installation is serialized with accepted memory writes; existing failure fencing and reinstall behavior remain enforced."
+  }
+}

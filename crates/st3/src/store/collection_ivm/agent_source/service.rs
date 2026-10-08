@@ -660,8 +660,14 @@ impl Service {
             .clone();
         store.read_snapshot(|_| {
             let c = store.readers.get();
-            let stopped = self.stopped.lock().map_err(|_| anyhow::anyhow!("source stop lock poisoned"))?.is_some();
-            if stopped { return Ok(serde_json::json!({"ready":false,"stopped":true})); }
+            let stopped = self.stopped
+                .lock()
+                .map_err(|_| anyhow::anyhow!("source stop lock poisoned"))?
+                .clone();
+            if let Some(reason) = stopped {
+                return Ok(serde_json::json!({"ready":false,"stopped":true,
+                    "refusal":{"phase":"setup","reason":bounded_reason(&reason)}}));
+            }
             let status = self.installer.status(&c, cards::VIEW)?;
             let root = self.installer.root(&c, cards::VIEW).ok();
             let job = job.as_deref().or_else(|| root.as_ref().map(|r| r.namespace.as_str()));
@@ -675,7 +681,7 @@ impl Service {
                 "namespace":root.as_ref().map(|r|r.namespace.as_str()),
                 "source":{"name":status.source.source,"fingerprint":status.source.fingerprint,"epoch":status.source.epoch,"revision":status.source.revision},
                 "cut":{"epoch":cut.epoch,"admitted":cut.admitted,"projected":cut.projected,"local_generation":cut.local_generation},
-                "job":progress.map(|p|serde_json::json!({"phase":p.phase,"refused":p.error.is_some(),"pages":p.pages,"extracted_rows":p.extracted_rows,"applied_rows":p.applied_rows,"max_page_us":p.max_page_us,"queued_rows":p.queued_rows,"queued_bytes":p.queued_bytes}))
+                "job":progress.map(|p|serde_json::json!({"phase":p.phase,"refused":p.error.is_some(),"refusal_reason":p.error.as_deref().map(bounded_reason),"pages":p.pages,"extracted_rows":p.extracted_rows,"applied_rows":p.applied_rows,"max_page_us":p.max_page_us,"queued_rows":p.queued_rows,"queued_bytes":p.queued_bytes}))
             }))
         })
     }
@@ -977,6 +983,14 @@ fn preflight_reopen(path: &Path, receiver: &str) -> Result<bool> {
         |r| r.get(0),
     )?;
     Ok(capture.gap.is_some() || fenced)
+}
+
+fn bounded_reason(reason: &str) -> &str {
+    let mut end = reason.len().min(2048);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason[..end]
 }
 
 fn now_ms_u64() -> Result<u64> {

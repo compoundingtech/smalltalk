@@ -45,6 +45,26 @@ fn counts(store: &Store, namespace: &str) -> Result<(Value, u64, u64)> {
     Ok((Value::Object(result), total, max))
 }
 
+// Detailed errors are private scratch stderr; public stdout stays the generic refusal.
+fn require_active(status: &Value) -> Result<()> {
+    ensure!(
+        !status["stopped"].as_bool().unwrap_or(true),
+        "source setup refused: {}",
+        status["refusal"]["reason"]
+            .as_str()
+            .unwrap_or("cause not retained")
+    );
+    ensure!(
+        !status["job"]["refused"].as_bool().unwrap_or(false),
+        "source installation refused in {}: {}",
+        status["job"]["phase"].as_str().unwrap_or("unknown phase"),
+        status["job"]["refusal_reason"]
+            .as_str()
+            .unwrap_or("cause not retained")
+    );
+    Ok(())
+}
+
 fn qualify(path: &Path, receiver: &str, deadline: Duration) -> Result<Value> {
     ensure!(path.is_file(), "existing scratch backup required");
     ensure!(
@@ -56,12 +76,7 @@ fn qualify(path: &Path, receiver: &str, deadline: Duration) -> Result<Value> {
     );
     let started = Instant::now();
     let store = Store::open_with_agent_collections(path, receiver)?;
-    ensure!(
-        !store.agent_collection_qualification_status()?["stopped"]
-            .as_bool()
-            .unwrap_or(true),
-        "source setup refused"
-    );
+    require_active(&store.agent_collection_qualification_status()?)?;
     gauges(&store)?;
     let mut pumps = 0_u64;
     let mut max_pump_us = 0_u128;
@@ -75,11 +90,7 @@ fn qualify(path: &Path, receiver: &str, deadline: Duration) -> Result<Value> {
         max_pump_us = max_pump_us.max(before.elapsed().as_micros());
         pumps += 1;
         let status = store.agent_collection_qualification_status()?;
-        ensure!(
-            !status["stopped"].as_bool().unwrap_or(true)
-                && !status["job"]["refused"].as_bool().unwrap_or(false),
-            "source installation refused"
-        );
+        require_active(&status)?;
         if status["ready"] == true {
             let namespace = status["namespace"]
                 .as_str()
@@ -188,12 +199,30 @@ mod tests {
         assert!(qualify(&path, "node", Duration::ZERO).is_err());
     }
     #[test]
+    fn actual_receiver_binding_refusal_retains_setup_cause() {
+        let _lock = LOCK.lock().unwrap();
+        let (_dir, path) = scratch();
+        drop(Store::open_with_agent_collections(&path, "node").unwrap());
+        let error = qualify(&path, "other-node", Duration::from_secs(30)).unwrap_err();
+        let reason = format!("{error:#}");
+        assert!(reason.contains("source setup refused"), "{reason}");
+        assert!(
+            reason.contains("retained agent capture schema/receiver/epoch"),
+            "{reason}"
+        );
+    }
+    #[test]
     fn actual_extractor_refuses_oversized_raw_input() {
         let _lock = LOCK.lock().unwrap();
         let (_dir, path) = scratch();
         let c = rusqlite::Connection::open(&path).unwrap();
         c.execute("INSERT INTO local_observations(subject,kind,actor,body,observed_at_unix_ms,after_store_index) VALUES('agent/node.amber','runtime.observed',NULL,?1,0,0)", [format!("{{\"status\":\"running\",\"extra\":\"{}\"}}", "x".repeat(70_000))]).unwrap();
         drop(c);
-        assert!(qualify(&path, "node", Duration::from_secs(30)).is_err());
+        let error = qualify(&path, "node", Duration::from_secs(30)).unwrap_err();
+        let reason = format!("{error:#}");
+        assert!(
+            reason.contains("source row exceeds extraction payload limit"),
+            "{reason}"
+        );
     }
 }

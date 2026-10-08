@@ -47,27 +47,57 @@ def footprint(root):
     return size
 
 
-def child_limits():
-    os.nice(10)
-    resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (32 * GIB, 32 * GIB))
-    resource.setrlimit(resource.RLIMIT_CPU, (TIME_LIMIT, TIME_LIMIT))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
+def child_limits(error_fd=None):
+    phases = (
+        ("nice", lambda: os.nice(10)),
+        ("RLIMIT_AS", lambda: resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))),
+        ("RLIMIT_FSIZE", lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (32 * GIB, 32 * GIB))),
+        ("RLIMIT_CPU", lambda: resource.setrlimit(resource.RLIMIT_CPU, (TIME_LIMIT, TIME_LIMIT))),
+        ("RLIMIT_NOFILE", lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))),
+    )
+    try:
+        for phase, apply in phases:
+            try:
+                apply()
+            except BaseException as error:
+                if error_fd is not None:
+                    message = f"{phase}: {type(error).__name__}: {error}\n".encode()[:4096]
+                    os.write(error_fd, message)
+                raise
+    finally:
+        if error_fd is not None:
+            os.close(error_fd)
 
 
 def supervise(binary, database, receiver, scratch, seconds=TIME_LIMIT):
     environment = {"PATH": "/usr/bin:/bin", "SQLITE_TMPDIR": str(scratch / "tmp")}
     (scratch / "tmp").mkdir(mode=0o700, exist_ok=True)
-    process = subprocess.Popen(
-        [str(binary), str(database), receiver], cwd=scratch, env=environment,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-        preexec_fn=child_limits,
-    )
+    started = time.monotonic()
+    read_fd, write_fd = os.pipe()
+    failure = None
+    try:
+        process = subprocess.Popen(
+            [str(binary), str(database), receiver], cwd=scratch, env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+            preexec_fn=lambda: child_limits(write_fd), pass_fds=(write_fd,),
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        failure = error
+    finally:
+        os.close(write_fd)
+    try:
+        diagnostic = os.read(read_fd, 4096)
+    finally:
+        os.close(read_fd)
+    if failure is not None:
+        detail = diagnostic.decode(errors="replace").strip()
+        reason = "PREEXEC_FAILED: " + detail if detail else "SPAWN_FAILED: " + type(failure).__name__
+        # No executed child exit is known. Preserve the attempted marker and bounded cause.
+        return None, reason, {"stdout": b"", "stderr": diagnostic}, time.monotonic() - started
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ, "stdout")
     selector.register(process.stderr, selectors.EVENT_READ, "stderr")
     output = {"stdout": bytearray(), "stderr": bytearray()}
-    started = time.monotonic()
     reason = None
     try:
         while selector.get_map() or process.poll() is None:
