@@ -63,7 +63,8 @@ interface RetainedFeed<A> {
   readonly snapshot: Atom.Atom<Feed<A>>
   readonly controller: Atom.Atom<Feed<A>>
   readonly sync: Atom.Atom<FeedSync<A>>
-  readonly publish: (value: A) => void
+  /** Whether the value became visible; `false` means the feed is not publishable. */
+  readonly publish: (value: A) => boolean
   readonly prefetch: () => void
   readonly release: () => void
 }
@@ -410,8 +411,12 @@ export const liveSource = ({
       controller: following,
       sync: syncData,
       publish: (value) => {
+        // A refused read stays refused: a local outbox update must never
+        // resurrect transcript rows the gateway stopped authorizing.
+        if (latest._tag === 'Unavailable') return false
         latest = latest._tag === 'Observed' ? { ...latest, value } : observed({ value })
         registry.set(data, latest)
+        return true
       },
       prefetch: () => {
         unmount ??= registry.mount(following)
@@ -528,7 +533,7 @@ export const liveSource = ({
     const publishPending = () => {
       changedFrom = Math.min(changedFrom, timeline.project().items.length)
       const page = projectPage()
-      retained.publish(page)
+      if (!retained.publish(page)) return
       publishedItems = page.items
       changedFrom = Infinity
     }

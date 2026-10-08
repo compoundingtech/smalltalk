@@ -616,4 +616,45 @@ describe('optimistic conversation sends', () => {
       }),
     ),
   )
+
+  it.live('never republishes transcript rows after the conversation read is refused', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        const conversation = live.source.conversation(agent.id)
+        live.registry.mount(conversation)
+        yield* settle
+        gateway.send({
+          kind: 'conversation', id: gateway.subscription('conversation').id,
+          collection: 'conversation', session_id: 'session/example',
+          replace: true, has_more: false,
+          items: [
+            { id: 'timeline-entry/secret/message', sequence: 1, revision: 1,
+              type: 'message', role: 'user', final: true, timestamp: snapshot.created_at,
+              body: { message_id: 'message/secret', from: 'person/operator', to: agent.id } },
+            { id: 'timeline-entry/secret/content', sequence: 2, revision: 1,
+              type: 'content', role: 'user', final: true, timestamp: snapshot.created_at,
+              body: { media_type: 'text/plain', text: 'authorized rows' } },
+          ],
+        })
+        yield* settle
+        expect(live.registry.get(conversation)).toMatchObject({ _tag: 'Observed' })
+        gateway.send({
+          kind: 'error', id: gateway.subscription('conversation').id, collection: 'conversation',
+          code: 'forbidden', message: 'Conversation read revoked', retryable: false,
+        })
+        yield* settle
+        expect(live.registry.get(conversation)).toMatchObject({ _tag: 'Unavailable', reason: 'ungranted' })
+        let resolvePost!: () => void
+        gateway.sendGate = new Promise<void>((resolve) => { resolvePost = resolve })
+        const sending = live.source.attachments!.send(request)
+        expect(live.registry.get(conversation)).toMatchObject({ _tag: 'Unavailable', reason: 'ungranted' })
+        resolvePost()
+        expect((yield* Effect.promise(() => sending))._tag).toBe('Success')
+        yield* settle
+        // A local outbox update must never resurrect rows the gateway stopped authorizing.
+        expect(live.registry.get(conversation)).toMatchObject({ _tag: 'Unavailable', reason: 'ungranted' })
+      }),
+    ),
+  )
 })
