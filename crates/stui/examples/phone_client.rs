@@ -50,9 +50,13 @@ async fn main() {
     if let Some(path) = timing {
         use std::io::Write as _;
         let started = Instant::now();
-        let file = std::sync::Mutex::new(
-            std::fs::OpenOptions::new().create(true).append(true).open(path).expect("timing log"),
-        );
+        let mut log = std::fs::OpenOptions::new().create(true).append(true).open(path).expect("timing log");
+        // The origin of every `at_ms`: wall-clock time, to line this log up with other clocks.
+        let epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        let _ = writeln!(log, "{}", serde_json::json!({ "at_ms": 0, "type": "start", "epoch_ms": epoch_ms }));
+        let file = std::sync::Mutex::new(log);
         st3_client::set_observer(move |observation| {
             let line = timing_line(started.elapsed().as_millis() as u64, observation);
             if let Ok(mut file) = file.lock() {
