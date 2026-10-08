@@ -235,6 +235,13 @@ def evaluate(args,archive,metadata,key,variant):
   run.save()
  return run
 
+def pair_must_stop(run):
+ # A mechanical failure consumes its one authorized attempt; do not pay again
+ # against the same failed fixture. Semantic/model outcomes can use variant 2.
+ reason=run.provider.get("stopped") or ""
+ return (not run.semantic_started or reason in ("authentication-or-rate-limit","credential-helper-mismatch","token-count-error","unexpected-model")
+         or reason.startswith("transport-") or any(c["status"]=="FAIL" and c["id"] in ("runner-error","stop-fixture","cleanup","credential-isolation-before-eval","credential-isolation-after-eval","credential-isolation-unavailable","provider-usage-unavailable","transcript-export") for c in run.checks))
+
 def main():
  parser=argparse.ArgumentParser(description=__doc__)
  parser.add_argument("--archive",required=True); parser.add_argument("--sha256",required=True)
@@ -253,7 +260,7 @@ def main():
   for variant in (1,2):
    run=evaluate(args,archive,metadata,key,variant)
    results.append({"variant":variant,"semantic_started":run.semantic_started,"checks":run.checks,"provider":run.provider})
-   if run.provider.get("stopped") in ("authentication-or-rate-limit","credential-helper-mismatch") or not run.semantic_started:
+   if pair_must_stop(run):
     break
   manifest={"authorization":args.authorization,"archive":metadata,"native_claude_sha256":hashlib.sha256(args.claude.read_bytes()).hexdigest(),"results":results,"authorized_semantic_evaluations":2,"no_third_attempt":True,"codex":"pending: no authorized credential source"}
   (args.out/"summary.json").write_text(json.dumps(manifest,indent=2)+"\n")

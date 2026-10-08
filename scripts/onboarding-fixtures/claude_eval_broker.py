@@ -154,7 +154,7 @@ def main():
      record["token_count_status"]=count_status
      if count_status!=200:
       error=count_data.get("error") or {}
-      record["token_count_error"]={"type":error.get("type"),"message":str(error.get("message",""))[:512].replace(key,"[REDACTED]")}
+      record["token_count_error"]={"type":error.get("type"),"message":str(error.get("message","")).replace(key,"[REDACTED]")[:512]}
      if auth_error(count_status,count_data): return self.respond(count_status,count_data)
      if count_status!=200:
       stop("token-count-error"); return self.respond(count_status,count_data)

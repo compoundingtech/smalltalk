@@ -43,6 +43,19 @@ class CredentialGuards(unittest.TestCase):
    run.execute("receipt","test")
    for path in run.out.iterdir(): self.assertNotIn("secret-test-value",path.read_text())
 
+class FinalAttemptBoundaries(unittest.TestCase):
+ def run_shape(self,reason="",checks=None,started=True):
+  return type("Run",(),{"provider":{"stopped":reason},"checks":checks or [],"semantic_started":started})()
+ def test_nonmodel_failure_stops_pair_without_another_paid_attempt(self):
+  for reason in ("token-count-error","transport-KeyError","authentication-or-rate-limit","credential-helper-mismatch","unexpected-model"):
+   self.assertTrue(runner.pair_must_stop(self.run_shape(reason)))
+  self.assertTrue(runner.pair_must_stop(self.run_shape(started=False)))
+  for name in ("runner-error","cleanup","credential-isolation-after-eval"):
+   self.assertTrue(runner.pair_must_stop(self.run_shape(checks=[{"id":name,"status":"FAIL"}])))
+ def test_distinct_second_variant_allowed_after_bounded_model_failure(self):
+  self.assertFalse(runner.pair_must_stop(self.run_shape("evaluation-budget-or-call-cap",[{"id":"semantic-run-completed","status":"FAIL"}])))
+  self.assertFalse(runner.pair_must_stop(self.run_shape()))
+
 class PersonBoundaries(unittest.TestCase):
  def fixture(self,name="tour",attempt=1,generation="current"):
   run={"generation":"current","requester":"person/ada","steps":[{"subject":"step-run/current/"+name,"generation":generation,"step":name,"attempt":1,"status":"waiting"}]}
