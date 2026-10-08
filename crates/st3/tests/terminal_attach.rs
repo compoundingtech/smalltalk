@@ -908,7 +908,7 @@ async fn a_new_ready_agent_attaches_to_its_requested_incarnation() {
     let store = state.store.clone();
     let socket = root.path().join("st3.sock");
     let server = serve_unix(state, &socket).await;
-    let mut command = st3::test_support::async_command(env!("CARGO_BIN_EXE_st3-fixture"));
+    let mut command = st3::test_support::async_command(test_env!("CARGO_BIN_EXE_st3-fixture"));
     command
         .env_clear()
         .env("HOME", root.path())

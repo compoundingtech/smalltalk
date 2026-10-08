@@ -204,7 +204,7 @@ async fn early_exit_cli(code: i32, structured: bool, attach: bool) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     });
-    let mut command = st3::test_support::async_command(env!("CARGO_BIN_EXE_st3-fixture"));
+    let mut command = st3::test_support::async_command(test_env!("CARGO_BIN_EXE_st3-fixture"));
     command
         .env_clear()
         .env("HOME", root.path())
