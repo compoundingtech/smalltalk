@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "A page carries at most 32 MiB of conservatively estimated serialized envelope payloads, so peers may need more exchanges. A single envelope above that limit returns an explicit error rather than being skipped. Legacy TEXT estimates count all stored bytes, including bytes after NUL, and may conservatively refuse an envelope whose actual JSON form would fit. Complete legacy inventory listings and signature arrays are separate from this payload-only limit and can still exceed the 64 MiB transport limit. The peer wire format is unchanged."
+    "detail": "A page carries at most 32 MiB of conservatively estimated serialized envelope payloads, so peers may need more exchanges. A single envelope above that limit returns an explicit error rather than being skipped. Legacy TEXT estimates count all stored bytes, including bytes after NUL, and may conservatively refuse an envelope whose actual JSON form would fit. The full JSON response, including inventory identities, checkpoint and signatures, is also counted against the 64 MiB transport limit; only an ordered envelope suffix can be shortened. Complete legacy inventory or signature proof that cannot fit returns an explicit error and still needs a separately negotiated paging protocol. The peer wire format is unchanged."
   },
   "downtime": {
     "status": "unknown",
