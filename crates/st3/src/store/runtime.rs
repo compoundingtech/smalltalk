@@ -10,6 +10,8 @@ use super::*;
 pub struct SmalltalkRuntime {
     /// One registry per graph. Registration alone does not certify source coverage.
     pub(crate) ivm_views: Option<Arc<smallclaims::ivm::Views>>,
+    pub(crate) collection_sources: Option<Arc<collection_reactor::Registry>>,
+    pub(crate) collection_reactor: Mutex<Option<collection_reactor::Reactor>>,
     /// Receipt waits and collection sockets share this one commit observer. Publisher
     /// construction is serialized, including simultaneous first subscriptions.
     pub(crate) ivm_publisher: Mutex<Option<Arc<smallclaims::ivm::events::Publisher>>>,
@@ -57,6 +59,14 @@ impl SmalltalkRuntime {
     pub fn with_ivm_views(views: Arc<smallclaims::ivm::Views>) -> Self {
         Self {
             ivm_views: Some(views),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_collection_sources(registry: Arc<collection_reactor::Registry>) -> Self {
+        Self {
+            ivm_views: Some(registry.cx.views.clone()),
+            collection_sources: Some(registry),
             ..Self::default()
         }
     }
@@ -164,6 +174,9 @@ impl Runtime for SmalltalkRuntime {
             // be idempotent, including reopen with persisted outputs and event cursors.
             views.create_schema(connection)?;
         }
+        if let Some(registry) = &self.collection_sources {
+            registry.create_schema(connection)?;
+        }
         Ok(())
     }
 
@@ -189,6 +202,11 @@ impl Runtime for SmalltalkRuntime {
             views.initialize_empty(transaction, cut)?;
             smallclaims::ivm::events::install(transaction, 4096)?;
         }
+        // GraphStore has not constructed its managed writer yet. Persisted capture triggers
+        // must still observe paired scope during projection setup and source registration.
+        if let Some(registry) = &self.collection_sources {
+            registry.begin(transaction)?;
+        }
         custom::open(transaction)?;
         resources::open(transaction)?;
         glass_heads::open(transaction)?;
@@ -198,6 +216,10 @@ impl Runtime for SmalltalkRuntime {
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
+            if let Some(registry) = &self.collection_sources {
+                registry.open(transaction)?;
+                registry.commit(transaction)?;
+            }
             return Ok(());
         }
         let upgraded: bool = transaction.query_row(
@@ -228,6 +250,10 @@ impl Runtime for SmalltalkRuntime {
             let _ = rebuilt;
         }
         migrate_occurrence_creation_projections_tx(transaction)?;
+        if let Some(registry) = &self.collection_sources {
+            registry.open(transaction)?;
+            registry.commit(transaction)?;
+        }
         Ok(())
     }
 
@@ -323,8 +349,12 @@ impl Runtime for SmalltalkRuntime {
         cache.statuses.clear();
         cache.card_statuses.clear();
         drop(cache);
-        let mut owners = self.conversation_owners.lock().unwrap_or_else(PoisonError::into_inner);
-        self.conversation_owner_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut owners = self
+            .conversation_owners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.conversation_owner_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         owners.clear();
         drop(owners);
         self.agent_status_cache
@@ -379,7 +409,10 @@ impl Runtime for SmalltalkRuntime {
         connection: &Connection,
         subject: &str,
         cut: u128,
-    ) -> Result<(Value, smallclaims::store::checkpoint::CheckpointAnswerSources)> {
+    ) -> Result<(
+        Value,
+        smallclaims::store::checkpoint::CheckpointAnswerSources,
+    )> {
         checkpoint_rules::subject_answers_with_sources(connection, subject, cut)
     }
 }
