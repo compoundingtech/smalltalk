@@ -4,14 +4,15 @@ Every pushed Git tag runs **Smalltalk tag release**. Both native builds must pas
 GitHub release is published. A release is also published once a day when `main` changed since the
 last one (see [Daily releases](#daily-releases)). Each release contains:
 
-- `smalltalk-x86_64-unknown-linux-gnu.tar.gz`: Linux x86_64, built on Ubuntu 22.04 (glibc 2.35 or newer).
+- `smalltalk-x86_64-unknown-linux-gnu.tar.gz`: Linux x86_64, linked for glibc 2.35 or newer (Ubuntu 22.04+).
 - `smalltalk-aarch64-apple-darwin.tar.gz`: Apple Silicon, macOS 15 or newer. The executables are
   ad-hoc signed, not Developer ID signed or notarized; macOS may require approval to open them.
 - One `.sha256` checksum per archive, combined `SHA256SUMS`, and `RELEASE.json` with the exact
   source commit, target, Rust compiler version, and PTY runtime revision.
 
-Each archive has `bin/st3`, `bin/st` (a relative symlink to `st3`), `bin/stui`, `bin/st3-migrate`,
-and `bin/pty`, plus `install.sh`, `install-macos.py`, `BUILD.json`, and this guide. PTY is built from the exact
+New archives contain `bin/st3`, `bin/st` (a relative symlink to `st3`) and `bin/pty`,
+plus `install.sh`, `install-macos.py`, `BUILD.json`, and this guide. `st3-migrate` remains
+a separate source tool. Older published archives retain their original contents. PTY is built from the exact
 `flake.lock` runtime revision; this is distinct from the `pty-core` library dependency. These
 archives need neither Nix nor Rust installed. Harness CLIs and their logins remain separate.
 
@@ -22,30 +23,37 @@ If a populated v0.3.4 store may have unsigned delegation grants, follow the
 keys first. A build containing prevention #1269 can sign preserved unsealed work; it retains
 signature warnings from already-sealed affected payloads.
 
-Choose a tag from the repository's Releases page, then download the archive for your machine
-and its `.sha256` file. For example, with GitHub CLI:
+For a new machine, the one-line installer detects the platform, verifies the archive
+and opens `st` for first-run setup:
 
 ```sh
-tag=v0.3.16 # example: choose a release and read its Upgrade impact first
-archive=smalltalk-x86_64-unknown-linux-gnu.tar.gz
-# On Apple Silicon: archive=smalltalk-aarch64-apple-darwin.tar.gz
-gh release download "$tag" --repo compoundingtech/smalltalk \
-  --pattern "$archive" --pattern "$archive.sha256"
-shasum -a 256 -c "$archive.sha256"
-tar -xzf "$archive"
-"./${archive%.tar.gz}/install.sh" --bin-dir "$HOME/.local/bin"
+curl -fsSL https://raw.githubusercontent.com/compoundingtech/smalltalk/main/install.sh | sh
 ```
 
-Put the chosen bin directory on `PATH`. The installer stages all four tools and the `st` link,
-then replaces each by rename; existing processes retain their old executable. It does not restart
-anything or erase state. On macOS it installs `st3` and `stui` in the fixed `~/Applications/SmallTalk.app` bundle, registers it with Launch Services, and updates existing daemon/replication LaunchAgent paths. Configure `ST_MACOS_SIGNING_IDENTITY` and optionally `ST_MACOS_SIGNING_TEAM` for persistent signing; no identity uses ad-hoc signing. A configured missing identity fails rather than falling back. See [macOS installation and signing](macos-installation.md). Keep the previous archive as recovery material. Installing it again is a supported rollback
+For a pinned version or an existing installation, select a published release after
+reading its Upgrade impact. Add `--tag` and `--no-run` to that installer to choose
+the release and install without opening st. `--bin-dir` chooses the command directory.
+No GitHub CLI is needed. The archive and expected SHA256 are fetched from the same
+release endpoint; this checks integrity, rather than providing an independent signature.
+To verify an archive manually, download it and its `.sha256` sidecar, use
+`sha256sum -c` on Linux or `shasum -a 256 -c` on macOS, extract it, and invoke its
+`install.sh`. Keep the archive, checksum and `BUILD.json` as the source record.
+
+Put the chosen bin directory on `PATH`. The new installer stages `st3`, `pty` and the `st` link,
+then replaces command files by rename; existing processes retain their old executable. It does not restart
+anything or erase state. On macOS it installs `st3` in the fixed `~/Applications/SmallTalk.app` bundle, registers it with Launch Services, and updates existing daemon/replication LaunchAgent paths. Configure `ST_MACOS_SIGNING_IDENTITY` and optionally `ST_MACOS_SIGNING_TEAM` for persistent signing; no identity uses ad-hoc signing. A configured missing identity fails rather than falling back. See [macOS installation and signing](macos-installation.md). Linux handled failures restore prior command files. A late macOS archive failure
+after the helper backup retains current app/links, the recovery job, prior command
+files and transaction locks because the existing helper API cannot atomically verify
+late ownership. Inspect newer installations before recovering from that retained
+material. Keep the previous archive as recovery material. Installing it again is a supported rollback
 only when its database, claim and driver contracts can read the current state; see
 [upgrade and recovery](../upgrading-st.md#swap-back-or-roll-forward) and the
 [0.x compatibility policy](compatibility.md). Forward-only migrations require roll-forward
 unless the release explicitly documents a downgrade. Before upgrading a healthy populated
 store, make a [claim backup](backups.md) and preserve excluded local data separately.
 
-Run `st service install` after the first install or a changed executable path; it refreshes
+First-run `st` offers to install the background service. For an upgrade or changed
+executable path, `st service install` refreshes
 service definitions and restarts daemon and replication services. `st service restart` suffices
 when those definitions already point at the intended binaries. Schedule that restart, compare
 `st --version --json` with the daemon's `machine_version` in `st doctor --json`, and verify peer

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Start the README and getting-started guide with download and run st, and correct fleet setup prerequisites.",
+  "replay": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or installation transaction changes. The guide describes the separately implemented first-run setup and expert, with Nix and daemon operations kept as reference."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or installation transaction changes. The guide describes the separately implemented first-run setup and expert, with Nix and daemon operations kept as reference."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or installation transaction changes. The guide describes the separately implemented first-run setup and expert, with Nix and daemon operations kept as reference."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or installation transaction changes. The guide describes the separately implemented first-run setup and expert, with Nix and daemon operations kept as reference."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or installation transaction changes. The guide describes the separately implemented first-run setup and expert, with Nix and daemon operations kept as reference."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or installation transaction changes. The guide describes the separately implemented first-run setup and expert, with Nix and daemon operations kept as reference."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or installation transaction changes. The guide describes the separately implemented first-run setup and expert, with Nix and daemon operations kept as reference."
+  }
+}
