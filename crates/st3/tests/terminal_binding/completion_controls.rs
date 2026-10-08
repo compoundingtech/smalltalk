@@ -172,14 +172,14 @@ try:
         event = json.loads(line)
         if event.get('method') == 'notifications/claude/channel':
             Path(os.environ['FIXTURE_RECEIVED']).write_text(json.dumps(event))
+            while not Path(os.environ['FIXTURE_NATIVE_IDLE']).exists():
+                time.sleep(0.005)
             break
     else:
         raise RuntimeError('channel ended without mail')
 finally:
     channel.stdin.close()
     channel.wait(timeout=10)
-while not Path(os.environ['FIXTURE_NATIVE_IDLE']).exists():
-    time.sleep(0.005)
 if os.environ.get('FIXTURE_EXIT_GATE'):
     while not Path(os.environ['FIXTURE_EXIT_GATE']).exists():
         time.sleep(0.005)
