@@ -166,49 +166,102 @@ mod tests {
                 ("agent/node.worker","agent",r#"{"children":[{"name":"under","arguments":["worker-lead"]}]}"#),
                 ("agent/claimant","agent",r#"{"children":[{"name":"under","arguments":["claimant-lead"]}]}"#),
                 ("agent/available","agent",r#"{"children":[{"name":"under","arguments":["available-lead"]}]}"#),
-                ("resource/non-agent","resource",r#"{"children":[{"name":"under","arguments":["wrong"]}]}"#),
-                ("agent/unrelated","agent","malformed")
+                ("resource/non-agent","resource",r#"{"children":[{"name":"under","arguments":["wrong"]}]}"#)
             ] {
                 tx.execute("INSERT INTO desired(subject,kind,revision,claim_id,body) VALUES (?1,?2,'fixture',?3,?4)",
                     rusqlite::params![subject,kind,anchor.id,body])?;
             }
             Ok(())
         }).unwrap().unwrap();
-        for (claimant, assigned, available, expected) in [
-            (
-                Some("agent/claimant"),
-                Some("agent/node.worker"),
-                vec![],
-                Some("agent/claimant-lead"),
-            ),
-            (
-                None,
-                Some("agent/node.worker"),
-                vec![],
-                Some("agent/worker-lead"),
-            ),
-            (
-                None,
-                None,
-                vec!["agent/available"],
-                Some("agent/available-lead"),
-            ),
-            (
-                None,
-                None,
-                vec!["agent/available", "agent/node.worker"],
-                None,
-            ),
-            (None, Some("agent/missing"), vec![], None),
-            (None, Some("resource/non-agent"), vec![], None),
-        ] {
-            let mut row = response();
-            row.claimant = claimant.map(str::to_owned);
-            row.assigned_to = assigned.map(str::to_owned);
-            row.available_to = available.into_iter().map(str::to_owned).collect();
-            enrich_under(&store, &mut row).unwrap();
-            assert_eq!(row.under.first().map(|u| u.agent.as_str()), expected);
-        }
+        store
+            .readers
+            .request_read(|| -> anyhow::Result<()> {
+                let connection = store.readers.get();
+                // Native declaration-edge triggers parse body during INSERT. Corrupt only a
+                // connection-local read fixture, keeping the native table and its guards intact.
+                connection.execute_batch(
+                    "PRAGMA query_only=OFF;
+            CREATE TEMP TABLE desired AS SELECT * FROM main.desired;",
+                )?;
+                connection.execute(
+                    "INSERT INTO temp.desired(subject,kind,revision,claim_id,body)
+            VALUES ('agent/unrelated','agent','fixture',?1,'malformed')",
+                    [&anchor.id],
+                )?;
+                connection.execute_batch("PRAGMA query_only=ON;")?;
+                assert!(
+                    connection.query_row("PRAGMA query_only", [], |row| row.get::<_, bool>(0))?
+                );
+                assert!(!connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM main.desired
+            WHERE subject='agent/unrelated')",
+                    [],
+                    |row| row.get::<_, bool>(0)
+                )?);
+                assert_eq!(
+                    connection.query_row(
+                        "SELECT body FROM temp.desired
+            WHERE subject='agent/unrelated'",
+                        [],
+                        |row| row.get::<_, String>(0)
+                    )?,
+                    "malformed"
+                );
+                let full = store.desired_subjects()?;
+                assert_eq!(
+                    full.iter()
+                        .find(|subject| subject.subject == "agent/unrelated")
+                        .expect("the full desired read must encounter the malformed fixture")
+                        .desired,
+                    Value::Null,
+                    "malformed JSON retains the existing desired-reader null fallback"
+                );
+                for (claimant, assigned, available, expected) in [
+                    (
+                        Some("agent/claimant"),
+                        Some("agent/node.worker"),
+                        vec![],
+                        Some("agent/claimant-lead"),
+                    ),
+                    (
+                        None,
+                        Some("agent/node.worker"),
+                        vec![],
+                        Some("agent/worker-lead"),
+                    ),
+                    (
+                        None,
+                        None,
+                        vec!["agent/available"],
+                        Some("agent/available-lead"),
+                    ),
+                    (
+                        None,
+                        None,
+                        vec!["agent/available", "agent/node.worker"],
+                        None,
+                    ),
+                    (None, Some("agent/missing"), vec![], None),
+                    (None, Some("resource/non-agent"), vec![], None),
+                ] {
+                    let mut row = response();
+                    row.claimant = claimant.map(str::to_owned);
+                    row.assigned_to = assigned.map(str::to_owned);
+                    row.available_to = available.into_iter().map(str::to_owned).collect();
+                    enrich_under(&store, &mut row).unwrap();
+                    assert_eq!(row.under.first().map(|u| u.agent.as_str()), expected);
+                }
+                let mut selected_bad = response();
+                selected_bad.assigned_to = Some("agent/unrelated".into());
+                enrich_under(&store, &mut selected_bad)?;
+                assert!(
+                    selected_bad.under.is_empty(),
+                    "a selected malformed declaration must not invent a hierarchy"
+                );
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
