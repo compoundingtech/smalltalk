@@ -20749,52 +20749,59 @@ fn spawn_codex_provider(
     let paths = paths.clone();
     let state_dir = state_dir.to_path_buf();
     let argv = argv.to_vec();
-    tokio::task::spawn_blocking(move || match start {
-        // A resumed seat's launch environment names the thread it suspended on, and any other
-        // relaunch the thread it continues.
-        ProviderStart::Launch(
-            _,
-            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
-            _,
-            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
-        ) => {
-            let thread = st3::native_resume::requested().or_else(|| codex_continued_thread(&argv));
-            st_drivers::codex_app_server::run_controlled_paths(
+    tokio::task::spawn_blocking(move || {
+        let outcome = match start {
+            // A resumed seat's launch environment names the thread it suspended on, and any other
+            // relaunch the thread it continues.
+            ProviderStart::Launch(
+                _,
+                // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                _,
+                // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+            ) => {
+                let thread = st3::native_resume::requested().or_else(|| codex_continued_thread(&argv));
+                st_drivers::codex_app_server::run_controlled_paths(
+                    &paths.driver_root,
+                    &state_dir,
+                    &paths.agent_dir,
+                    paths.identity,
+                    paths.runtime_id,
+                    argv,
+                    paths.delivery_gate,
+                    thread,
+                )
+            }
+            ProviderStart::Adopt(st_drivers::provider_session::DetachedSession::Codex {
+                tui_pid,
+                server_pid,
+                watchdog_pid,
+                owner_write_fd,
+                socket_path,
+                safe_fallback,
+            }) => st_drivers::codex_app_server::adopt_controlled_paths(
                 &paths.driver_root,
                 &state_dir,
                 &paths.agent_dir,
                 paths.identity,
                 paths.runtime_id,
                 argv,
+                tui_pid,
+                server_pid,
+                watchdog_pid,
+                owner_write_fd,
+                socket_path,
+                safe_fallback,
                 paths.delivery_gate,
-                thread,
-            )
+            ),
+            ProviderStart::Adopt(session) => {
+                anyhow::bail!("a Codex driver cannot adopt this provider session: {session:?}")
+            }
+        };
+        #[cfg(feature = "test-support")]
+        if env!("CARGO_BIN_NAME") == "st3-fixture" {
+            st3::test_support::hold_provider_completion(&outcome)?;
         }
-        ProviderStart::Adopt(st_drivers::provider_session::DetachedSession::Codex {
-            tui_pid,
-            server_pid,
-            watchdog_pid,
-            owner_write_fd,
-            socket_path,
-            safe_fallback,
-        }) => st_drivers::codex_app_server::adopt_controlled_paths(
-            &paths.driver_root,
-            &state_dir,
-            &paths.agent_dir,
-            paths.identity,
-            paths.runtime_id,
-            argv,
-            tui_pid,
-            server_pid,
-            watchdog_pid,
-            owner_write_fd,
-            socket_path,
-            safe_fallback,
-            paths.delivery_gate,
-        ),
-        ProviderStart::Adopt(session) => {
-            anyhow::bail!("a Codex driver cannot adopt this provider session: {session:?}")
-        }
+        outcome
     })
 }
 
@@ -20890,24 +20897,38 @@ async fn drive_codex_native(
     let mut last_capacity_fingerprint = None;
     let mut delivery = NativeDeliverySupervisor::resumed(loop_state.delivery_episode);
     let mut replacement = DriverReplacement::new();
+    // Defer only this provider's exact owned terminal observation until its task
+    // returns; a foreign or superseded mailbox fence still ends the wrapper.
+    let mut completion_announced = false;
     loop {
         tokio::select! {
             frame = mailbox.recv() => {
+                #[cfg(feature = "test-support")]
+                if env!("CARGO_BIN_NAME") == "st3-fixture"
+                    && matches!(&frame, Some(st3::mailbox::Frame::Fenced { .. }))
+                    && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION")
+                {
+                    fs::write(PathBuf::from(root).join("fence-received"),
+                        if task.is_finished() { "finished" } else { "pending" })?;
+                }
                 let mail_changed = matches!(&frame, Some(st3::mailbox::Frame::Mailbox { .. }));
                 mailbox.accept(frame, &runtime_id)?;
-                if mail_changed
+                if !completion_announced && mail_changed
                     && let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "app-server").await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
             }
 
-            wake = observations.recv() => {
+            wake = observations.recv(), if !completion_announced => {
                 wake?;
-                if let Err(error) = observations.drain(client, subject, "codex", &mut loop_state.ready).await {
-                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                match observations.drain_live(client, subject, "codex", &mut loop_state.ready).await {
+                    Ok(ended) => completion_announced |= ended,
+                    Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
                 }
+                #[cfg(feature = "test-support")]
+                if completion_announced { fixture_codex_completion_phase(&task).await?; }
             }
-            result = &mut task => {
+            result = &mut task, if completion_announced || fixture_completion_task_enabled() => {
                 let outcome = result.context("joining the Codex driver")?;
                 if let Some(session) = detached_session(&outcome) {
                     loop_state.delivery_episode = delivery.episode;
@@ -20921,6 +20942,7 @@ async fn drive_codex_native(
                     let _ = replacement.exec(subject, &root, &resume);
                     loop_state = resume.loop_state;
                     task = spawn_codex_provider(&paths, &state_dir, &argv, ProviderStart::Adopt(session));
+                    completion_announced = false;
                     continue;
                 }
                 // A resume that ended before its thread bound was refused by Codex itself, such
@@ -20983,14 +21005,20 @@ async fn drive_codex_native(
                 }
                 return outcome;
             },
-            _ = interval.tick() => {
+            _ = interval.tick(), if !completion_announced => {
                 if let Err(error) = observations.expire_due() {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
 
                 if observations.retry_pending {
-                    if let Err(error) = observations.drain(client, subject, "codex", &mut loop_state.ready).await {
-                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    match observations.drain_live(client, subject, "codex", &mut loop_state.ready).await {
+                        Ok(ended) => completion_announced |= ended,
+                        Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
+                    }
+                    if completion_announced {
+                        #[cfg(feature = "test-support")]
+                        fixture_codex_completion_phase(&task).await?;
+                        continue;
                     }
                 }
 
@@ -21165,7 +21193,7 @@ async fn drive_codex_native(
                     replacement.check();
                 }
             }
-            _ = work_interval.tick() => {
+            _ = work_interval.tick(), if !completion_announced => {
                 let tick: Result<()> = async {
                     let minute = unix_minute()?;
                     if renewed_minute != Some(minute) {
@@ -21180,6 +21208,37 @@ async fn drive_codex_native(
             }
         }
     }
+}
+
+/// Called only after the actual live Codex drain deferred its matching terminal event.
+/// This fixture controls JoinHandle ordering; it performs no drain, claim or fence itself.
+#[cfg(feature = "test-support")]
+async fn fixture_codex_completion_phase(task: &tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+    if env!("CARGO_BIN_NAME") != "st3-fixture" { return Ok(()); }
+    let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION").map(PathBuf::from) else {
+        return Ok(());
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !root.join("provider-return.json").exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "Codex fixture provider completion timed out");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    fs::write(root.join("observation-drained"), b"deferred")?;
+    let after = fs::read_to_string(root.join("order"))? == "after";
+    if after {
+        while !task.is_finished() {
+            anyhow::ensure!(tokio::time::Instant::now() < deadline, "Codex fixture JoinHandle completion timed out");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    } else {
+        anyhow::ensure!(!task.is_finished(), "Codex fixture must retain pending provider JoinHandle");
+    }
+    fs::write(root.join("join-phase"), if after { "finished" } else { "pending" })?;
+    while !root.join("poll-driver").exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "Codex fixture driver release timed out");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
 }
 
 const PROVIDER_CAPACITY_MAX_RETRIES: u32 = 6;

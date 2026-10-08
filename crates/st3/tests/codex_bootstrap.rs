@@ -58,7 +58,7 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
     if st3::test_support::supervise_test() {
         return;
     }
-    delivery_recovery_control(false, false).await;
+    delivery_recovery_control(false, false, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -66,7 +66,7 @@ async fn mailbox_reconnect_preserves_provider_and_consumes_queued_mail_once() {
     if st3::test_support::supervise_test() {
         return;
     }
-    delivery_recovery_control(true, false).await;
+    delivery_recovery_control(true, false, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -74,8 +74,34 @@ async fn bound_cold_codex_promotes_custody_delivers_once_and_returns_to_its_shel
     if st3::test_support::supervise_test() {
         return;
     }
-    delivery_recovery_control(true, true).await;
+    delivery_recovery_control(true, true, Some(CompletionControl { order: "before", failure: false, rejection: None })).await;
 }
+
+#[derive(Clone, Copy)]
+struct CompletionControl {
+    order: &'static str,
+    failure: bool,
+    rejection: Option<&'static str>,
+}
+
+macro_rules! codex_completion_control {
+    ($name:ident, $order:literal, $failure:literal, $rejection:expr) => {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn $name() {
+            if st3::test_support::supervise_test() { return; }
+            delivery_recovery_control(true, true, Some(CompletionControl {
+                order: $order, failure: $failure, rejection: $rejection,
+            })).await;
+        }
+    };
+}
+
+codex_completion_control!(bound_codex_success_after_join_keeps_its_shell, "after", false, None);
+codex_completion_control!(bound_codex_failure_before_join_keeps_failure, "before", true, None);
+codex_completion_control!(bound_codex_failure_after_join_keeps_failure, "after", true, None);
+codex_completion_control!(bound_codex_foreign_token_after_terminal_stays_fenced, "before", false, Some("token"));
+codex_completion_control!(bound_codex_foreign_runtime_after_terminal_stays_fenced, "before", false, Some("runtime"));
+codex_completion_control!(bound_codex_foreign_invocation_after_terminal_stays_fenced, "before", false, Some("invocation"));
 
 fn lease_evidence(root: &Path) -> Value {
     use sha2::{Digest as _, Sha256};
@@ -91,7 +117,11 @@ fn lease_evidence(root: &Path) -> Value {
     ).unwrap()
 }
 
-async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
+async fn delivery_recovery_control(
+    mailbox_loss: bool,
+    bound_shell: bool,
+    completion: Option<CompletionControl>,
+) {
     use std::sync::atomic::AtomicBool;
     let path = std::env::var_os("PATH").unwrap_or_default();
     let on_path = |name: &str| {
@@ -250,7 +280,7 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
         .unwrap();
     let binary = binary_dir.path().join("st3-fixture");
     std::fs::copy(test_env!("CARGO_BIN_EXE_st3-fixture"), &binary).unwrap();
-    let environment = BTreeMap::from([
+    let mut environment = BTreeMap::from([
         ("HOME", root.to_string_lossy().into_owned()),
         ("PATH", path.to_string_lossy().into_owned()),
         ("ST_AGENT", SUBJECT.to_owned()),
@@ -266,6 +296,12 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
         ),
         ("ST3_MAILBOX_TRANSPORT", "push".to_owned()),
     ]);
+    let barrier = root.join("completion-control");
+    if let Some(control) = completion {
+        std::fs::create_dir(&barrier).unwrap();
+        std::fs::write(barrier.join("order"), control.order).unwrap();
+        environment.insert("ST3_FIXTURE_TERMINAL_COMPLETION", barrier.to_string_lossy().into_owned());
+    }
     let launch_root = root.to_owned();
     let result = tokio::task::spawn_blocking(move || {
         let mut command = std::process::Command::new(pty);
@@ -671,7 +707,56 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
                 .unwrap()
                 .contains(root.to_str().unwrap())
         );
-        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+        let signal = if completion.is_some_and(|control| control.failure) { libc::SIGKILL } else { libc::SIGTERM };
+        assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0);
+        let mut terminal_result = Value::Null;
+        if let Some(control) = completion {
+            until(|| barrier.join("provider-return.json").exists(), "Codex provider result was not retained").await;
+            terminal_result = serde_json::from_slice(&std::fs::read(barrier.join("provider-return.json")).unwrap()).unwrap();
+            assert_eq!(terminal_result["ok"], !control.failure, "{terminal_result}");
+            until(|| barrier.join("observation-drained").exists(), "live Codex drain did not defer its owned terminal event").await;
+            assert_eq!(std::fs::read_to_string(barrier.join("observation-drained")).unwrap(), "deferred");
+            if control.order == "after" { std::fs::write(barrier.join("release-provider"), b"go").unwrap(); }
+            until(|| barrier.join("join-phase").exists(), "Codex JoinHandle phase was not observed").await;
+            assert_eq!(std::fs::read_to_string(barrier.join("join-phase")).unwrap(),
+                if control.order == "after" { "finished" } else { "pending" });
+            let latest = store.latest_claim(SUBJECT, Some("harness.observed")).unwrap().unwrap();
+            assert_ne!(latest.body["fields"]["state"], "ended", "terminal graph publication must wait for the task disposition");
+            let retained = lease_evidence(root);
+            assert_eq!(retained, lease, "completion does not reissue custody");
+            match control.rejection {
+                Some("token") => {
+                    let request = st3::mailbox::Fence::new(SUBJECT, &incarnation, "delivery");
+                    st3::test_support::bind_fixture_mailbox(&store, &request).unwrap();
+                }
+                Some("runtime") => {
+                    store.append_claim(&ClaimInput {
+                        subject: SUBJECT.into(), kind: "runtime.observed".into(), actor: Some("daemon/runtime".into()),
+                        fields: BTreeMap::from([("status".into(), json!("running")), ("incarnation_id".into(), json!("replacement-runtime"))]),
+                        evidence: vec![], expected_subject: None, idempotency_key: None,
+                    }).unwrap();
+                }
+                Some("invocation") => {
+                    let source = format!("version 2\nagent \"eval.codex-bootstrap\" {{ harness \"codex\" {{}}; bind-terminal {TERMINAL:?} incarnation={physical_incarnation:?} id=\"019a0000-0000-7000-8000-000000000005\"; }}");
+                    let intent = st3::graph::parse_intent(&source, "bootstrap").unwrap();
+                    let plan = store.mission(&intent, st3::model::IntentInput { kdl: source, source_name: None }).unwrap();
+                    store.apply_as(&intent, &plan.subject_tokens, "replace-codex-invocation", Some("person/eval")).unwrap();
+                }
+                None => {},
+                Some(other) => panic!("unknown completion rejection {other}"),
+            }
+            std::fs::write(barrier.join("poll-driver"), b"go").unwrap();
+            if control.order == "before" && control.rejection.is_none() {
+                std::fs::write(barrier.join("release-provider"), b"go").unwrap();
+            }
+            if control.rejection.is_some() {
+                // Prove the foreign fence is fatal while the provider JoinHandle is
+                // pending, then release the blocking fixture worker for shutdown.
+                until(|| barrier.join("fence-received").exists(), "foreign Codex fence was not accepted").await;
+                assert_eq!(std::fs::read_to_string(barrier.join("fence-received")).unwrap(), "pending");
+                std::fs::write(barrier.join("release-provider"), b"go").unwrap();
+            }
+        }
         until(
             || root.join("driver-returned").exists(),
             "the bound wrapper did not return to its shell",
@@ -679,8 +764,21 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
         .await;
         assert_eq!(
             std::fs::read_to_string(root.join("driver-returned")).unwrap(),
-            "0"
+            if completion.is_some_and(|control| control.failure || control.rejection.is_some()) { "2" } else { "0" }
         );
+        if let Some(control) = completion {
+            if control.failure {
+                assert!(store.claims_for(SUBJECT, Some("harness.diagnostic")).unwrap().iter()
+                    .any(|claim| claim.body["fields"]["code"] == "codex-driver-failed"));
+            }
+            assert_eq!(offers(), 1, "terminal disposition must not replay native mail");
+            std::fs::write(root.join("codex-completion-evidence.json"), serde_json::to_vec_pretty(&json!({
+                "order":control.order,"failed_provider":control.failure,"foreign_fence":control.rejection,
+                "provider_result":terminal_result,"wrapper_exit":std::fs::read_to_string(root.join("driver-returned")).unwrap(),
+                "join_phase":std::fs::read_to_string(barrier.join("join-phase")).unwrap(),
+                "original_lease":lease,"offers":offers(),"same_shell_pid":shell_pid,"same_shell_birth":shell_generation,
+            })).unwrap()).unwrap();
+        }
         assert_eq!(
             st_runtime::process_start_token(shell_pid).unwrap(),
             shell_generation

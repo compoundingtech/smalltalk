@@ -71,10 +71,6 @@ impl Daemon {
 
     // Dropping this runtime also closes upgraded WebSocket connections, just as exiting
     // the daemon does. Aborting only the listener would leave those tasks alive.
-    async fn start_isolated(&mut self) {
-        self.start_isolated_app(st3::api::router(self.state())).await;
-    }
-
     async fn start_isolated_app(&mut self, app: axum::Router) {
         let socket = self.socket.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel();
