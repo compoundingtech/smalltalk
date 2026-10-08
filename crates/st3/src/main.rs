@@ -17263,7 +17263,7 @@ async fn run_st2_native_driver(
         predecessor_harness_record: fs::read(&harness_state_path).ok(),
         ..NativeLoopState::default()
     };
-    let task = spawn_st2_provider(
+    let task = spawn_st3_provider(
         driver,
         &paths,
         ProviderStart::Launch(
@@ -17401,7 +17401,7 @@ enum ProviderStart {
     Adopt(st_drivers::provider_session::DetachedSession),
 }
 
-fn spawn_st2_provider(
+fn spawn_st3_provider(
     driver: &str,
     paths: &NativePaths,
     start: ProviderStart,
@@ -17615,7 +17615,7 @@ async fn resume_native_driver(
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
     resume.loop_state.paths = Some(paths.resolved());
-    let task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(resume.session));
+    let task = spawn_st3_provider(driver, &paths, ProviderStart::Adopt(resume.session));
     drive_st2_native(
         client,
         subject,
@@ -17842,7 +17842,7 @@ async fn drive_st2_native(
                     };
                     let _ = replacement.exec(subject, &paths.state_root(), &resume);
                     loop_state = resume.loop_state;
-                    task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(session));
+                    task = spawn_st3_provider(driver, &paths, ProviderStart::Adopt(session));
                     completion_announced = false;
                     continue;
                 }
