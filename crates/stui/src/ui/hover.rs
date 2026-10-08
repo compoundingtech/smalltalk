@@ -114,7 +114,10 @@ impl Ui {
         // The same goes for a list row that is a block of lines, such as Home's items: the lit
         // background behind a paragraph is hard to read.
         let plain = match &info.hits[target.index].1 {
-            Hit::Message | Hit::Subject => true,
+            // Messages and the rows that fold and unfold them do not light up as the pointer
+            // passes (Nathan, 2026-10-07: they flickered); the footer still says what a click does.
+            Hit::Message | Hit::Subject | Hit::ToggleTool(_) => true,
+            Hit::Pane(PaneIntent::Expand(_)) => true,
             Hit::Row(_) | Hit::SidebarRow(_) | Hit::Peek(_) => target.rect.height > 1,
             _ => false,
         };

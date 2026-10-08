@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "The timing log of a designated test client (stui, phone_client) starts with a line giving the wall-clock time its at_ms counts from",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, columns, indexes or triggers."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "A diagnostic log only, written when STUI_TIMING_LOG or --timing is set: one extra first line of type start. No product, wire or client behavior change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to recover."
+  }
+}

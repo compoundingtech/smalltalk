@@ -941,8 +941,7 @@ async fn response_envelope_unbounded(
                     })
                 })
             })
-            .and_then(|cursor| decode_client_cursor(&cursor).ok())
-            .map(|cursor| cursor.snapshot)
+            .and_then(|cursor| decode_client_cursor_snapshot(&cursor).ok())
     });
     // Authentication can scan pairing claims, and creating a snapshot reads the store. Both
     // must leave the async acceptor free to admit independent requests when SQLite is busy.
@@ -1447,6 +1446,14 @@ fn decode_client_cursor(cursor: &str) -> Result<ClientPageCursor, ApiError> {
         message: "the page cursor is malformed".into(),
         details: Box::default(),
     })
+}
+
+fn decode_client_cursor_snapshot(cursor: &str) -> Result<ClientSnapshot, ApiError> {
+    if cursor.starts_with(client_v0::NATIVE_PAGE_CURSOR_PREFIX) {
+        client_v0::native_page_cursor_snapshot(cursor)
+    } else {
+        decode_client_cursor(cursor).map(|cursor| cursor.snapshot)
+    }
 }
 
 fn client_page_expired(message: impl Into<String>) -> ApiError {
@@ -2831,11 +2838,13 @@ fn managed_session_id(owner: &str, identity: &str) -> String {
     format!("session/{}", &digest[..24])
 }
 
+type ManagedSessionOwner = (String, Option<String>, Option<String>);
+
 fn managed_session_owner_at(
     store: &Store,
     snapshot_index: u64,
     session_id: &str,
-) -> anyhow::Result<Option<(String, Option<String>, Option<String>)>> {
+) -> anyhow::Result<Option<ManagedSessionOwner>> {
     crate::performance::task("conversation/owner", || {
         let owners = store.conversation_owners_at(snapshot_index)?;
         for owner in owners.values() {
@@ -2847,6 +2856,27 @@ fn managed_session_owner_at(
             }
         }
         Ok(None)
+    })
+}
+
+fn managed_session_owner_for_subject_at(
+    store: &Store,
+    snapshot_index: u64,
+    session_id: &str,
+    owner: &str,
+) -> anyhow::Result<Option<ManagedSessionOwner>> {
+    crate::performance::task("conversation/owner", || {
+        let owners = store.conversation_owners_at(snapshot_index)?;
+        let Some(owner) = owners.get(owner) else {
+            return Ok(None);
+        };
+        let Some(identity) = owner.incarnation.as_deref().or(owner.runtime.as_deref()) else {
+            return Ok(None);
+        };
+        if managed_session_id(&owner.subject, identity) != session_id {
+            return Ok(None);
+        }
+        Ok(Some((owner.subject.clone(), owner.incarnation.clone(), owner.origin.clone())))
     })
 }
 
@@ -11692,7 +11722,7 @@ fn accept_message_receipt_with_upload_owner(
     };
     // A repeated key returns the first claim and says it appended nothing.
     let (record, appended) = match &device_signature {
-        Some(signature) => state.store.append_signed_claim(&input, signature),
+        Some(signature) => state.store.append_signed_message(&input, signature),
         None => state.store.append_claim_outcome(&input),
     }
     .map_err(ApiError::bad)?;
