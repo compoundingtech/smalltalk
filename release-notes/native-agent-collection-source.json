@@ -24,7 +24,7 @@
   },
   "downtime": {
     "status": "unknown",
-    "detail": "Populated installation and deployed Linux/macOS startup times have not been measured on this source. Open-time native backlog projection or raw-gap replay runs synchronously before daemon startup. After opening, the native Store serves while bounded agent namespace installation is pending or refused. Installer limits are explicit: 1,000,000 extracted rows, 128 rows/1 MiB per page, 16,384 rows/16 MiB pending journal, 1 s callback and 1 h lifetime. Historical inventories do not establish that the current populated source fits these limits."
+    "detail": "Populated installation and deployed Linux/macOS startup times have not been measured on this source. Open-time native backlog projection or raw-gap replay runs synchronously before daemon startup. After opening, the opted-in agents collection sends resync while installation is pending or refused; it has no legacy row fallback. Other native API and collection readers remain available. Installer limits are explicit: 1,000,000 extracted rows, 128 rows/1 MiB per page, 16,384 rows/16 MiB pending journal, 1 s callback and 1 h lifetime. Historical inventories do not establish that the current populated source fits these limits."
   },
   "manual": {
     "status": "changed",
@@ -32,6 +32,6 @@
   },
   "recovery": {
     "status": "changed",
-    "detail": "Same-binding recovery preserves source epoch, revision and graph identity, discards only the bounded fixed pre-recovery capture range covered by the new baseline, reclaims unattached namespaces and republishes a fresh namespace. Interrupted recovery remains unavailable. Disabling the opt-in returns to the existing native collection route; restoring an incompatible binding never adopts prior readiness or producer evidence."
+    "detail": "Same-binding recovery preserves source epoch, revision and graph identity, discards only the bounded fixed pre-recovery capture range covered by the new baseline, reclaims unattached namespaces and republishes a fresh namespace. Interrupted recovery remains unavailable. Disabling the opt-in selects the existing native reader, but the private IVM tables and source capture triggers remain installed. There is no uninstall: disabling does not remove trigger cost, so installation is a one-way change for that cost. Restoring an incompatible binding never adopts prior readiness or producer evidence."
   }
 }

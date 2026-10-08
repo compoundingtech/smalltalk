@@ -812,22 +812,11 @@ async fn collection_stream_socket(
 ) {
     let windows = collection_windows::Windows::attach(&state.store);
     // Complete source adapters are admitted explicitly, never inferred from partial view IDs.
-    let adapters = match collection_ivm::adapters(state.store.clone()) {
-        Ok(adapters)=>adapters,
-        Err(error)=> {tracing::warn!(%error,"collection source adapter construction failed");return;}
-    };
-    let sources = if adapters.is_empty() {
-        None
-    } else {
-        let store = state.store.clone();
-        match blocking_store(move || collection_ivm::Sources::from_store(store, adapters)).await {
-            Ok(sources) => sources,
-            Err(error) => {
-                tracing::warn!(message=%error.message, "collection source attachment failed");
-                return;
-            }
-        }
-    };
+    let (sources, source_error) = collection_sources(
+        state.store.clone(),
+        collection_ivm::adapters(state.store.clone()),
+    )
+    .await;
     collection_stream_socket_with_sources(
         socket,
         state,
@@ -836,12 +825,63 @@ async fn collection_stream_socket(
         sources,
         move |state, session, request, permit| {
             let windows = windows.clone();
+            let source_error = source_error.clone();
             async move {
-                collection_items_with_windows(&state, &session, &request, permit, windows).await
+                collection_items_without_source(
+                    &state,
+                    &session,
+                    &request,
+                    permit,
+                    windows,
+                    source_error,
+                )
+                .await
             }
         },
     )
     .await;
+}
+
+async fn collection_items_without_source(
+    state: &AppState,
+    session: &ClientSession,
+    request: &CollectionSubscribe,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    windows: Option<Arc<collection_windows::Windows>>,
+    source_error: Option<Arc<str>>,
+) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+    if request.collection == "agents"
+        && let Some(error) = source_error
+    {
+        return Err(ApiError::internal(error));
+    }
+    collection_items_with_windows(state, session, request, permit, windows).await
+}
+
+async fn collection_sources(
+    store: Arc<Store>,
+    adapters: anyhow::Result<BTreeMap<String, Arc<collection_ivm::Adapter>>>,
+) -> (Option<Arc<collection_ivm::Sources>>, Option<Arc<str>>) {
+    let result = match adapters {
+        Ok(adapters) if adapters.is_empty() => return (None, None),
+        Ok(adapters) => {
+            blocking_store(move || collection_ivm::Sources::from_store(store, adapters))
+                .await
+                .and_then(|sources| {
+                    sources.ok_or_else(|| {
+                        ApiError::internal("collection source registry is unavailable")
+                    })
+                })
+        }
+        Err(error) => Err(ApiError::internal(error)),
+    };
+    match result {
+        Ok(sources) => (Some(sources), None),
+        Err(error) => {
+            tracing::warn!(message=%error.message, "collection source setup failed; other collections remain available");
+            (None, Some(error.message.into()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -906,6 +946,8 @@ async fn collection_stream_socket_with_sources<F, Fut>(
     let mut reads = futures_util::stream::FuturesUnordered::new();
     let read_slots = Arc::new(tokio::sync::Semaphore::new(COLLECTION_MAX_SUBSCRIPTIONS));
     let mut generation = 0_u64;
+    type GrantCheck = std::pin::Pin<Box<dyn Future<Output = Result<ClientSession, ApiError>> + Send>>;
+    let mut grant_check: Option<GrantCheck> = None;
     loop {
         // The subscriptions to read after this wake-up.
         let mut refresh = Vec::<String>::new();
@@ -924,13 +966,25 @@ async fn collection_stream_socket_with_sources<F, Fut>(
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending().await,
                 }
-            }, if grant_deadline.is_some() => {
-                let Ok(permit) = read_slots.clone().acquire_owned().await else { return; };
+            }, if grant_deadline.is_some() && grant_check.is_none() => {
                 let (state, held) = (state.clone(), session.clone());
-                let current = blocking_store(move || {
-                    let _permit = permit;
-                    state.store.read_snapshot(|_| Ok(revalidate_session(&state, &held)))
-                }).await.and_then(std::convert::identity);
+                let slots = read_slots.clone();
+                grant_check = Some(Box::pin(async move {
+                    let permit = slots.acquire_owned().await.map_err(ApiError::internal)?;
+                    blocking_store(move || {
+                        let _permit = permit;
+                        state.store.read_snapshot(|_| Ok(revalidate_session(&state, &held)))
+                    }).await.and_then(std::convert::identity)
+                }));
+                continue;
+            }
+            current = async {
+                match grant_check.as_mut() {
+                    Some(check) => check.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                grant_check = None;
                 match current {
                     Ok(current) => session = current,
                     Err(error) => {
@@ -10505,6 +10559,192 @@ mod tests {
             &state.store, true, "2026-10-03T09:00:00Z", state.store.index().unwrap(),
         ).unwrap();
         assert!(items.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
+    }
+
+    #[tokio::test]
+    async fn collection_source_setup_refusal_keeps_other_windows_and_pings_live() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let missing = Arc::new(collection_ivm::Adapter {
+            view: "fixture.missing",
+            coverage: Arc::new(|_| Ok(false)),
+            rows: Arc::new(|_, _, _, _, _, _, _| panic!("missing source must not read rows")),
+        });
+        for adapters in [
+            Err(anyhow::anyhow!("injected adapter setup failure")),
+            Ok(BTreeMap::from([("agents".into(), missing)])),
+        ] {
+            let (sources, error) = collection_sources(state.store.clone(), adapters).await;
+            assert!(sources.is_none());
+            assert!(error.is_some());
+            let (state, error) = (state.clone(), error.clone());
+            let app = axum::Router::new().route(
+                "/stream",
+                axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                    let (state, error) = (state.clone(), error.clone());
+                    async move {
+                        upgrade.on_upgrade(move |socket| {
+                            collection_stream_socket_with_reader(
+                                socket,
+                                state,
+                                ClientSession::local(None).unwrap(),
+                                None,
+                                move |state, session, request, permit| {
+                                    let error = error.clone();
+                                    async move {
+                                        collection_items_without_source(
+                                            &state, &session, &request, permit, None, error,
+                                        )
+                                        .await
+                                    }
+                                },
+                            )
+                        })
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+                .await
+                .unwrap();
+            for collection in ["agents", "work"] {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"kind":"subscribe","id":collection,"collection":collection})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let mut received = BTreeMap::new();
+            for _ in 0..2 {
+                let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let value: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                received.insert(value["id"].as_str().unwrap().to_owned(), value);
+            }
+            assert_eq!(received["agents"]["kind"], "resync");
+            assert_eq!(received["work"]["kind"], "snapshot");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Ping(
+                    vec![4, 7].into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                tokio_tungstenite::tungstenite::Message::Pong(vec![4, 7].into())
+            );
+            socket.close(None).await.unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn collection_grant_deadline_waiting_for_read_slots_keeps_ping_and_commands_live() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, entered) = (state.clone(), entered.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        let mut session = ClientSession::local(None).unwrap();
+                        session.transport = "fabric";
+                        session.pairing_expires_at = Some(client_now_ms() + 100);
+                        collection_stream_socket_with_reader(
+                            socket,
+                            state,
+                            session,
+                            None,
+                            move |_, _, _, permit| {
+                                entered.send(()).unwrap();
+                                async move {
+                                    let _permit = permit;
+                                    std::future::pending::<
+                                        Result<(ClientSnapshot, Vec<Value>, bool), ApiError>,
+                                    >()
+                                    .await
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await
+            .unwrap();
+        for index in 0..COLLECTION_MAX_SUBSCRIPTIONS {
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"kind":"subscribe","id":format!("held-{index}"),"collection":"agents"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        }
+        for _ in 0..COLLECTION_MAX_SUBSCRIPTIONS {
+            tokio::time::timeout(Duration::from_secs(5), entries.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Ping(
+                vec![8, 3].into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            tokio_tungstenite::tungstenite::Message::Pong(vec![8, 3].into())
+        );
+        // Unsubscribe frees a slot; only then can the expired grant check run and refuse.
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"unsubscribe","id":"held-0"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["kind"], "error");
+        assert_eq!(frame["code"], "forbidden");
+        server.abort();
     }
 
     #[tokio::test]

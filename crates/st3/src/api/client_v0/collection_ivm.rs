@@ -136,7 +136,11 @@ fn authorize(
     session: &ClientSession,
     request: &CollectionSubscribe,
 ) -> Result<ClientSession, ApiError> {
-    let current = revalidate_session(state, session)?;
+    let current = if session.transport == "unix" {
+        session.clone()
+    } else {
+        revalidate_session(state, session)?
+    };
     require_scope(&current, "read.projections")?;
     let limit = request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS);
     if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
@@ -714,7 +718,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let session = ClientSession::local(Some("person/avery")).unwrap();
+        // A read-only Unix session has no person header or pairing grant. It retains
+        // the same local read authority as the legacy collection path.
+        let session = ClientSession::local(None).unwrap();
         let request: CollectionSubscribe =
             serde_json::from_value(json!({"kind":"subscribe","id":"agents","collection":"agents"}))
                 .unwrap();

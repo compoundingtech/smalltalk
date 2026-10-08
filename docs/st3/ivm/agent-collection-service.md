@@ -64,4 +64,14 @@ clear that fence. Recovery discards only the fixed, bounded pre-recovery capture
 range that the new baseline covers. Interrupted installations reclaim unattached
 namespaces and prune journal pages before restarting. A changed receiver, schema,
 fingerprint or epoch keeps the agent source unavailable while the native Store
-continues to serve. These recovery controls are separate from initial publication.
+remains open. The opted-in agents collection sends resync while this source is unavailable and has no legacy row fallback; other native API and collection readers retain their configured paths. These recovery controls are separate from initial publication.
+
+Disabling the flag selects the native reader but leaves private IVM tables and
+capture triggers installed. There is no uninstall, so disabling does not remove
+the trigger cost. Paired collection sockets now revalidate at their grant
+expiration deadline and close on refusal instead of waiting for a per-subscription
+error on a later approximately 30-second tick. Slot admission and physical grant
+validation run outside the socket loop; pings and commands remain live. Source
+adapter/bridge setup failure refuses agents while preserving other collections
+on the same socket. Local Unix read-only sessions require no person header or
+pairing grant, matching the existing native reader.

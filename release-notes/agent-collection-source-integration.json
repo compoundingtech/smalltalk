@@ -3,7 +3,7 @@
   "summary": "Compose bounded native agent SQL capture, primary-key extraction, canonical input and private delivery-source storage for the agent collection integration.",
   "replay": {
     "status": "changed",
-    "detail": "Explicit installation pages existing source tables at up to128 rows/1MiB per snapshot; namespace canonical metadata repairs and finite captured clocks share a bounded maintenance budget. No startup scan, automatic replay, gap recovery or source-cut promotion is installed."
+    "detail": "Explicit opt-in installation pages complete receiver-bound source tables at up to 128 rows/1 MiB per snapshot. Namespace repairs and captured clocks share a bounded maintenance budget; native-agent-collection-source.json describes actual native startup/recovery projection and fresh namespace publication."
   },
   "schema": {
     "status": "changed",
@@ -14,12 +14,12 @@
     "detail": "Public card admission and mutable-verdict policy are unchanged. The explicit capture fingerprint binds the default st3 registry/projection digest and current unfiltered-verdict domain."
   },
   "compatibility": {
-    "status": "none",
-    "detail": "Existing v0 frames and generated clients are unchanged. Empty-key full refresh invalidates retained rows; pending independent source evidence retries without acknowledging the cursor. Paired grant expiry is rechecked on its deadline."
+    "status": "changed",
+    "detail": "Paired collection sockets now revalidate at the grant expiration deadline and close with a forbidden error on refusal, instead of waiting for a per-subscription error on a later approximately 30-second tick. The slot wait and physical validation run outside the socket loop so pings and commands remain live. Local read-only Unix sessions keep their legacy read authority without requiring a person header or pairing grant. Local-observation pruning and checkpoint state writes use managed transactions on default Stores too; batch commit errors preserve the full cause chain. Delivery presence updates acquire the source mutex even without an installed source owner. Existing v0 frames and generated clients remain unchanged."
   },
   "downtime": {
-    "status": "none",
-    "detail": "No default reader activation or startup work. Complete card composition, real daemon parity and callback-cost qualification remain required before serving this source."
+    "status": "unknown",
+    "detail": "The default Store has no IVM source installer or backfill. Opt-in startup and populated installation costs require separate measurements; source preparation failure refuses agents while other collection readers remain available."
   },
   "manual": {
     "status": "none",
