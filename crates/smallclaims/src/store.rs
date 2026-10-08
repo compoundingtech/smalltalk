@@ -3497,7 +3497,7 @@ const REPLICATION_EXCHANGE_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
 
 /// Count the exact uncompressed JSON bytes without constructing another copy of a page.
 /// The serializer stops at the transport cap, even for malformed legacy TEXT payloads.
-fn serialized_bytes_bounded<T: Serialize>(value: &T, limit: usize) -> Result<Option<usize>> {
+pub(crate) fn serialized_bytes_bounded<T: Serialize>(value: &T, limit: usize) -> Result<Option<usize>> {
     struct Counter {
         bytes: usize,
         limit: usize,
@@ -3528,7 +3528,10 @@ fn serialized_bytes_bounded<T: Serialize>(value: &T, limit: usize) -> Result<Opt
 
 /// The complete inventory and signature proof is indivisible. Only the payload envelope suffix
 /// may be shortened; the next exchange resumes from the prefix the peer received.
-fn fit_replication_exchange_body(exchange: &mut ReplicationExchange, limit: usize) -> Result<()> {
+pub(crate) fn fit_replication_exchange_body(
+    exchange: &mut ReplicationExchange,
+    limit: usize,
+) -> Result<()> {
     let pending = std::mem::take(&mut exchange.envelopes);
     let mut bytes = serialized_bytes_bounded(exchange, limit)?
         .ok_or_else(|| anyhow::anyhow!("complete replication inventory or signatures exceed the exchange byte limit"))?;
