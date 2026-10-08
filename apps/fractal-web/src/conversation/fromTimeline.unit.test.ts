@@ -67,10 +67,11 @@ The person reads replies in st, not in the agent's session.`,
         entry('timeline-entry/unmatched', 2, 'content', {
           media_type: 'text/plain', text: '<smalltalk-message graph="message/unseen">unseen</smalltalk-message>',
         }),
+        entry('timeline-entry/image', 3, 'content', { media_type: 'image/png', attachment_id: 'blob/image' }),
       ],
     })
     expect(timeline.project().items.map((item) => item.id)).toEqual([
-      'timeline-entry/direct', 'timeline-entry/unmatched',
+      'timeline-entry/direct', 'timeline-entry/unmatched', 'timeline-entry/image',
     ])
   })
 })
