@@ -134,4 +134,4 @@ export type UnknownEventItem = Extract<ConversationItem, { _tag: 'UnknownEvent' 
 export type SendState =
   | { readonly _tag: 'Sent' }
   | { readonly _tag: 'Pending' }
-  | { readonly _tag: 'Failed'; readonly reason: string; readonly detail?: string }
+  | { readonly _tag: 'Failed'; readonly reason: { readonly _tag: 'Rejected' | 'Ungranted' | 'Invalid' | 'Failed' | 'StaleFence' | 'SnapshotUnavailable' }; readonly detail?: string }
