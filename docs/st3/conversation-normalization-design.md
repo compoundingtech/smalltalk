@@ -118,14 +118,14 @@ On `tool_call` blocks, parsed from the native arguments (OMP field `i` becomes
 | --- | --- | --- |
 | `bash` | command, cwd?, timeout_s?, env_keys?: string[], background: bool | tool `bash` {command,cwd,timeout,env,async} |
 | `edit` | path?, ops: number, input_bytes | tool `edit` {input} (hashline patch; path = first `[PATH#TAG]` header) |
-| `write` | path, bytes | tool `write` {path,content} |
+| `write` | path, bytes, content?, line_count? | tool `write` {path,content}; line count counts native written lines |
 | `read` | path, range?: string | tool `read` {path} (suffix after `:` = range) |
-| `search` | engine: "grep"\|"glob"\|"web", pattern?, path?, query? | tools `grep`, `glob`, `web_search` |
+| `search` | engine: "grep"\|"glob"\|"web", pattern?, path?, query?, case?, hidden?, gitignore?, limit?, skip? | tools `grep`, `glob`, `web_search`; flags preserve explicit false/zero values |
 | `todo` | op, items?: [{content, status}], phase?, task? | tool `todo` |
-| `ask` | questions: [{id, question, options: [{label}], multi: bool, recommended?: number}] | tool `ask` |
-| `task` | tasks: [{name?, agent?, task}] | tool `task` |
-| `hub` | op, name?, target?, timeout_s? | tool `hub` |
-| `eval` | language, title?, code_bytes | tool `eval` |
+| `ask` | questions: [{id, question, options: [{label, description?}], multi: bool, recommended?: number}] | tool `ask`; every alternative survives the selected answer |
+| `task` | context?, tasks: [{name?, agent?, task}] | tool `task`; context carries the parent context/contract |
+| `hub` | op, name?, target?, timeout_s?, message? | tool `hub`; send body remains beside its receipt |
+| `eval` | language, title?, code_bytes, code?, timeout_s?, reset? | tool `eval`; preserve explicit reset=false and timeout=0 |
 | `generic` | name | any other tool |
 
 On `tool_output` blocks, parsed from the OMP toolResult `details`; all of these also
@@ -134,6 +134,7 @@ have `tool`, `call_id` and `is_error`:
 | view.type | fields |
 | --- | --- |
 | `bash` | exit_code?, wall_ms?, timeout_s?, timed_out?: bool |
+| `search` | engine, match_count?, file_count?, truncated?, file_limit_reached?, per_file_limit_reached?, warning?; counts come from native matchCount/fileCount, never inferred from bounded rows |
 | `edit` | path?, first_changed_line?, diff?: string (unified diff as given) |
 | `todo` | phases: [{name, items: [{content, status}]}] |
 | `ask` | answers: [{question, selected: string[], custom?: string, note?: string}] |
@@ -141,8 +142,12 @@ have `tool`, `call_id` and `is_error`:
 | `hub` | op, timed_out?: bool, jobs?: [JobSummary], state? |
 | `generic` | is_error: bool, wall_ms? |
 
-`SubagentSummary` = `{id, agent?, status, task?, duration_ms?, tokens?, cost_usd?,
-requests?, tool_count?, conversation?: {session_id}}`. The owner fills
+`SubagentSummary` = `{id, name?, agent?, status, task?, duration_ms?, tokens?, cost_usd?,
+requests?, tool_count?, conversation?: {session_id}}`. `name` preserves the OMP name
+(native `name`, otherwise `id`); `agent` is its type. `task` preserves the full native
+`assignment`, otherwise `task`. Both clients retain invocation rows when the result
+arrives, draw all assignment lines on expansion, and label the child-open row with
+the name while routing to the actual session id. The owner fills
 `conversation.session_id` only when the child transcript exists at
 `<parent transcript without .jsonl>/<id>.jsonl` and is readable; that session id opens
 through the normal conversation routes (same fold, paging and refs), which is how a
@@ -159,7 +164,7 @@ its #1574 shape (other `custom_message` records with display != false stay `text
 | custom_message `launch-completion` | `job` | `{type:"job", jobs: [JobSummary]}` (from details.daemons) |
 | custom_message `async-result` | `job` | `{type:"job", jobs: [JobSummary]}` (from details.jobs) |
 | custom_message `skill-prompt` | `status` | `{type:"skill", name, path?, args?}` |
-| `compaction` / `branch_summary` | `status` | `{type:"compaction", method?, tokens_before?, tokens_after?, short_summary?}`; summary text stays as today |
+| `compaction` / `branch_summary` | `status` | `{type:"compaction", method?, tokens_before?, tokens_after?, short_summary?, summary?}`; first lines collapsed, full summary on expansion |
 | `model_change` | `status` | `{type:"model_change", model, role?, fallback?: bool}` |
 | `thinking_level_change` | `status` | `{type:"thinking_level", level, configured?}` |
 | `title_change` / `title` | `status` | `{type:"title", title, previous?, source?}` (`previous` only on title changes) |
@@ -168,6 +173,22 @@ its #1574 shape (other `custom_message` records with display != false stay `text
 | custom `session_exit` | `status` | `{type:"session_exit", kind, reason}` |
 | custom `tool_execution_start` | `status`, visibility `internal` | `{type:"tool_start", call_id, tool, started_at}`; renderers attach it to the call row and do not draw it alone |
 | assistant message metadata | on its `text`/`reasoning` blocks | `metadata.model`, `metadata.provider`, `metadata.usage` {input, output, cache_read, cache_write, total, cost_usd}, `metadata.context_tokens`, `metadata.stop_reason`, `metadata.ttft_ms`, `metadata.duration_ms`; no view |
+| assistant error message | `error` | `{type:"assistant_error", status, presentation, is_error, label, message, stop_reason?, error_id?, api?, provider?, model?, retry?}` |
+
+Assistant errors come from the assistant session message, not a synthesized daemon
+failure. Persisted `retry` markers carry `{kind,status,attempt,recovery,note,
+recovered_at?,superseded_by?}`. Status is `failed`, `recovered`, or `superseded`;
+presentation is `full`, `compact-recovered`, or `none`, matching OMP's persisted
+outcome. Original error text remains available on expansion after recovery.
+Superseded errors are retained in source data but not drawn. No in-progress retry
+state is invented when the session record does not contain it.
+
+Written content, assignment/context, eval code and compaction summaries use the
+existing 8 KiB display bound and authenticated continuation. Typed view-only refs
+are reattached to their original blocks and passed through the same adapter on
+expansion; metadata and unknown subtrees keep a raw JSON fallback. The written
+line count describes the complete source, not the bounded preview.
+
 
 Timeline pages and delta responses (when `conversation-blocks.v1` is negotiated) MAY
 carry a `header` object. Each field is `{value, source: register|transcript, as_of}`:

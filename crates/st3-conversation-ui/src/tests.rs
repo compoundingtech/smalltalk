@@ -604,11 +604,12 @@ fn a_subagent_card_opens_its_child_conversation() {
     let Body::Tool { title, state, output } = &card.body else {
         panic!("{card:?}");
     };
-    assert_eq!((title.as_str(), *state), ("reviewer · completed", ToolState::Ok));
+    assert_eq!((title.as_str(), *state), ("Review · completed · reviewer", ToolState::Ok));
     assert_eq!(
         output.as_slice(),
         [
             "Review synthetic code",
+            "Report all findings",
             "duration 1200ms",
             "tokens 80",
             "cost $0.02",
@@ -633,7 +634,7 @@ fn a_subagent_card_opens_its_child_conversation() {
     assert!(
         doc.lines
             .iter()
-            .any(|line| text::plain(line).contains("open session/child"))
+            .any(|line| text::plain(line).contains("open Review"))
     );
 }
 
@@ -655,8 +656,10 @@ fn typed_calls_bundle_in_the_simplified_conversation() {
         .map(|line| text::plain(line))
         .collect::<Vec<_>>();
     assert!(
-        // The thirteen typed calls and the subagent card form one run.
-        shown.iter().any(|line| line.contains("14 tool calls")),
+        // Written content remains a preview card, splitting the surrounding tool runs.
+        shown.iter().any(|line| line.contains("2 tool calls"))
+            && shown.iter().any(|line| line.contains("11 tool calls"))
+            && shown.iter().any(|line| line.contains("write demo.txt")),
         "{shown:?}"
     );
 }
@@ -1277,4 +1280,49 @@ fn native_window_notice_with_unfetchable_remainder_stays_at_start() {
     assert!(shown[0].contains("Earlier history is not shown"), "{shown:?}");
     assert!(shown[0].contains("not fetchable"), "{shown:?}");
     assert!(shown.last().unwrap().contains("last words"), "{shown:?}");
+}
+
+#[test]
+fn invocation_details_survive_tool_results_and_summaries_fold() {
+    let call = |id: &str, view: serde_json::Value| {
+        serde_json::from_value::<st3_client::TimelineEntry>(serde_json::json!({
+            "id":id, "sequence":1, "revision":1, "timestamp":"2026-10-08T12:00:00Z",
+            "role":"assistant", "final":true, "type":"tool_call",
+            "body":{"call_id":id,"name":view["type"],"arguments":{},
+                "blocks":[{"id":id,"kind":"tool_call","source_type":"synthetic","payload":{},"view":view}]}
+        })).unwrap()
+    };
+    for (kind, view, expected) in [
+        ("bash", serde_json::json!({"type":"bash","command":"echo synthetic","cwd":"/synthetic","timeout_s":30}), vec!["cwd: /synthetic", "timeout: 30s"]),
+        ("write", serde_json::json!({"type":"write","path":"demo","bytes":11,"line_count":2,"content":"first\nlast"}), vec!["first", "last"]),
+        ("eval", serde_json::json!({"type":"eval","language":"py","code":"1 + 2\n3 + 4","timeout_s":5,"reset":false}), vec!["language: py", "timeout: 5s", "reset: false", "1 + 2", "3 + 4"]),
+        ("hub", serde_json::json!({"type":"hub","op":"send","target":"Child","message":"sent\nbody"}), vec!["sent", "body"]),
+        ("search", serde_json::json!({"type":"search","engine":"grep","pattern":"needle","case":false,"gitignore":true,"skip":2}), vec!["case: false", "gitignore: true", "skip: 2"]),
+    ] {
+        let result: st3_client::TimelineEntry = serde_json::from_value(serde_json::json!({
+            "id":format!("{kind}-result"),"sequence":2,"revision":1,"timestamp":"2026-10-08T12:00:01Z",
+            "role":"tool","final":true,"type":"tool_result",
+            "body":{"call_id":kind,"status":"success","media_type":"text/plain","content":"receipt"}
+        })).unwrap();
+        let entries = adapt::conversation(&[call(kind, view), result], &Default::default());
+        let Body::Tool { output, .. } = &entries[0].body else { panic!("tool card") };
+        for row in expected { assert!(output.iter().any(|actual| actual == row), "{kind}: {output:?}"); }
+        assert_eq!(output.last().unwrap(), "receipt");
+    }
+}
+
+#[test]
+fn assistant_error_and_compaction_are_explicit_expandable_cards() {
+    for (view, kind, expected, state) in [
+        (serde_json::json!({"type":"assistant_error","status":"recovered","presentation":"compact-recovered","is_error":false,"message":"synthetic failure","retry":{"note":"retried successfully"}}), "error", vec!["synthetic failure", "retried successfully"], ToolState::Ok),
+        (serde_json::json!({"type":"compaction","summary":"first summary line\nlast summary line","tokens_before":100,"tokens_after":20}), "status", vec!["first summary line", "last summary line"], ToolState::Ok),
+    ] {
+        let entry: st3_client::TimelineEntry = serde_json::from_value(serde_json::json!({
+            "id":"summary", "sequence":1,"revision":1,"timestamp":"2026-10-08T12:00:00Z",
+            "role":"assistant","final":true,"type":"content",
+            "body":{"media_type":"text/plain","blocks":[{"id":"summary","kind":kind,"source_type":"synthetic","payload":{},"view":view}]}
+        })).unwrap();
+        let entries = adapt::conversation(&[entry], &Default::default());
+        assert!(matches!(&entries[0].body, Body::Tool { output, state:actual, .. } if output == &expected && actual == &state));
+    }
 }

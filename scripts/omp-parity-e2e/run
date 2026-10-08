@@ -110,11 +110,11 @@ jq -cs --arg id "$UUID" --arg cwd "$PROJECT" '
 cp -- "$CHILD_FIXTURE" "${PARENT%.jsonl}/ParityChild.jsonl"
 # A compact recent showcase puts bash and the child card together in stui's viewport.
 jq -cn '{type:"message",id:"e2e-showcase-call",timestamp:"2026-10-06T00:00:09Z",message:{role:"assistant",content:[
-  {type:"toolCall",id:"e2e-showcase-bash",name:"bash",arguments:{command:"printf E2E-BASH-ROW",i:"Showing parity bash",async:false}},
-  {type:"toolCall",id:"e2e-showcase-task",name:"task",arguments:{tasks:[{name:"ParityChild",agent:"scout",task:"Inspect synthetic parity"}]}}
+  {type:"toolCall",id:"e2e-showcase-bash",name:"bash",arguments:{command:"printf E2E-BASH-ROW",i:"Showing parity bash",cwd:"/synthetic/e2e",timeout:30,async:false}},
+  {type:"toolCall",id:"e2e-showcase-task",name:"task",arguments:{context:"E2E-PARENT-CONTEXT\nContract: E2E-PARENT-CONTRACT",tasks:[{name:"ParityChild",agent:"scout",task:"Inspect synthetic parity\nE2E-FULL-ASSIGNMENT"}]}}
 ]}}' >> "$PARENT"
 jq -cn '{type:"message",id:"e2e-showcase-bash-result",timestamp:"2026-10-06T00:00:10Z",message:{role:"toolResult",toolCallId:"e2e-showcase-bash",toolName:"bash",content:[{type:"text",text:"E2E-BASH-ROW"}],details:{exitCode:0,wallTimeMs:1},isError:false}}' >> "$PARENT"
-jq -cn '{type:"message",id:"e2e-showcase-task-result",timestamp:"2026-10-06T00:00:11Z",message:{role:"toolResult",toolCallId:"e2e-showcase-task",toolName:"task",content:[{type:"text",text:"Synthetic child"}],details:{async:{state:"running",jobId:"e2e-task",type:"task"},progress:[{id:"ParityChild",agent:"scout",status:"running",task:"Inspect synthetic parity",durationMs:10,tokens:20,cost:0.001,requests:1,toolCount:1}],results:[]},isError:false}}' >> "$PARENT"
+jq -cn '{type:"message",id:"e2e-showcase-task-result",timestamp:"2026-10-06T00:00:11Z",message:{role:"toolResult",toolCallId:"e2e-showcase-task",toolName:"task",content:[{type:"text",text:"Synthetic child"}],details:{async:{state:"running",jobId:"e2e-task",type:"task"},progress:[{id:"ParityChild",agent:"scout",status:"running",task:"Inspect synthetic parity",assignment:"Inspect synthetic parity\nE2E-FULL-ASSIGNMENT",durationMs:10,tokens:20,cost:0.001,requests:1,toolCount:1}],results:[]},isError:false}}' >> "$PARENT"
 if [[ -n "$CORPUS" ]]; then
   check 'corpus readable' test -r "$CORPUS"
   CORPUS_UUID=$(node -e 'console.log(require("node:crypto").randomUUID())')
@@ -166,7 +166,7 @@ assert_json() { jq -e "$@" >/dev/null; }
 for type in bash edit write read search todo ask task hub eval generic; do
   check "tool_call view.type=$type" assert_json --arg type "$type" '.value.items | any(.[] | .body.blocks[]?; .kind == "tool_call" and .view.type == $type)' "$PAGE"
 done
-for type in bash edit todo ask task hub generic; do
+for type in bash edit search todo ask task hub generic; do
   check "tool_output view.type=$type" assert_json --arg type "$type" '.value.items | any(.[] | .body.blocks[]?; .kind == "tool_output" and .view.type == $type)' "$PAGE"
 done
 for type in irc job skill compaction model_change thinking_level title session_exit tool_start; do
@@ -180,6 +180,23 @@ done
 check 'header model/context/cost/todos are populated' assert_json '.value.header | (.model.value | type == "string") and (.context.value.tokens > 0) and (.cost.value.usd > 0) and (.todos.value | length > 0)' "$PAGE"
 check 'header todos preserve all five OMP statuses' assert_json '[.value.header.todos.value[].items[].status] | sort == (["completed", "pending", "in_progress", "blocked", "abandoned"] | sort)' "$PAGE"
 check 'task output links ParityChild conversation' assert_json '.value.items | any(.[] | .body.blocks[]?; .kind == "tool_output" and .view.type == "task" and any(.view.agents[]?; .id == "ParityChild" and (.conversation.session_id | startswith("session/external-child-"))))' "$PAGE"
+check 'task carries source name type and full assignment' assert_json '.value.items | any(.[] | .body.blocks[]?; .view.type == "task" and any(.view.agents[]?; .name == "ParityChild" and .agent == "scout" and (.task | contains("E2E-FULL-ASSIGNMENT"))))' "$PAGE"
+check 'task carries parent context and contract' assert_json '.value.items | any(.[] | .body.blocks[]?; .view.type == "task" and (.view.context // "" | contains("E2E-PARENT-CONTEXT") and contains("E2E-PARENT-CONTRACT")))' "$PAGE"
+check 'assistant error is explicit in API' assert_json '.value.items | any(.[] | .body.blocks[]?; .kind == "error" and .view.type == "assistant_error" and .view.message == "E2E-ASSISTANT-ERROR" and .view.status == "failed")' "$PAGE"
+check 'assistant retry recovery preserves original error' assert_json '.value.items | any(.[] | .body.blocks[]?; .kind == "error" and .view.type == "assistant_error" and .view.status == "recovered" and .view.presentation == "compact-recovered" and .view.is_error == false and .view.label == "E2E-RETRIED-RECOVERED" and .view.message == "E2E-RECOVERED-ORIGINAL-ERROR")' "$PAGE"
+check 'bash carries cwd and timeout' assert_json '.value.items | any(.[] | .body.blocks[]?; .view.type == "bash" and .view.cwd == "/synthetic/e2e" and .view.timeout_s == 30)' "$PAGE"
+check 'grep carries explicit flags and native counts' assert_json '.value.items | any(.[] | .body.blocks[]?; .view.type == "search" and .view.engine == "grep" and .view.case == false and .view.gitignore == true and .view.skip == 2)' "$PAGE"
+check 'grep carries native warning and truncation summary' assert_json '.value.items | any(.[] | .body.blocks[]?; .view.type == "search" and .view.engine == "grep" and .view.match_count == 7 and .view.file_count == 3 and .view.truncated == true and .view.file_limit_reached == 3 and .view.per_file_limit_reached == 2)' "$PAGE"
+check 'glob carries flags limit and native file count' assert_json '(.value.items | any(.[] | .body.blocks[]?; .view.type == "search" and .view.engine == "glob" and .view.hidden == true and .view.gitignore == false and .view.limit == 10)) and (.value.items | any(.[] | .body.blocks[]?; .view.type == "search" and .view.engine == "glob" and .view.file_count == 1))' "$PAGE"
+check 'hub carries sent message body' assert_json '.value.items | any(.[] | .body.blocks[]?; .view.type == "hub" and .view.op == "send" and (.view.message | contains("E2E-SENT-BODY") and contains("E2E-SENT-LAST")))' "$PAGE"
+check 'write carries content and complete line count' assert_json '.value.items | any(.[] | .body.blocks[]?; .view.type == "write" and .view.line_count == 2 and (.view.content | contains("E2E-WRITE-FIRST") and contains("E2E-WRITE-LAST")))' "$PAGE"
+check 'ask carries every alternative and description' assert_json '.value.items | any(.[] | .body.blocks[]?; .view.type == "ask" and any(.view.questions[]?; (.options | length) == 2 and .options[0].description == "E2E-ASK-STRICT-DESCRIPTION" and .options[1].description == "E2E-ASK-LOOSE-DESCRIPTION"))' "$PAGE"
+check 'eval carries code language timeout and reset' assert_json '.value.items | any(.[] | .body.blocks[]?; .view.type == "eval" and .view.language == "py" and .view.timeout_s == 5 and .view.reset == false and (.view.code | contains("E2E-EVAL-CODE")))' "$PAGE"
+check 'compaction carries complete synthetic summary' assert_json '.value.items | any(.[] | .body.blocks[]?; .view.type == "compaction" and (.view.summary // "" | contains("E2E-COMPACTION-FIRST") and contains("E2E-COMPACTION-LAST")))' "$PAGE"
+check 'inline image has owner ref without inline pixels' assert_json '.value.items | any(.[] | .body.blocks[]?; .kind == "image" and .continuation.reason == "on-demand" and (.continuation.ref | type == "string") and .payload == {})' "$PAGE"
+IMAGE_REF=$(jq -r '[.value.items[].body.blocks[]? | select(.kind == "image") | .continuation.ref][0]' "$PAGE")
+check 'inline image content is readable for automatic clients' negotiated "http://localhost/v1/client/conversations/$(uri "${SESSION#session/}")/content/$(uri "$IMAGE_REF")/chunk?offset=0" -o "$OUT/image-chunk.json"
+check 'automatic image fetch returns passive PNG bytes' assert_json '.value.media_type == "image/png" and .value.size > 0 and .value.next_offset == null' "$OUT/image-chunk.json"
 check 'fetch legacy parent page' http "$URL?limit=200" -o "$OUT/legacy-page.json"
 check 'unnegotiated page omits blocks and header' assert_json '(.value | has("header") | not) and all(.value.items[]; (.body | has("blocks") | not))' "$OUT/legacy-page.json"
 CHILD=$(jq -r '[.value.items[].body.blocks[]? | select(.view.type == "task") | .view.agents[]? | select(.id == "ParityChild") | .conversation.session_id][0]' "$PAGE")
@@ -294,6 +311,12 @@ check 'TypeScript abandoned todo' contains_text '[/] Discard obsolete approach' 
 check 'TypeScript child open row' contains_text "open $CHILD" "$OUT/ts-rows.txt"
 check 'TypeScript IRC sender and message' grep -Eq 'ParityChild.*Synthetic child message' "$OUT/ts-rows.txt"
 check 'TypeScript compact transcript header and completed count' grep -Eq 'model synthetic/model.*context .*cost .*todo 1/5.* · transcript · .* ago$' "$OUT/ts-rows.txt"
+for marker in E2E-PARENT-CONTEXT E2E-PARENT-CONTRACT E2E-FULL-ASSIGNMENT E2E-ASSISTANT-ERROR E2E-RETRIED-RECOVERED E2E-RECOVERED-ORIGINAL-ERROR E2E-SENT-BODY E2E-SENT-LAST E2E-WRITE-FIRST E2E-WRITE-LAST E2E-ASK-STRICT-DESCRIPTION E2E-ASK-LOOSE-DESCRIPTION E2E-EVAL-CODE E2E-COMPACTION-FIRST E2E-COMPACTION-LAST; do
+  check "TypeScript parity detail $marker" contains_text "$marker" "$OUT/ts-rows.txt"
+done
+for marker in 'cwd: /synthetic/e2e' 'timeout: 30s' 'case: false' 'hidden: true' 'gitignore: false' 'limit: 10' 'skip: 2' '7 matches / 3 files' 'warning: search results truncated' 'warning: file limit reached (3)' 'warning: per-file limit reached (2)' '1 files' '1. Strict [selected]' 'language: py' 'reset: false' 'ParityChild · running · scout' '[image'; do
+  check "TypeScript parity row $marker" contains_text "$marker" "$OUT/ts-rows.txt"
+done
 
 # Open the actual saved session through Ctrl+K's direct session-id affordance.
 # No host-wide fake OMP process: the fixture remains a historical session.
@@ -325,11 +348,17 @@ check 'stui compact conversation transcript header visible' wait_pane 'model syn
 # Shift+O toggles full density; o opens all tool outputs; End follows the showcase.
 tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" O o End
 check 'stui bash command row visible' wait_pane '\$ printf E2E-BASH-ROW' "$OUT/stui.txt"
-check 'stui subagent open row visible' wait_pane 'open session/external-child-' "$OUT/stui.txt"
+check 'stui subagent named open row visible' wait_pane 'open ParityChild' "$OUT/stui.txt"
+check 'stui source agent name and type visible' contains_text 'ParityChild · running · scout' "$OUT/stui.txt"
+check 'stui full assignment visible' contains_text 'E2E-FULL-ASSIGNMENT' "$OUT/stui.txt"
+check 'stui parent context visible' contains_text 'E2E-PARENT-CONTEXT' "$OUT/stui.txt"
+check 'stui parent contract visible' contains_text 'E2E-PARENT-CONTRACT' "$OUT/stui.txt"
+check 'stui bash cwd visible' contains_text 'cwd: /synthetic/e2e' "$OUT/stui.txt"
+check 'stui bash timeout visible' contains_text 'timeout: 30s' "$OUT/stui.txt"
 # PaneIntent::Open is a left-button mouse hit. The document has no keyboard row
 # focus/Enter binding: use the real SGR terminal mouse event on the captured row.
-if contains_text "open $CHILD" "$OUT/stui.txt"; then
-read -r CLICK_X CLICK_Y < <(node --input-type=module - "$OUT/stui.txt" "$CHILD" <<'JS'
+if contains_text "open ParityChild" "$OUT/stui.txt"; then
+read -r CLICK_X CLICK_Y < <(node --input-type=module - "$OUT/stui.txt" "ParityChild" <<'JS'
 import { readFileSync } from 'node:fs';
 const lines = readFileSync(process.argv[2], 'utf8').split('\n');
 const row = lines.findIndex(line => line.includes(`open ${process.argv[3]}`));

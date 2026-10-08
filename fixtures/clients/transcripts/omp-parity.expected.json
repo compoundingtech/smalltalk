@@ -34,9 +34,9 @@
     "body": {
       "kind": "tool",
       "value": {
-        "title": "write demo.txt \u00b7 4 bytes",
+        "title": "write demo.txt \u00b7 1 lines \u00b7 4 bytes",
         "state": "running",
-        "output": []
+        "output": ["demo"]
       }
     }
   },
@@ -111,6 +111,11 @@
         "state": "ok",
         "output": [
           "Which mode?",
+          "  1. Full [selected]",
+          "     Keep all synthetic details",
+          "  2. Simple",
+          "     Keep a compact synthetic view",
+          "Which mode?",
           "  selected: Full"
         ]
       }
@@ -123,7 +128,7 @@
       "value": {
         "title": "task \u00b7 1 agents",
         "state": "ok",
-        "output": []
+        "output": ["parent context / contract:", "Synthetic parent context", "Contract: keep every detail", "Review · reviewer", "Review synthetic code"]
       }
     }
   },
@@ -147,7 +152,7 @@
       "value": {
         "title": "eval py \u00b7 Synthetic evaluation",
         "state": "running",
-        "output": []
+        "output": ["language: py"]
       }
     }
   },
@@ -169,10 +174,11 @@
     "body": {
       "kind": "tool",
       "value": {
-        "title": "reviewer \u00b7 completed",
+        "title": "Review \u00b7 completed \u00b7 reviewer",
         "state": "ok",
         "output": [
           "Review synthetic code",
+          "Report all findings",
           "duration 1200ms",
           "tokens 80",
           "cost $0.02",
@@ -205,8 +211,8 @@
   {
     "id": "parity-23",
     "body": {
-      "kind": "event",
-      "value": "compaction \u00b7 summary \u00b7 100 \u2192 50 tokens"
+      "kind": "tool",
+      "value": {"title": "compaction \u00b7 summary \u00b7 100 \u2192 50 tokens", "state": "ok", "output": []}
     }
   },
   {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { unreadableTranscript, cleanMessageText, conversationEntries, entryMatches, foldDeliveryFlaps, fromHarness, headerLine, shownToolLines, subagentSession, toolTitle, DEFAULT_FILTERS, SHOW_EVERYTHING } from '@smalltalk/st3-views/conversationView';
+import { unreadableTranscript, cleanMessageText, conversationEntries, fetchedConversationEntries, entryMatches, foldDeliveryFlaps, fromHarness, headerLine, shownToolLines, subagentSession, toolTitle, DEFAULT_FILTERS, SHOW_EVERYTHING } from '@smalltalk/st3-views/conversationView';
 
 let sequence = 0;
 const at = minute => `2026-09-30T12:${String(minute).padStart(2, '0')}:00Z`;
@@ -274,4 +274,39 @@ assert.equal(cleanMessageText(rawText, SHOW_EVERYTHING), rawText);
   };
   assert.equal(headerLine(header, '2026-10-06T12:00:00Z'), 'model m · context 50 tokens · cost $0.02 [register · 30m ago] · transcript · 1h ago');
   assert.equal(headerLine({ todos: { value: [], source: 'transcript', as_of: '2026-10-06T12:00:00Z' } }, '2026-10-06T12:00:00Z'), 'todo 0/0 · transcript · 0s ago');
+}
+
+// Parity gaps: expanded calls retain invocation rows after the receipt arrives.
+{
+  const block = (kind, view, extra = {}) => ({ id: 'synthetic-block', kind, source_type: 'synthetic', payload: {}, view, ...extra });
+  const cases = [
+    [{ type: 'bash', command: 'echo synthetic', cwd: '/synthetic', timeout_s: 30 }, ['cwd: /synthetic', 'timeout: 30s']],
+    [{ type: 'write', path: 'demo', content: 'first\nlast', line_count: 2, bytes: 10 }, ['first', 'last']],
+    [{ type: 'eval', language: 'py', code: '1 + 2\n3 + 4', timeout_s: 5, reset: false }, ['language: py', 'timeout: 5s', 'reset: false', '1 + 2', '3 + 4']],
+    [{ type: 'hub', op: 'send', target: 'Child', message: 'sent\nbody' }, ['sent', 'body']],
+    [{ type: 'search', engine: 'grep', pattern: 'needle', case: false, gitignore: true, skip: 2 }, ['case: false', 'gitignore: true', 'skip: 2']],
+  ];
+  for (const [view, expected] of cases) {
+    const call = e('tool_call', 'assistant', { call_id: view.type, name: view.type, arguments: {}, blocks: [block('tool_call', view)] });
+    const result = e('tool_result', 'tool', { call_id: view.type, status: 'success', content: 'receipt' });
+    const [entry] = conversationEntries([call, result], names);
+    for (const line of expected) assert(entry.body.output.includes(line), `${view.type}: ${line}`);
+    assert.equal(entry.body.output.at(-1), 'receipt');
+  }
+  const grep = e('tool_result', 'tool', { call_id: 'g', status: 'success', content: 'native matches', blocks: [block('tool_output', { type: 'search', match_count: 7, file_count: 3, truncated: true, file_limit_reached: 3, per_file_limit_reached: 2 })] });
+  assert.deepEqual(conversationEntries([grep], names)[0].body.output, ['7 matches / 3 files', 'warning: search results truncated', 'warning: file limit reached (3)', 'warning: per-file limit reached (2)', 'native matches']);
+  const compaction = e('content', 'system', { media_type: 'text/plain', blocks: [block('status', { type: 'compaction', summary: Array.from({ length: 10 }, (_, i) => `summary-${i}`).join('\n') })] });
+  const [summary] = conversationEntries([compaction], names);
+  assert.deepEqual(shownToolLines(summary.body, false).lines, ['summary-0', 'summary-1', 'summary-2', 'summary-3', 'summary-4', 'summary-5']);
+  assert.equal(shownToolLines(summary.body, true).lines.at(-1), 'summary-9');
+  const error = e('content', 'assistant', { blocks: [block('error', { type: 'assistant_error', status: 'recovered', presentation: 'compact-recovered', is_error: false, message: 'synthetic error', retry: { note: 'retried successfully' } })] });
+  assert.deepEqual(conversationEntries([error], names)[0].body.output, ['synthetic error', 'retried successfully']);
+  const hiddenError = e('content', 'assistant', { blocks: [block('error', { type: 'assistant_error', presentation: 'none' })] });
+  assert.equal(conversationEntries([hiddenError], names).length, 0);
+  const reference = { ref: 'full-write', media_type: 'application/json', reason: 'size-limit' };
+  const view = { type: 'write', path: 'demo', content: 'first\n[st truncated this native timeline value: size limit; 20000 bytes]', line_count: 2, bytes: 20000 };
+  const call = e('tool_call', 'assistant', { call_id: 'large-write', name: 'write', arguments: {}, blocks: [block('tool_call', view, { continuation: reference })] });
+  const [entry] = conversationEntries([call], names);
+  const hydrated = fetchedConversationEntries(entry, reference, { ...view, content: 'first\nlast' });
+  assert.deepEqual(hydrated[0].body.output, ['first', 'last'], 'view-only continuations hydrate written content through the typed adapter');
 }

@@ -4,11 +4,12 @@ use serde_json::{Value, json};
 fn fields(out: &mut Value, source: &Value, names: &[(&str, &str)]) {
     for &(target, native) in names {
         if let Some(value) = source.get(native).filter(|value| match target {
-            "fallback" | "timed_out" => value.is_boolean(),
+            "fallback" | "timed_out" | "case" | "hidden" | "gitignore" | "reset" | "truncated" => value.is_boolean(),
             "timeout_s" | "exit_code" | "wall_ms" | "first_changed_line" | "total_ms"
             | "duration_ms" | "tokens" | "cost_usd" | "requests" | "tool_count"
             | "output_bytes" | "tokens_before" | "tokens_after" | "recommended" | "input"
-            | "output" | "cache_read" | "cache_write" | "total" | "context_tokens" | "ttft_ms" => {
+            | "output" | "cache_read" | "cache_write" | "total" | "context_tokens" | "ttft_ms"
+            | "limit" | "skip" | "match_count" | "file_count" | "file_limit_reached" | "per_file_limit_reached" => {
                 value.is_number()
             }
             "started_at" | "ended_at" => value.is_string() || value.is_number(),
@@ -104,9 +105,10 @@ pub(crate) fn tool_call_view(tool: &str, args: &Value) -> Value {
             }
         }
         "write" => {
-            fields(&mut out, args, &[("path", "path")]);
+            fields(&mut out, args, &[("path", "path"), ("content", "content")]);
             if let Some(content) = args.get("content").and_then(Value::as_str) {
                 out["bytes"] = json!(content.len());
+                out["line_count"] = json!(content.lines().count());
             }
         }
         "read" => {
@@ -131,7 +133,11 @@ pub(crate) fn tool_call_view(tool: &str, args: &Value) -> Value {
             fields(
                 &mut out,
                 args,
-                &[("pattern", "pattern"), ("path", "path"), ("query", "query")],
+                &[
+                    ("pattern", "pattern"), ("path", "path"), ("query", "query"),
+                    ("case", "case"), ("hidden", "hidden"), ("gitignore", "gitignore"),
+                    ("limit", "limit"), ("skip", "skip"),
+                ],
             );
         }
         "todo" => {
@@ -158,13 +164,14 @@ pub(crate) fn tool_call_view(tool: &str, args: &Value) -> Value {
                 );
                 q["options"] = rows(question, "options", |option| {
                     let mut o = json!({});
-                    fields(&mut o, option, &[("label", "label")]);
+                    fields(&mut o, option, &[("label", "label"), ("description", "description")]);
                     o
                 });
                 q
             });
         }
         "task" => {
+            fields(&mut out, args, &[("context", "context")]);
             out["tasks"] = rows(args, "tasks", |task| {
                 let mut t = json!({});
                 fields(
@@ -173,7 +180,7 @@ pub(crate) fn tool_call_view(tool: &str, args: &Value) -> Value {
                     &[("name", "name"), ("agent", "agent"), ("task", "task")],
                 );
                 t
-            })
+            });
         }
         "hub" => fields(
             &mut out,
@@ -184,13 +191,14 @@ pub(crate) fn tool_call_view(tool: &str, args: &Value) -> Value {
                 ("target", "to"),
                 ("target", "target"),
                 ("timeout_s", "timeout"),
+                ("message", "message"),
             ],
         ),
         "eval" => {
             fields(
                 &mut out,
                 args,
-                &[("language", "language"), ("title", "title")],
+                &[("language", "language"), ("title", "title"), ("code", "code"), ("timeout_s", "timeout"), ("reset", "reset")],
             );
             if let Some(code) = args.get("code").and_then(Value::as_str) {
                 out["code_bytes"] = json!(code.len());
@@ -252,6 +260,16 @@ fn answer(value: &Value) -> Value {
     out
 }
 
+fn search_output(out: &mut Value, tool: &str, details: &Value) {
+    out["type"] = json!("search");
+    out["engine"] = json!(tool);
+    fields(out, details, &[
+        ("match_count", "matchCount"), ("file_count", "fileCount"),
+        ("truncated", "truncated"), ("file_limit_reached", "fileLimitReached"),
+        ("per_file_limit_reached", "perFileLimitReached"), ("warning", "warning"),
+    ]);
+}
+
 pub(crate) fn tool_output_view(
     tool: &str,
     call_id: &str,
@@ -271,6 +289,7 @@ pub(crate) fn tool_output_view(
                 ("timed_out", "timedOut"),
             ],
         ),
+        "grep" | "glob" => search_output(&mut out, tool, details),
         "edit" => fields(
             &mut out,
             details,
@@ -326,8 +345,11 @@ pub(crate) fn tool_output_view(
                     &[
                         ("id", "id"),
                         ("agent", "agent"),
+                        ("name", "id"),
+                        ("name", "name"),
                         ("status", "status"),
                         ("task", "task"),
+                        ("task", "assignment"),
                         ("duration_ms", "durationMs"),
                         ("tokens", "tokens"),
                         ("cost_usd", "cost"),
@@ -408,6 +430,7 @@ pub(crate) fn omp_record_view(
                     ("tokens_before", "tokensBefore"),
                     ("tokens_after", "tokensAfter"),
                     ("short_summary", "shortSummary"),
+                    ("summary", "summary"),
                 ],
             );
             "status"
@@ -778,5 +801,48 @@ mod tests {
             assistant_metadata(&json!({"role":"assistant","usage":[],"contextSnapshot":null}))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parity_invocations_keep_content_options_and_parent_contract() {
+        let write = tool_call_view("write", &json!({"path":"demo","content":"first\nlast\n"}));
+        assert_eq!(write["content"], "first\nlast\n");
+        assert_eq!(write["line_count"], 2);
+        let task = tool_call_view("task", &json!({"context":"Context\nContract","tasks":[{"name":"NamedChild","agent":"scout","task":"First\nSecond"}]}));
+        assert_eq!(task["context"], "Context\nContract");
+        assert_eq!(task["tasks"][0]["task"], "First\nSecond");
+        let ask = tool_call_view("ask", &json!({"questions":[{"id":"q","question":"Choose?","options":[{"label":"A","description":"All details"},{"label":"B","description":"Compact"}]}]}));
+        assert_eq!(ask["questions"][0]["options"][1]["description"], "Compact");
+        let hub = tool_call_view("hub", &json!({"op":"send","to":"NamedChild","message":"First\nSecond"}));
+        assert_eq!(hub["message"], "First\nSecond");
+        let eval = tool_call_view("eval", &json!({"language":"py","code":"1 + 2","timeout":0,"reset":false}));
+        assert_eq!(eval["code"], "1 + 2");
+        assert_eq!(eval["timeout_s"], 0);
+        assert_eq!(eval["reset"], false);
+        let search = tool_call_view("grep", &json!({"pattern":"needle","case":false,"gitignore":true,"skip":2}));
+        assert_eq!(search["case"], false);
+        assert_eq!(search["gitignore"], true);
+        assert_eq!(search["skip"], 2);
+        let glob = tool_call_view("glob", &json!({"path":"*.rs","hidden":false,"gitignore":false,"limit":10}));
+        assert_eq!(glob["hidden"], false);
+        assert_eq!(glob["limit"], 10);
+    }
+
+    #[test]
+    fn native_search_counts_and_named_full_assignments_are_not_inferred() {
+        let grep = tool_output_view("grep","g",false,Some(&json!({"matchCount":7,"fileCount":3,"truncated":true,"fileLimitReached":3,"perFileLimitReached":2})));
+        assert_eq!(grep["type"], "search");
+        assert_eq!(grep["match_count"], 7);
+        assert_eq!(grep["file_count"], 3);
+        assert_eq!(grep["truncated"], true);
+        assert_eq!(grep["file_limit_reached"], 3);
+        assert_eq!(grep["per_file_limit_reached"], 2);
+        assert!(tool_output_view("glob","g",false,None).get("file_count").is_none());
+        let task = tool_output_view("task","t",false,Some(&json!({"progress":[{"id":"NamedChild","agent":"scout","status":"running","task":"First","assignment":"First\nFull assignment"}]})));
+        assert_eq!(task["agents"][0]["name"], "NamedChild");
+        assert_eq!(task["agents"][0]["agent"], "scout");
+        assert_eq!(task["agents"][0]["task"], "First\nFull assignment");
+        let (_, compact, _) = omp_record_view(&json!({"type":"compaction","summary":"First\nFull summary"})).unwrap();
+        assert_eq!(compact["summary"], "First\nFull summary");
     }
 }
