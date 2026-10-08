@@ -818,7 +818,11 @@ async fn stream_with_timers_inner<F, S, H>(
                                 authority::admit_report(&checked_state, &binding, &peer, &raw)
                             }).await, Ok(Ok(())))
                         } else { true };
-                        let recorded = authenticated && record_admitted_report(&fence, &report);
+                        // Native refusal discards all report-driven effects, including
+                        // capability negotiation and rollout ACKs. Typed presence failure
+                        // remains separate for an otherwise authenticated control report.
+                        if !authenticated { continue; }
+                        let recorded = record_admitted_report(&fence, &report);
                         let value = serde_json::from_str::<Value>(&report).unwrap_or(Value::Null);
                         replay_supported |= peer.is_some() && value["mailbox_replay_ack"] == true;
                         if fence.component == "delivery" && replay_supported && !previous_mailbox.is_empty() && !replay_challenge_sent {
@@ -2219,6 +2223,12 @@ mod tests {
     }
 
     async fn controlled_stream(state: AppState, fence: &Fence, path: &Path) -> ControlledStream {
+        controlled_stream_with_peer(state, fence, path, None).await
+    }
+
+    async fn controlled_stream_with_peer(
+        state: AppState, fence: &Fence, path: &Path, peer: Option<NativeDeliveryPeer>,
+    ) -> ControlledStream {
         let (recheck, receiver) = tokio::sync::mpsc::unbounded_channel();
         let receiver = Arc::new(std::sync::Mutex::new(Some(receiver)));
         let (heartbeat, heartbeats) = tokio::sync::mpsc::unbounded_channel();
@@ -2241,6 +2251,7 @@ mod tests {
                         let heartbeats = heartbeats.lock().unwrap().take().unwrap();
                         let counted = counted.clone();
                         let fixture_gate = fixture_gate.clone();
+                        let peer = peer.clone();
                         async move {
                             websocket.on_upgrade(move |socket| {
                                 let ticks = futures_util::stream::unfold(
@@ -2264,7 +2275,7 @@ mod tests {
                                             receiver.recv().await.map(|()| ((), receiver))
                                         },
                                     ),
-                                    StreamControl { peer: None, dirty_gate: Some(fixture_gate) },
+                                    StreamControl { peer, dirty_gate: Some(fixture_gate) },
                                 )
                             })
                         }
@@ -2298,6 +2309,132 @@ mod tests {
             reads,
             server,
         }
+    }
+
+    #[cfg(all(feature = "test-support", target_os = "linux"))]
+    #[tokio::test]
+    async fn native_report_refusal_cannot_ack_drain_or_negotiate_replay() {
+        report_control_effects(true).await;
+    }
+
+    #[cfg(all(feature = "test-support", target_os = "linux"))]
+    #[tokio::test]
+    async fn legacy_report_keeps_control_admission_separate_from_typed_presence() {
+        report_control_effects(false).await;
+    }
+
+    #[cfg(all(feature = "test-support", target_os = "linux"))]
+    async fn report_control_effects(native: bool) {
+        use crate::store::owned_sets::{Options, Source};
+        use st_drivers::{harness_events, harness_state};
+        use std::sync::atomic::Ordering::SeqCst;
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open_memory("node").unwrap());
+        let name = if native { "eval.report-effects-native" } else { "eval.report-effects-legacy" };
+        let subject = format!("agent/{name}");
+        let input = crate::graph::parse_owned_set_intent(&format!(
+            "version 2\nagent {name:?} {{ host \"node\"; workspace \"/tmp\"; harness \"omp\" {{}} }}"
+        ), "node").unwrap();
+        let policy = crate::rollout::Policy::when_idle(1_800_000, false);
+        let mut options = Options {
+            set: name.into(), source: Source { repository: "fixture/report".into(),
+                r#ref: "refs/heads/main".into(), sha: "1".repeat(40), sequence: 1 },
+            expected_set: "absent".into(), rollout: Some(policy.clone()),
+            adopt: Default::default(), allow_empty: false, confirm_retire: None,
+            expected_subjects: Default::default(),
+        };
+        let preview = state.store.owned_set_preview(&input, &options).unwrap();
+        assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+        options.expected_subjects = preview.expected_subjects;
+        state.store.apply_owned_set(&input, &options, "report-publish", "person/test").unwrap();
+        let selected = state.store.rollout_selection(&subject).unwrap().unwrap();
+        let member = selected.desired.member.as_ref().unwrap();
+        state.store.append_claim(&ClaimInput {
+            subject: subject.clone(), kind: "runtime.observed".into(), actor: Some(subject.clone()),
+            fields: serde_json::from_value(json!({"status":"running", "host":"node",
+                "runtime_id":member.runtime_id, "incarnation_id":"current"})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let agent_dir = crate::hooks::claude_agent_dir(&state.state_dir.join("drivers"), &subject, "node");
+        harness_events::enable(&agent_dir, "current").unwrap();
+        let sequence = harness_state::claim(&agent_dir, name, "omp", "report-session").unwrap();
+        let raw = harness_events::read_runtime_state(&agent_dir, "current").unwrap().unwrap();
+        let peer = NativeDeliveryPeer { agent: subject.clone(), transport: "omp-channel",
+            pid: std::process::id(), archives_inbox: true };
+        // An explicitly already-admitted fixture lease isolates report consumption.
+        // This is not a physical bind/launch authentication certificate.
+        let owner = crate::mailbox::Authority { provider: "omp".into(), session: "report-session".into(),
+            sequence, pid: peer.pid, process_token: st_runtime::process_start_token(peer.pid).unwrap() };
+        let fence = state.store.bind_mailbox_with_lease(&Fence::new(&subject, "current", "delivery"), Some(&owner)).unwrap();
+        state.store.request_rollout(&subject, &selected.desired_token, member, "current",
+            "person/test", &policy, "report-drain").unwrap();
+        let operation = state.store.rollout(&subject).unwrap().unwrap();
+        let mut stream = controlled_stream_with_peer(state.clone(), &fence, &root.path().join("report.sock"),
+            native.then(|| peer.clone())).await;
+        assert!(matches!(next(&mut stream.socket).await,
+            Frame::Drain { operation: Some(id) } if id == operation.id));
+        stream.dirty_gate.allowed.store(false, SeqCst);
+        let report = |reason: &str| json!({"transport":"omp-channel", "pid":peer.pid,
+            "ready":false, "reason":reason});
+        let baseline = report("baseline");
+        assert!(authority::admit_report(&state, &fence, &peer, &baseline.to_string()).is_ok());
+        stream.socket.send(Message::Text(baseline.to_string().into())).await.unwrap();
+        stream.socket.send(Message::Ping(vec![0].into())).await.unwrap();
+        expect_pong(&mut stream.socket, &[0]).await;
+        assert_eq!(delivery_presence::assess_current(&subject,"omp",Some("current")).reason.as_deref(), Some("baseline"));
+        let tap_count = || std::env::var_os("ST3_TEST_ADMITTED_REPORTS").map(|path| {
+            std::fs::read_to_string(path).unwrap_or_default().lines().filter(|line|
+                serde_json::from_str::<Value>(line).is_ok_and(|value| value["subject"] == subject)).count()
+        });
+        let initial_taps = tap_count();
+        let index = state.store.index().unwrap();
+        if native {
+            for (number, refusal) in ["pid", "transport", "provider"].into_iter().enumerate() {
+                let mut rejected = report("must-not-be-recorded");
+                rejected["mailbox_replay_ack"] = json!(true);
+                rejected["drain_operation"] = json!(operation.id);
+                match refusal {
+                    "pid" => rejected["pid"] = json!(u64::from(peer.pid) + 1),
+                    "transport" => rejected["transport"] = json!("claude-channel"),
+                    _ => {
+                        let mut foreign: Value = serde_json::from_slice(&raw).unwrap();
+                        foreign["harness"] = json!("codex");
+                        harness_events::write_snapshot(&agent_dir, "harness-state", &serde_json::to_vec(&foreign).unwrap()).unwrap();
+                    }
+                }
+                assert!(state.store.check_mailbox(&fence).is_ok(), "Store fence must remain current");
+                assert!(authority::admit_report(&state, &fence, &peer, &rejected.to_string()).is_err(), "{refusal}");
+                stream.socket.send(Message::Text(rejected.to_string().into())).await.unwrap();
+                let barrier = [number as u8 + 1];
+                stream.socket.send(Message::Ping(barrier.to_vec().into())).await.unwrap();
+                expect_pong(&mut stream.socket, &barrier).await;
+                assert!(state.store.rollout(&subject).unwrap().unwrap().drain_ack.is_none(), "{refusal}");
+                assert_eq!(state.store.index().unwrap(), index, "no drain/recovery claim: {refusal}");
+                assert_eq!(delivery_presence::assess_current(&subject,"omp",Some("current")).reason.as_deref(), Some("baseline"));
+                assert_eq!(tap_count(), initial_taps, "no admitted tap: {refusal}");
+                harness_events::write_snapshot(&agent_dir, "harness-state", &raw).unwrap();
+            }
+        }
+        // Native authority can accept a control even when optional typed presence is invalid.
+        let mut malformed = report("must-not-replace-presence");
+        malformed["image"] = json!(42);
+        malformed["drain_operation"] = json!(operation.id);
+        assert!(authority::admit_report(&state, &fence, &peer, &malformed.to_string()).is_ok());
+        stream.socket.send(Message::Text(malformed.to_string().into())).await.unwrap();
+        stream.socket.send(Message::Ping(vec![4].into())).await.unwrap();
+        expect_pong(&mut stream.socket, &[4]).await;
+        assert!(state.store.rollout(&subject).unwrap().unwrap().drain_ack.is_some());
+        assert_eq!(delivery_presence::assess_current(&subject,"omp",Some("current")).reason.as_deref(), Some("baseline"));
+        assert_eq!(tap_count(), initial_taps);
+        let mut accepted = report("later-admissible");
+        accepted["mailbox_replay_ack"] = json!(true);
+        stream.socket.send(Message::Text(accepted.to_string().into())).await.unwrap();
+        stream.socket.send(Message::Ping(vec![5].into())).await.unwrap();
+        if native { assert!(matches!(next(&mut stream.socket).await, Frame::Replay { .. })); }
+        expect_pong(&mut stream.socket, &[5]).await;
+        assert_eq!(delivery_presence::assess_current(&subject,"omp",Some("current")).reason.as_deref(), Some("later-admissible"));
+        assert_eq!(tap_count(), initial_taps.map(|count| count + 1));
     }
 
     #[tokio::test]
