@@ -24,9 +24,9 @@ use crate::api::client_v0::{
     collection_stream_socket_with_sources, paired_client_session,
 };
 
-// Production delivery has one process-global producer registration. Serialize only these
-// fixtures; the installed Cargo runner and its normal test thread count are unchanged.
-static PRODUCER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// All actual Service constructors replace one process-global producer registration. Share
+// the Source controls' test-only exclusion without changing the runner or test thread count.
+use crate::store::collection_ivm::agent_source::service::TEST_LOCK as PRODUCER;
 const AMBER: &str = "agent/ivm-profile/20261008/amber";
 const BLUE: &str = "agent/ivm-profile/20261008/blue";
 const CYAN: &str = "agent/ivm-profile/20261008/cyan";
@@ -574,6 +574,15 @@ async fn actual_service_changed_desired_body_raw_gap_reopen_full_public_parity()
     drop(f);
 
     let recovered = Fixture::unready(root.path());
+    // Native replay must repair the legacy projection before namespace catchup. Keep this
+    // assertion before pump so a closure failure cannot hide a stale projection failure.
+    let declarations = recovered.state.store.desired_subjects().unwrap();
+    let repaired = declarations.iter().find(|s| s.subject == AMBER).unwrap();
+    assert_eq!(
+        repaired.member.as_ref().unwrap().display_name.as_deref(),
+        Some("IVM repaired declaration"),
+        "native desired projection must replay the changed canonical value"
+    );
     recovered.window(local()).await;
     assert_eq!(recovered.state.store.index().unwrap(), before_index);
     assert_eq!(
@@ -605,13 +614,6 @@ async fn actual_service_changed_desired_body_raw_gap_reopen_full_public_parity()
     assert_ne!(
         after_namespace, before_namespace,
         "recovery must publish a fresh actual namespace"
-    );
-    let declarations = recovered.state.store.desired_subjects().unwrap();
-    let repaired = declarations.iter().find(|s| s.subject == AMBER).unwrap();
-    assert_eq!(
-        repaired.member.as_ref().unwrap().display_name.as_deref(),
-        Some("IVM repaired declaration"),
-        "native desired projection must replay the changed canonical value"
     );
     assert_ne!(
         recovered.oracle().await,
