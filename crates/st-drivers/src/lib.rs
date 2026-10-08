@@ -90,6 +90,7 @@ pub mod subagents;
 pub mod supervisor_chain;
 pub mod task_inventory;
 pub mod telemetry;
+pub mod turn_obligation;
 pub mod validate;
 pub mod version;
 mod watch;

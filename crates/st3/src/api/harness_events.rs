@@ -146,6 +146,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_receipt_changes_wake_without_restarting_native_status_history() {
+        let root=tempfile::tempdir().unwrap();let state=super::super::tests::state(root.path());
+        runtime(&state,"native-one");
+        let mut input=event(1,"idle");
+        input.claim.fields.insert("turn_obligation".into(),serde_json::to_value(st_drivers::turn_obligation::Ledger::default()).unwrap());
+        assert_eq!(post(&state,&input,SEAT).await.0,StatusCode::OK);assert!(notified(&state).await);
+        let before=state.store.current_harness(SEAT).unwrap().unwrap().since_unix_ms;
+        input.sequence=2;
+        input.claim.fields.get_mut("turn_obligation").unwrap()["unknown"]=json!(true);
+        assert_eq!(post(&state,&input,SEAT).await.0,StatusCode::OK);assert!(notified(&state).await);
+        let source=state.store.claims_for(SEAT,Some("harness.observed")).unwrap().pop().unwrap();
+        assert_eq!(source.body["fields"]["status_transition"],false,"receipt-only change is no native transition");
+        assert_eq!(source.body["fields"]["observed_since_ms"],json!(before as u64));
+        assert_eq!(state.store.current_harness(SEAT).unwrap().unwrap().state,"blocked");
+        input.sequence=3;
+        assert_eq!(post(&state,&input,SEAT).await.0,StatusCode::OK);assert!(!notified(&state).await,"unchanged debt heartbeat is quiet");
+        assert_eq!(post(&state,&input,SEAT).await.0,StatusCode::OK);assert!(!notified(&state).await,"exact replay is quiet");
+    }
+
+    #[tokio::test]
     async fn native_usage_and_rejected_or_stale_events_do_not_wake_reconcile() {
         let root = tempfile::tempdir().unwrap();
         let state = super::super::tests::state(root.path());

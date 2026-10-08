@@ -55,7 +55,10 @@ const HOLD_MAX_MS = 10_000;
 
 type Frame = {
   type?: string;
+  requestId?: string;
+  receipt?: Record<string, unknown>;
   protocol?: number;
+  capabilities?: unknown;
   sessionContext?: string;
   content?: string;
   deliverAs?: "steer" | "followUp";
@@ -90,6 +93,16 @@ type Stash = {
   seq?: string;
   expectedNativeSession?: string;
   resumeGeneration?: string;
+  activeReceipt?: Record<string, unknown>;
+  toolReceipts?: Map<string, { receipt: Record<string, unknown>; sessionId: string }>;
+  receiptCapability?: childProcess.ChildProcess;
+  receiptSerial?: number;
+  pendingReceipts?: Map<string, {
+    child: childProcess.ChildProcess;
+    resolve: (receipt: Record<string, unknown>) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>;
   child?: childProcess.ChildProcess;
   reconnectTimer?: ReturnType<typeof setTimeout>;
   reconnectAttempt?: number;
@@ -423,6 +436,11 @@ export default function (pi: ExtensionAPI) {
             settle("");
             return;
           }
+          state.receiptCapability = Array.isArray(frame.capabilities)
+            && frame.capabilities.includes("durable-turn-receipts-v1") ? child : undefined;
+          if (state.receiptCapability === undefined) {
+            ctx.ui?.notify?.("st: this channel cannot persist native turn receipts; interrupted execution evidence is unavailable", "warning");
+          }
           state.reconnectAttempt = 0;
           send({ type: "ready", ...sessionBinding });
           // Every fresh channel needs the provider's idle proof, including reconnects
@@ -447,6 +465,15 @@ export default function (pi: ExtensionAPI) {
             } catch { /* session shutdown may have begun */ }
           }
           settle(context);
+          return;
+        }
+        if (frame.type === "turn_recorded" && typeof frame.requestId === "string") {
+          const pending = state.pendingReceipts?.get(frame.requestId);
+          if (pending?.child === child && frame.receipt) {
+            clearTimeout(pending.timer);
+            state.pendingReceipts?.delete(frame.requestId);
+            pending.resolve(frame.receipt);
+          }
           return;
         }
         if (frame.type !== "message" || typeof frame.content !== "string") return;
@@ -495,6 +522,30 @@ export default function (pi: ExtensionAPI) {
     const child = state.child;
     if (!child || !child.stdin || child.stdin.destroyed) return;
     child.stdin.write(JSON.stringify(frame) + "\n");
+  };
+  // Await positive durable evidence. Handler-error behavior varies by provider; a rejection
+  // is unknown evidence, not proof that native execution stopped. The handshake prevents a
+  // legacy channel from imposing a timeout on every hook. These are st source receipts.
+  const persistBoundary = (frame: Record<string, unknown>): Promise<Record<string, unknown> | undefined> => {
+    if (!bin || !catalog || !identity) return Promise.resolve(undefined);
+    const child = state.child;
+    if (!child || !child.stdin || child.stdin.destroyed) {
+      return Promise.reject(new Error("st: turn evidence channel is unavailable"));
+    }
+    if (state.receiptCapability !== child) {
+      return Promise.reject(new Error("st: durable turn receipt capability is unavailable; execution outcome is unknown"));
+    }
+    const input = child.stdin;
+    const requestId = `receipt-${state.receiptSerial = (state.receiptSerial ?? 0) + 1}`;
+    return new Promise((resolve, reject) => {
+      const pending = state.pendingReceipts ??= new Map();
+      const timer = setTimeout(() => {
+        pending.delete(requestId);
+        reject(new Error("st: durable turn evidence was not acknowledged; execution outcome is unknown"));
+      }, 5000);
+      pending.set(requestId, { child, resolve, reject, timer });
+      input.write(JSON.stringify({ ...frame, requestId }) + "\n");
+    });
   };
   const boundedTimelineString = (value: unknown, limit = 16_384): string | undefined =>
     typeof value === "string" ? value.slice(0, limit) : undefined;
@@ -773,10 +824,14 @@ export default function (pi: ExtensionAPI) {
 
   // Registered only now that every helper above is initialized: a use-before-declaration in this
   // file is the defect class that once shipped green through the type gate.
-  on("agent_start", async () => {
+  on("agent_start", async (_event, ctx) => {
+    if (state.shuttingDown) return;
     cancelSettle();
     state.running = true;
     toolCallsInFlight().clear();
+    // OMP has no durable agent-turn ID; the receipt names only this observed boundary.
+    state.activeReceipt = undefined;
+    state.activeReceipt = await persistBoundary({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() });
     sendFrame({ type: "state", state: "active" });
   });
   on("agent_end", async (event, ctx) => {
@@ -803,7 +858,18 @@ export default function (pi: ExtensionAPI) {
     // cannot win. An ordinary end carries no error and asserts no state: the sampled idle below
     // still owns that edge.
     const error = terminalProviderError(end);
-    sendFrame(error ? { type: "turn", error } : { type: "turn" });
+    const messages = Array.isArray(end.messages) ? end.messages : [];
+    const lastAssistant = [...messages].reverse().find((message) =>
+      typeof message === "object" && message !== null && message.role === "assistant");
+    const stopReason = lastAssistant?.stopReason;
+    const outcome = stopReason === "aborted" ? "cancelled"
+      : error ? "failed"
+      : stopReason === "stop" ? "completed" : "unknown";
+    const terminalFrame = { type: "turn", ...(error ? { error } : {}),
+      sessionId: ctx.sessionManager.getSessionId(), outcome, receipt: state.activeReceipt };
+    if (state.activeReceipt && outcome !== "unknown") await persistBoundary(terminalFrame);
+    else sendFrame(terminalFrame);
+    state.activeReceipt = undefined;
     if (error) {
       cancelSettle();
       return;
@@ -861,9 +927,19 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   };
 
-  on("tool_call", async (rawEvent) => {
+  on("tool_call", async (rawEvent, ctx) => {
     // Pinned pi declarations do not know OMP's tool events; the handler validates fields below.
     const event = rawEvent as ToolCallFrame;
+    if (typeof event.toolCallId === "string" && state.activeReceipt) {
+      const receipts = state.toolReceipts ??= new Map();
+      // Retain the real original receipt before I/O; delivery uncertainty cannot retarget
+      // a later observed result to a new native turn. No receipt survives process loss.
+      if (receipts.size >= 128) receipts.delete(receipts.keys().next().value!);
+      receipts.set(event.toolCallId, { receipt: state.activeReceipt, sessionId: ctx.sessionManager.getSessionId() });
+      await persistBoundary({ type: "turn_tool", sessionId: ctx.sessionManager.getSessionId(),
+        toolId: event.toolCallId, completed: false, receipt: state.activeReceipt });
+    }
+
     sendTimeline("tool_call", rawEvent);
     if (typeof event.toolCallId === "string") {
       toolCallsInFlight().add(event.toolCallId);
@@ -883,6 +959,15 @@ export default function (pi: ExtensionAPI) {
   });
   on("tool_result", async (rawEvent, ctx) => {
     const event = rawEvent as ToolResultFrame;
+    if (typeof event.toolCallId === "string") {
+      const original = state.toolReceipts?.get(event.toolCallId);
+      if (original && original.sessionId === ctx.sessionManager.getSessionId()) {
+        await persistBoundary({ type: "turn_tool", sessionId: original.sessionId,
+          toolId: event.toolCallId, completed: true, receipt: original.receipt });
+        state.toolReceipts?.delete(event.toolCallId);
+      }
+    }
+
     sendTimeline("tool_result", rawEvent);
     if (typeof event.toolCallId === "string") {
       const calls = toolCallsInFlight();

@@ -5,6 +5,7 @@ pub mod custom;
 pub mod glasses;
 pub mod owned_terminals;
 pub mod provenance;
+pub mod turn_obligation;
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -436,6 +437,12 @@ impl Registry {
         }
         if kind == "mission.provenance" {
             provenance::validate_claim(subject, fields)?;
+        }
+        if kind == "harness.observed" {
+            turn_obligation::validate(fields)?;
+        }
+        if kind == "harness.turn-acknowledged" {
+            turn_obligation::validate_acknowledgement(fields)?;
         }
         if kind == "harness.todo.observed" {
             validate_harness_todo(fields)?;
@@ -1745,6 +1752,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "harness.turn-acknowledged",
+            &["agent"],
+            WritePolicy::AuthorizedRequester,
+            Cardinality::Append,
+            Some("harnesses"),
+            true,
+            &[],
+        ),
+        (
             "harness.session-file",
             &["agent"],
             WritePolicy::AuthorizedRequester,
@@ -2936,6 +2952,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("targets", array()),
             ("source_revision", string()),
             ("incarnation", string()),
+            ("turn_receipts", array()),
         ],
         "operational.recovered" => &[
             ("episode", string()),
@@ -3040,6 +3057,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("legacy_adoption", boolean()),
         ],
         "harness.observed" => &[
+            ("turn_obligation", object()),
             (
                 "state",
                 required_enum(&[
@@ -3072,6 +3090,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("rollout_operation", string()),
             ("quiescent", boolean()),
             ("blocking", array()),
+        ],
+        "harness.turn-acknowledged" => &[
+            ("receipts", required_array()),
+            ("source_revision", required_string()),
+            ("captured_cut", required_integer()),
+            ("reason", required_string()),
         ],
         "harness.session-file" => &[
             ("harness", required_string()),
@@ -4072,6 +4096,7 @@ mod tests {
                 "harness.telemetry",
                 "harness.timeline",
                 "harness.todo.observed",
+                "harness.turn-acknowledged",
                 "harness.usage",
                 "intent.desired",
                 "lane.approved",

@@ -984,6 +984,22 @@ impl Store {
                     continue;
                 }
             }
+            if f["condition"] == "turn-obligation"
+                && let Some(recorded) = f["turn_receipts"].as_array()
+            {
+                let current = self.turn_obligation_source_at(source, i64::MAX as u64)?
+                    .map(|source| super::turn_obligation::actionable_receipt_keys(&source["evidence"]))
+                    .unwrap_or_default();
+                let recorded = recorded.iter().filter_map(|key| key.as_str().map(str::to_owned)).collect::<Vec<_>>();
+                if recorded != current { continue; }
+            }
+            if f["condition"] == "turn-obligation"
+                && self.current_harness(source)?.and_then(|harness| harness.turn_recovery)
+                    .map(|recovery| recovery["owner_action_required"] == false || matches!(recovery["state"].as_str(), Some("in-flight" | "pending-human")))
+                    .map(Ok).unwrap_or_else(|| self.turn_obligation_source_at(source, i64::MAX as u64).map(|source| source.is_none()))?
+            {
+                continue;
+            }
             if let Some(revision) = f["source_revision"].as_str() {
                 if self.selected_desired_token(source)?.as_deref() != Some(revision) {
                     continue;

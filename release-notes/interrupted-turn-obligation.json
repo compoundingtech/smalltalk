@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "summary": "Persist native turn obligations across provider loss and refuse successor admission without a usable runtime identity.",
+  "replay": {
+    "status": "changed",
+    "detail": "Build normalized turn evidence, receipt heads and local cut versions from admitted obligation-bearing observations on first open, explicit projection rebuild and checkpoint replay. Exceptional source mutation reconstructs the affected subject; pages bound memory, not total repair work. Reads refuse queued repairs and never replay provider history."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Add optional bounded harness.observed.turn_obligation, one shared selected-head table and four local candidate/cut/queue tables. Native producer records carry optional receipt evidence. Shared projection compatibility digest changes to turn-obligations.v4; checkpoint reader proof covers current turn evidence while old candidate carriers may compact. Add attributed harness.turn-acknowledged claims that quiet owner action while retaining unknown execution evidence."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Checkpoint rules version 14 retain the newest complete single-open receipt carrier and all terminal, unknown, tool-result and multi-receipt evidence. Sparse or idle observations cannot witness their removal. Repaired originals confer no start or terminal authority. Members using version 13 or the previous projection digest require a coordinated upgrade; mixed rules/digests are not sealing-compatible.",
+    "transitions": [
+      [
+        13,
+        14
+      ]
+    ]
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Older registries retry the new field and acknowledgement kind after upgrade. OMP hello explicitly advertises durable-turn-receipts-v1; unsupported channels refuse receipt requests immediately and capable-channel timeout is an unknown outcome, not proof execution stopped. Baseline complete.v2/public-card-v0 does not certify existing fields changed by debt or turn_recovery; successor card/source qualification remains required."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "First open scans existing claims to build the receipt index and projections before serving. Cost on a representative large store has not been measured; deployment must account for an unknown startup delay. No live reboot test was performed."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Unsettled native work and unknown tool outcomes require owner inspection. Exact native checkpoint continuation is unsupported; no continue prompt, task replay, tool replay or automatic human answer is issued. For existing pre-14 stores, use the coordinated roll-forward procedure in docs/st3/binary-releases.md at this source; opening rebuilds the new receipt projections before serving. Reinstalling an older binary does not undo the tables or preserved evidence. A named, attributed owner acknowledgement can quiet action without asserting execution completion; a new interruption remains actionable."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Exact terminal/native history evidence settles matching receipt identity. Idle, process exit and prompt answers do not. Missing tool results remain unknown after a turn terminal. Live runtimes without a usable PID/creation-time identity fault without authorizing replacement. Isolated crash, signed replica admission and real private-PTY controls do not establish the cause of the two reported issue1730 seats. Positive correlated native invocation results settle only their original tool scope; a clean later turn does not."
+  }
+}

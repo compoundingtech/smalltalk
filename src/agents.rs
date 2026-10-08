@@ -576,6 +576,7 @@ mod tests {
             0,
         );
         wedged.observed = Some(harness_state::Observed {
+            turn_obligation: Default::default(),
             state: harness_state::Activity::Idle,
             blocked_on: harness_state::BlockedOn::None,
             input_buffer: harness_state::InputBuffer::Empty,
@@ -604,6 +605,7 @@ mod tests {
 
         let mut derived = row("example-linux.worker", State::Available, None, false, None, 0);
         derived.observed = Some(harness_state::Observed {
+            turn_obligation: Default::default(),
             state: harness_state::Activity::Unknown,
             blocked_on: harness_state::BlockedOn::Unknown,
             input_buffer: harness_state::InputBuffer::Unknown,
@@ -634,6 +636,7 @@ mod tests {
     fn context_is_a_fourth_axis_that_survives_an_indeterminate_observed_state() {
         let mut wedged = row("example-linux.worker", State::Busy, None, false, None, 0);
         wedged.observed = Some(harness_state::Observed {
+            turn_obligation: Default::default(),
             state: harness_state::Activity::Unknown,
             blocked_on: harness_state::BlockedOn::Unknown,
             input_buffer: harness_state::InputBuffer::Unknown,
@@ -743,6 +746,7 @@ mod tests {
     fn exhausted_claude_rate_limit_is_explicit_beside_active_state() {
         let mut limited = row("example-linux.worker", State::Available, None, false, None, 0);
         limited.observed = Some(harness_state::Observed {
+            turn_obligation: Default::default(),
             state: harness_state::Activity::Active,
             blocked_on: harness_state::BlockedOn::None,
             input_buffer: harness_state::InputBuffer::Unknown,

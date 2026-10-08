@@ -27,7 +27,8 @@ use smallclaims::store::checkpoint_agreement::*;
 /// Version 11 includes arrangement tables in the graph proof and rebuilds them during replay.
 /// Version 12 ages out the sekrets claims written before they became local observations.
 /// Version 13 retains status transitions selected by the reader after filtering stamped heartbeats.
-pub const RULES_VERSION: u32 = 13;
+/// Version 14 retains exact turn terminals/unknown evidence and the newest complete open receipt.
+pub const RULES_VERSION: u32 = 14;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -65,7 +66,7 @@ pub(crate) const REQUEST_CLOSERS: [&str; 3] = [
 
 /// A canonical description of every rule. The rules digest hashes it with `RULES_VERSION`.
 pub(crate) const RULES_DESCRIPTION: &str = "\
-harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field,current-native-auth-run-start
+harness.observed with-single-open-receipt slot=subject,receipt keep=newest-complete-receipt; terminal-and-multi-receipt-evidence keep=all\nharness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field,current-native-auth-run-start
 seat.status-history slot=subject sources=exclude-status_transition-false-or-numeric-zero-heartbeats keep=last-200-transition-including-native-auth-and-runtime-reset-sources-within-7d-before-cut,current-state-run-start
 harness.timeline slot=subject,incarnation_id keep=newest min-age-before-cut=5d
 loop.state slot=subject keep=first-and-last-of-each-run-of-status-and-round,first-with-items
@@ -146,6 +147,17 @@ pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
     match claim.kind.as_str() {
         // A legacy observation without an incarnation falls back to store index comparisons in
         // `current_harness_at`, so it stays.
+        "harness.observed" if fields(claim).is_some_and(|fields| fields.contains_key("turn_obligation")) => {
+            let ledger = &claim.body["fields"]["turn_obligation"];
+            let open = ledger["open"].as_array()?;
+            if open.len() == 1 && ledger["terminal"].as_array()?.is_empty()
+                && ledger["unknown"] == false && ledger["unknown_tool_outcome"] != true
+                && ledger.get("tool_results").is_none_or(|results| results.as_array().is_some_and(Vec::is_empty)) {
+                let entry: st_drivers::turn_obligation::Obligation = serde_json::from_value(open[0].clone()).ok()?;
+                let key = turn_obligation::receipt(&entry).ok()?;
+                Some((Rule::Newest, vec![subject, kind, "turn-receipt".into(), key]))
+            } else { None }
+        },
         "harness.observed" => field_str(claim, "incarnation_id")
             .map(|_| (Rule::HarnessObserved, slot(&["incarnation_id"]))),
         "harness.timeline" => Some((Rule::NewestAged, slot(&["incarnation_id"]))),
@@ -700,12 +712,17 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
 }
 
 /// Tables projected from claims, children before the tables their foreign keys name.
-pub(crate) const PROJECTION_TABLES: [&str; 23] = [
+pub(crate) const PROJECTION_TABLES: [&str; 28] = [
     "operations",
     "arrangement_registers",
     "arrangements",
     "resource_observations",
     "glass_heads",
+    "agent_turn_obligation_evidence",
+    "agent_turn_obligations",
+    "local_turn_obligation_pending",
+    "local_turn_obligation_dirty",
+    "local_turn_obligation_versions",
     "local_glass_head_pending",
     "local_glass_head_dirty",
     "desired",
@@ -753,6 +770,7 @@ pub(crate) fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
     rebuild_planning_tx(transaction)?;
     resources::rebuild(transaction)?;
     glass_heads::rebuild(transaction)?;
+    turn_obligation::rebuild(transaction)?;
     arrangements::rebuild(transaction)?;
     Ok(())
 }
@@ -805,6 +823,10 @@ fn subject_answers_inner(connection: &Connection, subject: &str, cut: u128, sour
             seat_status::history_at(connection, subject, cut, i64::MAX as u64)?
         };
         answers.insert("status_history".into(), history["items"].clone());
+        answers.insert(
+            "turn_recovery_evidence".into(),
+            json!(turn_obligation::source(connection, subject, i64::MAX as u64)?),
+        );
     }
     // Which claim a status shows, its origin, and whether its runtime observations conflict.
     answers.insert(

@@ -2865,6 +2865,10 @@ enum AgentsCommand {
         #[arg(long)]
         all: bool,
     },
+    /// Show bounded native interruption evidence and exact acknowledgement receipt keys.
+    TurnObligation { subject: String },
+    /// Quiet owner action for the named unknown outcomes while retaining their evidence.
+    AcknowledgeTurn(AgentTurnAcknowledgementArgs),
     /// Print one seat's declared workspace directory on its owning host, even when stopped.
     Workspace { subject: String },
     /// Declare one new agent seat, start its harness, and wait until it is ready.
@@ -2909,6 +2913,18 @@ enum AgentsCommand {
     Queue(AgentQueueArgs),
     /// Inspect, set, or release a Codex/OpenCode delivery hold; the provider keeps running.
     Hold(AgentHoldArgs),
+}
+
+#[derive(Args)]
+struct AgentTurnAcknowledgementArgs {
+    subject: String,
+    #[arg(long = "as")]
+    actor: String,
+    /// Exact receipt keys shown by `st agents turn-obligation`; each is acknowledged explicitly.
+    #[arg(long = "receipt", required = true)]
+    receipts: Vec<String>,
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Args)]
@@ -5232,6 +5248,7 @@ fn guard_mutating_cli_actor(
             AgentsCommand::Rollout(args) => Some(args.actor.as_str()),
             AgentsCommand::Suspend(args) => Some(args.actor.as_str()),
             AgentsCommand::Resume(args) => Some(args.actor.as_str()),
+            AgentsCommand::AcknowledgeTurn(args) => Some(args.actor.as_str()),
             AgentsCommand::Hold(args) if args.duration.is_some() || args.release => Some(args.actor.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("a harness delivery hold needs explicit --as {own}")
             })?),
@@ -12094,6 +12111,29 @@ async fn run_agents(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        AgentsCommand::TurnObligation { subject } => {
+            let subject = normalize_agent_subject(&subject);
+            let snapshot: Value = cli_client(endpoint).get(&format!("/v1/agents/turn-obligation?subject={}", urlencoding::encode(&subject))).await?;
+            print_value(&snapshot, json_output)
+        }
+        AgentsCommand::AcknowledgeTurn(args) => {
+            let subject = normalize_agent_subject(&args.subject);
+            let client = cli_client(endpoint);
+            let snapshot: Value = client.get(&format!("/v1/agents/turn-obligation?subject={}", urlencoding::encode(&subject))).await?;
+            let mut receipts = Vec::new();
+            for key in args.receipts {
+                let selected = snapshot["evidence"]["selected_receipts"].as_array()
+                    .and_then(|rows| rows.iter().find(|row| row["receipt"].as_str() == Some(key.as_str())))
+                    .with_context(|| format!("receipt `{key}` is not in this captured evidence; inspect `st agents turn-obligation {subject}`"))?;
+                receipts.push(json!({"receipt":key,"source_claim":selected["source_claim"]}));
+            }
+            let claim: ClaimRecord = client.post("/v1/agents/turn-obligation/acknowledge", &json!({
+                "subject":subject,"actor":args.actor,"receipts":receipts,"reason":args.reason,
+                "source_revision":snapshot["source_revision"],"captured_cut":snapshot["captured_cut"],
+                "idempotency_key":format!("turn-acknowledgement:{}", uuid::Uuid::now_v7()),
+            })).await?;
+            print_value(&claim, json_output)
+        }
         AgentsCommand::Hold(args) => {
             let client = cli_client(endpoint);
             let subject = seat_subject(&args.subject);
@@ -13200,7 +13240,9 @@ async fn run_agent_inspection(
         | AgentsCommand::Resume(_)
         | AgentsCommand::Rename(_)
         | AgentsCommand::Queue(_)
-        | AgentsCommand::Hold(_) => {
+        | AgentsCommand::Hold(_)
+        | AgentsCommand::TurnObligation { .. }
+        | AgentsCommand::AcknowledgeTurn(_) => {
             unreachable!("agent mutation and queue commands return before inspection")
         }
     };
@@ -13984,6 +14026,14 @@ fn render_client_agent(
         agent.driver.as_deref().unwrap_or("none"),
         agent.harness_state.as_deref().unwrap_or("unobserved")
     );
+    if let Some(recovery) = agent.extra.get("turn_recovery").filter(|value| value.is_object()) {
+        let _ = writeln!(output, "TURN RECOVERY {}", recovery["state"].as_str().unwrap_or("unknown"));
+        if let Some(reason) = recovery["reason"].as_str() {
+            output.push_str("             ");
+            push_todo_terminal_text(&mut output, reason);
+            output.push('\n');
+        }
+    }
     if agent.blocked_on.as_deref() == Some("human")
         && agent.ask.as_deref() == Some("permission")
     {
@@ -15657,8 +15707,11 @@ async fn current_agent_incarnation(client: &Client, actor: &str) -> Result<Optio
         .subjects
         .first()
         .and_then(|subject| subject.actual.as_ref())
-        .and_then(|actual| actual.get("fields").unwrap_or(actual).get("incarnation_id"))
+        .map(|actual| actual.get("fields").unwrap_or(actual))
+        .filter(|fields| fields["status"] == "running")
+        .and_then(|fields| fields.get("incarnation_id"))
         .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
         .map(str::to_owned))
 }
 
@@ -15675,11 +15728,7 @@ fn pty_observation_incarnation(
         observation.status == "running"
             && observation.tags.get("st3.subject").map(String::as_str) == Some(subject)
     })?;
-    Some(format!(
-        "{}:{}",
-        observation.pid?,
-        observation.created_at.as_deref()?
-    ))
+    st3::reconcile::pty_incarnation(observation)
 }
 
 fn current_local_pty_incarnation(actor: &str) -> Result<Option<String>> {
@@ -15723,9 +15772,7 @@ fn bound_pty_incarnation(
     let matched = observations.iter().any(|o| {
         o.status == "running"
             && o.tags.get("st3.subject") == Some(&binding.subject)
-            && o.pid
-                .zip(o.created_at.as_deref())
-                .is_some_and(|(pid, created)| format!("{pid}:{created}") == binding.incarnation)
+            && st3::reconcile::pty_incarnation(o).as_deref() == Some(binding.incarnation.as_str())
     });
     matched.then(|| binding.agent_incarnation())
 }
@@ -18870,6 +18917,11 @@ async fn publish_harness_activity(
                 .unwrap_or(Value::Null),
         ),
     ]);
+    if observed.turn_obligation.sequence != 0 || observed.turn_obligation.unknown
+        || observed.turn_obligation.unknown_tool_outcome || !observed.turn_obligation.open.is_empty()
+        || !observed.turn_obligation.terminal.is_empty() {
+        fields.insert("turn_obligation".into(),serde_json::to_value(&observed.turn_obligation)?);
+    }
     if let Some(incarnation) = incarnation {
         fields.insert("incarnation_id".into(), Value::String(incarnation.into()));
     }
@@ -19451,7 +19503,7 @@ fn accept_managed_channel_frame(
         let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("unknown");
         let handled = match frame_type {
             "state" | "session" | "ready" | "delivered" | "read" | "failed" | "todo" => true,
-            "timeline" | "context" | "turn" => observer.is_some(),
+            "timeline" | "context" | "turn" | "turn_start" | "turn_tool" => observer.is_some(),
             // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
             "delivery_ready" | "retry_pending_ask" | "diagnostic" => true,
             // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
@@ -19465,7 +19517,9 @@ fn accept_managed_channel_frame(
             );
         }
         if let Some(observer) = observer.as_mut() {
-            observer.observe(&frame)?;
+            if let Err(error) = observer.observe(&frame) {
+                tracing::warn!("recording managed channel observation failed: {error:#}");
+            }
             if frame["type"] == "todo" {
                 // The managed observer committed this snapshot to the durable outbox already.
                 return Ok(false);
@@ -19591,6 +19645,9 @@ async fn run_pi_channel(
         }
         None => None,
     };
+    let receipt_capable = st_drivers::driver_paths::Paths::from_environment(identity, &|name| {
+        std::env::var(name).ok()
+    })?.is_some_and(|paths| st_drivers::harness_events::enabled(&paths.agent_dir));
     let mut stdout = tokio::io::stdout();
     let mut state = match resumed {
         // The extension already has its hello; a second one would restate the session context.
@@ -19625,6 +19682,7 @@ async fn run_pi_channel(
                         serde_json::to_string(&json!({
                             "type": "hello",
                             "protocol": if push_mailbox_enabled() { 2 } else { 1 },
+                            "capabilities": if receipt_capable { vec!["durable-turn-receipts-v1"] } else { vec![] },
                             "identity": identity,
                             "sessionContext": session_context,
                         }))?
@@ -19778,7 +19836,14 @@ async fn run_pi_channel(
                                 subject,
                                 // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
                             ) {
-                                Ok(changed) => publish |= changed,
+                                Ok(changed) => {
+                                    publish |= changed;
+                                    if let Ok(frame)=serde_json::from_str::<Value>(&line)
+                                        && let Some(ack)=observer.as_ref().and_then(|observer| observer.turn_boundary_ack(&frame)) {
+                                        stdout.write_all(format!("{}\n",serde_json::to_string(&ack)?).as_bytes()).await?;
+                                        stdout.flush().await?;
+                                    }
+                                },
                                 Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
                             }
                         }
@@ -19988,6 +20053,10 @@ async fn run_pi_channel(
                             subject,
                             // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
                         )?;
+                        if let Ok(frame)=serde_json::from_str::<Value>(&line)
+                            && let Some(ack)=observer.as_ref().and_then(|observer| observer.turn_boundary_ack(&frame)) {
+                            stdout.write_all(format!("{}\n",serde_json::to_string(&ack)?).as_bytes()).await?;
+                        }
                     }
                     if publish {
                         let _ = state

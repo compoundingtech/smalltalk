@@ -176,6 +176,7 @@ pub(super) fn enrich_harness(
     view: &mut crate::model::CurrentHarnessView,
 ) -> Result<()> {
     let index = at_index.unwrap_or(i64::MAX as u64);
+    super::turn_obligation::enrich(connection, subject, index, view)?;
     let claim = claim_by_id_tx(connection, &view.claim)?;
     if claim
         .as_ref()

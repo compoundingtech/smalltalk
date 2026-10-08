@@ -630,6 +630,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/agents/source-offline", post(override_placement_source))
         .route("/v1/agents/suspend", post(suspend_agent))
         .route("/v1/agents/resume", post(resume_agent))
+        .route("/v1/agents/turn-obligation", get(get_turn_obligation))
+        .route("/v1/agents/turn-obligation/acknowledge", post(acknowledge_turn_obligation))
         .route("/v1/internal/seat-snapshot", post(seat_snapshot_chunk))
         .route("/v1/agents/native-session", post(report_native_session))
         .route("/v1/missions/{id}", get(get_mission))
@@ -5627,6 +5629,7 @@ async fn guard_bound_request(
         "/v1/agents/source-offline",
         "/v1/agents/suspend",
         "/v1/agents/resume",
+        "/v1/agents/turn-obligation/acknowledge",
         "/v1/agents/native-session",
         "/v1/delivery/hold",
         "/v1/lane-changes",
@@ -9653,6 +9656,27 @@ async fn rollout_agent(
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+struct TurnObligationQuery { subject: String }
+
+async fn get_turn_obligation(State(state): State<AppState>, Query(request): Query<TurnObligationQuery>) -> Result<Json<Value>, ApiError> {
+    let subject = if request.subject.starts_with("agent/") { request.subject } else { format!("agent/{}", request.subject) };
+    let store = state.store.clone();
+    blocking_store(move || store.turn_obligation_snapshot(&subject)).await.map(Json)
+}
+
+async fn acknowledge_turn_obligation(
+    State(state): State<AppState>,
+    Json(mut request): Json<crate::store::turn_obligation::AcknowledgeRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    request.actor = person_or_agent_actor(&request.actor, "invalid-turn-acknowledgement-actor")?;
+    if !request.subject.starts_with("agent/") { request.subject = format!("agent/{}", request.subject); }
+    let store = state.store.clone();
+    let claim = blocking_action(move || store.acknowledge_turn_obligation(request)).await?;
+    signal_changed(&state);
+    Ok(Json(claim))
 }
 
 #[derive(Deserialize)]
