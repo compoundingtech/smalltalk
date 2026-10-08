@@ -99,6 +99,51 @@ fn private_runtime_socket_refuses_shared_gateway_before_creating_state_with_miss
 }
 
 #[test]
+fn private_runtime_socket_refuses_shared_gateway_before_creating_state_with_missing_parent_traversal()
+{
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    for above_ancestor in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        let physical_ancestor = if above_ancestor {
+            real.join("deep")
+        } else {
+            real.clone()
+        };
+        std::fs::create_dir_all(&physical_ancestor).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&physical_ancestor, &alias).unwrap();
+        let suffix = if above_ancestor {
+            "./new/../../run/private-st.sock"
+        } else {
+            "./new/../run/private-st.sock"
+        };
+        let output = command(root.path())
+            .env("XDG_RUNTIME_DIR", real.join("run"))
+            .arg("up")
+            .arg("--socket")
+            .arg(alias.join(suffix))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("pass --client-gateway-socket; the derived private gateway"),
+            "{error}"
+        );
+        assert!(
+            error.contains("equals the shared default gateway"),
+            "{error}"
+        );
+        assert!(!root.path().join("home/.local/state").exists());
+        assert!(!physical_ancestor.join("new").exists());
+        assert!(!real.join("run").exists());
+    }
+}
+
+#[test]
 fn replay_is_visible_before_the_api_serves_and_stale_files_are_ignored() {
     if st3::test_support::supervise_test() {
         return;

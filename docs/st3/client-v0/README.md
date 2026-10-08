@@ -106,8 +106,9 @@ Without an explicit `--client-gateway-socket`, a private `st up --state-dir DIR`
 gateway as `DIR/st3-client.sock`, even when `--socket` is also supplied. With only `--socket`,
 the gateway is `st3-client.sock` beside that socket. If this derived path equals the shared
 default gateway (including symlinked ancestors above directories not yet created), startup
-refuses before creating daemon state: pass `--client-gateway-socket` to select the private
-gateway explicitly.
+refuses before creating daemon state. Missing path suffixes normalize `.` and `..` after
+resolving existing symlinks. Pass `--client-gateway-socket` to select the private gateway
+explicitly.
 Default startup without either private flag is unchanged.
 
 For a direct tailnet connection, forward a TCP listener bound to the host's Tailscale IP to

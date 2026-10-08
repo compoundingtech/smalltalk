@@ -5588,12 +5588,14 @@ impl std::fmt::Display for PrivateGatewayCollision {
 impl std::error::Error for PrivateGatewayCollision {}
 
 fn gateway_path_for_comparison(socket: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
     let socket = std::path::absolute(socket)?;
     let parent = socket.parent().context("gateway socket has no parent")?;
     let mut ancestor = parent;
-    let parent = loop {
+    let mut resolved = loop {
         match fs::canonicalize(ancestor) {
-            Ok(resolved) => break resolved.join(parent.strip_prefix(ancestor)?),
+            Ok(resolved) => break resolved,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ancestor = ancestor
                     .parent()
@@ -5602,7 +5604,51 @@ fn gateway_path_for_comparison(socket: &Path) -> Result<PathBuf> {
             Err(error) => return Err(error).context("resolve gateway socket parent"),
         }
     };
-    Ok(parent.join(
+    let mut missing_depth = 0_usize;
+    for component in parent.strip_prefix(ancestor)?.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+                if missing_depth > 0 {
+                    missing_depth -= 1;
+                } else {
+                    // Walk from the physical ancestor, not the lexical symlink location.
+                    resolved = fs::canonicalize(&resolved)
+                        .context("resolve gateway socket ancestor after ..")?;
+                }
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                if missing_depth > 0 {
+                    missing_depth += 1;
+                    continue;
+                }
+                // A .. can return to an existing directory; resolve symlinks again there.
+                match fs::canonicalize(&resolved) {
+                    Ok(path) => resolved = path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match fs::symlink_metadata(&resolved) {
+                            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                                missing_depth = 1;
+                            }
+                            Ok(_) => {
+                                return Err(error).context("resolve existing gateway socket ancestor");
+                            }
+                            Err(error) => {
+                                return Err(error).context("inspect gateway socket ancestor");
+                            }
+                        }
+                    }
+                    Err(error) => return Err(error).context("resolve gateway socket ancestor"),
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                anyhow::bail!("gateway socket suffix must be relative");
+            }
+        }
+    }
+    Ok(resolved.join(
         socket
             .file_name()
             .context("gateway socket has no file name")?,
@@ -5725,6 +5771,36 @@ mod private_gateway_tests {
             gateway_path_for_comparison(&alias.join("missing/run/st3-client.sock")).unwrap()
         );
         assert!(!real.join("missing").exists());
+    }
+
+    #[test]
+    fn gateway_comparison_normalizes_missing_suffix_after_resolving_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir_all(real.join("deep")).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(real.join("deep"), &alias).unwrap();
+        let target = real.join("run/st3-client.sock");
+        for path in [
+            alias.join("missing/../../run/st3-client.sock"),
+            alias.join("./missing/.././../run/st3-client.sock"),
+            alias.join("missing/../other/../../run/st3-client.sock"),
+        ] {
+            assert_eq!(
+                gateway_path_for_comparison(&path).unwrap(),
+                gateway_path_for_comparison(&target).unwrap()
+            );
+        }
+        // After canceling a missing component, resolve an existing symlink before parent traversal.
+        std::os::unix::fs::symlink(real.join("deep"), real.join("link")).unwrap();
+        assert_eq!(
+            gateway_path_for_comparison(&real.join("missing/../link/../run/st3-client.sock"))
+                .unwrap(),
+            gateway_path_for_comparison(&target).unwrap()
+        );
+        assert!(!real.join("deep/missing").exists());
+        assert!(!real.join("missing").exists());
+        assert!(!real.join("run").exists());
     }
 }
 
