@@ -45,6 +45,13 @@ impl Daemon {
         self.start_with_binding(false).await;
     }
 
+    /// Protocol/receipt controls with fabricated incarnations and bare channel children.
+    /// Actual physical ownership controls always use the production bound API.
+    async fn start_admitted_protocol(&mut self) {
+        let app = st3::test_support::admitted_mailbox_protocol_router(self.state());
+        self.start_isolated_app(app).await;
+    }
+
     fn state(&self) -> AppState {
         AppState {
             store: self.store.clone(),
@@ -334,7 +341,7 @@ async fn native_exit_driver(root: &Path, daemon: &mut Daemon) -> TestSeat {
     let mut command = seat_command(root, &daemon.socket);
     declare_claude(daemon, seat);
     daemon.observe_running(seat, "exit-orchid:one");
-    daemon.start_isolated().await;
+    daemon.start_admitted_protocol().await;
     let provider = r#"
 import os, signal, time
 from pathlib import Path
@@ -744,7 +751,7 @@ async fn title_failure(pty_session: Option<&str>, expected_session: &str) {
     let mut command = seat_command(root, &daemon.socket);
     declare_claude(&daemon, seat);
     daemon.observe_running(seat, "title-cedar:one");
-    daemon.start_with_binding(true).await;
+    daemon.start_admitted_protocol().await;
     let bin = root.join("bin");
     std::fs::create_dir(&bin).unwrap();
     let pty = bin.join("pty");
@@ -1501,7 +1508,7 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
             let mut daemon = Daemon::new(root);
             daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
             daemon.observe_running(seat, "same-incarnation");
-            daemon.start_with_binding(true).await;
+            daemon.start_admitted_protocol().await;
 
             let socket = daemon.socket.clone();
             daemon.send("message/ready-probe", seat, "READINESS PROBE");
@@ -1602,7 +1609,7 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
             // A real durable Store reopen discards projection caches as a fresh daemon does.
             daemon.stop().await;
             daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
-            daemon.start_with_binding(true).await;
+            daemon.start_admitted_protocol().await;
             let (channel, _input, received) = open_channel().await;
             daemon.send("message/unread", seat, "UNREAD SIGNAL");
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -1686,7 +1693,7 @@ async fn delivered_unread_mail_stays_in_the_mailbox_after_seat_restart() {
                 "runtime_id": "replay-worker", "incarnation_id": "previous", "status": "exited",
             }));
             daemon.observe_running(seat, "replacement");
-            daemon.start_with_binding(true).await;
+            daemon.start_admitted_protocol().await;
             let mut channel = seat_command(root, &daemon.socket)
                 .env("ST_AGENT", seat)
                 .env("ST3_MAILBOX_TRANSPORT", transport)
@@ -1962,7 +1969,7 @@ async fn claude_staged_mail_receipted_after_restart_is_not_injected_on_second_re
     let root = root.path();
     let mut daemon = Daemon::new(root);
     daemon.observe_running("agent/quartz", "first");
-    daemon.start_with_binding(true).await;
+    daemon.start_admitted_protocol().await;
     let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-first");
     let (channel, _input, received) = fixture.open(root, &daemon, "wrapper-first").await;
     daemon.send("message/restart", "agent/quartz", "QUARTZ RESTART SIGNAL");

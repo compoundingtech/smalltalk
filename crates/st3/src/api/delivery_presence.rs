@@ -210,20 +210,27 @@ fn assess_selected(recipient: &str, driver: &str, incarnation: Option<&str>, cur
             "omp" => "omp-channel", "pi" => "pi-channel", _ => return false,
         };
         beat.report.transport.as_deref() == Some(transport)
-            && (beat.report.legacy || incarnation.is_none_or(|incarnation| beat.fence.as_ref().is_some_and(|fence| fence.incarnation == incarnation)))
+            && beat.fence.as_ref().is_none_or(|fence| incarnation.is_none_or(|incarnation| fence.incarnation == incarnation))
+    };
+    let captured = |beat: &Beat| {
+        let mut report = beat.report.clone();
+        if current && beat.fence.is_none() && report.ready != Some(false) {
+            report.legacy = true;
+        }
+        (beat.at, report)
     };
     let mut beat = presence.beats.lock().ok().and_then(|beats| {
         beats
             .get(recipient)
             .filter(eligible)
-            .map(|beat| (beat.at, beat.report.clone()))
+            .map(captured)
     });
     if driver == "claude"
         && let Ok(monitors) = presence.monitors.lock()
         && let Some(monitor) = monitors.get(recipient).filter(eligible)
         && monitor.report.ready == Some(false)
     {
-        beat = Some((monitor.at, monitor.report.clone()));
+        beat = Some(captured(monitor));
     }
     assess_beat(
         presence.started.elapsed(),
@@ -441,6 +448,19 @@ mod tests {
         // A legacy poll proves transport liveness without asserting a fenced incarnation.
         assert_eq!(assess_current(recipient, "claude", Some("current")).state, "legacy");
         assert!(assess_current(recipient, "codex", Some("current")).state != "legacy");
+    }
+
+    #[test]
+    fn unfenced_reports_preserve_legacy_liveness_but_never_current_native_readiness() {
+        let recipient = "agent/eval.unfenced-report";
+        record(recipient, &json!({"transport":"omp-channel","pid":7,"ready":true}).to_string());
+        assert_eq!(assess_current(recipient, "omp", Some("current")).state, "legacy");
+        assert_ne!(assess_current(recipient, "codex", Some("current")).state, "legacy");
+        let old = crate::mailbox::Fence::new(recipient, "old", "delivery");
+        record_fenced(&old, &json!({"transport":"omp-channel","pid":7,"ready":true}).to_string());
+        let current = assess_current(recipient, "omp", Some("current"));
+        assert!(matches!(current.state, "unknown" | "stale"));
+        assert_eq!(current.transport, None);
     }
 
     fn report(image: Option<&str>, channel: Option<(Option<&str>, u64)>) -> Report {

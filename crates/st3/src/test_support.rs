@@ -224,3 +224,11 @@ pub(crate) fn fixture_mailbox_transport(store: &std::sync::Arc<crate::store::Sto
         .entry((std::sync::Arc::as_ptr(store) as usize, subject.into()))
         .or_insert_with(|| tokio::sync::watch::channel(false).0).subscribe()
 }
+
+/// Build an explicit already-admitted protocol fixture. Callers own its temporary Store,
+/// socket and synthetic runtime. This adapter preserves kernel peer subject checks and
+/// durable Store fences, but cannot qualify native physical ownership or recovery.
+#[cfg(feature = "test-support")]
+pub fn admitted_mailbox_protocol_router(state: crate::api::AppState) -> axum::Router {
+    crate::api::admitted_mailbox_protocol_router(state)
+}

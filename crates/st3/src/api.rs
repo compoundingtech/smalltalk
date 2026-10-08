@@ -446,6 +446,17 @@ pub fn router(state: AppState) -> Router {
     router_for_transport(state, ClientTransportBoundary::Unix)
 }
 
+/// Already-admitted snapshot/receipt transport fixtures only. There is no CLI/API switch
+/// into this router: real native custody controls and the daemon use `router`.
+#[cfg(feature = "test-support")]
+pub(crate) fn admitted_mailbox_protocol_router(state: AppState) -> Router {
+    Router::new()
+        .route("/v1/mailbox/bind", post(mailbox::bind_admitted_fixture))
+        .route("/v1/mailbox", get(mailbox::subscribe_admitted_fixture))
+        .fallback_service(router(state.clone()))
+        .with_state(state)
+}
+
 /// Build the loopback-only client gateway. Unlike the local Unix boundary, every ordinary
 /// client request on this router requires a paired bearer credential.
 pub fn fabric_router(state: AppState) -> Router {

@@ -50,6 +50,32 @@ pub(super) async fn bind(
     Ok(Json(bound))
 }
 
+// Explicit already-admitted protocol fixtures lack a physical PTY/provider lease.
+// Selected Rust integration fixtures use these routes; the installed API router cannot.
+#[cfg(feature = "test-support")]
+pub(super) async fn bind_admitted_fixture(
+    State(state): State<AppState>,
+    peer: Option<Extension<NativeDeliveryPeer>>,
+    Json(request): Json<Fence>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&request, peer.as_ref().map(|peer| &peer.0))?;
+    let bound = blocking_action(move || state.store.bind_mailbox(&request)).await?;
+    Ok(Json(json!({"api_version":"st3.v1","value":bound})))
+}
+
+#[cfg(feature = "test-support")]
+pub(super) async fn subscribe_admitted_fixture(
+    State(state): State<AppState>,
+    Query(fence): Query<Fence>,
+    peer: Option<Extension<NativeDeliveryPeer>>,
+    websocket: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    authorize(&fence, peer.as_ref().map(|peer| &peer.0))?;
+    state.store.check_mailbox(&fence).map_err(ApiError::bad)?;
+    signal_local_change(&state);
+    Ok(websocket.on_upgrade(move |socket| stream_with_reader(state, fence, socket, raw_snapshot)))
+}
+
 pub(super) async fn attachment(
     State(state): State<AppState>,
     Query(fence): Query<Fence>,
@@ -481,7 +507,7 @@ fn safety_timer(fence: &Fence) -> tokio::time::Interval {
     timer
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 async fn stream_with_reader<F>(state: AppState, fence: Fence, socket: WebSocket, read: F)
 where
     F: Fn(&Store, &Fence) -> anyhow::Result<Snapshot> + Clone + Send + 'static,
@@ -493,7 +519,7 @@ where
     stream_with_rechecks(state, fence, socket, read, safety).await;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 async fn stream_with_rechecks<F, S>(
     state: AppState,
     fence: Fence,
@@ -514,7 +540,7 @@ async fn stream_with_rechecks<F, S>(
     stream_with_timers(state, fence, socket, read, safety, heartbeat).await;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 async fn stream_with_timers<F, S, H>(
     state: AppState,
     fence: Fence,

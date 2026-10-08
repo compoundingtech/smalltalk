@@ -8,7 +8,13 @@ pub(crate) fn eligible(
 ) -> Option<CurrentHarnessView> {
     observed.filter(|harness| {
         runtime_incarnation == Some(harness.incarnation_id.as_str())
-            && declared_provider.is_none_or(|provider| harness.driver.as_deref() == Some(provider))
+            && declared_provider.is_none_or(|provider| {
+                harness.driver.as_deref() == Some(provider)
+                    // Current-runtime diagnostic and modal blocks can be provider-neutral.
+                    // Missing provider identity must never establish positive native activity.
+                    || (harness.driver.is_none()
+                        && matches!(harness.state.as_str(), "indeterminate" | "blocked"))
+            })
     })
 }
 
