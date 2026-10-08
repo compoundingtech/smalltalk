@@ -76,7 +76,10 @@ interface RetainedConversation extends RetainedFeed<ConversationPage> {
 interface PendingSend {
   item: TextItem
   messageIds: readonly string[]
-  /** Newest subscribe serial at Sent settle; a later subscription's replace page may retire the row. */
+  /**
+   * Subscribe serial the row settled under; 0 when no follow was live at completion, so
+   * any later subscription's replace page (serials start at 1) may retire the row.
+   */
   settledUnder?: number
 }
 
@@ -495,11 +498,9 @@ export const liveSource = ({
     let painted = false
     let publishedItems: ConversationPage['items'] = []
     let changedFrom = Infinity
-    const shownMessageIds = () =>
-      new Set(timeline.project().items.flatMap((item) => item._tag === 'Message' ? [item.messageId] : []))
     const projectPage = (): ConversationPage => {
       const projection = timeline.project()
-      const shown = shownMessageIds()
+      const shown = timeline.shownMessageIds()
       for (const [id, send] of pending)
         if (send.messageIds.some((messageId) => shown.has(messageId))) pending.delete(id)
       changedFrom = Math.min(changedFrom, projection.changedFrom)
@@ -514,11 +515,12 @@ export const liveSource = ({
      * A replace page from a subscription opened after a send settled retires its outbox
      * row when the authoritative window does not contain the identity (an in-window echo
      * retires it in `projectPage`; a page from the subscription the row settled under may
-     * simply lag the send, so it never retires anything).
+     * simply lag the send, so it never retires anything). Sends that settle without a live
+     * follow use baseline 0: every real subscription opened after them.
      */
     const retireSettled = (subscription: number | undefined) => {
       if (subscription === undefined) return
-      const shown = shownMessageIds()
+      const shown = timeline.shownMessageIds()
       for (const [id, send] of pending)
         if (
           send.settledUnder !== undefined &&
@@ -557,7 +559,7 @@ export const liveSource = ({
       },
     })
     const publishPending = () => {
-      changedFrom = Math.min(changedFrom, timeline.project().items.length)
+      changedFrom = Math.min(changedFrom, timeline.project().changedFrom)
       const page = projectPage()
       if (!retained.publish(page)) return
       publishedItems = page.items
@@ -601,7 +603,7 @@ export const liveSource = ({
             parameters: request.parameters,
             idempotency_key: idempotencyKey,
           })
-        if (request._tag === 'Resend' && shownMessageIds().has(local.messageIds[0]!)) return submit()
+        if (request._tag === 'Resend' && timeline.shownMessageIds().has(local.messageIds[0]!)) return submit()
         if (request._tag === 'Resend') {
           pending.set(id, local)
           publishPending()
@@ -616,7 +618,7 @@ export const liveSource = ({
           if (affected.length > 0) local.messageIds = affected
           // Terminal gateway success settles the outbox row even when the mailbox echo
           // falls outside the newest window; an in-window echo still removes it.
-          local.settledUnder = subscribeSerialNow?.()
+          local.settledUnder = subscribeSerialNow?.() ?? 0
           local.item = { ...local.item, sendState: { _tag: 'Sent' } }
         }
         publishPending()
