@@ -406,13 +406,13 @@ impl Service {
                     "multiple captured maintenance clocks exceed transaction budget",
                 )?;
             }
-            if clock_rows == 0 {
-                if let Err(error) = clock::tick(tx, crate::store::now_ms(), clock::Reason::Kernel) {
-                    super::super::gap(
-                        tx,
-                        &format!("captured maintenance clock unsupported: {error}"),
-                    )?;
-                }
+            if clock_rows == 0
+                && let Err(error) = clock::tick(tx, crate::store::now_ms(), clock::Reason::Kernel)
+            {
+                super::super::gap(
+                    tx,
+                    &format!("captured maintenance clock unsupported: {error}"),
+                )?;
             }
         }
         let changed = super::super::status(tx)?.pending_rows > 0;
