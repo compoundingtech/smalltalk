@@ -104,7 +104,7 @@ export interface EarlySocket {
   /** Socket factory seam: the early socket once, or `undefined` once it cannot be adopted. */
   readonly consume: () => CollectionSocket | undefined
   /** Release the socket if still held; idempotent. */
-  readonly close: () => void
+  readonly close: (code?: number) => void
 }
 
 export interface EarlySocketBounds {
@@ -172,7 +172,7 @@ const makeEarlySocket = (
   let chars = buffered.reduce((total, frame) => total + frame.length, 0)
   let timer: ReturnType<typeof setTimeout> | undefined
 
-  const close = () => {
+  const close = (code = 1000) => {
     if (closed) return
     closed = true
     clearTimeout(timer)
@@ -181,7 +181,7 @@ const makeEarlySocket = (
     socket.onmessage = null
     socket.onclose = null
     socket.onerror = null
-    socket.close(1000)
+    socket.close(code)
   }
   const sendEarly = () => {
     socket.send(JSON.stringify({ ...taken.command, trace: { traceparent: taken.traceparent } }))
@@ -213,9 +213,9 @@ const makeEarlySocket = (
     }
     buffered.push(frame)
   }
-  socket.onclose = close
-  socket.onerror = close
-  timer = setTimeout(close, consumeDeadlineMs)
+  socket.onclose = () => close()
+  socket.onerror = () => close()
+  timer = setTimeout(() => close(), consumeDeadlineMs)
 
   const deliver = (frame: string) => {
     if (!frame.includes(earlyToken)) {

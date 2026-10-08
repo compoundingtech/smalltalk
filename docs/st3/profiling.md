@@ -635,6 +635,7 @@ assertion surface; adding the separate otelite package is unnecessary for these 
 | `wf.sync.transition` | `window`, `conversation`, `terminal`, `gateway` | SyncStatus v2 tag/stage/reason transitions; `wf.subscription.kind`, `wf.sync.from`, `wf.sync.to`, `wf.sync.stage`, `wf.sync.previous_ms`, `wf.sync.reconnect_ms`. Span duration is capped at 30 seconds; full dwell and reconnect durations remain numeric attributes. `wf.ux.budget_ms=30000`, `wf.ux.budget_phase=transition-bound` describes this lifecycle bound, not a product reconnect SLO. |
 | `wf.ux.send_echo` | `echo` | Feature-owned hook: send → verified echo DOM commit followed by paint; `wf.ux.painted`, `wf.ux.budget_ms=100`, `wf.ux.budget_phase=send-to-echo-paint`, `wf.ux.budget_met`. |
 | `st3.capabilities`, `st3.snapshot`, `st3.messageSend`, `st3.follow.subscribe` | Fixed operation name in production | SDK children inherit the active UX context and propagate their own child traceparent; identifiers and failure details are stripped. |
+| `st3.socket.probe`, `st3.socket.create` | `probe`, `socket` | Per-attempt capability probe and credential/socket issuance. These are children of an active UX operation, or independent roots on reconnect; creation is not a long-lived socket span or a handshake timing claim. |
 
 UX operations have a 30-second deadline and `wf.ux.outcome` distinguishes `painted`, `observed`,
 `timeout`, `superseded`, and `disposed`. Repeated progress ticks do not create new transition
@@ -666,8 +667,15 @@ support; upgrade-level and HTTP parenting do not.
 
 The roster bootstrap runs before the main module and sends its first subscribe without waiting
 for the bundle. The SDK adopts the page-owned socket and buffered frames, without persistence,
-duplicate roster subscribe, or a second initial socket. Browser fixtures exercise early-send
-ordering and committed-paint completion; SDK/server tests assert trace-ID continuity.
+duplicate roster subscribe, or a second initial socket. Its first-frame observation is an
+independent root linked to the bootstrap trace, rather than adopting an unrelated active UX parent.
+Browser fixtures exercise early-send ordering and committed-paint completion; SDK/server tests
+assert trace-ID continuity.
+
+On `pagehide`, the source synchronously sends close code 1001 on its collection socket before
+starting asynchronous disposal. A persisted (back/forward-cache) page closes the wire but retains
+its scope; persisted `pageshow` reconnects and resubscribes its existing interests. These lifecycle
+handlers add no timers. The early unclaimed socket also closes synchronously on pagehide.
 
 The browser proof commands require `playwright-cli` on `PATH` and the locked workspace
 dependencies installed:
@@ -679,9 +687,12 @@ node apps/fractal-web/scripts/ux-paint-proof.mjs
 
 The early-connect proof controls module delivery, then imports the actual main entry,
 renders the real shell, and checks that the SDK took the one initial socket without sending
-a second roster subscribe. This proves the early path while a bundle is loading; it does
-not promise that every network's WebSocket handshake outruns an already-cached bundle.
-Both commands close their ephemeral servers and browser sessions in `finally`.
+a second roster subscribe. It then dispatches persisted page-transition events to exercise
+retained-scope reconnect, and performs a real browser reload. The test server requires each
+1001 close frame before the next roster subscribe. The persisted events test the handlers,
+not browser-specific back/forward-cache eligibility. This proves the early path while a bundle
+is loading; it does not promise that every network's WebSocket handshake outruns an already-cached
+bundle. Both commands close their ephemeral servers and browser sessions in `finally`.
 
 The daemon's existing [`CollectionSubscribe`](../../crates/st3/src/api/client_v0.rs)
 derives Serde deserialization without `deny_unknown_fields`, so the optional trace field

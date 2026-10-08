@@ -28,6 +28,7 @@ import {
   type Resource as ResourceWire,
   ClientError,
   type ActionOf,
+  type CollectionSocket,
   type ErrorEnvelope,
   type CollectionFilters,
   type CollectionFrame,
@@ -256,6 +257,10 @@ export class St3 extends Context.Service<
   St3,
   {
     readonly connection: Stream.Stream<ConnectionState>
+    /** Synchronously send a going-away close, then pause automatic reconnect. */
+    readonly suspendSockets: () => void
+    /** Reconnect and resubscribe retained follows after a bfcache restore; no lifecycle timer. */
+    readonly resumeSockets: Effect.Effect<void>
     /** The gateway's capabilities (limits, actions and the scopes this credential holds). */
     readonly capabilities: Effect.Effect<Capabilities, Rejected>
     /** A fresh HTTP snapshot, never the generated client's cached discovery snapshot. */
@@ -457,8 +462,11 @@ const make = (options: St3Options) =>
         )
       : undefined
     const freshSocket = traceQuerySocket(options.socket ?? browserSocket)
-    const socket: CollectionSocketFactory = (url, protocols, headers) =>
-      early?.consume() ?? freshSocket(url, protocols, headers)
+    let currentSocket: CollectionSocket | undefined
+    const socket: CollectionSocketFactory = (url, protocols, headers) => {
+      currentSocket = early?.consume() ?? freshSocket(url, protocols, headers)
+      return currentSocket
+    }
     const followKeys = new Map<string, string>()
     /** Per-follow freshness keyed by followKey while the follow's stream runs. */
     const freshnessTable = new Map<string, FollowFreshness>()
@@ -517,6 +525,7 @@ const make = (options: St3Options) =>
     const channel = yield* makeChannel({
       client,
       socket,
+      parentSpan: options.parentSpan,
       ...(options.onDiagnostics === undefined ? {} : { onDiagnostics: options.onDiagnostics }),
       ...(options.conversationSlots === 'advertised'
         ? {
@@ -918,6 +927,13 @@ const make = (options: St3Options) =>
 
     return St3.of({
       connection: SubscriptionRef.changes(channel.connection),
+      suspendSockets: () => {
+        // Send synchronously before Effect interruption/finalization or document teardown.
+        currentSocket?.close(1001)
+        early?.close(1001)
+        channel.suspend()
+      },
+      resumeSockets: channel.resume,
       freshness: freshnessRef,
       followFreshness: (key) =>
         SubscriptionRef.changes(freshnessRef).pipe(

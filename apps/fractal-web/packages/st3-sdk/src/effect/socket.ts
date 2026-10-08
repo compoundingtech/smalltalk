@@ -22,10 +22,12 @@ import * as Data from 'effect/Data'
 import * as Deferred from 'effect/Deferred'
 import * as Effect from 'effect/Effect'
 import * as Exit from 'effect/Exit'
-import type * as Fiber from 'effect/Fiber'
+import * as Fiber from 'effect/Fiber'
 import * as Result from 'effect/Result'
 import type * as Scope from 'effect/Scope'
 import * as SubscriptionRef from 'effect/SubscriptionRef'
+import * as Tracer from 'effect/Tracer'
+import { traceContextOf } from './trace.ts'
 import type { SyncStatus } from './sync-status.ts'
 
 /** The gateway connection as the UI shows it. */
@@ -82,6 +84,10 @@ export interface Subscriber {
 export interface Channel {
   readonly connection: SubscriptionRef.SubscriptionRef<ConnectionState>
   readonly syncStatus: SubscriptionRef.SubscriptionRef<SyncStatus>
+  /** Stop reconnect and subscribe work synchronously; caller already closed the raw socket. */
+  readonly suspend: () => void
+  /** Resume retained subscriptions without a lifecycle timer. */
+  readonly resume: Effect.Effect<void>
   /** A subscription has successfully decoded a data frame from this socket. */
   readonly onDecodedFrame: () => void
   /** Register and, when a socket is live, subscribe now. */
@@ -104,6 +110,7 @@ const isRejection = (error: unknown): error is ClientError =>
 export const makeChannel = ({
   client,
   socket,
+  parentSpan,
   onDiagnostics,
   onSubscribeSent,
   onCapabilities,
@@ -111,6 +118,7 @@ export const makeChannel = ({
 }: {
   readonly client: St3Client
   readonly socket?: CollectionSocketFactory
+  readonly parentSpan?: () => Tracer.Span | undefined
   readonly onDiagnostics?: (event: St3Diagnostic) => void
   /** A subscribe command for registration `id` went out under generation wire id `wire`. */
   readonly onSubscribeSent?: (sent: { readonly id: string; readonly wire: string }) => void
@@ -130,9 +138,15 @@ export const makeChannel = ({
       return SubscriptionRef.set(syncStatus, status)
     }
     onDiagnostics?.({ _tag: 'Connection', state: { _tag: 'Idle' } })
+    let suspended = false
+    let disposed = false
+    let permanentlyRejected = false
     const setConnection = (state: ConnectionState) =>
       SubscriptionRef.set(connection, state).pipe(
-        Effect.tap(() => Effect.sync(() => onDiagnostics?.({ _tag: 'Connection', state }))),
+        Effect.tap(() => Effect.sync(() => {
+          if (state._tag === 'Rejected') permanentlyRejected = true
+          onDiagnostics?.({ _tag: 'Connection', state })
+        })),
         Effect.tap(() => {
           const now = Date.now()
           switch (state._tag) {
@@ -217,8 +231,11 @@ export const makeChannel = ({
       const ended = Deferred.makeUnsafe<Error | undefined>()
       const opened = Deferred.makeUnsafe<boolean>()
       let socketEnded = false
-      const stream = yield* Effect.tryPromise(() =>
-        client.collectionStream({
+      const parent = parentSpan?.()
+      const stream = yield* Effect.currentSpan.pipe(
+        Effect.orDie,
+        Effect.flatMap((span) => Effect.tryPromise(() =>
+        client.withTraceContext(() => traceContextOf(span)).collectionStream({
           onFrame: dispatch,
           onOpen: () => { Deferred.doneUnsafe(opened, Exit.succeed(true)) },
           onCommandSent: (command) => {
@@ -233,6 +250,9 @@ export const makeChannel = ({
           },
           ...(socket === undefined ? {} : { socket }),
         }),
+        )),
+        // Creation includes credential resolution and issuing the upgrade, not its full lifetime.
+        Effect.withSpan('st3.socket.create', { kind: 'client', root: parent === undefined, parent, attributes: { 'span.label': 'socket' } }),
       )
       return yield* Effect.gen(function* () {
         const didOpen = yield* Deferred.await(opened)
@@ -276,15 +296,19 @@ export const makeChannel = ({
             : { _tag: 'Reconnecting', attempt, issue, nextAt: Date.now() },
         )
         // An HTTP read first: the browser cannot see a refused WebSocket upgrade's status.
+        const parent = parentSpan?.()
         const probe = yield* Effect.result(
-          Effect.tryPromise({
-            try: () => client.capabilities(),
-            catch: (cause) =>
-              new ProbeFailure({
+          Effect.currentSpan.pipe(
+            Effect.orDie,
+            Effect.flatMap((span) => Effect.tryPromise({
+              try: () => client.withTraceContext(() => traceContextOf(span)).capabilities(),
+              catch: (cause) => new ProbeFailure({
                 cause,
                 message: cause instanceof Error ? cause.message : String(cause),
               }),
-          }),
+            })),
+            Effect.withSpan('st3.socket.probe', { kind: 'client', root: parent === undefined, parent, attributes: { 'span.label': 'probe' } }),
+          ),
         )
         if (Result.isFailure(probe)) {
           onProbeFailure?.()
@@ -307,9 +331,10 @@ export const makeChannel = ({
         return yield* connect({ attempt: 2, issue: ended })
       })
 
-    yield* Effect.forkIn(connect({ attempt: 1, issue: undefined }), scope)
+    let connectionFiber = yield* Effect.forkIn(connect({ attempt: 1, issue: undefined }), scope)
     yield* Effect.addFinalizer(() =>
       Effect.gen(function* () {
+        disposed = true
         live?.close()
         live = undefined
         for (const entry of subscribers.values()) entry.fiber?.interruptUnsafe()
@@ -322,6 +347,25 @@ export const makeChannel = ({
     return {
       connection,
       syncStatus,
+      suspend: () => {
+        if (suspended || disposed || permanentlyRejected) return
+        suspended = true
+        connectionFiber.interruptUnsafe()
+        live = undefined
+        for (const entry of subscribers.values()) {
+          entry.fiber?.interruptUnsafe()
+          entry.fiber = undefined
+          entry.subscriber.onDrop()
+        }
+        Effect.runFork(setConnection({ _tag: 'Closed' }))
+      },
+      resume: Effect.gen(function* () {
+        if (!suspended || disposed || permanentlyRejected) return
+        yield* Fiber.interrupt(connectionFiber)
+        if (!suspended || disposed || permanentlyRejected) return
+        suspended = false
+        connectionFiber = yield* Effect.forkIn(connect({ attempt: 1, issue: undefined }), scope)
+      }),
       onDecodedFrame: () => {
         if (live === undefined || gatewayStatus._tag === 'Live') return
         lastLiveAt = Date.now()

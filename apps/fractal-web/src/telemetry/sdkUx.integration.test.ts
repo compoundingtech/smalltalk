@@ -90,8 +90,10 @@ it('a conversation switch traces subscribe -> first frame -> painted transcript 
     const subscribe = commands.find((command) => command['kind'] === 'subscribe' && command['collection'] === 'conversation')!
     const child = spans.find((span) => span.name === FOLLOW_SUBSCRIBE_SPAN)!
     expect(Option.getOrUndefined(child.parent)).toBe(switchRoot)
-    // The connect probe ran during page load and carried the reload root's context.
-    expect(headers[0]).toBe(`00-${reloadRoot.traceId}-${reloadRoot.spanId}-01`)
+    // Probe HTTP also names its own SDK child, and keeps context even without an active UX root.
+    const probe = spans.find((span) => span.name === 'st3.socket.probe')!
+    expect(Option.getOrUndefined(probe.parent)).toBe(reloadRoot)
+    expect(headers[0]).toBe(`00-${reloadRoot.traceId}-${probe.spanId}-01`)
     // The subscribe frame names the SDK's own child span, not the switch root.
     expect(subscribe['trace']).toEqual({ traceparent: `00-${switchRoot.traceId}-${child.spanId}-01` })
     // So does an SDK HTTP read issued while the switch is active.
