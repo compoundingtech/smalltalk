@@ -66,10 +66,7 @@ pub(super) fn glasses_at(
         Some(claims) => claims,
         None => live_claims(glass_claims(connection, person, through)?),
     };
-    let mut result: Vec<_> = claims
-        .iter()
-        .map(resource)
-        .collect::<Result<_>>()?;
+    let mut result: Vec<_> = claims.iter().map(resource).collect::<Result<_>>()?;
     result.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     Ok(result)
 }
@@ -165,7 +162,9 @@ mod tests {
         for edit in 1..=128 {
             store.set_write_clock_at(1_800_000_000_000 + edit).unwrap();
             let mut update = input(1, &format!("Edit {edit}"));
-            update.fields.insert("base_revision".into(), json!(previous.id));
+            update
+                .fields
+                .insert("base_revision".into(), json!(previous.id));
             let next = store.append_claim(&update).unwrap();
             assert_eq!(next.body["fields"]["replaced_revision"], previous.id);
             previous = next;
@@ -174,10 +173,16 @@ mod tests {
         assert_eq!(latest[0]["revision"], previous.id);
         assert_eq!(latest[0]["body"]["name"], "Edit 128");
         assert_eq!(latest, history_oracle(&store));
-        assert_eq!(store.glasses("person/ada", first.store_index).unwrap(), snapshot);
+        assert_eq!(
+            store.glasses("person/ada", first.store_index).unwrap(),
+            snapshot
+        );
         assert_eq!(snapshot[0]["body"]["name"], "Original");
         store.rebuild_claim_projections().unwrap();
-        assert_eq!(store.glasses("person/ada", first.store_index).unwrap(), snapshot);
+        assert_eq!(
+            store.glasses("person/ada", first.store_index).unwrap(),
+            snapshot
+        );
         assert_eq!(store.glasses("person/ada", u64::MAX).unwrap(), latest);
     }
 
@@ -196,10 +201,18 @@ mod tests {
         let forward = Store::open_memory("cedar").unwrap();
         let reverse = Store::open(&path, "elm").unwrap();
         for envelope in &envelopes {
-            receive_and_project(&forward, "relay", &exchange_of("relay", vec![envelope.clone()]));
+            receive_and_project(
+                &forward,
+                "relay",
+                &exchange_of("relay", vec![envelope.clone()]),
+            );
         }
         for envelope in envelopes.iter().rev().chain(envelopes.iter().rev()) {
-            receive_and_project(&reverse, "relay", &exchange_of("relay", vec![envelope.clone()]));
+            receive_and_project(
+                &reverse,
+                "relay",
+                &exchange_of("relay", vec![envelope.clone()]),
+            );
         }
         let expected = history_oracle(&forward);
         assert_eq!(expected[0]["revision"], canonical.id);
@@ -214,7 +227,9 @@ mod tests {
         assert_eq!(reverse.glasses("person/ada", u64::MAX).unwrap(), expected);
         reverse.set_write_clock_at(1_800_000_000_001).unwrap();
         let mut stale = input(1, "After reopen");
-        stale.fields.insert("base_revision".into(), json!(earlier.id));
+        stale
+            .fields
+            .insert("base_revision".into(), json!(earlier.id));
         let next = reverse.append_claim(&stale).unwrap();
         assert_eq!(next.body["fields"]["base_revision"], earlier.id);
         assert_eq!(next.body["fields"]["replaced_revision"], canonical.id);
@@ -227,37 +242,48 @@ mod tests {
     fn dirty_canonical_record_correction_reads_and_prepares_the_correct_head() {
         let store = Store::open_memory("alder").unwrap();
         store.set_write_clock_at(1_800_000_000_000).unwrap();
-        let first = store.append_claim(&input(1, "First wire position")).unwrap();
-        let second = {
-            let mut connection = store.connection.write();
-            let transaction = connection.transaction().unwrap();
-            let second = append_claim_record_tx(
-                &transaction,
-                "alder",
-                &first.subject,
-                "glass.upserted",
-                Some("person/ada"),
-                &json!({"fields": input(1, "Second wire position").fields}),
-                &[],
-                Some(&first.batch_id),
-            )
+        let first = store
+            .append_claim(&input(1, "First wire position"))
             .unwrap();
-            for (claim, position) in [(&first, 0), (&second, 1)] {
-                transaction.execute(
+        let second =
+            {
+                let mut connection = store.connection.write();
+                let transaction = connection.transaction().unwrap();
+                let second = append_claim_record_tx(
+                    &transaction,
+                    "alder",
+                    &first.subject,
+                    "glass.upserted",
+                    Some("person/ada"),
+                    &json!({"fields": input(1, "Second wire position").fields}),
+                    &[],
+                    Some(&first.batch_id),
+                )
+                .unwrap();
+                for (claim, position) in [(&first, 0), (&second, 1)] {
+                    transaction.execute(
                     "INSERT INTO replica_records(record_ref, writer, sequence, envelope_hash,
                         position, raw, state, claim_id, updated_at_unix_ms)
                      VALUES (?1, 'alder', 1, 'fixture', ?2, X'', 'valid', ?3, '0')",
                     params![format!("record/{}", claim.id), position, claim.id],
                 ).unwrap();
-            }
-            super::super::glass_heads::flush(&transaction).unwrap();
-            transaction.commit().unwrap();
-            second
-        };
-        assert_eq!(store.glasses("person/ada", u64::MAX).unwrap()[0]["revision"], second.id);
-        store.connection.write().execute(
-            "UPDATE replica_records SET position=2 WHERE claim_id=?1", [&first.id],
-        ).unwrap();
+                }
+                super::super::glass_heads::flush(&transaction).unwrap();
+                transaction.commit().unwrap();
+                second
+            };
+        assert_eq!(
+            store.glasses("person/ada", u64::MAX).unwrap()[0]["revision"],
+            second.id
+        );
+        store
+            .connection
+            .write()
+            .execute(
+                "UPDATE replica_records SET position=2 WHERE claim_id=?1",
+                [&first.id],
+            )
+            .unwrap();
         // The durable metadata changed, but no projection worker has flushed it yet.
         let corrected = store.glasses("person/ada", u64::MAX).unwrap();
         assert_eq!(corrected[0]["revision"], first.id);
@@ -265,11 +291,19 @@ mod tests {
         assert_eq!(corrected, history_oracle(&store));
         store.set_write_clock_at(1_800_000_000_001).unwrap();
         let mut update = input(1, "After correction");
-        update.fields.insert("base_revision".into(), json!(second.id));
+        update
+            .fields
+            .insert("base_revision".into(), json!(second.id));
         let next = store.append_claim(&update).unwrap();
         assert_eq!(next.body["fields"]["replaced_revision"], first.id);
-        assert_eq!(store.glasses("person/ada", u64::MAX).unwrap()[0]["revision"], next.id);
-        assert_eq!(store.glasses("person/ada", u64::MAX).unwrap(), history_oracle(&store));
+        assert_eq!(
+            store.glasses("person/ada", u64::MAX).unwrap()[0]["revision"],
+            next.id
+        );
+        assert_eq!(
+            store.glasses("person/ada", u64::MAX).unwrap(),
+            history_oracle(&store)
+        );
     }
     #[test]
     fn split_ratios_survive_replication_and_projection_replay() {
@@ -393,7 +427,10 @@ mod tests {
         a.set_write_clock_at(1_800_000_000_001).unwrap();
         let mut edited = None;
         for edit in 0..32 {
-            edited = Some(a.append_claim(&input(0, &format!("Edited {edit}"))).unwrap());
+            edited = Some(
+                a.append_claim(&input(0, &format!("Edited {edit}")))
+                    .unwrap(),
+            );
         }
         assert_eq!(
             a.append_claim(&input(101, "Over quota")).unwrap_err().code,
@@ -413,8 +450,15 @@ mod tests {
         assert_eq!(live.len(), 100);
         assert_eq!(live, d.glasses("person/ada", i64::MAX as u64).unwrap());
         assert_eq!(live[0]["revision"], edited.unwrap().id);
-        assert!(live.iter().any(|glass| glass["id"] == input(99, "").subject));
-        assert!(!live.iter().any(|glass| glass["id"] == input(100, "").subject));
+        assert!(
+            live.iter()
+                .any(|glass| glass["id"] == input(99, "").subject)
+        );
+        assert!(
+            !live
+                .iter()
+                .any(|glass| glass["id"] == input(100, "").subject)
+        );
         assert_eq!(live, history_oracle(&c));
         c.rebuild_claim_projections().unwrap();
         assert_eq!(live, c.glasses("person/ada", i64::MAX as u64).unwrap());
@@ -425,8 +469,12 @@ mod tests {
         c.append_claim(&delete).unwrap();
         sync(&c, &d);
         assert_eq!(c.glasses("person/ada", i64::MAX as u64).unwrap().len(), 100);
-        assert!(c.glasses("person/ada", u64::MAX).unwrap().iter()
-            .any(|glass| glass["id"] == input(100, "").subject));
+        assert!(
+            c.glasses("person/ada", u64::MAX)
+                .unwrap()
+                .iter()
+                .any(|glass| glass["id"] == input(100, "").subject)
+        );
         assert_eq!(
             c.glasses("person/ada", i64::MAX as u64).unwrap(),
             d.glasses("person/ada", i64::MAX as u64).unwrap()

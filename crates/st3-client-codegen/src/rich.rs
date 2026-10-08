@@ -39,6 +39,12 @@ const KEYWORDS: &[&str] = &[
     "x-st-ref",
     "x-st-brand",
     "x-st-codec",
+    "x-st-preserve-null",
+    "x-st-custom-claim-schema",
+    "x-st-native-ref-families",
+    "x-st-max-utf8-bytes",
+    "x-st-exact-json",
+    "x-st-unknown-case",
 ];
 const DATE_TIME: &str =
     r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$";
@@ -87,7 +93,15 @@ fn merge_objects(parts: &[Value]) -> Result<Value> {
             match key.as_str() {
                 "properties" => {
                     for (name, schema) in value.as_object().context("properties")? {
-                        properties.insert(name.clone(), schema.clone());
+                        let mut schema = schema.clone();
+                        if let Some(known) = properties.get(name).and_then(open_enum)
+                            && schema["not"]["enum"]
+                                .as_array()
+                                .is_some_and(|excluded| known.iter().all(|value| excluded.contains(value)))
+                        {
+                            schema["x-st-unknown-case"] = Value::Bool(true);
+                        }
+                        properties.insert(name.clone(), schema);
                     }
                 }
                 "required" => {
@@ -260,7 +274,7 @@ fn normalize(value: &Value, defs: &Defs) -> Result<Value> {
         })
         .collect::<Result<Vec<_>>>()?;
     if open {
-        base["properties"][&key] = json!({ "type": "string", "not": { "enum": domain } });
+        base["properties"][&key] = json!({ "type": "string", "not": { "enum": domain }, "x-st-unknown-case": true });
         branches.push(base);
     }
     let mut out = Map::new();
@@ -397,18 +411,23 @@ fn subject_ref(object: &Map<String, Value>, families: &Value) -> Result<String> 
 }
 
 fn emit_string(object: &Map<String, Value>) -> Result<String> {
-    let mut excluded = None;
-    if let Some(not) = object.get("not") {
+    if let Some(families) = object.get("x-st-native-ref-families") {
+        return Ok(format!("Schema.String.check(Schema.makeFilter((value: string) => RawSubjects.isNativeSubjectReference(value, {}), {{ expected: \"a canonical registered native reference within 512 UTF-8 bytes\" }}))", js(families)));
+    }
+    let excluded = if let Some(not) = object.get("not") {
         let only = not.as_object().filter(|n| n.len() == 1);
         if let Some(known) = only.and_then(|n| n.get("enum")).and_then(Value::as_array) {
-            return Ok(format!("unknownCase({})", js(&Value::Array(known.clone()))));
+            if object.get("x-st-unknown-case") == Some(&Value::Bool(true)) {
+                return Ok(format!("unknownCase({})", js(&Value::Array(known.clone()))));
+            }
+            known.clone()
+        } else {
+            vec![only.and_then(|n| n.get("const"))
+                .context("only `not: { enum }` and `not: { const }` are translated")?.clone()]
         }
-        // `not: { const }` excludes one value from an otherwise plain string.
-        excluded = Some(
-            only.and_then(|n| n.get("const"))
-                .context("only `not: { enum }` and `not: { const }` are translated")?,
-        );
-    }
+    } else {
+        vec![]
+    };
     let mut schema = match object.get("x-st-ref") {
         Some(families) => subject_ref(object, families)?,
         None => {
@@ -435,11 +454,11 @@ fn emit_string(object: &Map<String, Value>) -> Result<String> {
             with_checks("Schema.String".into(), checks)
         }
     };
-    if let Some(value) = excluded {
+    if !excluded.is_empty() {
         schema = format!(
-            "{schema}.check(Schema.makeFilter((value: string) => value !== {}, {{ expected: {} }}))",
-            js(value),
-            js(&json!(format!("a string other than {value}")))
+            "{schema}.check(Schema.makeFilter((value: string) => !{}.includes(value), {{ expected: {} }}))",
+            js(&Value::Array(excluded.clone())),
+            js(&json!(format!("a string outside {}", js(&Value::Array(excluded)))))
         );
     }
     if let Some(brand) = object.get("x-st-brand") {
@@ -560,6 +579,12 @@ fn emit(value: &Value, cx: &mut Cx) -> Result<String> {
         }
         return Ok(format!("openEnum({})", js(&Value::Array(known))));
     }
+    if let Some(exact) = object.get("x-st-exact-json") {
+        let mut inner = object.clone();
+        inner.remove("const");
+        inner.remove("x-st-exact-json");
+        return Ok(format!("{}.check(Schema.makeFilter((value) => RawSubjects.isExactJson(value, {}), {{ expected: \"the exact compiled descriptor array in its canonical order\" }}))", emit(&Value::Object(inner), cx)?, js(exact)));
+    }
     if let Some(constant) = object.get("const") {
         return Ok(format!("Schema.Literal({})", js(constant)));
     }
@@ -677,11 +702,16 @@ fn emit_field(
         Some(inner) => (emit(&inner, cx)?, true),
         None => (emit(value, cx)?, false),
     };
-    let schema = match (nullable, required) {
-        (true, true) => format!("Schema.OptionFromNullOr({schema})"),
-        (true, false) => format!("Schema.OptionFromOptionalNullOr({schema}, NULL_NONE)"),
-        (false, true) => schema,
-        (false, false) => format!("optionalKey({schema})"),
+    let schema = if value.get("x-st-preserve-null") == Some(&Value::Bool(true)) {
+        let schema = if nullable { format!("Schema.NullOr({schema})") } else { schema };
+        if required { schema } else { format!("Schema.optionalKey({schema})") }
+    } else {
+        match (nullable, required) {
+            (true, true) => format!("Schema.OptionFromNullOr({schema})"),
+            (true, false) => format!("Schema.OptionFromOptionalNullOr({schema}, NULL_NONE)"),
+            (false, true) => schema,
+            (false, false) => format!("optionalKey({schema})"),
+        }
     };
     let docs = annotations(value, None);
     let schema = if docs.is_empty() || value.get("$ref").is_some() {
@@ -775,6 +805,9 @@ fn emit_object(object: &Map<String, Value>, cx: &mut Cx, indent: &str) -> Result
         Some(schema) => Some(emit(schema, cx)?),
     };
     let mut checks = vec![];
+    if object.get("x-st-custom-claim-schema") == Some(&json!(true)) {
+        checks.push("Schema.makeFilter((claim: { readonly kind: string; readonly schema_id: string; readonly ref: string }) => RawSubjects.isSupportedCustomClaim(claim), { expected: \"the locally compiled concrete custom kind descriptor and allowed custom reference\" })".to_owned());
+    }
     if let Some(names) = object.get("propertyNames") {
         let mut key = names.as_object().context("propertyNames")?.clone();
         // Property names are always strings; references already name a string schema.
@@ -824,7 +857,7 @@ fn emit_object(object: &Map<String, Value>, cx: &mut Cx, indent: &str) -> Result
     })
 }
 
-/// The single-const discriminator shared by every branch, if all values are unique.
+/// A required string/number literal discriminator shared by every branch, with unique keys.
 fn tagged_by(branches: &[Value], cx: &Cx) -> Option<String> {
     let resolved: Vec<&Value> = branches
         .iter()
@@ -839,12 +872,18 @@ fn tagged_by(branches: &[Value], cx: &Cx) -> Option<String> {
         .find(|key| {
             let values: Option<Vec<&Value>> = resolved
                 .iter()
-                .map(|branch| branch.get("properties")?.get(key.as_str())?.get("const"))
+                .map(|branch| {
+                    if !branch.get("required")?.as_array()?.contains(&json!(key)) {
+                        return None;
+                    }
+                    let value = branch.get("properties")?.get(key.as_str())?.get("const")?;
+                    (value.is_string() || value.is_number()).then_some(value)
+                })
                 .collect();
             values.is_some_and(|values| {
                 values
                     .iter()
-                    .map(|value| value.to_string())
+                    .map(|value| value.as_str().map_or_else(|| value.to_string(), str::to_owned))
                     .collect::<BTreeSet<_>>()
                     .len()
                     == values.len()

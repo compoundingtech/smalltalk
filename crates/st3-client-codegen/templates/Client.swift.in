@@ -4,6 +4,12 @@ import Foundation
 import FoundationNetworking
 #endif
 
+public enum SubjectsSelector: Sendable {
+    case family(String, refPrefix: String? = nil)
+    case ref(String)
+}
+private struct SubjectStreamControl: Decodable { let kind: String; let message: String? }
+
 public actor St3Client {
     public let baseURL: URL
     private let session: URLSession
@@ -116,6 +122,40 @@ public actor St3Client {
                         continuation.yield(frame)
                     }
                 } catch { continuation.finish(throwing: task.closeCode == .normalClosure ? nil : error); task.cancel(with: .normalClosure, reason: nil) }
+            }
+        }
+    }
+    public func subscribeSubjects(subscriptionID: String, selector: SubjectsSelector, limit: Int = 50) -> AsyncThrowingStream<SubjectCollectionFrame, Error> {
+        var components = URLComponents(url: baseURL.appending(path: "v1/client/collections/stream"), resolvingAgainstBaseURL: false)!
+        components.scheme = components.scheme == "https" ? "wss" : "ws"
+        var request = URLRequest(url: components.url!)
+        request.setValue("st3.client.collections.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol")
+        request.setValue("custom-subjects.v1", forHTTPHeaderField: "x-st3-features")
+        if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
+        let task = session.webSocketTask(with: request)
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
+            task.resume()
+            Task {
+                do {
+                    var fields: [String: JSONValue] = ["kind": .string("subscribe"), "id": .string(subscriptionID), "collection": .string("subjects"), "limit": .number(Double(limit))]
+                    switch selector {
+                    case .family(let family, let prefix):
+                        fields["family"] = .string(family)
+                        if let prefix { fields["ref_prefix"] = .string(prefix) }
+                    case .ref(let reference): fields["ref"] = .string(reference)
+                    }
+                    let command = try JSONEncoder().encode(JSONValue.object(fields))
+                    try await task.send(.string(String(decoding: command, as: UTF8.self)))
+                    while true {
+                        let data = try Self.websocketData(from: try await task.receive())
+                        let control = try JSONDecoder().decode(SubjectStreamControl.self, from: data)
+                        if control.kind == "error" { throw NSError(domain: "St3Client", code: 0, userInfo: [NSLocalizedDescriptionKey: control.message ?? "Native subject subscription failed"]) }
+                        if control.kind == "resync" { try await task.send(.string(String(decoding: command, as: UTF8.self))); continue }
+                        continuation.yield(try JSONDecoder().decode(SubjectCollectionFrame.self, from: data))
+                    }
+                } catch { continuation.finish(throwing: error); task.cancel(with: .normalClosure, reason: nil) }
             }
         }
     }

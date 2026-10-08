@@ -4417,7 +4417,6 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "hex",
- "hmac",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -4469,6 +4468,7 @@ dependencies = [
  "bytes",
  "ciborium",
  "crossterm",
+ "fancy-regex 0.16.2",
  "futures-util",
  "hex",
  "http-body-util",
@@ -4498,6 +4498,7 @@ dependencies = [
  "anyhow",
  "serde_json",
  "sha2",
+ "st3-schema",
 ]
 
 [[package]]

@@ -962,9 +962,9 @@ impl Store {
             if f["condition"] == "provider-auth"
                 && let Some(harness) = self.current_harness(source)?
             {
-                let update_menu = self.claim_by_id(&harness.claim)?.is_some_and(|claim| {
-                    claim.body["fields"]["code"] == "provider-update-prompt"
-                });
+                let update_menu = self
+                    .claim_by_id(&harness.claim)?
+                    .is_some_and(|claim| claim.body["fields"]["code"] == "provider-update-prompt");
                 // The visible update modal takes priority without restoring authentication.
                 // Once it clears, an unresolved login exposes its fallback fault again.
                 if update_menu

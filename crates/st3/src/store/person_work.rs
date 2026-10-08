@@ -724,7 +724,9 @@ impl Store {
         let has_asks: bool = {
             let connection = self.readers.get();
             connection
-                .prepare_cached("SELECT EXISTS(SELECT 1 FROM claims WHERE kind='work.person-asked')")?
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM claims WHERE kind='work.person-asked')",
+                )?
                 .query_row([], |row| row.get(0))?
         };
         if !has_asks {
@@ -1031,7 +1033,9 @@ pub(super) mod tests {
             completed
         });
         assert!(
-            !completed.expect("empty reconciliation submitted a writer job").unwrap(),
+            !completed
+                .expect("empty reconciliation submitted a writer job")
+                .unwrap(),
             "empty reconciliation must not report a change"
         );
     }

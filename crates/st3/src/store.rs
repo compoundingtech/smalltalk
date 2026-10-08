@@ -1,12 +1,13 @@
-pub mod custom;
-pub mod declarations;
-mod glass_heads;
 mod arrangements;
 #[cfg(test)]
 mod arrangements_tests;
+pub mod custom;
+pub mod declarations;
+mod glass_heads;
 mod glasses;
-pub(crate) mod mailbox_wakes;
 mod mailbox_changes;
+pub(crate) mod mailbox_wakes;
+mod native_sources;
 pub mod owned_sets;
 #[cfg(test)]
 mod owned_sets_tests;
@@ -15,6 +16,10 @@ mod github_workflow_failures;
 pub(crate) mod message_subscriptions;
 mod rollouts;
 mod seat_status;
+mod subjects;
+pub(crate) use subjects::{
+    NativeSourceFence, NativeSourceRecord, native_source_log_order, normalize_native_claim_fields,
+};
 pub(crate) mod step_labels;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -62,7 +67,7 @@ use smallclaims::claim::ReplicaEnvelopePayload;
 use smallclaims::error::internal;
 use smallclaims::hash::{
     batch_header_hash, canonical_hash, canonical_json_text, canonical_json_value,
-    canonical_serialized_json_text, claim_hash,
+    canonical_serialized_json_text, claim_hash, keyed_canonical_hash,
 };
 #[cfg(test)]
 use smallclaims::hash::{
@@ -920,8 +925,18 @@ struct ViewEntry {
 
 fn subject_head_at(connection: &Connection, subject: &str, store_index: u64) -> Result<u64> {
     if subject.starts_with("arrangement/") {
-        let index: u64 = connection.query_row("SELECT changed_index FROM arrangements WHERE subject=?1", [subject], |row| row.get(0)).optional()?.unwrap_or(0);
-        anyhow::ensure!(index <= store_index, "arrangement snapshot frontier is stale");
+        let index: u64 = connection
+            .query_row(
+                "SELECT changed_index FROM arrangements WHERE subject=?1",
+                [subject],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        anyhow::ensure!(
+            index <= store_index,
+            "arrangement snapshot frontier is stale"
+        );
         return Ok(index);
     }
     connection
@@ -1089,7 +1104,13 @@ fn subject_status_at(
     at_index: Option<u64>,
     owner_filter: Option<&str>,
 ) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
-    subject_status_at_with_mode(connection, subject, at_index, owner_filter, SubjectStatusMode::Full)
+    subject_status_at_with_mode(
+        connection,
+        subject,
+        at_index,
+        owner_filter,
+        SubjectStatusMode::Full,
+    )
 }
 
 fn subject_status_at_with_mode(
@@ -1102,20 +1123,48 @@ fn subject_status_at_with_mode(
     #[cfg(test)]
     SUBJECT_REDUCTIONS.with(|reductions| reductions.set(reductions.get() + 1));
     if subject.starts_with("arrangement/") {
-        if owner_filter.is_some() { return Ok(None); }
-        let actual = arrangements::arrangement_at(connection, subject, at_index.unwrap_or(i64::MAX as u64))?;
-        let revision = actual.as_ref().and_then(|v| v["revision"].as_str()).map(str::to_owned);
+        if owner_filter.is_some() {
+            return Ok(None);
+        }
+        let actual =
+            arrangements::arrangement_at(connection, subject, at_index.unwrap_or(i64::MAX as u64))?;
+        let revision = actual
+            .as_ref()
+            .and_then(|v| v["revision"].as_str())
+            .map(str::to_owned);
         let live = actual.is_some();
-        return Ok(Some((SubjectStatus {
-            subject: subject.into(), kind: Some("arrangement".into()),
-            desired_token: None, desired_revision: None, desired: None,
-            actual, actual_claim: revision.clone(), actual_origin: None,
-            harness: None, conflicts: vec![], claims: revision.into_iter().collect(),
-            owner_run: None, gap: None, reachability: if live { "reachable" } else { "unknown" }.into(),
-            reason: None, under: vec![],
-            projection: OperationalAnnotation { layer: if live { "current" } else { "history" }.into(), actionable: false,
-                reasons: if live { vec![] } else { vec!["retired-or-uncreated".into()] }, owner_generation: None, runtime_incarnation: None },
-        }, None)));
+        return Ok(Some((
+            SubjectStatus {
+                subject: subject.into(),
+                kind: Some("arrangement".into()),
+                desired_token: None,
+                desired_revision: None,
+                desired: None,
+                actual,
+                actual_claim: revision.clone(),
+                actual_origin: None,
+                harness: None,
+                conflicts: vec![],
+                claims: revision.into_iter().collect(),
+                owner_run: None,
+                gap: None,
+                reachability: if live { "reachable" } else { "unknown" }.into(),
+                reason: None,
+                under: vec![],
+                projection: OperationalAnnotation {
+                    layer: if live { "current" } else { "history" }.into(),
+                    actionable: false,
+                    reasons: if live {
+                        vec![]
+                    } else {
+                        vec!["retired-or-uncreated".into()]
+                    },
+                    owner_generation: None,
+                    runtime_incarnation: None,
+                },
+            },
+            None,
+        )));
     }
     let desired = desired_row_at(connection, subject, at_index)?;
     let member = desired
@@ -1133,17 +1182,29 @@ fn subject_status_at_with_mode(
         SubjectStatusMode::Full => (
             current_harness_at(connection, subject, at_index)?,
             claim_ids_at(connection, subject, at_index)?,
-            desired_conflicts_at(connection, subject, desired.as_ref().map(|row| row.claim_id.as_str()), at_index)?,
+            desired_conflicts_at(
+                connection,
+                subject,
+                desired.as_ref().map(|row| row.claim_id.as_str()),
+                at_index,
+            )?,
         ),
         SubjectStatusMode::AgentCard => {
             let claims = if desired.is_some() {
                 Vec::new()
             } else {
-                connection.prepare_cached(&canonical_sql(
-                    "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2
+                connection
+                    .prepare_cached(&canonical_sql(
+                        "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2
                      ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                ))?.query_row(params![subject, at_index.unwrap_or(i64::MAX as u64)], |row| row.get::<_, String>(0))
-                    .optional()?.into_iter().collect()
+                    ))?
+                    .query_row(
+                        params![subject, at_index.unwrap_or(i64::MAX as u64)],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .into_iter()
+                    .collect()
             };
             (None, claims, Vec::new())
         }
@@ -1315,6 +1376,7 @@ pub type IdempotencyConflict = Vec<(String, String)>;
 pub struct Store {
     graph: GraphStore,
     smalltalk: Arc<SmalltalkRuntime>,
+    native_retention: Mutex<subjects::NativeRetentionLimits>,
 }
 
 impl std::borrow::Borrow<GraphStore> for Store {
@@ -1443,13 +1505,34 @@ struct ChildMissionContext {
     default_selector: Option<WorkSelector>,
 }
 
-fn stale_ref_request_tx(connection: &Connection, resource: &str, discovery: &str) -> Result<Option<String>> {
-    let Some(requested) = claim_by_id_tx(connection, discovery)?.filter(|claim|
-        claim.subject == resource && claim.body.pointer("/fields/kind").and_then(Value::as_str) == Some("vcs.ref")) else { return Ok(None); };
-    let Some(current) = latest_actual(connection, resource)?.and_then(|actual| actual.get("facts").cloned()) else { return Ok(None); };
-    let requested_head = requested.body.pointer("/fields/facts/head").and_then(Value::as_str);
-    if let Some((requested, current)) = requested_head.zip(current.get("head").and_then(Value::as_str))
-        && requested != current { return Ok(Some(format!("ref {resource} moved from head {requested} to {current}"))); }
+fn stale_ref_request_tx(
+    connection: &Connection,
+    resource: &str,
+    discovery: &str,
+) -> Result<Option<String>> {
+    let Some(requested) = claim_by_id_tx(connection, discovery)?.filter(|claim| {
+        claim.subject == resource
+            && claim.body.pointer("/fields/kind").and_then(Value::as_str) == Some("vcs.ref")
+    }) else {
+        return Ok(None);
+    };
+    let Some(current) =
+        latest_actual(connection, resource)?.and_then(|actual| actual.get("facts").cloned())
+    else {
+        return Ok(None);
+    };
+    let requested_head = requested
+        .body
+        .pointer("/fields/facts/head")
+        .and_then(Value::as_str);
+    if let Some((requested, current)) =
+        requested_head.zip(current.get("head").and_then(Value::as_str))
+        && requested != current
+    {
+        return Ok(Some(format!(
+            "ref {resource} moved from head {requested} to {current}"
+        )));
+    }
     Ok(None)
 }
 
@@ -1924,8 +2007,9 @@ fn discovered_collection_items(
             }
             // Creation receipts establish identity and attribution, not observer state.
             let observed_prior = prior.filter(|prior| prior.get("state").is_some());
-            let new_item =
-                observed_prior.is_none() && !baseline && item.get("new") != Some(&Value::Bool(false));
+            let new_item = observed_prior.is_none()
+                && !baseline
+                && item.get("new") != Some(&Value::Bool(false));
             let deliver = match (field, observed_prior) {
                 ("pull_requests", Some(prior)) => pull_request_needs_review(Some(prior), &facts),
                 (_, Some(_)) => false,
@@ -2685,7 +2769,11 @@ impl Store {
         {
             graph.heal_replay_backoff_ms = 0;
         }
-        Ok(Self { graph, smalltalk })
+        Ok(Self {
+            graph,
+            smalltalk,
+            native_retention: Mutex::new(Default::default()),
+        })
     }
 
     /// Open explicitly registered shadow views beside Smalltalk's production admission and
@@ -2697,7 +2785,11 @@ impl Store {
     ) -> Result<Self> {
         let smalltalk = Arc::new(SmalltalkRuntime::with_ivm_views(views));
         let graph = GraphStore::open(path, origin, smalltalk.clone())?;
-        Ok(Self { graph, smalltalk })
+        Ok(Self {
+            graph,
+            smalltalk,
+            native_retention: Mutex::new(Default::default()),
+        })
     }
 
     /// Open a shared-memory store for sequential fixtures and short-lived tools.
@@ -2712,7 +2804,11 @@ impl Store {
         {
             graph.heal_replay_backoff_ms = 0;
         }
-        Ok(Self { graph, smalltalk })
+        Ok(Self {
+            graph,
+            smalltalk,
+            native_retention: Mutex::new(Default::default()),
+        })
     }
 
     /// Simulate a different build's registry on this node.
@@ -4000,13 +4096,22 @@ impl Store {
         self.create_mission_run_inner(request, child, Some(&subject), None)
     }
 
-    pub fn create_subscription_mission_run(&self, request: &MissionRunRequest,
-        parent: Option<&MissionRunView>, subscription: &str, resource: &str, discovery: &str,
+    pub fn create_subscription_mission_run(
+        &self,
+        request: &MissionRunRequest,
+        parent: Option<&MissionRunView>,
+        subscription: &str,
+        resource: &str,
+        discovery: &str,
     ) -> Result<MissionRunView, St3Error> {
         let child = parent.map(|parent| ChildMissionContext {
             root_revision: parent.root_revision.clone(),
-            root_run_id: parent.root_mission_run.trim_start_matches("mission-run/").into(),
-            parent_step_run: normalize_step_run(subscription), default_selector: None,
+            root_run_id: parent
+                .root_mission_run
+                .trim_start_matches("mission-run/")
+                .into(),
+            parent_step_run: normalize_step_run(subscription),
+            default_selector: None,
         });
         self.create_mission_run_inner(request, child, None, Some((resource, discovery)))
     }
@@ -4098,7 +4203,9 @@ impl Store {
         let transaction = connection.transaction().map_err(internal)?;
         owned_sets::guard_mission_start(&transaction, mission_id)?;
         if let Some((resource, discovery)) = latest_ref
-            && let Some(reason) = stale_ref_request_tx(&transaction, resource, discovery).map_err(internal)? {
+            && let Some(reason) =
+                stale_ref_request_tx(&transaction, resource, discovery).map_err(internal)?
+        {
             return Err(St3Error::new("stale-ref-head", reason));
         }
         let inputs = resolve_mission_run_inputs(&transaction, &mission, &request.inputs)?;
@@ -9726,7 +9833,10 @@ impl Store {
             || publication.runtime_incarnation.is_empty()
             || !matches!(
                 input.kind.as_str(),
-                "harness.observed" | "harness.usage" | "harness.limits" | "harness.timeline"
+                "harness.observed"
+                    | "harness.usage"
+                    | "harness.limits"
+                    | "harness.timeline"
                     | "harness.todo.observed"
             )
             || input.actor.as_deref() != Some(input.subject.as_str())
@@ -9791,9 +9901,14 @@ impl Store {
         current: &(dyn Fn() -> bool + Sync),
     ) -> Result<ClaimRecord, St3Error> {
         append_claim_with_subject_fences(
-            &self.graph, input, None, None, None,
+            &self.graph,
+            input,
+            None,
+            None,
+            None,
             Some((&input.subject, desired_revision, current)),
-        ).map(|(claim, _)| claim)
+        )
+        .map(|(claim, _)| claim)
     }
 
     pub(crate) fn append_claim_outcome(
@@ -10108,10 +10223,7 @@ impl Store {
                     ORDER BY observed_at_unix_ms
                     LIMIT ?2
                  )",
-                params![
-                    older_than_unix_ms.min(i64::MAX as u128) as i64,
-                    chunk
-                ],
+                params![older_than_unix_ms.min(i64::MAX as u128) as i64, chunk],
             )?;
             drop(connection);
             deleted += removed;
@@ -10496,31 +10608,42 @@ impl Store {
         let (actual, actual_origin, conflict) = match runtime_only_authority(connection, subject, i64::MAX as u64, &["status", "runtime_id", "incarnation_id", "terminal", "reachability"])? {
             Some((actual, origin)) => (Some(actual), Some(origin), false),
             None => {
-                let member = desired.as_ref()
+                let member = desired
+                    .as_ref()
                     .and_then(|row| row.member.as_deref())
                     .and_then(|value| serde_json::from_str::<crate::model::MemberSpec>(value).ok());
                 let actual = latest_actual_at(connection, subject, None)?;
                 let (_, origin, conflict) = selected_actual_source_at(
-                    connection, subject, None, member.as_ref().map(|member| member.host.as_str()),
+                    connection,
+                    subject,
+                    None,
+                    member.as_ref().map(|member| member.host.as_str()),
                 )?;
                 (actual, origin, conflict)
             }
         };
-        let reachability = if conflict || has_unknown_claim_at(connection, subject, None)?.is_some() {
-            "indeterminate"
-        } else {
-            actual.as_ref()
-                .and_then(|value| value.get("reachability"))
-                .and_then(Value::as_str)
-                .unwrap_or(if actual.is_some() {
-                    "reachable"
-                } else if desired.is_some() {
-                    "indeterminate"
-                } else {
-                    "unknown"
-                })
-        }.to_owned();
-        Ok(Some(RuntimeAuthority { actual, actual_origin, reachability }))
+        let reachability =
+            if conflict || has_unknown_claim_at(connection, subject, None)?.is_some() {
+                "indeterminate"
+            } else {
+                actual
+                    .as_ref()
+                    .and_then(|value| value.get("reachability"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(if actual.is_some() {
+                        "reachable"
+                    } else if desired.is_some() {
+                        "indeterminate"
+                    } else {
+                        "unknown"
+                    })
+            }
+            .to_owned();
+        Ok(Some(RuntimeAuthority {
+            actual,
+            actual_origin,
+            reachability,
+        }))
     }
 
     pub fn status(&self, selected: Option<&str>) -> Result<StatusResponse> {
@@ -10648,24 +10771,26 @@ impl Store {
             connection.prepare_cached("SELECT subject FROM arrangements WHERE subject>=?1 AND subject<?2 ORDER BY subject")?
                 .query_map(params![prefix, prefix_upper_bound(prefix).context("arrangement prefix bound")?], |row| row.get::<_,String>(0))?
                 .collect::<Result<BTreeSet<_>,_>>()?
-        } else { match prefix_upper_bound(prefix) {
-            // One seek per subject instead of every claim of every subject in the range.
-            Some(bound) => connection
-                .prepare_cached(RANGE_SUBJECTS)?
-                .query_map(params![store_index, prefix, bound], |row| {
-                    row.get::<_, String>(0)
-                })?
-                .collect::<Result<BTreeSet<_>, _>>()?,
-            None => connection
-                .prepare(
-                    "SELECT DISTINCT subject FROM claims
+        } else {
+            match prefix_upper_bound(prefix) {
+                // One seek per subject instead of every claim of every subject in the range.
+                Some(bound) => connection
+                    .prepare_cached(RANGE_SUBJECTS)?
+                    .query_map(params![store_index, prefix, bound], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<BTreeSet<_>, _>>()?,
+                None => connection
+                    .prepare(
+                        "SELECT DISTINCT subject FROM claims
                      WHERE store_index<=?1 AND subject GLOB ?2 ORDER BY subject",
-                )?
-                .query_map(params![store_index, format!("{prefix}*")], |row| {
-                    row.get::<_, String>(0)
-                })?
-                .collect::<Result<BTreeSet<_>, _>>()?,
-        }};
+                    )?
+                    .query_map(params![store_index, format!("{prefix}*")], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<BTreeSet<_>, _>>()?,
+            }
+        };
         drop(connection);
         self.status_for_subject_names_at(subjects, store_index, include_history)
     }
@@ -10681,8 +10806,10 @@ impl Store {
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
         let subjects = if kind == "arrangement.edited" {
-            connection.prepare_cached("SELECT subject FROM arrangements ORDER BY subject")?
-                .query_map([], |row| row.get::<_,String>(0))?.collect::<Result<BTreeSet<_>,_>>()?
+            connection
+                .prepare_cached("SELECT subject FROM arrangements ORDER BY subject")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<BTreeSet<_>, _>>()?
         } else if kind == "runtime.observed" {
             // One seek per runtime instead of every runtime observation.
             connection
@@ -10725,7 +10852,10 @@ impl Store {
                 cache.statuses.clear();
                 cache.card_statuses.clear();
                 cache.conflicts = conflicts;
-            } else if !cache.views.is_empty() || !cache.statuses.is_empty() || !cache.card_statuses.is_empty() {
+            } else if !cache.views.is_empty()
+                || !cache.statuses.is_empty()
+                || !cache.card_statuses.is_empty()
+            {
                 // The subjects and actors of the claims that arrived.
                 let mut statement = connection.prepare_cached(
                     "SELECT subject, actor FROM claims WHERE store_index>?1 AND store_index<=?2",
@@ -10748,7 +10878,9 @@ impl Store {
                 cache
                     .statuses
                     .retain(|subject, entry| !stale(subject, &entry.owners));
-                cache.card_statuses.retain(|subject, entry| !stale(subject, &entry.owners));
+                cache
+                    .card_statuses
+                    .retain(|subject, entry| !stale(subject, &entry.owners));
             }
             cache.through = store_index;
         }
@@ -10764,12 +10896,22 @@ impl Store {
         store_index: u64,
         newest: bool,
     ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
-        self.cached_subject_status_with_mode(connection, subject, store_index, newest, SubjectStatusMode::Full)
+        self.cached_subject_status_with_mode(
+            connection,
+            subject,
+            store_index,
+            newest,
+            SubjectStatusMode::Full,
+        )
     }
 
     fn cached_subject_status_with_mode(
-        &self, connection: &Connection, subject: &str, store_index: u64,
-        newest: bool, mode: SubjectStatusMode,
+        &self,
+        connection: &Connection,
+        subject: &str,
+        store_index: u64,
+        newest: bool,
+        mode: SubjectStatusMode,
     ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
         {
             let cache = self
@@ -10781,14 +10923,16 @@ impl Store {
                 SubjectStatusMode::Full => &cache.statuses,
                 SubjectStatusMode::AgentCard => &cache.card_statuses,
             };
-            if let Some(entry) = entries.get(subject)
+            if let Some(entry) = entries
+                .get(subject)
                 .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
             {
                 return Ok((entry.status.clone(), entry.action.clone()));
             }
         }
-        let (status, action) = subject_status_at_with_mode(connection, subject, Some(store_index), None, mode)?
-            .expect("a reduction without an owner filter always has a status");
+        let (status, action) =
+            subject_status_at_with_mode(connection, subject, Some(store_index), None, mode)?
+                .expect("a reduction without an owner filter always has a status");
         if newest {
             let mut cache = self
                 .smalltalk
@@ -10810,7 +10954,9 @@ impl Store {
                 // At capacity, a cold summary remains correct and uncached. Invalidation
                 // frees slots; no growing history map or full-status cache warming is needed.
                 if matches!(mode, SubjectStatusMode::AgentCard)
-                    && entries.len() >= AGENT_CARD_STATUS_LIMIT && !entries.contains_key(subject) {
+                    && entries.len() >= AGENT_CARD_STATUS_LIMIT
+                    && !entries.contains_key(subject)
+                {
                     return Ok((status, action));
                 }
                 entries.insert(
@@ -10898,27 +11044,41 @@ impl Store {
         history: bool,
     ) -> Result<StatusResponse> {
         let connection = self.readers.get();
-        let index = selected_index(current_index(&connection)?, Some(index)).map_err(anyhow::Error::new)?;
+        let index =
+            selected_index(current_index(&connection)?, Some(index)).map_err(anyhow::Error::new)?;
         let names = match names {
             Some(names) => names.clone(),
-            None => connection.prepare_cached(RANGE_SUBJECTS)?
-                .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+            None => connection
+                .prepare_cached(RANGE_SUBJECTS)?
+                .query_map(params![index, "agent/", "agent0"], |row| {
+                    row.get::<_, String>(0)
+                })?
                 .collect::<rusqlite::Result<BTreeSet<_>>>()?,
         };
-        let names = if history { names } else {
+        let names = if history {
+            names
+        } else {
             self.current_view_candidates(&connection, names, index, true)?
         };
         let newest = self.advance_subject_cache(&connection, index)?;
         let mut subjects = Vec::with_capacity(names.len());
         for name in names {
             let (status, _) = self.cached_subject_status_with_mode(
-                &connection, &name, index, newest, SubjectStatusMode::AgentCard,
+                &connection,
+                &name,
+                index,
+                newest,
+                SubjectStatusMode::AgentCard,
             )?;
             if history || status.projection.layer == "current" {
                 subjects.push(status);
             }
         }
-        Ok(StatusResponse { store_index: index, subjects, pending_actions: Vec::new() })
+        Ok(StatusResponse {
+            store_index: index,
+            subjects,
+            pending_actions: Vec::new(),
+        })
     }
 
     /// The terminals collection consumes the same authority fields as full status, but
@@ -11377,7 +11537,10 @@ impl Store {
         idempotency_key: &str,
     ) -> Result<ApplyResponse, St3Error> {
         if name == Some("") {
-            return Err(St3Error::new("invalid-agent-name", "a seat label must be a non-empty string"));
+            return Err(St3Error::new(
+                "invalid-agent-name",
+                "a seat label must be a non-empty string",
+            ));
         }
         let (mut desired, heads, writer) = {
             let connection = self.readers.get();
@@ -12028,7 +12191,11 @@ impl Store {
 
     /// Search refreshes only a person's private message texts, using the same endpoint
     /// indexes as the mailbox. Other fleet writes do not invalidate this source.
-    pub(crate) fn conversation_search_mail_stamp(&self, person: &str, through: u64) -> Result<String> {
+    pub(crate) fn conversation_search_mail_stamp(
+        &self,
+        person: &str,
+        through: u64,
+    ) -> Result<String> {
         let connection = self.readers.get();
         let (count, newest): (u64, u64) = connection.query_row(
             "WITH sent AS (
@@ -12043,22 +12210,37 @@ impl Store {
         Ok(format!("{count}:{newest}"))
     }
 
-    pub(crate) fn conversation_search_timeline_stamp(&self, agent: &str, incarnation: &str, through: u64) -> Result<String> {
+    pub(crate) fn conversation_search_timeline_stamp(
+        &self,
+        agent: &str,
+        incarnation: &str,
+        through: u64,
+    ) -> Result<String> {
         let connection = self.readers.get();
-        let (local_count, local_newest): (u64,u64) = connection.query_row(
+        let (local_count, local_newest): (u64, u64) = connection.query_row(
             "SELECT COUNT(*),COALESCE(MAX(id),0) FROM local_observations
              WHERE subject=?1 AND kind='harness.timeline'
-               AND json_extract(body,'$.fields.incarnation_id')=?2 AND after_store_index<=?3", params![agent,incarnation,through],
-            |row| Ok((row.get(0)?,row.get(1)?)))?;
-        let (legacy_count, legacy_newest): (u64,u64) = connection.query_row(
+               AND json_extract(body,'$.fields.incarnation_id')=?2 AND after_store_index<=?3",
+            params![agent, incarnation, through],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (legacy_count, legacy_newest): (u64, u64) = connection.query_row(
             "SELECT COUNT(*),COALESCE(MAX(store_index),0) FROM claims
              WHERE subject=?1 AND kind='harness.timeline'
-               AND json_extract(body,'$.fields.incarnation_id')=?2 AND store_index<=?3", params![agent,incarnation,through],
-            |row| Ok((row.get(0)?,row.get(1)?)))?;
-        Ok(format!("{local_count}:{local_newest}:{legacy_count}:{legacy_newest}"))
+               AND json_extract(body,'$.fields.incarnation_id')=?2 AND store_index<=?3",
+            params![agent, incarnation, through],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(format!(
+            "{local_count}:{local_newest}:{legacy_count}:{legacy_newest}"
+        ))
     }
 
-    pub(crate) fn conversation_search_messages(&self, person: &str, through: u64) -> Result<Vec<MessageView>> {
+    pub(crate) fn conversation_search_messages(
+        &self,
+        person: &str,
+        through: u64,
+    ) -> Result<Vec<MessageView>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(&canonical_sql(
             "WITH candidates AS (
@@ -12073,7 +12255,7 @@ impl Store {
                 FROM claims JOIN candidates ON candidates.id=claims.id
             ) SELECT sent.subject,sent.created_index FROM ranked AS sent
               WHERE ordinal=1 ORDER BY CANONICAL_DESC(sent) LIMIT 50001"))?;
-        let rows = statement.query_map(params![person,through], |row| {
+        let rows = statement.query_map(params![person, through], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
         })?;
         let mut messages = Vec::new();
@@ -12268,17 +12450,30 @@ impl Store {
                AND json_extract(body, '$.fields.to') IN (SELECT value FROM json_each(?4))
              ORDER BY store_index LIMIT ?5",
         )?;
-        let mut subjects = statement.query_map(
-            params![sender, after, through, serde_json::to_string(recipients)?, limit.saturating_add(1)],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
-        )?.collect::<Result<Vec<_>, _>>()?;
+        let mut subjects = statement
+            .query_map(
+                params![
+                    sender,
+                    after,
+                    through,
+                    serde_json::to_string(recipients)?,
+                    limit.saturating_add(1)
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
         let more = subjects.len() > limit;
         subjects.truncate(limit);
-        let next = more.then(|| subjects.last().map(|(_, index)| *index)).flatten();
+        let next = more
+            .then(|| subjects.last().map(|(_, index)| *index))
+            .flatten();
         let mut output = Vec::new();
         for (subject, index) in subjects {
             let message = self.message_view_cached(&connection, &subject, index)?;
-            if message.from == sender && recipients.contains(&message.to) && message.in_reply_to.is_some() {
+            if message.from == sender
+                && recipients.contains(&message.to)
+                && message.in_reply_to.is_some()
+            {
                 output.push(message);
             }
         }
@@ -12542,13 +12737,18 @@ impl Store {
              JOIN batches ON batches.id=claims.batch_id"
         ))?;
         let rows = statement.query_map(
-            params![serde_json::to_string(subjects)?, at_index.min(i64::MAX as u64)],
+            params![
+                serde_json::to_string(subjects)?,
+                at_index.min(i64::MAX as u64)
+            ],
             claim_from_row,
         )?;
         let mut observations = BTreeMap::<String, BTreeMap<String, ClaimRecord>>::new();
         for claim in rows {
             let claim = claim?;
-            observations.entry(claim.subject.clone()).or_default()
+            observations
+                .entry(claim.subject.clone())
+                .or_default()
                 .insert(claim.kind.clone(), claim);
         }
         Ok(observations)
@@ -12998,7 +13198,10 @@ impl Store {
     pub fn human_attention_runs(&self) -> Result<BTreeSet<String>> {
         let mut items = self.mission_run_attention_items(None)?;
         items.extend(self.person_attention_items(None, now_ms())?);
-        Ok(items.into_iter().filter_map(|item| item.mission_run).collect())
+        Ok(items
+            .into_iter()
+            .filter_map(|item| item.mission_run)
+            .collect())
     }
 
     /// The attention items that belong to a mission run: gate reviews, launch approvals and
@@ -14588,7 +14791,10 @@ impl Store {
         run: &MissionRunView,
     ) -> Result<Option<String>> {
         if !run.inputs.values().any(|input| {
-            input.subject.as_deref().is_some_and(|subject| subject.contains("/pull-request/"))
+            input
+                .subject
+                .as_deref()
+                .is_some_and(|subject| subject.contains("/pull-request/"))
         }) {
             return Ok(None);
         }
@@ -15443,7 +15649,12 @@ impl Store {
             ) WHERE position=1",
         )?;
         let rows = statement.query_map(
-            params![subject, incarnation, serde_json::to_string(entries)?, before_index],
+            params![
+                subject,
+                incarnation,
+                serde_json::to_string(entries)?,
+                before_index
+            ],
             |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))),
         )?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
@@ -15482,13 +15693,17 @@ impl Store {
                  AND (?3 IS NULL OR after_store_index<?3)",
         )?;
         let rows = statement.query_map(params![subject, incarnation, before_index], |row| {
-            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
         })?;
         let mut intervals = Vec::new();
         for row in rows {
             let (from, to) = row?;
             // Raw JSON scalars preserve unsigned bounds and reject strings, floats and booleans.
-            if let Some((from, to)) = from.and_then(|value| value.parse::<u64>().ok())
+            if let Some((from, to)) = from
+                .and_then(|value| value.parse::<u64>().ok())
                 .zip(to.and_then(|value| value.parse::<u64>().ok()))
                 .filter(|(from, to)| from <= to)
             {
@@ -15734,21 +15949,33 @@ impl Store {
         token: &str,
         build: impl FnOnce() -> Result<Option<crate::placement::Fence>>,
     ) -> Result<Option<Arc<crate::placement::Fence>>> {
-        if let Some(fence) = self.smalltalk.placement_cache.lock()
-            .unwrap_or_else(PoisonError::into_inner).get(token) {
+        if let Some(fence) = self
+            .smalltalk
+            .placement_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(token)
+        {
             return Ok(fence.clone());
         }
         let fence = build()?.map(Arc::new);
-        let mut cache = self.smalltalk.placement_cache.lock()
+        let mut cache = self
+            .smalltalk
+            .placement_cache
+            .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if cache.len() >= ACTUAL_CACHE_LIMIT { cache.clear(); }
+        if cache.len() >= ACTUAL_CACHE_LIMIT {
+            cache.clear();
+        }
         cache.insert(token.to_owned(), fence.clone());
         Ok(fence)
     }
 
     /// Read just the newest runtime body of each origin in canonical order at a snapshot.
     pub(crate) fn runtime_observations_at(
-        &self, subject: &str, at: u64,
+        &self,
+        subject: &str,
+        at: u64,
     ) -> Result<BTreeMap<String, ClaimRecord>> {
         smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
@@ -15921,8 +16148,10 @@ impl Store {
         // The process-wide committed index may advance beyond a pinned reader. Capture both
         // cursors from its SQLite snapshot, or a concurrent commit could be skipped forever.
         let (index, local) = connection
-            .prepare_cached("SELECT COALESCE((SELECT MAX(store_index) FROM claims),0),
-                                    COALESCE((SELECT MAX(id) FROM local_observations),0)")
+            .prepare_cached(
+                "SELECT COALESCE((SELECT MAX(store_index) FROM claims),0),
+                                    COALESCE((SELECT MAX(id) FROM local_observations),0)",
+            )
             .map_err(internal)?
             .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(internal)?;
@@ -15930,9 +16159,12 @@ impl Store {
             index,
             local,
             owner: mailbox_owner_key(&connection, fence)?,
-            desired: connection.prepare_cached("SELECT claim_id FROM desired WHERE subject=?1")
-                .map_err(internal)?.query_row([&fence.subject], |row| row.get(0))
-                .optional().map_err(internal)?,
+            desired: connection
+                .prepare_cached("SELECT claim_id FROM desired WHERE subject=?1")
+                .map_err(internal)?
+                .query_row([&fence.subject], |row| row.get(0))
+                .optional()
+                .map_err(internal)?,
         })
     }
 
@@ -18179,7 +18411,10 @@ fn desired_row_at(
     let Some(at_index) = at_index else {
         return current_desired_row(connection, subject);
     };
-    if owned_sets::owner(connection, subject, Some(at_index)).map_err(anyhow::Error::new)?.is_some() {
+    if owned_sets::owner(connection, subject, Some(at_index))
+        .map_err(anyhow::Error::new)?
+        .is_some()
+    {
         return owned_sets::desired_at(connection, subject, at_index);
     }
     let mut statement = connection.prepare_cached(&canonical_sql(
@@ -18604,7 +18839,8 @@ fn normalize_resource_observation(
         // Issue and pull request attribution belongs to its publisher, not to the latest
         // observer or fixer. Keep each named field, including a mission-run-only opener, across
         // observations, so a partial snapshot such as a merge never erases it.
-        if carries_opener(&kind) && input.fields.get("attribution_only") != Some(&Value::Bool(true)) {
+        if carries_opener(&kind) && input.fields.get("attribution_only") != Some(&Value::Bool(true))
+        {
             for name in ["opened_by", "opened_by_run"] {
                 if let Some(value) = previous.get(name) {
                     facts.insert(name.into(), value.clone());
@@ -18629,7 +18865,10 @@ fn normalize_resource_observation(
     let mut fields = input.fields.clone();
     if carries_opener(&kind) {
         if fields.contains_key("facts") {
-            fields.insert("facts".into(), serde_json::to_value(facts).map_err(internal)?);
+            fields.insert(
+                "facts".into(),
+                serde_json::to_value(facts).map_err(internal)?,
+            );
         } else {
             fields.extend(facts);
         }
@@ -19176,11 +19415,19 @@ fn latest_harness_of_incarnation_tx(
 ) -> Result<Option<ClaimRecord>, St3Error> {
     let latest = latest_claim_of_kind_tx(connection, subject, "harness.observed")?;
     if latest.as_ref().is_none_or(|claim| {
-        claim.body.pointer("/fields/incarnation_id").and_then(Value::as_str) == incarnation
+        claim
+            .body
+            .pointer("/fields/incarnation_id")
+            .and_then(Value::as_str)
+            == incarnation
     }) {
         return Ok(latest);
     }
-    let comparison = if incarnation.is_some() { "=?2" } else { "IS ?2" };
+    let comparison = if incarnation.is_some() {
+        "=?2"
+    } else {
+        "IS ?2"
+    };
     let indexed = if incarnation.is_some() {
         " INDEXED BY claims_incarnation_accepted_index"
     } else {
@@ -19223,12 +19470,17 @@ fn publish_changed_harness_state_tx(
             }
         }
         if fields.get("provider_auth").is_none_or(Value::is_null)
-            && let Some(value) = previous.get("provider_auth").filter(|value| value.is_boolean())
+            && let Some(value) = previous
+                .get("provider_auth")
+                .filter(|value| value.is_boolean())
         {
             fields.insert("provider_auth".into(), value.clone());
         }
     }
-    if matches!(fields.get("state").and_then(Value::as_str), Some("ended" | "indeterminate")) {
+    if matches!(
+        fields.get("state").and_then(Value::as_str),
+        Some("ended" | "indeterminate")
+    ) {
         fields.insert("blocked_on".into(), Value::Null);
         fields.insert("ask".into(), Value::Null);
     }
@@ -19239,17 +19491,26 @@ fn publish_changed_harness_state_tx(
             .and_then(Value::as_object)
             .is_some_and(|previous| {
                 fields.iter().all(|(name, value)| {
-                    matches!(name.as_str(), "observed_at_ms" | "observed_since_ms" | "status_transition")
-                        || previous.get(name) == Some(value)
+                    matches!(
+                        name.as_str(),
+                        "observed_at_ms" | "observed_since_ms" | "status_transition"
+                    ) || previous.get(name) == Some(value)
                 })
             })
     });
     // Refresh remote freshness at most once a minute, without manufacturing transitions.
-    if unchanged && latest.as_ref().is_some_and(|claim| now.saturating_sub(claim.accepted_at_unix_ms) < 60_000) {
+    if unchanged
+        && latest
+            .as_ref()
+            .is_some_and(|claim| now.saturating_sub(claim.accepted_at_unix_ms) < 60_000)
+    {
         return Ok(None);
     }
-    let observed_at = fields.get("observed_at_ms").and_then(Value::as_u64)
-        .map_or(now, u128::from).min(now);
+    let observed_at = fields
+        .get("observed_at_ms")
+        .and_then(Value::as_u64)
+        .map_or(now, u128::from)
+        .min(now);
     let same_state = latest.as_ref().is_some_and(|claim| {
         let previous = &claim.body["fields"];
         let carried = |name: &str| fields.get(name).or_else(|| previous.get(name));
@@ -19271,10 +19532,21 @@ fn publish_changed_harness_state_tx(
         let previous = latest.as_ref().unwrap();
         match previous.body["fields"]["observed_since_ms"].as_u64() {
             Some(since) => u128::from(since),
-            None => seat_status::state_run_since(transaction, &input.subject,
-                fields.get("incarnation_id").and_then(Value::as_str).unwrap_or_default(),
-                fields.get("state").and_then(Value::as_str).unwrap_or_default(), i64::MAX as u64).map_err(internal)?
-                .unwrap_or_else(|| seat_status::observation_time(previous)),
+            None => seat_status::state_run_since(
+                transaction,
+                &input.subject,
+                fields
+                    .get("incarnation_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                fields
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                i64::MAX as u64,
+            )
+            .map_err(internal)?
+            .unwrap_or_else(|| seat_status::observation_time(previous)),
         }
     } else {
         observed_at
@@ -19291,8 +19563,14 @@ fn publish_changed_harness_state_tx(
     )?;
     if input.fields.get("state").and_then(Value::as_str) != Some("working") {
         publish_pending_usage_tx(
-            transaction, origin, &input.subject,
-            fields.get("incarnation_id").and_then(Value::as_str).unwrap_or(""), now,
+            transaction,
+            origin,
+            &input.subject,
+            fields
+                .get("incarnation_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            now,
         )?;
     }
     Ok(Some(claim))
@@ -20220,8 +20498,13 @@ fn validate_message_transition(
     ) && input.actor.is_some()
     {
         let index: Option<u64> = transaction
-            .query_row("SELECT created_index FROM message_index WHERE subject=?1", [&input.subject], |row| row.get(0))
-            .optional().map_err(internal)?;
+            .query_row(
+                "SELECT created_index FROM message_index WHERE subject=?1",
+                [&input.subject],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
         if let Some(index) = index {
             let message = message_view_tx(transaction, &input.subject, index).map_err(internal)?;
             if !message.to.is_empty() && input.actor.as_deref() == Some(message.to.as_str()) {
@@ -20812,7 +21095,12 @@ fn selected_actual_source_at(
 ) -> Result<(Option<String>, Option<String>, bool)> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     if subject.starts_with("arrangement/") {
-        return Ok((arrangements::arrangement_at(connection, subject, at_index)?.and_then(|v| v["revision"].as_str().map(str::to_owned)), None, false));
+        return Ok((
+            arrangements::arrangement_at(connection, subject, at_index)?
+                .and_then(|v| v["revision"].as_str().map(str::to_owned)),
+            None,
+            false,
+        ));
     }
     // Canonical order, not arrival order, so every node holding these claims selects the same
     // source. Only claims about the subject's actual state can be selected or conflict, so the
@@ -21082,8 +21370,8 @@ fn check_mailbox_incarnation(
     // A runtime observation that does not name this incarnation describes something older: a
     // predecessor, or the daemon's own "exited" for a seat that died while no daemon watched,
     // which names no incarnation at all. Only an observation of this very incarnation is final.
-    let describes_another = fields.get("incarnation_id").and_then(Value::as_str)
-        != Some(fence.incarnation.as_str());
+    let describes_another =
+        fields.get("incarnation_id").and_then(Value::as_str) != Some(fence.incarnation.as_str());
     if !live
         && (describes_another
             || matches!(
@@ -21118,8 +21406,13 @@ fn check_mailbox_incarnation(
         }
     }
     if !live
-        || mailbox_harness_ended(connection, &fence.subject, &fence.incarnation, &runtime_claim)
-            .map_err(internal)?
+        || mailbox_harness_ended(
+            connection,
+            &fence.subject,
+            &fence.incarnation,
+            &runtime_claim,
+        )
+        .map_err(internal)?
     {
         return Err(St3Error::new(
             "stale-mailbox-session",
@@ -21299,10 +21592,9 @@ fn check_mailbox_fence(
              WHERE owner.subject=?1 AND owner.component=?2",
         )
         .map_err(internal)?
-        .query_row(
-            params![fence.subject, fence.component, fence.token],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        .query_row(params![fence.subject, fence.component, fence.token], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
         .optional()
         .map_err(internal)?;
     if owner != Some((fence.incarnation.clone(), fence.epoch)) {
@@ -21387,9 +21679,16 @@ fn claude_attachment_fence(
     incarnation: &str,
     at_index: u64,
 ) -> Result<Option<crate::model::CurrentHarnessView>> {
-    let claim = connection.prepare_cached(&claude_attachment_query())?.query_row(params![subject, at_index, incarnation], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-    }).optional()?;
+    let claim = connection
+        .prepare_cached(&claude_attachment_query())?
+        .query_row(params![subject, at_index, incarnation], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .optional()?;
     let Some((claim, body, at)) = claim else {
         return Ok(None);
     };
@@ -21450,11 +21749,10 @@ fn login_evidence_in_epoch(
                          OR (length(claims.accepted_at_unix_ms)=length(?4)
                              AND claims.accepted_at_unix_ms>=?4)))))"
     );
-    Ok(connection
-        .prepare_cached(&sql)?
-        .query_row(params![subject, at_index, incarnation_id, runtime_accepted_at], |row| {
-            row.get(0)
-        })?)
+    Ok(connection.prepare_cached(&sql)?.query_row(
+        params![subject, at_index, incarnation_id, runtime_accepted_at],
+        |row| row.get(0),
+    )?)
 }
 
 /// `login_only` answers only whether the seat needs a login: it returns at once, before any
@@ -21611,7 +21909,14 @@ fn current_harness_fold_at(
             state: state.into(),
             driver: Some(driver.into()),
             incarnation_id: incarnation_id.to_owned(),
-            transport: Some(if driver == "claude" { "claude-channel" } else { "native" }.into()),
+            transport: Some(
+                if driver == "claude" {
+                    "claude-channel"
+                } else {
+                    "native"
+                }
+                .into(),
+            ),
             reason: Some(reason.into()),
             blocked_on: Some("human".into()),
             ask: None,
@@ -21690,7 +21995,10 @@ fn current_harness_fold_at(
         {
             current = Some((state.to_owned(), claim, observed_at_unix_ms, key));
         }
-        if matches!(fields.get("state").and_then(Value::as_str), Some("ended" | "indeterminate")) {
+        if matches!(
+            fields.get("state").and_then(Value::as_str),
+            Some("ended" | "indeterminate")
+        ) {
             optional.entry("blocked_on").or_insert(None);
             optional.entry("ask").or_insert(None);
         }
@@ -21716,31 +22024,34 @@ fn current_harness_fold_at(
             break;
         }
     }
-    let work_activity = if include_work_activity { connection
-        .query_row(
-            &canonical_sql(
-                "SELECT id, store_index, accepted_at_unix_ms FROM claims
+    let work_activity = if include_work_activity {
+        connection
+            .query_row(
+                &canonical_sql(
+                    "SELECT id, store_index, accepted_at_unix_ms FROM claims
              WHERE actor=?1 AND store_index<=?2
                AND kind IN ('work.claimed','work.progress')
                AND json_extract(body, '$.fields.claim_incarnation')=?3
              ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-            ),
-            params![subject, at_index, incarnation_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .optional()?
-        .map(|(claim, store_index, observed_at_unix_ms)| {
-            let key = canonical::claim_key(connection, &claim)?;
-            Ok::<_, anyhow::Error>((claim, store_index, observed_at_unix_ms, key))
-        })
-        .transpose()?
-    } else { None };
+                ),
+                params![subject, at_index, incarnation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(claim, store_index, observed_at_unix_ms)| {
+                let key = canonical::claim_key(connection, &claim)?;
+                Ok::<_, anyhow::Error>((claim, store_index, observed_at_unix_ms, key))
+            })
+            .transpose()?
+    } else {
+        None
+    };
     if let Some((claim, _store_index, observed_at_unix_ms, key)) = work_activity
         && include_work_activity
         && key > runtime_key
@@ -22599,9 +22910,11 @@ fn pending_attention_requests_tx(
 
 fn sort_messages_canonically(connection: &Connection, messages: &mut [MessageView]) -> Result<()> {
     let mut keys = BTreeMap::new();
-    static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| canonical_sql(
-        "SELECT id FROM claims WHERE subject=?1 AND kind IN ('message.sent','intent.desired') ORDER BY CANONICAL_ASC(claims) LIMIT 1"
-    ));
+    static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        canonical_sql(
+            "SELECT id FROM claims WHERE subject=?1 AND kind IN ('message.sent','intent.desired') ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+        )
+    });
     let mut statement = connection.prepare_cached(&QUERY)?;
     for message in messages.iter() {
         let id: String = statement.query_row([&message.subject], |row| row.get(0))?;
@@ -24276,7 +24589,14 @@ mod fleet_admission_tests {
         sync(&current, &older);
         let status = older.status(Some(subject)).unwrap();
         assert_eq!(status.subjects[0].reachability, "indeterminate");
-        assert_eq!(older.runtime_authority(subject).unwrap().unwrap().reachability, "indeterminate");
+        assert_eq!(
+            older
+                .runtime_authority(subject)
+                .unwrap()
+                .unwrap()
+                .reachability,
+            "indeterminate"
+        );
         assert!(
             status.subjects[0]
                 .reason
@@ -24288,26 +24608,59 @@ mod fleet_admission_tests {
     #[test]
     fn runtime_authority_preserves_append_fields_nulls_and_other_actual_kinds() {
         let subject = "agent/runtime-fence-fields";
-        for missing in ["status", "runtime_id", "incarnation_id", "terminal", "reachability"] {
+        for missing in [
+            "status",
+            "runtime_id",
+            "incarnation_id",
+            "terminal",
+            "reachability",
+        ] {
             let store = Store::open_memory("owner").unwrap();
             let original = json!({"status":"running","runtime_id":"r","incarnation_id":"i",
                                   "terminal":true,"reachability":"reachable"});
             append(&store, "runtime.observed", subject, original.clone());
-            append(&store, "runtime.observed", subject, json!({"reason":"later partial report"}));
+            append(
+                &store,
+                "runtime.observed",
+                subject,
+                json!({"reason":"later partial report"}),
+            );
             let narrow = store.runtime_authority(subject).unwrap().unwrap();
             let status = store.status(Some(subject)).unwrap();
-            for field in ["status", "runtime_id", "incarnation_id", "terminal", "reachability"] {
-                assert_eq!(narrow.actual.as_ref().unwrap().get(field), status.subjects[0].actual.as_ref().unwrap().get(field));
-                assert_eq!(narrow.actual.as_ref().unwrap().get(field), original.get(field));
+            for field in [
+                "status",
+                "runtime_id",
+                "incarnation_id",
+                "terminal",
+                "reachability",
+            ] {
+                assert_eq!(
+                    narrow.actual.as_ref().unwrap().get(field),
+                    status.subjects[0].actual.as_ref().unwrap().get(field)
+                );
+                assert_eq!(
+                    narrow.actual.as_ref().unwrap().get(field),
+                    original.get(field)
+                );
             }
             append(&store, "runtime.observed", subject, json!({missing: null}));
             let narrow = store.runtime_authority(subject).unwrap().unwrap();
             let status = store.status(Some(subject)).unwrap();
-            assert_eq!(narrow.actual.as_ref().unwrap().get(missing), Some(&Value::Null));
+            assert_eq!(
+                narrow.actual.as_ref().unwrap().get(missing),
+                Some(&Value::Null)
+            );
             assert_eq!(narrow.reachability, status.subjects[0].reachability);
-            assert_eq!(narrow.actual.as_ref().unwrap().get(missing), status.subjects[0].actual.as_ref().unwrap().get(missing));
-            append(&store, "runtime.reconcile-decision", subject,
-                   json!({"decision":"hold","reachability":"unreachable"}));
+            assert_eq!(
+                narrow.actual.as_ref().unwrap().get(missing),
+                status.subjects[0].actual.as_ref().unwrap().get(missing)
+            );
+            append(
+                &store,
+                "runtime.reconcile-decision",
+                subject,
+                json!({"decision":"hold","reachability":"unreachable"}),
+            );
             let narrow = store.runtime_authority(subject).unwrap().unwrap();
             let status = store.status(Some(subject)).unwrap();
             assert_eq!(narrow.reachability, "unreachable");
@@ -24358,7 +24711,9 @@ mod fleet_admission_tests {
         let plan = connection
             .prepare(&format!("EXPLAIN QUERY PLAN {CONFLICT_CLAIM_QUERY}"))
             .unwrap()
-            .query_map(params!["agent/worker", 10001], |row| row.get::<_, String>(3))
+            .query_map(params!["agent/worker", 10001], |row| {
+                row.get::<_, String>(3)
+            })
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
@@ -24854,7 +25209,9 @@ mod fleet_admission_tests {
         let connection = store.readers.get();
         for table in ["arrangements", "arrangement_registers"] {
             let count: u64 = connection
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             assert_eq!(count, 0);
         }
@@ -24864,8 +25221,8 @@ mod fleet_admission_tests {
             .copied()
             .filter(|(table, _)| !matches!(*table, "arrangements" | "arrangement_registers"))
             .collect::<Vec<_>>();
-        let legacy = smallclaims::store::projection_digest::oracle(&connection, &legacy_tables)
-            .unwrap();
+        let legacy =
+            smallclaims::store::projection_digest::oracle(&connection, &legacy_tables).unwrap();
         assert_ne!(
             projection_digest::root(&current),
             projection_digest::root(&legacy)
@@ -24908,12 +25265,18 @@ mod fleet_admission_tests {
         let ask = |store: &Store| {
             let before = STATEMENTS_RUN.with(std::cell::Cell::get);
             let membership = store.fleet_membership().unwrap();
-            (membership, STATEMENTS_RUN.with(std::cell::Cell::get) - before)
+            (
+                membership,
+                STATEMENTS_RUN.with(std::cell::Cell::get) - before,
+            )
         };
         let (first, _) = ask(&a);
         let (again, spent) = ask(&a);
         assert_eq!(again, first);
-        assert_eq!(spent, 1, "an unchanged fleet costs the generation read alone");
+        assert_eq!(
+            spent, 1,
+            "an unchanged fleet costs the generation read alone"
+        );
         // Ordinary claims, replicated or local, leave the generation where it was.
         note(b, "plain");
         sync(b, &a);
@@ -26363,7 +26726,10 @@ fn mark_dirty(dirty: &mut BTreeSet<Aggregate>, aggregate: Aggregate, reason: &st
 /// Whether claims of `kind` belong to a mission run tree.
 fn run_tree_kind(kind: &str) -> bool {
     replay_projects_kind(kind)
-        && !matches!(kind, "intent.desired" | "owned-set.revised" | "doc.bound" | "mission.published")
+        && !matches!(
+            kind,
+            "intent.desired" | "owned-set.revised" | "doc.bound" | "mission.published"
+        )
         && !kind.starts_with("planning-session.")
 }
 
@@ -26413,9 +26779,11 @@ fn generation_run_tx(
     }
     let asked = transaction
         .query_row(
-            &canonical_sql("SELECT json_extract(body, '$.fields.run') FROM claims
+            &canonical_sql(
+                "SELECT json_extract(body, '$.fields.run') FROM claims
              WHERE kind='work.person-asked' AND json_extract(body, '$.fields.generation')=?1
-             ORDER BY CANONICAL_ASC(claims) LIMIT 1"),
+             ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+            ),
             [&subject],
             |row| row.get::<_, Option<String>>(0),
         )
@@ -26510,9 +26878,11 @@ fn run_tree_of_tx(
         Some(root) => Some(root),
         None => transaction
             .query_row(
-                &canonical_sql("SELECT json_extract(body, '$.fields.owner_run') FROM claims
+                &canonical_sql(
+                    "SELECT json_extract(body, '$.fields.owner_run') FROM claims
                  WHERE kind='work.person-asked' AND json_extract(body, '$.fields.run')=?1
-                 ORDER BY CANONICAL_ASC(claims) LIMIT 1"),
+                 ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+                ),
                 [format!("mission-run/{run}")],
                 |row| row.get::<_, Option<String>>(0),
             )
@@ -27678,7 +28048,9 @@ fn select_replicated_desired(
     claim: &ClaimRecord,
     desired: &DesiredSubject,
 ) -> Result<(), St3Error> {
-    if claim.body.get("owned_set").is_some() || owned_sets::owner(transaction, &claim.subject, None)?.is_some() {
+    if claim.body.get("owned_set").is_some()
+        || owned_sets::owner(transaction, &claim.subject, None)?.is_some()
+    {
         return Ok(());
     }
     let current = current_desired_row_tx(transaction, &claim.subject).map_err(internal)?;
@@ -28740,7 +29112,9 @@ fn select_replicated_mission(
             )
             .map_err(internal)?;
     }
-    if claim.body.get("owned_set").is_some() || owned_sets::owner(transaction, &claim.subject, None)?.is_some() {
+    if claim.body.get("owned_set").is_some()
+        || owned_sets::owner(transaction, &claim.subject, None)?.is_some()
+    {
         return Ok(());
     }
     let current: Option<(String, String)> = transaction
@@ -32067,7 +32441,12 @@ fn step_generation_is_current(
 }
 
 #[cfg(test)]
-pub(crate) fn expire_work_lease_by_claim(store: &Store, subject: &str, actor: &str, incarnation: &str) {
+pub(crate) fn expire_work_lease_by_claim(
+    store: &Store,
+    subject: &str,
+    actor: &str,
+    incarnation: &str,
+) {
     let current = store.step_run(subject).unwrap().unwrap();
     let mut connection = store.connection.lock().unwrap();
     let transaction = connection.transaction().unwrap();
@@ -32396,29 +32775,46 @@ mod tests {
         let path = directory.path().join("graph.db");
         let store = Store::open(&path, "node").unwrap();
         let append = |subject: &str, kind: &str| {
-            store.append_claim(&ClaimInput {
-                subject: subject.into(),
-                kind: kind.into(),
-                actor: None,
-                fields: BTreeMap::from([("capability_hash".into(), json!("secret-digest"))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            }).unwrap()
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: None,
+                    fields: BTreeMap::from([("capability_hash".into(), json!("secret-digest"))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
         };
-        let attached = append("custom/client/attachment-a", "custom.client.terminal-attached");
+        let attached = append(
+            "custom/client/attachment-a",
+            "custom.client.terminal-attached",
+        );
         append("custom/client/decoy", "custom.client.other");
         assert_eq!(
-            store.terminal_attachment_for_capability_hash("secret-digest").unwrap()
+            store
+                .terminal_attachment_for_capability_hash("secret-digest")
+                .unwrap()
                 .map(|(claim, current)| (claim.id, current)),
             Some((attached.id.clone(), true)),
         );
-        assert!(store.terminal_attachment_for_capability_hash("unknown").unwrap().is_none());
-        append("custom/client/attachment-a", "custom.client.terminal-consumed");
+        assert!(
+            store
+                .terminal_attachment_for_capability_hash("unknown")
+                .unwrap()
+                .is_none()
+        );
+        append(
+            "custom/client/attachment-a",
+            "custom.client.terminal-consumed",
+        );
         drop(store);
         let reopened = Store::open(&path, "node").unwrap();
         assert_eq!(
-            reopened.terminal_attachment_for_capability_hash("secret-digest").unwrap()
+            reopened
+                .terminal_attachment_for_capability_hash("secret-digest")
+                .unwrap()
                 .map(|(claim, current)| (claim.id, current)),
             Some((attached.id, false)),
         );
@@ -32440,28 +32836,65 @@ mod tests {
         let path = directory.path().join("state.sqlite3");
         let original = {
             let store = Store::open(&path, "node").unwrap();
-            let intent = parse_intent(r#"version 2
+            let intent = parse_intent(
+                r#"version 2
 agent "test/worker" { workspace "."; command "true"; name "Initial" }
-"#, "node").unwrap();
-            let preview = store.mission(&intent, IntentInput {
-                kdl: String::new(), source_name: None,
-            }).unwrap();
-            store.apply_as(&intent, &preview.subject_tokens, "initial", Some("person/operator")).unwrap();
-            let original = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap();
-            store.rename_agent("agent/test/worker", Some("Renamed"), "rename").unwrap();
+"#,
+                "node",
+            )
+            .unwrap();
+            let preview = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: String::new(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    "initial",
+                    Some("person/operator"),
+                )
+                .unwrap();
+            let original = store
+                .desired_subject_with_writer("agent/test/worker")
+                .unwrap()
+                .unwrap();
+            store
+                .rename_agent("agent/test/worker", Some("Renamed"), "rename")
+                .unwrap();
             original
         };
         let store = Store::open(&path, "node").unwrap();
-        let (mut renamed, writer) = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap();
+        let (mut renamed, writer) = store
+            .desired_subject_with_writer("agent/test/worker")
+            .unwrap()
+            .unwrap();
         assert_eq!(writer, original.1);
-        assert_eq!(renamed.member.as_ref().unwrap().display_name.as_deref(), Some("Renamed"));
+        assert_eq!(
+            renamed.member.as_ref().unwrap().display_name.as_deref(),
+            Some("Renamed")
+        );
         renamed.set_display_name(Some("Initial")).unwrap();
         assert_eq!(renamed, original.0);
-        store.rename_agent("agent/test/worker", None, "clear").unwrap();
+        store
+            .rename_agent("agent/test/worker", None, "clear")
+            .unwrap();
         drop(store);
         let store = Store::open(&path, "node").unwrap();
-        let cleared = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap().0;
-        assert_eq!(crate::model::effective_agent_name("agent/test/worker", Some(&cleared.desired)), "test/worker");
+        let cleared = store
+            .desired_subject_with_writer("agent/test/worker")
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(
+            crate::model::effective_agent_name("agent/test/worker", Some(&cleared.desired)),
+            "test/worker"
+        );
         assert_eq!(cleared.member.unwrap().display_name, None);
     }
 
@@ -32469,23 +32902,62 @@ agent "test/worker" { workspace "."; command "true"; name "Initial" }
     fn a_rename_that_merges_concurrent_renames_keeps_the_launch_revision() {
         let left = Store::open_memory("left").unwrap();
         let right = Store::open_memory("right").unwrap();
-        let intent = parse_intent(r#"version 2
+        let intent = parse_intent(
+            r#"version 2
 agent "test/worker" { command "true"; name "A" }
-"#, "left").unwrap();
-        let preview = left.mission(&intent, IntentInput {
-            kdl: String::new(), source_name: None,
-        }).unwrap();
+"#,
+            "left",
+        )
+        .unwrap();
+        let preview = left
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
         left.apply(&intent, &preview.subject_tokens, "a").unwrap();
-        let launch = left.selected_desired_token("agent/test/worker").unwrap().unwrap();
-        receive_and_project(&right, "left", &exchange_from(&left, &ReplicationInventory::default()));
+        let launch = left
+            .selected_desired_token("agent/test/worker")
+            .unwrap()
+            .unwrap();
+        receive_and_project(
+            &right,
+            "left",
+            &exchange_from(&left, &ReplicationInventory::default()),
+        );
         // Two hosts relabel the same seat concurrently, then one relabels the merged fork.
-        left.rename_agent("agent/test/worker", Some("R1"), "r1").unwrap();
-        right.rename_agent("agent/test/worker", Some("R2"), "r2").unwrap();
-        receive_and_project(&right, "left", &exchange_from(&left, &right.replication_inventory().unwrap()));
-        receive_and_project(&left, "right", &exchange_from(&right, &left.replication_inventory().unwrap()));
-        left.rename_agent("agent/test/worker", Some("R3"), "r3").unwrap();
-        let merged = left.selected_desired_token("agent/test/worker").unwrap().unwrap();
-        assert_eq!(left.claim_by_id(&merged).unwrap().unwrap().predecessors.len(), 2);
+        left.rename_agent("agent/test/worker", Some("R1"), "r1")
+            .unwrap();
+        right
+            .rename_agent("agent/test/worker", Some("R2"), "r2")
+            .unwrap();
+        receive_and_project(
+            &right,
+            "left",
+            &exchange_from(&left, &right.replication_inventory().unwrap()),
+        );
+        receive_and_project(
+            &left,
+            "right",
+            &exchange_from(&right, &left.replication_inventory().unwrap()),
+        );
+        left.rename_agent("agent/test/worker", Some("R3"), "r3")
+            .unwrap();
+        let merged = left
+            .selected_desired_token("agent/test/worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            left.claim_by_id(&merged)
+                .unwrap()
+                .unwrap()
+                .predecessors
+                .len(),
+            2
+        );
         let lineage = left.launch_lineage("agent/test/worker").unwrap();
         assert_eq!(lineage.first(), Some(&merged));
         assert_eq!(lineage.last(), Some(&launch), "{lineage:?}");
@@ -32494,28 +32966,53 @@ agent "test/worker" { command "true"; name "A" }
     #[test]
     fn seat_rename_refuses_an_unreadable_member_and_an_empty_label() {
         let store = Store::open_memory("node").unwrap();
-        let intent = parse_intent(r#"version 2
+        let intent = parse_intent(
+            r#"version 2
 agent "test/worker" { command "true"; name "Initial" }
-"#, "node").unwrap();
-        let preview = store.mission(&intent, IntentInput {
-            kdl: String::new(), source_name: None,
-        }).unwrap();
-        store.apply(&intent, &preview.subject_tokens, "initial").unwrap();
+"#,
+            "node",
+        )
+        .unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "initial")
+            .unwrap();
         let before = store.selected_desired_token("agent/test/worker").unwrap();
         assert_eq!(
-            store.rename_agent("agent/test/worker", Some(""), "empty").unwrap_err().code,
+            store
+                .rename_agent("agent/test/worker", Some(""), "empty")
+                .unwrap_err()
+                .code,
             "invalid-agent-name"
         );
         // A launch published by a newer peer stays until a build that can read it takes it up.
         store.replace_desired_member_for_test("agent/test/worker", r#"{"future":true}"#);
         assert_eq!(
-            store.rename_agent("agent/test/worker", Some("Renamed"), "unreadable").unwrap_err().code,
+            store
+                .rename_agent("agent/test/worker", Some("Renamed"), "unreadable")
+                .unwrap_err()
+                .code,
             "unreadable-agent-member"
         );
-        assert_eq!(store.selected_desired_token("agent/test/worker").unwrap(), before);
+        assert_eq!(
+            store.selected_desired_token("agent/test/worker").unwrap(),
+            before
+        );
         let connection = store.readers.get();
         let member: String = connection
-            .query_row("SELECT member FROM desired WHERE subject='agent/test/worker'", [], |row| row.get(0))
+            .query_row(
+                "SELECT member FROM desired WHERE subject='agent/test/worker'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(member, r#"{"future":true}"#);
     }
@@ -32523,23 +33020,47 @@ agent "test/worker" { command "true"; name "Initial" }
     #[test]
     fn seat_rename_accepts_an_empty_body_and_rejects_a_non_array_body() {
         let store = Store::open_memory("node").unwrap();
-        let mut intent = parse_intent(r#"version 2
+        let mut intent = parse_intent(
+            r#"version 2
 agent "test/empty" { command "true" }
-"#, "node").unwrap();
+"#,
+            "node",
+        )
+        .unwrap();
         // An empty canonical KDL body has no children key. Exercise that stored shape
         // independently of launch validation, which requires a command for new seats.
         let empty = intent.subjects.get_mut("agent/test/empty").unwrap();
         empty.desired.as_object_mut().unwrap().remove("children");
         empty.member = None;
-        let preview = store.mission(&intent, IntentInput {
-            kdl: String::new(), source_name: None,
-        }).unwrap();
-        store.apply(&intent, &preview.subject_tokens, "empty").unwrap();
-        store.rename_agent("agent/test/empty", Some("Empty seat"), "rename-empty").unwrap();
-        let mut desired = store.desired_subject_with_writer("agent/test/empty").unwrap().unwrap().0;
-        assert_eq!(crate::model::effective_agent_name("agent/test/empty", Some(&desired.desired)), "Empty seat");
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "empty")
+            .unwrap();
+        store
+            .rename_agent("agent/test/empty", Some("Empty seat"), "rename-empty")
+            .unwrap();
+        let mut desired = store
+            .desired_subject_with_writer("agent/test/empty")
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(
+            crate::model::effective_agent_name("agent/test/empty", Some(&desired.desired)),
+            "Empty seat"
+        );
         desired.desired["children"] = json!({});
-        assert_eq!(desired.set_display_name(Some("Invalid")).unwrap_err().code, "invalid-agent-declaration");
+        assert_eq!(
+            desired.set_display_name(Some("Invalid")).unwrap_err().code,
+            "invalid-agent-declaration"
+        );
     }
 
     #[test]
@@ -32665,9 +33186,7 @@ agent "test/empty" { command "true" }
         release.send(()).unwrap();
         holder.join().unwrap();
         // Idle retention does not bound concurrently open connections.
-        assert!(
-            store.readers.idle.lock().unwrap().len() <= max_idle_read_connections()
-        );
+        assert!(store.readers.idle.lock().unwrap().len() <= max_idle_read_connections());
     }
 
     #[test]
@@ -33052,7 +33571,10 @@ agent "test/empty" { command "true" }
             .query_row("PRAGMA cache_size", [], |row| row.get(0))
             .unwrap();
         assert_eq!(writer_cache_kib, -32768);
-        assert_eq!(reader_cache_kib, -(smallclaims::sqlite::read_cache_kib() as i64));
+        assert_eq!(
+            reader_cache_kib,
+            -(smallclaims::sqlite::read_cache_kib() as i64)
+        );
     }
 
     #[test]
@@ -34217,6 +34739,7 @@ agent "test/empty" { command "true" }
                 let operation = json!({"id":"op/replay-test", "request_digest":"digest-a"});
                 let (kind, body) = match reason {
                     "non-incremental-kind" => ("work.unknown", json!({"fields":{}})),
+
                     "malformed-operation" => (
                         "harness.observed",
                         json!({"fields":{"state":"ready"}, "_operation":{"id":"op/malformed"}}),
@@ -34785,7 +35308,10 @@ mission "summary-child" state="ready" {
         let finished_tree = store.mission_runs_for_root(&root.id).unwrap();
         assert_eq!(store.index().unwrap(), index);
         let finished = finished_tree.iter().find(|run| run.id == root.id).unwrap();
-        assert_eq!(finished.outcome.as_ref().unwrap().reason, "preserved outcome");
+        assert_eq!(
+            finished.outcome.as_ref().unwrap().reason,
+            "preserved outcome"
+        );
         assert_eq!(
             finished.outcome,
             store.mission_run(&root.id).unwrap().unwrap().outcome
@@ -35006,19 +35532,35 @@ mission "clock-automatic" state="ready" {
         let third = start_agentless_run(&store, "third");
         // Fixed timestamps prove both the priority class and numeric newest-first ordering.
         for (run, at) in [(&first, "9"), (&second, "10"), (&third, "11")] {
-            store.connection.write().execute(
-                "UPDATE mission_runs SET created_at_unix_ms=?1 WHERE id=?2",
-                params![at, run.id],
-            ).unwrap();
+            store
+                .connection
+                .write()
+                .execute(
+                    "UPDATE mission_runs SET created_at_unix_ms=?1 WHERE id=?2",
+                    params![at, run.id],
+                )
+                .unwrap();
         }
-        store.set_step_state(&third.steps[0].subject, "ready", None).unwrap();
-        assert_eq!(store.active_mission_run_ids_for_origin("node").unwrap(),
-            [second.id.clone(), first.id.clone(), third.id.clone()]);
-        store.set_step_state(&second.steps[0].subject, "ready", None).unwrap();
-        assert_eq!(store.active_mission_run_ids_for_origin("node").unwrap(),
-            [first.id.clone(), third.id.clone(), second.id.clone()]);
+        store
+            .set_step_state(&third.steps[0].subject, "ready", None)
+            .unwrap();
+        assert_eq!(
+            store.active_mission_run_ids_for_origin("node").unwrap(),
+            [second.id.clone(), first.id.clone(), third.id.clone()]
+        );
+        store
+            .set_step_state(&second.steps[0].subject, "ready", None)
+            .unwrap();
+        assert_eq!(
+            store.active_mission_run_ids_for_origin("node").unwrap(),
+            [first.id.clone(), third.id.clone(), second.id.clone()]
+        );
         // The order is deterministic even when two creations share the same millisecond.
-        store.connection.write().execute("UPDATE mission_runs SET created_at_unix_ms='12'", []).unwrap();
+        store
+            .connection
+            .write()
+            .execute("UPDATE mission_runs SET created_at_unix_ms='12'", [])
+            .unwrap();
         let ids = store.active_mission_run_ids_for_origin("node").unwrap();
         assert_eq!(ids[0], first.id);
         assert!(ids[1] > ids[2]);
@@ -35479,7 +36021,8 @@ resource "refresh/file" {
         for failure in [false, true] {
             for (accepted_checks, stale_revision) in [(0, false), (1, false), (2, true)] {
                 let store = Store::open_memory("node").unwrap();
-                let intent = crate::graph::parse_execution_intent(r#"version 2
+                let intent = crate::graph::parse_execution_intent(
+                    r#"version 2
 resource "fenced/file" { kind "filesystem.file" }
 observer "fenced/file" {
   resource "resource/fenced/file"
@@ -35487,49 +36030,95 @@ observer "fenced/file" {
   locator "/tmp/st3-fenced-file"
   field "status"
 }
-"#, "node", "fenced-run").unwrap();
+"#,
+                    "node",
+                    "fenced-run",
+                )
+                .unwrap();
                 store.apply_internal(&intent, "fenced-observer").unwrap();
-                let observer = intent.subjects.values().find(|subject| subject.kind == "observer")
-                    .unwrap().subject.as_str();
-                let resource = intent.subjects.values().find(|subject| subject.kind == "resource")
-                    .unwrap().subject.as_str();
+                let observer = intent
+                    .subjects
+                    .values()
+                    .find(|subject| subject.kind == "observer")
+                    .unwrap()
+                    .subject
+                    .as_str();
+                let resource = intent
+                    .subjects
+                    .values()
+                    .find(|subject| subject.kind == "resource")
+                    .unwrap()
+                    .subject
+                    .as_str();
                 let revision = store.selected_desired_revision(observer).unwrap().unwrap();
-                let selected = if stale_revision { "stale-revision" } else { &revision };
+                let selected = if stale_revision {
+                    "stale-revision"
+                } else {
+                    &revision
+                };
                 let input = ClaimInput {
-                    subject: observer.into(), kind: "observer.state".into(), actor: None,
+                    subject: observer.into(),
+                    kind: "observer.state".into(),
+                    actor: None,
                     fields: BTreeMap::from([
                         ("state".into(), json!("unreachable")),
                         ("revision".into(), json!(revision)),
                         ("attempt".into(), json!("fenced-attempt")),
                         ("reason".into(), json!("provider failed")),
                     ]),
-                    evidence: Vec::new(), expected_subject: None,
+                    evidence: Vec::new(),
+                    expected_subject: None,
                     idempotency_key: Some("fenced-failure".into()),
                 };
                 let before = store.index().unwrap();
                 let counts = || {
                     let connection = store.readers.get();
                     ["claims", "batches", "operations", "idempotency"].map(|table| {
-                        connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get::<_, u64>(0)).unwrap()
+                        connection
+                            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                                row.get::<_, u64>(0)
+                            })
+                            .unwrap()
                     })
                 };
                 let before_counts = counts();
                 let checks = AtomicUsize::new(0);
                 let current = || checks.fetch_add(1, Ordering::SeqCst) < accepted_checks;
                 let result = if failure {
-                    store.append_observer_state(&input, selected, &current).map(|_| ())
+                    store
+                        .append_observer_state(&input, selected, &current)
+                        .map(|_| ())
                 } else {
-                    store.record_resource_observation(
-                        observer, selected, Some("fenced-attempt"), resource, Some("cursor"),
-                        &json!({"status": "ready"}), 10, &[], Some(&current),
-                    ).map(|_| ())
+                    store
+                        .record_resource_observation(
+                            observer,
+                            selected,
+                            Some("fenced-attempt"),
+                            resource,
+                            Some("cursor"),
+                            &json!({"status": "ready"}),
+                            10,
+                            &[],
+                            Some(&current),
+                        )
+                        .map(|_| ())
                 };
-                assert_eq!(result.unwrap_err().code, if stale_revision {
-                    "stale-observer-revision"
-                } else {
-                    "observer-operation-retired"
-                });
-                assert_eq!(checks.load(Ordering::SeqCst), if stale_revision { 1 } else { accepted_checks + 1 });
+                assert_eq!(
+                    result.unwrap_err().code,
+                    if stale_revision {
+                        "stale-observer-revision"
+                    } else {
+                        "observer-operation-retired"
+                    }
+                );
+                assert_eq!(
+                    checks.load(Ordering::SeqCst),
+                    if stale_revision {
+                        1
+                    } else {
+                        accepted_checks + 1
+                    }
+                );
                 assert_eq!(store.index().unwrap(), before);
                 assert_eq!(counts(), before_counts);
                 assert!(store.latest_actual_value(resource).unwrap().is_none());
@@ -35537,18 +36126,40 @@ observer "fenced/file" {
 
                 // Rejection must not poison the request's idempotency or operation cache.
                 if failure {
-                    let receipt = store.append_observer_state(&input, &revision, &|| true).unwrap();
-                    assert_eq!(store.latest_actual_value(observer).unwrap().unwrap()["state"], "unreachable");
-                    let retry = store.append_observer_state(&input, &revision, &|| true).unwrap();
+                    let receipt = store
+                        .append_observer_state(&input, &revision, &|| true)
+                        .unwrap();
+                    assert_eq!(
+                        store.latest_actual_value(observer).unwrap().unwrap()["state"],
+                        "unreachable"
+                    );
+                    let retry = store
+                        .append_observer_state(&input, &revision, &|| true)
+                        .unwrap();
                     assert_eq!(retry.id, receipt.id);
                 } else {
-                    let outcome = store.record_resource_observation(
-                        observer, &revision, Some("fenced-attempt"), resource, Some("cursor"),
-                        &json!({"status": "ready"}), 10, &[], Some(&|| true),
-                    ).unwrap();
+                    let outcome = store
+                        .record_resource_observation(
+                            observer,
+                            &revision,
+                            Some("fenced-attempt"),
+                            resource,
+                            Some("cursor"),
+                            &json!({"status": "ready"}),
+                            10,
+                            &[],
+                            Some(&|| true),
+                        )
+                        .unwrap();
                     assert!(outcome.baseline);
-                    assert_eq!(store.latest_actual_value(resource).unwrap().unwrap()["facts"]["status"], "ready");
-                    assert_eq!(store.latest_actual_value(observer).unwrap().unwrap()["state"], "healthy");
+                    assert_eq!(
+                        store.latest_actual_value(resource).unwrap().unwrap()["facts"]["status"],
+                        "ready"
+                    );
+                    assert_eq!(
+                        store.latest_actual_value(observer).unwrap().unwrap()["state"],
+                        "healthy"
+                    );
                 }
             }
         }
@@ -35584,11 +36195,33 @@ observer "quiet/file" {
         store.apply_internal(&intent, "quiet-observer").unwrap();
         let revision = store.selected_desired_revision(&observer).unwrap().unwrap();
         let facts = json!({"status": "ready"});
-        store.record_resource_observation(&observer, &revision, None, &resource, None, &facts, 1, &[], None)
+        store
+            .record_resource_observation(
+                &observer,
+                &revision,
+                None,
+                &resource,
+                None,
+                &facts,
+                1,
+                &[],
+                None,
+            )
             .unwrap();
         let before = store.index().unwrap();
 
-        let outcome = store.record_resource_observation(&observer, &revision, None, &resource, None, &facts, 2, &[], None)
+        let outcome = store
+            .record_resource_observation(
+                &observer,
+                &revision,
+                None,
+                &resource,
+                None,
+                &facts,
+                2,
+                &[],
+                None,
+            )
             .unwrap();
 
         assert_eq!(store.index().unwrap(), before);
@@ -35626,10 +36259,32 @@ observer "manual/file" {
         store.apply_internal(&intent, "manual-observer").unwrap();
         let revision = store.selected_desired_revision(&observer).unwrap().unwrap();
         let facts = json!({"status": "ready"});
-        store.record_resource_observation(&observer, &revision, None, &resource, None, &facts, 1, &[], None)
+        store
+            .record_resource_observation(
+                &observer,
+                &revision,
+                None,
+                &resource,
+                None,
+                &facts,
+                1,
+                &[],
+                None,
+            )
             .unwrap();
 
-        store.record_resource_observation(&observer, &revision, Some("attempt-one"), &resource, Some("cursor-one"), &facts, 2, &[], None)
+        store
+            .record_resource_observation(
+                &observer,
+                &revision,
+                Some("attempt-one"),
+                &resource,
+                Some("cursor-one"),
+                &facts,
+                2,
+                &[],
+                None,
+            )
             .unwrap();
 
         let receipt = store
@@ -35690,7 +36345,18 @@ observer "ordered/file" {
             Some("attempt-one".into())
         );
 
-        store.record_resource_observation(&observer, &revision, Some("attempt-one"), &resource, None, &json!({"status": "ready"}), 1, &[], None)
+        store
+            .record_resource_observation(
+                &observer,
+                &revision,
+                Some("attempt-one"),
+                &resource,
+                None,
+                &json!({"status": "ready"}),
+                1,
+                &[],
+                None,
+            )
             .unwrap();
         assert_eq!(
             store.pending_observer_refresh_attempt(&observer).unwrap(),
@@ -35956,7 +36622,8 @@ observer "ordered/file" {
         observe_runtime(&store, "agent/cache/first", "running", "one");
         observe_runtime(&store, "agent/cache/second", "running", "two");
         let first_cut = store.index().unwrap();
-        let view = |at| serde_json::to_value(store.agent_card_status_at(None, at, true).unwrap()).unwrap();
+        let view =
+            |at| serde_json::to_value(store.agent_card_status_at(None, at, true).unwrap()).unwrap();
         let original = view(first_cut);
         SUBJECT_REDUCTIONS.with(|count| count.set(0));
         assert_eq!(view(first_cut), original);
@@ -35970,9 +36637,17 @@ observer "ordered/file" {
         SUBJECT_REDUCTIONS.with(|count| count.set(0));
         let changed = view(store.index().unwrap());
         assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 1);
-        assert_eq!(view(first_cut), original, "a newer entry must not serve an old cut");
+        assert_eq!(
+            view(first_cut),
+            original,
+            "a newer entry must not serve an old cut"
+        );
         store.forget_current_views();
-        assert_eq!(view(store.index().unwrap()), changed, "cache and fresh reducer must agree");
+        assert_eq!(
+            view(store.index().unwrap()),
+            changed,
+            "cache and fresh reducer must agree"
+        );
     }
 
     #[test]
@@ -35980,23 +36655,36 @@ observer "ordered/file" {
         let store = Store::open_memory("node").unwrap();
         let subject = "agent/cache/modes";
         observe_runtime(&store, subject, "running", "one");
-        store.append_claim(&ClaimInput {
-            subject: subject.into(), kind: "harness.observed".into(), actor: Some(subject.into()),
-            fields: BTreeMap::from([
-                ("state".into(), json!("idle")), ("incarnation_id".into(), json!("one")),
-                ("driver".into(), json!("claude")),
-            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-        }).unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), json!("idle")),
+                    ("incarnation_id".into(), json!("one")),
+                    ("driver".into(), json!("claude")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         let cut = store.index().unwrap();
         let card = store.agent_card_status_at(None, cut, true).unwrap();
         assert!(card.subjects[0].harness.is_none());
         assert_eq!(card.subjects[0].claims.len(), 1);
-        let full = store.status_for_subject_prefix_at("agent/", Some(cut), true).unwrap();
+        let full = store
+            .status_for_subject_prefix_at("agent/", Some(cut), true)
+            .unwrap();
         assert!(full.subjects[0].harness.is_some());
         assert_eq!(full.subjects[0].claims.len(), 2);
         SUBJECT_REDUCTIONS.with(|count| count.set(0));
         let again = store.agent_card_status_at(None, cut, true).unwrap();
-        assert_eq!(serde_json::to_value(again).unwrap(), serde_json::to_value(card).unwrap());
+        assert_eq!(
+            serde_json::to_value(again).unwrap(),
+            serde_json::to_value(card).unwrap()
+        );
         assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 0);
     }
 
@@ -36069,61 +36757,125 @@ observer "ordered/file" {
             let mut cache = store.smalltalk.subject_cache.lock().unwrap();
             cache.card_statuses.clear();
             for n in 0..AGENT_CARD_STATUS_LIMIT {
-                cache.card_statuses.insert(format!("agent/fill/{n}"), StatusEntry {
-                    read_at: cut, owners: Vec::new(), status: first.subjects[0].clone(), action: None,
-                });
+                cache.card_statuses.insert(
+                    format!("agent/fill/{n}"),
+                    StatusEntry {
+                        read_at: cut,
+                        owners: Vec::new(),
+                        status: first.subjects[0].clone(),
+                        action: None,
+                    },
+                );
             }
         }
         let cold = store.agent_card_status_at(None, cut, true).unwrap();
-        assert_eq!(serde_json::to_value(cold).unwrap(), serde_json::to_value(first).unwrap());
+        assert_eq!(
+            serde_json::to_value(cold).unwrap(),
+            serde_json::to_value(first).unwrap()
+        );
         let cache = store.smalltalk.subject_cache.lock().unwrap();
         assert_eq!(cache.card_statuses.len(), AGENT_CARD_STATUS_LIMIT);
         assert!(!cache.card_statuses.contains_key("agent/cache/cold"));
         drop(cache);
         store.forget_current_views();
-        assert!(store.smalltalk.subject_cache.lock().unwrap().card_statuses.is_empty());
+        assert!(
+            store
+                .smalltalk
+                .subject_cache
+                .lock()
+                .unwrap()
+                .card_statuses
+                .is_empty()
+        );
         store.agent_card_status_at(None, cut, true).unwrap();
-        assert_eq!(store.smalltalk.subject_cache.lock().unwrap().card_statuses.len(), 1);
+        assert_eq!(
+            store
+                .smalltalk
+                .subject_cache
+                .lock()
+                .unwrap()
+                .card_statuses
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn agent_card_status_cache_follows_owning_generation_changes() {
         let store = Store::open_memory("node").unwrap();
-        publish_mission(&store, r#"version 2
+        publish_mission(
+            &store,
+            r#"version 2
 mission "card-owner" state="ready" {
   goal "Fence card status to its owner."; step "work" { agentless }
-}"#, "card-owner-mission");
-        let run = store.create_mission_run(&MissionRunRequest {
-            mission: "card-owner".into(), revision: None, workspace: "/tmp".into(),
-            requester: Some("person/test".into()), mode: Some("run".into()),
-            inputs: BTreeMap::new(), idempotency_key: "card-owner-run".into(),
-        }).unwrap();
-        let mut intent = parse_intent("version 2\nagent \"worker\" { command \"true\" }\n", "node").unwrap();
+}"#,
+            "card-owner-mission",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "card-owner".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "card-owner-run".into(),
+            })
+            .unwrap();
+        let mut intent =
+            parse_intent("version 2\nagent \"worker\" { command \"true\" }\n", "node").unwrap();
         let desired = intent.subjects.values_mut().next().unwrap();
         desired.owner_run = Some(run.subject.clone());
         desired.owner_generation = Some(run.generation.clone());
-        let preview = store.mission(&intent, IntentInput { kdl: String::new(), source_name: None }).unwrap();
-        store.apply(&intent, &preview.subject_tokens, "card-owned-runtime").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "card-owned-runtime")
+            .unwrap();
         let first = store.index().unwrap();
         let before = store.agent_card_status_at(None, first, true).unwrap();
         assert_eq!(before.subjects[0].projection.layer, "current");
-        store.append_claim(&ClaimInput {
-            subject: run.generation, kind: "run-generation.superseded".into(),
-            actor: Some("person/test".into()), fields: BTreeMap::from([
-                ("status".into(), json!("superseded")),
-                ("successor".into(), json!("run-generation/replacement")),
-                ("reason".into(), json!("test revision")),
-            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-        }).unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: run.generation,
+                kind: "run-generation.superseded".into(),
+                actor: Some("person/test".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("superseded")),
+                    ("successor".into(), json!("run-generation/replacement")),
+                    ("reason".into(), json!("test revision")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         let index = store.index().unwrap();
         let after = store.agent_card_status_at(None, index, true).unwrap();
         assert_eq!(after.subjects[0].projection.layer, "history");
-        assert!(store.agent_card_status_at(None, index, false).unwrap().subjects.is_empty());
-        assert_eq!(serde_json::to_value(store.agent_card_status_at(None, first, true).unwrap()).unwrap(),
-            serde_json::to_value(before).unwrap());
+        assert!(
+            store
+                .agent_card_status_at(None, index, false)
+                .unwrap()
+                .subjects
+                .is_empty()
+        );
+        assert_eq!(
+            serde_json::to_value(store.agent_card_status_at(None, first, true).unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
         store.forget_current_views();
-        assert_eq!(serde_json::to_value(store.agent_card_status_at(None, index, true).unwrap()).unwrap(),
-            serde_json::to_value(after).unwrap());
+        assert_eq!(
+            serde_json::to_value(store.agent_card_status_at(None, index, true).unwrap()).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
     }
 
     #[test]
@@ -36956,15 +37708,20 @@ version 2
             observe(&left, terminal_status, "left");
             // The new owner has no causal path through the old owner's runtime branch.
             let selected = observe(&right, "running", "right");
-            right.import_replication("left", &left.export_replication(0).unwrap())
+            right
+                .import_replication("left", &left.export_replication(0).unwrap())
                 .unwrap();
             let view = right.status(Some(subject)).unwrap().subjects.remove(0);
             assert_eq!(view.actual_claim.as_deref(), Some(selected.id.as_str()));
-            assert_eq!(view.reachability, "reachable", "{terminal_status}: {view:?}");
+            assert_eq!(
+                view.reachability, "reachable",
+                "{terminal_status}: {view:?}"
+            );
             // A later live rival is not hidden by its previous terminal observation.
             left.set_write_clock_at(1_800_000_000_002).unwrap();
             observe(&left, "running", "left");
-            right.import_replication("left", &left.export_replication(0).unwrap())
+            right
+                .import_replication("left", &left.export_replication(0).unwrap())
                 .unwrap();
             assert_eq!(
                 right.status(Some(subject)).unwrap().subjects[0].reachability,
@@ -38598,7 +39355,8 @@ version 2
                 let mut connection = controller.connection.lock().unwrap();
                 let transaction = connection.transaction().unwrap();
                 assert!(
-                    try_project_all_simple_replication_tx(&transaction, &controller.origin).unwrap(),
+                    try_project_all_simple_replication_tx(&transaction, &controller.origin)
+                        .unwrap(),
                     "a single routine work transition should use the bounded projection path"
                 );
                 transaction.rollback().unwrap();
@@ -39604,7 +40362,13 @@ version 2
     fn a_run_tree_with_only_this_nodes_new_claims_is_not_rebuilt_by_a_projection_pass() {
         let (_controller, worker, step) = replicated_step_pair();
         worker_work(&worker, &step, "claim", None, "local-only-claim");
-        worker_work(&worker, &step, "progress", Some("working"), "local-only-progress");
+        worker_work(
+            &worker,
+            &step,
+            "progress",
+            Some("working"),
+            "local-only-progress",
+        );
         RUN_TREE_REBUILDS.with(|rebuilds| rebuilds.set(0));
         FULL_REPLAYS.with(|replays| replays.set(0));
         worker.project_replication_backlog().unwrap();
@@ -39627,9 +40391,7 @@ version 2
     fn a_local_claim_sorting_before_a_projected_peer_claim_still_rebuilds_its_run_tree() {
         let (controller, worker, step) = replicated_step_pair();
         // The peer's clock runs ahead: its claim is dated ten minutes from now.
-        controller
-            .set_write_clock_at(now_ms() + 600_000)
-            .unwrap();
+        controller.set_write_clock_at(now_ms() + 600_000).unwrap();
         controller
             .set_step_state(&step, "blocked", Some("the peer blocks it"))
             .unwrap();
@@ -43023,7 +43785,9 @@ version 2
                     .unwrap()
                     .reset_status(rusqlite::StatementStatus::VmStep);
                 assert!(subscription_started_run_tx(&transaction, "mission-run/1").unwrap());
-                assert!(!subscription_started_run_tx(&transaction, "mission-run/authored").unwrap());
+                assert!(
+                    !subscription_started_run_tx(&transaction, "mission-run/authored").unwrap()
+                );
                 costs.push(
                     transaction
                         .prepare_cached(SUBSCRIPTION_STARTED_RUN_QUERY)
@@ -43206,27 +43970,43 @@ version 2
             let fields = match kind {
                 "harness.diagnostic" => json!({"incarnation_id":incarnation,
                     "code":code,"status":"blocked","severity":"warning","reason":"cost fixture"}),
-                "harness.observed" => json!({"incarnation_id":incarnation,"state":"idle","driver":"claude"}),
+                "harness.observed" => {
+                    json!({"incarnation_id":incarnation,"state":"idle","driver":"claude"})
+                }
                 "runtime.observed" => json!({"incarnation_id":incarnation,"status":"running",
                     "runtime_id":"grove/cedar","reachability":"local"}),
                 _ => unreachable!(),
             };
-            store.append_claim(&ClaimInput {
-                subject: "agent/grove/cedar".into(),
-                kind: kind.into(), actor: None,
-                fields: serde_json::from_value(fields).unwrap(),
-                evidence: Vec::new(), expected_subject: None,
-                idempotency_key: Some(key.into()),
-            }).unwrap();
+            store
+                .append_claim(&ClaimInput {
+                    subject: "agent/grove/cedar".into(),
+                    kind: kind.into(),
+                    actor: None,
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap();
         };
-        append("harness.diagnostic", "current", "claude-channel-unattached", "attach");
+        append(
+            "harness.diagnostic",
+            "current",
+            "claude-channel-unattached",
+            "attach",
+        );
         let work = || {
             let connection = store.connection.lock().unwrap();
             let mut statement = connection.prepare(&claude_attachment_query()).unwrap();
-            let claim: String = statement.query_row(
-                params!["agent/grove/cedar", i64::MAX, "current"], |row| row.get(0),
-            ).unwrap();
-            (claim, statement.get_status(rusqlite::StatementStatus::VmStep))
+            let claim: String = statement
+                .query_row(params!["agent/grove/cedar", i64::MAX, "current"], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            (
+                claim,
+                statement.get_status(rusqlite::StatementStatus::VmStep),
+            )
         };
         let before = work();
         for index in 0..128 {
@@ -43236,12 +44016,20 @@ version 2
                 ("harness.diagnostic", "current", "native-delivery-recovered"),
                 ("harness.diagnostic", "previous", "claude-channel-attached"),
             ] {
-                append(kind, incarnation, code, &format!("history:{kind}:{incarnation}:{index}"));
+                append(
+                    kind,
+                    incarnation,
+                    code,
+                    &format!("history:{kind}:{incarnation}:{index}"),
+                );
             }
         }
         let after = work();
         assert_eq!(after.0, before.0);
-        assert!(after.1 <= before.1 + 20, "attachment lookup grew with unrelated history: {before:?} -> {after:?}");
+        assert!(
+            after.1 <= before.1 + 20,
+            "attachment lookup grew with unrelated history: {before:?} -> {after:?}"
+        );
     }
 
     #[test]
@@ -46769,10 +47557,18 @@ mission "nested-work" state="ready" {
     #[test]
     fn the_per_subject_cap_trims_every_subject_over_it_and_only_those() {
         let store = Store::open_memory("node").unwrap();
-        for (subject, entries) in [("agent/node.a", 7), ("agent/node.b", 5), ("agent/node.c", 2)] {
+        for (subject, entries) in [
+            ("agent/node.a", 7),
+            ("agent/node.b", 5),
+            ("agent/node.c", 2),
+        ] {
             for entry in 0..entries {
                 store
-                    .append_claim(&timeline_observation(subject, "inc", &format!("entry-{entry}")))
+                    .append_claim(&timeline_observation(
+                        subject,
+                        "inc",
+                        &format!("entry-{entry}"),
+                    ))
                     .unwrap();
             }
         }
@@ -46781,7 +47577,12 @@ mission "nested-work" state="ready" {
                 .local_observations_after(0, 100)
                 .unwrap()
                 .iter()
-                .map(|record| (record.subject.clone(), local_observation_position(record).unwrap()))
+                .map(|record| {
+                    (
+                        record.subject.clone(),
+                        local_observation_position(record).unwrap(),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         // Nothing is old; the cap alone applies, two rows to a chunk, to a and b but not c.
@@ -46795,7 +47596,11 @@ mission "nested-work" state="ready" {
         };
         assert_eq!(of("agent/node.a"), [5, 6, 7], "the three newest of seven");
         assert_eq!(of("agent/node.b"), [10, 11, 12], "the three newest of five");
-        assert_eq!(of("agent/node.c"), [13, 14], "a subject under the cap is untouched");
+        assert_eq!(
+            of("agent/node.c"),
+            [13, 14],
+            "a subject under the cap is untouched"
+        );
         assert_eq!(store.trim_local_observations(0, 3, 2).unwrap(), 0);
     }
 
@@ -46823,7 +47628,10 @@ mission "nested-work" state="ready" {
                 .unwrap()
         };
         let rows = count(&store);
-        assert!(rows >= 5, "each claim with an idempotency key registers an operation");
+        assert!(
+            rows >= 5,
+            "each claim with an idempotency key registers an operation"
+        );
         store
             .connection
             .lock()
@@ -50569,20 +51377,37 @@ mission "review-guardrail" state="ready" {
             "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "checks": [{"name": "build", "conclusion": "success"}]
         });
-        store.append_claim(&ClaimInput {
-            subject: subject.clone(), kind: "resource.observed".into(), actor: None,
-            fields: BTreeMap::from([
-                ("kind".into(), json!("vcs.pull-request")),
-                ("facts".into(), observed.clone()),
-            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-        }).unwrap();
-        std::fs::write(spool.path().join("1.json"), serde_json::to_vec(&crate::recorder::Receipt {
-            schema: "st3.recorder.receipt.v1".into(),
-            url: "https://github.com/acme/demo/pull/9".into(),
-            actor: "agent/node.builder".into(), mission_run: Some("created".into()),
-            exit_code: Some(0), at: "2026-10-03T12:00:00Z".into(),
-        }).unwrap()).unwrap();
-        assert_eq!(crate::recorder_receipts::ingest_once(&store, spool.path()).unwrap(), 1);
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.clone(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("kind".into(), json!("vcs.pull-request")),
+                    ("facts".into(), observed.clone()),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        std::fs::write(
+            spool.path().join("1.json"),
+            serde_json::to_vec(&crate::recorder::Receipt {
+                schema: "st3.recorder.receipt.v1".into(),
+                url: "https://github.com/acme/demo/pull/9".into(),
+                actor: "agent/node.builder".into(),
+                mission_run: Some("created".into()),
+                exit_code: Some(0),
+                at: "2026-10-03T12:00:00Z".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::recorder_receipts::ingest_once(&store, spool.path()).unwrap(),
+            1
+        );
         let recorded = store.latest_actual_value(&subject).unwrap().unwrap()["facts"].clone();
         let previous = json!({"pull_requests": [{
             "number": 9, "state": "open", "draft": false
@@ -50591,15 +51416,23 @@ mission "review-guardrail" state="ready" {
             "number": 9, "new": false, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         }]});
         let items = discovered_collection_items(
-            repository, "pull_requests", Some(&previous), &current,
+            repository,
+            "pull_requests",
+            Some(&previous),
+            &current,
             &mut |_| Some(recorded.clone()),
         );
-        assert!(items[0].deliver, "a late receipt must not lose the next head's review");
+        assert!(
+            items[0].deliver,
+            "a late receipt must not lose the next head's review"
+        );
         for field in ["state", "title", "head_sha", "checks"] {
             assert_eq!(recorded[field], observed[field], "{field}");
         }
         assert_eq!(recorded["opened_by"], "agent/node.builder");
-        let projected = store.resource_collection_page(None, None, Some(&subject), None, 10).unwrap();
+        let projected = store
+            .resource_collection_page(None, None, Some(&subject), None, 10)
+            .unwrap();
         assert_eq!(projected[0]["facts"], recorded);
     }
 
@@ -50638,36 +51471,49 @@ mission "review-guardrail" state="ready" {
                 "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             }]});
             let items = discovered_collection_items(
-                repository, field, Some(&previous), &current,
+                repository,
+                field,
+                Some(&previous),
+                &current,
                 &mut |_| Some(recorded.clone()),
             );
             assert_eq!(items.len(), 1);
-            assert!(items[0].deliver, "{field} must deliver its first observed state");
+            assert!(
+                items[0].deliver,
+                "{field} must deliver its first observed state"
+            );
             assert_eq!(items[0].facts["opened_by"], "agent/node.builder");
             assert_eq!(items[0].facts["opened_by_run"], "mission-run/created");
             let observed = items[0].facts.clone();
             assert!(
                 discovered_collection_items(
-                    repository, field, Some(&current), &current,
+                    repository,
+                    field,
+                    Some(&current),
+                    &current,
                     &mut |_| Some(observed.clone()),
                 )
                 .is_empty(),
                 "the same sighting must not deliver twice"
             );
             assert!(
-                !discovered_collection_items(
-                    repository, field, None, &current,
-                    &mut |_| Some(recorded.clone()),
-                )[0].deliver,
+                !discovered_collection_items(repository, field, None, &current, &mut |_| Some(
+                    recorded.clone()
+                ),)[0]
+                    .deliver,
                 "a repository baseline must not deliver receipt-born items"
             );
             let mut old_item = current.clone();
             old_item[field][0]["new"] = Value::Bool(false);
             assert!(
                 !discovered_collection_items(
-                    repository, field, Some(&previous), &old_item,
+                    repository,
+                    field,
+                    Some(&previous),
+                    &old_item,
                     &mut |_| Some(recorded.clone()),
-                )[0].deliver,
+                )[0]
+                .deliver,
                 "an explicitly historical item must not deliver"
             );
         }
@@ -51039,11 +51885,22 @@ version 2
                 .code,
             "stale-observer-revision"
         );
-        let baseline = store.record_resource_observation("observer/github/acme/demo/pull/1", &observer_revision, None, "resource/github/acme/demo/pull/1", Some("cursor-one"), &json!({
-            "head": "resource/github/acme/demo/ref/a",
-            "state": "open",
-            "checks": ["pending"]
-        }), 100, &subscriptions, None)
+        let baseline = store
+            .record_resource_observation(
+                "observer/github/acme/demo/pull/1",
+                &observer_revision,
+                None,
+                "resource/github/acme/demo/pull/1",
+                Some("cursor-one"),
+                &json!({
+                    "head": "resource/github/acme/demo/ref/a",
+                    "state": "open",
+                    "checks": ["pending"]
+                }),
+                100,
+                &subscriptions,
+                None,
+            )
             .unwrap();
         assert!(baseline.baseline);
         assert!(baseline.message_subjects.is_empty());
@@ -51064,27 +51921,60 @@ version 2
                 .unwrap()["state"],
             "pending"
         );
-        let unchanged = store.record_resource_observation("observer/github/acme/demo/pull/1", &observer_revision, None, "resource/github/acme/demo/pull/1", Some("cursor-one"), &json!({
-            "head": "resource/github/acme/demo/ref/a",
-            "state": "open",
-            "checks": ["pending"]
-        }), 200, &subscriptions, None)
+        let unchanged = store
+            .record_resource_observation(
+                "observer/github/acme/demo/pull/1",
+                &observer_revision,
+                None,
+                "resource/github/acme/demo/pull/1",
+                Some("cursor-one"),
+                &json!({
+                    "head": "resource/github/acme/demo/ref/a",
+                    "state": "open",
+                    "checks": ["pending"]
+                }),
+                200,
+                &subscriptions,
+                None,
+            )
             .unwrap();
         assert!(unchanged.changed_fields.is_empty());
         assert!(unchanged.observation_claim.is_none());
-        let changed = store.record_resource_observation("observer/github/acme/demo/pull/1", &observer_revision, None, "resource/github/acme/demo/pull/1", Some("cursor-two"), &json!({
-            "head": "resource/github/acme/demo/ref/a",
-            "state": "closed",
-            "checks": ["pending"]
-        }), 300, &subscriptions, None)
+        let changed = store
+            .record_resource_observation(
+                "observer/github/acme/demo/pull/1",
+                &observer_revision,
+                None,
+                "resource/github/acme/demo/pull/1",
+                Some("cursor-two"),
+                &json!({
+                    "head": "resource/github/acme/demo/ref/a",
+                    "state": "closed",
+                    "checks": ["pending"]
+                }),
+                300,
+                &subscriptions,
+                None,
+            )
             .unwrap();
         assert_eq!(changed.changed_fields, ["state"]);
         assert_eq!(changed.message_subjects.len(), 2);
-        let retry = store.record_resource_observation("observer/github/acme/demo/pull/1", &observer_revision, None, "resource/github/acme/demo/pull/1", Some("cursor-two"), &json!({
-            "head": "resource/github/acme/demo/ref/a",
-            "state": "closed",
-            "checks": ["pending"]
-        }), 300, &subscriptions, None)
+        let retry = store
+            .record_resource_observation(
+                "observer/github/acme/demo/pull/1",
+                &observer_revision,
+                None,
+                "resource/github/acme/demo/pull/1",
+                Some("cursor-two"),
+                &json!({
+                    "head": "resource/github/acme/demo/ref/a",
+                    "state": "closed",
+                    "checks": ["pending"]
+                }),
+                300,
+                &subscriptions,
+                None,
+            )
             .unwrap();
         assert_eq!(retry.message_subjects, changed.message_subjects);
         assert_eq!(store.messages(None, true).unwrap().len(), 2);
@@ -51106,19 +51996,41 @@ version 2
                 "stop-one-subscription",
             )
             .unwrap();
-        let after_stop = store.record_resource_observation("observer/github/acme/demo/pull/1", &observer_revision, None, "resource/github/acme/demo/pull/1", Some("cursor-after-stop"), &json!({
-            "head": "resource/github/acme/demo/ref/a",
-            "state": "open",
-            "checks": ["pending"]
-        }), 350, &subscriptions, None)
+        let after_stop = store
+            .record_resource_observation(
+                "observer/github/acme/demo/pull/1",
+                &observer_revision,
+                None,
+                "resource/github/acme/demo/pull/1",
+                Some("cursor-after-stop"),
+                &json!({
+                    "head": "resource/github/acme/demo/ref/a",
+                    "state": "open",
+                    "checks": ["pending"]
+                }),
+                350,
+                &subscriptions,
+                None,
+            )
             .unwrap();
         assert_eq!(after_stop.message_subjects.len(), 1);
         assert_eq!(store.messages(None, true).unwrap().len(), 3);
-        let unselected = store.record_resource_observation("observer/github/acme/demo/pull/1", &observer_revision, None, "resource/github/acme/demo/pull/1", Some("cursor-three"), &json!({
-            "head": "resource/github/acme/demo/ref/a",
-            "state": "open",
-            "checks": ["passing"]
-        }), 400, &subscriptions, None)
+        let unselected = store
+            .record_resource_observation(
+                "observer/github/acme/demo/pull/1",
+                &observer_revision,
+                None,
+                "resource/github/acme/demo/pull/1",
+                Some("cursor-three"),
+                &json!({
+                    "head": "resource/github/acme/demo/ref/a",
+                    "state": "open",
+                    "checks": ["passing"]
+                }),
+                400,
+                &subscriptions,
+                None,
+            )
             .unwrap();
         assert_eq!(unselected.changed_fields, ["checks"]);
         assert!(unselected.message_subjects.is_empty());
@@ -51180,7 +52092,18 @@ subscription "green" {
             .unwrap()
             .unwrap();
         let observe = |cursor: &str, checks: Value| {
-            store.record_resource_observation("observer/pull", &observer_revision, None, "resource/pull", Some(cursor), &json!({"checks": checks}), 100, &subscriptions, None)
+            store
+                .record_resource_observation(
+                    "observer/pull",
+                    &observer_revision,
+                    None,
+                    "resource/pull",
+                    Some(cursor),
+                    &json!({"checks": checks}),
+                    100,
+                    &subscriptions,
+                    None,
+                )
                 .unwrap()
         };
 
@@ -51457,9 +52380,17 @@ observer "issue" {
 "#;
             let intent = parse_intent(source, "node").unwrap();
             let planned = store
-                .mission(&intent, IntentInput { kdl: source.into(), source_name: None })
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
                 .unwrap();
-            store.apply(&intent, &planned.subject_tokens, "publish-watch").unwrap();
+            store
+                .apply(&intent, &planned.subject_tokens, "publish-watch")
+                .unwrap();
             let subject = "resource/github/acme/demo/issue/8";
             let publish = |facts: Value| ClaimInput {
                 subject: subject.into(),
@@ -51473,13 +52404,29 @@ observer "issue" {
                 expected_subject: None,
                 idempotency_key: None,
             };
-            store.append_client_claim(&publish(attribution.clone())).unwrap();
-            store.append_client_claim(&publish(json!({
-                "opened_by_run": "mission-run/fixer", "state": "open"
-            }))).unwrap();
+            store
+                .append_client_claim(&publish(attribution.clone()))
+                .unwrap();
+            store
+                .append_client_claim(&publish(json!({
+                    "opened_by_run": "mission-run/fixer", "state": "open"
+                })))
+                .unwrap();
             let observe = |observer: &str, resource: &str, facts: Value| {
                 let revision = store.selected_desired_revision(observer).unwrap().unwrap();
-                store.record_resource_observation(observer, &revision, None, resource, None, &facts, 50, &[], None).unwrap();
+                store
+                    .record_resource_observation(
+                        observer,
+                        &revision,
+                        None,
+                        resource,
+                        None,
+                        &facts,
+                        50,
+                        &[],
+                        None,
+                    )
+                    .unwrap();
             };
             observe("observer/issue", subject, json!({"state": "closed"}));
             let actual = store.latest_actual_value(subject).unwrap().unwrap();
@@ -51488,21 +52435,34 @@ observer "issue" {
             if let Some(opener) = attribution.get("opened_by") {
                 assert_eq!(&actual["facts"]["opened_by"], opener);
             }
-            observe("observer/repo", "resource/github/acme/demo", json!({"issues": []}));
-            observe("observer/repo", "resource/github/acme/demo", json!({
-                "issues": [{"number": 8, "state": "open", "title": "Updated issue"}]
-            }));
+            observe(
+                "observer/repo",
+                "resource/github/acme/demo",
+                json!({"issues": []}),
+            );
+            observe(
+                "observer/repo",
+                "resource/github/acme/demo",
+                json!({
+                    "issues": [{"number": 8, "state": "open", "title": "Updated issue"}]
+                }),
+            );
             let actual = store.latest_actual_value(subject).unwrap().unwrap();
             assert_eq!(actual["facts"]["state"], "open");
             assert_eq!(actual["facts"]["title"], "Updated issue");
             assert_eq!(actual["facts"]["opened_by_run"], "mission-run/author");
             if let Some(opener) = attribution.get("opened_by") {
                 assert_eq!(&actual["facts"]["opened_by"], opener);
-                let changed = store.append_client_claim(&publish(json!({
-                    "opened_by": "agent/node.fixer", "opened_by_run": "mission-run/fixer"
-                }))).unwrap();
+                let changed = store
+                    .append_client_claim(&publish(json!({
+                        "opened_by": "agent/node.fixer", "opened_by_run": "mission-run/fixer"
+                    })))
+                    .unwrap();
                 assert_eq!(&changed.body["fields"]["facts"]["opened_by"], opener);
-                assert_eq!(changed.body["fields"]["facts"]["opened_by_run"], "mission-run/author");
+                assert_eq!(
+                    changed.body["fields"]["facts"]["opened_by_run"],
+                    "mission-run/author"
+                );
             }
         }
     }
@@ -51570,7 +52530,18 @@ observer "pull" {
                 .selected_desired_revision("observer/pull")
                 .unwrap()
                 .unwrap();
-            store.record_resource_observation("observer/pull", &revision, None, subject, None, &json!({"state": "closed"}), 50, &[], None)
+            store
+                .record_resource_observation(
+                    "observer/pull",
+                    &revision,
+                    None,
+                    subject,
+                    None,
+                    &json!({"state": "closed"}),
+                    50,
+                    &[],
+                    None,
+                )
                 .unwrap();
             let actual = store.latest_actual_value(subject).unwrap().unwrap();
             assert_eq!(actual["facts"]["state"], "closed");
@@ -52486,12 +53457,22 @@ message "human-attention" {
         assert_eq!(only.subjects.len(), 1);
         assert!(only.subjects[0].claims.is_empty());
         assert_eq!(
-            only.subjects[0].harness.as_ref().map(|harness| harness.incarnation_id.clone()),
-            store.current_harness(subject).unwrap().map(|harness| harness.incarnation_id)
+            only.subjects[0]
+                .harness
+                .as_ref()
+                .map(|harness| harness.incarnation_id.clone()),
+            store
+                .current_harness(subject)
+                .unwrap()
+                .map(|harness| harness.incarnation_id)
         );
         assert_eq!(
             store.latest_claim_id(subject).unwrap(),
-            store.claims_for(subject, None).unwrap().last().map(|claim| claim.id.clone())
+            store
+                .claims_for(subject, None)
+                .unwrap()
+                .last()
+                .map(|claim| claim.id.clone())
         );
         store
             .append_claim(&ClaimInput {
@@ -54134,13 +55115,22 @@ fn append_latest_observation_publication(
                     )?,
                 };
                 if let Some(source) = source {
-                    local.body["fields"]["observed_since_ms"] = source.body["fields"]["observed_since_ms"].clone();
-                    local.body["fields"]["status_transition"] = published.as_ref()
-                        .map_or(json!(false), |claim| claim.body["fields"]["status_transition"].clone());
-                    transaction.execute("UPDATE local_observations SET body=?1 WHERE id=?2", params![
-                        canonical_json_text(&local.body).map_err(internal)?,
-                        local_observation_position(&local).expect("a local observation has a position"),
-                    ]).map_err(internal)?;
+                    local.body["fields"]["observed_since_ms"] =
+                        source.body["fields"]["observed_since_ms"].clone();
+                    local.body["fields"]["status_transition"] =
+                        published.as_ref().map_or(json!(false), |claim| {
+                            claim.body["fields"]["status_transition"].clone()
+                        });
+                    transaction
+                        .execute(
+                            "UPDATE local_observations SET body=?1 WHERE id=?2",
+                            params![
+                                canonical_json_text(&local.body).map_err(internal)?,
+                                local_observation_position(&local)
+                                    .expect("a local observation has a position"),
+                            ],
+                        )
+                        .map_err(internal)?;
                 }
             }
             Ok((published.unwrap_or(local), true, status_transition))
@@ -54464,44 +55454,64 @@ mod harness_event_tests {
                 {"content":"Review claim","status":"blocked","blocker":"Await review"}
             ]}],"totals":{"pending":0,"in_progress":0,"completed":0,"blocked":1},
             "truncated":false
-        })).unwrap();
+        }))
+        .unwrap();
         let (first, changed) = store.append_harness_event(&input).unwrap();
         assert!(changed);
         let (replay, changed) = store.append_harness_event(&input).unwrap();
         assert!(!changed);
         assert_eq!(replay.body["fields"], first.body["fields"]);
         let original = input.claim.fields.clone();
-        input.claim.fields.insert("source_op".into(), json!("hydrate"));
-        assert_eq!(store.append_harness_event(&input).unwrap_err().code, "idempotency-mismatch");
+        input
+            .claim
+            .fields
+            .insert("source_op".into(), json!("hydrate"));
+        assert_eq!(
+            store.append_harness_event(&input).unwrap_err().code,
+            "idempotency-mismatch"
+        );
         input.claim.fields = original;
         input.sequence = 2;
         input.claim.fields.insert("phases".into(), json!([]));
-        input.claim.fields.insert("totals".into(), json!({
-            "pending":0,"in_progress":0,"completed":0,"blocked":0
-        }));
-        input.claim.fields.insert("source_op".into(), json!("clear"));
+        input.claim.fields.insert(
+            "totals".into(),
+            json!({
+                "pending":0,"in_progress":0,"completed":0,"blocked":0
+            }),
+        );
+        input
+            .claim
+            .fields
+            .insert("source_op".into(), json!("clear"));
         let (cleared, changed) = store.append_harness_event(&input).unwrap();
         assert!(changed);
         assert_eq!(cleared.body["fields"]["phases"], json!([]));
         runtime(&store, "runtime-b", "running");
         input.sequence = 3;
-        assert_eq!(store.append_harness_event(&input).unwrap_err().code, "stale-harness-event-session");
-        let current = store.latest_observation(SEAT, "harness.todo.observed").unwrap().unwrap();
+        assert_eq!(
+            store.append_harness_event(&input).unwrap_err().code,
+            "stale-harness-event-session"
+        );
+        let current = store
+            .latest_observation(SEAT, "harness.todo.observed")
+            .unwrap()
+            .unwrap();
         assert_eq!(current.body["fields"]["source_op"], "clear");
         const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
         let peer = Store::open_memory("blue").unwrap();
         store.bind_fleet(FLEET).unwrap();
         peer.bind_fleet(FLEET).unwrap();
-        let exchange = store.export_replication_exchange(
-            FLEET, &ReplicationInventory::default(),
-        ).unwrap();
-        peer.receive_replication_exchange("amber", FLEET, &exchange).unwrap();
+        let exchange = store
+            .export_replication_exchange(FLEET, &ReplicationInventory::default())
+            .unwrap();
+        peer.receive_replication_exchange("amber", FLEET, &exchange)
+            .unwrap();
         peer.validate_replication_backlog().unwrap();
         peer.apply_replication_repairs().unwrap();
         assert!(peer.project_replication_backlog().unwrap());
-        let remote = peer.agent_todo_observations_for(
-            &[SEAT.to_owned()], peer.index().unwrap(),
-        ).unwrap();
+        let remote = peer
+            .agent_todo_observations_for(&[SEAT.to_owned()], peer.index().unwrap())
+            .unwrap();
         let remote = &remote[SEAT]["harness.todo.observed"];
         assert_eq!(remote.id, cleared.id);
         assert_eq!(remote.body["fields"]["source_op"], "clear");

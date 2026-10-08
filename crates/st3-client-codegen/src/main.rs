@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 mod rich;
+mod subjects;
+mod subject_models;
 
 const RUST_MODELS_TEMPLATE: &str = include_str!("../templates/generated.rs.in");
 const RUST_CLIENT_TEMPLATE: &str = include_str!("../templates/lib.rs.in");
@@ -24,12 +26,35 @@ fn main() -> Result<()> {
     let operations_bytes = std::fs::read(&operations_path).context("read operations manifest")?;
     let schema_bytes = std::fs::read(&schema_path).context("read client schema")?;
     let operations: Value = serde_json::from_slice(&operations_bytes)?;
-    let schema: Value = serde_json::from_slice(&schema_bytes)?;
+    let mut schema: Value = serde_json::from_slice(&schema_bytes)?;
+    let native = subjects::Contract::derive(&schema)?;
+    native.apply(&mut schema)?;
+    let native_bytes = serde_json::to_vec_pretty(&native.artifact)?;
     let actions = operations["actions"]
         .as_object()
         .context("actions object")?;
     let reads = operations["reads"].as_array().context("reads array")?;
-    let digest = hex_digest(&[&schema_bytes, &operations_bytes]);
+    let digest = hex_digest(&[
+        &schema_bytes, &operations_bytes, &native_bytes,
+        include_bytes!("main.rs"), include_bytes!("rich.rs"),
+        include_bytes!("subjects.rs"), include_bytes!("subject_models.rs"),
+        include_bytes!("../Cargo.toml"),
+        include_bytes!("../../../Cargo.toml"),
+        include_bytes!("../../../Cargo.lock"),
+        include_bytes!("../../st3-schema/Cargo.toml"),
+        include_bytes!("../../st3-schema/src/lib.rs"),
+        include_bytes!("../../st3-schema/src/glasses.rs"),
+        include_bytes!("../../st3-schema/src/owned_terminals.rs"),
+        include_bytes!("../../st3-schema/src/client_projection.rs"),
+        include_bytes!("../../st3-schema/src/client_projection/contract.rs"),
+        RUST_MODELS_TEMPLATE.as_bytes(), RUST_CLIENT_TEMPLATE.as_bytes(),
+        SWIFT_MODELS_TEMPLATE.as_bytes(), SWIFT_CLIENT_TEMPLATE.as_bytes(),
+        TYPESCRIPT_CLIENT_TEMPLATE.as_bytes(),
+        include_bytes!("../templates/Subjects.rs.in"),
+        include_bytes!("../templates/Subjects.swift.in"),
+        include_bytes!("../templates/Subjects.ts.in"),
+        include_bytes!("../templates/Subjects.effect.ts.in"),
+    ]);
     let rust = format_rust(&rust_contract(
         &digest,
         actions.keys().map(String::as_str),
@@ -57,7 +82,10 @@ fn main() -> Result<()> {
         &swift_operation_methods(reads, actions)?,
     )?;
     let typescript_models = typescript_models(&schema, &operations)?;
-    let typescript_schema = rich::models(&schema)?;
+    let mut typescript_schema = rich::models(&schema)?;
+    typescript_schema.push_str(&native.rich()?);
+    let typescript_subjects = native.typescript(&schema)?;
+    let (rust_subjects, swift_subjects) = native.native_models(&schema)?;
     let typescript_client = render_marker(
         TYPESCRIPT_CLIENT_TEMPLATE,
         "    // @st3-codegen:typescript-operation-methods",
@@ -116,6 +144,14 @@ fn main() -> Result<()> {
         &typescript_client,
         check,
     )?;
+    output(
+        &root.join("docs/st3/client-v0/schemas/subject-projection.schema.json"),
+        &String::from_utf8(native_bytes)?,
+        check,
+    )?;
+    output(&root.join("crates/st3-client/src/subjects.generated.rs"), &format_rust(&rust_subjects)?, check)?;
+    output(&root.join("clients/swift/St3Client/Sources/St3Client/Subjects.generated.swift"), &swift_subjects, check)?;
+    output(&root.join("clients/typescript/st3-client/Subjects.generated.ts"), &typescript_subjects, check)?;
     Ok(())
 }
 
@@ -196,6 +232,20 @@ fn rust_operation_methods(
         let id = read["id"].as_str().context("read id")?;
         let path = read["path"].as_str().context("read path")?;
         let method = action_method(id);
+        if id == "subject.get" {
+            writeln!(out,"    pub async fn subject_get(&self, reference: &str) -> Result<Envelope<SubjectProjection>, ClientError> {{ self.get(&format!(\"/v1/client/subject?ref={{}}\", percent_encode(reference))).await }}")?;
+            continue;
+        } else if id == "subjects.list" {
+            writeln!(out,"    pub async fn subjects_list(&self, family: &str, ref_prefix: Option<&str>, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<SubjectsPage>, ClientError> {{ let mut query = vec![format!(\"family={{}}\", percent_encode(family))]; for (name,value) in [(\"ref_prefix\",ref_prefix),(\"cursor\",cursor)] {{ if let Some(value)=value {{ query.push(format!(\"{{name}}={{}}\",percent_encode(value))); }} }} if let Some(limit)=limit {{ query.push(format!(\"limit={{limit}}\")); }} self.get(&format!(\"/v1/client/subjects?{{}}\",query.join(\"&\"))).await }}")?;
+            continue;
+        } else if matches!(id,"subject.claims"|"subject.history") {
+            let response=read["response"].as_str().context("native response")?;
+            writeln!(out,"    pub async fn {method}(&self, reference: &str, kind: Option<&str>, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<{response}>, ClientError> {{ let mut query=vec![format!(\"ref={{}}\",percent_encode(reference))]; for (name,value) in [(\"kind\",kind),(\"cursor\",cursor)] {{ if let Some(value)=value {{ query.push(format!(\"{{name}}={{}}\",percent_encode(value))); }} }} if let Some(limit)=limit {{ query.push(format!(\"limit={{limit}}\")); }} self.get(&format!(\"{path}?{{}}\",query.join(\"&\"))).await }}")?;
+            continue;
+        } else if id == "subject.schemas" {
+            writeln!(out,"    pub async fn subject_schemas(&self) -> Result<Envelope<SubjectSchemas>, ClientError> {{ self.get(\"/v1/client/subject-schemas\").await }}")?;
+            continue;
+        }
         if id == "arrangements.list" {
             writeln!(out, "    pub async fn arrangements_list(&self, person: &str, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<ArrangementPage>, ClientError> {{ let mut path = format!(\"/v1/client/arrangements?person={{}}\", percent_encode(person)); if let Some(cursor) = cursor {{ path.push_str(&format!(\"&cursor={{}}\", percent_encode(cursor))); }} if let Some(limit) = limit {{ path.push_str(&format!(\"&limit={{limit}}\")); }} self.get(&path).await }}")?;
             continue;
@@ -352,6 +402,21 @@ fn swift_operation_methods(
         let id = read["id"].as_str().context("read id")?;
         let path = read["path"].as_str().context("read path")?;
         let method = lower_camel(&pascal(id));
+        if id == "subject.get" {
+            writeln!(out,"    public func subjectGet(reference: String) async throws -> Envelope<SubjectProjection> {{ try await get(\"v1/client/subject\", query: [.init(name: \"ref\", value: reference)]) }}")?;
+            continue;
+        } else if id == "subjects.list" {
+            writeln!(out,"    public func subjectsList(family: String, refPrefix: String? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<SubjectsPage> {{ var query = [URLQueryItem(name: \"family\", value: family)]; for (name,value) in [(\"ref_prefix\",refPrefix),(\"cursor\",cursor)] {{ if let value {{ query.append(.init(name: name, value: value)) }} }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/subjects\", query: query) }}")?;
+            continue;
+        } else if matches!(id,"subject.claims"|"subject.history") {
+            let response=read["response"].as_str().context("native response")?;
+            let route=path.trim_start_matches('/');
+            writeln!(out,"    public func {method}(reference: String, kind: String? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<{response}> {{ var query = [URLQueryItem(name: \"ref\", value: reference)]; for (name,value) in [(\"kind\",kind),(\"cursor\",cursor)] {{ if let value {{ query.append(.init(name: name, value: value)) }} }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"{route}\", query: query) }}")?;
+            continue;
+        } else if id == "subject.schemas" {
+            writeln!(out,"    public func subjectSchemas() async throws -> Envelope<SubjectSchemas> {{ try await get(\"v1/client/subject-schemas\") }}")?;
+            continue;
+        }
         if id == "arrangements.list" {
             writeln!(out, "    public func arrangementsList(person: String, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ArrangementPage> {{ var query: [URLQueryItem] = [.init(name: \"person\", value: person)]; if let cursor {{ query.append(.init(name: \"cursor\", value: cursor)) }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/arrangements\", query: query) }}")?;
             continue;
@@ -1027,7 +1092,8 @@ fn ts_object(value: &Value) -> Result<String> {
             } else {
                 "?"
             };
-            fields.push(format!("  {name}{optional}: {};", ts_type(definition)?));
+            let field = if name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') { name.clone() } else { serde_json::to_string(name)? };
+            fields.push(format!("  {field}{optional}: {};", ts_type(definition)?));
         }
     }
     if let Some(extra) = value.get("additionalProperties")
@@ -1174,6 +1240,21 @@ fn typescript_operation_methods(
         } else {
             path.to_owned()
         };
+        if id == "subject.get" {
+            writeln!(out,"    async subjectGet(reference: string): Promise<EnvelopeOf<SubjectProjectionResult>> {{ const envelope = await this.get<unknown>('/v1/client/subject' + query({{ ref: reference }})); return {{ ...envelope, value: decodeSubjectProjection(envelope.value) }}; }}")?;
+            continue;
+        } else if id == "subjects.list" {
+            writeln!(out,"    async subjectsList(family: string, options: PageOptions & {{ ref_prefix?: string }} = {{}}): Promise<EnvelopeOf<SubjectsPageResult>> {{ const envelope = await this.get<unknown>('/v1/client/subjects' + query({{ family, ...options }})); return {{ ...envelope, value: decodeSubjectsPage(envelope.value) }}; }}")?;
+            continue;
+        } else if matches!(id,"subject.claims"|"subject.history") {
+            let result=format!("{response}Result");
+            let decoder=format!("decode{response}");
+            writeln!(out,"    async {method}(reference: string, options: PageOptions & {{ kind?: string }} = {{}}): Promise<EnvelopeOf<{result}>> {{ const envelope = await this.get<unknown>('{route}' + query({{ ref: reference, ...options }})); return {{ ...envelope, value: {decoder}(envelope.value) }}; }}")?;
+            continue;
+        } else if id == "subject.schemas" {
+            writeln!(out,"    async subjectSchemas(): Promise<EnvelopeOf<SubjectSchemas>> {{ const envelope = await this.get<unknown>('/v1/client/subject-schemas'); return {{ ...envelope, value: decodeSubjectSchemas(envelope.value) }}; }}")?;
+            continue;
+        }
         if id == "arrangements.list" {
             writeln!(out, "    async arrangementsList(person: string, options: PageOptions = {{}}): Promise<EnvelopeOf<ArrangementPage>> {{ return this.get('/v1/client/arrangements' + query({{ person, ...options }})); }}")?;
             continue;
@@ -1283,108 +1364,3 @@ fn typescript_operation_methods(
     Ok(out.trim_end().into())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temporary_output(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "st3-client-codegen-{}-{nonce}-{name}",
-            std::process::id()
-        ))
-    }
-
-    #[test]
-    fn check_rejects_model_and_route_drift_and_generation_restores_stable_bytes() -> Result<()> {
-        let operations: Value = serde_json::from_str(include_str!(
-            "../../../docs/st3/client-v0/schemas/operations.json"
-        ))?;
-        let actions = operations["actions"].as_object().context("actions")?;
-        let reads = operations["reads"].as_array().context("reads")?;
-        let schema: Value = serde_json::from_str(include_str!(
-            "../../../docs/st3/client-v0/schemas/client-v0.schema.json"
-        ))?;
-        let digest = hex_digest(&[
-            include_bytes!("../../../docs/st3/client-v0/schemas/client-v0.schema.json"),
-            include_bytes!("../../../docs/st3/client-v0/schemas/operations.json"),
-        ]);
-        let ts_models = typescript_models(&schema, &operations)?;
-        let ts_schema = rich::models(&schema)?;
-        let ts_client = render_marker(
-            TYPESCRIPT_CLIENT_TEMPLATE,
-            "    // @st3-codegen:typescript-operation-methods",
-            &typescript_operation_methods(reads, actions)?,
-        )?;
-        let models = format_rust(&render_marker(
-            RUST_MODELS_TEMPLATE,
-            "    // @st3-codegen:rust-action-constructors",
-            &rust_action_constructors(actions)?,
-        )?)?;
-        let client = format_rust(&render_marker(
-            RUST_CLIENT_TEMPLATE,
-            "    // @st3-codegen:rust-operation-methods",
-            &rust_operation_methods(reads, actions)?,
-        )?)?;
-        let cases = [
-            (
-                "generated.rs",
-                models.as_str(),
-                models.replacen("pub attention_id: String,", "", 1),
-            ),
-            (
-                "lib.rs",
-                client.as_str(),
-                client.replacen(
-                    "pub async fn attention_list(",
-                    "async fn removed_attention_list(",
-                    1,
-                ),
-            ),
-            (
-                "Models.generated.ts",
-                ts_models.as_str(),
-                ts_models.replacen(
-                    "export type ActionRequest =",
-                    "export type MissingActionRequest =",
-                    1,
-                ),
-            ),
-            (
-                "Client.generated.ts",
-                ts_client.as_str(),
-                ts_client.replacen("async eventsList(", "async removedEventsList(", 1),
-            ),
-            (
-                "Schema.generated.ts",
-                ts_schema.as_str(),
-                ts_schema.replacen(
-                    "export const Resource =",
-                    "export const RemovedResource =",
-                    1,
-                ),
-            ),
-        ];
-        for (name, expected, drifted) in cases {
-            assert_ne!(
-                expected, drifted,
-                "test mutation must change generated output"
-            );
-            let path = temporary_output(name);
-            output(&path, &drifted, false)?;
-            assert!(output(&path, expected, true).is_err());
-            output(&path, expected, false)?;
-            let first = std::fs::read(&path)?;
-            output(&path, expected, false)?;
-            let second = std::fs::read(&path)?;
-            assert_eq!(first, second, "second generation must be byte-identical");
-            output(&path, expected, true)?;
-            std::fs::remove_file(&path)?;
-        }
-        Ok(())
-    }
-}

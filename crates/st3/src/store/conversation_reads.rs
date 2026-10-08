@@ -894,7 +894,13 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
             .join("\n");
-        assert!(plan.contains("claims_subject_index"), "{plan}");
+        // A covering subject index may replace the original subject index;
+        // require the same bounded owner seek, not a particular index name.
+        assert!(
+            plan.contains("SEARCH claims USING ")
+                && plan.contains("(subject=? AND store_index>? AND store_index<?)"),
+            "{plan}"
+        );
         assert!(!plan.contains("SCAN claims"), "{plan}");
     }
 

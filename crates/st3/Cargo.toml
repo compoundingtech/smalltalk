@@ -27,7 +27,6 @@ flate2 = "1"
 futures-util = "0.3"
 getrandom = "0.3"
 hex = "0.4"
-hmac = "0.12"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -103,3 +102,4 @@ required-features = ["perf-load"]
 [[test]]
 name = "api_accept"
 path = "tests/api_accept.rs"
+

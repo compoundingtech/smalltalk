@@ -194,6 +194,7 @@ impl Runtime for SmalltalkRuntime {
         glass_heads::open(transaction)?;
         agent_messages::open(transaction)?;
         arrangements::open(transaction)?;
+        native_sources::open(transaction)?;
         limits::open_limits(transaction)?;
         if shared_memory {
             rebuild_operations_tx(transaction)?;

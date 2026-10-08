@@ -4,10 +4,12 @@ import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
     Arrangement, ArrangementId, ArrangementPage,
-    PublicationDefinition, SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
+    PublicationDefinition, SubjectDefinition, SubjectSchemas, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationContentChunk, ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
 } from './Models.generated.ts';
+import { decodeSubjectProjection, decodeSubjectsPage, decodeSubjectClaimsPage, decodeSubjectHistoryPage, decodeSubjectSchemas, decodeSubjectCollectionFrame } from './Subjects.generated.ts';
+import type { SubjectProjectionResult, SubjectsPageResult, SubjectClaimsPageResult, SubjectHistoryPageResult, SubjectCollectionFrameResult, SubjectsSelector } from './Subjects.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };
 export type TerminalListOptions = PageOptions & { history?: boolean; owner?: string; state?: string };
@@ -55,8 +57,9 @@ export type CollectionSocket = TerminalSocket & {
     send(data: string): void;
 };
 export type CollectionSocketFactory = (url: string, protocols: string[], headers: Record<string, string>) => CollectionSocket;
+export type CollectionStreamFrame = Exclude<CollectionFrame, { collection: 'subjects' }> | SubjectCollectionFrameResult;
 export type CollectionStreamOptions = {
-    onFrame: (frame: CollectionFrame) => void;
+    onFrame: (frame: CollectionStreamFrame) => void;
     /** Called once when the socket ends: without an error after a normal close. Open a new
      * socket and subscribe again; its snapshots are authoritative. */
     onEnd?: (error?: Error) => void;
@@ -67,6 +70,7 @@ export type CollectionStream = {
     subscribeGlasses(id: string): void;
     subscribeArrangements(id: string, person: string, limit?: number, subject?: ArrangementId): void;
     subscribe(id: string, collection: Exclude<CollectionName, 'arrangements'>, limit?: number, filters?: CollectionFilters): void;
+    subscribeSubjects(id: string, selector: SubjectsSelector, limit?: number): void;
     /** Follow a terminal with the incarnation and single-use capability `terminal.attach` returned. */
     subscribeTerminal(id: string, terminal: string, incarnation: string | null | undefined, capability: string): void;
     /** Follow the conversation of an agent or a session. */
@@ -79,8 +83,8 @@ export type CollectionWindow = { items: Resource[]; hasMore: boolean; snapshot: 
 
 /** Apply one `snapshot` or `changes` frame to a window: removals and upserts first, then the
  * frame's complete order. A `changes` frame without an earlier snapshot has nothing to apply to. */
-export function applyWindow(window: CollectionWindow | undefined, frame: CollectionFrame): CollectionWindow | undefined {
-    if (frame.kind !== 'snapshot' && frame.kind !== 'changes') return window;
+export function applyWindow(window: CollectionWindow | undefined, frame: CollectionStreamFrame): CollectionWindow | undefined {
+    if ((frame.kind !== 'snapshot' && frame.kind !== 'changes') || frame.collection === 'subjects') return window;
     if (frame.kind === 'changes' && !window) return undefined;
     const rows = new Map<string, Resource>(frame.kind === 'snapshot' ? [] : window!.items.map(item => [item.id, item]));
     if (frame.kind === 'changes') for (const id of frame.removes) rows.delete(id);
@@ -89,14 +93,28 @@ export function applyWindow(window: CollectionWindow | undefined, frame: Collect
     return { items, hasMore: frame.has_more, snapshot: frame.snapshot };
 }
 
+export type SubjectCollectionWindow = { items: SubjectProjectionResult[]; hasMore: boolean; snapshot: Snapshot };
+export function applySubjectWindow(window: SubjectCollectionWindow | undefined, frame: CollectionStreamFrame): SubjectCollectionWindow | undefined {
+    if ((frame.kind !== 'snapshot' && frame.kind !== 'changes') || frame.collection !== 'subjects') return window;
+    if (frame.kind === 'changes' && !window) return undefined;
+    const rows = new Map<string, SubjectProjectionResult>(frame.kind === 'snapshot' ? [] : window!.items.map(item => [item.id, item]));
+    if (frame.kind === 'changes') for (const id of frame.removes) rows.delete(id);
+    for (const item of frame.kind === 'snapshot' ? frame.items : frame.upserts) rows.set(item.id, item);
+    return { items: frame.order.flatMap(id => rows.get(id) ?? []), hasMore: frame.has_more, snapshot: frame.snapshot };
+}
+
 function defaultTerminalSocket(url: string, protocols: string[], headers: Record<string, string>): TerminalSocket {
     const Socket = WebSocket as unknown as new (url: string, protocols: string[], options: { headers: Record<string, string> }) => TerminalSocket;
     return new Socket(url, protocols, { headers });
 }
 
 export class ClientError extends Error {
-    constructor(public readonly response: ErrorEnvelope, public readonly status: number) {
+    readonly response: ErrorEnvelope;
+    readonly status: number;
+    constructor(response: ErrorEnvelope, status: number) {
         super(response.message);
+        this.response = response;
+        this.status = status;
         this.name = 'ClientError';
     }
 }
@@ -124,7 +142,7 @@ function bounded(value: number | undefined, maximum: number, name: string): void
 export class St3Client {
     private readonly baseUrl: string;
     private readonly credential?: ClientOptions['credential'];
-    private readonly client?: string;
+    private readonly client: string | undefined;
     private readonly fetchImpl: typeof fetch;
     private discovered?: EnvelopeOf<Capabilities>;
 
@@ -314,9 +332,12 @@ export class St3Client {
         };
         socket.onopen = () => { open = true; for (const text of waiting.splice(0)) socket.send(text); };
         socket.onmessage = event => {
-            let frame: CollectionFrame;
-            try { frame = JSON.parse(String(event.data)) as CollectionFrame; } catch { end(new Error('A collections message is not JSON')); socket.close(1000); return; }
-            if (!frame || typeof frame !== 'object' || typeof frame.kind !== 'string') { end(new Error('Unexpected st collections message')); socket.close(1000); return; }
+            let frame: CollectionStreamFrame;
+            try {
+                const value: unknown = JSON.parse(String(event.data));
+                if (!value || typeof value !== 'object' || !('kind' in value) || typeof value.kind !== 'string') throw new Error('Unexpected st collections message');
+                frame = 'collection' in value && value.collection === 'subjects' && (value.kind === 'snapshot' || value.kind === 'changes') ? decodeSubjectCollectionFrame(value) : value as Exclude<CollectionFrame, { collection: 'subjects' }>;
+            } catch (cause) { end(cause instanceof Error ? cause : new Error('A collections message is not JSON')); socket.close(1000); return; }
             options.onFrame(frame);
         };
         socket.onclose = event => end(event.code === 1000 ? undefined : new Error(`The collections socket closed (${event.code}${event.reason ? ` ${event.reason}` : ''})`));
@@ -325,6 +346,12 @@ export class St3Client {
             subscribeGlasses: id => send({kind: 'subscribe', id, collection: 'glasses', limit: 100}),
             subscribeArrangements: (id, person, limit = 100, subject) => send({kind: 'subscribe', id, collection: 'arrangements', person, limit, ...(subject === undefined ? {} : {subject})}),
             subscribe: (id, collection, limit, filters = {}) => send({ kind: 'subscribe', id, collection, ...(limit === undefined ? {} : { limit }), ...filters }),
+            subscribeSubjects: (id, selector, limit) => {
+                bounded(limit, 200, 'limit');
+                const family = selector.family !== undefined, reference = selector.ref !== undefined;
+                if (family === reference || (!family && selector.ref_prefix !== undefined)) throw new TypeError('Subjects require exactly one family or ref; ref_prefix requires family');
+                send({ kind: 'subscribe', id, collection: 'subjects', ...selector, ...(limit === undefined ? {} : { limit }) });
+            },
             subscribeTerminal: (id, terminal, incarnation, capability) => send({ kind: 'subscribe', id, collection: 'terminal', terminal, incarnation, capability }),
             subscribeConversation: (id, conversation) => send({ kind: 'subscribe', id, collection: 'conversation', conversation }),
             unsubscribe: id => send({ kind: 'unsubscribe', id }),
@@ -356,6 +383,11 @@ export class St3Client {
     async publicationDefinition(subject: string): Promise<EnvelopeOf<PublicationDefinition>> { return this.get('/v1/client/publication-definition' + query({ subject })); }
     async subjectDefinition(subject: string, showEnvValues = false): Promise<EnvelopeOf<SubjectDefinition>> { return this.get('/v1/client/subject-definition' + query({ subject, show_env_values: showEnvValues })); }
     async mailBacklogSummary(): Promise<EnvelopeOf<MailBacklog>> { return this.get('/v1/client/mail-backlog'); }
+    async subjectsList(family: string, options: PageOptions & { ref_prefix?: string } = {}): Promise<EnvelopeOf<SubjectsPageResult>> { const envelope = await this.get<unknown>('/v1/client/subjects' + query({ family, ...options })); return { ...envelope, value: decodeSubjectsPage(envelope.value) }; }
+    async subjectGet(reference: string): Promise<EnvelopeOf<SubjectProjectionResult>> { const envelope = await this.get<unknown>('/v1/client/subject' + query({ ref: reference })); return { ...envelope, value: decodeSubjectProjection(envelope.value) }; }
+    async subjectClaims(reference: string, options: PageOptions & { kind?: string } = {}): Promise<EnvelopeOf<SubjectClaimsPageResult>> { const envelope = await this.get<unknown>('/v1/client/subject-claims' + query({ ref: reference, ...options })); return { ...envelope, value: decodeSubjectClaimsPage(envelope.value) }; }
+    async subjectHistory(reference: string, options: PageOptions & { kind?: string } = {}): Promise<EnvelopeOf<SubjectHistoryPageResult>> { const envelope = await this.get<unknown>('/v1/client/subject-history' + query({ ref: reference, ...options })); return { ...envelope, value: decodeSubjectHistoryPage(envelope.value) }; }
+    async subjectSchemas(): Promise<EnvelopeOf<SubjectSchemas>> { const envelope = await this.get<unknown>('/v1/client/subject-schemas'); return { ...envelope, value: decodeSubjectSchemas(envelope.value) }; }
     async usagePeriod(options: { since_ms?: number; until_ms?: number } = {}): Promise<EnvelopeOf<UsagePeriod>> { return this.get('/v1/client/usage' + query(options)); }
     async clientsList(): Promise<EnvelopeOf<ClientConnections>> { return this.get('/v1/client/clients'); }
     async nowList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/now' + query(options)); }

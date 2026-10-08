@@ -324,6 +324,92 @@ unambiguous predecessor return `validation-failed`. No directory is inferred fro
 
 For the full attach, stop/start, and suspend/resume recipe, see
 [seat lifecycle](../../seat-lifecycle.md#find-a-workspace-and-return-to-an-interactive-seat).
+### Native subject projections
+
+Native identities are separate from operational resources and applied agent definitions:
+
+| Read | Route | Selector |
+| --- | --- | --- |
+| Family page | `/subjects` | required `family`, optional literal `ref_prefix` |
+| One native identity | `/subject` | required canonical `ref` |
+| Retained claims | `/subject-claims` | required `ref`, optional native `kind` |
+| Retained history | `/subject-history` | required `ref`, optional native `kind` |
+| Compiled discovery | `/subject-schemas` | none |
+
+Refs are URL-encoded query values, not path segments. Family and history pages accept bounded
+`limit` and opaque `cursor`; repeat the same selectors when continuing. All reads require
+`read.projections`. Private glasses additionally require `read.glasses` and their concrete owner.
+Absent and dynamically hidden identities are indistinguishable; internal `custom/client` identities
+and `custom.client.*` claims are never disclosed. Existing claim audiences and positive field
+policies apply before head selection, pagination, and live diffs.
+Registered families without a reviewed client identity policy, including `sekret`, default to
+denied reads while remaining represented in static discovery. New claim kinds and fields likewise
+remain withheld until explicitly selected by policy.
+
+A `SubjectProjection` carries the native `ref` (also its `id`), family, content-addressed `schema_id`,
+typed authorized claim `heads`, `heads_complete`, and an answering-host `local_fence`. Heads are
+observations, not a field-by-field reduced declaration. Missing fields remain distinct from null.
+Unsafe or unsupported payloads retain honest availability/omission metadata, never arbitrary bags.
+History merges retained replicated claims and local observations in host source-log order; its
+coverage declares actual local retention, checkpoint-prunable replicated retention, and projection
+bounds. It does not promise lifetime or fleet-wide history.
+
+Cursors bind the host, authenticated session, policy/descriptors, selectors, visibility, source
+watermarks, and retained membership. They reauthorize every continuation and expire when relevant
+retained sources disappear; a cursor is not a grant.
+
+Discovery accounts for every registered native family and includes registry/projected-schema
+digests, family/claim/resource descriptors, and the full projected JSON Schema. Rust, Swift, raw
+TypeScript, and Effect clients derive their validators from the same contract. Unknown descriptors
+become explicit payload-free unsupported-schema values; known malformed payloads fail decoding.
+Use the native `subjects` collection for bounded current windows, described in
+[`collections.md`](collections.md); retained history remains on these paged HTTP reads.
+
+#### Native source cost and retention
+
+Native source discovery reads admitted claims and local observations directly, not an
+authorization cache. Every candidate still passes the existing identity, audience,
+field-disclosure, and canonical-head policies in one pinned SQLite read snapshot.
+
+Covering source indexes contain only the subject, source position, claim ID, kind,
+recorded actor, and local graph position needed by discovery and retention checks.
+Family enumeration uses successive indexed `MIN(subject)` seeks rather than walking
+every historical row to deduplicate a bounded page. Each source independently limits
+its candidates before the ordered merge. Exclusive continuation seeks skip the previous
+subject's whole history; old fences still select only eligible retained source rows.
+
+Family fingerprints need counts, not extrema. Their claim count subtracts matching
+repair markers from the covering source count instead of probing the repair table once
+per claim. Only retained claims matching the literal family/prefix range, source fence,
+and recorded actor are subtracted; absent or out-of-selector repairs contribute nothing.
+Per-subject fingerprints retain their original count and extrema semantics.
+
+No source aggregate or aggregate-maintenance trigger remains. Source writes pay for
+ordinary index maintenance, not root/ancestor UPSERTs or block sealing. The remaining
+family count work grows with matching source rows and repair markers; this design does
+not claim history-independent fingerprint cost. Both the unchanged daemon cost probe
+and cold store generation remain the end-to-end performance gates.
+
+Pruning or repairing an unseen ref below an original fence expires its continuation.
+Later appends, deletions above either fence, and mutations outside the selected literal
+prefix or recorded actor do not expire it. Local observation IDs order their
+nondecreasing `after_store_index`: writes capture the graph's committed high water under
+the writer lock, and checkpoint pruning cannot decrease that watermark. An indexed
+graph-position seek intersects the local ID and graph fences exactly.
+
+Fingerprints preserve the original selector/fence-specific v1 encoding, keyed with the
+per-store HMAC secret: a cursor holder cannot enumerate small count spaces offline to
+recover retained membership it cannot read. Opening a main-shaped store creates the
+indexes and secret transactionally. Opening either unmerged aggregate-cache version
+drops its derived tables/triggers and creates the indexes while retaining authoritative
+source rows and the secret. Reopening or index creation alone does not invalidate an
+otherwise usable cursor. No request cache, global invalidation generation, replicated
+projection digest, or public source count is introduced.
+
+Source-contract tests compare indexed membership and cursor hashes with direct fenced
+source queries across sparse integer positions, pruning, repair/readmission, and reopen.
+Cutover tests cover main-shaped stores and both predecessor cache versions.
+
 
 ### Applied subject definitions
 

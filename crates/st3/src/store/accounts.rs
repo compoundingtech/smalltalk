@@ -161,9 +161,7 @@ impl Store {
                         .account_limits_ready()
                         .map_err(|error| error.to_string())?
                     {
-                        return Err(
-                            "account limits are catching up, try again".to_owned()
-                        );
+                        return Err("account limits are catching up, try again".to_owned());
                     }
                     let refs = bindable.iter().collect::<Vec<_>>();
                     let candidates = self

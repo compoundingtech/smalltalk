@@ -3,11 +3,12 @@ use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
 use std::collections::BTreeSet;
 
+pub(super) mod arrangements;
+pub(super) mod conversation_blocks;
 pub(super) mod raw_terminal;
 pub(super) mod resources;
 pub(super) mod search;
-pub(super) mod arrangements;
-pub(super) mod conversation_blocks;
+pub(super) mod subjects;
 mod collection_windows;
 mod collection_ivm;
 
@@ -46,6 +47,11 @@ struct CollectionSubscribe {
     capability: Option<String>,
     /// A conversation subscription names an agent or a session.
     conversation: Option<String>,
+    /// Native subject collections select one family or one canonical ref.
+    family: Option<String>,
+    ref_prefix: Option<String>,
+    #[serde(rename = "ref")]
+    subject_ref: Option<String>,
 }
 
 struct CollectionSubscription {
@@ -75,18 +81,28 @@ const COLLECTION_SEND_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
+    if collection == "subjects" {
+        return false;
+    }
     // A held window must be rechecked when its exact grant or delegated scopes change,
     // including otherwise graph-only glasses and arrangements.
     if matches!(kind, "custom.client.pairing-completed" | "custom.client.pairing-revoked") {
         return false;
     }
-    if collection == "glasses" { return !kind.starts_with("glass."); }
+    if collection == "glasses" {
+        return !kind.starts_with("glass.");
+    }
     if collection == "arrangements" {
         return !kind.starts_with("arrangement.")
-            && !matches!(kind, "custom.client.pairing-completed" | "custom.client.pairing-revoked");
+            && !matches!(
+                kind,
+                "custom.client.pairing-completed" | "custom.client.pairing-revoked"
+            );
     }
-    matches!(kind, "daemon.diagnostic" | "transport.observed" | "workspace.observed")
-        || (kind == "harness.usage" && collection != "agents")
+    matches!(
+        kind,
+        "daemon.diagnostic" | "transport.observed" | "workspace.observed"
+    ) || (kind == "harness.usage" && collection != "agents")
 }
 
 pub(super) async fn collection_stream(
@@ -109,7 +125,12 @@ pub(super) async fn collection_stream(
             "the collection WebSocket requires exactly st3.client.collections.v0",
         ));
     }
-    let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
+    let presence = super::client_presence::open_stream(
+        &state.node,
+        &session,
+        &headers,
+        super::client_now_ms(),
+    );
     Ok(websocket
         .protocols([COLLECTION_SUBPROTOCOL])
         .on_upgrade(move |socket| collection_stream_socket(socket, state, session, presence)))
@@ -134,6 +155,27 @@ async fn collection_items_with_windows(
     read_permit: tokio::sync::OwnedSemaphorePermit,
     windows: Option<Arc<collection_windows::Windows>>,
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+    if request.collection == "subjects" {
+        if request.person.is_some() || request.actor.is_some() || request.status.is_some() {
+            return Err(validation(
+                "native subjects use the paired session's disclosure policy",
+            ));
+        }
+        let limit = request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS);
+        if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
+            return Err(validation("collection limit must be 1 through 200"));
+        }
+        return subjects::collection_window(
+            state.clone(),
+            session.clone(),
+            request.family.clone(),
+            request.subject_ref.clone(),
+            request.ref_prefix.clone(),
+            limit,
+            read_permit,
+        )
+        .await;
+    }
     if !matches!(
         request.collection.as_str(),
         "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements"
@@ -602,7 +644,9 @@ fn conversation_owner_host(
             .as_ref()
             .is_none_or(|relay| !relay.reaches(owner))
         {
-            return Err(conversation_blocks::availability(remote_unavailable_for_owner(state, owner)));
+            return Err(conversation_blocks::availability(
+                remote_unavailable_for_owner(state, owner),
+            ));
         }
     }
     Ok(remote)
@@ -617,10 +661,9 @@ async fn conversation_page(
 ) -> Result<Value, ApiError> {
     const PAGE: usize = 200;
     if let Some(owner) = remote {
-        let relay = state
-            .client_relay
-            .as_ref()
-            .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(state, owner)))?;
+        let relay = state.client_relay.as_ref().ok_or_else(|| {
+            conversation_blocks::availability(remote_unavailable_for_owner(state, owner))
+        })?;
         return relay
             .read(
                 owner,
@@ -669,10 +712,9 @@ async fn conversation_changes_value(
     wait_ms: u64,
 ) -> Result<Value, ApiError> {
     if let Some(owner) = remote {
-        let relay = state
-            .client_relay
-            .as_ref()
-            .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(state, owner)))?;
+        let relay = state.client_relay.as_ref().ok_or_else(|| {
+            conversation_blocks::availability(remote_unavailable_for_owner(state, owner))
+        })?;
         return relay
             .read(
                 owner,
@@ -1024,7 +1066,19 @@ async fn collection_stream_socket_with_sources<F, Fut>(
                 subscription.reading = None;
                 if std::mem::take(&mut subscription.dirty) { refresh.push(id.clone()); }
                 let refreshed = match result {
-                    CollectionRead::Legacy(result) => deliver_collection(&mut socket, subscription, result).await,
+                    CollectionRead::Legacy(mut result) => {
+                        if subscription.request.collection == "subjects" {
+                            if let Err(error) = subjects::validate_live_session(state.clone(), session.clone()).await {
+                                result = Err(error);
+                            }
+                            if !subscription.delivered && subscription.request.subject_ref.is_some()
+                                && result.as_ref().is_ok_and(|(_, items, _): &(ClientSnapshot, Vec<Value>, bool)| items.is_empty())
+                            {
+                                result = Err(ApiError::not_found("the native subject is not available"));
+                            }
+                        }
+                        deliver_collection(&mut socket, subscription, result).await
+                    }
                     CollectionRead::Ivm(result) => deliver_ivm_collection(&mut socket, subscription, *result, &mut refresh).await,
                 };
                 match refreshed {
@@ -1060,6 +1114,8 @@ async fn collection_stream_socket_with_sources<F, Fut>(
             result = changed.changed(), if !command_waiting => {
                 if result.is_err() { return; }
                 // Weigh only the commits since the last look: a reread is due when one of them
+                // Local observations can change native heads without advancing the graph index.
+                reread_due |= subscriptions.values().any(|s| s.request.collection == "subjects");
                 // can change a held window.
                 let index = state.store.index().unwrap_or(weighed);
                 if subscriptions.values().all(|s| s.ivm.is_some()) {
@@ -1078,7 +1134,7 @@ async fn collection_stream_socket_with_sources<F, Fut>(
                     weighed = index;
                 } else if index > weighed {
                     let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims);
-                    let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses") && state.store.glasses_changed(weighed, index).unwrap_or(true);
+                    let glasses_changed = subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "glasses" | "subjects")) && state.store.glasses_changed(weighed, index).unwrap_or(true);
                     let arrangements_changed = subscriptions.values().any(|s| s.request.collection == "arrangements") && state.store.arrangements_changed(weighed, index).unwrap_or(true);
                     reread_due |= glasses_changed || arrangements_changed || match claims {
                         Err(_) => true,
@@ -1099,6 +1155,9 @@ async fn collection_stream_socket_with_sources<F, Fut>(
                 // Pairing expiry and mission lease state can change without a claim. Stable
                 // rows remain reusable; authority and local overlays are rechecked on reads.
                 refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
+            }
+            () = tokio::time::sleep(subjects::expiry_delay(&session)), if !command_waiting && subscriptions.values().any(|s| s.request.collection == "subjects") => {
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.request.collection == "subjects").map(|(id, _)| id.clone()));
             }
             _ = ping_clock.tick() => {
                 // Protocol liveness never schedules an authorized window read.
@@ -1352,11 +1411,7 @@ pub(super) async fn usage_period(
     let store = state.store.clone();
     let (mut rows, agent_messages, limits) = blocking_store(move || {
         let (rows, agent_messages) = store.usage_period_report(since_ms, until_ms)?;
-        Ok((
-            rows,
-            agent_messages,
-            store.account_limits()?,
-        ))
+        Ok((rows, agent_messages, store.account_limits()?))
     })
     .await?;
     for row in &mut rows {
@@ -1413,7 +1468,10 @@ pub(super) async fn subject_definition(
         let store = state.store.clone();
         store.read_snapshot(|index| {
             let status = store.status_at(Some(&subject), None, Some(index))?;
-            let Some(status) = status.subjects.into_iter().find(|item| item.subject == subject)
+            let Some(status) = status
+                .subjects
+                .into_iter()
+                .find(|item| item.subject == subject)
             else {
                 return Ok(None);
             };
@@ -1424,9 +1482,11 @@ pub(super) async fn subject_definition(
                 crate::graph::redact_agent_env_values(&mut desired);
             }
             let kdl = crate::graph::render_agent_desired_kdl(&desired)?;
-            let revision = status.desired_revision
+            let revision = status
+                .desired_revision
                 .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired revision"))?;
-            let token = status.desired_token
+            let token = status
+                .desired_token
                 .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired token"))?;
             let value = json!({
                 "kind": "subject-definition",
@@ -1439,12 +1499,18 @@ pub(super) async fn subject_definition(
             });
             Ok(Some((client_snapshot_at(&state, index), value)))
         })
-    }).await?;
-    let (snapshot, value) = result.ok_or_else(|| ApiError::not_found(
-        format!("subject `{}` has no applied definition", query.subject),
-    ))?;
+    })
+    .await?;
+    let (snapshot, value) = result.ok_or_else(|| {
+        ApiError::not_found(format!(
+            "subject `{}` has no applied definition",
+            query.subject
+        ))
+    })?;
     // Reserve space for the snapshot and response envelope. Definitions are never truncated.
-    if serde_json::to_vec(&value).map_err(ApiError::internal)?.len()
+    if serde_json::to_vec(&value)
+        .map_err(ApiError::internal)?
+        .len()
         > CLIENT_MAX_RESPONSE_BYTES - 4096
     {
         return Err(ApiError::bad(St3Error::new(
@@ -1656,6 +1722,8 @@ pub(super) struct ClientSession {
     pub(super) custom_forms: bool,
     pub(super) conversation_blocks: bool,
     scopes: std::collections::BTreeSet<String>,
+    /// Server-derived authority retained by native-subject subscriptions, never a client assertion.
+    pairing_binding: Option<subjects::PairingBinding>,
 }
 
 impl ClientSession {
@@ -1669,6 +1737,7 @@ impl ClientSession {
             custom_forms: true,
             conversation_blocks: false,
             scopes: std::collections::BTreeSet::new(),
+            pairing_binding: None,
         }
     }
 
@@ -1694,6 +1763,7 @@ impl ClientSession {
                     .into_iter()
                     .map(str::to_owned)
                     .collect(),
+                pairing_binding: None,
             });
         };
         // Free mode: an agent's local session holds every scope a person's does. Its actions
@@ -1706,6 +1776,7 @@ impl ClientSession {
             custom_forms,
             conversation_blocks: false,
             scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
+            pairing_binding: None,
         })
     }
 
@@ -1718,6 +1789,7 @@ impl ClientSession {
             custom_forms: false,
             conversation_blocks: false,
             scopes: std::collections::BTreeSet::new(),
+            pairing_binding: None,
         }
     }
 
@@ -1826,7 +1898,9 @@ pub(super) fn authenticate(
         .get("x-st3-features")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| {
-            value.split(',').any(|feature| feature.trim() == "custom-subjects.v1")
+            value
+                .split(',')
+                .any(|feature| feature.trim() == "custom-subjects.v1")
         });
     let conversation_blocks = request
         .headers()
@@ -1902,18 +1976,37 @@ fn paired_client_session(
     transport: &'static str,
     custom_forms: bool,
 ) -> Result<ClientSession, ApiError> {
-    let revoked = state.store.claims_for_subject_kind_at(
-        &paired.subject, "custom.client.pairing-revoked", None, true, 1,
-    ).map_err(ApiError::internal)?.claims.first()
+    let revoked = state
+        .store
+        .claims_for_subject_kind_at(
+            &paired.subject,
+            "custom.client.pairing-revoked",
+            None,
+            true,
+            1,
+        )
+        .map_err(ApiError::internal)?
+        .claims
+        .first()
         .is_some_and(|claim| claim.store_index > paired.store_index);
-    let expires_at = paired.body.pointer("/fields/expires_at_unix_ms")
-        .and_then(Value::as_u64).map(u128::from).unwrap_or_default();
+    let expires_at = paired
+        .body
+        .pointer("/fields/expires_at_unix_ms")
+        .and_then(Value::as_u64)
+        .map(u128::from)
+        .unwrap_or_default();
     if revoked || expires_at <= client_now_ms() {
         return Err(forbidden("the client credential was revoked or expired"));
     }
-    let actor = paired.body.pointer("/fields/session_actor").and_then(Value::as_str)
+    let actor = paired
+        .body
+        .pointer("/fields/session_actor")
+        .and_then(Value::as_str)
         .ok_or_else(|| ApiError::internal("a paired client has no derived actor"))?;
-    let authority_actor = paired.body.pointer("/fields/person_id").and_then(Value::as_str)
+    let authority_actor = paired
+        .body
+        .pointer("/fields/person_id")
+        .and_then(Value::as_str)
         .filter(|actor| actor.starts_with("person/") && actor.matches('/').count() == 1)
         .ok_or_else(|| ApiError::internal("a paired client has no concrete delegated person"))?;
     let scopes = paired
@@ -1933,12 +2026,20 @@ fn paired_client_session(
         custom_forms,
         conversation_blocks: false,
         scopes,
+        pairing_binding: Some(subjects::PairingBinding {
+            claim_id: paired.id.clone(),
+            subject: paired.subject.clone(),
+            expires_at_unix_ms: expires_at,
+        }),
     })
 }
 
 /// Held collection sockets carry no bearer secret. Re-resolve their session grant at each
 /// arrangement read, using the same expiration/revocation checks as HTTP authentication.
-fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<ClientSession, ApiError> {
+fn revalidate_session(
+    state: &AppState,
+    session: &ClientSession,
+) -> Result<ClientSession, ApiError> {
     if session.transport == "unix" && acting_party(session) {
         return Ok(session.clone());
     }
@@ -4000,7 +4101,11 @@ pub(super) async fn clients_list(
     // A paired phone acts as person/NAME/session/ID: name its device.
     let people = items
         .iter()
-        .filter(|item| item["actor"].as_str().is_some_and(|actor| actor.contains("/session/")))
+        .filter(|item| {
+            item["actor"]
+                .as_str()
+                .is_some_and(|actor| actor.contains("/session/"))
+        })
         .filter_map(|item| item["person"].as_str().map(str::to_owned))
         .filter(|person| person.starts_with("person/"))
         .collect::<BTreeSet<_>>();
@@ -4008,7 +4113,10 @@ pub(super) async fn clients_list(
     for person in people {
         for device in device_resources(&state, &snapshot, &person)? {
             if let Some(actor) = device["session_actor"].as_str() {
-                devices.insert(actor.to_owned(), (device["id"].clone(), device["name"].clone()));
+                devices.insert(
+                    actor.to_owned(),
+                    (device["id"].clone(), device["name"].clone()),
+                );
             }
         }
     }
@@ -4057,7 +4165,10 @@ pub(super) async fn status_history(
     require_scope(&session, "read.projections")?;
     let subject = client_detail_id("agent", &id);
     let store = state.store.clone();
-    let history = blocking_store(move || store.seat_status_history_at(&subject, client_now_ms(), snapshot.store_index)).await?;
+    let history = blocking_store(move || {
+        store.seat_status_history_at(&subject, client_now_ms(), snapshot.store_index)
+    })
+    .await?;
     Ok(Json(history))
 }
 
@@ -4133,7 +4244,6 @@ fn timeline_attribution(owner: &str, desired: &[crate::model::DesiredSubject]) -
         "step_id": ownership.and_then(|value| value.owner_step.as_deref()),
     })
 }
-
 
 fn normalized_timeline_usage_body(
     body: Value,
@@ -4713,7 +4823,9 @@ pub(super) fn timeline_value(
             query,
         )?;
         for item in &mut page.items {
-            if !session.conversation_blocks && let Some(body) = item["body"].as_object_mut() {
+            if !session.conversation_blocks
+                && let Some(body) = item["body"].as_object_mut()
+            {
                 body.remove("blocks");
             }
         }
@@ -4807,18 +4919,30 @@ fn timeline_first_page(
     });
     // The oldest physical row, not a query cursor, establishes missing prefix history.
     let oldest = if let Some(incarnation) = incarnation {
-        state.store.timeline_claims_for_incarnation_at(owner, incarnation, before, false, 1)
-            .map_err(ApiError::internal)?.claims.pop()
+        state
+            .store
+            .timeline_claims_for_incarnation_at(owner, incarnation, before, false, 1)
+            .map_err(ApiError::internal)?
+            .claims
+            .pop()
     } else {
         None
     };
-    let missing_prefix_through = oldest.as_ref().and_then(|claim| {
-        claim.body.pointer("/fields/sequence").and_then(Value::as_u64)
-    }).unwrap_or(1).saturating_sub(1);
+    let missing_prefix_through = oldest
+        .as_ref()
+        .and_then(|claim| {
+            claim
+                .body
+                .pointer("/fields/sequence")
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(1)
+        .saturating_sub(1);
     let prefix_unavailable = if let Some(incarnation) = incarnation {
-        !state.store.timeline_retention_is_explicit_at(
-            owner, incarnation, before, missing_prefix_through,
-        ).map_err(ApiError::internal)?
+        !state
+            .store
+            .timeline_retention_is_explicit_at(owner, incarnation, before, missing_prefix_through)
+            .map_err(ApiError::internal)?
     } else {
         false
     };
@@ -4840,17 +4964,24 @@ fn timeline_first_page(
         missing
     };
     let appends = if has_older_timeline && !missing_appends.is_empty() {
-        state.store.timeline_entry_append_positions_at(
-            owner, incarnation.unwrap_or_default(), &missing_appends, before,
-        ).map_err(ApiError::internal)?
+        state
+            .store
+            .timeline_entry_append_positions_at(
+                owner,
+                incarnation.unwrap_or_default(),
+                &missing_appends,
+                before,
+            )
+            .map_err(ApiError::internal)?
     } else {
         BTreeMap::new()
     };
     let mut omitted_updates = BTreeSet::new();
     for entry_id in missing_appends {
-        if appends.get(&entry_id).is_some_and(|append| {
-            window_start.is_some_and(|start| *append < start)
-        }) {
+        if appends
+            .get(&entry_id)
+            .is_some_and(|append| window_start.is_some_and(|start| *append < start))
+        {
             // An entry outside this view is not absent from retained storage.
             // Never fabricate its latest revision without intervening operations.
             omitted_updates.insert(entry_id);
@@ -4868,7 +4999,9 @@ fn timeline_first_page(
     }
     timeline_claims.retain(|claim| {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
-        !fields.get("entry_id").and_then(Value::as_str)
+        !fields
+            .get("entry_id")
+            .and_then(Value::as_str)
             .is_some_and(|entry| omitted_updates.contains(entry))
     });
     let mut owner_claims = state
@@ -5348,8 +5481,11 @@ fn conversation_read_now_unbounded(
             {
                 changed_indexes.insert(claim.store_index);
                 if claim.kind == "harness.timeline" {
-                    retention_changed |= claim.body.pointer("/fields/entry_type")
-                        .and_then(Value::as_str) == Some("truncation");
+                    retention_changed |= claim
+                        .body
+                        .pointer("/fields/entry_type")
+                        .and_then(Value::as_str)
+                        == Some("truncation");
                     if let Some(id) = claim
                         .body
                         .pointer("/fields/entry_id")
@@ -5378,8 +5514,11 @@ fn conversation_read_now_unbounded(
             if claim.subject == owner.as_deref().unwrap_or_default()
                 && claim.kind == "harness.timeline"
             {
-                retention_changed |= claim.body.pointer("/fields/entry_type")
-                    .and_then(Value::as_str) == Some("truncation");
+                retention_changed |= claim
+                    .body
+                    .pointer("/fields/entry_type")
+                    .and_then(Value::as_str)
+                    == Some("truncation");
                 if let Some(id) = claim
                     .body
                     .pointer("/fields/entry_id")
@@ -5398,7 +5537,8 @@ fn conversation_read_now_unbounded(
             code: "cursor-gap".into(),
             message: "transcript retention changed; refresh the newest conversation page".into(),
             details: Box::new(serde_json::Map::from_iter([(
-                "full_resync".into(), Value::Bool(true),
+                "full_resync".into(),
+                Value::Bool(true),
             )])),
         });
     }
@@ -5496,10 +5636,15 @@ type TranscriptSeen = Option<(u64, std::time::SystemTime)>;
 type HashMap<K, V> = std::collections::HashMap<K, V>;
 const ISSUED_CURSORS: usize = 4096;
 
-fn issued_cursors()
--> &'static std::sync::Mutex<(std::collections::VecDeque<String>, HashMap<String, TranscriptSeen>)> {
+fn issued_cursors() -> &'static std::sync::Mutex<(
+    std::collections::VecDeque<String>,
+    HashMap<String, TranscriptSeen>,
+)> {
     static ISSUED: std::sync::OnceLock<
-        std::sync::Mutex<(std::collections::VecDeque<String>, HashMap<String, TranscriptSeen>)>,
+        std::sync::Mutex<(
+            std::collections::VecDeque<String>,
+            HashMap<String, TranscriptSeen>,
+        )>,
     > = std::sync::OnceLock::new();
     ISSUED.get_or_init(Default::default)
 }
@@ -5657,7 +5802,9 @@ async fn conversation_changes_local(
         };
         if !since.changed(state)? {
             mark = since;
-            quiet = Some(json!({"kind":"conversation-changes", "session_id":session_id, "items":[], "next_cursor":cursor}));
+            quiet = Some(
+                json!({"kind":"conversation-changes", "session_id":session_id, "items":[], "next_cursor":cursor}),
+            );
         }
     }
     loop {
@@ -5728,10 +5875,9 @@ pub(super) async fn conversation_changes(
                 ));
             }
             let owner = client_host_id(&origin);
-            let relay = state
-                .client_relay
-                .as_ref()
-                .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(&state, &owner)))?;
+            let relay = state.client_relay.as_ref().ok_or_else(|| {
+                conversation_blocks::availability(remote_unavailable_for_owner(&state, &owner))
+            })?;
             let mut value = relay
                 .read(
                     &owner,
@@ -5804,18 +5950,26 @@ pub(super) async fn conversation_stream(
             .as_ref()
             .is_none_or(|relay| !relay.reaches(owner))
         {
-            return Err(conversation_blocks::availability(remote_unavailable_for_owner(&state, owner)));
+            return Err(conversation_blocks::availability(
+                remote_unavailable_for_owner(&state, owner),
+            ));
         }
     } else {
         conversation_read_now(&state, &session, &session_id, query.after.as_deref())?;
     }
-    let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
+    let presence = super::client_presence::open_stream(
+        &state.node,
+        &session,
+        &headers,
+        super::client_now_ms(),
+    );
     presence.follow("conversation", format!("conversation:{id}"));
     Ok(websocket
         .protocols([CONVERSATION_SUBPROTOCOL])
         .on_upgrade(move |socket| async move {
             let _presence = presence;
-            conversation_stream_socket(socket, state, session, session_id, query.after, remote).await
+            conversation_stream_socket(socket, state, session, session_id, query.after, remote)
+                .await
         }))
 }
 
@@ -5831,10 +5985,9 @@ async fn conversation_stream_socket(
         let after_input = after.clone();
         let read = async {
             if let Some(owner) = &remote {
-                let relay = state
-                    .client_relay
-                    .as_ref()
-                    .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(&state, owner)))?;
+                let relay = state.client_relay.as_ref().ok_or_else(|| {
+                    conversation_blocks::availability(remote_unavailable_for_owner(&state, owner))
+                })?;
                 relay
                     .read(
                         owner,
@@ -6343,7 +6496,9 @@ pub(super) async fn pairing_begin(
                 )));
             }
             if requested.is_empty() {
-                return Err(validation("the pairing request must name at least one scope"));
+                return Err(validation(
+                    "the pairing request must name at least one scope",
+                ));
             }
             // Canonical order, duplicates dropped.
             LIMITED_PAIRING_SCOPES
@@ -6573,7 +6728,9 @@ pub(super) async fn pairing_complete(
                 rusqlite::params![person_id, key], |row| row.get(0),
             ).map_err(ApiError::internal)?;
             if revoked {
-                return Err(validation("the device signing key was revoked; the pairing code was not consumed. Retry with a fresh signing key"));
+                return Err(validation(
+                    "the device signing key was revoked; the pairing code was not consumed. Retry with a fresh signing key",
+                ));
             }
             let name = begun
                 .body
@@ -6711,7 +6868,10 @@ fn remote_terminal_live_session(
     expected_incarnation: &str,
 ) -> Result<LiveSession, ApiError> {
     let _span = crate::profile::span("terminal/live-fence");
-    let selected = state.store.runtime_authority(subject).map_err(ApiError::internal)?
+    let selected = state
+        .store
+        .runtime_authority(subject)
+        .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no live session")))?;
     if !matches!(selected.reachability.as_str(), "reachable" | "local") {
         return Err(terminal_unavailable("the terminal owner is not reachable"));
@@ -7028,13 +7188,20 @@ pub(super) async fn terminal_stream(
         query.incarnation.as_deref(),
         stream_capability,
     )?;
-    let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
+    let presence = super::client_presence::open_stream(
+        &state.node,
+        &session,
+        &headers,
+        super::client_now_ms(),
+    );
     presence.follow("terminal", format!("terminal:{id}"));
     Ok(websocket
         .protocols([TERMINAL_SUBPROTOCOL])
         .on_upgrade(move |socket| async move {
             let _presence = presence;
-            follow.run(state, TerminalSink::Socket(Box::new(socket))).await
+            follow
+                .run(state, TerminalSink::Socket(Box::new(socket)))
+                .await
         }))
 }
 
@@ -7196,7 +7363,8 @@ async fn remote_terminal_stream_socket(
     incarnation: String,
 ) {
     let Some(relay) = state.client_relay.as_ref() else {
-        sink.fail(&remote_unavailable_for_owner(&state, &owner)).await;
+        sink.fail(&remote_unavailable_for_owner(&state, &owner))
+            .await;
         return;
     };
     let terminal_id = client_detail_id("terminal", &id);
@@ -7604,9 +7772,9 @@ fn consume_terminal_attachment_mode(
         .ok_or_else(|| forbidden("the terminal stream capability is unknown"))?;
     drop(lookup_span);
     let field = |name: &str| attached.body.pointer(&format!("/fields/{name}"));
-    let raw_live = raw_mode.map(|_| {
-        remote_terminal_live_session(state, &terminal_subject(terminal_id), incarnation)
-    }).transpose()?;
+    let raw_live = raw_mode
+        .map(|_| remote_terminal_live_session(state, &terminal_subject(terminal_id), incarnation))
+        .transpose()?;
     let valid = is_current
         && attached.origin == state.store.origin()
         && field("session_actor").and_then(Value::as_str) == Some(session.actor.as_str())
@@ -7783,7 +7951,11 @@ async fn close_terminal_stream_with_error(socket: &mut WebSocket, error: &ApiErr
 }
 
 fn terminal_error_close_code(code: &str) -> u16 {
-    if matches!(code, "internal" | "database-busy" | "database-locked") { 1011 } else { 1008 }
+    if matches!(code, "internal" | "database-busy" | "database-locked") {
+        1011
+    } else {
+        1008
+    }
 }
 
 /// Hold an owner-local terminal stream open. The first message is the current screen; every
@@ -8779,8 +8951,14 @@ async fn dispatch_action(
                     from: authority_actor.clone(),
                     to,
                     // An attachment may travel alone; text is then optional.
-                    content: if p.get("attachments").is_some_and(|value| value.as_array().is_some_and(|list| !list.is_empty())) {
-                        p.get("content").and_then(Value::as_str).unwrap_or_default().to_owned()
+                    content: if p
+                        .get("attachments")
+                        .is_some_and(|value| value.as_array().is_some_and(|list| !list.is_empty()))
+                    {
+                        p.get("content")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned()
                     } else {
                         parameter_string(p, "content")?
                     },
@@ -9367,7 +9545,11 @@ async fn dispatch_action(
                 actor: authority_actor.clone(),
                 idempotency_key: request.idempotency_key.clone(),
                 reason,
-                host: if action == "agent.resume" { p.get("host").and_then(Value::as_str).map(str::to_owned) } else { None },
+                host: if action == "agent.resume" {
+                    p.get("host").and_then(Value::as_str).map(str::to_owned)
+                } else {
+                    None
+                },
             };
             let fence = super::SuspensionFence {
                 incarnation,
@@ -9581,8 +9763,16 @@ async fn dispatch_action(
                 })
                 .map_err(ApiError::bad)?;
             // A revoked device's key signs nothing more, on every member.
-            let field = |name: &str| paired.body.pointer(&format!("/fields/{name}")).and_then(Value::as_str);
-            if let (Some(key), Some(person)) = (field("device_public_key").and_then(device_signing_key), field("person_id")) {
+            let field = |name: &str| {
+                paired
+                    .body
+                    .pointer(&format!("/fields/{name}"))
+                    .and_then(Value::as_str)
+            };
+            if let (Some(key), Some(person)) = (
+                field("device_public_key").and_then(device_signing_key),
+                field("person_id"),
+            ) {
                 state
                     .store
                     .revoke_device_key(person, key, &format!("pairing of {device} revoked"))
@@ -10147,6 +10337,456 @@ mod tests {
     }
 
     #[test]
+    fn canceled_native_subscription_keeps_its_queued_physical_read_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe", "id":"native", "collection":"subjects", "family":"custom",
+        }))
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            started.send(()).unwrap();
+            held.recv().unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        runtime.block_on(async {
+            let slots = Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = slots.clone().acquire_owned().await.unwrap();
+            let mut read = Box::pin(collection_items(&state, &session, &request, permit));
+            // The sole blocking worker is held, so polling queues the real native SQLite read.
+            assert!(futures_util::poll!(read.as_mut()).is_pending());
+            drop(read);
+            let available = slots.available_permits();
+            release.send(()).unwrap();
+            assert_eq!(
+                available, 0,
+                "subscription cancellation released a queued native read slot"
+            );
+            let restored = tokio::time::timeout(Duration::from_secs(5), slots.acquire_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            drop(restored);
+        });
+        runtime.block_on(blocker).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_subject_projection_hides_other_actor_heads_and_internal_refs() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let append = |subject: &str, actor: &str, value: &str| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "custom.team.record".into(),
+                    actor: Some(actor.into()),
+                    fields: BTreeMap::from([
+                        ("value".into(), json!(value)),
+                        ("nullable".into(), Value::Null),
+                        (
+                            "nested".into(),
+                            json!({"arbitrary":[1, true, "writer-owned"]}),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let own = append("custom/team/shared", "person/alex", "own-head");
+        append("custom/team/shared", "person/ada", "private-newer");
+        append("custom/team/other", "person/ada", "private-only");
+        append("custom/client/private", "person/alex", "internal");
+        let app = super::super::router(state.clone());
+        let read = |uri: String| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header(LOCAL_PERSON_HEADER, "person/alex")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                    .await
+                    .unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        let (status, subject) = read("/v1/client/subject?ref=custom%2Fteam%2Fshared".into()).await;
+        assert_eq!(status, StatusCode::OK, "{subject}");
+        assert_eq!(subject["value"]["heads"][0]["id"], own.id);
+        assert_eq!(subject["value"]["heads"][0]["fields"]["value"], "own-head");
+        assert_eq!(
+            subject["value"]["heads"][0]["fields"]["nullable"],
+            Value::Null
+        );
+        assert!(
+            subject["value"]["heads"][0]["fields"]
+                .get("absent")
+                .is_none()
+        );
+        assert_eq!(
+            subject["value"]["heads"][0]["fields"]["nested"],
+            json!({"arbitrary":[1,true,"writer-owned"]})
+        );
+        let (status, page) = read("/v1/client/subjects?family=custom".into()).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["value"]["items"], json!([subject["value"]]));
+        for reference in ["custom%2Fteam%2Fother", "custom%2Fteam%2Fmissing"] {
+            let (status, hidden) = read(format!("/v1/client/subject?ref={reference}")).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
+        }
+        let (status, internal) =
+            read("/v1/client/subject?ref=custom%2Fclient%2Fprivate".into()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{internal}");
+        let (status, history) =
+            read("/v1/client/subject-history?ref=custom%2Fteam%2Fshared".into()).await;
+        assert_eq!(status, StatusCode::OK, "{history}");
+        assert_eq!(
+            history["value"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|claim| claim["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [own.id.as_str()]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_subject_history_fences_continuation_and_revalidates_pairing() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "custom/team/history";
+        let append = |reference: &str, actor: &str, value: &str| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: reference.into(),
+                    kind: "custom.team.record".into(),
+                    actor: Some(actor.into()),
+                    fields: BTreeMap::from([("value".into(), json!(value))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let first = append(subject, "person/alex", "first");
+        append(subject, "person/ada", "foreign-history");
+        let second = append(subject, "person/alex", "second");
+        append(subject, "person/ada", "foreign-head");
+        append("custom/team/other", "person/alex", "own-other");
+        append("custom/team/private", "person/ada", "foreign-only");
+        let credential = "subject-test-credential";
+        let pairing_ref = "custom/client/subject-test";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: pairing_ref.into(),
+                kind: "custom.client.pairing-completed".into(),
+                actor: Some("person/alex".into()),
+                fields: BTreeMap::from([
+                    (
+                        "credential_hash".into(),
+                        json!(credential_digest(credential)),
+                    ),
+                    (
+                        "session_actor".into(),
+                        json!("person/alex/session/subject-test-device"),
+                    ),
+                    ("person_id".into(), json!("person/alex")),
+                    ("scopes".into(), json!(["read.projections"])),
+                    (
+                        "expires_at_unix_ms".into(),
+                        json!(client_now_ms() as u64 + 60_000),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let app = super::super::fabric_router(state.clone());
+        let read = |uri: String| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header(AUTHORIZATION, format!("Bearer {credential}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                    .await
+                    .unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        let (status, projection) =
+            read("/v1/client/subject?ref=custom%2Fteam%2Fhistory".into()).await;
+        assert_eq!(status, StatusCode::OK, "{projection}");
+        assert_eq!(projection["value"]["heads"][0]["id"], second.id);
+        assert_eq!(projection["value"]["heads"][0]["fields"]["value"], "second");
+        let (status, hidden) = read("/v1/client/subject?ref=custom%2Fteam%2Fprivate".into()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
+        let (status, family) =
+            read("/v1/client/subjects?family=custom&ref_prefix=custom%2Fteam%2F&limit=1".into())
+                .await;
+        assert_eq!(status, StatusCode::OK, "{family}");
+        assert_eq!(family["value"]["items"], json!([projection["value"]]));
+        assert_eq!(family["value"]["page"]["has_more"], true);
+        let family_cursor =
+            urlencoding::encode(family["value"]["page"]["next_cursor"].as_str().unwrap());
+        let (status, family_continuation) = read(format!(
+            "/v1/client/subjects?family=custom&ref_prefix=custom%2Fteam%2F&limit=1&cursor={family_cursor}"
+        )).await;
+        assert_eq!(status, StatusCode::OK, "{family_continuation}");
+        assert_eq!(
+            family_continuation["value"]["items"][0]["ref"],
+            "custom/team/other"
+        );
+        assert_eq!(family_continuation["value"]["page"]["has_more"], false);
+        let filter = "ref=custom%2Fteam%2Fhistory&limit=1";
+        let (status, page) = read(format!("/v1/client/subject-history?{filter}")).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["value"]["items"][0]["id"], second.id);
+        assert_eq!(page["value"]["page"]["has_more"], true);
+        append(subject, "person/alex", "after-fence");
+        let cursor = urlencoding::encode(page["value"]["page"]["next_cursor"].as_str().unwrap());
+        let (status, continuation) = read(format!(
+            "/v1/client/subject-history?{filter}&cursor={cursor}"
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{continuation}");
+        assert_eq!(continuation["value"]["items"][0]["id"], first.id);
+        assert_eq!(continuation["value"]["page"]["has_more"], false);
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: pairing_ref.into(),
+                kind: "custom.client.pairing-revoked".into(),
+                actor: Some("person/alex".into()),
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let (status, revoked) = read(format!("/v1/client/subject-history?{filter}")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{revoked}");
+    }
+
+    #[tokio::test]
+    async fn native_subject_stream_refuses_hidden_refs_and_revoked_delayed_results() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        for (subject, actor) in [
+            ("custom/team/visible", "person/alex"),
+            ("custom/team/private", "person/ada"),
+        ] {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "custom.team.record".into(),
+                    actor: Some(actor.into()),
+                    fields: BTreeMap::from([("value".into(), json!("private payload"))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let credential = "native-stream-credential";
+        let pairing_ref = "custom/client/native-stream";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: pairing_ref.into(),
+                kind: "custom.client.pairing-completed".into(),
+                actor: Some("person/alex".into()),
+                fields: BTreeMap::from([
+                    (
+                        "credential_hash".into(),
+                        json!(credential_digest(credential)),
+                    ),
+                    (
+                        "session_actor".into(),
+                        json!("person/alex/session/native-stream-device"),
+                    ),
+                    ("person_id".into(), json!("person/alex")),
+                    ("scopes".into(), json!(["read.projections"])),
+                    (
+                        "expires_at_unix_ms".into(),
+                        json!(client_now_ms() as u64 + 60_000),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let request = Request::builder()
+            .uri("/v1/client/collections/stream")
+            .header(AUTHORIZATION, format!("Bearer {credential}"))
+            .body(Body::empty())
+            .unwrap();
+        let session = authenticate(&state, &request, "fabric-loopback").unwrap();
+        let (release, held) = tokio::sync::watch::channel(false);
+        let (ready, mut reads) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get({
+                let state = state.clone();
+                move |upgrade: WebSocketUpgrade| {
+                    let (state, session, held, ready) =
+                        (state.clone(), session.clone(), held.clone(), ready.clone());
+                    async move {
+                        upgrade.on_upgrade(move |socket| {
+                            collection_stream_socket_with_reader(
+                                socket,
+                                state,
+                                session,
+                                None,
+                                move |state, session, request, permit| {
+                                    let (mut held, ready) = (held.clone(), ready.clone());
+                                    async move {
+                                        // Exercise the production windows-aware dispatch, including
+                                        // its native fast path and post-change grant revalidation.
+                                        let result = collection_items_with_windows(
+                                            &state,
+                                            &session,
+                                            &request,
+                                            permit,
+                                            collection_windows::Windows::attach(&state.store),
+                                        ).await;
+                                        if request.id == "held" {
+                                            assert!(result.as_ref().is_ok_and(|(_, items, _)| {
+                                                items
+                                                    .iter()
+                                                    .any(|item| item["id"] == "custom/team/visible")
+                                            }));
+                                            ready.send(()).unwrap();
+                                            held.wait_for(|released| *released).await.unwrap();
+                                        }
+                                        result
+                                    }
+                                },
+                            )
+                        })
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await
+            .unwrap();
+        for (id, reference) in [
+            ("private", "custom/team/private"),
+            ("missing", "custom/team/missing"),
+        ] {
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"kind":"subscribe","id":id,"collection":"subjects","ref":reference})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["id"], id);
+            assert_eq!(frame["kind"], "error");
+            assert_eq!(frame["code"], "not-found");
+            assert_eq!(frame["retryable"], false);
+            assert!(frame.get("items").is_none());
+        }
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"held","collection":"subjects","ref":"custom/team/visible"})
+                .to_string().into(),
+        )).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reads.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"other","collection":"work"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "other");
+        assert_eq!(frame["kind"], "snapshot");
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: pairing_ref.into(),
+                kind: "custom.client.pairing-revoked".into(),
+                actor: Some("person/alex".into()),
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        release.send(true).unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "held");
+        assert_eq!(frame["kind"], "error");
+        assert_eq!(frame["code"], "forbidden");
+        assert_eq!(frame["retryable"], false);
+        assert!(frame.get("items").is_none());
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[test]
     fn missions_first_page_has_bounded_queries_with_thousands_of_definitions() {
         let root = tempfile::tempdir().unwrap();
         let db = root.path().join("large.sqlite");
@@ -10212,10 +10852,14 @@ mod tests {
     #[test]
     fn terminal_contention_preserves_retryable_code_and_service_close() {
         for code in ["database-busy", "database-locked"] {
-            let envelope = terminal_stream_error(&ApiError::bad(St3Error::new(code, "fixture contention")));
+            let envelope =
+                terminal_stream_error(&ApiError::bad(St3Error::new(code, "fixture contention")));
             assert_eq!(envelope["code"], code);
             assert_eq!(envelope["retryable"], true);
-            assert_eq!(terminal_error_close_code(envelope["code"].as_str().unwrap()), 1011);
+            assert_eq!(
+                terminal_error_close_code(envelope["code"].as_str().unwrap()),
+                1011
+            );
         }
         assert_eq!(terminal_error_close_code("internal"), 1011);
         assert_eq!(terminal_error_close_code("stale-incarnation"), 1008);
@@ -10230,6 +10874,16 @@ mod tests {
         schema["$ref"] = json!("#/$defs/CollectionFrame");
         let validator = jsonschema::options()
             .with_draft(jsonschema::Draft::Draft202012)
+            .with_resource(
+                "https://st3.local/schemas/subject-projection.schema.json",
+                jsonschema::Resource::from_contents(
+                    serde_json::from_str(include_str!(
+                        "../../../../docs/st3/client-v0/schemas/subject-projection.schema.json"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
             .build(&schema)
             .unwrap();
         let errors: Vec<_> = validator
@@ -10380,22 +11034,49 @@ mod tests {
         let state = test_state(root.path());
         let subject = "agent/todo-worker";
         let append = |kind: &str, fields: Value| {
-            state.store.append_claim(&ClaimInput {
-                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
-                fields: fields.as_object().unwrap().iter()
-                    .map(|(key, value)| (key.clone(), value.clone())).collect(),
-                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-            }).unwrap()
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some(subject.into()),
+                    fields: fields
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
         };
-        assert!(agent_todo(&state.store, subject, Some("one"), state.store.index().unwrap()).unwrap().is_null());
-        append("runtime.observed", json!({
-            "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
-        }));
-        append("harness.session-file", json!({
-            "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/session"
-        }));
+        assert!(
+            agent_todo(
+                &state.store,
+                subject,
+                Some("one"),
+                state.store.index().unwrap()
+            )
+            .unwrap()
+            .is_null()
+        );
+        append(
+            "runtime.observed",
+            json!({
+                "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
+            }),
+        );
+        append(
+            "harness.session-file",
+            json!({
+                "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/session"
+            }),
+        );
         let before = state.store.index().unwrap();
-        let cached = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
+        let cached =
+            client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
         assert!(cached.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
         let snapshot = json!({
             "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
@@ -10406,31 +11087,60 @@ mod tests {
         let first = append("harness.todo.observed", snapshot.clone());
         assert!(crate::store::local_observation_position(&first).is_none());
         assert!(state.store.index().unwrap() > before);
-        let old = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
+        let old =
+            client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
         assert!(old.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
-        let refreshed = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", first.store_index).unwrap();
-        assert_eq!(refreshed.iter().find(|agent| agent["id"] == subject).unwrap()["todo"]["snapshot"], snapshot);
-        let first_value = agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap();
+        let refreshed = client_agent_resources(
+            &state.store,
+            true,
+            "2026-10-03T09:00:00Z",
+            first.store_index,
+        )
+        .unwrap();
+        assert_eq!(
+            refreshed
+                .iter()
+                .find(|agent| agent["id"] == subject)
+                .unwrap()["todo"]["snapshot"],
+            snapshot
+        );
+        let first_value =
+            agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap();
         assert_eq!(first_value["snapshot"], snapshot);
         assert_eq!(first_value["claim_id"], first.id);
         assert_eq!(first_value["stale"], false);
-        assert_eq!(agent_todo(&state.store, subject, Some("two"), first.store_index).unwrap()["stale"], true);
+        assert_eq!(
+            agent_todo(&state.store, subject, Some("two"), first.store_index).unwrap()["stale"],
+            true
+        );
         let mut empty = snapshot;
         empty["phases"] = json!([]);
         empty["totals"]["blocked"] = json!(0);
         empty["truncated"] = json!(true);
-        append("harness.session-file", json!({
-            "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/fence"
-        }));
+        append(
+            "harness.session-file",
+            json!({
+                "harness":"omp", "agent":subject, "session_id":"native-one", "path":"/tmp/fence"
+            }),
+        );
         let second = append("harness.todo.observed", empty.clone());
         let latest = agent_todo(&state.store, subject, Some("one"), second.store_index).unwrap();
         assert_eq!(latest["snapshot"], empty);
         assert_eq!(latest["claim_id"], second.id);
-        assert_eq!(agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap()["claim_id"], first.id);
-        let changed = append("harness.session-file", json!({
-            "harness":"omp", "agent":subject, "session_id":"native-two", "path":"/tmp/session"
-        }));
-        assert_eq!(agent_todo(&state.store, subject, Some("one"), changed.store_index).unwrap()["stale"], true);
+        assert_eq!(
+            agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap()["claim_id"],
+            first.id
+        );
+        let changed = append(
+            "harness.session-file",
+            json!({
+                "harness":"omp", "agent":subject, "session_id":"native-two", "path":"/tmp/session"
+            }),
+        );
+        assert_eq!(
+            agent_todo(&state.store, subject, Some("one"), changed.store_index).unwrap()["stale"],
+            true
+        );
     }
 
     #[test]
@@ -10439,30 +11149,49 @@ mod tests {
         let state = test_state(root.path());
         let subject = "agent/malformed-todo";
         let append = |kind: &str, fields: Value| {
-            state.store.append_claim(&ClaimInput {
-                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
-                fields: serde_json::from_value(fields).unwrap(),
-                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-            }).unwrap()
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some(subject.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
         };
-        append("runtime.observed", json!({
-            "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
-        }));
-        let claim = append("harness.todo.observed", json!({
-            "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
-            "observed_at":"2026-10-03T09:00:00Z", "source_op":"clear",
-            "phases":[], "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0},
-            "truncated":false
-        }));
+        append(
+            "runtime.observed",
+            json!({
+                "status":"running", "runtime_id":"todo-runtime", "incarnation_id":"one"
+            }),
+        );
+        let claim = append(
+            "harness.todo.observed",
+            json!({
+                "harness":"omp", "session_id":"native-one", "incarnation_id":"one",
+                "observed_at":"2026-10-03T09:00:00Z", "source_op":"clear",
+                "phases":[], "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0},
+                "truncated":false
+            }),
+        );
         // Simulate an older or corrupt replicated record beyond the typed writer boundary.
         let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
-        connection.execute(
-            "UPDATE claims SET body=json_set(body, '$.fields.unrecognized', 1) WHERE id=?1",
-            [&claim.id],
-        ).unwrap();
+        connection
+            .execute(
+                "UPDATE claims SET body=json_set(body, '$.fields.unrecognized', 1) WHERE id=?1",
+                [&claim.id],
+            )
+            .unwrap();
         let items = client_agent_resources(
-            &state.store, true, "2026-10-03T09:00:00Z", state.store.index().unwrap(),
-        ).unwrap();
+            &state.store,
+            true,
+            "2026-10-03T09:00:00Z",
+            state.store.index().unwrap(),
+        )
+        .unwrap();
         assert!(items.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
     }
 
@@ -10472,7 +11201,9 @@ mod tests {
         struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
         impl Drop for Dropped {
             fn drop(&mut self) {
-                if let Some(sender) = self.0.take() { let _ = sender.send(()); }
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
             }
         }
         for replace in [true, false] {
@@ -10485,27 +11216,49 @@ mod tests {
             let app = axum::Router::new().route(
                 "/stream",
                 axum::routing::get(move |upgrade: WebSocketUpgrade| {
-                    let (state, held, dropped, entered, completed) =
-                        (state.clone(), held.clone(), dropped.clone(), entered.clone(), completed.clone());
+                    let (state, held, dropped, entered, completed) = (
+                        state.clone(),
+                        held.clone(),
+                        dropped.clone(),
+                        entered.clone(),
+                        completed.clone(),
+                    );
                     async move {
                         upgrade.on_upgrade(move |socket| {
                             collection_stream_socket_with_reader(
-                                socket, state, ClientSession::local(None).unwrap(), None,
+                                socket,
+                                state,
+                                ClientSession::local(None).unwrap(),
+                                None,
                                 move |state, session, request, permit| {
-                                    let (mut held, dropped, entered, completed) =
-                                        (held.clone(), dropped.clone(), entered.clone(), completed.clone());
+                                    let (mut held, dropped, entered, completed) = (
+                                        held.clone(),
+                                        dropped.clone(),
+                                        entered.clone(),
+                                        completed.clone(),
+                                    );
                                     async move {
-                                        let result = collection_items(&state, &session, &request, permit).await;
-                                        if request.id != "held" || request.collection != "work" { return result; }
+                                        let result =
+                                            collection_items(&state, &session, &request, permit)
+                                                .await;
+                                        if request.id != "held" || request.collection != "work" {
+                                            return result;
+                                        }
                                         let (sender, receiver) = tokio::sync::oneshot::channel();
-                                        tokio::spawn(async move { let _ = receiver.await; let _ = dropped.send(()); });
+                                        tokio::spawn(async move {
+                                            let _ = receiver.await;
+                                            let _ = dropped.send(());
+                                        });
                                         let _dropped = Dropped(Some(sender));
                                         crate::api::read_deadline::spawn_blocking(move || {
                                             entered.send(()).unwrap();
-                                            let _ = tokio::runtime::Handle::current().block_on(held.wait_for(|released| *released));
+                                            let _ = tokio::runtime::Handle::current()
+                                                .block_on(held.wait_for(|released| *released));
                                             completed.send(()).unwrap();
                                             result
-                                        }).await.unwrap()
+                                        })
+                                        .await
+                                        .unwrap()
                                     }
                                 },
                             )
@@ -10515,37 +11268,80 @@ mod tests {
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-            let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
-            socket.send(tokio_tungstenite::tungstenite::Message::Text(
-                json!({"kind":"subscribe","id":"held","collection":"work","limit":2}).to_string().into(),
-            )).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(5), entries.recv()).await.unwrap().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let (mut socket, _) =
+                tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+                    .await
+                    .unwrap();
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"kind":"subscribe","id":"held","collection":"work","limit":2})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), entries.recv())
+                .await
+                .unwrap()
+                .unwrap();
             if !replace {
-                socket.send(tokio_tungstenite::tungstenite::Message::Text(
-                    json!({"kind":"unsubscribe","id":"held"}).to_string().into(),
-                )).await.unwrap();
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"kind":"unsubscribe","id":"held"}).to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
             }
             let visible = if replace { "held" } else { "visible" };
-            socket.send(tokio_tungstenite::tungstenite::Message::Text(
-                json!({"kind":"subscribe","id":visible,"collection":"missions","limit":2}).to_string().into(),
-            )).await.unwrap();
-            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"kind":"subscribe","id":visible,"collection":"missions","limit":2})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
             assert_eq!(frame["id"], visible);
             assert_eq!(frame["collection"], "missions");
             assert_eq!(frame["kind"], "snapshot");
             // Confirm the obsolete awaiter is gone, then complete its uncancellable
             // physical worker. A ready marker lets us inspect post-release wire delivery.
-            tokio::time::timeout(Duration::from_secs(5), drops.recv()).await.unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), drops.recv())
+                .await
+                .unwrap()
+                .unwrap();
             release.send(true).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), completions.recv()).await.unwrap().unwrap();
-            socket.send(tokio_tungstenite::tungstenite::Message::Text(
-                json!({"kind":"subscribe","id":"barrier","collection":"work","limit":2}).to_string().into(),
-            )).await.unwrap();
-            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), completions.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"kind":"subscribe","id":"barrier","collection":"work","limit":2})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
-            assert_eq!(frame["id"], "barrier", "obsolete result arrived after release: {frame}");
+            assert_eq!(
+                frame["id"], "barrier",
+                "obsolete result arrived after release: {frame}"
+            );
             assert_eq!(frame["kind"], "snapshot");
             socket.close(None).await.unwrap();
             server.abort();
@@ -10568,21 +11364,40 @@ mod tests {
         let app = axum::Router::new().route(
             "/stream",
             axum::routing::get(move |upgrade: WebSocketUpgrade| {
-                let (state, held, entered, refreshed, first, probe) =
-                    (state.clone(), held.clone(), entered.clone(), refreshed.clone(), first.clone(), probe.clone());
+                let (state, held, entered, refreshed, first, probe) = (
+                    state.clone(),
+                    held.clone(),
+                    entered.clone(),
+                    refreshed.clone(),
+                    first.clone(),
+                    probe.clone(),
+                );
                 async move {
                     upgrade.on_upgrade(move |socket| {
                         collection_stream_socket_with_reader(
-                            socket, state, ClientSession::local(None).unwrap(), None,
+                            socket,
+                            state,
+                            ClientSession::local(None).unwrap(),
+                            None,
                             move |state, session, request, permit| {
-                                let (held, entered, refreshed, first, probe) =
-                                    (held.clone(), entered.clone(), refreshed.clone(), first.clone(), probe.clone());
+                                let (held, entered, refreshed, first, probe) = (
+                                    held.clone(),
+                                    entered.clone(),
+                                    refreshed.clone(),
+                                    first.clone(),
+                                    probe.clone(),
+                                );
                                 async move {
-                                    let result = collection_items(&state, &session, &request, permit).await;
-                                    if request.id == "held" && first.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    let result =
+                                        collection_items(&state, &session, &request, permit).await;
+                                    if request.id == "held"
+                                        && first.fetch_add(1, Ordering::SeqCst) == 0
+                                    {
                                         entered.send(()).unwrap();
                                         held.notified().await;
-                                    } else if request.id == "probe" && probe.fetch_add(1, Ordering::SeqCst) > 0 {
+                                    } else if request.id == "probe"
+                                        && probe.fetch_add(1, Ordering::SeqCst) > 0
+                                    {
                                         // A second work read can only come from the all-window
                                         // commit refresh; the same pass marks held dirty.
                                         refreshed.send(()).unwrap();
@@ -10597,30 +11412,68 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
-        socket.send(tokio_tungstenite::tungstenite::Message::Text(
-            json!({"kind":"subscribe","id":"held","collection":"missions","limit":2}).to_string().into(),
-        )).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), entries.recv()).await.unwrap().unwrap();
-        socket.send(tokio_tungstenite::tungstenite::Message::Text(
-            json!({"kind":"subscribe","id":"probe","collection":"work","limit":2}).to_string().into(),
-        )).await.unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await
+            .unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"held","collection":"missions","limit":2})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entries.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"probe","collection":"work","limit":2})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
         let frame = socket.next().await.unwrap().unwrap();
         let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
         assert_eq!(frame["id"], "probe");
         let source = "version 2\nmission \"during-read\" state=\"ready\" { goal \"Observed after the fence.\"; step \"check\" { agentless; goal \"Check.\" } }\n";
         let intent = crate::graph::parse_intent(source, "during-read").unwrap();
-        let planned = writer.store.mission(&intent, IntentInput { kdl: source.into(), source_name: None }).unwrap();
-        writer.store.apply(&intent, &planned.subject_tokens, "during-read").unwrap();
+        let planned = writer
+            .store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        writer
+            .store
+            .apply(&intent, &planned.subject_tokens, "during-read")
+            .unwrap();
         signal_changed(&writer);
-        tokio::time::timeout(Duration::from_secs(5), refreshes.recv()).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), refreshes.recv())
+            .await
+            .unwrap()
+            .unwrap();
         release.notify_one();
         let mut frames = Vec::new();
         while frames.len() < 2 {
-            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
-            if frame["id"] == "held" { frames.push(frame); }
+            if frame["id"] == "held" {
+                frames.push(frame);
+            }
         }
         assert_eq!(frames[0]["kind"], "snapshot");
         assert_eq!(frames[0]["items"], json!([]));
@@ -10638,18 +11491,23 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut state = test_state(root.path());
         state.native_session_home = Some(root.path().join("native"));
-        state.store.append_claim(&ClaimInput {
-            subject: "agent/dispatch-chat".into(),
-            kind: "runtime.observed".into(),
-            actor: Some("agent/dispatch-chat".into()),
-            fields: BTreeMap::from([
-                ("status".into(), json!("running")),
-                ("runtime_id".into(), json!("dispatch-runtime")),
-                ("incarnation_id".into(), json!("dispatch-runtime:i1")),
-                ("terminal".into(), json!(false)),
-            ]),
-            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-        }).unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "agent/dispatch-chat".into(),
+                kind: "runtime.observed".into(),
+                actor: Some("agent/dispatch-chat".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("runtime_id".into(), json!("dispatch-runtime")),
+                    ("incarnation_id".into(), json!("dispatch-runtime:i1")),
+                    ("terminal".into(), json!(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let (started, blocked) = (entered.clone(), release.clone());
@@ -10660,7 +11518,10 @@ mod tests {
                 async move {
                     upgrade.on_upgrade(move |socket| {
                         collection_stream_socket_with_reader(
-                            socket, state, ClientSession::local(None).unwrap(), None,
+                            socket,
+                            state,
+                            ClientSession::local(None).unwrap(),
+                            None,
                             move |state, session, request, permit| {
                                 let (entered, release) = (entered.clone(), release.clone());
                                 async move {
@@ -10678,25 +11539,41 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
-            .await.unwrap();
-        socket.send(tokio_tungstenite::tungstenite::Message::Text(
-            json!({"kind":"subscribe","id":"slow","collection":"agents","limit":1})
-                .to_string().into(),
-        )).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), entered.notified()).await.unwrap();
+            .await
+            .unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"slow","collection":"agents","limit":1})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
         for command in [
             json!({"kind":"subscribe","id":"fast","collection":"work","limit":2}),
             json!({"kind":"subscribe","id":"chat","collection":"conversation","conversation":"agent/dispatch-chat"}),
         ] {
-            socket.send(tokio_tungstenite::tungstenite::Message::Text(command.to_string().into()))
-                .await.unwrap();
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    command.to_string().into(),
+                ))
+                .await
+                .unwrap();
         }
         let mut received = BTreeMap::new();
         for _ in 0..2 {
             let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
-                .await.unwrap().unwrap().unwrap();
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
             received.insert(frame["id"].as_str().unwrap().to_owned(), frame);
         }
@@ -10704,14 +11581,24 @@ mod tests {
         assert_eq!(received["chat"]["kind"], "conversation");
         assert_eq!(received["chat"]["collection"], "conversation");
         assert_eq!(received["chat"]["replace"], true);
-        assert_eq!(received["chat"]["session_id"], managed_session_id("agent/dispatch-chat", "dispatch-runtime:i1"));
+        assert_eq!(
+            received["chat"]["session_id"],
+            managed_session_id("agent/dispatch-chat", "dispatch-runtime:i1")
+        );
         // A held ID can be replaced while its previous read is still blocked.
-        socket.send(tokio_tungstenite::tungstenite::Message::Text(
-            json!({"kind":"subscribe","id":"slow","collection":"agents","limit":2})
-                .to_string().into(),
-        )).await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"slow","collection":"agents","limit":2})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
         let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
         assert_eq!(frame["id"], "slow");
         assert_eq!(frame["kind"], "snapshot");
@@ -10734,15 +11621,21 @@ mod tests {
                 async move {
                     upgrade.on_upgrade(move |socket| {
                         collection_stream_socket_with_reader(
-                            socket, state, ClientSession::local(None).unwrap(), None,
+                            socket,
+                            state,
+                            ClientSession::local(None).unwrap(),
+                            None,
                             move |state, session, request, permit| {
                                 let (mut gate, started) = (gate.clone(), started.clone());
                                 async move {
                                     let permit = crate::api::read_deadline::spawn_blocking(move || {
                                         started.send(permit.semaphore().clone()).unwrap();
-                                        let _ = tokio::runtime::Handle::current().block_on(gate.wait_for(|released| *released));
+                                        let _ = tokio::runtime::Handle::current()
+                                            .block_on(gate.wait_for(|released| *released));
                                         permit
-                                    }).await.unwrap();
+                                    })
+                                    .await
+                                    .unwrap();
                                     collection_items(&state, &session, &request, permit).await
                                 }
                             },
@@ -10753,21 +11646,45 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
-        let command = json!({"kind":"subscribe","id":"replace","collection":"work","limit":2}).to_string();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await
+            .unwrap();
+        let command =
+            json!({"kind":"subscribe","id":"replace","collection":"work","limit":2}).to_string();
         let mut slots = None;
         for _ in 0..COLLECTION_MAX_SUBSCRIPTIONS {
-            socket.send(tokio_tungstenite::tungstenite::Message::Text(command.clone().into())).await.unwrap();
-            slots = Some(tokio::time::timeout(Duration::from_secs(5), starts.recv()).await.unwrap().unwrap());
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    command.clone().into(),
+                ))
+                .await
+                .unwrap();
+            slots = Some(
+                tokio::time::timeout(Duration::from_secs(5), starts.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
         }
-        socket.send(tokio_tungstenite::tungstenite::Message::Text(command.into())).await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                command.into(),
+            ))
+            .await
+            .unwrap();
         // A conversation outbox frame positively confirms command/frame dispatch is live
         // while all sixteen physical workers are held; no wall-clock negative wait.
         socket.send(tokio_tungstenite::tungstenite::Message::Text(
             json!({"kind":"subscribe","id":"admission","collection":"conversation","conversation":"session/missing"}).to_string().into(),
         )).await.unwrap();
-        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
         // Worker-owned permit signals prove capacity is exhausted independently
         // of whether the queued read happened to be polled before the outbox frame.
@@ -10775,9 +11692,19 @@ mod tests {
         release.send(true).unwrap();
         assert_eq!(frame["id"], "admission");
         assert_eq!(frame["kind"], "error");
-        assert_eq!(available, 0, "canceled awaiters released live physical read slots");
-        tokio::time::timeout(Duration::from_secs(5), starts.recv()).await.unwrap().unwrap();
-        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        assert_eq!(
+            available, 0,
+            "canceled awaiters released live physical read slots"
+        );
+        tokio::time::timeout(Duration::from_secs(5), starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
         assert_eq!(frame["id"], "replace");
         assert_eq!(frame["kind"], "snapshot");
@@ -10801,7 +11728,10 @@ mod tests {
                 async move {
                     upgrade.on_upgrade(move |socket| {
                         collection_stream_socket_with_reader(
-                            socket, state, ClientSession::local(None).unwrap(), None,
+                            socket,
+                            state,
+                            ClientSession::local(None).unwrap(),
+                            None,
                             move |state, session, request, permit| {
                                 let (release, attempts) = (release.clone(), attempts.clone());
                                 async move {
@@ -10822,12 +11752,21 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await
+            .unwrap();
         for (id, collection) in [("retry", "work"), ("refused", "agents")] {
-            socket.send(tokio_tungstenite::tungstenite::Message::Text(
-                json!({"kind":"subscribe","id":id,"collection":collection,"limit":2}).to_string().into(),
-            )).await.unwrap();
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"kind":"subscribe","id":id,"collection":collection,"limit":2})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
         }
         let frame = socket.next().await.unwrap().unwrap();
         let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
@@ -10838,7 +11777,11 @@ mod tests {
         release.notify_one();
         let mut frames = BTreeMap::new();
         for _ in 0..2 {
-            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
             frames.insert(frame["id"].as_str().unwrap().to_owned(), frame);
         }
@@ -10994,19 +11937,30 @@ mod tests {
         assert_eq!(document.nodes()[1].name().value(), "agent");
         let node = &document.nodes()[1].children().unwrap().nodes()[0];
         assert_eq!(node.name().value(), "name with spaces");
-        let values = node.entries().iter().filter(|entry| entry.name().is_none())
-            .map(|entry| entry.value().clone()).collect::<Vec<_>>();
-        assert_eq!(values, vec![
-            kdl::KdlValue::String("λ \"quoted\"\\\n".into()),
-            kdl::KdlValue::Integer(i128::from(i64::MIN)),
-            kdl::KdlValue::Integer(i128::from(i64::MAX)),
-            kdl::KdlValue::Float(1.0),
-            kdl::KdlValue::Float(1.25),
-            kdl::KdlValue::Bool(true),
-            kdl::KdlValue::Bool(false),
-            kdl::KdlValue::Null,
-        ]);
-        let property = node.entries().iter().find(|entry| entry.name().is_some()).unwrap();
+        let values = node
+            .entries()
+            .iter()
+            .filter(|entry| entry.name().is_none())
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                kdl::KdlValue::String("λ \"quoted\"\\\n".into()),
+                kdl::KdlValue::Integer(i128::from(i64::MIN)),
+                kdl::KdlValue::Integer(i128::from(i64::MAX)),
+                kdl::KdlValue::Float(1.0),
+                kdl::KdlValue::Float(1.25),
+                kdl::KdlValue::Bool(true),
+                kdl::KdlValue::Bool(false),
+                kdl::KdlValue::Null,
+            ]
+        );
+        let property = node
+            .entries()
+            .iter()
+            .find(|entry| entry.name().is_some())
+            .unwrap();
         assert_eq!(property.name().unwrap().value(), "property with spaces");
         assert_eq!(property.value(), &kdl::KdlValue::String("\"\\\nλ".into()));
         let child = &node.children().unwrap().nodes()[0];
@@ -11024,10 +11978,19 @@ mod tests {
         let state = test_state(root.path());
         let mut image = b"\x89PNG\r\n\x1a\n".to_vec();
         image.extend([7; 32]);
-        let hash = crate::blobs::BlobDir::under(root.path()).put(&image).unwrap();
+        let hash = crate::blobs::BlobDir::under(root.path())
+            .put(&image)
+            .unwrap();
         state
             .store
-            .record_blob_upload("person/alex", &hash, "image/png", image.len() as u64, 1 << 20, 60_000)
+            .record_blob_upload(
+                "person/alex",
+                &hash,
+                "image/png",
+                image.len() as u64,
+                1 << 20,
+                60_000,
+            )
             .unwrap();
         let sent = accept_message(
             &state,
@@ -11088,7 +12051,11 @@ mod tests {
             .claims_for(&plain.subject, Some("message.sent"))
             .unwrap()
             .remove(0);
-        assert!(session_message_body(&state, &claim).get("attachments").is_none());
+        assert!(
+            session_message_body(&state, &claim)
+                .get("attachments")
+                .is_none()
+        );
         // What a person wrote carries its provenance (here no signature: the fixture seals
         // nothing); what an agent wrote carries none.
         let provenance = session_message_body(&state, &claim)["provenance"].clone();
@@ -11101,16 +12068,26 @@ mod tests {
             .remove(0);
         let mut agent_claim = agent_claim;
         agent_claim.body["fields"]["from"] = json!("agent/terminal-test.seat");
-        assert!(session_message_body(&state, &agent_claim).get("provenance").is_none());
+        assert!(
+            session_message_body(&state, &agent_claim)
+                .get("provenance")
+                .is_none()
+        );
     }
 
     #[test]
     fn a_devices_label_is_read_from_its_key_grant() {
         assert_eq!(
-            key_grant_label(&json!({"fields": {"label": "example phone (secure enclave)", "role": "device"}})).as_deref(),
+            key_grant_label(
+                &json!({"fields": {"label": "example phone (secure enclave)", "role": "device"}})
+            )
+            .as_deref(),
             Some("example phone (secure enclave)")
         );
-        assert_eq!(key_grant_label(&json!({"fields": {"role": "device"}})), None);
+        assert_eq!(
+            key_grant_label(&json!({"fields": {"role": "device"}})),
+            None
+        );
         assert_eq!(key_grant_label(&json!({"fields": {"label": "  "}})), None);
     }
 
@@ -11119,72 +12096,142 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
         let observe = |subject: &str, kind: &str, facts: Value| {
-            state.store.append_client_claim(&crate::model::ClaimInput {
-                subject: subject.into(),
-                kind: "resource.observed".into(),
-                actor: None,
-                fields: BTreeMap::from([("kind".into(), json!(kind)), ("facts".into(), facts)]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            }).unwrap();
+            state
+                .store
+                .append_client_claim(&crate::model::ClaimInput {
+                    subject: subject.into(),
+                    kind: "resource.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("kind".into(), json!(kind)), ("facts".into(), facts)]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
         };
-        observe("resource/github/a", "vcs.pull-request", json!({"title":"Old", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}));
-        observe("resource/github/b", "vcs.pull-request", json!({"title":"Second", "opened_by":"agent/alice", "opened_by_run":"mission-run/two"}));
-        observe("resource/github/c", "vcs.pull-request", json!({"title":"Other", "opened_by":"agent/bob"}));
-        observe("resource/repository", "vcs.repository", json!({"url":"https://example.org/repository"}));
-        observe("resource/github/a", "vcs.pull-request", json!({"title":"New", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}));
+        observe(
+            "resource/github/a",
+            "vcs.pull-request",
+            json!({"title":"Old", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}),
+        );
+        observe(
+            "resource/github/b",
+            "vcs.pull-request",
+            json!({"title":"Second", "opened_by":"agent/alice", "opened_by_run":"mission-run/two"}),
+        );
+        observe(
+            "resource/github/c",
+            "vcs.pull-request",
+            json!({"title":"Other", "opened_by":"agent/bob"}),
+        );
+        observe(
+            "resource/repository",
+            "vcs.repository",
+            json!({"url":"https://example.org/repository"}),
+        );
+        observe(
+            "resource/github/a",
+            "vcs.pull-request",
+            json!({"title":"New", "opened_by":"agent/alice", "opened_by_run":"mission-run/one"}),
+        );
         let app = super::super::router(state.clone());
         let read = |uri: String| {
             let app = app.clone();
             async move {
-                let response = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
                 let status = response.status();
-                let body = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap();
+                let body = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                    .await
+                    .unwrap();
                 (status, serde_json::from_slice::<Value>(&body).unwrap())
             }
         };
         let (status, all) = read("/v1/client/resources".into()).await;
         assert_eq!(status, StatusCode::OK, "{all}");
-        assert_eq!(all["value"]["items"].as_array().unwrap().iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(),
-            ["resource/github/a", "resource/github/b", "resource/github/c", "resource/repository"]);
+        assert_eq!(
+            all["value"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "resource/github/a",
+                "resource/github/b",
+                "resource/github/c",
+                "resource/repository"
+            ]
+        );
         assert_eq!(all["value"]["items"][0]["facts"]["title"], "New");
         assert_eq!(all["value"]["items"][0]["opened_by"], "agent/alice");
         assert_eq!(all["value"]["items"][0]["opened_by_run"], "mission-run/one");
-        chrono::DateTime::parse_from_rfc3339(all["value"]["items"][0]["observed_at"].as_str().unwrap()).unwrap();
+        chrono::DateTime::parse_from_rfc3339(
+            all["value"]["items"][0]["observed_at"].as_str().unwrap(),
+        )
+        .unwrap();
         assert_eq!(all["value"]["items"][3]["opened_by"], Value::Null);
-        let (status, run) = read("/v1/client/resources?opened_by=mission-run%2Fone&kind=vcs.pull-request".into()).await;
+        let (status, run) =
+            read("/v1/client/resources?opened_by=mission-run%2Fone&kind=vcs.pull-request".into())
+                .await;
         assert_eq!(status, StatusCode::OK, "{run}");
-        assert_eq!(run["value"]["items"], json!([all["value"]["items"][0].clone()]));
+        assert_eq!(
+            run["value"]["items"],
+            json!([all["value"]["items"][0].clone()])
+        );
         let (status, repository) = read("/v1/client/resources?kind=vcs.repository".into()).await;
         assert_eq!(status, StatusCode::OK, "{repository}");
-        assert_eq!(repository["value"]["items"], json!([all["value"]["items"][3].clone()]));
+        assert_eq!(
+            repository["value"]["items"],
+            json!([all["value"]["items"][3].clone()])
+        );
         let filters = "opened_by=agent%2Falice&kind=vcs.pull-request&subject_prefix=resource%2Fgithub%2F&limit=1";
         let (status, first) = read(format!("/v1/client/resources?{filters}")).await;
         assert_eq!(status, StatusCode::OK, "{first}");
-        assert_eq!(first["value"]["filters"], json!({"opened_by":"agent/alice", "kind":"vcs.pull-request", "subject_prefix":"resource/github/"}));
-        assert_eq!(first["value"]["items"], json!([all["value"]["items"][0].clone()]));
+        assert_eq!(
+            first["value"]["filters"],
+            json!({"opened_by":"agent/alice", "kind":"vcs.pull-request", "subject_prefix":"resource/github/"})
+        );
+        assert_eq!(
+            first["value"]["items"],
+            json!([all["value"]["items"][0].clone()])
+        );
         assert_eq!(first["value"]["page"]["has_more"], true);
         let cursor = urlencoding::encode(first["value"]["page"]["next_cursor"].as_str().unwrap());
         let continuation = format!("/v1/client/resources?{filters}&cursor={cursor}");
-        state.store.append_claim(&ClaimInput {
-            subject: "custom/test/unrelated".into(),
-            kind: "custom.test.marker".into(),
-            actor: None,
-            fields: BTreeMap::new(),
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: None,
-        }).unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/test/unrelated".into(),
+                kind: "custom.test.marker".into(),
+                actor: None,
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         let (status, second) = read(continuation.clone()).await;
         assert_eq!(status, StatusCode::OK, "{second}");
         assert_eq!(second["snapshot"], first["snapshot"]);
-        assert_eq!(second["value"]["items"], json!([all["value"]["items"][1].clone()]));
+        assert_eq!(
+            second["value"]["items"],
+            json!([all["value"]["items"][1].clone()])
+        );
         assert_eq!(second["value"]["page"]["has_more"], false);
-        let (status, changed_filter) = read(format!("/v1/client/resources?opened_by=agent%2Fbob&cursor={cursor}")).await;
+        let (status, changed_filter) = read(format!(
+            "/v1/client/resources?opened_by=agent%2Fbob&cursor={cursor}"
+        ))
+        .await;
         assert_eq!(status, StatusCode::GONE, "{changed_filter}");
         assert_eq!(changed_filter["code"], "page-cursor-expired");
-        observe("resource/github/a", "vcs.pull-request", json!({"title":"Reassigned", "opened_by":"agent/bob"}));
+        observe(
+            "resource/github/a",
+            "vcs.pull-request",
+            json!({"title":"Reassigned", "opened_by":"agent/bob"}),
+        );
         let (status, expired) = read(continuation).await;
         assert_eq!(status, StatusCode::GONE, "{expired}");
         assert_eq!(expired["code"], "page-cursor-expired");
@@ -11212,26 +12259,45 @@ mod tests {
         let state = test_state(root.path());
         let credential = "resources-reader";
         let app = super::super::fabric_router(state.clone());
-        for (scopes, expected) in [(json!([]), StatusCode::FORBIDDEN), (json!(["read.projections"]), StatusCode::OK)] {
-            state.store.append_claim(&ClaimInput {
-                subject: "custom/client/resources-reader".into(),
-                kind: "custom.client.pairing-completed".into(),
-                actor: Some("person/ada".into()),
-                fields: BTreeMap::from([
-                    ("credential_hash".into(), json!(credential_digest(credential))),
-                    ("session_actor".into(), json!("client/resources-reader")),
-                    ("person_id".into(), json!("person/ada")),
-                    ("scopes".into(), scopes),
-                    ("expires_at_unix_ms".into(), json!(client_now_ms() as u64 + 60_000)),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            }).unwrap();
-            let response = app.clone().oneshot(Request::builder()
-                .uri("/v1/client/resources")
-                .header(AUTHORIZATION, format!("Bearer {credential}"))
-                .body(Body::empty()).unwrap()).await.unwrap();
+        for (scopes, expected) in [
+            (json!([]), StatusCode::FORBIDDEN),
+            (json!(["read.projections"]), StatusCode::OK),
+        ] {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "custom/client/resources-reader".into(),
+                    kind: "custom.client.pairing-completed".into(),
+                    actor: Some("person/ada".into()),
+                    fields: BTreeMap::from([
+                        (
+                            "credential_hash".into(),
+                            json!(credential_digest(credential)),
+                        ),
+                        ("session_actor".into(), json!("client/resources-reader")),
+                        ("person_id".into(), json!("person/ada")),
+                        ("scopes".into(), scopes),
+                        (
+                            "expires_at_unix_ms".into(),
+                            json!(client_now_ms() as u64 + 60_000),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/client/resources")
+                        .header(AUTHORIZATION, format!("Bearer {credential}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(response.status(), expected);
         }
     }
@@ -13371,16 +14437,22 @@ mission "example/steps" state="ready" {
             runs.push(view.subject);
         }
         for run in 2..5 {
-            let view = state.store.create_mission_run(&crate::model::MissionRunRequest {
-                mission: "example/steps".into(),
-                revision: None,
-                workspace: root.path().display().to_string(),
-                requester: Some("person/operator".into()),
-                mode: None,
-                inputs: BTreeMap::new(),
-                idempotency_key: format!("steps-{run}"),
-            }).unwrap();
-            state.store.set_mission_run_state(&view.id, "cancelled", "terminal", None).unwrap();
+            let view = state
+                .store
+                .create_mission_run(&crate::model::MissionRunRequest {
+                    mission: "example/steps".into(),
+                    revision: None,
+                    workspace: root.path().display().to_string(),
+                    requester: Some("person/operator".into()),
+                    mode: None,
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("steps-{run}"),
+                })
+                .unwrap();
+            state
+                .store
+                .set_mission_run_state(&view.id, "cancelled", "terminal", None)
+                .unwrap();
         }
         let index = state.store.index().unwrap();
 
@@ -13393,7 +14465,13 @@ mission "example/steps" state="ready" {
         assert_eq!(crate::store::STEPS_ENRICHED.with(std::cell::Cell::get), 0);
         for run in detail[0]["run_details"].as_array().unwrap() {
             if run["status"] == "cancelled" {
-                assert!(run["steps"].as_array().unwrap().iter().all(|step| step["wake"].is_null()));
+                assert!(
+                    run["steps"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|step| step["wake"].is_null())
+                );
             }
         }
 
@@ -14283,10 +15361,9 @@ mission "example/zero-run" state="ready" {
                     idempotency_key: None,
                 })
                 .unwrap();
-            let idle =
-                conversation_changes_local(&owner, &session, &session_id, Some(&cursor), 50)
-                    .await
-                    .unwrap();
+            let idle = conversation_changes_local(&owner, &session, &session_id, Some(&cursor), 50)
+                .await
+                .unwrap();
             assert!(idle["items"].as_array().unwrap().is_empty());
             cursor = idle["next_cursor"].as_str().unwrap().to_owned();
         }
@@ -14313,7 +15390,10 @@ mission "example/zero-run" state="ready" {
         let changed = conversation_changes_local(&owner, &session, &session_id, Some(&cursor), 50)
             .await
             .unwrap();
-        assert!(!changed["items"].as_array().unwrap().is_empty(), "{changed}");
+        assert!(
+            !changed["items"].as_array().unwrap().is_empty(),
+            "{changed}"
+        );
         assert_eq!(rebuilds(), 2);
         // A cursor this member did not give out (another member's, or one from before a
         // restart) is read as before.
@@ -15976,76 +17056,147 @@ mission "example/zero-run" state="ready" {
         let subject = "agent/physical-retention-owner";
         let incarnation = "physical-retention-runtime:i1";
         let append = |kind: &str, fields: Value| {
-            state.store.append_claim(&ClaimInput {
-                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
-                fields: serde_json::from_value(fields).unwrap(), evidence: vec![],
-                expected_subject: None, idempotency_key: None,
-            }).unwrap();
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some(subject.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
         };
-        append("runtime.observed", json!({
-            "status":"running", "runtime_id":"physical-retention-runtime",
-            "incarnation_id":incarnation, "terminal":false,
-        }));
-        let entry = |sequence, entry_type, body| json!({
-            "operation":"append", "entry_id":format!("timeline-entry/physical-{sequence}"),
-            "sequence":sequence, "revision":1, "role":"system", "entry_type":entry_type,
-            "final":true, "body":body, "driver":"codex", "incarnation_id":incarnation,
-        });
-        append("harness.timeline", entry(3, "status", json!({"status":"running"})));
+        append(
+            "runtime.observed",
+            json!({
+                "status":"running", "runtime_id":"physical-retention-runtime",
+                "incarnation_id":incarnation, "terminal":false,
+            }),
+        );
+        let entry = |sequence, entry_type, body| {
+            json!({
+                "operation":"append", "entry_id":format!("timeline-entry/physical-{sequence}"),
+                "sequence":sequence, "revision":1, "role":"system", "entry_type":entry_type,
+                "final":true, "body":body, "driver":"codex", "incarnation_id":incarnation,
+            })
+        };
+        append(
+            "harness.timeline",
+            entry(3, "status", json!({"status":"running"})),
+        );
         let session = ClientSession::local(None).unwrap();
         let read = || {
             let snapshot = new_client_snapshot(&state);
-            let id = client_session_resources(&state.store, true, &snapshot.created_at,
-                snapshot.store_index, None, false).unwrap()[0]["id"].as_str().unwrap().to_owned();
-            timeline_value(&state, &snapshot, &session, id.trim_start_matches("session/"),
-                &ClientListQuery::default()).unwrap().0
+            let id = client_session_resources(
+                &state.store,
+                true,
+                &snapshot.created_at,
+                snapshot.store_index,
+                None,
+                false,
+            )
+            .unwrap()[0]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            timeline_value(
+                &state,
+                &snapshot,
+                &session,
+                id.trim_start_matches("session/"),
+                &ClientListQuery::default(),
+            )
+            .unwrap()
+            .0
         };
-        let unavailable = |page: &Value| page["items"].as_array().unwrap().iter().any(|item| {
-            item["body"]["code"] == "timeline-history-incomplete"
-                && item["body"]["retryable"] == false
-        });
+        let unavailable = |page: &Value| {
+            page["items"].as_array().unwrap().iter().any(|item| {
+                item["body"]["code"] == "timeline-history-incomplete"
+                    && item["body"]["retryable"] == false
+            })
+        };
         let page = read();
         assert!(unavailable(&page));
-        assert!(page["items"].as_array().unwrap().iter().any(|item| {
-            item["id"] == "timeline-entry/physical-3"
-        }));
-        append("harness.timeline", entry(4, "truncation", json!({
-            "reason":"producer-retention", "omitted_from_sequence":1, "omitted_to_sequence":1,
-        })));
+        assert!(
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["id"] == "timeline-entry/physical-3" })
+        );
+        append(
+            "harness.timeline",
+            entry(
+                4,
+                "truncation",
+                json!({
+                    "reason":"producer-retention", "omitted_from_sequence":1, "omitted_to_sequence":1,
+                }),
+            ),
+        );
         assert!(unavailable(&read()));
         let snapshot = new_client_snapshot(&state);
-        let id = client_session_resources(&state.store, true, &snapshot.created_at,
-            snapshot.store_index, None, false).unwrap()[0]["id"].as_str().unwrap().to_owned();
+        let id = client_session_resources(
+            &state.store,
+            true,
+            &snapshot.created_at,
+            snapshot.store_index,
+            None,
+            false,
+        )
+        .unwrap()[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let followed = conversation_read_now(&state, &session, &id, None).unwrap();
-        append("harness.timeline", entry(5, "truncation", json!({
-            "reason":"producer-retention", "omitted_from_sequence":1, "omitted_to_sequence":2,
-        })));
-        let refresh = conversation_read_now(
-            &state, &session, &id, followed["next_cursor"].as_str(),
-        ).unwrap_err();
+        append(
+            "harness.timeline",
+            entry(
+                5,
+                "truncation",
+                json!({
+                    "reason":"producer-retention", "omitted_from_sequence":1, "omitted_to_sequence":2,
+                }),
+            ),
+        );
+        let refresh =
+            conversation_read_now(&state, &session, &id, followed["next_cursor"].as_str())
+                .unwrap_err();
         assert_eq!(refresh.code, "cursor-gap");
         assert_eq!(refresh.details["full_resync"], true);
         assert!(!unavailable(&read()));
         // Coverage remains retained even after the materialization window no longer includes
         // its truncation entries.
         state.store.append_local_observations_for_test(
-            &(6..=4_101).map(|sequence| ClaimInput {
-                subject: subject.into(),
-                kind: "harness.timeline".into(),
-                actor: Some(subject.into()),
-                fields: serde_json::from_value(entry(
-                    sequence, "status", json!({"status":"running"}),
-                )).unwrap(),
-                evidence: vec![],
-                expected_subject: None,
-                idempotency_key: None,
-            }).collect::<Vec<_>>(),
+            &(6..=4_101)
+                .map(|sequence| ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.timeline".into(),
+                    actor: Some(subject.into()),
+                    fields: serde_json::from_value(entry(
+                        sequence,
+                        "status",
+                        json!({"status":"running"}),
+                    ))
+                    .unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .collect::<Vec<_>>(),
         );
         let bounded = read();
         assert!(!unavailable(&bounded));
-        assert!(bounded["items"].as_array().unwrap().iter().any(|item| {
-            item["body"]["code"] == "timeline-query-limited"
-        }));
+        assert!(
+            bounded["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["body"]["code"] == "timeline-query-limited" })
+        );
         let followed = conversation_read_now(&state, &session, &id, None).unwrap();
         assert!(!unavailable(&followed));
     }
@@ -16079,8 +17230,11 @@ mission "example/zero-run" state="ready" {
         // Local observations can advance time without changing the replicated snapshot clock.
         let local_observed_at = u64::try_from(
             chrono::DateTime::parse_from_rfc3339(&new_client_snapshot(&state).created_at)
-                .unwrap().timestamp_millis(),
-        ).unwrap() + 1_000;
+                .unwrap()
+                .timestamp_millis(),
+        )
+        .unwrap()
+            + 1_000;
         let entry = |sequence: u64, entry_type: &str, body: Value| ClaimInput {
             subject: subject.into(),
             kind: "harness.timeline".into(),
@@ -16133,13 +17287,24 @@ mission "example/zero-run" state="ready" {
             .unwrap()
             .to_owned();
         let before_bound = conversation_read_now(&state, &session, &session_id, None).unwrap();
-        state.store.append_claim(&entry(4_097, "status", json!({"status":"running"}))).unwrap();
+        state
+            .store
+            .append_claim(&entry(4_097, "status", json!({"status":"running"})))
+            .unwrap();
         let changes = conversation_read_now(
-            &state, &session, &session_id, before_bound["next_cursor"].as_str(),
-        ).unwrap();
-        assert!(changes["items"].as_array().unwrap().iter().any(|item| {
-            item["body"]["code"] == "timeline-query-limited"
-        }));
+            &state,
+            &session,
+            &session_id,
+            before_bound["next_cursor"].as_str(),
+        )
+        .unwrap();
+        assert!(
+            changes["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["body"]["code"] == "timeline-query-limited" })
+        );
         let snapshot = new_client_snapshot(&state);
         let read = |snapshot: &ClientSnapshot| {
             timeline_value(
@@ -16147,43 +17312,72 @@ mission "example/zero-run" state="ready" {
                 snapshot,
                 &session,
                 session_id.trim_start_matches("session/"),
-                &ClientListQuery { limit: Some(200), ..Default::default() },
+                &ClientListQuery {
+                    limit: Some(200),
+                    ..Default::default()
+                },
             )
             .expect("a query bound is not missing retained history")
             .0
         };
         let page = read(&snapshot);
-        assert!(page["items"].as_array().unwrap().iter().any(|item| {
-            item["body"]["code"] == "timeline-query-limited"
-        }));
+        assert!(
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["body"]["code"] == "timeline-query-limited" })
+        );
         let entries = page["items"].as_array().unwrap();
-        let notice = entries.iter().find(|item| {
-            item["body"]["code"] == "timeline-query-limited"
-        }).unwrap();
-        assert!(entries.iter().all(|item| {
-            item["timestamp"].as_str() <= notice["timestamp"].as_str()
-        }), "a projection notice cannot become the oldest scroll-back boundary");
-        assert!(page["items"].as_array().unwrap().iter().any(|item| {
-            item["id"] == "timeline-entry/retention-4097"
-        }));
-        let mut update = entry(1, "status", json!({"status":"waiting", "detail":"old entry updated"}));
+        let notice = entries
+            .iter()
+            .find(|item| item["body"]["code"] == "timeline-query-limited")
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|item| { item["timestamp"].as_str() <= notice["timestamp"].as_str() }),
+            "a projection notice cannot become the oldest scroll-back boundary"
+        );
+        assert!(
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["id"] == "timeline-entry/retention-4097" })
+        );
+        let mut update = entry(
+            1,
+            "status",
+            json!({"status":"waiting", "detail":"old entry updated"}),
+        );
         update.fields.insert("operation".into(), json!("replace"));
         update.fields.insert("revision".into(), json!(2));
         update.idempotency_key = None;
         state.store.append_claim(&update).unwrap();
         let gap = conversation_read_now(
-            &state, &session, &session_id, changes["next_cursor"].as_str(),
-        ).unwrap_err();
+            &state,
+            &session,
+            &session_id,
+            changes["next_cursor"].as_str(),
+        )
+        .unwrap_err();
         assert_eq!(gap.code, "cursor-gap");
         let page = read(&new_client_snapshot(&state));
         assert!(page["items"].as_array().unwrap().iter().any(|item| {
             item["body"]["code"] == "timeline-query-limited"
                 && item["body"]["details"]["omitted_updated_entries"] == 1
         }));
-        assert!(!page["items"].as_array().unwrap().iter().any(|item| {
-            item["body"]["code"] == "invalid-timeline-transition"
-        }));
-        update.fields.insert("entry_id".into(), json!("timeline-entry/retention-2"));
+        assert!(
+            !page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["body"]["code"] == "invalid-timeline-transition" })
+        );
+        update
+            .fields
+            .insert("entry_id".into(), json!("timeline-entry/retention-2"));
         update.fields.insert("sequence".into(), json!(2));
         update.fields.insert("operation".into(), json!("finalize"));
         state.store.append_claim(&update).unwrap();
@@ -16192,13 +17386,19 @@ mission "example/zero-run" state="ready" {
             item["body"]["code"] == "timeline-query-limited"
                 && item["body"]["details"]["omitted_updated_entries"] == 2
         }));
-        update.fields.insert("entry_id".into(), json!("timeline-entry/actually-missing"));
+        update
+            .fields
+            .insert("entry_id".into(), json!("timeline-entry/actually-missing"));
         update.idempotency_key = None;
         state.store.append_claim(&update).unwrap();
         let gap = timeline_value(
-            &state, &new_client_snapshot(&state), &session,
-            session_id.trim_start_matches("session/"), &ClientListQuery::default(),
-        ).unwrap_err();
+            &state,
+            &new_client_snapshot(&state),
+            &session,
+            session_id.trim_start_matches("session/"),
+            &ClientListQuery::default(),
+        )
+        .unwrap_err();
         assert_eq!(gap.code, "timeline-history-incomplete");
         assert!(gap.message.contains("append operation is missing"));
     }
@@ -16469,8 +17669,8 @@ mission "example/zero-run" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let mut state = test_state(root.path());
         state.pty_binary = pty.clone();
-        let runtime = st_runtime::PtyRuntime::new(state.pty_root.clone())
-            .with_binary(pty.to_string_lossy());
+        let runtime =
+            st_runtime::PtyRuntime::new(state.pty_root.clone()).with_binary(pty.to_string_lossy());
         struct Cleanup(st_runtime::PtyRuntime);
         impl Drop for Cleanup {
             fn drop(&mut self) {
@@ -16629,7 +17829,13 @@ mission "example/zero-run" state="ready" {
         // keys land, with the sequence or without it. A line with its Enter still needs it.
         for (key, fence) in [
             ("fence-raw", fence.clone()),
-            ("fence-raw-no-sequence", Fence { terminal_sequence: None, ..fence.clone() }),
+            (
+                "fence-raw-no-sequence",
+                Fence {
+                    terminal_sequence: None,
+                    ..fence.clone()
+                },
+            ),
         ] {
             let _ = action(
                 State(state.clone()),
@@ -16793,21 +17999,63 @@ mission "example/zero-run" state="ready" {
     fn terminal_live_fence_refusal_matrix() {
         let subject = "agent/fence-matrix";
         for (label, fields, expected, message) in [
-            ("running", json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true}), None, None),
-            ("stale", json!({"status":"running","runtime_id":"r","incarnation_id":"old","terminal":true}), Some("stale-fence"), Some("subject `agent/fence-matrix` changed incarnation")),
-            ("exited", json!({"status":"exited","runtime_id":"r","incarnation_id":"i","terminal":true}), Some("not-found"), Some("subject `agent/fence-matrix` has no running session")),
-            ("unreachable", json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true,"reachability":"unreachable"}), Some("terminal-unavailable"), Some("the terminal owner is not reachable")),
-            ("no-runtime", json!({"status":"running","incarnation_id":"i","terminal":true}), Some("not-found"), Some("subject `agent/fence-matrix` has no runtime")),
-            ("no-incarnation", json!({"status":"running","runtime_id":"r","terminal":true}), Some("not-found"), Some("subject `agent/fence-matrix` has no incarnation")),
-            ("no-kind", json!({"status":"running","runtime_id":"r","incarnation_id":"i"}), Some("not-found"), Some("subject `agent/fence-matrix` has no runtime kind")),
+            (
+                "running",
+                json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true}),
+                None,
+                None,
+            ),
+            (
+                "stale",
+                json!({"status":"running","runtime_id":"r","incarnation_id":"old","terminal":true}),
+                Some("stale-fence"),
+                Some("subject `agent/fence-matrix` changed incarnation"),
+            ),
+            (
+                "exited",
+                json!({"status":"exited","runtime_id":"r","incarnation_id":"i","terminal":true}),
+                Some("not-found"),
+                Some("subject `agent/fence-matrix` has no running session"),
+            ),
+            (
+                "unreachable",
+                json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true,"reachability":"unreachable"}),
+                Some("terminal-unavailable"),
+                Some("the terminal owner is not reachable"),
+            ),
+            (
+                "no-runtime",
+                json!({"status":"running","incarnation_id":"i","terminal":true}),
+                Some("not-found"),
+                Some("subject `agent/fence-matrix` has no runtime"),
+            ),
+            (
+                "no-incarnation",
+                json!({"status":"running","runtime_id":"r","terminal":true}),
+                Some("not-found"),
+                Some("subject `agent/fence-matrix` has no incarnation"),
+            ),
+            (
+                "no-kind",
+                json!({"status":"running","runtime_id":"r","incarnation_id":"i"}),
+                Some("not-found"),
+                Some("subject `agent/fence-matrix` has no runtime kind"),
+            ),
         ] {
             let root = tempfile::tempdir().unwrap();
             let state = test_state_named(root.path(), "matrix-owner");
-            state.store.append_claim(&ClaimInput {
-                subject: subject.into(), kind: "runtime.observed".into(),
-                actor: Some(subject.into()), fields: serde_json::from_value(fields).unwrap(),
-                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-            }).unwrap();
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: Some(subject.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
             let result = remote_terminal_live_session(&state, subject, "i");
             if let Some(code) = expected {
                 let error = result.unwrap_err();
@@ -16827,37 +18075,75 @@ mission "example/zero-run" state="ready" {
         assert_eq!(error.message, "the terminal owner is not reachable");
 
         let runtime = ClaimInput {
-            subject: subject.into(), kind: "runtime.observed".into(),
+            subject: subject.into(),
+            kind: "runtime.observed".into(),
             actor: Some(subject.into()),
-            fields: serde_json::from_value(json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true})).unwrap(),
-            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            fields: serde_json::from_value(
+                json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true}),
+            )
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
         };
         state.store.append_claim(&runtime).unwrap();
         let rival_root = tempfile::tempdir().unwrap();
         let rival = test_state_named(rival_root.path(), "matrix-rival");
         rival.store.append_claim(&runtime).unwrap();
-        state.store.import_replication("matrix-rival", &rival.store.export_replication(0).unwrap()).unwrap();
+        state
+            .store
+            .import_replication("matrix-rival", &rival.store.export_replication(0).unwrap())
+            .unwrap();
         let error = remote_terminal_live_session(&state, subject, "i").unwrap_err();
         assert_eq!(error.code, "terminal-unavailable");
         assert_eq!(error.message, "the terminal owner is not reachable");
-        assert_eq!(terminal_live_session(&state, subject, Some("i")).unwrap_err().code, "runtime-authority-indeterminate");
+        assert_eq!(
+            terminal_live_session(&state, subject, Some("i"))
+                .unwrap_err()
+                .code,
+            "runtime-authority-indeterminate"
+        );
 
         let gateway_root = tempfile::tempdir().unwrap();
         let gateway = test_state_named(gateway_root.path(), "matrix-gateway");
-        gateway.store.import_replication("matrix-rival", &rival.store.export_replication(0).unwrap()).unwrap();
+        gateway
+            .store
+            .import_replication("matrix-rival", &rival.store.export_replication(0).unwrap())
+            .unwrap();
         let error = remote_terminal_live_session(&gateway, subject, "i").unwrap_err();
         assert_eq!(error.code, "remote-unavailable");
-        assert_eq!(terminal_live_session(&gateway, subject, Some("i")).unwrap_err().code, "runtime-not-local");
+        assert_eq!(
+            terminal_live_session(&gateway, subject, Some("i"))
+                .unwrap_err()
+                .code,
+            "runtime-not-local"
+        );
     }
 
     #[test]
     fn remote_terminal_live_fence_refusal_matrix() {
         let subject = "agent/remote-fence-matrix";
         for (fields, code, message) in [
-            (json!({"status":"exited","runtime_id":"r","incarnation_id":"i","terminal":true}), "not-found", "the terminal is not running"),
-            (json!({"status":"running","runtime_id":"r","terminal":true}), "not-found", "the terminal has no incarnation"),
-            (json!({"status":"running","runtime_id":"r","incarnation_id":"old","terminal":true}), "stale-fence", "the terminal incarnation fence is stale"),
-            (json!({"status":"running","incarnation_id":"i","terminal":true}), "not-found", "the terminal has no runtime ID"),
+            (
+                json!({"status":"exited","runtime_id":"r","incarnation_id":"i","terminal":true}),
+                "not-found",
+                "the terminal is not running",
+            ),
+            (
+                json!({"status":"running","runtime_id":"r","terminal":true}),
+                "not-found",
+                "the terminal has no incarnation",
+            ),
+            (
+                json!({"status":"running","runtime_id":"r","incarnation_id":"old","terminal":true}),
+                "stale-fence",
+                "the terminal incarnation fence is stale",
+            ),
+            (
+                json!({"status":"running","incarnation_id":"i","terminal":true}),
+                "not-found",
+                "the terminal has no runtime ID",
+            ),
         ] {
             let owner_root = tempfile::tempdir().unwrap();
             let gateway_root = tempfile::tempdir().unwrap();
@@ -16868,18 +18154,34 @@ mission "example/zero-run" state="ready" {
             std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
             gateway.client_relay = crate::peer::ClientRelay::from_config(&crate::config::Config {
                 node: "matrix-remote-gateway".into(),
-                fleet_id: Some("fleet-test".into()), shared_secret_file: Some(secret),
+                fleet_id: Some("fleet-test".into()),
+                shared_secret_file: Some(secret),
                 peers: vec![crate::config::PeerConfig {
-                    name: "matrix-remote-owner".into(), url: "http://127.0.0.1:9".into(),
+                    name: "matrix-remote-owner".into(),
+                    url: "http://127.0.0.1:9".into(),
                 }],
                 ..Default::default()
-            }).unwrap();
-            owner.store.append_claim(&ClaimInput {
-                subject: subject.into(), kind: "runtime.observed".into(),
-                actor: Some(subject.into()), fields: serde_json::from_value(fields).unwrap(),
-                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-            }).unwrap();
-            gateway.store.import_replication("matrix-remote-owner", &owner.store.export_replication(0).unwrap()).unwrap();
+            })
+            .unwrap();
+            owner
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: Some(subject.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            gateway
+                .store
+                .import_replication(
+                    "matrix-remote-owner",
+                    &owner.store.export_replication(0).unwrap(),
+                )
+                .unwrap();
             let error = remote_terminal_live_session(&gateway, subject, "i").unwrap_err();
             assert_eq!(error.code, code);
             assert_eq!(error.message, message);
@@ -16888,7 +18190,9 @@ mission "example/zero-run" state="ready" {
 
     #[test]
     fn raw_capability_refuses_changed_selected_owner_or_runtime() {
-        for (bound_owner, bound_runtime) in [("host/another-owner", "r"), ("host/matrix-owner", "old")] {
+        for (bound_owner, bound_runtime) in
+            [("host/another-owner", "r"), ("host/matrix-owner", "old")]
+        {
             let root = tempfile::tempdir().unwrap();
             let mut state = test_state_named(root.path(), "matrix-owner");
             let secret = root.path().join("fleet-secret");
@@ -16896,12 +18200,15 @@ mission "example/zero-run" state="ready" {
             std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
             state.client_relay = crate::peer::ClientRelay::from_config(&crate::config::Config {
                 node: "matrix-owner".into(),
-                fleet_id: Some("fleet-test".into()), shared_secret_file: Some(secret),
+                fleet_id: Some("fleet-test".into()),
+                shared_secret_file: Some(secret),
                 peers: vec![crate::config::PeerConfig {
-                    name: "another-owner".into(), url: "http://127.0.0.1:9".into(),
+                    name: "another-owner".into(),
+                    url: "http://127.0.0.1:9".into(),
                 }],
                 ..Default::default()
-            }).unwrap();
+            })
+            .unwrap();
             let session = ClientSession::local(Some("person/alex")).unwrap();
             state.store.append_claim(&ClaimInput {
                 subject: "agent/fence-matrix".into(), kind: "runtime.observed".into(),
@@ -16921,12 +18228,29 @@ mission "example/zero-run" state="ready" {
                 })).unwrap(),
                 evidence: Vec::new(), expected_subject: None, idempotency_key: None,
             }).unwrap();
-            let before = state.store.status(Some("terminal-attachment/matrix")).unwrap().store_index;
+            let before = state
+                .store
+                .status(Some("terminal-attachment/matrix"))
+                .unwrap()
+                .store_index;
             let error = consume_terminal_attachment_mode(
-                &state, &session, "terminal/agent/fence-matrix", "i", Some(capability), Some("peek"),
-            ).unwrap_err();
+                &state,
+                &session,
+                "terminal/agent/fence-matrix",
+                "i",
+                Some(capability),
+                Some("peek"),
+            )
+            .unwrap_err();
             assert_eq!(error.code, "forbidden");
-            assert_eq!(state.store.status(Some("terminal-attachment/matrix")).unwrap().store_index, before);
+            assert_eq!(
+                state
+                    .store
+                    .status(Some("terminal-attachment/matrix"))
+                    .unwrap()
+                    .store_index,
+                before
+            );
         }
     }
 
@@ -17115,6 +18439,7 @@ mission "example/zero-run" state="ready" {
             custom_forms: false,
             conversation_blocks: false,
             scopes: ["terminal.read".into()].into_iter().collect(),
+            pairing_binding: None,
         };
         let mut remote_request = request.clone();
         remote_request.idempotency_key = "fleet-terminal-attach-device-one".into();
@@ -17219,14 +18544,27 @@ mission "example/zero-run" state="ready" {
         let state = test_state_named(root.path(), "status-cache");
         let subject = "agent/cedar";
         let append = |kind: &str, fields: Value| {
-            state.store.append_claim(&ClaimInput {
-                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
-                fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
-                expected_subject: None, idempotency_key: None,
-            }).unwrap()
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some(subject.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
         };
-        append("runtime.observed", json!({"status":"running", "runtime_id":"native", "incarnation_id":"one"}));
-        append("harness.observed", json!({"state":"idle", "driver":"codex", "incarnation_id":"one", "observed_at_ms":(client_now_ms() - 91_000) as u64}));
+        append(
+            "runtime.observed",
+            json!({"status":"running", "runtime_id":"native", "incarnation_id":"one"}),
+        );
+        append(
+            "harness.observed",
+            json!({"state":"idle", "driver":"codex", "incarnation_id":"one", "observed_at_ms":(client_now_ms() - 91_000) as u64}),
+        );
         let index = state.store.index().unwrap();
         let before = client_agent_resources(&state.store, false, "", index).unwrap();
         let before = before.iter().find(|item| item["id"] == subject).unwrap();
@@ -17236,28 +18574,42 @@ mission "example/zero-run" state="ready" {
         assert_eq!(before["harness_state"], "idle");
         assert!(before.get("_status_source").is_none());
         let mut aged = vec![before.clone()];
-        let mut cached_harness = state.store.observed_harness_at(subject, index).unwrap().unwrap();
+        let mut cached_harness = state
+            .store
+            .observed_harness_at(subject, index)
+            .unwrap()
+            .unwrap();
         cached_harness.observed_at_unix_ms = client_now_ms() - 91_000;
         aged[0]["_status_source"] = json!(cached_harness);
         overlay_agent_resources(&state.store, &mut aged, "").unwrap();
         assert_eq!(aged[0]["observation"], "stale");
         assert_eq!(aged[0]["harness_state"], "indeterminate");
         assert_eq!(aged[0]["since"], before["since"]);
-        append("harness.observed", json!({"state":"idle", "driver":"codex", "incarnation_id":"one", "observed_at_ms":client_now_ms() as u64}));
-        assert_eq!(state.store.index().unwrap(), index, "same state stays local within the publish interval");
+        append(
+            "harness.observed",
+            json!({"state":"idle", "driver":"codex", "incarnation_id":"one", "observed_at_ms":client_now_ms() as u64}),
+        );
+        assert_eq!(
+            state.store.index().unwrap(),
+            index,
+            "same state stays local within the publish interval"
+        );
         let after = client_agent_resources(&state.store, false, "", index).unwrap();
         let after = after.iter().find(|item| item["id"] == subject).unwrap();
         assert_eq!(after["observation"], "current");
         assert_eq!(after["harness_state"], "idle");
         assert_eq!(after["since"], before["since"]);
-        append("runtime.observed", json!({"status":"running", "runtime_id":"native", "incarnation_id":"two"}));
-        let reset = client_agent_resources(&state.store, false, "", state.store.index().unwrap()).unwrap();
+        append(
+            "runtime.observed",
+            json!({"status":"running", "runtime_id":"native", "incarnation_id":"two"}),
+        );
+        let reset =
+            client_agent_resources(&state.store, false, "", state.store.index().unwrap()).unwrap();
         let reset = reset.iter().find(|item| item["id"] == subject).unwrap();
         assert_eq!(reset["observation"], "missing");
         assert_eq!(reset["harness_state"], Value::Null);
         assert_eq!(reset["since"], Value::Null);
     }
-
 }
 
 fn glass_person(session: &ClientSession, write: bool) -> Result<String, ApiError> {
@@ -17380,7 +18732,10 @@ async fn glass_write(
     .map_err(|error| {
         let is_idempotency = matches!(error.code, "idempotency-mismatch" | "idempotency-conflict");
         let mut error = ApiError::bad(error);
-        if is_idempotency { error.code = "idempotency-conflict".into(); error.status = StatusCode::CONFLICT; }
+        if is_idempotency {
+            error.code = "idempotency-conflict".into();
+            error.status = StatusCode::CONFLICT;
+        }
         error
     })?;
     signal_changed(&state);
@@ -17418,5 +18773,4 @@ pub(super) async fn glass_delete(
     Json(request): Json<GlassDelete>,
 ) -> Result<Json<Value>, ApiError> {
     glass_write(state, session, id, headers, None, request.base_revision).await
-
 }

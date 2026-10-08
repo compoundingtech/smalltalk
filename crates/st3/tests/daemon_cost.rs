@@ -621,6 +621,20 @@ const PROBES: &[Probe] = &[
     get("GET /v1/client/work/{*id}", "/v1/client/work/{step}"),
     get("GET /v1/client/agents", "/v1/client/agents"),
     get("GET /v1/client/agents/{*id}", "/v1/client/agents/{agent}"),
+    get("GET /v1/client/subject-schemas", "/v1/client/subject-schemas"),
+    get(
+        "GET /v1/client/subjects",
+        "/v1/client/subjects?family=agent&limit=20",
+    ),
+    get("GET /v1/client/subject", "/v1/client/subject?ref={agent}"),
+    get(
+        "GET /v1/client/subject-claims",
+        "/v1/client/subject-claims?ref={agent}&limit=20",
+    ),
+    get(
+        "GET /v1/client/subject-history",
+        "/v1/client/subject-history?ref={agent}&limit=20",
+    ),
     get(
         "GET /v1/client/agent-workspaces/{*id}",
         "/v1/client/agent-workspaces/{agent}",

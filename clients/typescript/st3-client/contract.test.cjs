@@ -6,12 +6,13 @@ const path = require('node:path');
 const ts = require('typescript');
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'st3-ts-client-'));
-for (const name of ['Models.generated', 'Client.generated', 'fetch-receiver.test']) {
+for (const name of ['Models.generated', 'Subjects.generated', 'Client.generated', 'fetch-receiver.test']) {
     const source = fs.readFileSync(path.join(__dirname, `${name}.ts`), 'utf8');
     const output = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, rewriteRelativeImportExtensions: true } }).outputText;
     fs.writeFileSync(path.join(temporary, `${name}.js`), output);
 }
-const { St3Client, ClientError, applyWindow } = require(path.join(temporary, 'Client.generated.js'));
+const { St3Client, ClientError, applyWindow, applySubjectWindow } = require(path.join(temporary, 'Client.generated.js'));
+const { decodeSubjectCollectionFrame, SubjectDecodeError } = require(path.join(temporary, 'Subjects.generated.js'));
 require(path.join(temporary, 'fetch-receiver.test.js'));
 fs.rmSync(temporary, { recursive: true, force: true });
 
@@ -231,6 +232,71 @@ test('applyWindow keeps a window in the order each frame names', () => {
     assert.equal(window.hasMore, false);
     assert.equal(window.snapshot.id, 'snapshot/later');
     assert.equal(applyWindow(window, { kind: 'resync', id: 'm' }), window);
+});
+
+test('native subject socket keeps unknown schemas payload-free through snapshot, change, and removal', async () => {
+    const artifact = require('../../../docs/st3/client-v0/schemas/subject-projection.schema.json');
+    const entry = artifact.families.find(entry => entry.family === 'message');
+    const known = {
+        kind: 'subject', id: 'message/proof', ref: 'message/proof', family: 'message',
+        schema_id: entry.schema_id, heads: [], heads_complete: true,
+        local_fence: { node: 'host/test', position: 0 },
+    };
+    const unknownHead = {
+        id: 'claim/future', ref: 'message/future', kind: 'message.sent',
+        schema_id: 'future-head-descriptor', retention: entry.descriptor.claims['message.sent'].retention,
+        provenance: { source: 'replicated', claim_id: 'claim/future', origin: 'host/test', accepted_at: '2026-10-05T00:00:00Z', store_index: 1 },
+        payload_availability: 'available', omitted_fields: [], fields: { private: 'never disclose' },
+    };
+    const unknown = {
+        ...known, id: unknownHead.ref, ref: unknownHead.ref, heads: [unknownHead],
+    };
+    const unavailable = {
+        kind: 'unsupported-subject-schema', id: unknown.id, ref: unknown.ref,
+        schema_id: unknown.schema_id, payload_availability: 'unsupported-schema',
+    };
+    const socket = collectionSocket();
+    const frames = [], ends = [];
+    let window;
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const stream = await client.collectionStream({
+        onFrame: frame => { frames.push(frame); window = applySubjectWindow(window, frame); },
+        onEnd: error => ends.push(error), socket: () => socket,
+    });
+    const header = { id: 'native', collection: 'subjects', snapshot, has_more: false };
+    try {
+        for (const malformed of [
+            { ...unknown, id: 'message/wrong' },
+            { ...unknown, id: 'message/', ref: 'message/' },
+        ]) {
+            assert.throws(() => decodeSubjectCollectionFrame({
+                ...header, kind: 'snapshot', items: [malformed], order: [unknown.ref],
+            }), SubjectDecodeError);
+            assert.throws(() => decodeSubjectCollectionFrame({
+                ...header, kind: 'changes', upserts: [malformed], removes: [], order: [unknown.ref],
+            }), SubjectDecodeError);
+        }
+        socket.onopen();
+        stream.subscribeSubjects('native', { family: 'message' }, 2);
+        socket.onmessage({ data: JSON.stringify({ ...header, kind: 'snapshot', items: [unknown, known], order: [known.id, unknown.id] }) });
+        assert.deepEqual(window.items, [known, unavailable]);
+        assert.deepEqual(frames[0].items, [unavailable, known]);
+        const changed = { ...unknown, heads: [{ ...unknownHead, schema_id: 'future-head-descriptor-v2', fields: { private: 'changed hidden payload' } }] };
+        socket.onmessage({ data: JSON.stringify({
+            ...header, kind: 'changes', upserts: [changed], removes: [],
+            order: [unknown.id, known.id], snapshot: { ...snapshot, store_index: 2 },
+        }) });
+        assert.deepEqual(window.items, [{ ...unavailable, schema_id: changed.schema_id }, known]);
+        assert.equal(window.snapshot.store_index, 2);
+        socket.onmessage({ data: JSON.stringify({
+            ...header, kind: 'changes', upserts: [], removes: [unknown.id], order: [known.id],
+        }) });
+        assert.deepEqual(window.items, [known]);
+        assert.deepEqual(ends, []);
+        assert.deepEqual(socket.closed, []);
+    } finally {
+        stream.close();
+    }
 });
 
 test('glass methods preserve structure, null creation base, and idempotency headers', async () => {

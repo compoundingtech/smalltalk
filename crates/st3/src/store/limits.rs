@@ -268,9 +268,11 @@ pub(super) fn flush_limits(transaction: &Transaction<'_>) -> Result<usize> {
 
 pub(crate) fn flush_limits_page(transaction: &Transaction<'_>, limit: usize) -> Result<usize> {
     let through: u64 = transaction
-        .query_row("SELECT value FROM meta WHERE key=?1", [LIMITS_CURSOR], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [LIMITS_CURSOR],
+            |row| row.get::<_, String>(0),
+        )
         .optional()?
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
@@ -401,7 +403,11 @@ pub(super) fn account_limits_at(connection: &Connection) -> Result<Vec<AccountLi
             continue;
         };
         limit.measured_by = subject;
-        let key = (driver, account, (!account_ref.is_empty()).then_some(account_ref));
+        let key = (
+            driver,
+            account,
+            (!account_ref.is_empty()).then_some(account_ref),
+        );
         if is_weekly {
             weekly.entry(key).or_default().push(limit);
         } else {
@@ -431,7 +437,11 @@ pub(super) fn account_limits_at(connection: &Connection) -> Result<Vec<AccountLi
         ))
     })? {
         let (seat, driver, account, account_ref) = row?;
-        let key = (driver, account, (!account_ref.is_empty()).then_some(account_ref));
+        let key = (
+            driver,
+            account,
+            (!account_ref.is_empty()).then_some(account_ref),
+        );
         accounts
             .get_mut(&key)
             .expect("the seat reported an account")
@@ -535,9 +545,7 @@ impl Store {
                 if let Some(binding) = &binding
                     && let crate::accounts::Binding::Account(name) = &binding.binding
                 {
-                    if limit.driver == binding.driver
-                        && limit.account_ref.as_ref() == Some(name)
-                    {
+                    if limit.driver == binding.driver && limit.account_ref.as_ref() == Some(name) {
                         reading = Some(limit);
                         break;
                     }
@@ -995,22 +1003,40 @@ mod tests {
         let stale = "agent/alder.stale";
         read(&store, busy, Some("claude/aaaa"), 97.0, now);
         read(&store, stale, Some("claude/aaaa"), 45.0, now + 1);
-        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(97.0));
+        assert_eq!(
+            store.account_limits().unwrap()[0].weekly_percent,
+            Some(97.0)
+        );
         // Arrival order cannot override source time, even outside the maximum's window.
         read(&store, stale, Some("claude/aaaa"), 8.0, now - 2 * HOUR);
-        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(97.0));
+        assert_eq!(
+            store.account_limits().unwrap()[0].weekly_percent,
+            Some(97.0)
+        );
         read(&store, stale, Some("claude/aaaa"), 46.0, now + HOUR + 1);
-        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(46.0));
+        assert_eq!(
+            store.account_limits().unwrap()[0].weekly_percent,
+            Some(46.0)
+        );
 
-        let mut next = store.latest_claim(busy, Some("harness.limits")).unwrap().unwrap();
+        let mut next = store
+            .latest_claim(busy, Some("harness.limits"))
+            .unwrap()
+            .unwrap();
         next.body["fields"]["weekly_resets_at_unix_ms"] = json!(1_800_600_000_000_u64);
         next.body["fields"]["weekly_percent"] = json!(2.0);
         next.body["fields"]["measured_at_unix_ms"] = json!((now + HOUR + 2) as u64);
-        store.append_claim(&ClaimInput {
-            subject: busy.into(), kind: "harness.limits".into(), actor: Some(busy.into()),
-            fields: serde_json::from_value(next.body["fields"].clone()).unwrap(),
-            evidence: vec![], expected_subject: None, idempotency_key: None,
-        }).unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: busy.into(),
+                kind: "harness.limits".into(),
+                actor: Some(busy.into()),
+                fields: serde_json::from_value(next.body["fields"].clone()).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         // An old producer re-publishes the previous reset with an even newer timestamp.
         read(&store, stale, Some("claude/aaaa"), 99.0, now + HOUR + 3);
         let limit = &store.account_limits().unwrap()[0];
@@ -1028,29 +1054,55 @@ mod tests {
             store
                 .readers
                 .get()
-                .query_row("SELECT COUNT(*) FROM account_limit_readings", [], |row| row.get(0))
+                .query_row("SELECT COUNT(*) FROM account_limit_readings", [], |row| {
+                    row.get(0)
+                })
                 .unwrap()
         };
         {
             let store = Store::open(&path, "alder").unwrap();
             // A reading every two hours for a week: each makes the previous one irrelevant.
             for beat in 0..84_u128 {
-                read(&store, seat, Some("claude/aaaa"), 40.0 + (beat % 50) as f64, now + beat * 2 * HOUR);
+                read(
+                    &store,
+                    seat,
+                    Some("claude/aaaa"),
+                    40.0 + (beat % 50) as f64,
+                    now + beat * 2 * HOUR,
+                );
             }
             assert_eq!(count(&store), 1);
             let limit = store.account_limits().unwrap().remove(0);
             assert_eq!(limit.weekly_percent, Some(40.0 + (83 % 50) as f64));
             assert_eq!(limit.seats, [seat]);
             // Several inside the newest hour stay, so the highest of the hour still decides.
-            read(&store, seat, Some("claude/aaaa"), 90.0, now + 167 * HOUR + 10);
-            read(&store, seat, Some("claude/aaaa"), 60.0, now + 167 * HOUR + 20);
+            read(
+                &store,
+                seat,
+                Some("claude/aaaa"),
+                90.0,
+                now + 167 * HOUR + 10,
+            );
+            read(
+                &store,
+                seat,
+                Some("claude/aaaa"),
+                60.0,
+                now + 167 * HOUR + 20,
+            );
             // The reading two hours earlier fell out of the newest's hour; the two inside stay.
             assert_eq!(count(&store), 2);
-            assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(90.0));
+            assert_eq!(
+                store.account_limits().unwrap()[0].weekly_percent,
+                Some(90.0)
+            );
         }
         // A store opened again answers the same, and opening folds nothing.
         let store = Store::open(&path, "alder").unwrap();
-        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(90.0));
+        assert_eq!(
+            store.account_limits().unwrap()[0].weekly_percent,
+            Some(90.0)
+        );
         drop(store);
         // A store from before the projection existed has the claims and no tables. Opening it
         // does not fold them: the answer is not yet known, and the policy decides nothing, until a
@@ -1063,18 +1115,30 @@ mod tests {
                     [],
                 )
                 .unwrap();
-            connection.execute("DELETE FROM account_limit_readings", []).unwrap();
-            connection.execute("DELETE FROM account_limit_seats", []).unwrap();
+            connection
+                .execute("DELETE FROM account_limit_readings", [])
+                .unwrap();
+            connection
+                .execute("DELETE FROM account_limit_seats", [])
+                .unwrap();
         }
         let store = Store::open(&path, "alder").unwrap();
         assert!(!store.account_limits_ready().unwrap());
         assert!(store.account_limits().unwrap().is_empty());
-        assert!(store
-            .enforce_account_limits(&policy(), now + 168 * HOUR)
-            .unwrap()
-            .stopped
-            .is_empty());
-        assert_eq!(store.account_limits_check(now + 168 * HOUR, 3_600_000).unwrap().status, "pass");
+        assert!(
+            store
+                .enforce_account_limits(&policy(), now + 168 * HOUR)
+                .unwrap()
+                .stopped
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .account_limits_check(now + 168 * HOUR, 3_600_000)
+                .unwrap()
+                .status,
+            "pass"
+        );
         // One page of ten of the 86 claims, then the daemon dies.
         assert!(store.catch_up_account_limits(10).unwrap());
         assert!(!store.account_limits_ready().unwrap());
@@ -1115,33 +1179,52 @@ mod tests {
                     [],
                 )
                 .unwrap();
-            connection.execute("DELETE FROM account_limit_readings", []).unwrap();
-            connection.execute("DELETE FROM account_limit_seats", []).unwrap();
+            connection
+                .execute("DELETE FROM account_limit_readings", [])
+                .unwrap();
+            connection
+                .execute("DELETE FROM account_limit_seats", [])
+                .unwrap();
         }
         let store = Store::open(&path, "alder").unwrap();
         assert!(!store.account_limits_ready().unwrap());
         let binding = store.seat_binding(seat).unwrap().unwrap();
         // Every account would read as unused, so a pool start chooses nothing and stores nothing.
-        let error = store.account_for_start(seat, &binding, "alder", now + 2).unwrap_err();
+        let error = store
+            .account_for_start(seat, &binding, "alder", now + 2)
+            .unwrap_err();
         assert!(error.contains("catching up"), "{error}");
         assert_eq!(store.seat_account_choice(seat).unwrap(), None);
-        assert!(store
-            .pool_alternatives(&binding, "alder", "ada/one", 95.0, now + 2)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .pool_alternatives(&binding, "alder", "ada/one", 95.0, now + 2)
+                .unwrap()
+                .is_empty()
+        );
         // A single named account does not depend on the readings.
         let single = store.seat_binding("agent/alder.single").unwrap().unwrap();
         assert_eq!(
-            store.account_for_start("agent/alder.single", &single, "alder", now + 2).unwrap().account.name,
+            store
+                .account_for_start("agent/alder.single", &single, "alder", now + 2)
+                .unwrap()
+                .account
+                .name,
             "ada/one"
         );
         // Once the projection has caught up the pool start picks the account with usage left.
         while store.catch_up_account_limits(1).unwrap() {}
         assert_eq!(
-            store.account_for_start(seat, &binding, "alder", now + 2).unwrap().account.name,
+            store
+                .account_for_start(seat, &binding, "alder", now + 2)
+                .unwrap()
+                .account
+                .name,
             "ada/two"
         );
-        assert_eq!(store.seat_account_choice(seat).unwrap().as_deref(), Some("ada/two"));
+        assert_eq!(
+            store.seat_account_choice(seat).unwrap().as_deref(),
+            Some("ada/two")
+        );
     }
 
     #[test]
@@ -1538,8 +1621,14 @@ agent "other" { workspace "/tmp"; harness "codex" { account-pool "person/ada"; }
         read_account(&store, "agent/alder.other", "ada/two", "", 20.0, now + 1);
         let limits = store.account_limits().unwrap();
         assert_eq!(limits.len(), 2);
-        let first = limits.iter().find(|limit| limit.account_ref.as_deref() == Some("ada/one")).unwrap();
-        let second = limits.iter().find(|limit| limit.account_ref.as_deref() == Some("ada/two")).unwrap();
+        let first = limits
+            .iter()
+            .find(|limit| limit.account_ref.as_deref() == Some("ada/one"))
+            .unwrap();
+        let second = limits
+            .iter()
+            .find(|limit| limit.account_ref.as_deref() == Some("ada/two"))
+            .unwrap();
         assert_eq!(first.weekly_percent, Some(97.0));
         assert_eq!(second.weekly_percent, Some(20.0));
         let outcome = store.enforce_account_limits(&policy(), now + 2).unwrap();

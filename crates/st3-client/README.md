@@ -17,6 +17,26 @@ parameters, and manually paired action discriminators are private implementation
 Mutation callers pass the latest response snapshot and exact resource fences. `ClientError::Api`
 preserves stable error codes such as `stale-fence`, `runtime-not-local`, and `cursor-gap`.
 
+## Native subjects
+
+`subject_get`, `subjects_list`, `subject_claims`, `subject_history`, and `subject_schemas` read
+native registry identities independently of operational resources and applied agent definitions.
+Use `SubjectsSelector` with `subscribe_subjects` for an exact ref or a bounded family window.
+Discovery includes all registered families, effective descriptors, registry/projected-schema
+digests, and the full projected JSON Schema.
+
+Native models validate canonical references, claim kinds, and descriptor IDs when deserialized.
+Known malformed payloads fail decoding; unknown descriptors return the payload-free
+`Unsupported` union case, including inside collection frames. `ProjectedField` preserves absent,
+null, and present native values. Claims/history declare retained answering-host coverage and
+local evidence provenance; they are not complete fleet-wide lifetime histories.
+
+Native pattern validators compile the generated schema's patterns with `fancy-regex`, including
+the base schema's negative-lookahead exclusions for generic arrangement subjects. Each match has an
+explicit 100,000-backtrack budget; matching errors, including budget exhaustion, reject the value.
+Reference schemas carrying `x-st-native-ref-families` retain their canonical-reference validator
+rather than using the pattern engine.
+
 ## Raw PTY connectors
 
 `raw_terminal_attachment(terminal_id, runtime_incarnation, RawTerminalMode::Attach)` acquires
@@ -75,5 +95,14 @@ Paired observations require the pairing issuer's gateway. `pairing.revoke` on an
 member fails without committing, with HTTP 409 `issuer-required` and
 `details.issuer_host_id`. Automatic cross-gateway revocation routing is not provided.
 
-Run `cargo run -p st3-client-codegen -- --check` from the repository root to verify the generated
-models and operation surfaces exactly match the normative schema and operation manifest.
+After registry changes, regenerate the public registry document from the repository root with
+`cargo run -p st3-schema --example schema_markdown -- docs/st3/schema.md`, then regenerate the
+client surfaces with `cargo run -p st3-client-codegen`. Run
+`cargo run -p st3-client-codegen -- --check` to verify the generated models and operation surfaces
+exactly match the normative schema and operation manifest.
+
+Offline JSON Schema validators must register
+`docs/st3/client-v0/schemas/subject-projection.schema.json` at
+`https://st3.local/schemas/subject-projection.schema.json`, including when validating a modified
+older client schema. Registering the native resource resolves its external references without
+enabling network retrieval or loosening the older schema's closed enums.

@@ -1,6 +1,7 @@
 //! The authoritative st3 subject, resource, and claim registry.
 
 pub mod arrangements;
+pub mod client_projection;
 pub mod custom;
 pub mod glasses;
 pub mod owned_terminals;
@@ -14,6 +15,80 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 pub const SCHEMA_NAME: &str = "st3.v1";
+
+pub const SUBJECT_REFERENCE_MAX_UTF8_BYTES: usize = 512;
+const SUBJECT_REFERENCE_FORBIDDEN_PATTERN: &str = r"[\u0000-\u0020\u007f-\u009f\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]";
+const CUSTOM_REFERENCE_SUFFIX_PATTERN: &str = r"[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)+";
+const FILE_REFERENCE_HOST_PATTERN: &str = r"[a-zA-Z0-9][a-zA-Z0-9._@-]*";
+
+/// Canonical JSON sorts object keys recursively, regardless of preserve_order.
+/// Array order and scalar encodings are retained exactly.
+pub fn canonical_json(value: &Value) -> Vec<u8> {
+    fn encode(value: &Value, output: &mut Vec<u8>) {
+        match value {
+            Value::Object(values) => {
+                output.push(b'{');
+                let mut keys = values.keys().collect::<Vec<_>>();
+                keys.sort_unstable();
+                for (index, key) in keys.into_iter().enumerate() {
+                    if index != 0 { output.push(b','); }
+                    serde_json::to_writer(&mut *output, key).expect("JSON object key");
+                    output.push(b':');
+                    encode(&values[key], output);
+                }
+                output.push(b'}');
+            }
+            Value::Array(values) => {
+                output.push(b'[');
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 { output.push(b','); }
+                    encode(value, output);
+                }
+                output.push(b']');
+            }
+            _ => serde_json::to_writer(output, value).expect("JSON scalar"),
+        }
+    }
+    let mut output = Vec::new();
+    encode(value, &mut output);
+    output
+}
+
+pub fn canonical_json_sha256(value: &Value) -> String {
+    hex::encode(Sha256::digest(canonical_json(value)))
+}
+
+/// Executable reference grammar metadata for generated non-native clients.
+/// Rust character predicates and UTF-8 byte lengths remain the native authority.
+pub fn subject_reference_contract() -> Value {
+    serde_json::json!({
+        "families": registry().subjects.keys().collect::<Vec<_>>(),
+        "max_utf8_bytes": SUBJECT_REFERENCE_MAX_UTF8_BYTES,
+        "forbidden_pattern": SUBJECT_REFERENCE_FORBIDDEN_PATTERN,
+        "custom_suffix_pattern": CUSTOM_REFERENCE_SUFFIX_PATTERN,
+        "file_host_pattern": FILE_REFERENCE_HOST_PATTERN
+    })
+}
+
+/// JSON Schema plus explicit UTF-8 byte-bound semantics, translated by all SDK
+/// validators (JSON Schema maxLength alone counts code points, not UTF-8 bytes).
+pub fn subject_reference_schema(families: &[String]) -> Value {
+    let registered = registry().subjects.keys()
+        .filter(|family| families.is_empty() || families.contains(family))
+        .collect::<Vec<_>>();
+    let alternatives = registered.iter().map(|family| match family.as_str() {
+        "custom" => format!("custom/{CUSTOM_REFERENCE_SUFFIX_PATTERN}"),
+        "file" => format!(r"file/{FILE_REFERENCE_HOST_PATTERN}:/(?!\.\.(?:/|$))(?!.*(?:/\.\./|/\.\.$))[^/]+(?:/[^/]+)*"),
+        other => format!(r"{other}/[^/]+(?:/[^/]+)*"),
+    }).collect::<Vec<_>>().join("|");
+    serde_json::json!({
+        "type":"string",
+        "pattern":format!(r"^(?!.*{SUBJECT_REFERENCE_FORBIDDEN_PATTERN})(?:{alternatives})(?![\s\S])"),
+        "maxLength":SUBJECT_REFERENCE_MAX_UTF8_BYTES,
+        "x-st-max-utf8-bytes":SUBJECT_REFERENCE_MAX_UTF8_BYTES,
+        "x-st-native-ref-families":registered
+    })
+}
 
 pub const HARNESS_TODO_MAX_PHASES: usize = 16;
 pub const HARNESS_TODO_MAX_TASKS: usize = 100;
@@ -227,8 +302,7 @@ impl std::error::Error for ValidationError {}
 
 impl Registry {
     pub fn digest(&self) -> String {
-        let bytes = serde_json::to_vec(self).expect("the schema registry is serializable");
-        hex::encode(Sha256::digest(bytes))
+        canonical_json_sha256(&serde_json::to_value(self).expect("the schema registry is serializable"))
     }
 
     pub fn markdown(&self) -> String {
@@ -303,7 +377,7 @@ impl Registry {
 
     pub fn validate_subject(&self, subject: &str) -> Result<&SubjectSpec, ValidationError> {
         if subject.is_empty()
-            || subject.len() > 512
+            || subject.len() > SUBJECT_REFERENCE_MAX_UTF8_BYTES
             || !subject.contains('/')
             || subject.chars().any(char::is_whitespace)
             || subject.chars().any(char::is_control)

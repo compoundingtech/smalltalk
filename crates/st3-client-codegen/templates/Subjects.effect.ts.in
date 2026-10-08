@@ -1,0 +1,69 @@
+
+import { Effect } from "effect"
+import { St3Client } from "./Client.generated.ts"
+import * as RawSubjects from "./Subjects.generated.ts"
+
+export class SubjectBoundaryError extends Schema.TaggedError<SubjectBoundaryError>()("SubjectBoundaryError", {
+  code: Schema.Literals(["validation-failed", "unsupported-schema", "request-failed"]),
+  message: Schema.String
+}) {}
+const subjectBoundaryError = (cause: unknown): SubjectBoundaryError => new SubjectBoundaryError({
+  code: cause instanceof RawSubjects.UnsupportedSubjectDescriptorError ? "unsupported-schema" : cause instanceof RawSubjects.SubjectDecodeError ? "validation-failed" : "request-failed",
+  message: cause instanceof Error ? cause.message : "Native subject request failed"
+})
+const richProjection = (value: RawSubjects.SubjectProjectionResult): Effect.Effect<SubjectProjection | RawSubjects.UnsupportedSubjectSchema, Schema.SchemaError> =>
+  RawSubjects.isUnsupportedSubjectSchema(value) ? Effect.succeed(value) : Schema.decodeUnknownEffect(SubjectProjection, { onExcessProperty: "error" })(value)
+const richClaim = (value: RawSubjects.SubjectClaimResult): Effect.Effect<SubjectClaim | RawSubjects.UnsupportedSubjectSchema, Schema.SchemaError> =>
+  RawSubjects.isUnsupportedSubjectSchema(value) ? Effect.succeed(value) : Schema.decodeUnknownEffect(SubjectClaim, { onExcessProperty: "error" })(value)
+/** Unknown descriptor identities return only unavailable metadata, never the unvalidated fields. */
+export const decodeNativeSubjectProjection = Effect.fn("St3.SubjectProjection.decode")((input: unknown) =>
+  Effect.try({ try: () => RawSubjects.decodeSubjectProjection(input), catch: subjectBoundaryError }).pipe(
+    Effect.flatMap(richProjection)
+  )
+)
+export const decodeNativeSubjectClaim = Effect.fn("St3.SubjectClaim.decode")((input: unknown) =>
+  Effect.try({ try: () => RawSubjects.decodeSubjectClaim(input), catch: subjectBoundaryError }).pipe(
+    Effect.flatMap(richClaim)
+  )
+)
+/** A generated Effect facade over the dependency-free raw transport, with compiled edge codecs. */
+export class SubjectClient {
+  readonly raw: St3Client
+  constructor(raw: St3Client) { this.raw = raw }
+  subjectGet = Effect.fn("St3.SubjectClient.subjectGet")((reference: string) => Effect.gen({ self: this }, function* () {
+    const envelope = yield* Effect.tryPromise({ try: () => this.raw.subjectGet(reference), catch: subjectBoundaryError })
+    const snapshot = yield* Schema.decodeUnknownEffect(Snapshot, { onExcessProperty: "error" })(envelope.snapshot)
+    const value = yield* richProjection(envelope.value)
+    return { ...envelope, snapshot, value }
+  }))
+  subjectsList = Effect.fn("St3.SubjectClient.subjectsList")((family: string, options: { ref_prefix?: string; limit?: number; cursor?: string } = {}) => Effect.gen({ self: this }, function* () {
+    const envelope = yield* Effect.tryPromise({ try: () => this.raw.subjectsList(family, options), catch: subjectBoundaryError })
+    const snapshot = yield* Schema.decodeUnknownEffect(Snapshot, { onExcessProperty: "error" })(envelope.snapshot)
+    const page = yield* Schema.decodeUnknownEffect(SubjectsPage, { onExcessProperty: "error" })({ ...envelope.value, items: [] })
+    const items = yield* Effect.forEach(envelope.value.items, richProjection)
+    return { ...envelope, snapshot, value: { ...page, items } }
+  }))
+  subjectClaims = Effect.fn("St3.SubjectClient.subjectClaims")((reference: string, options: { kind?: string; limit?: number; cursor?: string } = {}) => Effect.gen({ self: this }, function* () {
+    const envelope = yield* Effect.tryPromise({ try: () => this.raw.subjectClaims(reference, options), catch: subjectBoundaryError })
+    const snapshot = yield* Schema.decodeUnknownEffect(Snapshot, { onExcessProperty: "error" })(envelope.snapshot)
+    const page = yield* Schema.decodeUnknownEffect(SubjectClaimsPage, { onExcessProperty: "error" })({ ...envelope.value, items: [] })
+    const items = yield* Effect.forEach(envelope.value.items, richClaim)
+    return { ...envelope, snapshot, value: { ...page, items } }
+  }))
+  subjectHistory = Effect.fn("St3.SubjectClient.subjectHistory")((reference: string, options: { kind?: string; limit?: number; cursor?: string } = {}) => Effect.gen({ self: this }, function* () {
+    const envelope = yield* Effect.tryPromise({ try: () => this.raw.subjectHistory(reference, options), catch: subjectBoundaryError })
+    const snapshot = yield* Schema.decodeUnknownEffect(Snapshot, { onExcessProperty: "error" })(envelope.snapshot)
+    const page = yield* Schema.decodeUnknownEffect(SubjectHistoryPage, { onExcessProperty: "error" })({ ...envelope.value, items: [] })
+    const items = yield* Effect.forEach(envelope.value.items, richClaim)
+    return { ...envelope, snapshot, value: { ...page, items } }
+  }))
+  subjectSchemas = Effect.fn("St3.SubjectClient.subjectSchemas")(() => Effect.gen({ self: this }, function* () {
+    const envelope = yield* Effect.tryPromise({ try: () => this.raw.subjectSchemas(), catch: subjectBoundaryError })
+    const snapshot = yield* Schema.decodeUnknownEffect(Snapshot, { onExcessProperty: "error" })(envelope.snapshot)
+    const value = yield* Schema.decodeUnknownEffect(SubjectSchemas, { onExcessProperty: "error" })(envelope.value)
+    return { ...envelope, snapshot, value }
+  }))
+  subscribeSubjects = Effect.fn("St3.SubjectClient.subscribeSubjects")((id: string, selector: RawSubjects.SubjectsSelector, options: Parameters<St3Client["collectionStream"]>[0], limit?: number) =>
+    Effect.tryPromise({ try: async () => { const stream = await this.raw.collectionStream(options); stream.subscribeSubjects(id, selector, limit); return stream }, catch: subjectBoundaryError })
+  )
+}

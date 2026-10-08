@@ -185,10 +185,18 @@ pub(super) fn retiring_ask_live(
     let Some(subject) = ask.actor.as_deref() else {
         return Ok(false);
     };
-    let retiring: bool = connection.query_row(
-        "SELECT kind='stop' FROM desired WHERE subject=?1", [subject], |row| row.get(0),
-    ).optional().map_err(internal)?.unwrap_or(false);
-    if !retiring { return Ok(false); }
+    let retiring: bool = connection
+        .query_row(
+            "SELECT kind='stop' FROM desired WHERE subject=?1",
+            [subject],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .unwrap_or(false);
+    if !retiring {
+        return Ok(false);
+    }
     let Some(selected) = selection(connection, subject)? else {
         return Ok(false);
     };

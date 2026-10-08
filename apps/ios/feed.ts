@@ -1,4 +1,4 @@
-import { applyWindow, isTransientCode, plainError, plainMessage, type Agent, type Attention, type CollectionFrame, type Glass, type CollectionName, type CollectionStream, type CollectionWindow, type Mission, type Snapshot, type St3Client, type TerminalScreen, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { applyWindow, isTransientCode, plainError, plainMessage, type Agent, type Attention, type CollectionStreamFrame, type Glass, type CollectionName, type CollectionStream, type CollectionWindow, type Mission, type Snapshot, type St3Client, type TerminalScreen, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { TERMINAL_RESTARTED, withFreshTerminalFence, type Foreground, type TerminalFollowHandlers } from './terminalControls';
 
 // The app holds three windows on one collections socket. It needs no work window: missions carry
@@ -243,7 +243,9 @@ export class Feed {
     this.timer = setTimeout(() => { void this.connect(); }, delay);
   }
 
-  private frame(frame: CollectionFrame): void {
+  private frame(frame: CollectionStreamFrame): void {
+    // This feed subscribes only to operational windows, never native subject projections.
+    if ((frame.kind === 'snapshot' || frame.kind === 'changes') && frame.collection === 'subjects') return;
     const id = 'id' in frame ? frame.id : undefined;
     if ((frame.kind === 'snapshot' || frame.kind === 'changes') && frame.id === GLASSES) {
       const follow = this.glasses;

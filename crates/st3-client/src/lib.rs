@@ -367,6 +367,15 @@ pub struct CollectionStream {
     subscribed: std::collections::HashMap<String, std::time::Instant>,
 }
 
+/// Native family window or one exact native ref; the two selectors cannot be combined.
+pub enum SubjectsSelector<'a> {
+    Family {
+        family: &'a str,
+        ref_prefix: Option<&'a str>,
+    },
+    Ref(&'a str),
+}
+
 /// When anything last arrived on a stream, a frame or a WebSocket pong alike. A clone of it
 /// outlives borrows of the stream, so a task waiting on the stream can tell how long it has been
 /// quiet without asking st anything.
@@ -401,6 +410,25 @@ impl Heard {
 impl CollectionStream {
     pub async fn subscribe_glasses(&mut self, id: &str) -> Result<(), ClientError> {
         self.subscribe(id, "glasses", 100, None, None).await
+    }
+    pub async fn subscribe_subjects(
+        &mut self,
+        id: &str,
+        selector: SubjectsSelector<'_>,
+        limit: usize,
+    ) -> Result<(), ClientError> {
+        let mut command =
+            serde_json::json!({"kind":"subscribe","id":id,"collection":"subjects","limit":limit});
+        match selector {
+            SubjectsSelector::Family { family, ref_prefix } => {
+                command["family"] = family.into();
+                if let Some(prefix) = ref_prefix {
+                    command["ref_prefix"] = prefix.into();
+                }
+            }
+            SubjectsSelector::Ref(reference) => command["ref"] = reference.into(),
+        }
+        self.send(&command).await
     }
     /// Select the owner's fleet explicitly; agent identity is not an owner selector.
     pub async fn subscribe_arrangements(
@@ -583,6 +611,21 @@ pub enum CollectionEvent {
         order: Vec<String>,
         has_more: bool,
     },
+    SubjectsSnapshot {
+        id: String,
+        snapshot: Snapshot,
+        items: Vec<SubjectProjection>,
+        order: Vec<String>,
+        has_more: bool,
+    },
+    SubjectsChanges {
+        id: String,
+        snapshot: Snapshot,
+        upserts: Vec<SubjectProjection>,
+        removes: Vec<String>,
+        order: Vec<String>,
+        has_more: bool,
+    },
     /// A terminal subscription's whole current screen; it replaces every earlier one.
     Screen {
         id: String,
@@ -627,6 +670,31 @@ impl CollectionEvent {
         }
         let id = field::<String>(&frame, "id")?;
         match frame.get("kind").and_then(serde_json::Value::as_str) {
+            Some("snapshot")
+                if frame.get("collection").and_then(serde_json::Value::as_str)
+                    == Some("subjects") =>
+            {
+                Ok(Self::SubjectsSnapshot {
+                    snapshot: field(&frame, "snapshot")?,
+                    items: field(&frame, "items")?,
+                    order: field(&frame, "order")?,
+                    has_more: field(&frame, "has_more")?,
+                    id,
+                })
+            }
+            Some("changes")
+                if frame.get("collection").and_then(serde_json::Value::as_str)
+                    == Some("subjects") =>
+            {
+                Ok(Self::SubjectsChanges {
+                    snapshot: field(&frame, "snapshot")?,
+                    upserts: field(&frame, "upserts")?,
+                    removes: field(&frame, "removes")?,
+                    order: field(&frame, "order")?,
+                    has_more: field(&frame, "has_more")?,
+                    id,
+                })
+            }
             Some("snapshot") => Ok(Self::Snapshot {
                 snapshot: field(&frame, "snapshot")?,
                 items: field(&frame, "items")?,
@@ -1534,6 +1602,76 @@ impl Client {
     }
     pub async fn mail_backlog_summary(&self) -> Result<Envelope<MailBacklog>, ClientError> {
         self.get("/v1/client/mail-backlog").await
+    }
+    pub async fn subjects_list(
+        &self,
+        family: &str,
+        ref_prefix: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<SubjectsPage>, ClientError> {
+        let mut query = vec![format!("family={}", percent_encode(family))];
+        for (name, value) in [("ref_prefix", ref_prefix), ("cursor", cursor)] {
+            if let Some(value) = value {
+                query.push(format!("{name}={}", percent_encode(value)));
+            }
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        self.get(&format!("/v1/client/subjects?{}", query.join("&")))
+            .await
+    }
+    pub async fn subject_get(
+        &self,
+        reference: &str,
+    ) -> Result<Envelope<SubjectProjection>, ClientError> {
+        self.get(&format!(
+            "/v1/client/subject?ref={}",
+            percent_encode(reference)
+        ))
+        .await
+    }
+    pub async fn subject_claims(
+        &self,
+        reference: &str,
+        kind: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<SubjectClaimsPage>, ClientError> {
+        let mut query = vec![format!("ref={}", percent_encode(reference))];
+        for (name, value) in [("kind", kind), ("cursor", cursor)] {
+            if let Some(value) = value {
+                query.push(format!("{name}={}", percent_encode(value)));
+            }
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        self.get(&format!("/v1/client/subject-claims?{}", query.join("&")))
+            .await
+    }
+    pub async fn subject_history(
+        &self,
+        reference: &str,
+        kind: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<SubjectHistoryPage>, ClientError> {
+        let mut query = vec![format!("ref={}", percent_encode(reference))];
+        for (name, value) in [("kind", kind), ("cursor", cursor)] {
+            if let Some(value) = value {
+                query.push(format!("{name}={}", percent_encode(value)));
+            }
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        self.get(&format!("/v1/client/subject-history?{}", query.join("&")))
+            .await
+    }
+    pub async fn subject_schemas(&self) -> Result<Envelope<SubjectSchemas>, ClientError> {
+        self.get("/v1/client/subject-schemas").await
     }
     pub async fn usage_period(
         &self,

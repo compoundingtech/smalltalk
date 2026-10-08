@@ -84,14 +84,21 @@ pub(super) fn merge_observation(
     current: &mut serde_json::Map<String, Value>,
     fields: &serde_json::Map<String, Value>,
 ) {
-    let carries_opener = fields.get("kind").and_then(Value::as_str).is_some_and(super::carries_opener);
+    let carries_opener = fields
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(super::carries_opener);
     if carries_opener && fields.get("attribution_only") == Some(&Value::Bool(true)) {
         if let Some(kind) = fields.get("kind") {
             current.entry("kind").or_insert_with(|| kind.clone());
         }
         let nested = current.contains_key("facts") || current.len() == 1;
         let current = if nested {
-            current.entry("facts").or_insert_with(|| json!({})).as_object_mut().unwrap()
+            current
+                .entry("facts")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .unwrap()
         } else {
             current
         };
@@ -101,7 +108,9 @@ pub(super) fn merge_observation(
             }
             let initial = current.is_empty();
             for name in ["repository", "number", "url", "opened_by", "opened_by_run"] {
-                if (initial || matches!(name, "opened_by" | "opened_by_run")) && let Some(value) = incoming.get(name) {
+                if (initial || matches!(name, "opened_by" | "opened_by_run"))
+                    && let Some(value) = incoming.get(name)
+                {
                     current.entry(name).or_insert_with(|| value.clone());
                 }
             }
@@ -154,7 +163,11 @@ pub(super) fn refresh(transaction: &Transaction<'_>, subject: &str) -> Result<()
             Some(fields) => serde_json::from_value(fields)?,
         };
         let mut facts = resource_facts(&fields).map_err(anyhow::Error::new)?;
-        if fields.get("kind").and_then(Value::as_str).is_some_and(super::carries_opener) {
+        if fields
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(super::carries_opener)
+        {
             let first_opener = transaction.query_row(
                 &format!("SELECT body FROM claims WHERE subject=?1 AND kind='resource.observed'
                     AND (COALESCE(json_extract(body, '$.fields.facts.opened_by'), json_extract(body, '$.fields.opened_by')) IS NOT NULL
@@ -166,7 +179,8 @@ pub(super) fn refresh(transaction: &Transaction<'_>, subject: &str) -> Result<()
             if let Some(opener) = first_opener {
                 let mut opener: Value = serde_json::from_str(&opener)?;
                 let opener_fields = serde_json::from_value(opener["fields"].take())?;
-                let mut opener_facts = resource_facts(&opener_fields).map_err(anyhow::Error::new)?;
+                let mut opener_facts =
+                    resource_facts(&opener_fields).map_err(anyhow::Error::new)?;
                 facts.remove("opened_by");
                 facts.remove("opened_by_run");
                 for name in ["opened_by", "opened_by_run"] {
@@ -487,26 +501,51 @@ mod replication_tests {
         target.bind_fleet(FLEET).unwrap();
         let subject = "resource/github/acme/demo/pull-request/9";
         let spool = tempfile::tempdir().unwrap();
-        std::fs::write(spool.path().join("1.json"), serde_json::to_vec(&crate::recorder::Receipt {
-            schema: "st3.recorder.receipt.v1".into(),
-            url: "https://github.com/acme/demo/pull/9".into(),
-            actor: "agent/node.builder".into(), mission_run: Some("created".into()),
-            exit_code: Some(0), at: "2026-10-03T12:00:00Z".into(),
-        }).unwrap()).unwrap();
-        assert_eq!(crate::recorder_receipts::ingest_once(&target, spool.path()).unwrap(), 1);
-        source.append_claim(&ClaimInput {
-            subject: subject.into(), kind: "resource.observed".into(), actor: None,
-            fields: BTreeMap::from([
-                ("kind".into(), json!("vcs.pull-request")),
-                ("facts".into(), json!({"number": 9, "state": "open", "title": "Observed",
-                    "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})),
-            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-        }).unwrap();
-        let exchange = source.export_replication_exchange_answering(
-            FLEET, &target.replication_inventory().unwrap(),
-            &target.replication_signature_requests().unwrap(),
-        ).unwrap();
-        target.receive_replication_exchange(&source.origin, FLEET, &exchange).unwrap();
+        std::fs::write(
+            spool.path().join("1.json"),
+            serde_json::to_vec(&crate::recorder::Receipt {
+                schema: "st3.recorder.receipt.v1".into(),
+                url: "https://github.com/acme/demo/pull/9".into(),
+                actor: "agent/node.builder".into(),
+                mission_run: Some("created".into()),
+                exit_code: Some(0),
+                at: "2026-10-03T12:00:00Z".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::recorder_receipts::ingest_once(&target, spool.path()).unwrap(),
+            1
+        );
+        source
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("kind".into(), json!("vcs.pull-request")),
+                    (
+                        "facts".into(),
+                        json!({"number": 9, "state": "open", "title": "Observed",
+                    "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let exchange = source
+            .export_replication_exchange_answering(
+                FLEET,
+                &target.replication_inventory().unwrap(),
+                &target.replication_signature_requests().unwrap(),
+            )
+            .unwrap();
+        target
+            .receive_replication_exchange(&source.origin, FLEET, &exchange)
+            .unwrap();
         target.validate_replication_backlog().unwrap();
         target.project_replication_backlog().unwrap();
         let facts = target.latest_actual_value(subject).unwrap().unwrap()["facts"].clone();
@@ -514,11 +553,27 @@ mod replication_tests {
         assert_eq!(facts["opened_by_run"], "mission-run/created");
         assert_eq!(facts["state"], "open");
         assert_eq!(facts["title"], "Observed");
-        assert_eq!(facts["head_sha"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert_eq!(target.resource_collection_page(None, None, Some(subject), None, 10).unwrap()[0]["facts"], facts);
+        assert_eq!(
+            facts["head_sha"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            target
+                .resource_collection_page(None, None, Some(subject), None, 10)
+                .unwrap()[0]["facts"],
+            facts
+        );
         target.replay_replication_graph().unwrap();
-        assert_eq!(target.latest_actual_value(subject).unwrap().unwrap()["facts"], facts);
-        assert_eq!(target.resource_collection_page(None, None, Some(subject), None, 10).unwrap()[0]["facts"], facts);
+        assert_eq!(
+            target.latest_actual_value(subject).unwrap().unwrap()["facts"],
+            facts
+        );
+        assert_eq!(
+            target
+                .resource_collection_page(None, None, Some(subject), None, 10)
+                .unwrap()[0]["facts"],
+            facts
+        );
     }
 
     #[test]

@@ -14,6 +14,12 @@ HOME = re.compile(r"/(?:home|Users)/([A-Za-z][A-Za-z0-9_.-]*)")
 PERSON_NAME = r"([A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*)"
 PERSON = re.compile("person" + r"/" + PERSON_NAME)
 ENCODED_PERSON = re.compile("person" + r"%2[fF]" + PERSON_NAME)
+# Only the person segment of a complete native claim descriptor is metadata, not an actor.
+# Do not exempt its surrounding line: it can still contain private person references.
+PERSON_DESCRIPTOR = re.compile(
+    r"(?<![A-Za-z0-9_./-])subject-claim-schema/[0-9a-f]{64}/"
+    r"(person/[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)(?![A-Za-z0-9_./-])"
+)
 # Default mission authority specifically requires fleet/PROJECT identities. These tests
 # use the reserved invented fixture- project prefix; other fleet seats remain forbidden.
 FLEET_AGENT = re.compile("agent" + r"/fleet/(?!fixture-)[A-Za-z0-9_./-]+")
@@ -60,8 +66,9 @@ def findings(path, content):
         for match in HOME.finditer(line):
             if match.group(1) != "example":
                 reasons.append("personal home path")
+        descriptor_spans = {match.span(1) for match in PERSON_DESCRIPTOR.finditer(line)}
         for match in PERSON.finditer(line):
-            if match.group(1) not in EXAMPLE_PEOPLE:
+            if match.span() not in descriptor_spans and match.group(1) not in EXAMPLE_PEOPLE:
                 reasons.append("unlisted person ID")
         for match in ENCODED_PERSON.finditer(line):
             if match.group(1) not in EXAMPLE_PEOPLE:

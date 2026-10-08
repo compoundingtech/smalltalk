@@ -91,13 +91,20 @@ fn consumer_validator(definition: &str) -> jsonschema::Validator {
     )
 }
 
-fn compile_contract_validator(mut schema: Value, definition: &str) -> jsonschema::Validator {
+pub(super) fn compile_contract_validator(mut schema: Value, definition: &str) -> jsonschema::Validator {
     schema.as_object_mut().unwrap().remove("oneOf");
     schema["$ref"] = Value::String(format!("#/$defs/{definition}"));
     // Unknown x-st-* annotation keywords are ignored by the standard validator.
     jsonschema::options()
         .with_draft(jsonschema::Draft::Draft202012)
         .should_validate_formats(true)
+        .with_resource(
+            "https://st3.local/schemas/subject-projection.schema.json",
+            jsonschema::Resource::from_contents(json(
+                asset_root().join("schemas/subject-projection.schema.json"),
+            ))
+            .expect("parse native subject projection schema resource"),
+        )
         .build(&schema)
         .unwrap_or_else(|error| panic!("compile {definition} contract: {error}"))
 }
@@ -4158,8 +4165,7 @@ async fn custom_subject_contract_pagination_and_paired_person_reply() {
     let properties = &mut old_schema["$defs"]["Attention"]["allOf"][1]["properties"];
     properties["attention_kind"] = serde_json::json!({"enum":["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault"]});
     properties["actions"] = serde_json::json!({"type":"array","items":{"enum":["work.done","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"]}});
-    old_schema["$ref"] = serde_json::json!("#/$defs/Envelope");
-    let old_validator = jsonschema::options().build(&old_schema).unwrap();
+    let old_validator = compile_contract_validator(old_schema, "Envelope");
     assert_conforms(&old_validator, "older custom attention fallback", &legacy);
     let response = fabric.clone().oneshot(Request::builder()
         .uri("/v1/client/attention")

@@ -24,6 +24,30 @@ class PublicRepositoryCheck(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(self.findings(text))
 
+    def test_person_claim_descriptors_are_not_actor_identities(self):
+        descriptor = 'subject-claim-schema/' + 'a' * 64 + '/person/' + 'intent.desired'
+        for path in ['docs/example.md', 'clients/typescript/Models.generated.ts']:
+            with self.subTest(path=path):
+                self.assertEqual(self.findings(f'"{descriptor}"', path), [])
+                self.assertEqual(self.findings(f'"{descriptor}" person/ada', path), [])
+                self.assertEqual(self.findings(
+                    f'"{descriptor}" person' + '/unknown-fixture', path
+                ), ['1: unlisted person ID'])
+
+    def test_descriptor_exemption_requires_complete_native_namespace(self):
+        suffix = '/person/' + 'intent.desired'
+        for prefix in ['subject-claim-schema/' + 'a' * 63,
+                       'subject-claim-schema/' + 'g' * 64,
+                       'other-schema/' + 'a' * 64,
+                       'prefixsubject-claim-schema/' + 'a' * 64]:
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.findings(prefix + suffix), ['1: unlisted person ID'])
+        descriptor = 'subject-claim-schema/' + 'a' * 64 + suffix
+        self.assertEqual(self.findings(descriptor + '/extra'), ['1: unlisted person ID'])
+        self.assertEqual(self.findings(
+            'subject-claim-schema/' + 'a' * 64 + '/person' + '/unknown-fixture'
+        ), ['1: unlisted person ID'])
+
     def test_legacy_provider_templates_allow_only_invented_accounts(self):
         self.assertEqual(self.findings('person/discord-{id} person/discord-404 person/discord-606'), [])
         self.assertTrue(self.findings('person' + '/discord-123456789012345678'))

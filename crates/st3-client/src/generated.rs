@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+#[path = "subjects.generated.rs"]
+mod native_subjects;
+pub use native_subjects::*;
+
 pub const API_VERSION: &str = "st3.client.v0";
 pub const ERROR_VERSION: &str = "st3.client.error.v0";
 pub const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";

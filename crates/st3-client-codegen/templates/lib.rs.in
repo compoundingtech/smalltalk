@@ -367,6 +367,12 @@ pub struct CollectionStream {
     subscribed: std::collections::HashMap<String, std::time::Instant>,
 }
 
+/// Native family window or one exact native ref; the two selectors cannot be combined.
+pub enum SubjectsSelector<'a> {
+    Family { family: &'a str, ref_prefix: Option<&'a str> },
+    Ref(&'a str),
+}
+
 /// When anything last arrived on a stream, a frame or a WebSocket pong alike. A clone of it
 /// outlives borrows of the stream, so a task waiting on the stream can tell how long it has been
 /// quiet without asking st anything.
@@ -399,6 +405,17 @@ impl Heard {
 
 impl CollectionStream {
     pub async fn subscribe_glasses(&mut self, id: &str) -> Result<(), ClientError> { self.subscribe(id, "glasses", 100, None, None).await }
+    pub async fn subscribe_subjects(&mut self, id: &str, selector: SubjectsSelector<'_>, limit: usize) -> Result<(), ClientError> {
+        let mut command = serde_json::json!({"kind":"subscribe","id":id,"collection":"subjects","limit":limit});
+        match selector {
+            SubjectsSelector::Family { family, ref_prefix } => {
+                command["family"] = family.into();
+                if let Some(prefix) = ref_prefix { command["ref_prefix"] = prefix.into(); }
+            }
+            SubjectsSelector::Ref(reference) => command["ref"] = reference.into(),
+        }
+        self.send(&command).await
+    }
     /// Select the owner's fleet explicitly; agent identity is not an owner selector.
     pub async fn subscribe_arrangements(&mut self, id: &str, person: &str, limit: usize, subject: Option<&str>) -> Result<(), ClientError> {
         let mut command = serde_json::json!({"kind":"subscribe", "id":id, "collection":"arrangements", "person":person, "limit":limit});
@@ -570,6 +587,21 @@ pub enum CollectionEvent {
         order: Vec<String>,
         has_more: bool,
     },
+    SubjectsSnapshot {
+        id: String,
+        snapshot: Snapshot,
+        items: Vec<SubjectProjection>,
+        order: Vec<String>,
+        has_more: bool,
+    },
+    SubjectsChanges {
+        id: String,
+        snapshot: Snapshot,
+        upserts: Vec<SubjectProjection>,
+        removes: Vec<String>,
+        order: Vec<String>,
+        has_more: bool,
+    },
     /// A terminal subscription's whole current screen; it replaces every earlier one.
     Screen {
         id: String,
@@ -609,6 +641,21 @@ impl CollectionEvent {
         }
         let id = field::<String>(&frame, "id")?;
         match frame.get("kind").and_then(serde_json::Value::as_str) {
+            Some("snapshot") if frame.get("collection").and_then(serde_json::Value::as_str) == Some("subjects") => Ok(Self::SubjectsSnapshot {
+                snapshot: field(&frame, "snapshot")?,
+                items: field(&frame, "items")?,
+                order: field(&frame, "order")?,
+                has_more: field(&frame, "has_more")?,
+                id,
+            }),
+            Some("changes") if frame.get("collection").and_then(serde_json::Value::as_str) == Some("subjects") => Ok(Self::SubjectsChanges {
+                snapshot: field(&frame, "snapshot")?,
+                upserts: field(&frame, "upserts")?,
+                removes: field(&frame, "removes")?,
+                order: field(&frame, "order")?,
+                has_more: field(&frame, "has_more")?,
+                id,
+            }),
             Some("snapshot") => Ok(Self::Snapshot {
                 snapshot: field(&frame, "snapshot")?,
                 items: field(&frame, "items")?,
