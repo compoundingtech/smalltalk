@@ -480,7 +480,7 @@ fn completed_seat_carry_replays_canonical_desired_ownership() {
     for name in ["amber", "birch", "cedar", "dahlia"] {
         let subject = format!("agent/{}/{name}", run.id);
         let desired = replica
-            .desired_subjects_named(&[subject.clone()])
+            .desired_subjects_named(std::slice::from_ref(&subject))
             .unwrap()
             .pop()
             .unwrap();
@@ -808,12 +808,7 @@ mission "orchid" state="ready" {
             &format!("restore-{round}"),
         );
         settle(&reconciler);
-        assert!(
-            store
-                .fault_items(Some("person/lichen"))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store.fault_items(Some("person/lichen")).unwrap().is_empty());
     }
     let current = store.mission_run(&run.id).unwrap().unwrap();
     store
@@ -833,12 +828,7 @@ mission "orchid" state="ready" {
             .unwrap()
     );
     assert_eq!(store.index().unwrap(), index);
-    assert!(
-        store
-            .fault_items(Some("person/lichen"))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(store.fault_items(Some("person/lichen")).unwrap().is_empty());
 }
 
 #[test]
@@ -875,12 +865,7 @@ mission "orchid" state="ready" {
             .unwrap()
             .is_empty()
     );
-    assert!(
-        store
-            .fault_items(Some("person/lichen"))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(store.fault_items(Some("person/lichen")).unwrap().is_empty());
 }
 
 #[test]
@@ -924,15 +909,127 @@ mission "orchid" state="ready" {
             .unwrap()
     );
     assert_eq!(store.index().unwrap(), index);
-    assert!(
-        store
-            .fault_items(Some("person/lichen"))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(store.fault_items(Some("person/lichen")).unwrap().is_empty());
     settle(&reconciler);
     let faults = store.fault_items(Some("person/lichen")).unwrap();
     assert_eq!(faults.len(), 1);
     assert!(faults[0].targets.contains(&successor.generation));
     assert!(!faults[0].targets.contains(&predecessor.generation));
+}
+
+#[test]
+fn deduped_and_deliberately_stopped_fault_checks_do_not_wait_for_the_writer() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&directory.path().join("claims.sqlite3"), "node").unwrap());
+    publish(
+        &store,
+        r#"version 2
+mission "orchid" state="ready" {
+ goal "Diagnose a missing seat without blocking a quiet writer queue."
+ completion { when "all-steps-exhausted" }
+ step "work" { assigned-to "agent/orchid/absent" }
+}"#,
+        "first",
+    );
+    let run = start(&store, "quiet-fault");
+    let reconciler = Reconciler::new(
+        store.clone(),
+        Arc::new(FakeRuntime::default()),
+        "node".into(),
+        Arc::new(Notify::new()),
+    );
+    settle(&reconciler);
+    for quiet_stop in [false, true] {
+        if quiet_stop {
+            apply_source(
+                &store,
+                "version 2\nstop \"agent/orchid/absent\"",
+                "deliberate-stop",
+            );
+        }
+        let current = store.mission_run_for_reconcile(&run.id).unwrap();
+        let writer_store = store.clone();
+        let (entered, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            writer_store.hold_writer_for_test(|| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            })
+        });
+        held.recv_timeout(Duration::from_secs(2)).unwrap();
+        let checker_store = store.clone();
+        let (finished, result) = std::sync::mpsc::channel();
+        let checker = std::thread::spawn(move || {
+            let checked = checker_store.record_missing_agent_failure(&current, &current.steps[0]);
+            let _ = finished.send(checked);
+        });
+        let checked = result.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        checker.join().unwrap();
+        assert!(
+            !checked
+                .expect("quiet fault check must finish while the writer is still held")
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn failure_after_canonical_carry_rolls_back_seats_generation_and_public_cards() {
+    let store = Arc::new(Store::open_memory("node").unwrap());
+    publish(&store, &source("Grow a garden."), "first");
+    let run = start(&store, "late-rollback");
+    let reconciler = Reconciler::new(
+        store.clone(),
+        Arc::new(FakeRuntime::default()),
+        "node".into(),
+        Arc::new(Notify::new()),
+    );
+    settle(&reconciler);
+    let next = publish(&store, &source("Grow a revised garden."), "second");
+    let before = store.index().unwrap();
+    let cards_before = store.agent_card_status_at(None, before, false).unwrap();
+    store.connection.write().execute_batch("CREATE TEMP TRIGGER fail_cutover AFTER UPDATE OF current_generation_id ON mission_runs WHEN NEW.current_generation_id <> OLD.current_generation_id BEGIN SELECT RAISE(ABORT, 'injected cutover failure after seat carry'); END;").unwrap();
+    let error = store
+        .adopt_mission_revision(
+            &run.id,
+            &next,
+            "person/lichen",
+            "Update goal",
+            "late-rollback-cutover",
+        )
+        .unwrap_err();
+    assert!(error.message.contains("injected cutover failure"));
+    assert_eq!(store.index().unwrap(), before);
+    assert_eq!(
+        store.mission_run(&run.id).unwrap().unwrap().generation,
+        run.generation
+    );
+    for name in ["amber", "birch", "cedar", "dahlia"] {
+        let subject = format!("agent/{}/{name}", run.id);
+        let desired = store
+            .desired_subjects_named(std::slice::from_ref(&subject))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            desired.owner_generation.as_deref(),
+            Some(run.generation.as_str())
+        );
+        assert_eq!(
+            store
+                .latest_claim(&subject, Some("intent.desired"))
+                .unwrap()
+                .unwrap()
+                .body["owner_generation"],
+            run.generation
+        );
+    }
+    let cards_after = store.agent_card_status_at(None, before, false).unwrap();
+    assert_eq!(
+        serde_json::to_value(cards_before).unwrap(),
+        serde_json::to_value(cards_after).unwrap()
+    );
 }

@@ -9,103 +9,110 @@ import traceback
 
 shared = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'st3-subagents-eval/run'))
 Node, until = shared['Node'], shared['until']
-binary, output = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
-output.mkdir(parents=True, exist_ok=True)
-node = Node(output / 'node', binary)
-node.subjects = []
-checks = {}
 
-def cli(*args):
-    return json.loads(node.cli('--json', *args))
+def main():
+    binary, output = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    node = Node(output / 'node', binary)
+    node.subjects = []
+    checks = {}
 
-def fixture(goal, removed=False):
-    names = ['amber', 'birch', 'cedar', 'dahlia']
-    agents = '\n'.join(f'agent "{name}" {{ command "sleep 3600"; restart "never" }}' for name in names if not (removed and name == 'dahlia'))
-    steps = '\n'.join(f'step "{name}" {{ assigned-to "agent/${{ST_MISSION_RUN}}/{name}"; depends-on {{ step "start-seats" completed }} }}' for name in names if not (removed and name == 'dahlia'))
-    return f'''version 2
-mission "orchid" state="ready" {{
- goal "{goal}"
- completion {{ when "all-steps-exhausted" }}
- step "start-seats" {{ agentless; {agents} }}
- {steps}
- finally {{ step "cleanup" {{ agentless; exec "tidy" {{ command "echo cleaned > cleaned"; restart "never" }} }} }}
-}}
-'''
+    def cli(*args):
+        return json.loads(node.cli('--json', *args))
 
-def write(name, text):
-    path = output / name
-    path.write_text(text)
-    return str(path)
+    def fixture(goal, removed=False):
+        names = ['amber', 'birch', 'cedar', 'dahlia']
+        agents = '\n'.join(f'agent "{name}" {{ command "sleep 3600"; restart "never" }}' for name in names if not (removed and name == 'dahlia'))
+        steps = '\n'.join(f'step "{name}" {{ assigned-to "agent/${{ST_MISSION_RUN}}/{name}"; depends-on {{ step "start-seats" completed }} }}' for name in names if not (removed and name == 'dahlia'))
+        return f'''version 2
+    mission "orchid" state="ready" {{
+     goal "{goal}"
+     completion {{ when "all-steps-exhausted" }}
+     step "start-seats" {{ agentless; {agents} }}
+     {steps}
+     finally {{ step "cleanup" {{ agentless; exec "tidy" {{ command "echo cleaned > cleaned"; restart "never" }} }} }}
+    }}
+    '''
 
-def run():
-    return cli('missions', 'show', 'mission-run/orchid/garden')
+    def write(name, text):
+        path = output / name
+        path.write_text(text)
+        return str(path)
 
-def ready():
-    value = run()
-    steps = value.get('steps', [])
-    return value if any(s['step'] == 'start-seats' and s['status'] == 'completed' for s in steps) and all(s['status'] == 'ready' for s in steps if s['step'] in ['amber','birch','cedar','dahlia']) else None
+    def run():
+        return cli('missions', 'show', 'mission-run/orchid/garden')
 
-try:
-    node.start()
-    cli('apply', write('first.kdl', fixture('Grow a garden.')), '--as', 'person/lichen')
-    cli('missions', 'start', 'orchid', '--id', 'orchid/garden', '--workspace', str(output), '--as', 'person/lichen')
-    node.subjects = [f'agent/orchid/garden/{name}' for name in ['amber','birch','cedar','dahlia']]
-    initial = until(ready, 60, 'four initial builders ready')
-    until(lambda: all(node.seat_processes(s) for s in node.subjects), 60, 'four actual seat processes running')
-    checks['initial'] = initial
-    checks['initial-processes'] = {s: node.seat_processes(s) for s in node.subjects}
-    for round in [1,2]:
-        cli('work', 'revise', 'mission-run/orchid/garden', write(f'revision-{round}.kdl', fixture(f'Grow garden {round}.')), '--as', 'person/lichen', '--reason', 'Update goal')
-        checks[f'revision-{round}'] = until(ready, 60, 'revised builders ready')
-        until(lambda: all(node.seat_processes(s) for s in node.subjects), 60, 'four actual seats after revision')
-        checks[f'processes-{round}'] = {s: node.seat_processes(s) for s in node.subjects}
-        assert checks[f'processes-{round}'] == checks['initial-processes'], 'cutover retains the actual seat processes'
-    cli('agents', 'stop', 'agent/orchid/garden/amber', '--as', 'person/lichen')
-    cli('work', 'revise', 'mission-run/orchid/garden', write('stop-revision.kdl', fixture('Respect the stop.')), '--as', 'person/lichen', '--reason', 'Keep explicit stop')
-    until(lambda: not node.seat_processes('agent/orchid/garden/amber'), 60, 'explicit stop survives revision')
-    checks['explicit-stop'] = run()
-    cli('work', 'revise', 'mission-run/orchid/garden', write('removed.kdl', fixture('Remove dahlia.', removed=True)), '--as', 'person/lichen', '--reason', 'Remove seat explicitly')
-    until(lambda: not node.seat_processes('agent/orchid/garden/dahlia'), 60, 'removed seat stopped')
-    checks['removed'] = run()
-    cli('missions', 'cancel', 'mission-run/orchid/garden', '--as', 'person/lichen', '--reason', 'Finish isolated control')
-    checks['cancelled'] = until(lambda: (v if (v := run())['status'] == 'cancelled' else None), 60, 'cancelled after cleanup')
-    assert (output / 'cleaned').exists(), 'finally cleanup executed'
-    until(lambda: all(not node.seat_processes(s) for s in node.subjects), 60, 'all owned seats ended')
-    requester = 'agent/orchid/requester'
-    node.subjects.append(requester)
-    cli('apply', write('requester.kdl', 'version 2\nagent "orchid/requester" { command "sleep 3600"; restart "never" }'), '--as', 'person/lichen')
-    cli('apply', write('missing.kdl', '\n'.join([
-        'version 2', 'mission "missing" state="ready" {',
-        ' goal "Recover a missing desired seat."',
-        ' completion { when "all-steps-exhausted" }',
-        ' step "setup" { agentless; agent "absent" { command "sleep 3600"; restart "never" } }',
-        ' step "retire" { agentless; stop "agent/${ST_MISSION_RUN}/absent"; depends-on { step "setup" completed } }',
-        ' step "work" { assigned-to "agent/${ST_MISSION_RUN}/absent"; depends-on { step "retire" completed } }', '}',
-    ])), '--as', 'person/lichen')
-    node.subjects.append('agent/orchid/missing/absent')
-    cli('missions', 'start', 'missing', '--id', 'orchid/missing', '--workspace', str(output), '--as', requester)
-    def missing():
-        return cli('missions', 'show', 'mission-run/orchid/missing')
-    checks['missing-blocked'] = until(lambda: (v if (v := missing())['status'] == 'blocked' else None), 30, 'missing-agent run is blocked')
-    def failures():
-        with sqlite3.connect('file:' + str(node.root / 'state/claims.sqlite3') + '?mode=ro', uri=True) as db:
-            return [json.loads(row[0]) for row in db.execute("SELECT body FROM claims WHERE subject='mission-run/orchid/missing' AND kind='operational.failure'")]
-    checks['fault'] = until(lambda: failures(), 30, 'stable fault recorded')
-    assert len(checks['fault']) == 1 and checks['fault'][0]['fields']['condition'] == 'mission-no-eligible-agent'
-    checks['fault-message'] = until(lambda: (v if 'Fault: Mission work has no eligible agent' in json.dumps(v := cli('conversations', 'ls', '--as', requester)) else None), 30, 'fault delivered to requester')
-    cli('agents', 'start', 'agent/orchid/missing/absent', '--as', 'person/lichen')
-    def missing_ready():
-        value = missing()
-        return value if any(step['step'] == 'work' and step['status'] == 'ready' for step in value['steps']) else None
-    checks['fault-recovery'] = until(missing_ready, 30, 'eligibility event restores ready work')
-    assert len(failures()) == 1, 'fault episode deduped'
-    cli('missions', 'cancel', 'mission-run/orchid/missing', '--as', requester, '--reason', 'End fault control')
-    until(lambda: missing()['status'] == 'cancelled', 30, 'missing-agent control ends')
-    result = {'verdict':'pass', 'checks':checks}
-except Exception as error:
-    result = {'verdict':'fail', 'reason':str(error), 'checks':checks, 'trace':traceback.format_exc(), 'daemon_tail':node.tail()}
-finally:
-    node.stop()
-(output / 'result.json').write_text(json.dumps(result, indent=2))
-print(json.dumps({'verdict':result['verdict'], 'reason':result.get('reason'), 'evidence':str(output)}))
-raise SystemExit(0 if result['verdict'] == 'pass' else 1)
+    def ready():
+        value = run()
+        steps = value.get('steps', [])
+        return value if any(s['step'] == 'start-seats' and s['status'] == 'completed' for s in steps) and all(s['status'] == 'ready' for s in steps if s['step'] in ['amber','birch','cedar','dahlia']) else None
+
+    try:
+        node.start()
+        cli('apply', write('first.kdl', fixture('Grow a garden.')), '--as', 'person/lichen')
+        cli('missions', 'start', 'orchid', '--id', 'orchid/garden', '--workspace', str(output), '--as', 'person/lichen')
+        node.subjects = [f'agent/orchid/garden/{name}' for name in ['amber','birch','cedar','dahlia']]
+        initial = until(ready, 60, 'four initial builders ready')
+        until(lambda: all(node.seat_processes(s) for s in node.subjects), 60, 'four actual seat processes running')
+        checks['initial'] = initial
+        checks['initial-processes'] = {s: node.seat_processes(s) for s in node.subjects}
+        for round in [1,2]:
+            cli('work', 'revise', 'mission-run/orchid/garden', write(f'revision-{round}.kdl', fixture(f'Grow garden {round}.')), '--as', 'person/lichen', '--reason', 'Update goal')
+            checks[f'revision-{round}'] = until(ready, 60, 'revised builders ready')
+            until(lambda: all(node.seat_processes(s) for s in node.subjects), 60, 'four actual seats after revision')
+            checks[f'processes-{round}'] = {s: node.seat_processes(s) for s in node.subjects}
+            assert checks[f'processes-{round}'] == checks['initial-processes'], 'cutover retains the actual seat processes'
+        cli('agents', 'stop', 'agent/orchid/garden/amber', '--as', 'person/lichen')
+        cli('work', 'revise', 'mission-run/orchid/garden', write('stop-revision.kdl', fixture('Respect the stop.')), '--as', 'person/lichen', '--reason', 'Keep explicit stop')
+        until(lambda: not node.seat_processes('agent/orchid/garden/amber'), 60, 'explicit stop survives revision')
+        checks['explicit-stop'] = run()
+        cli('work', 'revise', 'mission-run/orchid/garden', write('removed.kdl', fixture('Remove dahlia.', removed=True)), '--as', 'person/lichen', '--reason', 'Remove seat explicitly')
+        until(lambda: not node.seat_processes('agent/orchid/garden/dahlia'), 60, 'removed seat stopped')
+        checks['removed'] = run()
+        cli('missions', 'cancel', 'mission-run/orchid/garden', '--as', 'person/lichen', '--reason', 'Finish isolated control')
+        checks['cancelled'] = until(lambda: (v if (v := run())['status'] == 'cancelled' else None), 60, 'cancelled after cleanup')
+        assert (output / 'cleaned').exists(), 'finally cleanup executed'
+        until(lambda: all(not node.seat_processes(s) for s in node.subjects), 60, 'all owned seats ended')
+        requester = 'agent/orchid/requester'
+        node.subjects.append(requester)
+        cli('apply', write('requester.kdl', 'version 2\nagent "orchid/requester" { command "sleep 3600"; restart "never" }'), '--as', 'person/lichen')
+        cli('apply', write('missing.kdl', '\n'.join([
+            'version 2', 'mission "missing" state="ready" {',
+            ' goal "Recover a missing desired seat."',
+            ' completion { when "all-steps-exhausted" }',
+            ' step "setup" { agentless; agent "absent" { command "sleep 3600"; restart "never" } }',
+            ' step "retire" { agentless; stop "agent/${ST_MISSION_RUN}/absent"; depends-on { step "setup" completed } }',
+            ' step "work" { assigned-to "agent/${ST_MISSION_RUN}/absent"; depends-on { step "retire" completed } }', '}',
+        ])), '--as', 'person/lichen')
+        node.subjects.append('agent/orchid/missing/absent')
+        cli('missions', 'start', 'missing', '--id', 'orchid/missing', '--workspace', str(output), '--as', requester)
+        def missing():
+            return cli('missions', 'show', 'mission-run/orchid/missing')
+        checks['missing-blocked'] = until(lambda: (v if (v := missing())['status'] == 'blocked' else None), 30, 'missing-agent run is blocked')
+        def failures():
+            with sqlite3.connect('file:' + str(node.root / 'state/claims.sqlite3') + '?mode=ro', uri=True) as db:
+                return [json.loads(row[0]) for row in db.execute("SELECT body FROM claims WHERE subject='mission-run/orchid/missing' AND kind='operational.failure'")]
+        checks['fault'] = until(lambda: failures(), 30, 'stable fault recorded')
+        assert len(checks['fault']) == 1 and checks['fault'][0]['fields']['condition'] == 'mission-no-eligible-agent'
+        checks['fault-message'] = until(lambda: (v if 'Fault: Mission work has no eligible agent' in json.dumps(v := cli('conversations', 'ls', '--as', requester)) else None), 30, 'fault delivered to requester')
+        cli('agents', 'start', 'agent/orchid/missing/absent', '--as', 'person/lichen')
+        def missing_ready():
+            value = missing()
+            return value if any(step['step'] == 'work' and step['status'] == 'ready' for step in value['steps']) else None
+        checks['fault-recovery'] = until(missing_ready, 30, 'eligibility event restores ready work')
+        assert len(failures()) == 1, 'fault episode deduped'
+        cli('missions', 'cancel', 'mission-run/orchid/missing', '--as', requester, '--reason', 'End fault control')
+        until(lambda: missing()['status'] == 'cancelled', 30, 'missing-agent control ends')
+        result = {'verdict':'pass', 'checks':checks}
+    except Exception as error:
+        result = {'verdict':'fail', 'reason':str(error), 'checks':checks, 'trace':traceback.format_exc(), 'daemon_tail':node.tail()}
+    finally:
+        node.stop()
+    (output / 'result.json').write_text(json.dumps(result, indent=2))
+    print(json.dumps({'verdict':result['verdict'], 'reason':result.get('reason'), 'evidence':str(output)}))
+    return 0 if result['verdict'] == 'pass' else 1
+
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from st3_test_process import supervised_main
+    raise SystemExit(supervised_main(main))

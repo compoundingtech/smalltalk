@@ -34,6 +34,21 @@ fn missing_binding_tx(connection: &Connection, step: &StepRunView) -> Result<boo
 }
 
 impl Store {
+    /// Stop ownership is enough to preserve an existing cross-run ready queue.
+    pub(crate) fn selected_stop_owner_run(&self, subject: &str) -> Result<Option<String>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        Ok(self
+            .readers
+            .get()
+            .query_row(
+                "SELECT owner_run FROM desired WHERE subject=?1 AND kind='stop'",
+                [subject],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub(crate) fn missing_agent_fault_is_current(
         &self,
         run: &MissionRunView,
@@ -56,9 +71,19 @@ impl Store {
         expected: &MissionRunView,
         expected_step: &StepRunView,
     ) -> Result<bool> {
+        // Quiet root stops and already-reported episodes must not join the writer queue.
+        // This preview grants no authority: every needed write is rechecked below.
+        if !self.missing_agent_fault_is_current(expected, expected_step)? {
+            return Ok(false);
+        }
+        let expected_episode = episode(expected, expected_step);
+        if self.readers.get().query_row(
+            "SELECT 1 FROM claims WHERE subject=?1 AND kind='operational.failure' AND json_extract(body, '$.fields.episode')=?2 LIMIT 1",
+            params![expected.subject, expected_episode], |_| Ok(())
+        ).optional()?.is_some() { return Ok(false); }
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
-        let run = mission_run_view_tx(&transaction, &expected.id)?;
+        let run = mission_run_view_for_reconcile_tx(&transaction, &expected.id)?;
         if run.generation != expected.generation
             || run.revision != expected.revision
             || run.phase != "normal"

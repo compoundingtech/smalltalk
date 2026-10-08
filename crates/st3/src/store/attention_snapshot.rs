@@ -1006,9 +1006,17 @@ impl Store {
             }
             if source.starts_with("mission-run/") {
                 if claim.body["fields"]["condition"] == MISSING_AGENT_CONDITION {
-                    let Some(run) = self.mission_run(source)? else {
+                    let latest: Option<String> = connection.query_row(
+                        &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='operational.failure' AND json_extract(body,'$.fields.condition')=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                        params![source, MISSING_AGENT_CONDITION], |row| row.get(0),
+                    ).optional()?;
+                    if latest.as_deref() != Some(claim.id.as_str())
+                        || !person_work::run_live(&connection, source, None, true)?
+                    {
                         continue;
-                    };
+                    }
+                    let run =
+                        self.mission_run_for_reconcile(source.trim_start_matches("mission-run/"))?;
                     let generation = failure.targets.get(1);
                     if generation != Some(&run.generation) {
                         continue;
@@ -1026,13 +1034,6 @@ impl Store {
                     if claim.body["fields"]["episode"].as_str()
                         != Some(mission_eligibility::episode(&run, step).as_str())
                     {
-                        continue;
-                    }
-                    let latest: Option<String> = connection.query_row(
-                        &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='operational.failure' AND json_extract(body,'$.fields.condition')=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
-                        params![source, MISSING_AGENT_CONDITION], |row| row.get(0),
-                    ).optional()?;
-                    if latest.as_deref() != Some(claim.id.as_str()) {
                         continue;
                     }
                 }

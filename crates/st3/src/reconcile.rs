@@ -7675,10 +7675,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         if run.phase == "normal" {
-            let refreshed = self
-                .store
-                .mission_run(&run.id)?
-                .context("the active mission run disappeared")?;
+            let refreshed = self.store.mission_run_for_reconcile(&run.id)?;
             let normal = refreshed
                 .steps
                 .iter()
@@ -7724,22 +7721,17 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// Cleanup may have selected a stop while a seat still owns ready work in another run.
     /// Keep that existing queue alive until ordinary seat retention lets the runtime end.
     fn ready_step_binding_missing(&self, run: &MissionRunView, step: &StepRunView) -> Result<bool> {
-        let names = step
-            .assigned_to
-            .iter()
-            .chain(step.available_to.iter())
-            .cloned()
-            .collect::<Vec<_>>();
-        for desired in self.store.desired_subjects_named(&names)? {
-            if desired.kind == "agent" {
+        for name in step.assigned_to.iter().chain(step.available_to.iter()) {
+            let kind = self.store.selected_desired_kind(name)?;
+            if kind.as_deref() == Some("agent") {
                 return Ok(false);
             }
-            if desired.kind == "stop"
-                && let Some(owner) = desired.owner_run.as_deref()
+            if kind.as_deref() == Some("stop")
+                && let Some(owner) = self.store.selected_stop_owner_run(name)?
                 && owner != run.subject
                 && self
                     .store
-                    .seat_work_in_other_runs(&desired.subject, owner)?
+                    .seat_work_in_other_runs(name, &owner)?
                     .contains(&step.subject)
             {
                 return Ok(false);
