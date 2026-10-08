@@ -6065,7 +6065,12 @@ impl Store {
         if received != 0 {
             self.replica_generation.fetch_add(1, Ordering::AcqRel);
         }
-        let snapshot = self.replication_snapshot().map_err(internal)?;
+        let snapshot = if input.projection_digests.is_empty() {
+            self.replication_snapshot()
+        } else {
+            self.replication_snapshot_modern()
+        }
+        .map_err(internal)?;
         let difference = replication_inventory_difference(
             &snapshot.inventory,
             &snapshot.buckets,

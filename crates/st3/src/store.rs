@@ -43991,6 +43991,23 @@ version 2
     }
 
     #[test]
+    fn modern_receipt_uses_projection_snapshot_without_legacy_scan() {
+        let fleet = "fleet/example";
+        let source = Store::open_memory("source").unwrap();
+        let target = Store::open_memory("target").unwrap();
+        source.bind_fleet(fleet).unwrap();
+        target.bind_fleet(fleet).unwrap();
+        let exchange = source.export_replication_summary_modern(fleet).unwrap();
+        assert!(exchange.graph_digest.is_empty());
+        assert!(!exchange.projection_digests.is_empty());
+        GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(0));
+        target
+            .receive_replication_exchange("source", fleet, &exchange)
+            .unwrap();
+        assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
     fn response_idempotency_caches_never_store_caller_keys() {
         let store = Store::open_memory("node").unwrap();
         let caller_key = "caller-visible-secret-key";
