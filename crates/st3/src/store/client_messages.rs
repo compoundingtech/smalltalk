@@ -112,7 +112,8 @@ fn page_sql(person: bool, actor: bool, history: bool) -> String {
          UNION SELECT subject FROM claims INDEXED BY claims_message_to_index WHERE kind='message.sent' AND json_extract(body,'$.fields.to') IN (?4,?9) AND store_index<=?1
          UNION SELECT subject FROM claims INDEXED BY claims_message_legacy_from_index WHERE kind='message.sent' AND json_type(body,'$.fields') IS NULL AND json_extract(body,'$.from') IN (?4,?9) AND store_index<=?1
          UNION SELECT subject FROM claims INDEXED BY claims_message_legacy_to_index WHERE kind='message.sent' AND json_type(body,'$.fields') IS NULL AND json_extract(body,'$.to') IN (?4,?9) AND store_index<=?1
-         UNION SELECT json_extract(value,'$.subject') FROM json_each(?7) WHERE json_extract(value,'$.from')=?4 OR json_extract(value,'$.to')=?4"
+         UNION SELECT json_extract(value,'$.subject') FROM json_each(?7) WHERE json_extract(value,'$.from')=?4 OR json_extract(value,'$.to')=?4
+         UNION SELECT subject FROM candidates WHERE ?4='requester'"
     } else { "SELECT subject FROM candidates" };
     let rival_recipient = if person { format!("AND {to}=?2") } else { String::new() };
     let actor_scope = if actor { "AND (sender=?4 OR recipient=?4)" } else { "" };
@@ -206,7 +207,7 @@ impl Store {
         let bare = person.as_deref().map(|person| person.strip_prefix("agent/").filter(|suffix| !suffix.contains('/')).unwrap_or(person));
         // Desired-only messages have no endpoint claim index. Resolve their small
         // declaration headers at the cut, without folding any actual-state body.
-        let subjects = connection.prepare_cached("SELECT DISTINCT subject FROM claims WHERE kind='intent.desired' AND subject LIKE 'message/%' AND store_index<=?1")?
+        let subjects = connection.prepare_cached("SELECT subject FROM desired WHERE kind='message' AND subject LIKE 'message/%' AND EXISTS(SELECT 1 FROM claims WHERE claims.subject=desired.subject AND kind='intent.desired' AND store_index<=?1)")?
             .query_map([through], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut legacy = Vec::new();
         for subject in subjects {

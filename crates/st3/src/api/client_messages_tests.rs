@@ -324,6 +324,52 @@ message "sql-legacy-mail" {
 }
 
 #[tokio::test]
+async fn sql_message_fresh_pages_do_not_restore_deleted_desired_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::state(root.path());
+    let intent = crate::graph::parse_test_intent(r#"version 2
+agent "sql-removed" { workspace "/tmp"; command "true" }
+message "sql-removed-mail" {
+    from "requester"
+    to "sql-removed"
+    content "removed content"
+    title "Removed title"
+    tag "reminder:removed"
+}
+"#, "node").unwrap();
+    let mission = state.store.mission(&intent, crate::model::IntentInput {
+        kdl: "deleted-desired-message-fixture".into(), source_name: None,
+    }).unwrap();
+    state.store.apply(&intent,&mission.subject_tokens,"deleted-desired-message-fixture").unwrap();
+    let subject = "message/sql-removed-mail";
+    let now = client_now_ms();
+    let before = collect_sql_pages(&state,ClientListQuery::default(),now).await;
+    assert_eq!(before[0]["content"],"removed content");
+    state.store.connection.batched(|tx| {
+        Ok::<_,rusqlite::Error>(tx.execute("DELETE FROM desired WHERE subject=?1",[subject])?)
+    }).unwrap().unwrap();
+    assert!(!state.store.claims_for(subject,Some("intent.desired")).unwrap().is_empty());
+    for history in [false,true] {
+        let expected = client_message_resources_at(&state.store,None,history,None,now).unwrap();
+        assert_eq!(expected.len(),1);
+        assert_eq!(expected[0]["to"],"");
+        assert_eq!(expected[0]["content"],"");
+        assert!(expected[0]["title"].is_null());
+        assert_eq!(expected[0]["tags"],json!([]));
+        let query = ClientListQuery { history,limit:Some(1),..Default::default() };
+        assert_eq!(collect_sql_pages(&state,query.clone(),now).await,expected);
+        let requester = ClientListQuery { actor:Some("requester".into()),..query.clone() };
+        assert_eq!(collect_sql_pages(&state,requester,now).await,expected);
+        for filtered in [
+            ClientListQuery { person:Some("agent/sql-removed".into()),..query.clone() },
+            ClientListQuery { actor:Some("agent/sql-removed".into()),..query.clone() },
+        ] {
+            assert!(collect_sql_pages(&state,filtered,now).await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn sql_message_pages_match_replicated_tied_claims_in_both_arrival_orders() {
     const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
     let source = Store::open_memory("sql-source").unwrap();

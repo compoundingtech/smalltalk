@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Message JSON, recipient/actor filters, ordering, reminder selection and snapshot-consistent traversal are preserved. Continuations require bounded server-issued metadata that binds the exact store cut, snapshot, filters, limit, position and expiry. Tampered, expired, evicted, restarted or deletion-invalidated cursors return HTTP 410/page-cursor-expired and require restarting pagination. Delivery presence remains live on each page while delivery age retains the first request time."
+    "detail": "Message JSON, recipient/actor filters, ordering, reminder selection and snapshot-consistent traversal are preserved. Fresh pages honor current desired-projection deletion: retained intent.desired claims do not restore removed message fields or recipient membership. Continuations require bounded server-issued metadata that binds the exact store cut, snapshot, filters, limit, position and expiry. Tampered, expired, evicted, restarted or deletion-invalidated cursors return HTTP 410/page-cursor-expired and require restarting pagination. Delivery presence remains live on each page while delivery age retains the first request time."
   },
   "downtime": {
     "status": "unknown",

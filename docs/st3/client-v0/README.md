@@ -1118,6 +1118,8 @@ The server retains only bounded cursor metadata, not message bodies; the cut, ex
 snapshot and keyset must exactly match an issued cursor. Tampering, metadata eviction or restart,
 and repair/checkpoint deletion that makes the cut unavailable return `page-cursor-expired`
 (HTTP 410), never a successful incomplete page. A web client restarts pagination on that error.
+Fresh pages also respect current desired-projection availability: removing a desired-only
+declaration does not restore its recipient or content from retained `intent.desired` history.
 Recipient delivery presence is live process evidence, not graph state: each page reassesses
 `recipient_delivery`, including its observation age, rather than retaining a stale report.
 

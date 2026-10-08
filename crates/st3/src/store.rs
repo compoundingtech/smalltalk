@@ -20764,8 +20764,15 @@ fn message_view_at(
     through: Option<u64>,
 ) -> Result<MessageView> {
     let actual = latest_actual_at(connection, subject, through)?.unwrap_or(Value::Null);
-    let desired = desired_row_at(connection, subject, through)?
-        .and_then(|row| serde_json::from_str::<Value>(&row.body).ok());
+    // Deletion of the current projection retires the declaration. A retained
+    // intent.desired claim is not permission to resurrect it in a fresh page.
+    let desired = if through.is_some() && !connection.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM desired WHERE subject=?1)",
+    )?.query_row([subject], |row|row.get::<_,bool>(0))? {
+        None
+    } else {
+        desired_row_at(connection, subject, through)?
+    }.and_then(|row| serde_json::from_str::<Value>(&row.body).ok());
     let field = |name: &str| actual.get(name).and_then(Value::as_str).map(str::to_owned);
     let child = |name: &str| {
         desired
