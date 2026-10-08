@@ -409,11 +409,11 @@ pub(super) fn current_from_facts(
     if unfenced {
         return Ok(true);
     }
+    let ask_key = facts
+        .ask_key
+        .as_ref()
+        .context("person ask canonical key absent")?;
     if !facts.retiring {
-        let ask_key = facts
-            .ask_key
-            .as_ref()
-            .context("person ask canonical key absent")?;
         if facts
             .maximum_stop
             .as_ref()
@@ -1289,6 +1289,19 @@ mission "person-work" state="ready" {
             assert!(!current_from_facts(&record, &facts, now_ms()).unwrap());
             facts.ask_run_live = true;
         }
+    }
+
+    #[test]
+    fn fenced_currency_refuses_missing_canonical_ask_evidence_even_when_retiring() {
+        let (store, _, input) = fixture();
+        let ask_view = store.ask_person(&input).unwrap();
+        let connection = store.readers.get();
+        let ask = request(&connection, &ask_view.subject).unwrap().unwrap();
+        let mut facts = currency_facts(&connection, &ask);
+        facts.retiring = true;
+        facts.requester_live = false;
+        facts.ask_key = None;
+        assert!(current_from_facts(&ask, &facts, now_ms()).is_err());
     }
 
     #[test]
