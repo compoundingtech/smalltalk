@@ -83,8 +83,8 @@ fixtures and budgets; retain completed failures as evidence. See Namespace's
   model check, the [warning ratchet](#clippy-warning-ratchet), then
   `cargo run --locked -p st3-client-codegen -- --check`;
 - `linux-fleet-compat`: the fleet compatibility test against `.github/fleet-compat-baseline.json`'s
-  pinned older st3. Building that baseline also runs the pinned pty's own unit tests, two of which
-  are timing-sensitive, so the build is retried up to three times.
+  previous-release native archive. CI verifies its pinned SHA-256 and embedded source/target
+  metadata before running it; it does not rebuild the baseline or its PTY dependency.
 
 The primary test job proves that the two actual nextest inventories are disjoint and their union
 equals the full selected suite. The explicit zero-retry mail canaries run in a parallel job. The primary also
@@ -143,7 +143,7 @@ backend) holding Cargo's registry and the workspace `target/` directory, keyed o
 `$RUNNER_TEMP/st-ci-cache`. Its key includes `flake.lock`, the flake, Nix expressions and both compatibility baseline pins.
 `scripts/ci-nix-cache use` makes it a preferred substituter. After a successful stage, `save`
 copies reference-free downloads and sources fetched by the run, plus the closures of the
-historical messaging channel and provider components. It leaves the installer-managed
+previous-release messaging package and provider components. It leaves the installer-managed
 `/nix` directory intact. Cache failures emit a warning and let the job build normally.
 
 The [original trial measurements](https://github.com/compoundingtech/smalltalk/pull/849#issuecomment-5936374396)
@@ -210,18 +210,19 @@ The separate `api_accept` target also supervises its descriptor-exhaustion subpr
 The remaining daemon fixtures serve their APIs in process or use fake runtime observations;
 their tasks end with their test runtime. New process-spawning fixtures should use this helper.
 
-The workspace suite still covers the token-free two-node messaging fault matrix. Its historical
-channel build remains independently pinned in `.github/messaging-compat-baseline.json`. Its
+The workspace suite still covers the token-free two-node messaging fault matrix. Its
+previous-release channel archive is pinned in `.github/messaging-compat-baseline.json`. Its
 provider stand-in runs the omp channel hook's TypeScript with Node 24's built-in type stripping;
 the default devShell supplies that `node`. See [the eval contract](../evals/st3/messaging-faults/README.md).
 
 ### Rolling compatibility baselines
 
-The fleet and historical messaging pins in `.github/*-compat-baseline.json` track the latest
+The fleet and messaging pins in `.github/*-compat-baseline.json` track the latest
 published stable release for testing the next candidate. Each contains `commit`, `tag`, policy
 `why`, `exception_reason` (`null` ordinarily), and both native archive URLs and hex SHA256
 checksums. Fleet CI downloads, verifies and extracts the published native archive instead of
-rebuilding an old workspace. Messaging builds the historical channel source at the pinned commit.
+rebuilding an old workspace. Messaging consumes the pinned published archive too; Nix adjusts
+its Linux interpreter path for sandbox execution without recompiling the channel.
 
 The public-repository workflow runs `python3 scripts/compat-baseline-release check` on every
 PR, merge group and main push (and manual dispatch). It paginates the actual published release
