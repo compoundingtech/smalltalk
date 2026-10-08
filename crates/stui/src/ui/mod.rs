@@ -231,6 +231,7 @@ pub enum Effect {
     /// Start a plain shell for the person; it opens in a new tab.
     CreateTerminal {
         name: String,
+        command: Option<(u64, crate::SetupCommand)>,
     },
     /// Send a failed or unconfirmed message again, as the same request.
     Resend {
@@ -326,6 +327,8 @@ pub struct Ui {
     /// Live: actions become `effects` for the live loop instead of demo edits.
     live: bool,
     effects: Vec<Effect>,
+    setup_commands: HashMap<String, crate::SetupCommand>,
+    setup_generation: u64,
     /// Updates marked read from here, so each is sent once.
     updates_read: HashSet<String>,
     /// Attention items the person acted on from here: st closing them is their doing.
@@ -473,6 +476,8 @@ impl Ui {
             quit: false,
             live: false,
             effects: Vec::new(),
+            setup_commands: HashMap::new(),
+            setup_generation: 0,
             updates_read: HashSet::new(),
             acted: HashSet::new(),
             closed: HashSet::new(),
@@ -4282,10 +4287,71 @@ impl Ui {
         if self.live {
             self.effects.push(Effect::CreateTerminal {
                 name: screens::random_name(),
+                command: None,
             });
             self.flash("Starting a shell…");
         } else {
             self.terminal_started("terminal/pty/person/demo/shell".into());
+        }
+    }
+
+    /// Setup chores use a fresh plain shell, never an agent's existing terminal.
+    pub(crate) fn open_setup_terminal(&mut self, command: crate::SetupCommand) {
+        if self.live {
+            self.effects.push(Effect::CreateTerminal {
+                name: format!("setup-{}", screens::random_name()),
+                command: Some((self.setup_generation, command)),
+            });
+            self.flash("Starting a setup shell · review the command, then press Enter");
+        } else {
+            self.flash("Setup shell · demo: nothing was typed or sent");
+        }
+    }
+
+    pub(crate) fn setup_terminal_started(
+        &mut self,
+        id: String,
+        command: Option<(u64, crate::SetupCommand)>,
+    ) {
+        if let Some((generation, command)) = command {
+            if generation != self.setup_generation {
+                return;
+            }
+            self.setup_commands.insert(id.clone(), command);
+        }
+        self.terminal_started(id);
+    }
+
+    /// Wait for the native attachment's first screen; consume before writing, without retry.
+    pub(crate) fn stage_setup_commands(&mut self) {
+        let ready: Vec<_> = self
+            .setup_commands
+            .keys()
+            .filter(|id| {
+                self.terminal_view(id)
+                    .and_then(|view| view.native.as_ref())
+                    .is_some_and(|native| native.attached() && native.ended().is_none())
+            })
+            .cloned()
+            .collect();
+        for id in ready {
+            if let Some(command) = self.setup_commands.remove(&id)
+                && let Some(native) = self
+                    .terminal_view(&id)
+                    .and_then(|view| view.native.as_ref())
+            {
+                native.write(command.0.into_bytes());
+                self.flash("Setup command ready · review it, then press Enter");
+            }
+        }
+    }
+
+    pub(crate) fn cancel_setup_commands(&mut self, input: &Event) {
+        if matches!(input, Event::Key(_) | Event::Paste(_))
+            || matches!(input, Event::Mouse(mouse) if mouse.kind != MouseEventKind::Moved)
+        {
+            self.setup_commands.clear();
+            self.setup_generation = self.setup_generation.wrapping_add(1);
         }
     }
 

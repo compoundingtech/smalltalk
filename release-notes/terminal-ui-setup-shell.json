@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Provide an optional setup shell tab that stages a caller-supplied command for review before Enter.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay, projection rebuild or store recovery changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, columns, indexes, triggers or schema transitions."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or coordinated fleet-upgrade changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The UI library offers with_setup_command, validated as a nonempty line without terminal control characters. Local clients create a fresh shell after the live space arrives, stage raw command bytes once after native attachment, and leave Enter to the person. Navigation cancels delayed prefill. Paired-device clients ignore this entry point. No new CLI flags, setup facts model, wire format or persisted state transition."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon lifecycle changes or additional service restart requirement."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No migration or required manual step. A person reviews and presses Enter only when they choose to execute a staged setup command."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persisted-state transition. Prefill is consumed once and is never replayed on terminal reconnect."
+  }
+}

@@ -660,6 +660,22 @@ async fn send_terminal_key(
     Ok(())
 }
 
+/// A single shell command staged for review without executing it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupCommand(String);
+
+impl SetupCommand {
+    pub fn new(command: impl Into<String>) -> Result<Self> {
+        let command = command.into();
+        anyhow::ensure!(!command.trim().is_empty(), "Setup command is empty");
+        anyhow::ensure!(
+            !command.chars().any(char::is_control),
+            "Setup command must be one line without terminal control characters"
+        );
+        Ok(Self(command))
+    }
+}
+
 /// Options for the terminal interface shared by `st ui` and plain interactive `st`.
 #[derive(clap::Args, Debug, Default)]
 pub struct Args {
@@ -667,6 +683,8 @@ pub struct Args {
     endpoint: Option<PathBuf>,
     #[arg(skip)]
     initial_subject: Option<String>,
+    #[arg(skip)]
+    setup_command: Option<SetupCommand>,
     /// Open a named space instead of the last space used on this device.
     #[arg(long, alias = "glass", conflicts_with = "classic")]
     pub space: Option<String>,
@@ -712,6 +730,14 @@ impl Args {
     pub fn with_initial_subject(mut self, subject: impl Into<String>) -> Self {
         self.initial_subject = Some(subject.into());
         self
+    }
+
+    /// Open a fresh setup shell and stage a command without pressing Enter.
+    /// Command selection belongs to the caller. Paired-device clients ignore this request.
+    /// Navigation before the live space arrives cancels it.
+    pub fn with_setup_command(mut self, command: impl Into<String>) -> Result<Self> {
+        self.setup_command = Some(SetupCommand::new(command)?);
+        Ok(self)
     }
 
     // Keep the renderer's option handling together; the CLI owns validation and help.
@@ -849,11 +875,32 @@ pub fn run(options: Args) -> Result<()> {
         cached,
         glass: ui::glass_request(&args),
         initial_subject: options.initial_subject.filter(|_| profile.is_none()),
+        setup_command: options.setup_command.filter(|_| profile.is_none()),
     })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn setup_command_rejects_submission_and_terminal_controls() {
+        for command in [
+            "",
+            "  ",
+            "echo hi\n",
+            "echo hi\r",
+            "\x1b[200~echo hi",
+            "echo\thi",
+            "echo\x7fhi",
+        ] {
+            assert!(super::Args::default().with_setup_command(command).is_err());
+        }
+        assert!(
+            super::Args::default()
+                .with_setup_command("printf 'hello world'")
+                .is_ok()
+        );
+    }
+
     use super::*;
     use std::collections::BTreeMap;
 

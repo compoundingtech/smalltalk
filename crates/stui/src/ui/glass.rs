@@ -4375,6 +4375,109 @@ mod tests {
         assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
     }
 
+    /// Drive a real glass and the native PTY wire: the prefill waits for SCREEN and has no
+    /// submit byte, survives later polling once, and belongs to this shell rather than an agent.
+    #[test]
+    fn setup_terminal_stages_once_after_attachment_without_enter() {
+        use pty_core::protocol::{MessageType, PacketReader, encode_packet};
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        let mut ui = glass();
+        ui.live = true;
+        ui.open_setup_terminal(crate::SetupCommand::new("printf setup-ready").unwrap());
+        let Effect::CreateTerminal { command, .. } = ui.effects.pop().unwrap() else {
+            panic!("new shell");
+        };
+        let shell = "terminal/pty/person/demo/setup";
+        ui.setup_terminal_started(shell.into(), command);
+        assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        ui.terminal = Some(TerminalView {
+            agent: shell.into(),
+            name: "Setup".into(),
+            title: "Setup".into(),
+            lines: Vec::new(),
+            cursor: None,
+            stale: None,
+            ended: None,
+            native: Some(crate::ui::pty::NativeTerminal::spawn(
+                client,
+                "setup",
+                "one".into(),
+                24,
+                80,
+            )),
+        });
+        let mut reader = PacketReader::new();
+        let mut packets = Vec::new();
+        let mut next = |peer: &mut UnixStream| {
+            while packets.is_empty() {
+                let mut bytes = [0; 1024];
+                let count = peer.read(&mut bytes).unwrap();
+                packets.extend(reader.feed(&bytes[..count]).unwrap());
+            }
+            packets.remove(0)
+        };
+        assert_eq!(next(&mut peer).type_, MessageType::Attach);
+        ui.stage_setup_commands();
+        assert_eq!(ui.setup_commands.len(), 1);
+        peer.write_all(&encode_packet(MessageType::Screen, b"$ "))
+            .unwrap();
+        let start = Instant::now();
+        while !ui
+            .terminal_view(shell)
+            .unwrap()
+            .native
+            .as_ref()
+            .unwrap()
+            .attached()
+        {
+            assert!(start.elapsed() < Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ui.stage_setup_commands();
+        let data = next(&mut peer);
+        assert_eq!(data.type_, MessageType::Data);
+        assert_eq!(data.payload, b"printf setup-ready");
+        assert!(ui.setup_commands.is_empty());
+        for _ in 0..3 {
+            ui.stage_setup_commands();
+        }
+        assert!(peer.read(&mut [0; 256]).is_err(), "no second prefill");
+        // Only an explicit Enter from the person produces the submit byte.
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(next(&mut peer).payload, b"\r");
+    }
+
+    #[test]
+    fn setup_terminal_navigation_cancels_a_late_creation_and_pending_prefill() {
+        let mut ui = glass();
+        ui.live = true;
+        ui.open_setup_terminal(crate::SetupCommand::new("printf review").unwrap());
+        let Effect::CreateTerminal { command, .. } = ui.effects.pop().unwrap() else {
+            panic!("new shell");
+        };
+        let before = tabs(&ui);
+        let input = Event::Key(KeyEvent::from(KeyCode::Char('x')));
+        ui.cancel_setup_commands(&input);
+        ui.setup_terminal_started("terminal/late-setup".into(), command);
+        assert_eq!(tabs(&ui), before);
+        assert!(ui.setup_commands.is_empty());
+        assert!(ui.terminal.is_none());
+        ui.open_setup_terminal(crate::SetupCommand::new("printf review").unwrap());
+        let Effect::CreateTerminal { command, .. } = ui.effects.pop().unwrap() else {
+            panic!("new shell");
+        };
+        ui.setup_terminal_started("terminal/setup".into(), command);
+        assert_eq!(ui.setup_commands.len(), 1);
+        ui.cancel_setup_commands(&Event::Resize(120, 32));
+        assert_eq!(ui.setup_commands.len(), 1);
+        ui.cancel_setup_commands(&Event::Paste("my draft".into()));
+        assert!(ui.setup_commands.is_empty());
+    }
+
     #[test]
     fn two_terminals_in_two_splits_stay_attached_and_keys_follow_focus() {
         // Nathan, 2026-10-06: attaching one terminal detached the other.

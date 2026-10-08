@@ -110,6 +110,7 @@ pub struct Context {
     /// named glass or the last one used on this device.
     pub glass: Option<Option<String>>,
     pub initial_subject: Option<String>,
+    pub setup_command: Option<crate::SetupCommand>,
 }
 
 // Setup's initial destination waits for a live inventory, rather than cached agent data.
@@ -200,7 +201,7 @@ enum Fetched {
     Sent(String, Result<Option<String>, (String, bool)>),
     /// st started an agent asked for here.
     /// st started a shell asked for here.
-    TerminalStarted(String),
+    TerminalStarted(String, Option<(u64, crate::SetupCommand)>),
     /// A direct stream to an agent's (or a shell's) PTY session.
     Native {
         agent: String,
@@ -282,6 +283,7 @@ pub fn run(context: Context) -> Result<()> {
         cached,
         glass,
         mut initial_subject,
+        mut setup_command,
     } = context;
     let (fetched_tx, fetched) = mpsc::channel::<Fetched>();
     let mut model = cached.unwrap_or_default();
@@ -657,7 +659,7 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 Fetched::Devices(devices) => model.devices = devices,
                 Fetched::GlassSaved { id, key, outcome } => ui.glass_saved(&id, &key, outcome),
-                Fetched::TerminalStarted(id) => ui.terminal_started(id),
+                Fetched::TerminalStarted(id, command) => ui.setup_terminal_started(id, command),
                 Fetched::Native { agent, direct } => {
                     if let Some(waited) = attach_started.take().map(|at| at.elapsed())
                         && waited >= Duration::from_secs(3)
@@ -1196,6 +1198,10 @@ pub fn run(context: Context) -> Result<()> {
                 other => (other, None, None),
             };
             let shell = matches!(effect, Effect::CreateTerminal { .. });
+            let setup = match &effect {
+                Effect::CreateTerminal { command, .. } => command.clone(),
+                _ => None,
+            };
             let client = client.clone();
             let tx = fetched_tx.clone();
             let person = person.clone();
@@ -1217,7 +1223,7 @@ pub fn run(context: Context) -> Result<()> {
                     ));
                 }
                 if shell && let Ok((_, Some(terminal))) = &outcome {
-                    let _ = tx.send(Fetched::TerminalStarted(terminal.clone()));
+                    let _ = tx.send(Fetched::TerminalStarted(terminal.clone(), setup));
                 }
                 let _ = tx.send(Fetched::Notice(match outcome {
                     Ok((notice, _)) => notice,
@@ -1243,6 +1249,12 @@ pub fn run(context: Context) -> Result<()> {
             }
             ui.set_world(adapt::world(&model, &person, &extras));
             focus_initial_subject(&mut ui, &mut initial_subject, agents_live, glasses_ready);
+            if glasses_ready
+                && matches!(ui.world.link, super::view::Link::Live)
+                && let Some(command) = setup_command.take()
+            {
+                ui.open_setup_terminal(command);
+            }
             changed = false;
             if last_cache_save.elapsed() >= Duration::from_secs(60) {
                 save_cache(cache_path.as_deref(), &person, &model);
@@ -1334,6 +1346,7 @@ pub fn run(context: Context) -> Result<()> {
             reattach_tries = 0;
         }
         ui.terminal_requests();
+        ui.stage_setup_commands();
         // While an attached terminal's output flows, or voice listens, draw it as it comes.
         let flowing = ui.voice.is_some()
             || ui
@@ -1347,6 +1360,12 @@ pub fn run(context: Context) -> Result<()> {
             &stopping,
             |input| {
                 cancel_initial_subject(&mut initial_subject, &input);
+                if matches!(input, Event::Key(_) | Event::Paste(_))
+                    || matches!(&input, Event::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved)
+                {
+                    setup_command = None;
+                }
+                ui.cancel_setup_commands(&input);
                 match input {
                     Event::Key(key)
                         if !extras.live
@@ -1818,7 +1837,7 @@ async fn perform(
             .await?;
             Ok(("Stopped its turn".into(), None))
         }
-        Effect::CreateTerminal { name } => {
+        Effect::CreateTerminal { name, .. } => {
             let snapshot = client.capabilities().await?.snapshot.id;
             let (id, idem) = crate::action_pair();
             let result = client
@@ -2457,6 +2476,7 @@ mod tests {
             },
             Effect::CreateTerminal {
                 name: "Copper shell".into(),
+                command: None,
             },
             Effect::CreateLaunch {
                 title: "Copper launch".into(),
@@ -2642,6 +2662,7 @@ mod tests {
         };
         let terminal = Effect::CreateTerminal {
             name: "shell".into(),
+            command: None,
         };
         let stale = refused(st3_client::ErrorCode::StaleFence);
         assert!(!not_applied(&stale, &attention));
