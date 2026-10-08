@@ -28,7 +28,6 @@ export type StackParams = {
   /** An st document by its name and hash (`doc/NAME@HASH`), drawn as markdown. */
   Document: { name: string };
   NewMission: undefined;
-  NewAgent: undefined;
   History: undefined;
 };
 /** The tabs, and Glasses while that experiment is on. */

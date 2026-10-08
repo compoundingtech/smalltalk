@@ -22,7 +22,25 @@ pub struct SmalltalkRuntime {
     pub(crate) subject_cache: Mutex<SubjectCache>,
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
-    pub(crate) agent_resources_cache: Mutex<VecDeque<(u64, bool, Arc<Vec<Value>>)>>,
+    pub(crate) agent_resources_cache: Mutex<VecDeque<AgentResourcesEntry>>,
+    /// Ordering and queue metadata for lazy HTTP pages, shared at the same graph cuts.
+    pub(crate) agent_page_refs_cache: Mutex<VecDeque<AgentResourcesEntry>>,
+    /// Acquire before opening a SQLite snapshot, never while pinning a WAL read mark.
+    pub(crate) agent_resources_admission: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    pub(crate) agent_resources_builds: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentResourcesEntry {
+    pub(crate) index: u64,
+    pub(crate) local: u64,
+    pub(crate) history: bool,
+    /// None certifies the whole roster; Some records the lazily materialized page subjects.
+    pub(crate) covered: Option<BTreeSet<String>>,
+    /// Earliest wall-clock boundary in queue metadata; absent means no expiring work lease.
+    pub(crate) valid_until_unix_ms: Option<u128>,
+    pub(crate) items: Arc<Vec<Value>>,
 }
 
 impl SmalltalkRuntime {
@@ -36,6 +54,79 @@ impl SmalltalkRuntime {
 }
 
 impl Runtime for SmalltalkRuntime {
+    fn idempotency_response_in_use(&self, connection: &Connection, response: &str) -> Result<bool> {
+        // Some local entries contain a digest, not JSON. They have no work lifetime to pin.
+        let Ok(value) = serde_json::from_str::<Value>(response) else {
+            return Ok(false);
+        };
+        let view = value
+            .get("mission_run")
+            .filter(|run| run.is_object())
+            .unwrap_or(&value);
+        for field in ["generation", "source_generation"] {
+            if let Some(generation) = view.get(field).and_then(Value::as_str) {
+                let active: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM run_generations g JOIN mission_runs r ON r.id=g.run_id
+                     WHERE g.id=?1 AND g.status NOT IN ('completed','failed','cancelled','superseded')
+                     AND r.phase!='terminal')",
+                    [generation.trim_start_matches("run-generation/")],
+                    |row| row.get(0),
+                )?;
+                if active {
+                    return Ok(true);
+                }
+            }
+        }
+        let run = view
+            .get("run")
+            .and_then(Value::as_str)
+            .or_else(|| view.get("mission_run").and_then(Value::as_str))
+            .or_else(|| {
+                view.get("subject")
+                    .and_then(Value::as_str)
+                    .filter(|subject| subject.starts_with("mission-run/"))
+            });
+        if let Some(run) = run {
+            return connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mission_runs WHERE id=?1 AND phase!='terminal')",
+                    [run.trim_start_matches("mission-run/")],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into);
+        }
+        if let Some(step) = view
+            .get("step")
+            .and_then(Value::as_str)
+            .filter(|step| step.starts_with("step-run/"))
+        {
+            return connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM step_runs s JOIN mission_runs r ON r.id=s.run_id
+                 WHERE s.subject=?1 AND r.phase!='terminal')",
+                    [step],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into);
+        }
+        if let Some(tokens) = view.get("subject_tokens").and_then(Value::as_object) {
+            for subject in tokens
+                .keys()
+                .filter(|subject| subject.starts_with("mission-run/"))
+            {
+                let active: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mission_runs WHERE id=?1 AND phase!='terminal')",
+                    [subject.trim_start_matches("mission-run/")],
+                    |row| row.get(0),
+                )?;
+                if active {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn migrate_schema(&self, connection: &Connection) -> Result<()> {
         migrate_schema(connection)
     }
@@ -197,6 +288,10 @@ impl Runtime for SmalltalkRuntime {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.agent_page_refs_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     fn digest_tables(&self) -> &'static [(&'static str, &'static [&'static str])] {
@@ -230,6 +325,15 @@ impl Runtime for SmalltalkRuntime {
         cut: u128,
     ) -> Result<Value> {
         checkpoint_rules::subject_answers(connection, subject, cut)
+    }
+
+    fn checkpoint_subject_answers_with_sources(
+        &self,
+        connection: &Connection,
+        subject: &str,
+        cut: u128,
+    ) -> Result<(Value, smallclaims::store::checkpoint::CheckpointAnswerSources)> {
+        checkpoint_rules::subject_answers_with_sources(connection, subject, cut)
     }
 }
 

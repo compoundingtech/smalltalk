@@ -28,8 +28,6 @@ pub enum Pane {
     Document(String),
     /// The new mission form.
     NewMission,
-    /// The new agent form.
-    NewAgent,
 }
 
 impl Pane {
@@ -49,7 +47,6 @@ impl Pane {
             Pane::Usage(subject) => with("usage", subject),
             Pane::Document(name) => format!("document:{name}"),
             Pane::NewMission => "new-mission:".into(),
-            Pane::NewAgent => "new-agent:".into(),
         }
     }
 
@@ -73,7 +70,6 @@ impl Pane {
             "usage" => Pane::Usage(subject),
             "document" => Pane::Document(subject?),
             "new-mission" => Pane::NewMission,
-            "new-agent" => Pane::NewAgent,
             _ => return None,
         })
     }
@@ -100,7 +96,6 @@ mod tests {
             Pane::Usage(some("mission/example/harbor/audit")),
             Pane::Usage(None),
             Pane::NewMission,
-            Pane::NewAgent,
         ] {
             assert_eq!(
                 Pane::parse(&pane.key()),
@@ -114,5 +109,7 @@ mod tests {
         assert_eq!(Pane::parse("terminal:"), None, "a terminal needs its agent");
         assert_eq!(Pane::parse("document:"), None, "a document needs its name");
         assert_eq!(Pane::parse("a later kind:subject"), None);
+        // The new-agent form is gone; a stored tab for it is dropped like any unknown kind.
+        assert_eq!(Pane::parse("new-agent:"), None);
     }
 }

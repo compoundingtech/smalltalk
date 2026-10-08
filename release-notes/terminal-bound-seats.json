@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Allow a native driver seat to borrow an existing person's terminal without launching or terminating its shell.",
+  "replay": {
+    "status": "none",
+    "detail": "No full claim replay or projection migration. Existing member declarations retain their serialized form; bindings and invocation fences persist through ordinary claim loading and daemon restart."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or index change. New declarations carry an optional terminal_binding member and the terminal-bound lifecycle."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Existing checkpoint rules and digest inputs are unchanged. Only the terminal owner's person actor may publish a new terminal binding; local and replicated claim admission enforce the existing terminal-owner-forbidden rule."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Adds bind-terminal to top-level harness seats. Drivers match a bound person's terminal tag and exact PTY incarnation, then use a per-invocation agent fence. Existing managed drivers retain their normal tag lookup. Older binaries cannot read the terminal-bound member lifecycle."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Upgrade the terminal-owning daemon before creating bindings. Callers declare with the person's credential and launch a registered driver as a child of the shell. Terminal PATH shims and user surfaces are separate changes."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Rollback is supported before bindings have been created. Once bindings exist, roll forward: older reconcilers do not know that stop intents must preserve a borrowed shell. A killed driver that never records its exit may leave the seat observed running while its shell survives."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal daemon restart; interruption duration has not been measured. A bound driver exit remains terminal after daemon restart without respawning the shell."
+  }
+}

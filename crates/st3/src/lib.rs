@@ -34,11 +34,14 @@ pub mod hooks;
 pub mod incremental;
 pub mod lane;
 pub mod mailbox;
+/// Bounded local maintenance workers shared by daemon startup and lifecycle fixtures.
+pub mod maintenance;
 pub(crate) mod memory;
 pub mod mission;
 pub mod model;
 /// A driver relaunches its harness on the native session a suspended seat resumes.
 pub mod native_resume;
+pub mod node_identity;
 // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
 pub mod omp_ask_resume;
 // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
@@ -82,6 +85,7 @@ pub mod telemetry;
 pub mod test_support;
 /// Attaches a local terminal to another fleet host's PTY session over Fabric, without st daemons.
 pub mod terminal_fabric;
+pub mod terminal_binding;
 
 pub use graph::{parse_intent, validate_mission_runtimes};
 pub use model::{NormalizedIntent, St3Error};

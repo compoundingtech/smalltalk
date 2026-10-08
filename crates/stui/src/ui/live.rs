@@ -156,7 +156,6 @@ enum Fetched {
     Sessions(Collection),
     /// The Fleet tab's machines and paired devices.
     Machines(Collection),
-    Repositories(String, Load<Vec<String>>),
     /// A document read for a tab: its name and its text, or why it could not be read.
     Document(String, Result<String, String>),
     /// Token spend over a period of this many hours, or why st could not say.
@@ -173,7 +172,6 @@ enum Fetched {
     /// answer is unknown.
     Sent(String, Result<Option<String>, (String, bool)>),
     /// st started an agent asked for here.
-    AgentStarted(String),
     /// st started a shell asked for here.
     TerminalStarted(String),
     /// A direct stream to an agent's (or a shell's) PTY session.
@@ -314,6 +312,8 @@ pub fn run(context: Context) -> Result<()> {
     } else {
         ratatui_image::picker::Picker::halfblocks()
     });
+    // Clickable addresses (OSC 8) where the terminal draws images, as kitty and its kin do.
+    let hyperlinks = super::attach::graphics_terminal();
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
     let started = Instant::now();
@@ -332,7 +332,6 @@ pub fn run(context: Context) -> Result<()> {
     let mut cursor_style: Option<crossterm::cursor::SetCursorStyle> = None;
     // The tab shown on the last pass: opening a tab loads what only it needs.
     let mut shown_tab = usize::MAX;
-    let mut repositories_asked: Option<String> = None;
     // When usage was last asked for and over how many hours, and whether that read is out.
     let mut usage_read: Option<(Instant, u64)> = None;
     // When the connected clients were last read, while the fleet shows, and whether a read is out.
@@ -572,11 +571,6 @@ pub fn run(context: Context) -> Result<()> {
                     model.sessions = native;
                 }
                 Fetched::Machines(machines) => model.machines = machines,
-                Fetched::Repositories(host, load) => {
-                    if ui.agent_repository_host().as_ref() == Some(&host) {
-                        ui.agent_repositories = Some((host, load));
-                    }
-                }
                 Fetched::Older {
                     target,
                     session_id,
@@ -626,7 +620,6 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 Fetched::Devices(devices) => model.devices = devices,
                 Fetched::GlassSaved { id, key, outcome } => ui.glass_saved(&id, &key, outcome),
-                Fetched::AgentStarted(id) => ui.agent_started(id),
                 Fetched::TerminalStarted(id) => ui.terminal_started(id),
                 Fetched::Native { agent, direct } => {
                     if let Some(waited) = attach_started.take().map(|at| at.elapsed())
@@ -745,33 +738,6 @@ pub fn run(context: Context) -> Result<()> {
                     }
                 });
             }
-        }
-        if !extras.live {
-            repositories_asked = None;
-        }
-        match ui.agent_repository_host() {
-            Some(host) if extras.live && repositories_asked.as_ref() != Some(&host) => {
-                repositories_asked = Some(host.clone());
-                ui.agent_repositories = Some((host.clone(), Load::Loading));
-                let client = client.clone();
-                let tx = fetched_tx.clone();
-                runtime.spawn(async move {
-                    let load = match client.host_repositories(&host).await {
-                        Ok(reply) => Load::Ready(
-                            reply
-                                .value
-                                .repositories
-                                .into_iter()
-                                .map(|repo| repo.path)
-                                .collect(),
-                        ),
-                        Err(error) => Load::Failed(error.plain()),
-                    };
-                    let _ = tx.send(Fetched::Repositories(host, load));
-                });
-            }
-            None => repositories_asked = None,
-            _ => {}
         }
         // Ctrl+K asks st's conversation search once what is typed has been still for a moment;
         // an answer to an earlier query is dropped where it lands (Ui::said_choices).
@@ -1205,7 +1171,6 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 other => (other, None, None),
             };
-            let started = matches!(effect, Effect::CreateAgent { .. });
             let shell = matches!(effect, Effect::CreateTerminal { .. });
             let client = client.clone();
             let tx = fetched_tx.clone();
@@ -1226,9 +1191,6 @@ pub fn run(context: Context) -> Result<()> {
                             (plain(error), unconfirmed)
                         }),
                     ));
-                }
-                if started && let Ok((_, Some(agent))) = &outcome {
-                    let _ = tx.send(Fetched::AgentStarted(agent.clone()));
                 }
                 if shell && let Ok((_, Some(terminal))) = &outcome {
                     let _ = tx.send(Fetched::TerminalStarted(terminal.clone()));
@@ -1265,7 +1227,16 @@ pub fn run(context: Context) -> Result<()> {
         ui.step_voice();
         ui.step_terminal_hold();
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
-        terminal.draw(|frame| ui.render(frame))?;
+        let mut links = Vec::new();
+        terminal.draw(|frame| {
+            ui.render(frame);
+            if hyperlinks {
+                links = ui.link_cells(frame.buffer_mut());
+            }
+        })?;
+        if hyperlinks && !links.is_empty() {
+            super::hyperlinks::write_links(terminal.backend_mut(), &links)?;
+        }
         // The attached terminal's cursor shape (vim's bar while inserting), and the person's
         // own shape back once it is gone.
         let style = ui.cursor_style();
@@ -1853,52 +1824,6 @@ async fn perform(
                 .find(|id| id.starts_with("terminal/"));
             Ok((format!("Started shell {name}"), terminal))
         }
-        Effect::CreateAgent {
-            name,
-            harness,
-            model,
-            effort,
-            host,
-            message,
-            repo,
-            branch,
-            base,
-            workspace,
-        } => {
-            let snapshot = client.capabilities().await?.snapshot.id;
-            let (id, idem) = crate::action_pair();
-            let result = client
-                .agent_create(
-                    id,
-                    idem,
-                    Fence {
-                        snapshot_id: snapshot,
-                        ..Fence::default()
-                    },
-                    st3_client::AgentCreateParameters {
-                        name: name.clone(),
-                        harness,
-                        host,
-                        model,
-                        effort,
-                        workspace,
-                        repo,
-                        branch,
-                        base,
-                        description: None,
-                        message,
-                        ..Default::default()
-                    },
-                )
-                .await?;
-            // The new agent's id, so its conversation opens in place of the form.
-            let agent = result
-                .value
-                .affected_ids
-                .into_iter()
-                .find(|id| id.starts_with("agent/"));
-            Ok((format!("Starting {name}"), agent))
-        }
         Effect::Attention {
             id,
             action,
@@ -2426,18 +2351,6 @@ mod tests {
                 title: "Copper discussion".into(),
                 text: "Record the evidence".into(),
             },
-            Effect::CreateAgent {
-                name: "example/copper".into(),
-                harness: "claude".into(),
-                model: None,
-                effort: None,
-                host: None,
-                repo: Some("/srv/example/repo".into()),
-                branch: Some("copper".into()),
-                base: Some("origin/main".into()),
-                workspace: Some("/srv/example/copper".into()),
-                message: None,
-            },
             Effect::CreateTerminal {
                 name: "Copper shell".into(),
             },
@@ -2456,28 +2369,6 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert!(
-            store
-                .desired_subjects()
-                .unwrap()
-                .iter()
-                .any(|item| item.subject == "agent/example/copper")
-        );
-        let agent = store
-            .desired_subjects()
-            .unwrap()
-            .into_iter()
-            .find(|item| item.subject == "agent/example/copper")
-            .unwrap();
-        let checkout = agent.desired["children"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|node| node["name"] == "checkout")
-            .unwrap();
-        assert_eq!(checkout["arguments"][0], "/srv/example/repo");
-        assert_eq!(checkout["properties"]["branch"], "copper");
-        assert_eq!(agent.member.unwrap().workspace, "/srv/example/copper");
         assert_eq!(store.planning_sessions(true).unwrap().len(), 1);
         let launch = store.planning_sessions(true).unwrap().pop().unwrap();
         let transport = st3::client::Client::unix_as(&socket, "person/avery").unwrap();

@@ -400,7 +400,7 @@ pub struct CommitFrontiers {
     pub status_floor: u64,
 }
 
-fn frontiers(connection: &Connection) -> Result<CommitFrontiers> {
+pub(super) fn frontiers(connection: &Connection) -> Result<CommitFrontiers> {
     let (format, value): (String, CommitFrontiers) = connection.query_row(
         "SELECT e.format,e.database_id,c.epoch,c.admitted,c.projected,c.local_generation,
                 k.sequence,s.sequence,e.key_floor,e.status_floor

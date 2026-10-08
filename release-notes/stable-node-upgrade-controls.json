@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Guard stable identity upgrades, restore collisions and explicit fleet admission across all CLI paths.",
+  "replay": {"status": "none", "detail": "No history rewriting, fake exits or local receipt trimming."},
+  "schema": {"status": "none", "detail": "Pre-migration identity inspection checks legacy table columns and leaves schema changes to the normal store migration. Pin writes synchronize the directory after atomic publication."},
+  "rules": {"status": "none", "detail": "No membership, checkpoint or delivery admission changes."},
+  "compatibility": {"status": "changed", "detail": "Fleet create and both migration roles record their explicit admission under the state lock. Fleet controls, including leave's live-runtime check, use the resolved pinned identity. A Claude identity-only invocation remains an error; installer preflights plugin-disable support before marketplace or plugin changes."},
+  "downtime": {"status": "changed", "detail": "Installed-service membership creation stops its daemon before admission and restarts afterward; foreground daemons must be stopped explicitly. No affected-machine deployment or service mutation was executed in verification."},
+  "manual": {"status": "changed", "detail": "For ambiguous legacy receipt hosts or disagreement with fleet membership, back up state/config and restore the prior compatible binary with its verified writer while the operator checks keys and live ownership. Restore a corrupted pin only from a known-good backup for this state. Never clone a live state's pin/keys onto another active machine. Claude must support plugin disable; unsupported versions fail before plugin activation."},
+  "recovery": {"status": "changed", "detail": "Claim restore requires a fresh state directory without an old identity pin; a restored writer conflicting with a pin reports this explicitly. Resume a saved join if admission persisted before its pin write. Local checkpoint matching prevents accidental inconsistency, not edits by the filesystem owner."}
+}

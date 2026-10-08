@@ -3,7 +3,7 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
-import { API_VERSION, ClientError, St3Client, isTransient, notApplied, plainError, retryTransient, type AgentCreateParameters, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { API_VERSION, ClientError, St3Client, isTransient, notApplied, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { keepClosed, personAnswer, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
 import app from './app.json';
 import { canVerifyPairing, createDeviceKey, removeDeviceKey, signWithDeviceKey, verifyGrantSignature } from './modules/st-device-key';
@@ -365,7 +365,7 @@ function useAppStore(proof?: FabricProfile) {
       if (typeof typed === 'string') { setError(typed); return false; }
       return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(typed ? { answer: typed } : {}) } }); });
     },
-    /** Clear an item st closed elsewhere: only the person's own word removes it from Home. */
+    /** Clear an item st closed: only the person's own word removes it from Home. */
     clearClosed(id: string) {
       acted.current.add(id);
       setData(previous => ({ ...previous, attention: previous.attention.filter(item => item.id !== id) }));
@@ -446,17 +446,6 @@ function useAppStore(proof?: FabricProfile) {
         try { await client.terminalScreen(created); return created; } catch { await new Promise(resolve => setTimeout(resolve, 500)); }
       }
       return created;
-    },
-    /** A new agent with its first message; its id, or null with the reason shown. */
-    async createAgent(parameters: AgentCreateParameters): Promise<string | null> {
-      if (!client) return null;
-      let created: string | null = null;
-      const done = await runAction(async () => {
-        const id = actionId();
-        const result = await client.agentCreate({ id, idempotency_key: id, fence: await fence(), parameters });
-        created = result.value.affected_ids?.find(affected => affected.startsWith('agent/')) ?? null;
-      });
-      return done ? created : null;
     },
     async createLaunch(parameters: { title: string; request: string; workspace: string; provider: Planner; model?: string; effort?: string }) {
       if (!client) return false;

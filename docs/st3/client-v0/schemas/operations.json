@@ -144,7 +144,7 @@
     "max_response_bytes": 8388608,
     "max_wait_ms": 30000,
     "event_retention_seconds": 86400,
-    "idempotency_retention_seconds": 2592000,
+    "idempotency_retention_seconds": 604800,
     "max_arrangement_body_bytes": 1048576,
     "max_arrangement_resource_bytes": 524288,
     "max_arrangements": 100,
@@ -153,6 +153,98 @@
     "max_arrangement_operations": 1024,
     "max_arrangement_folders": 1024,
     "max_arrangement_placements": 4096,
-    "pairing_ttl_seconds": 300
+    "pairing_ttl_seconds": 300  },
+  "idempotency_contract": {
+    "storage": "local-sqlite-completed-response-rows",
+    "minimum_retention_seconds": 604800,
+    "key_reuse": "never",
+    "after_reclamation": "recognise-original-effect-from-existing-operation-index-or-checkpoint-tombstone; reconstruct-document-response-or-terminal-idempotency-key-expired",
+    "active_mission_receipts": "extend-while-run-or-generation-active",
+    "longest_supported_retry_horizon_seconds": 604800,
+    "local_response_operations": {
+      "documents.put": "recover-original-doc.bound-response-or-terminal-checkpoint-refusal",
+      "missions.start": "primary-creation-operation; terminal-refusal; deterministic-run-identity",
+      "work.start": "primary-creation-operation; terminal-refusal; deterministic-run-and-step-identity",
+      "missions.output": "primary-output-operation; terminal-refusal",
+      "missions.revision-propose": "primary-proposal-operation; terminal-refusal",
+      "missions.revision-adopt": "primary-generation-operation; terminal-refusal",
+      "missions.revision-approve": "primary-approval-operation; terminal-refusal; unchanged-approval-safe-no-op",
+      "missions.revision-cancel": "primary-cancellation-operation; terminal-refusal",
+      "work.retry": "primary-retry-operation; terminal-refusal-before-second-attempt",
+      "missions.outcome": "primary-run-state-operation; terminal-refusal",
+      "missions.retire": "primary-publication-operation; terminal-refusal",
+      "work.claim-renew-progress-complete-fail-release-handoff": "primary-work-operation; terminal-refusal; quiet-renewal-is-naturally-idempotent-under-current-ownership-fences",
+      "apply": "primary-direct-declaration-operation-or-existing-compound-publication-identities; unchanged-apply-safe-to-recompute",
+      "apply.owned-set": "existing-owned-set-and-publication-identities; no-op-retry; never-reuse-key-with-different-bytes",
+      "agents.quick": "direct-declaration-operation-or-existing-desired-identity; atomic-secondary-response",
+      "resources.observation-complete": "primary-observation-state-or-delivery-operation; terminal-refusal"
+    },
+    "durable_exceptions": {
+      "client.actions": "custom.client.action-result-receipt",
+      "message.send": "deterministic-message-subject",
+      "work.ask": "deterministic-person-ask-identity",
+      "claims.append": "operation-identity-and-checkpoint-tombstones"
+    },
+    "storage_sites": {
+      "documents.put": [
+        "smallclaims::Store::put_document_as"
+      ],
+      "missions.start": [
+        "Store::create_mission_run_inner"
+      ],
+      "work.start": [
+        "Store::create_mission_run_inner (delegated deterministic run)"
+      ],
+      "missions.output": [
+        "Store::record_mission_output"
+      ],
+      "missions.revision-propose": [
+        "Store::create_revision_proposal"
+      ],
+      "missions.revision-adopt": [
+        "Store::adopt_mission_revision_inner"
+      ],
+      "missions.revision-approve": [
+        "Store::approve_revision_proposal: already-applied",
+        "Store::approve_revision_proposal: immediate-cutover",
+        "Store::approve_revision_proposal: approval-or-draining"
+      ],
+      "missions.revision-cancel": [
+        "Store::cancel_revision_proposal"
+      ],
+      "work.retry": [
+        "Store::retry_failed_step"
+      ],
+      "missions.outcome": [
+        "Store::set_mission_run_outcome"
+      ],
+      "missions.retire": [
+        "Store::retire_mission"
+      ],
+      "work.claim-renew-progress-complete-fail-release-handoff": [
+        "Store::work_action_with_handoff"
+      ],
+      "apply": [
+        "Store::apply_as_impl: unchanged-response",
+        "Store::apply_as_impl: changed-response"
+      ],
+      "apply.owned-set": [
+        "Store::apply_as_impl: owned-set-request-digest",
+        "Store::apply_as_impl: shared apply response sites"
+      ],
+      "agents.quick": [
+        "cache_local_apply_receipt_tx: secondary-response",
+        "Store::apply_as_impl: shared apply response sites"
+      ],
+      "resources.observation-complete": [
+        "Store::record_resource_observation"
+      ],
+      "test-only-cache-helper": [
+        "Store::cache_idempotency_response (no production caller)"
+      ]
+    },
+    "legacy_receipts": "retain-all-rows-present-at-upgrade; follow-up-1741-deletes-at-deployment-plus-30-days",
+    "indexes": "no-added-dropped-or-changed-indexes",
+    "cleanup": "rowid-after-legacy-watermark; at-most-64; stop-at-first-young-row; rotate-active-pins-with-update"
   }
 }

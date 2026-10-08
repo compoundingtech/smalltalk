@@ -10,6 +10,7 @@ use anyhow::{Context as _, Result, bail};
 /// What the built-in `merged` and `ci-passed` gates read from GitHub.
 pub mod github_gates;
 mod github_repository;
+pub(crate) mod github_workflows;
 pub(crate) use github_repository::{RECENT_COMMENTS, merge_recent_comments, recent_comment_key};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -810,6 +811,19 @@ async fn github_listing(
     pages: usize,
     resumable: bool,
 ) -> Result<GithubListing> {
+    github_listing_at_field(client, url, token, cache_for, pages, resumable, None).await
+}
+
+/// The same conditional paginated read for an object-wrapped GitHub collection.
+async fn github_listing_at_field(
+    client: &reqwest::Client,
+    url: String,
+    token: &GithubAuth,
+    cache_for: Duration,
+    pages: usize,
+    resumable: bool,
+    field: Option<&str>,
+) -> Result<GithubListing> {
     let mut next = Some(url);
     let mut listing = GithubListing {
         values: Vec::new(),
@@ -823,6 +837,13 @@ async fn github_listing(
             break;
         }
         let payload = github_json(client, url, token, cache_for).await?;
+        if field.is_some() {
+            anyhow::ensure!(
+                payload.value.get("total_count").and_then(Value::as_u64)
+                    .is_none_or(|count| count <= (pages as u64).saturating_mul(100)),
+                "the GitHub object listing exceeds the {pages}-page bound"
+            );
+        }
         listing
             .versions
             .push(payload.etag.clone().unwrap_or_else(|| {
@@ -830,9 +851,12 @@ async fn github_listing(
                     serde_json::to_vec(&payload.value).unwrap_or_default(),
                 ))
             }));
-        listing
-            .values
-            .extend(serde_json::from_value::<Vec<Value>>(payload.value)?);
+        let values = match field {
+            Some(field) => payload.value.get(field).cloned()
+                .with_context(|| format!("GitHub listing has no {field} collection"))?,
+            None => payload.value,
+        };
+        listing.values.extend(serde_json::from_value::<Vec<Value>>(values)?);
         next = payload.next;
     }
     Ok(listing)
@@ -892,7 +916,7 @@ pub(crate) use crate::github_http::github_auth;
 
 /// Select the daemon's GitHub source before its first request. Configuration is immutable
 /// for this process; token-file contents are revalidated when the file changes.
-pub fn configure_github(config: &crate::config::GithubConfig) -> Result<()> {
+pub fn configure_github(config: &crate::config::Config) -> Result<()> {
     crate::github_http::configure(config)
 }
 
