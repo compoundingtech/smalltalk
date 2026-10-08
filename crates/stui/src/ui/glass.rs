@@ -2561,6 +2561,10 @@ impl Ui {
             }
             // Ctrl chords, not Alt: on a Mac Option and a letter types a character (Nathan,
             // 2026-10-03).
+            KeyCode::Enter if control && quiet && conversation.is_some() => self.toggle_focused_tool(),
+            KeyCode::Up if control && quiet && conversation.is_some() => self.focus_tool(-1),
+            KeyCode::Down if control && quiet && conversation.is_some() => self.focus_tool(1),
+            KeyCode::Char('u') if control && quiet && conversation.is_some() => self.toggle_focused_images(),
             KeyCode::Char('e') if control && conversation.is_some() => self.toggle_all_tools(),
             KeyCode::Char('p') if control && conversation.is_some() => self.toggle_simple(),
             KeyCode::Char('d') if control && conversation.is_some() => self.toggle_details(),
