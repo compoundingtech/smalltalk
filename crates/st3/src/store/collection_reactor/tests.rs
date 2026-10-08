@@ -666,3 +666,74 @@ async fn publication_panic_returns_the_writer_and_preserves_later_native_writes(
     replace(&store, good.source, 3);
     wait_for(|| output(&store, good.source) == Some(3)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_siblings_capture_hook_failure_does_not_fence_valid_publication() {
+    for begin in [true, false] {
+        for failure in [1, 3] {
+            let root = tempfile::tempdir().unwrap();
+            let gate = Arc::new(Gate {
+                entered: Notify::new(),
+                release: (Mutex::new(false), std::sync::Condvar::new()),
+                once: AtomicBool::new(false),
+            });
+            let idle = source("fixture.idle", "fixture.idle.rows", None, false);
+            let active = source(
+                "fixture.active",
+                "fixture.active.rows",
+                Some(gate.clone()),
+                false,
+            );
+            let store = Arc::new(
+                Store::open_with_collection_sources(
+                    &root.path().join("graph.db"),
+                    "alder",
+                    vec![idle.clone(), active.clone()],
+                )
+                .unwrap(),
+            );
+            replace(&store, active.source, 19);
+            store.start_collection_reactor().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+                .await
+                .unwrap();
+            // B's owned page is prepared after releasing its read snapshot. A has no page.
+            if begin {
+                idle.begin_failure.store(failure, Ordering::SeqCst);
+            } else {
+                idle.commit_failure.store(failure, Ordering::SeqCst);
+            }
+            *gate.release.0.lock().unwrap() = true;
+            gate.release.1.notify_one();
+            wait_for(|| output(&store, active.source) == Some(19)).await;
+            let registry = store.collection_sources().unwrap();
+            assert!(
+                registry
+                    .cx
+                    .installer
+                    .position(&store.readers.get(), idle.source)
+                    .is_err()
+            );
+            assert!(
+                registry
+                    .cx
+                    .installer
+                    .position(&store.readers.get(), active.source)
+                    .is_ok()
+            );
+            assert!(registry.unavailable[0].load(Ordering::Acquire));
+            assert!(!registry.unavailable[1].load(Ordering::Acquire));
+            assert_eq!(output(&store, idle.source), None);
+            // A keeps failing; later native B admission and its next publication still succeed.
+            replace(&store, active.source, 23);
+            wait_for(|| output(&store, active.source) == Some(23)).await;
+            assert!(
+                registry
+                    .cx
+                    .installer
+                    .position(&store.readers.get(), active.source)
+                    .is_ok()
+            );
+        }
+    }
+}
