@@ -129,3 +129,24 @@ quiescent differential and missing-read tests continue to exercise full-pass aud
 No production reconciler behavior changes. An attempted control before member
 classification was caught by the existing second change-feed refresh and did not
 reproduce the hosted mid-evaluation panic; it is not claimed as cause proof.
+
+## Terminal probe action publication
+
+Merge-group run 37736805982 at `c49892de8f5d44b842f08689e956fae8e98f410b`
+contains the earlier input-barrier fix, but its terminal protocol probe first
+attempt timed out waiting for image hiding: the last status retained a focused
+terminal and two image cells. The later passing retry remains separate evidence.
+The log does not retain the worker's output or the action file, so it does not
+establish the historical timeout's cause.
+
+The fixture has an independently reproducible publication race. Python creates
+`ui-action` before writing `hide` or `show`; the Rust worker immediately reads and
+removes any existing action file. If it reads a prefix, it panics on the unknown
+action and leaves the last status unchanged. A forced split-write control lets the
+real worker run while only the first byte has been written; the old publication
+path fails, while staging and renaming the complete file preserves both hide and
+show. Two title acknowledgements span a new worker loop during the partial write.
+
+The probe now publishes action files with rename, like its existing output
+requests. Production UI, input, image handling and PTY transport are unchanged.
+The original matrix, image lifecycle assertions and timeouts remain in force.
