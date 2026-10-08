@@ -21,6 +21,8 @@
     "server/**/*.mts",
     "src/**/*.ts",
     "src/**/*.tsx",
+    "packages/st3-sdk/src/**/*.ts",
+    "packages/st3-sdk/vitest.config.ts",
     "vitest.config.ts"
   ],
   "exclude": [
