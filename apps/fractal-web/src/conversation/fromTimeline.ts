@@ -81,6 +81,26 @@ const joinResult = ({
 const isTurnHeader = (entry: Entry) =>
   entry.type === 'message' && entry.body.from === undefined && entry.body.to === undefined
 
+/**
+ * st merges native and mailbox items by `(timestamp, sequence)` (`client_v0.rs`
+ * `native_timeline_page`); the fold mirrors that exact server rule, because mail
+ * and harness sequences live in unrelated number spaces.
+ */
+const stampOf = (entry: Entry): string =>
+  entry.type === 'unrecognized' ? entry.timestamp ?? '' : DateTime.formatIso(entry.timestamp)
+
+/** Whether `a` sorts at or before `b` under the server's `(timestamp, sequence)` rule. */
+const notAfter = (a: Entry, b: Entry): boolean => {
+  const stamp = stampOf(a).localeCompare(stampOf(b))
+  return stamp < 0 || (stamp === 0 && a.sequence <= b.sequence)
+}
+
+/** Whether `a` sorts strictly before `b` under the same rule. */
+const strictlyBefore = (a: Entry, b: Entry): boolean => {
+  const stamp = stampOf(a).localeCompare(stampOf(b))
+  return stamp < 0 || (stamp === 0 && a.sequence < b.sequence)
+}
+
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))
 
 /** st3 explicitly marks unsupported omp entries; ordinary prose/JSON is never guessed at. */
@@ -349,14 +369,11 @@ export class LiveTimeline {
       ) {
         at = this.positionOf(previous)
         this.ordered[at] = entry
-      } else if (
-        previous === undefined &&
-        (last === undefined || last.sequence <= entry.sequence)
-      ) {
+      } else if (previous === undefined && (last === undefined || notAfter(last, entry))) {
         at = this.ordered.push(entry) - 1
       } else {
         if (previous !== undefined) this.ordered.splice(this.positionOf(previous), 1)
-        this.ordered.splice(this.insertionIndex(entry.sequence), 0, entry)
+        this.ordered.splice(this.insertionIndex(entry), 0, entry)
         this.reindex = true
         continue
       }
@@ -420,13 +437,22 @@ export class LiveTimeline {
         entry.type === 'message' && !isTurnHeader(entry) ? [entry.body.message_id] : [],
       ),
     )
+    // Both st projections stamp a mail pair from one claim: identical timestamp, message
+    // at `store_index*4`, content at `+1`. That structure survives split pages and native
+    // interleaving, unlike array adjacency.
+    const mailContentSlots = new Set(
+      this.ordered.flatMap((entry) => {
+        if (entry.type !== 'message' || isTurnHeader(entry)) return []
+        return [`${stampOf(entry)}|${entry.sequence + 1}`]
+      }),
+    )
     for (let at = from; at < this.ordered.length; at += 1) {
       const entry = this.ordered[at]!
       this.itemsBefore.push(items.length)
       if (isTurnHeader(entry)) continue
       // Only native harness turns repeat shown mail as delivery copies; a mailbox
       // message's own content is person-authored text that may quote anything.
-      const mailboxPair = at > 0 && this.ordered[at - 1]!.type === 'message' && !isTurnHeader(this.ordered[at - 1]!)
+      const mailboxPair = mailContentSlots.has(`${stampOf(entry)}|${entry.sequence}`)
       if (entry.type === 'content' && !mailboxPair && (entry.role === 'user' || entry.role === 'system')) {
         const text = withoutShownDeliveries(entry.body.text ?? '', shown)
         if (text !== (entry.body.text ?? '')) {
@@ -493,22 +519,22 @@ export class LiveTimeline {
     return item
   }
 
-  private insertionIndex(sequence: number): number {
+  private insertionIndex(entry: Entry): number {
     let low = 0
     let high = this.ordered.length
     while (low < high) {
       const mid = (low + high) >>> 1
-      if (this.ordered[mid]!.sequence <= sequence) low = mid + 1
+      if (notAfter(this.ordered[mid]!, entry)) low = mid + 1
       else high = mid
     }
     return low
   }
 
-  /** Position of an entry already in `ordered`; searches back from its sequence slot. */
+  /** Position of an entry already in `ordered`; searches back from its sort slot. */
   private positionOf(entry: Entry): number {
-    for (let at = this.insertionIndex(entry.sequence) - 1; at >= 0; at -= 1) {
+    for (let at = this.insertionIndex(entry) - 1; at >= 0; at -= 1) {
       if (this.ordered[at]!.id === entry.id) return at
-      if (this.ordered[at]!.sequence < entry.sequence) break
+      if (strictlyBefore(this.ordered[at]!, entry)) break
     }
     return this.ordered.findIndex((candidate) => candidate.id === entry.id)
   }

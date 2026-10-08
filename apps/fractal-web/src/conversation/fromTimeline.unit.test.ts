@@ -27,10 +27,16 @@ describe('native conversation page boundaries', () => {
 })
 
 describe('mailbox deliveries', () => {
-  const entry = (id: string, sequence: number, type: string, body: unknown, role = 'user') =>
+  const entry = (
+    id: string,
+    sequence: number,
+    type: string,
+    body: unknown,
+    role = 'user',
+    timestamp = '2026-10-03T00:00:00Z',
+  ) =>
     Schema.decodeUnknownSync(TimelineEntry)({
-      id, sequence, type, body, role, revision: 1, final: true,
-      timestamp: '2026-10-03T00:00:00Z',
+      id, sequence, type, body, role, revision: 1, final: true, timestamp,
     })
 
   it('shows mailbox mail once at its original position, not again as a later harness delivery', () => {
@@ -127,5 +133,98 @@ and copied it into my reply`,
     expect(timeline.project().items.map((item) => item.id)).toEqual([
       'timeline-entry/direct', 'timeline-entry/unmatched', 'timeline-entry/image',
     ])
+  })
+})
+
+describe('structural mailbox pairs and server ordering', () => {
+  const entry = (
+    id: string,
+    sequence: number,
+    type: string,
+    body: unknown,
+    role = 'user',
+    timestamp = '2026-10-03T00:00:00Z',
+  ) =>
+    Schema.decodeUnknownSync(TimelineEntry)({
+      id, sequence, type, body, role, revision: 1, final: true, timestamp,
+    })
+
+  it('identifies mailbox content by its pair structure across split pages and native interleaving', () => {
+    const timeline = new LiveTimeline()
+    const mailAt = '2026-10-03T00:00:00Z'
+    const turnAt = '2026-10-03T00:01:00Z'
+    timeline.apply({
+      replace: true, hasMore: false,
+      entries: [entry('timeline-entry/mail/message', 4, 'message', {
+        message_id: 'message/abc', from: 'person/operator', to: 'agent/example',
+      }, 'user', mailAt)],
+    })
+    timeline.apply({
+      replace: false, hasMore: false,
+      entries: [entry('timeline-entry/native/content', 5, 'content', {
+        media_type: 'text/plain',
+        text: `<smalltalk-message graph="message/abc">hello</smalltalk-message>
+The person reads replies in st, not in the agent's session.`,
+      }, 'user', turnAt)],
+    })
+    timeline.apply({
+      replace: false, hasMore: false,
+      entries: [entry('timeline-entry/mail/content', 5, 'content', {
+        media_type: 'text/plain',
+        text: `<smalltalk-message graph="message/abc">I quoted this envelope</smalltalk-message>
+in my own reply`,
+      }, 'user', mailAt)],
+    })
+    const items = timeline.project().items
+    // st's merge order is (timestamp, sequence): the mail pair precedes the later harness turn.
+    expect(items.map((item) => item.id)).toEqual(['timeline-entry/mail/message', 'timeline-entry/mail/content'])
+    const mailContent = items.at(-1)
+    expect(mailContent?._tag === 'Text' ? mailContent.text : '').toBe(
+      `<smalltalk-message graph="message/abc">I quoted this envelope</smalltalk-message>
+in my own reply`,
+    )
+  })
+
+  it('orders merged entries by (timestamp, sequence) even when sequences disagree', () => {
+    const timeline = new LiveTimeline()
+    timeline.apply({
+      replace: true, hasMore: false,
+      entries: [
+        entry('timeline-entry/later-turn', 2, 'content', {
+          media_type: 'text/plain', text: 'later turn',
+        }, 'assistant', '2026-10-03T00:02:00Z'),
+        entry('timeline-entry/earlier-mail', 40, 'content', {
+          media_type: 'text/plain', text: 'earlier mail',
+        }, 'user', '2026-10-03T00:00:00Z'),
+      ],
+    })
+    expect(timeline.project().items.map((item) => item.id))
+      .toEqual(['timeline-entry/earlier-mail', 'timeline-entry/later-turn'])
+  })
+
+  it('treats content whose mailbox header never arrived as a native turn', () => {
+    const timeline = new LiveTimeline()
+    timeline.apply({
+      replace: true, hasMore: false,
+      entries: [
+        entry('timeline-entry/shown/message', 1, 'message', {
+          message_id: 'message/abc', from: 'person/operator', to: 'agent/example',
+        }),
+        entry('timeline-entry/shown/content', 2, 'content', { media_type: 'text/plain', text: 'hello' }),
+        entry('timeline-entry/orphan/content', 3, 'content', {
+          media_type: 'text/plain',
+          text: `<smalltalk-message graph="message/abc">orphaned copy</smalltalk-message>
+but this line is the harness's own`,
+        }),
+      ],
+    })
+    const items = timeline.project().items
+    expect(items.map((item) => item.id)).toEqual([
+      'timeline-entry/shown/message', 'timeline-entry/shown/content', 'timeline-entry/orphan/content',
+    ])
+    const orphan = items.at(-1)
+    expect(orphan?._tag === 'Text' ? orphan.text : '').toBe(
+      "but this line is the harness's own",
+    )
   })
 })
