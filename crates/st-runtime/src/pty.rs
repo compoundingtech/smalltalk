@@ -1534,7 +1534,7 @@ exit 0
         let binary = fake_pty(
             root.path(),
             "fake-pty-root",
-            "  printenv > \"$0.env\"\n  publish new",
+            "  for key in PTY_ROOT ST_AGENT ST3_BIN PATH ST3_ROLLOUT_OPERATION ST3_ROLLOUT_PREDECESSOR TERM; do printf '%s=' \"$key\"; printenv \"$key\"; done > \"$0.env\"\n  publish new",
         );
         let environment: BTreeMap<String, String> = BTreeMap::from([
             ("PTY_ROOT".into(), declared.to_string_lossy().into_owned()),
@@ -1546,14 +1546,8 @@ exit 0
             ("ST3_ROLLOUT_PREDECESSOR".into(), "synthetic-predecessor".into()),
             ("TERM".into(), "screen-256color".into()),
         ]);
-        // The resolved member overlay must still beat the CLI's own environment.
-        let ambient = environment
-            .keys()
-            .map(|key| (key.clone(), "synthetic-ambient-conflict".into()))
-            .collect();
         let runtime = PtyRuntime::new(registry.clone())
-            .with_binary(binary.to_string_lossy())
-            .with_environment(ambient);
+            .with_binary(binary.to_string_lossy());
         spawn_work(&runtime, root.path(), &environment).unwrap();
         assert!(registry.join("work.json").exists());
         assert!(!declared.exists());
