@@ -1787,7 +1787,7 @@ impl ClaudeChannelFixture {
             .env("ST_CLAUDE_SESSION_SEQ", "1");
         command
     }
-    async fn open(
+    fn open_protocol(
         &self,
         root: &Path,
         daemon: &Daemon,
@@ -1834,6 +1834,19 @@ impl ClaudeChannelFixture {
         )
         .unwrap();
         input.flush().unwrap();
+        (channel, input, received)
+    }
+    async fn open(
+        &self,
+        root: &Path,
+        daemon: &Daemon,
+        wrapper: &str,
+    ) -> (
+        Child,
+        std::process::ChildStdin,
+        std::sync::mpsc::Receiver<Value>,
+    ) {
+        let (channel, input, received) = self.open_protocol(root, daemon, wrapper);
         let client = st3::client::Client::new(st3::client::Endpoint::Unix(daemon.socket.clone()));
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1860,6 +1873,145 @@ impl ClaudeChannelFixture {
         writeln!(file, "{record}").unwrap();
     }
 }
+
+/// Force a native activity publication to commit while the real channel's startup
+/// claim is in flight. This is a publisher/Store ordering control, not a hook eval.
+async fn delayed_channel_initialization_preserves_activity(activity: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    declare_claude(&daemon, "agent/quartz");
+    daemon.observe_running("agent/quartz", "wrapper-activity");
+    let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let release = Arc::new(Notify::new());
+    let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let captured = requests.clone();
+    let release_request = release.clone();
+    let recorded = committed.clone();
+    let app = st3::api::router(daemon.state()).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let captured = captured.clone();
+            let release = release_request.clone();
+            let recorded = recorded.clone();
+            async move {
+                if request.method() != axum::http::Method::POST
+                    || request.uri().path() != "/v1/claims"
+                {
+                    return next.run(request).await;
+                }
+                let (parts, body) = request.into_parts();
+                let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                let input: Value = serde_json::from_slice(&bytes).unwrap();
+                let startup = input["idempotency_key"].as_str().is_some_and(|key| {
+                    key.starts_with("channel-ready:") || key.starts_with("channel-initialized:")
+                });
+                if startup {
+                    let count = {
+                        let mut requests = captured.lock().unwrap();
+                        requests.push(input);
+                        requests.len()
+                    };
+                    if count == 1 { release.notified().await; }
+                }
+                let response = next
+                    .run(axum::extract::Request::from_parts(
+                        parts,
+                        axum::body::Body::from(bytes),
+                    ))
+                    .await;
+                if startup {
+                    recorded.store(
+                        response.status().is_success(),
+                        std::sync::atomic::Ordering::Release,
+                    );
+                }
+                response
+            }
+        },
+    ));
+    daemon.start_isolated_app(app).await;
+    let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-activity");
+    let (mut channel, mut input, received) = fixture.open_protocol(root, &daemon, "wrapper-activity");
+    wait_until(
+        "startup POST is held before commit",
+        Duration::from_secs(5),
+        || requests.lock().unwrap().len() == 1,
+    )
+    .await;
+    daemon.append(
+        "agent/quartz",
+        "harness.observed",
+        json!({
+            "state": activity, "driver": "claude", "incarnation_id": "wrapper-activity",
+        }),
+    );
+    assert_eq!(
+        daemon
+            .store
+            .current_harness("agent/quartz")
+            .unwrap()
+            .unwrap()
+            .state,
+        activity
+    );
+    release.notify_one();
+    wait_until(
+        "actual startup claim commits",
+        Duration::from_secs(5),
+        || committed.load(std::sync::atomic::Ordering::Acquire),
+    )
+    .await;
+    let after = daemon
+        .store
+        .current_harness("agent/quartz")
+        .unwrap()
+        .unwrap()
+        .state;
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(5)).unwrap()["id"],
+        2,
+        "acknowledged startup must keep MCP requests responsive"
+    );
+    drop(input);
+    wait_until("EOF closes the channel", Duration::from_secs(5), || {
+        channel.try_wait().unwrap().is_some()
+    })
+    .await;
+    assert!(channel.try_wait().unwrap().unwrap().success());
+    let selected = daemon.store.current_harness("agent/quartz").unwrap().unwrap();
+    let claims = daemon.store.claims_for("agent/quartz", None).unwrap();
+    eprintln!("selected harness after startup: {selected:?}; actual claims: {claims:?}");
+    daemon.stop().await;
+    assert_eq!(
+        after, activity,
+        "late channel initialization replaced native activity"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_claude_channel_initialization_preserves_idle() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    delayed_channel_initialization_preserves_activity("idle").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_claude_channel_initialization_preserves_working() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    delayed_channel_initialization_preserves_activity("working").await;
+}
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_idle_staged_mail_recovers_startup_binding_and_both_native_receipt_forms() {
