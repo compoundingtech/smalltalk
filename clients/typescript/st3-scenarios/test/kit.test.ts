@@ -8,6 +8,8 @@ import { Schema } from 'effect'
 import { describe, expect } from 'vitest'
 
 import { ANCHOR, ANCHOR_MS, catalog, loadWorld, parseTimestamp, rebase, SLICE_KINDS, TimeRangeError, type AnySlice } from '../src/index.ts'
+import type { Asciicast } from '../src/kit/asciicast.ts'
+import { screenAt } from '../src/kit/screen.ts'
 import { canonicalJson, generate, sliceFile, sliceTimes } from '../scripts/emit.ts'
 import { rebaseVectors } from '../scripts/vectors.ts'
 
@@ -95,6 +97,20 @@ describe('worlds', () => {
       if (kind === 'sync') expect(failed.slices.sync).not.toEqual(base.slices.sync)
       else expect(failed.slices[kind]).toEqual(base.slices[kind])
     }
+  })
+})
+
+describe('terminal screen', () => {
+  it('wraps a line that reaches the width onto the next row and keeps every character', () => {
+    const cast = { header: { version: 2, width: 10, height: 4 }, started_at_ms: 0,
+      events: [[0, 'o', 'Expected 2 arguments\r\nok\r\n']] } satisfies Asciicast
+    const screen = screenAt(cast, 1, { terminalId: 'terminal/t', incarnation: 'i' })
+    expect(screen.lines.map(({ text, wrapped }) => ({ text, wrapped }))).toEqual([
+      { text: 'Expected 2', wrapped: true },
+      { text: ' arguments', wrapped: false },
+      { text: 'ok', wrapped: false },
+      { text: '', wrapped: false },
+    ])
   })
 })
 
