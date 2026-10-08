@@ -84,6 +84,10 @@ const ROSTER_BUDGET: Duration = Duration::from_millis(300);
 /// on 2026-10-08, reading each agent's status inputs one agent at a time.
 const COLD_ROSTER_STATEMENTS_PER_CARD: u64 = 30;
 
+/// Held by each test that measures the whole process, its CPU or its statements, so that one
+/// does not count the other's work when both run in one test process.
+static WHOLE_PROCESS: Mutex<()> = Mutex::new(());
+
 /// One kind of request, how many the busy host served each second, and its p99 budget.
 struct Load {
     name: &'static str,
@@ -189,6 +193,7 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
         println!("skipped: a debug build is too slow to measure; run with cargo test --release");
         return;
     }
+    let _whole_process = WHOLE_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let scale = env_number("ST_LOAD_SCALE", 1.0_f64);
     let seconds = env_number("ST_LOAD_SECONDS", 120_u64);
     let keep = std::env::var_os("ST_BENCH_DIR")
@@ -266,6 +271,8 @@ fn a_cold_roster_rebuild_reads_the_fleet_in_few_statements() {
         println!("skipped: a debug build is too slow to measure; run with cargo test --release");
         return;
     }
+    // The statement counter is the process's: the load test must not run meanwhile.
+    let _whole_process = WHOLE_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let scale = env_number("ST_LOAD_SCALE", 1.0_f64);
     let keep = std::env::var_os("ST_BENCH_DIR")
         .map(PathBuf::from)
