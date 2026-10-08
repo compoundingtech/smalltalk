@@ -8,8 +8,8 @@
 //! The fix: spawn each task into its own OS supervision domain, independent of BOTH the spawner and
 //! the transport daemon — one goal, per-OS mechanism.
 //!
-//! - **Linux with systemd 254+**: `systemd-run --user --scope --collect --quiet --unit=<unit>`
-//!   `--expand-environment=no -- <task>`. The task runs in its own transient scope = its own cgroup,
+//! - **Linux with systemd 236+**: `systemd-run --user --scope --collect --quiet --unit=<unit>`
+//!   `-- <task>`, with `--expand-environment=no` on v254+. Legacy scopes directly exec argv. The task runs in its own transient scope = its own cgroup,
 //!   registered with the user manager as a **sibling** of the transport unit (a scope created inside
 //!   a service lands at `app.slice/<unit>`, not nested under the service). A cascade kill of the
 //!   transport unit's cgroup cannot reach a sibling. `--scope` (not `--service`) keeps st2 the logical
@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// How a task is isolated from its spawner and the transport daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Isolation {
-    /// Linux with systemd 254+: own transient `--user` scope with opaque inner argv.
+    /// Linux with systemd 236+: own transient `--user` scope with opaque inner argv.
     Scope,
     /// macOS / non-systemd: `setsid` + reparent to init/launchd (no cgroup needed — the transport
     /// cannot cascade-kill a detached process on these platforms).
@@ -43,54 +43,73 @@ pub enum Isolation {
     DegradedDetached,
 }
 
-static MODE: OnceLock<Isolation> = OnceLock::new();
+struct Configuration {
+    mode: Isolation,
+    expansion_flag: bool,
+}
+
+static CONFIGURATION: OnceLock<Configuration> = OnceLock::new();
 
 /// The isolation mode for this host, detected once and cached.
 pub fn mode() -> Isolation {
-    *MODE.get_or_init(detect)
+    CONFIGURATION.get_or_init(detect).mode
 }
 
-fn detect() -> Isolation {
-    if cfg!(target_os = "linux") {
-        if systemd_user_available() {
-            Isolation::Scope
-        } else {
-            // The old line embedded a manual "WARN" prefix; the facade carries severity now.
-            tracing::warn!(
-                "st: systemd user scopes with opaque argv unavailable (`systemd-run` 254+ and \
-                 $XDG_RUNTIME_DIR are required) — spawning tasks WITHOUT cgroup isolation. A \
-                 transport/supervisor restart may cascade-kill them. Upgrade systemd and enable a \
-                 user manager (`loginctl enable-linger`) to restore isolation."
-            );
-            Isolation::DegradedDetached
+fn detect() -> Configuration {
+    if !cfg!(target_os = "linux") {
+        return Configuration {
+            mode: Isolation::Detached,
+            expansion_flag: false,
+        };
+    }
+    if let Some(expansion_flag) = systemd_scope_available() {
+        Configuration {
+            mode: Isolation::Scope,
+            expansion_flag,
         }
     } else {
-        // macOS et al: setsid + reparent is the whole defense; no cgroups to escape.
-        Isolation::Detached
+        tracing::warn!(
+            "st: systemd user scopes are unavailable — spawning tasks WITHOUT cgroup isolation. \
+             A transport/supervisor restart may cascade-kill them. Enable a systemd user manager \
+             (`loginctl enable-linger`) to restore isolation."
+        );
+        Configuration {
+            mode: Isolation::DegradedDetached,
+            expansion_flag: false,
+        }
     }
 }
 
-/// Whether a `--user` systemd scope can preserve the inner argv exactly.
-fn systemd_user_available() -> bool {
-    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
-        return false;
-    }
-    Command::new("systemd-run")
-        .args(["--user", "--version"])
+fn systemd_scope_available() -> Option<bool> {
+    std::env::var_os("XDG_RUNTIME_DIR")?;
+    let output = Command::new("systemd-run")
+        .arg("--version")
         .stderr(Stdio::null())
         .output()
-        .map(|output| {
-            output.status.success() && systemd_version_supports_exact_argv(&output.stdout)
-        })
-        .unwrap_or(false)
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let expansion_flag = scope_expansion_flag(&output.stdout)?;
+    Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?
+        .success()
+        .then_some(expansion_flag)
 }
 
-fn systemd_version_supports_exact_argv(output: &[u8]) -> bool {
-    std::str::from_utf8(output)
-        .ok()
-        .and_then(|output| output.split_ascii_whitespace().nth(1))
-        .and_then(|version| version.parse::<u32>().ok())
-        .is_some_and(|version| version >= 254)
+// v236 adds --collect. Legacy scopes pass argv directly to execvpe; do not
+// escape percent or dollar bytes. v254+ supports explicitly disabling expansion.
+fn scope_expansion_flag(output: &[u8]) -> Option<bool> {
+    let mut words = std::str::from_utf8(output).ok()?.split_ascii_whitespace();
+    if words.next()? != "systemd" {
+        return None;
+    }
+    let version = words.next()?.parse::<u32>().ok()?;
+    (version >= 236).then_some(version >= 254)
 }
 
 static SCOPE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -121,25 +140,46 @@ pub fn scope_unit(task_id: &str) -> String {
 /// Build the OUTER launch [`Command`] for the inner `program` + `args`, isolated under `unit`.
 ///
 /// In [`Isolation::Scope`] this is `systemd-run --user --scope --collect --quiet --unit=<unit>
-/// --expand-environment=no -- <program> <args>`; otherwise it is `<program> <args>` verbatim.
-/// Disabling systemd's environment expansion keeps every inner argv element opaque, including
-/// dollar-bearing literals. Either way the caller applies env / cwd / stdio / `pre_exec` to the
+/// -- <program> <args>`, adding `--expand-environment=no` before `--` on v254+;
+/// otherwise it is `<program> <args>` verbatim.
+/// v254+ adds the expansion-disable option; older scopes already exec argv directly. This keeps
+/// every inner argv element opaque, including dollar-bearing literals. Either way the caller applies env / cwd / stdio / `pre_exec` to the
 /// returned Command and they reach the task — for `--scope`, scope mode runs the command in the
 /// caller's context, so cwd, environment, and stdio fds all inherit (verified).
 pub fn wrap(unit: &str, program: &OsStr, args: &[&OsStr]) -> Command {
-    wrap_for_mode(mode(), unit, program, args)
+    let configuration = CONFIGURATION.get_or_init(detect);
+    wrap_for_mode(
+        configuration.mode,
+        configuration.expansion_flag,
+        unit,
+        program,
+        args,
+    )
 }
 
-fn wrap_for_mode(isolation: Isolation, unit: &str, program: &OsStr, args: &[&OsStr]) -> Command {
+fn wrap_for_mode(
+    isolation: Isolation,
+    expansion_flag: bool,
+    unit: &str,
+    program: &OsStr,
+    args: &[&OsStr],
+) -> Command {
     match isolation {
         Isolation::Scope => {
             let mut c = Command::new("systemd-run");
-            c.args(["--user", "--scope", "--collect", "--quiet"])
-                .arg(format!("--unit={unit}"))
-                .arg("--expand-environment=no")
-                .arg("--")
-                .arg(program)
-                .args(args);
+            c.args([
+                "--user",
+                "--scope",
+                "--collect",
+                "--quiet",
+                "--no-ask-password",
+            ])
+            .arg(format!("--unit={unit}"))
+            .arg("--description=st seat");
+            if expansion_flag {
+                c.arg("--expand-environment=no");
+            }
+            c.arg("--").arg(program).args(args);
             c
         }
         Isolation::Detached | Isolation::DegradedDetached => {
@@ -153,6 +193,32 @@ fn wrap_for_mode(isolation: Isolation, unit: &str, program: &OsStr, args: &[&OsS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_scope_keeps_literal_percent_dollar_and_non_utf8_argv() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let bytes = std::ffi::OsString::from_vec(b"%n:$HOME:${UNSET}:$$:%%:\xff".to_vec());
+        let arguments = [bytes.as_os_str(), OsStr::new(""), OsStr::new("two words")];
+        let program = OsStr::new("/tmp/provider%$literal");
+        let command = wrap_for_mode(
+            Isolation::Scope,
+            false,
+            "st-studio.scope",
+            program,
+            &arguments,
+        );
+        let actual = command.get_args().collect::<Vec<_>>();
+        let separator = actual
+            .iter()
+            .position(|arg| *arg == OsStr::new("--"))
+            .unwrap();
+        assert_eq!(actual[separator + 1], program);
+        assert_eq!(&actual[separator + 2..], &arguments);
+        assert!(!actual.contains(&OsStr::new("--expand-environment=no")));
+        assert!(actual[..separator].contains(&OsStr::new("--description=st seat")));
+        assert!(actual.contains(&OsStr::new("--no-ask-password")));
+        assert_eq!(command.get_program(), OsStr::new("systemd-run"));
+    }
 
     #[test]
     fn scope_unit_is_unique_and_systemd_safe() {
@@ -170,26 +236,28 @@ mod tests {
     }
 
     #[test]
-    fn exact_argv_requires_systemd_254_or_newer() {
-        assert!(!systemd_version_supports_exact_argv(
-            b"systemd 249 (249.11)\n"
-        ));
-        assert!(!systemd_version_supports_exact_argv(
-            b"systemd 252 (252.38)\n"
-        ));
-        assert!(systemd_version_supports_exact_argv(
-            b"systemd 254 (254.5)\n"
-        ));
-        assert!(systemd_version_supports_exact_argv(
-            b"systemd 257 (257.7)\n"
-        ));
-        assert!(!systemd_version_supports_exact_argv(b"unexpected output\n"));
+    fn legacy_scopes_preserve_argv_and_newer_versions_support_the_expansion_flag() {
+        for version in [236, 249, 252, 253] {
+            assert_eq!(
+                scope_expansion_flag(format!("systemd {version} (fixture)\n").as_bytes()),
+                Some(false)
+            );
+        }
+        for version in [254, 257, 260] {
+            assert_eq!(
+                scope_expansion_flag(format!("systemd {version} (fixture)\n").as_bytes()),
+                Some(true)
+            );
+        }
+        assert_eq!(scope_expansion_flag(b"systemd 235\n"), None);
+        assert_eq!(scope_expansion_flag(b"unexpected output\n"), None);
     }
 
     #[test]
     fn wrap_scope_disables_expansion_and_preserves_dollar_bearing_argv() {
         let cmd = wrap_for_mode(
             Isolation::Scope,
+            true,
             "st-x.scope",
             OsStr::new("provider"),
             &[
@@ -208,7 +276,9 @@ mod tests {
                 OsStr::new("--scope"),
                 OsStr::new("--collect"),
                 OsStr::new("--quiet"),
+                OsStr::new("--no-ask-password"),
                 OsStr::new("--unit=st-x.scope"),
+                OsStr::new("--description=st seat"),
                 OsStr::new("--expand-environment=no"),
                 OsStr::new("--"),
                 OsStr::new("provider"),
@@ -224,6 +294,7 @@ mod tests {
         for isolation in [Isolation::Detached, Isolation::DegradedDetached] {
             let cmd = wrap_for_mode(
                 isolation,
+                false,
                 "unused.scope",
                 OsStr::new("provider"),
                 &[

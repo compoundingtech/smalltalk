@@ -380,6 +380,13 @@ witnesses can retain other claims; the client read independently enforces its se
 bound. Checkpoint tombstones make unprovable completeness explicit instead of treating deleted
 observations as evidence of continuity.
 
+Rules version 14 additionally retains the transition preceding the first visible entry for
+each incarnation in that bounded history, even when the witness predates seven days. A kept
+unstamped legacy row can otherwise stop emitting when trimming removes its preceding state:
+an older retained idle can replace a newer retained idle at the 200-item boundary. These
+context witnesses do not expand the reader's bound. The reader and preservation proof are
+unchanged; proof success and supported old-cut verification remain required.
+
 Rules version 10 also treats native credential refusal and recovery as observed status
 transitions within the same seven-day / 200-transition cap. It preserves the beginning
 of the current credential episode and its latest native evidence fields, so trimming

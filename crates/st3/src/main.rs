@@ -5915,7 +5915,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| config.state_dir.join("pty"));
     let login_environment = st3::environment::snapshot_at_startup()?;
-    st_runtime::initialize_isolation(&login_environment);
+    let isolation_environment = login_environment.clone();
+    tokio::task::spawn_blocking(move || st_runtime::initialize_isolation(&isolation_environment))
+        .await
+        .context("probe task isolation during daemon startup")?;
     let pty_binary = match args.pty_binary.clone() {
         Some(pty_binary) => pty_binary,
         None => st_runtime::resolve_executable("pty", &login_environment)?,
