@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Refresh only collection subscriptions whose inputs changed or whose reads need a retry",
+  "replay": {"status": "none", "detail": "Collection refresh scheduling changes only; claim admission and replay are unchanged."},
+  "schema": {"status": "none", "detail": "Pending subscription IDs are kept in memory. No database schema or persistent state changes."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged; no coordinated member upgrade is required."},
+  "compatibility": {"status": "none", "detail": "The existing collection protocol, authorization checks, snapshot fences, current-row diffs and reconnect behavior are unchanged. Failed reads retry their own subscription; replacement, unsubscribe and permanent refusal clear its pending refresh."},
+  "downtime": {"status": "none", "detail": "No additional startup work or interruption beyond a normal daemon restart."},
+  "manual": {"status": "none", "detail": "No operator action or client configuration change is needed."},
+  "recovery": {"status": "none", "detail": "No persistent changes or new binary swap-back restrictions."}
+}
