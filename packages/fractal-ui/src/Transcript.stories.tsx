@@ -257,7 +257,7 @@ export const FailedRetry: Story = { name: 'Failed → Retry', render: args => <F
 export const FailedRetryLight: Story = { ...FailedRetry, args: { scheme: 'light' } }
 
 const promptlessData: TranscriptStoryData = {
-  sync: { _tag: 'Live' },
+  sync: { _tag: 'Live', since: now },
   turns: fixture('settled', 'promptless').turns.map(({ prompt, ...turn }) => turn),
 }
 export const MidTurnHistory: Story = { render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><RuntimeTranscript data={promptlessData} onOpenTool={() => {}} onRetry={() => {}} history={{ _tag: 'HasOlder' }} /></main>, play: async ({ canvasElement }) => {
@@ -283,7 +283,7 @@ export const ReadOnlyTools: Story = { render: args => <main {...stylex.props(sty
 } }
 export const ReadOnlyToolsLight: Story = { ...ReadOnlyTools, args: { scheme: 'light' } }
 const proseOnlyItems: readonly ConversationItem[] = [{ _tag: 'Text', id: 'prose/answer', role: 'assistant', text: 'A plain answer needs no work summary.', attachments: [], streaming: false, at }]
-const proseOnlyData: TranscriptStoryData = { sync: { _tag: 'Live' }, turns: [{ id: 'prose', items: proseOnlyItems, work: workLogTurnFromItems(proseOnlyItems, { kindFor: () => 'read', running: false, failed: false, interrupted: false, completeHistory: true }) }] }
+const proseOnlyData: TranscriptStoryData = { sync: { _tag: 'Live', since: now }, turns: [{ id: 'prose', items: proseOnlyItems, work: workLogTurnFromItems(proseOnlyItems, { kindFor: () => 'read', running: false, failed: false, interrupted: false, completeHistory: true }) }] }
 export const ProseOnly: Story = { render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><RuntimeTranscript data={proseOnlyData} onRetry={() => {}} /></main>, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   await expect(await canvas.findByTestId('agent-message')).toHaveTextContent('A plain answer')
