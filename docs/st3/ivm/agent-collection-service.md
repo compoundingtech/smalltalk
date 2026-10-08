@@ -42,6 +42,11 @@ catch-up can apply a previously queued clock after that wait starts; genuine
 acknowledgments and net forward seeks during catch-up permit another finite page.
 Cursor advance followed by a wrap inside one callback does not count as progress.
 An idle, current boundary performs no maintenance write.
+Native classifier requests can remain pending behind authority repair after all
+five producer assessments have committed. The worker checks their acknowledged
+live certificates before recapturing. A still-current producer is not scheduling
+progress; expired or revoked evidence requests another bounded capture while the
+namespace remains unavailable.
 
 Local real Store controls cover publication, writes, complete public rows, ranked
 socket deltas, reconnect, paired authority and changed-value raw recovery. A real

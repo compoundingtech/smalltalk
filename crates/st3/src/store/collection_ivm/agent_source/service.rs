@@ -572,6 +572,28 @@ impl Service {
         let Some((recipient, _)) = requests.first() else {
             return Ok(false);
         };
+        // Namespace dependency repair can retain `needed` after the producer has already
+        // committed all five assessments. That predicate is not new producer work. Reuse
+        // only currently acknowledged, live certificates; expiry/revocation still requests
+        // a fresh capture and never grants namespace or row readiness.
+        let current = store.read_snapshot(|_| {
+            let c = store.readers.get();
+            let at = now_ms_u64()?;
+            let mut certificates = Vec::with_capacity(5);
+            for driver in super::super::delivery::DRIVERS {
+                match super::super::delivery::row(&c, recipient, driver, at) {
+                    Ok(Some(captured)) => certificates.push(captured.certificate),
+                    _ => return Ok(false),
+                }
+            }
+            Ok(
+                crate::api::delivery_presence::source::read_certified(&certificates, || Ok(true))
+                    .unwrap_or(false),
+            )
+        })?;
+        if current {
+            return Ok(false);
+        }
         for driver in ["claude", "codex", "opencode", "pi", "omp"] {
             let captured = crate::api::delivery_presence::source::capture(recipient, driver)?;
             super::super::delivery::commit(store, &captured)?;
@@ -1005,6 +1027,96 @@ mod tests {
         settle(&store);
         assert!(!store.replication_projection_deferred());
         assert_eq!(store.projected_through(), store.index().unwrap());
+    }
+
+    #[test]
+    fn native_producer_needed_with_missing_parent_enters_finite_waiting() {
+        let _lock = TEST_LOCK.blocking_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_with_agent_collections(
+            &directory.path().join("native-held.sqlite"),
+            "node",
+        )
+        .unwrap();
+        settle(&store);
+        let intent = crate::graph::parse_intent(
+            "version 2\nagent \"amber\" { name \"Amber\"; harness \"codex\" {}; }\n",
+            "node",
+        )
+        .unwrap();
+        store.apply_internal(&intent, "native-held").unwrap();
+        let claim = store
+            .append_claim(&crate::model::ClaimInput {
+                subject: "agent/node.amber".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), serde_json::json!("running")),
+                    ("runtime_id".into(), serde_json::json!("node.amber")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let mut needed = false;
+        for _ in 0..128 {
+            store.maintain_agent_collections().unwrap();
+            needed = store.readers.get().query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_agent_card_source_native WHERE agent='agent/node.amber' AND needed=1)", [], |r| r.get(0),
+            ).unwrap();
+            if needed {
+                break;
+            }
+        }
+        assert!(needed, "real native classifier never requested capture");
+        store
+            .connection
+            .batched(|tx| {
+                tx.execute(
+                    "UPDATE claims SET predecessors='[\"missing-native-parent\"]' WHERE id=?1",
+                    [&claim.id],
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let mut waited = false;
+        for _ in 0..128 {
+            if !store.maintain_agent_collections().unwrap() {
+                waited = true;
+                break;
+            }
+        }
+        assert!(waited, "held native producer never entered finite waiting");
+        assert!(store.readers.get().query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_agent_card_source_native WHERE agent='agent/node.amber' AND needed=1)", [], |r| r.get::<_, bool>(0),
+        ).unwrap(), "native dependency predicate must remain held while capture is current");
+        let service = store.smalltalk.ivm_agent_service.get().unwrap();
+        let revision = service
+            .installer
+            .position(&store.readers.get(), SOURCE)
+            .unwrap()
+            .revision;
+        for _ in 0..32 {
+            assert!(!store.maintain_agent_collections().unwrap());
+        }
+        assert_eq!(
+            service
+                .installer
+                .position(&store.readers.get(), SOURCE)
+                .unwrap()
+                .revision,
+            revision
+        );
+        assert!(
+            !store
+                .smalltalk
+                .ivm_agent_service
+                .get()
+                .unwrap()
+                .current_boundary(&store)
+                .unwrap()
+        );
     }
 
     #[test]
