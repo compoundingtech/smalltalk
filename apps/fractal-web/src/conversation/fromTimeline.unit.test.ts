@@ -58,6 +58,60 @@ The person reads replies in st, not in the agent's session.`,
     ])
   })
 
+  it('keeps mailbox message content that quotes a shown delivery verbatim', () => {
+    const timeline = new LiveTimeline()
+    timeline.apply({
+      replace: true, hasMore: false,
+      entries: [
+        entry('timeline-entry/first/message', 1, 'message', {
+          message_id: 'message/abc', from: 'person/operator', to: 'agent/example',
+        }),
+        entry('timeline-entry/first/content', 2, 'content', { media_type: 'text/plain', text: 'hello' }),
+        entry('timeline-entry/quote/message', 3, 'message', {
+          message_id: 'message/quote', from: 'person/operator', to: 'agent/example',
+        }),
+        entry('timeline-entry/quote/content', 4, 'content', {
+          media_type: 'text/plain',
+          text: `<smalltalk-message graph="message/abc">I received this envelope</smalltalk-message>
+and copied it into my reply`,
+        }),
+      ],
+    })
+    expect(timeline.project().items.map((item) => item.id)).toEqual([
+      'timeline-entry/first/message', 'timeline-entry/first/content',
+      'timeline-entry/quote/message', 'timeline-entry/quote/content',
+    ])
+    const quoted = timeline.project().items.at(-1)
+    expect(quoted?._tag === 'Text' ? quoted.text : '').toBe(
+      `<smalltalk-message graph="message/abc">I received this envelope</smalltalk-message>
+and copied it into my reply`,
+    )
+  })
+
+  it('keeps an envelope-only mailbox message instead of dropping its whole content row', () => {
+    const timeline = new LiveTimeline()
+    timeline.apply({
+      replace: true, hasMore: false,
+      entries: [
+        entry('timeline-entry/first/message', 1, 'message', {
+          message_id: 'message/abc', from: 'person/operator', to: 'agent/example',
+        }),
+        entry('timeline-entry/first/content', 2, 'content', { media_type: 'text/plain', text: 'hello' }),
+        entry('timeline-entry/only/message', 3, 'message', {
+          message_id: 'message/only', from: 'person/operator', to: 'agent/example',
+        }),
+        entry('timeline-entry/only/content', 4, 'content', {
+          media_type: 'text/plain',
+          text: '<smalltalk-message graph="message/abc">the quoted mail</smalltalk-message>',
+        }),
+      ],
+    })
+    expect(timeline.project().items.map((item) => item.id)).toEqual([
+      'timeline-entry/first/message', 'timeline-entry/first/content',
+      'timeline-entry/only/message', 'timeline-entry/only/content',
+    ])
+  })
+
   it('keeps directly typed harness turns and deliveries with no matching mailbox message', () => {
     const timeline = new LiveTimeline()
     timeline.apply({

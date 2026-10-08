@@ -424,7 +424,10 @@ export class LiveTimeline {
       const entry = this.ordered[at]!
       this.itemsBefore.push(items.length)
       if (isTurnHeader(entry)) continue
-      if (entry.type === 'content' && (entry.role === 'user' || entry.role === 'system')) {
+      // Only native harness turns repeat shown mail as delivery copies; a mailbox
+      // message's own content is person-authored text that may quote anything.
+      const mailboxPair = at > 0 && this.ordered[at - 1]!.type === 'message' && !isTurnHeader(this.ordered[at - 1]!)
+      if (entry.type === 'content' && !mailboxPair && (entry.role === 'user' || entry.role === 'system')) {
         const text = withoutShownDeliveries(entry.body.text ?? '', shown)
         if (text !== (entry.body.text ?? '')) {
           if (text.length > 0)
