@@ -4786,6 +4786,13 @@ impl Store {
         Ok(self.committed_index.load(Ordering::Acquire))
     }
 
+    /// A cheap committed point for a mutation caller deciding whether to wake its readers.
+    /// This is an invalidation hint, never a graph-equality or admission certificate. Replay
+    /// may conservatively change the generation even when its final graph bytes agree.
+    pub fn replication_change_point(&self) -> Result<(u64, i64)> {
+        self.read_snapshot(|index| Ok((index, graph_generation(&self.readers.get())?)))
+    }
+
     /// Run `read` with every read this thread makes through the store seeing one SQLite
     /// snapshot, and give it that snapshot's store index. Rows read inside always match the
     /// index, however many commits land meanwhile. A nested call joins the outer snapshot.

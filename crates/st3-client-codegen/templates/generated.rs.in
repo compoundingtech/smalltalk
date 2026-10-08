@@ -1582,9 +1582,28 @@ pub struct OwnedSet {
     pub commit_status: Option<Value>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SummaryMachines {
+    pub connected: u64,
+    pub indirect: u64,
+    pub offline: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Summary {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    pub person_id: Option<String>,
+    pub needs_you: u64,
+    pub working_agents: u64,
+    pub active_missions: u64,
+    pub machines: SummaryMachines,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Resource {
+    Summary(Summary),
     Attention(Attention),
     Message(Message),
     Launch(Launch),
@@ -1615,6 +1634,7 @@ pub enum Resource {
 
 /// The resource kinds this client models; any other kind reads as [`Resource::Unknown`].
 pub const KNOWN_RESOURCE_KINDS: &[&str] = &[
+    "summary",
     "attention",
     "message",
     "launch",
@@ -1679,6 +1699,7 @@ impl<'de> Deserialize<'de> for UnknownResource {
 impl Resource {
     pub fn header(&self) -> &ResourceHeader {
         match self {
+            Self::Summary(v) => &v.header,
             Self::Attention(v) => &v.header,
             Self::Message(v) => &v.header,
             Self::Launch(v) => &v.header,
