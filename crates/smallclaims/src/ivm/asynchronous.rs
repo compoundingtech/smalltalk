@@ -578,12 +578,23 @@ impl Worker {
     pub fn start(
         store: Arc<Store>,
         runtime: Arc<ViewRuntime>,
-        mut notices: broadcast::Receiver<events::Notice>,
+        notices: broadcast::Receiver<events::Notice>,
     ) -> Result<Self> {
         ensure!(
             runtime.asynchronous.is_some(),
             "async worker requires asynchronous runtime"
         );
+        Self::start_pages(Arc::new(move || step(&store, &runtime)), notices)
+    }
+    /// Reuse bounded scheduling for a native source owner. The callback must close its
+    /// short read snapshot, prepare owned output off writer, then briefly publish one
+    /// bounded page. This supplies no source/admission/cut certificate or registry.
+    /// Subscribe before starting; the callback must return CaughtUp from an authoritative
+    /// recheck. Commit notices received during a page remain pending for the idle wait.
+    pub fn start_pages(
+        run_page: Arc<dyn Fn() -> Result<PageReport> + Send + Sync>,
+        mut notices: broadcast::Receiver<events::Notice>,
+    ) -> Result<Self> {
         let (stop, mut cancelled) = watch::channel(false);
         let (progress, receiver) = watch::channel(None);
         let executor = tokio::runtime::Handle::try_current()
@@ -593,9 +604,8 @@ impl Worker {
                 if *cancelled.borrow() || cancelled.has_changed().is_err() {
                     return Ok(());
                 }
-                let page_store = store.clone();
-                let page_runtime = runtime.clone();
-                let page = tokio::task::spawn_blocking(move || step(&page_store, &page_runtime))
+                let execute = run_page.clone();
+                let page = tokio::task::spawn_blocking(move || execute())
                     .await
                     .context("async page task failed")??;
                 let status = page.status.clone();

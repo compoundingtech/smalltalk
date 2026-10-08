@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Group prepared publication metadata in a typed request",
+  "replay": {
+    "status": "none",
+    "detail": "Library API packaging only; no source/view behavior, migration, authority, activation or recovery policy changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Library API packaging only; no source/view behavior, migration, authority, activation or recovery policy changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Library API packaging only; no source/view behavior, migration, authority, activation or recovery policy changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The new unpublished prepared bridge groups expected SourcePosition, graph cut, changed keys and time in PreparedPublication. Existing released API signatures are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Library API packaging only; no source/view behavior, migration, authority, activation or recovery policy changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Library API packaging only; no source/view behavior, migration, authority, activation or recovery policy changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Library API packaging only; no source/view behavior, migration, authority, activation or recovery policy changes."
+  }
+}

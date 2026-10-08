@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Prepare deferred incremental namespaces outside the admission writer",
+  "replay": {
+    "status": "none",
+    "detail": "No automatic startup/read history replay. Source owners explicitly page extraction and consume retained immutable references."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Opt-in Installer creates deferred-source configuration/journal integrity triggers. Explicit installed registration adds indexed source availability notifications. No default Store schema migration or production activation."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No admission, authority, canonical order or checkpoint rule change. Native source/dependency completeness remains owner-certified."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "New deferred mode refuses synchronous Installer callbacks. Existing synchronous operators stay supported. Prepared namespace writes require ordinary full-PK tables without triggers or foreign-key edges."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No automatic activation or restart. Existing source lifetimes are not converted."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "An adapter explicitly enables a fresh deferred source lifetime, retains immutable input references and schedules owned off-writer preparation with bounded publication."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Queue loss/exhaustion fences derived state; raw valid admission survives logical gaps. Database errors propagate. Stale prepared pages roll back and must be prepared again. Fresh complete namespace publication is required for recovery."
+  }
+}
