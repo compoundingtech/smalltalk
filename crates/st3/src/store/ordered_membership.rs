@@ -167,6 +167,10 @@ pub(super) fn container_changed(transaction: &Transaction<'_>, container: &str, 
     if !members.is_empty() {
         let view = container_view(transaction, container)?;
         for member in &members { refresh_pair(transaction, container, member, index, &view)?; }
+    } else if arrangements::migrated(transaction, container)? {
+        // Migration retains a container lifecycle dependency even with zero pairs.
+        // Keep it current on name/folder edits and retirement, exactly as replay does.
+        remember_lifecycle(transaction, container)?;
     }
     if arrangements::version(transaction, container)? == 2 {
         transaction.execute(

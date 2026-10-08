@@ -309,12 +309,15 @@ pub(super) fn prepare(transaction: &Transaction<'_>, input: &ClaimInput) -> Resu
             }
         }
     }
-    let folders = heads.keys().filter(|k| k.starts_with("folder/") && k.ends_with("/name")).count();
-    let placements = heads.keys().filter(|k| k.starts_with("placement/")).count();
-    if folders > schema::MAX_FOLDERS || placements > schema::MAX_PLACEMENTS { return Err(St3Error::new("arrangement-limit","arrangement folder or placement count exceeds its admission bound")); }
     let layout_version = if creating {
         u8::try_from(input.fields.get("version").and_then(Value::as_u64).unwrap_or(1)).expect("validated arrangement version")
     } else { version(transaction, &input.subject).map_err(internal)? };
+    let folders = heads.keys().filter(|k| k.starts_with("folder/") && k.ends_with("/name")).count();
+    let legacy_placements_exceed_limit = layout_version == 1
+        && heads.keys().filter(|k| k.starts_with("placement/")).count() > schema::MAX_PLACEMENTS;
+    if folders > schema::MAX_FOLDERS || legacy_placements_exceed_limit {
+        return Err(St3Error::new("arrangement-limit","arrangement folder or placement count exceeds its admission bound"));
+    }
     let projected = resource(&input.subject, input.fields["owner"].as_str().expect("validated owner"), &"0".repeat(64), now_ms(), &heads, layout_version).map_err(internal)?;
     if serde_json::to_vec(&projected).map_err(internal)?.len() > schema::MAX_RESOURCE_BYTES { return Err(St3Error::new("arrangement-body-too-large","projected arrangement resource exceeds 512 KiB")); }
     Ok(())

@@ -163,6 +163,9 @@ claims but do not compare incompatible projection maps.
 Concurrent v1/v2 creates preserve unrepaired v1 authority unless explicit migration activates
 membership authority. Reads/admission consult the indexed retained marker/version registers;
 pure legacy layouts gain no synthetic register.
+Migrated containers retain and refresh their lifecycle dependency even with zero pair heads,
+including on name/folder edits and retirement. Historical placement-count admission applies
+only to effective v1 layouts; inactive source heads cannot block v2 folder/name edits.
 Repairing a retained arrangement or membership original rebuilds both dependent projections,
 including the container revision and reverse edges, so operations omitted by a replacement
 cannot remain visible. Incremental projection and rebuild both exclude repaired originals.

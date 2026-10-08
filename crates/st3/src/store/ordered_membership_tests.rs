@@ -1094,3 +1094,132 @@ fn placement_migration_failed_backfill_rolls_back_and_retry_survives_reopen() {
     migrate_placements(&store);
     assert_eq!(head(&store, SEAT_C), retained);
 }
+
+#[test]
+fn placement_migration_empty_container_dependency_tracks_edits_and_retirement() {
+    let store = Store::open_memory("migration-empty-dependency").unwrap();
+    folder_edit(&store, json!([{"op":"create","name":"Empty"}]));
+    let marker = migrate_placements(&store);
+    assert_eq!(lifecycle(&store, CONTAINER), (true,marker.id));
+    for operations in [
+        json!([{"op":"rename","name":"Renamed empty"}]),
+        json!([{"op":"folder.create","id":FOLDER_A,"name":"Empty folder","parent":null,"key":"a0"}]),
+        json!([{"op":"folder.rename","id":FOLDER_A,"name":"Renamed folder"}]),
+        json!([{"op":"folder.delete","id":FOLDER_A}]),
+        json!([{"op":"retire"}]),
+    ] {
+        let retired = operations[0]["op"] == "retire";
+        let changed = folder_edit(&store, operations);
+        assert_eq!(lifecycle(&store, CONTAINER), (!retired,changed.id));
+        assert_eq!(store.ordered_membership_count(CONTAINER).unwrap(), 0);
+        let before = layout_digests(&store);
+        let directory = tempfile::tempdir().unwrap();
+        let (_, proof) = store.plan_checkpoint(now_ms()+1, directory.path()).unwrap();
+        assert!(proof.passed);
+        assert_eq!(layout_digests(&store), before);
+        store.rebuild_claim_projections().unwrap();
+        assert_eq!(layout_digests(&store), before);
+        assert!(store.replay_graph_for_heal().unwrap());
+        assert_eq!(layout_digests(&store), before);
+    }
+}
+
+#[test]
+fn placement_migration_inactive_legacy_union_does_not_limit_version_two_folder_edits() {
+    let left = Store::open_memory("migration-union-left").unwrap();
+    let right = Store::open_memory("migration-union-right").unwrap();
+    folder_edit(&left, json!([{"op":"create","name":"Offline union"}]));
+    sync(&left, &right);
+    let per_writer = st3_schema::arrangements::MAX_PLACEMENTS / 2 + 1;
+    for (store, start) in [(&left,0),(&right,per_writer)] {
+        let operations: Vec<_> = (start..start+per_writer).map(|index| json!({
+            "op":"subject.place","subject":format!("agent/migration-union/{index}"),
+            "folder":null,"key":"a0"
+        })).collect();
+        for batch in operations.chunks(st3_schema::arrangements::MAX_OPERATIONS) {
+            folder_edit(store, json!(batch));
+        }
+    }
+    sync(&right, &left);
+    let retained: usize = left.readers.get().query_row(
+        "SELECT COUNT(*) FROM arrangement_registers WHERE subject=?1 AND register LIKE 'placement/%'",
+        [CONTAINER], |row| row.get(0),
+    ).unwrap();
+    assert!(retained > st3_schema::arrangements::MAX_PLACEMENTS);
+    assert_eq!(left.edit_arrangement(&arrangement_input(json!([{"op":"rename","name":"Legacy limit"}])),
+        &BTreeMap::new()).unwrap_err().code, "arrangement-limit");
+    migrate_placements(&left);
+    folder_edit(&left, json!([{"op":"rename","name":"Migrated union"}]));
+    folder_edit(&left, json!([{"op":"folder.create","id":FOLDER_A,"name":"New folder","parent":null,"key":"a0"}]));
+    folder_edit(&left, json!([{"op":"folder.rename","id":FOLDER_A,"name":"Renamed folder"}]));
+    folder_edit(&left, json!([{"op":"folder.delete","id":FOLDER_A}]));
+    assert_eq!(left.ordered_membership_count(CONTAINER).unwrap(), 0);
+    let raw: usize = left.readers.get().query_row(
+        "SELECT COUNT(*) FROM ordered_membership_heads WHERE container=?1", [CONTAINER], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(raw, retained);
+    sync(&left, &right);
+    assert_eq!(layout_digests(&left), layout_digests(&right));
+    let before = layout_digests(&left);
+    left.rebuild_claim_projections().unwrap();
+    assert_eq!(layout_digests(&left), before);
+    let directory = tempfile::tempdir().unwrap();
+    let (_, proof) = left.plan_checkpoint(now_ms()+1, directory.path()).unwrap();
+    assert!(proof.passed);
+}
+
+#[test]
+fn placement_migration_mixed_rules_fourteen_fifteen_exchange_authority_but_refuse_comparison_and_verification() {
+    use smallclaims::store::checkpoint_agreement::{CheckpointContext, SealTerms, seal_difference};
+    let legacy = Store::open_memory("migration-rules14").unwrap();
+    let modern = Store::open_memory("migration-rules15").unwrap();
+    folder_edit(&legacy, json!([{"op":"create","name":"Mixed peers"}]));
+    let old_layout = canonical_hash(&(
+        "st3.shared-projections.ordered-membership.v1", st3_schema::registry().digest(),
+    )).unwrap();
+    let mut exchange = exchange_from(&legacy, &ReplicationInventory::default());
+    let fleet = exchange.fleet_id.clone();
+    assert_ne!(exchange.schema_digest, old_layout);
+    exchange.schema_digest = old_layout.clone();
+    receive_and_project(&modern, &legacy.origin, &exchange);
+    assert!(modern.arrangement(CONTAINER, u64::MAX).unwrap().is_some());
+    let mut summary = legacy.export_replication_summary(&fleet).unwrap();
+    summary.schema_digest = old_layout;
+    summary.graph_digest = "different-rules14-projection".into();
+    summary.projection_digests.insert("arrangements".into(), "different-rules14-table".into());
+    let receipt = modern.receive_replication_exchange_asking(&legacy.origin, &fleet, &summary, true).unwrap();
+    assert!(!receipt.heal);
+    let status = modern.replication_status(true, Some(&fleet), &[legacy.origin.clone()]).unwrap();
+    assert!(status.peers[0].projection_comparison_waiting);
+    assert!(status.peers[0].differing_tables.is_empty());
+    assert!(!status.peers[0].sync.as_ref().unwrap().diverged);
+    assert_eq!(status.unhealthy_projections, 0);
+    assert_eq!(status.authority_digest,
+        legacy.replication_status(true, Some(&fleet), &[]).unwrap().authority_digest);
+
+    migrate_placements(&modern);
+    let mut digest = Sha256::new();
+    digest.update(b"st3-checkpoint-rules-v1\0");
+    digest.update(14_u32.to_be_bytes());
+    digest.update(checkpoint_rules::RULES_DESCRIPTION.as_bytes());
+    let rules14 = hex::encode(digest.finalize());
+    assert_eq!(checkpoint_rules::RULES_VERSION, 15);
+    assert_ne!(rules14, checkpoint_rules::rules_digest());
+    let terms15 = SealTerms {
+        cut_unix_ms: now_ms(),
+        participants: BTreeSet::from([legacy.origin.clone(), modern.origin.clone()]),
+        sealed_digest: "a".repeat(64),
+        rules_digest: checkpoint_rules::rules_digest(),
+    };
+    let terms14 = SealTerms { rules_digest: rules14, ..terms15.clone() };
+    assert_eq!(seal_difference(&terms15, &terms14), "rules");
+    let directory = tempfile::tempdir().unwrap();
+    let context = CheckpointContext { now_unix_ms: now_ms(), configured_peers: vec![legacy.origin.clone()],
+        scratch: directory.path().to_owned(), reviewer: "person/ada".into() };
+    let before = modern.index().unwrap();
+    let mut actions = Vec::new();
+    // Mismatched rules must return before reading a seal row or running a proof.
+    modern.graph.verify_checkpoint("checkpoint/mixed-migration-rules", &terms14, 0, &context, &mut actions).unwrap();
+    assert!(actions.is_empty());
+    assert_eq!(modern.index().unwrap(), before);
+}
