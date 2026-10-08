@@ -953,6 +953,15 @@ async fn response_envelope_unbounded(
         .into_response();
     }
     let started = Instant::now();
+    let client_request = request.uri().path().starts_with("/v1/client/");
+    let request_id = if client_request {
+        crate::relay_trace::current().map_or_else(
+            || format!("request/{}", new_request_id()),
+            |trace| trace.id().to_owned(),
+        )
+    } else {
+        new_request_id()
+    };
     let request_path = request.uri().path().to_owned();
     let request_query = request.uri().query().map(str::to_owned);
     let long_poll = request_query.as_deref().is_some_and(asks_to_wait);
@@ -981,12 +990,12 @@ async fn response_envelope_unbounded(
         &request_route,
         client_class,
         request.headers(),
+        &request_id,
     );
     let profile = crate::profile::Op::start(
         format!("{} {request_route}", request.method()),
         Some(caller.clone()),
     );
-    let client_request = request.uri().path().starts_with("/v1/client/");
     // These point readers admit snapshot metadata inside their pinned read before
     // formatting it. Authentication still runs here; their response extension
     // supplies the envelope snapshot. All other routes keep admission snapshots.
@@ -1232,14 +1241,6 @@ async fn response_envelope_unbounded(
         // handlers just to decorate its response.
         state.store.index().unwrap_or_default()
     };
-    let request_id = if client_request {
-        crate::relay_trace::current().map_or_else(
-            || format!("request/{}", new_request_id()),
-            |trace| trace.id().to_owned(),
-        )
-    } else {
-        new_request_id()
-    };
     if let Some(trace) = crate::relay_trace::current() {
         trace.response(&request_id);
     }
@@ -1319,6 +1320,7 @@ fn request_trace(
     route: &str,
     client_class: crate::otel_client_class::ClientClass,
     headers: &axum::http::HeaderMap,
+    request_id: &str,
 ) -> Option<tracing::Span> {
     if !crate::otel::export_enabled() {
         return None;
@@ -1335,6 +1337,7 @@ fn request_trace(
         "http.request.method" = method.as_str(),
         "http.route" = route,
         "st3.client.class" = client_class.as_str(),
+        "st.request.id" = request_id,
         "http.response.status_code" = tracing::field::Empty,
         "st.parent.sampled" = tracing::field::Empty,
         "st.admission.queue_ms" = tracing::field::Empty,
