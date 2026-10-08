@@ -66,6 +66,7 @@ pub fn counter(c: &Connection, ns: &Namespace) -> Result<u64> {
     .unwrap_or(0))
 }
 
+#[derive(Clone)]
 pub struct Seeks {
     authority: (String, String),
     lifecycle: String,

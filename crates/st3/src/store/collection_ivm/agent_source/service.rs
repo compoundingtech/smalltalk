@@ -78,6 +78,14 @@ impl Operator for Observed {
     }
 }
 
+#[derive(Clone)]
+struct Waiting {
+    namespace: String,
+    position: SourcePosition,
+    counter: u64,
+    seeks: super::work_progress::Seeks,
+}
+
 pub(crate) struct Service {
     store: Weak<Store>,
     views: Arc<Views>,
@@ -87,7 +95,7 @@ pub(crate) struct Service {
     fingerprint: String,
     job: Mutex<Option<String>>,
     producer_after: Mutex<String>,
-    waiting: Mutex<Option<SourcePosition>>,
+    waiting: Mutex<Option<Waiting>>,
     recovery: Mutex<bool>,
     stopped: Mutex<Option<String>>,
 }
@@ -666,14 +674,23 @@ impl Service {
 
     // Only real queue acknowledgments/cursor advances justify immediate continuation.
     // An unchanged pending source gets one tick, then waits for new input or a due deadline.
+    // Staging applies that clock in the next catch-up page, so remember its observed work
+    // state and permit continuation when that later page makes genuine finite progress.
     fn tick_work(&self, store: &Store, ns: &Namespace) -> Result<bool> {
         let position = self.installer.position(&store.readers.get(), SOURCE)?;
+        let before = super::work_progress::counter(&store.readers.get(), ns)?;
+        let seeks = super::work_progress::seeks(&store.readers.get(), ns)?;
         let waiting = self
             .waiting
             .lock()
             .map_err(|_| anyhow::anyhow!("source wait lock poisoned"))?
             .clone();
-        if waiting.as_ref() == Some(&position) {
+        if waiting.as_ref().is_some_and(|waiting| {
+            waiting.namespace == ns.as_str()
+                && waiting.position == position
+                && before <= waiting.counter
+                && !super::work_progress::advanced(&waiting.seeks, &seeks)
+        }) {
             let c = store.readers.get();
             let captured: String = c.query_row(
                 "SELECT at FROM local_agent_card_source_clock WHERE namespace=?1",
@@ -688,19 +705,23 @@ impl Service {
                 return Ok(false);
             }
         }
-        let before = super::work_progress::counter(&store.readers.get(), ns)?;
-        let seeks = super::work_progress::seeks(&store.readers.get(), ns)?;
         self.tick(store, clock::Reason::Kernel)?;
         let c = store.readers.get();
-        let progressed = super::work_progress::counter(&c, ns)? > before
-            || super::work_progress::advanced(&seeks, &super::work_progress::seeks(&c, ns)?);
+        let after = super::work_progress::counter(&c, ns)?;
+        let after_seeks = super::work_progress::seeks(&c, ns)?;
+        let progressed = after > before || super::work_progress::advanced(&seeks, &after_seeks);
         *self
             .waiting
             .lock()
             .map_err(|_| anyhow::anyhow!("source wait lock poisoned"))? = if progressed {
             None
         } else {
-            Some(self.installer.position(&c, SOURCE)?)
+            Some(Waiting {
+                namespace: ns.as_str().into(),
+                position: self.installer.position(&c, SOURCE)?,
+                counter: after,
+                seeks: after_seeks,
+            })
         };
         Ok(progressed)
     }
