@@ -15,6 +15,7 @@ import { failedSyncSubscriptionLimitLegacy } from './failedSyncSubscriptionLimit
 import { firstRunOnboarding } from './firstRunOnboarding.ts'
 import { fleetMidRefactor } from './fleetMidRefactor.ts'
 import { loading } from './loading.ts'
+import { huge } from './huge.ts'
 import { longDebugRabbitHole } from './longDebugRabbitHole.ts'
 import { mergeConflictStandoff } from './mergeConflictStandoff.ts'
 import { offlineReconnectStorm } from './offlineReconnectStorm.ts'
@@ -47,5 +48,6 @@ export const worldDefinitions: readonly WorldDefinition[] = [
   failedSyncCursorGap,
   failedSyncPageCursorExpired,
   replicationDiverged,
+  huge,
   unicode,
 ]

@@ -5,8 +5,8 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { ANCHOR_MS, loadWorld, type Slice } from '../src/index.ts'
-import { decodeCatalog, decodeFixtures, decodeSlice, everyVariant } from '../scripts/decode.ts'
+import { ANCHOR_MS, catalog, loadWorld, type Slice } from '../src/index.ts'
+import { decodeFixtures, decodeSlice, everyVariant } from '../scripts/decode.ts'
 import { checkTree, FIXTURES_DIR, generate } from '../scripts/emit.ts'
 import { checkPublicRepo, scanContent, scanIdentities, scanTree, scanVocabulary } from '../scripts/scan.ts'
 
@@ -14,8 +14,12 @@ const scratch: string[] = []
 afterEach(() => scratch.splice(0).forEach((dir) => rmSync(dir, { recursive: true, force: true })))
 
 describe('decode gate', () => {
-  it('decodes every variant of every world strictly, at the anchor and at another now', () => {
-    expect(decodeCatalog([ANCHOR_MS, Date.UTC(2101, 6, 4, 3, 2, 1, 7)])).toEqual([])
+  it('decodes every ordinary-world variant at two instants; huge has bounded coverage separately', () => {
+    // CLI decode still exhausts all huge variants. Avoid duplicating that scale workload in Vitest.
+    const failures = [ANCHOR_MS, Date.UTC(2101, 6, 4, 3, 2, 1, 7)].flatMap((now) =>
+      catalog.filter(({ id }) => id !== 'huge').flatMap(({ id }) =>
+        everyVariant(loadWorld(id, { now })).flatMap((slice) => decodeSlice(id, slice))))
+    expect(failures).toEqual([])
   }, 30_000)
 
   it('covers every variant the worlds offer', () => {

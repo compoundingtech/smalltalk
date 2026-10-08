@@ -5,6 +5,10 @@ import type {
 } from '@smalltalk/st3-client'
 
 import type { Clock } from '../clock.ts'
+import { generateConversationRange } from '../kit/conversationHistory.ts'
+import type { FactoryContext } from '../kit/context.ts'
+import { rngFromSeed } from '../kit/rng.ts'
+import { timeContext } from '../kit/time.ts'
 import { foldSlice } from '../kit/fold.ts'
 import { SLICE_KINDS, type HttpCondition, type Selector, type SliceKind, type TimelineEvent, type WireResource } from '../kit/slice.ts'
 import type { World } from '../kit/world.ts'
@@ -441,9 +445,21 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
       const session = parts[1]
       const thread = state('conversation').threads.find((thread) => thread.session_id === session || thread.session_id.replace(/^session\//, '') === session)
       if (thread === undefined) return json(errorEnvelope('not-found', 'Session not found'), 404)
-      const end = Math.max(0, thread.items.length - start)
-      const items = thread.items.slice(Math.max(0, end - limit), end)
-      const value: TimelinePage = { kind: 'timeline-page', session_id: thread.session_id, items, page: pageInfo(thread.items.length, start + items.length) }
+      const total = thread.history === undefined ? thread.items.length : Math.max(thread.history.total_entries, thread.items.at(-1)?.sequence ?? 0)
+      const end = Math.max(0, total - start)
+      const begin = Math.max(0, end - limit)
+      let items = thread.items.slice(begin, end)
+      if (thread.history !== undefined) {
+        const member = world.cast.agents.find((member) => member.id === thread.agent)
+        if (member === undefined) return json(errorEnvelope('not-found', 'Conversation agent not found'), 404)
+        const ctx: FactoryContext = { world: thread.history.world, rng: rngFromSeed(thread.history.seed), cast: world.cast, t: timeContext(world.now) }
+        const boundary = thread.history.committed_from_sequence
+        items = [
+          ...generateConversationRange(ctx, member, thread.history, begin + 1, Math.min(end, boundary - 1)),
+          ...thread.items.filter(({ sequence }) => sequence > begin && sequence <= end),
+        ]
+      }
+      const value: TimelinePage = { kind: 'timeline-page', session_id: thread.session_id, items, page: pageInfo(total, start + items.length) }
       return json(envelope(value))
     }
     if (route === 'events') return json(envelope({ kind: 'event-page', items: [], has_more: false,

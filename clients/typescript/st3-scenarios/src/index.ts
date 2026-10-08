@@ -44,6 +44,7 @@ export type WorldId =
   | 'failed-sync-cursor-gap'
   | 'failed-sync-page-cursor-expired'
   | 'replication-diverged'
+  | 'huge'
   | 'unicode'
 
 export const DEFAULT_WORLD: WorldId = 'fleet-mid-refactor'

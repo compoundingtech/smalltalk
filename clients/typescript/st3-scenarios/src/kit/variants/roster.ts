@@ -35,5 +35,26 @@ export const rosterVariants: VariantTable['roster'] = {
       return { _tag: 'changes' as const, at_ms: phase * 2_000, store: 0, upserts: [...next.agents, ...next.runtimes, ...next.machines], removes: ctx.cast.agents.filter((member) => !next.runtimes.some((runtime) => runtime.id === member.runtime)).map((member) => member.runtime), order: next.order }
     }) }
   },
-  // TODO(Axe 0crzkm): roster.huge awaits the approved storage decision.
+  huge: (ctx, base) => {
+    const built = ctx.cast.agents.map((member, index) => {
+      const mission = ctx.cast.missions[index % ctx.cast.missions.length]
+      return agent(child(ctx, `huge/roster/${member.key}`), member, {
+        state: index % 5 === 0 ? 'waiting' : 'running',
+        sinceMs: -60_000 - index * 1_000,
+        harnessState: index % 5 === 0 ? 'idle' : 'busy',
+        reachability: member.host === ctx.cast.hosts[0] ? 'local' : 'remote',
+        mission,
+        step: mission === undefined ? undefined : Math.floor(index / ctx.cast.missions.length) % mission.steps.length,
+        workState: 'claimed',
+      })
+    })
+    const runtimes = built.flatMap((value) => value.runtime ?? [])
+    return cleared(base.roster, {
+      agents: built.map((value) => value.agent),
+      runtimes,
+      machines: ctx.cast.hosts.map((host) => machine(ctx, host,
+        runtimes.filter((runtime) => runtime.owner_host_id === host.id).map((runtime) => runtime.id), [])),
+      order: ctx.cast.agents.map((member) => member.id),
+    })
+  },
 }

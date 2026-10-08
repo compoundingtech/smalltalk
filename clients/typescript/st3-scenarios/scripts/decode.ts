@@ -113,13 +113,18 @@ export const decodeSlice = (world: string, slice: AnySlice): DecodeFailure[] => 
 export const everyVariant = (world: World): AnySlice[] =>
   SLICE_KINDS.flatMap((kind) => world.available[kind].map((variant) => world.with({ [kind]: variant }).slices[kind] as AnySlice))
 
-export const decodeCatalog = (nows: readonly number[]): DecodeFailure[] =>
-  nows.flatMap((now) =>
-    catalog.flatMap(({ id }) => {
-      const world = loadWorld(id, { now })
-      return everyVariant(world).flatMap((slice) => decodeSlice(id, slice))
-    }),
-  )
+export const decodeCatalog = (nows: readonly number[]): DecodeFailure[] => {
+  const failures: DecodeFailure[] = []
+  for (const now of nows) for (const { id } of catalog) {
+    const world = loadWorld(id, { now })
+    // Decode one variant at a time: huge's per-agent variants must not all stay resident.
+    for (const kind of SLICE_KINDS) for (const variant of world.available[kind]) {
+      const slice = world.with({ [kind]: variant }).slices[kind]
+      failures.push(...decodeSlice(id, slice))
+    }
+  }
+  return failures
+}
 
 const isSliceKind = (value: string): value is SliceKind => (SLICE_KINDS as readonly string[]).includes(value)
 

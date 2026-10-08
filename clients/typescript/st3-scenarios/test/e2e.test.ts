@@ -17,7 +17,7 @@ import {
 } from '../src/index.ts'
 import { createReplay, manualClock } from '../src/replay/index.ts'
 import { ScenarioProvider, createReadTracker, useScenarioSlice } from '../src/react/index.ts'
-import { scenarioGlobalTypes, scenarioStoryCheck, withScenario } from '../src/storybook/index.ts'
+import { resolveScenarioWorld, scenarioGlobalTypes, scenarioStoryCheck, withScenario } from '../src/storybook/index.ts'
 
 const REBASED_NOW = ANCHOR_MS + 123_456_789
 const WINDOW_LIMIT = 200
@@ -52,15 +52,27 @@ const rowsAt = (world: World, at: number): Record<string, WireResource[]> => {
   }
 }
 
+// The huge world renders bounded previews instead of a thousand roster rows: long arrays keep
+// head, tail and count. Marker-scale story checks for it live in the dedicated huge suite.
+const PREVIEW_LIMIT = 50
+const preview = (value: unknown): unknown => {
+  if (Array.isArray(value)) {
+    const half = PREVIEW_LIMIT / 2
+    return value.length > PREVIEW_LIMIT ? { count: value.length, head: value.slice(0, half).map(preview), tail: value.slice(-half).map(preview) } : value.map(preview)
+  }
+  return typeof value === 'object' && value !== null ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, preview(item)])) : value
+}
+
 // A deliberately plain diagnostic consumer displays every slice's wire state, not fixture constants.
 // Each slice is a separate component: no variable hook order when the catalog grows.
-const SliceConsumer = ({ kind }: { kind: SliceKind }) => {
+const SliceConsumer = ({ kind, bound }: { kind: SliceKind; bound?: (value: unknown) => unknown }) => {
   const slice = useScenarioSlice(kind)
   return React.createElement('pre', { 'data-slice': kind }, JSON.stringify(slice.loading ? { loading: true } : {
-    loading: slice.loading, state: slice.state, ...('status' in slice ? { status: slice.status } : {}),
+    loading: slice.loading, state: bound === undefined ? slice.state : bound(slice.state), ...('status' in slice ? { status: slice.status } : {}),
   }))
 }
-const Consumer = () => React.createElement('main', {}, ...SLICE_KINDS.map((kind) => React.createElement(SliceConsumer, { key: kind, kind })))
+const Consumer = ({ bound }: { bound?: (value: unknown) => unknown }) =>
+  React.createElement('main', {}, ...SLICE_KINDS.map((kind) => React.createElement(SliceConsumer, { key: kind, kind, bound })))
 const meta = {
   title: 'Scenarios/CatalogEndToEnd', component: Consumer,
   parameters: { scenario: { slices: SLICE_KINDS } },
@@ -210,41 +222,60 @@ const verifyReplay = async (world: World) => {
     ]
     if (discovery !== undefined) {
       const limit = Math.min(WINDOW_LIMIT, discovery.value.limits.max_page_items)
+      // Huge collection windows are checked as bounded prefixes; a full drain belongs to the kit gates.
+      const pageCeiling = world.id === 'huge' ? 2 : Number.POSITIVE_INFINITY
       for (const [collection, kinds, list] of lists) await step(world, kinds.join('+'), `anchor:pages ${collection}`, async () => {
         const items: Resource[] = []
         const cursors = new Set<string>()
         let cursor: string | undefined
+        let fetched = 0
         do {
           const result = await read(collection, kinds, () => list({ limit, ...(cursor === undefined ? {} : { cursor }) }))
           if (result === undefined) return
           items.push(...result.value.items)
+          fetched += 1
           cursor = result.value.page.has_more ? result.value.page.next_cursor ?? undefined : undefined
           if (result.value.page.has_more) expect(cursor, 'has_more requires a next cursor').toBeDefined()
           if (cursor !== undefined) { expect(cursors.has(cursor), `repeated cursor ${cursor}`).toBe(false); cursors.add(cursor) }
-        } while (cursor !== undefined)
-        expect(items).toEqual(rowsAt(world, 0)[collection])
+        } while (cursor !== undefined && fetched < pageCeiling)
+        const expected = rowsAt(world, 0)[collection]
+        if (expected === undefined) throw new Error(`No expected rows for ${collection}`)
+        if (cursor === undefined) expect(items).toEqual(expected)
+        else {
+          expect(items).toEqual(expected.slice(0, items.length))
+          expect(expected.length, `${collection} stopped at the page ceiling with no rows left`).toBeGreaterThan(items.length)
+        }
       })
       await step(world, 'roster+details+attention+terminal', 'anchor:pages resources', async () => {
         const facts: unknown[] = []
         const cursors = new Set<string>()
         let cursor: string | undefined
+        let fetched = 0
         do {
           const result = await read('resources', ['roster', 'details', 'attention', 'terminal'],
             () => client.resourcesList({}, { limit, ...(cursor === undefined ? {} : { cursor }) }))
           if (result === undefined) return
           facts.push(...result.value.items.map((item) => item.facts))
+          fetched += 1
           cursor = result.value.page.has_more ? result.value.page.next_cursor ?? undefined : undefined
           if (result.value.page.has_more) expect(cursor).toBeDefined()
           if (cursor !== undefined) { expect(cursors.has(cursor)).toBe(false); cursors.add(cursor) }
-        } while (cursor !== undefined)
+        } while (cursor !== undefined && fetched < pageCeiling)
         const rows = rowsAt(world, 0)
-        expect(facts).toEqual(['agents', 'runtimes', 'machines', 'missions', 'work', 'attention', 'messages'].flatMap((collection) => rows[collection]!))
+        const expected = ['agents', 'runtimes', 'machines', 'missions', 'work', 'attention', 'messages'].flatMap((collection) => rows[collection]!)
+        if (cursor === undefined) expect(facts).toEqual(expected)
+        else {
+          expect(facts).toEqual(expected.slice(0, facts.length))
+          expect(expected.length).toBeGreaterThan(facts.length)
+        }
       })
       await read('events', ['sync'], () => client.eventsList())
       for (const thread of world.slices.conversation.state.threads) await step(world, 'conversation', `anchor:pages ${thread.agent}`, async () => {
         let cursor: string | undefined
         const cursors = new Set<string>()
         const pages: TimelineEntry[][] = []
+        // A seeded history stops after its committed window; generated older pages have a dedicated suite.
+        const stopCursor = thread.history?.next_cursor
         do {
           const result = await read('timeline', ['conversation'], () => client.timelineList(thread.session_id, { limit, ...(cursor === undefined ? {} : { cursor }) }),
             cursor === undefined ? {} : { cursor })
@@ -253,7 +284,8 @@ const verifyReplay = async (world: World) => {
           cursor = result.value.page.has_more ? result.value.page.next_cursor ?? undefined : undefined
           if (result.value.page.has_more) expect(cursor).toBeDefined()
           if (cursor !== undefined) { expect(cursors.has(cursor)).toBe(false); cursors.add(cursor) }
-        } while (cursor !== undefined)
+        } while (cursor !== undefined && cursor !== stopCursor)
+        if (stopCursor !== undefined) expect(cursor, 'committed window must end exactly at its history cursor').toBe(stopCursor)
         expect(pages.flat()).toEqual(thread.items)
       })
     }
@@ -340,10 +372,11 @@ describe.each(catalog.map(({ id }) => [id]))('catalog consumer end-to-end: %s', 
     const world = loadWorld(id!, { now: ANCHOR_MS })
     const clock = manualClock(world.now)
     const tracker = createReadTracker()
-    const render = () => renderToStaticMarkup(React.createElement(ScenarioProvider, { world, clock, tracker }, React.createElement(Consumer)))
+    const bound = world.id === 'huge' ? preview : undefined
+    const render = () => renderToStaticMarkup(React.createElement(ScenarioProvider, { world, clock, tracker }, React.createElement(Consumer, { bound })))
     const initialMarkup = render()
     expect(tracker.reads()).toEqual(new Set(SLICE_KINDS))
-    const Composed = composeStory(story, meta, { decorators: [withScenario], globalTypes: scenarioGlobalTypes,
+    const Composed = composeStory({ ...story, args: { bound } }, meta, { decorators: [withScenario], globalTypes: scenarioGlobalTypes,
       initialGlobals: { scenario: world.id, scenarioNow: world.now } })
     const toolbarMarkup = renderToStaticMarkup(React.createElement(Composed))
     expect(toolbarMarkup, label(world, 'all', 'toolbar selected world')).toContain(`data-scenario="${world.id}"`)
@@ -353,10 +386,25 @@ describe.each(catalog.map(({ id }) => [id]))('catalog consumer end-to-end: %s', 
       clock.advance(world.now + at - clock.now())
       const expected = React.createElement('main', {}, ...SLICE_KINDS.map((kind) => {
         const slice = foldSlice(world.slices[kind], at)
-        return React.createElement('pre', { key: kind, 'data-slice': kind }, JSON.stringify(slice.loading ? { loading: true } : { loading: slice.loading, state: slice.state,
+        return React.createElement('pre', { key: kind, 'data-slice': kind }, JSON.stringify(slice.loading ? { loading: true } : { loading: slice.loading,
+          state: bound === undefined ? slice.state : bound(slice.state),
           ...(kind === 'sync' ? { status: syncStatusAt(world.slices.sync, at, world.now) } : {}) }))
       }))
       expect(render(), label(world, 'all', `provider fold at ${at}ms`)).toBe(renderToStaticMarkup(expected))
+    }
+    if (world.id === 'huge') {
+      // The pinned marker contract needs every world marker rendered, which a bounded preview
+      // cannot show; the dedicated huge suite owns variant coherence. Here the toolbar variant
+      // choice is exercised through the same binding with bounded output.
+      for (const [kind, variant] of [['roster', 'empty'], ['conversation', 'empty']] as const satisfies readonly (readonly [SliceKind, string])[]) {
+        const switched = resolveScenarioWorld({ slices: SLICE_KINDS }, { scenario: world.id, scenarioNow: world.now }, { [kind]: variant })
+        expect(switched.variants[kind], label(world, kind, `toolbar variant ${variant}`)).toBe(variant)
+        const expected = renderToStaticMarkup(React.createElement(ScenarioProvider, { world: switched, clock },
+          React.createElement(Consumer, { bound })))
+        expect(expected, label(world, 'all', `toolbar variant ${variant}`)).not.toBe(initialMarkup)
+        expect(expected.length).toBeLessThan(initialMarkup.length)
+      }
+      return
     }
     // Check each world's variant and pinning contracts; world-switch contrasts run once below.
     // Scope marker checks to one slice: shared titles/text in other slices are legitimate, not stale data.

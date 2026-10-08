@@ -40,7 +40,9 @@ describe('rebase', () => {
     }
   })
 
-  const files = catalog.flatMap(({ id }) => {
+  // Huge's full files are rebased once in huge.test.ts, not once per random clock draw.
+  const ordinaryCatalog = catalog.filter(({ id }) => id !== 'huge')
+  const files = ordinaryCatalog.flatMap(({ id }) => {
     const world = loadWorld(id, { now: ANCHOR_MS })
     return SLICE_KINDS.map((kind) => ({ id, kind, file: JSON.parse(canonicalJson(sliceFile(world, world.slices[kind] as AnySlice))) }))
   })
@@ -49,7 +51,7 @@ describe('rebase', () => {
   const nows = Schema.Int.check(Schema.isBetween({ minimum: Date.UTC(1900, 0, 1), maximum: Date.UTC(2200, 0, 1) }))
 
   it.prop('a rebased file equals the world generated at that now; differences stay exact', { now: nows }, ({ now }) => {
-    const worlds = new Map(catalog.map(({ id }) => [id, loadWorld(id, { now })]))
+    const worlds = new Map(ordinaryCatalog.map(({ id }) => [id, loadWorld(id, { now })]))
     for (const { id, kind, file } of files) {
       const rebased = rebase({ state: file.state, timeline: file.timeline }, file.times, ANCHOR, now)
       const world = worlds.get(id)!
@@ -80,7 +82,8 @@ describe('worlds', () => {
       const world = loadWorld(id, { now: ANCHOR_MS })
       const stores = new Set<number>()
       for (const kind of SLICE_KINDS) {
-        for (const slice of [world.slices[kind], ...world.available[kind].map((variant) => world.with({ [kind]: variant }).slices[kind])]) {
+        const variants = id === 'huge' ? [] : world.available[kind].map((variant) => world.with({ [kind]: variant }).slices[kind])
+        for (const slice of [world.slices[kind], ...variants]) {
           const times = slice.timeline.map((event) => event.at_ms)
           expect(times).toEqual([...times].sort((a, b) => a - b))
         }

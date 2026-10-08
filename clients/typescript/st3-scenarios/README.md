@@ -3,9 +3,8 @@
 Seeded, privacy-safe scenario worlds for every Smalltalk client, and the kit that builds and
 replays them. [spec.md](spec.md) is the contract.
 
-The registered catalog contains 23 worlds: seven narratives, empty/loading/forward-compatibility
-edges, eleven failed-sync causes, replication divergence and Unicode. The `huge` world and its
-fixture encoding are not registered pending the storage decision (Axe `0crzkm`).
+The registered catalog contains 24 worlds: seven narratives, empty/loading/forward-compatibility
+edges, eleven failed-sync causes, replication divergence, `huge` and Unicode.
 
 ```ts
 import { loadWorld } from '@smalltalk/st3-scenarios'
@@ -38,6 +37,29 @@ scenarioStoryCheck(Story, meta, { assert: true })
 
 Rust, Swift and other readers use the committed files in `fixtures/scenarios/` and shift the
 instants each file lists in `times` (vectors: `fixtures/scenarios/_vectors/rebase.json`).
+
+## Huge world and history pages
+
+`loadWorld('huge')` contains all 1,000 agents across many hosts and missions in the normal roster
+slice. The first cast agent has a logical 10,000-turn conversation, with four entries per turn
+(40,000 entries). The committed conversation contains only the newest 400 turns (1,600 entries,
+sequences 38,401–40,000), including the 50-entry live window. The thread advertises
+`page_size: 50` and `has_more: true`; a scripted consumer requests older pages rather than
+receiving the whole history in its live subscription.
+
+Optional `ConversationThread.history` records `{ kind: 'seeded-turns', seed: number,
+world: string, total_turns: number, total_entries: number, committed_from_sequence: number,
+next_cursor: string }`. In `huge`, the totals are 10,000 turns and 40,000 entries,
+`committed_from_sequence` is 38,401, and `next_cursor` is `scenario-cursor/1600`.
+Timeline cursors use `scenario-cursor/<newest-relative-offset>`, counting from the newest end
+through both committed and generated history. Replay serves committed entries first, then
+deterministically generates requested older ranges from the history seed and world at `world.now`;
+each turn is independently seeded, without `Math.random` or `Date.now`. Native readers see only
+the committed pages, not the full logical history.
+
+Fixtures retain `fixtures/scenarios/<world>/<slice>.json`, one file per slice with no per-world
+manifest or shards. The bounded history window preserves the unchanged 8 MiB/file and
+24 MiB/tree budgets without trimming the roster.
 
 ## Authoring contracts
 
@@ -73,8 +95,9 @@ instants each file lists in `times` (vectors: `fixtures/scenarios/_vectors/rebas
   when the web consumer adopts it.
 - Add variants in `src/kit/variants/<slice>.ts`, exporting
   `<slice>Variants: VariantTable['<slice>']`; the central module composes them. Populated variants
-  synthesize from the cast when default records are absent. No paged/sharded fixture encoding
-  is defined here; the catalog's `huge` format remains a separate decision.
+  synthesize from the cast when default records are absent. `roster.huge` uses the full
+  1,000-agent roster; `conversation.huge` uses the first cast agent's seeded history and bounded
+  committed window described above.
 
 - `roster.all-states` cycles states across existing cast agents; `conversation.long` has 80
   exchanges per agent; `attention.many` has 50 cards. Singleton `remote-only-mail` casts use

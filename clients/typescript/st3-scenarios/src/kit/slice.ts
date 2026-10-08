@@ -58,13 +58,26 @@ export interface AttentionState {
   readonly messages: Message[]
 }
 
+/** Portable description of the uncommitted prefix; only TypeScript replay synthesizes it. */
+export interface ConversationHistory {
+  readonly kind: 'seeded-turns'
+  readonly seed: number
+  readonly world: string
+  readonly total_turns: number
+  readonly total_entries: number
+  readonly committed_from_sequence: number
+  /** Older-page cursor immediately beyond the committed entries. */
+  readonly next_cursor: string
+}
+
 export interface ConversationThread {
   readonly agent: Id
   readonly session_id: Id
-  /** Every entry, oldest first; the newest `page_size` form the first page. */
+  /** Committed entries, oldest first; the newest `page_size` form the live window. */
   readonly items: TimelineEntry[]
   readonly page_size: number
   readonly has_more: boolean
+  readonly history?: ConversationHistory
 }
 
 export interface ConversationState {

@@ -1,9 +1,10 @@
 import type { TimelineEntry } from '@smalltalk/st3-client'
 import { child, type FactoryContext } from '../context.ts'
+import { ENTRIES_PER_HISTORY_TURN, generateConversationRange, HUGE_COMMITTED_TURNS, HUGE_TURNS } from '../conversationHistory.ts'
 import { diff } from '../factories/diff.ts'
 import { toolCall } from '../factories/toolCall.ts'
 import { entry, revise, thread, turn, type TurnInput } from '../factories/turn.ts'
-import type { ConversationEvent, ConversationState } from '../slice.ts'
+import type { ConversationEvent, ConversationHistory, ConversationState } from '../slice.ts'
 import type { VariantTable } from '../world.ts'
 import { cleared } from './shared.ts'
 
@@ -59,5 +60,27 @@ export const conversationVariants: VariantTable['conversation'] = {
   'tool-heavy': (ctx, base) => cleared(base.conversation, conversation(ctx, 'tool-heavy')),
   'failed-tools': (ctx, base) => cleared(base.conversation, conversation(ctx, 'failed-tools')),
   'remote-only-mail': (ctx, base) => cleared(base.conversation, conversation(ctx, 'remote-only-mail')),
-  // TODO(Axe 0crzkm): conversation.huge awaits the approved storage decision.
+  huge: (ctx, base) => {
+    const member = ctx.cast.agents[0]
+    if (member === undefined) throw new Error('huge conversation requires a cast agent')
+    const totalEntries = HUGE_TURNS * ENTRIES_PER_HISTORY_TURN
+    const committedEntries = HUGE_COMMITTED_TURNS * ENTRIES_PER_HISTORY_TURN
+    const history: ConversationHistory = {
+      kind: 'seeded-turns',
+      seed: base.conversation.source._tag === 'synthetic' ? base.conversation.source.seed : ctx.rng.seed[0],
+      world: ctx.world,
+      total_turns: HUGE_TURNS,
+      total_entries: totalEntries,
+      committed_from_sequence: totalEntries - committedEntries + 1,
+      next_cursor: `scenario-cursor/${committedEntries}`,
+    }
+    return cleared(base.conversation, { threads: [{
+      agent: member.id,
+      session_id: member.session,
+      items: generateConversationRange(ctx, member, history, history.committed_from_sequence, totalEntries),
+      page_size: 50,
+      has_more: true,
+      history,
+    }] })
+  },
 }

@@ -35,8 +35,10 @@ These decisions are fixed for this package. Sections below cite them as D1–D10
 - **D4 Gates:** CI decodes every emitted scenario with the real client-v0 codecs in strict mode and
   runs a privacy scan.
 - **D5 Time:** every time is an offset from the load-time `now`. Screenshots pin `now`.
-- **D6 Artifacts:** generated JSON is committed under `fixtures/scenarios/<world>/<slice>.json`. A
-  freshness check fails on drift. Rust and Swift read the plain files.
+- **D6 Artifacts:** generated JSON is committed under `fixtures/scenarios/<world>/<slice>.json`,
+  one file per slice with no manifest or shards. A freshness check fails on drift. Rust and Swift
+  read the plain files. `huge` commits its full 1,000-agent roster and a bounded conversation
+  history window; replay deterministically generates older history from seed metadata.
 - **D7 Model:** factories → slices → worlds. Factories are seeded and schema-typed (`agent`, `turn`,
   `toolCall`, `diff`, `terminalRun`); terminal streams use the asciicast v2 shape. Slices are
   `roster`, `conversation`, `sync`, `terminal`, `details` and `attention`. A world composes slices
@@ -233,7 +235,7 @@ so an override never introduces strangers. Variants per slice:
 | `roster` | `default`, `empty`, `loading`, `one-agent`, `all-states`, `huge` |
 | `details` | `default`, `empty`, `loading`, `stalled`, `failed` |
 | `attention` | `default`, `none`, `one-of-each-kind`, `many` |
-| `conversation` | `default`, `empty`, `loading`, `streaming`, `long`, `tool-heavy`, `failed-tools`, `remote-only-mail` |
+| `conversation` | `default`, `empty`, `loading`, `streaming`, `long`, `huge`, `tool-heavy`, `failed-tools`, `remote-only-mail` |
 | `terminal` | `default`, `none`, `running`, `unavailable`, `exited`, `restarted` |
 | `sync` | one variant per row of the [sync matrix](#sync-matrix) |
 
@@ -252,6 +254,10 @@ it does not add agents merely to display every state. `conversation.long` contai
 per cast agent, and `attention.many` contains 50 cards distributed over cast-owned work.
 `conversation.remote-only-mail` uses another cast agent, preferring a different host; a singleton
 cast uses agent-to-agent loopback mail, which the protocol permits, never person-origin content.
+`conversation.huge` gives the first cast agent a logical 10,000-turn history, four entries per
+turn (40,000 entries). It commits only the newest 400 turns (1,600 entries), including the
+50-entry live window; a scripted consumer reaches older pages. `roster.huge` retains the full
+1,000-agent roster in the normal roster slice, not merely a subscription window.
 
 ### Terminal data
 
@@ -370,7 +376,22 @@ and the Swift reader in `St3Client` each run all vectors in their own tests.
   `-diff`.
 - Only each world's default slices are committed. Variants are generated in process; the decode
   gate still checks every variant of every world (D4).
+- The format remains one JSON file per slice: no per-world manifest, page files or shards.
+  `huge` stores all 1,000 agents in its normal roster slice. Its first cast agent's conversation
+  has 10,000 logical turns (40,000 entries), but the conversation slice commits only the newest
+  400 turns (1,600 entries, sequences 38,401–40,000), including the 50-entry live window.
+  The thread advertises `page_size: 50` and `has_more: true`.
+- Optional `ConversationThread.history` describes seeded history rather than embedding every
+  older entry: `{ kind: 'seeded-turns', seed: number, world: string, total_turns: number,
+  total_entries: number, committed_from_sequence: number, next_cursor: string }`.
+  For `huge`, the totals are 10,000 and 40,000, `committed_from_sequence` is 38,401 and
+  `next_cursor` is `scenario-cursor/1600`. Cursors use
+  `scenario-cursor/<newest-relative-offset>`: the offset counts entries from the newest end,
+  independently of how many entries are committed. Native readers see committed pages only;
+  replay uses the seed and world metadata to generate requested older ranges deterministically.
 - Size budget: one file at most 8 MiB, the whole tree at most 24 MiB. A unit test enforces both.
+  The bounded committed history keeps `huge` within these unchanged budgets without dropping
+  roster agents or introducing a different fixture encoding.
 
 `scripts/emit.ts` is the only writer. `emit --check` generates into a temporary directory and
 fails on any byte difference, naming each stale or missing file and the command that fixes it
@@ -472,6 +493,13 @@ replay.actions  // actions the client submitted, in order, for test assertions
   socket accepts. Other actions are recorded in `replay.actions` and answered with an accepted
   `ActionResult` and an operation that completes; a world may declare a different answer per
   action. Replay does not simulate the effects of actions.
+- **Seeded history:** conversation pages first serve committed entries, then generate only the
+  requested older range from `ConversationThread.history`, using its seed and world at
+  `world.now`. Each turn is independently seeded; generation uses neither `Math.random` nor
+  `Date.now`. Timeline cursors remain `scenario-cursor/<newest-relative-offset>` across the
+  committed/generated boundary. The `huge` scripted consumer starts with the newest 50 entries
+  and requests older pages, including beyond the committed 1,600-entry window. Native file
+  readers have only the committed pages; the full logical history is available through replay.
 - **Clocks:** `realClock()` schedules with timers; `manualClock()` exposes `advance(ms)` for unit
   tests. Replay never waits on its own; it runs only what the clock releases.
 
@@ -539,7 +567,9 @@ package, which takes the kit as a development dependency (see
 [Consumer contracts](#consumer-contracts-d2-d8)). Separately, this package tests wire delivery for
 every terminal event: the generated `collectionStream` receives the expected `screen` and `error`
 frames in order, and each frame decodes as a `CollectionFrame` in strict mode, including the
-screen frame's `snapshot`. `huge` checks windows and pages, not a full 1,000-agent window.
+screen frame's `snapshot`. `huge` checks protocol-sized windows and scripted older conversation
+pages, including deterministic generation beyond committed history, not a full 1,000-agent
+socket window. The normal roster slice still commits all 1,000 agents.
 
 ## Sync matrix
 
@@ -723,7 +753,7 @@ Edge states:
 | `unknown-fields` | Future enum values, extra keys, unknown resource and entry kinds. Decoded tolerant; strict decoding fails exactly at the declared paths. |
 | `failed-sync-<cause>` | One world per failed or stale [sync matrix](#sync-matrix) row that is not pending and needs no local condition: `socket-dropped`, `open-fail`, `resync-coded`, `forbidden`, `non-client-response`, `subscription-error`, `subscription-limit-legacy`, `capability-absent`, `rate-limited`, `cursor-gap`, `page-cursor-expired`. Each uses `fleet-mid-refactor`'s cast and other slices. Pending rows become worlds when their frames land. |
 | `replication-diverged` | Healthy transport; page responses carry a `diverged` sync notice for one peer. |
-| `huge` | 1,000 agents across many hosts and missions; one conversation of 10,000 turns; served in protocol-sized windows and pages. |
+| `huge` | Full 1,000-agent roster across many hosts and missions in the normal slice; the first cast agent has 10,000 logical turns (40,000 entries). Commits the newest 400 turns (1,600 entries), including a 50-entry live window; scripted replay pages reach older entries generated deterministically from seed metadata. Native readers see committed pages only. |
 | `unicode` | RTL, CJK, emoji, combining marks, zero-width joiners, 200-character names and long paths in every slice. |
 
 `evicted`, `quiet` and `progress` stay variants: they need a local condition or a pending frame.

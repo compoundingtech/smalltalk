@@ -108,7 +108,10 @@ it('removes obsolete unknown declarations from regenerated slices and preserves 
   }
 })
 
-for (const { id } of catalog) for (const now of [ANCHOR_MS, ANCHOR_MS + 123_456_789]) it(`generates all declared variants coherently: ${id}/${now}`, () => {
+// The huge world leaves this matrix: its per-agent conversation variants synthesize hundreds of
+// thousands of entries and its roster phases thousands of agents per build. Its bounded variant
+// coherence has a dedicated suite (huge.test.ts).
+for (const { id } of catalog.filter((entry) => entry.id !== 'huge')) for (const now of [ANCHOR_MS, ANCHOR_MS + 123_456_789]) it(`generates all declared variants coherently: ${id}/${now}`, () => {
   const base = loadWorld(id, { now })
   for (const kind of SLICE_KINDS) for (const variant of base.available[kind]) {
     const world = base.with({ [kind]: variant })
@@ -129,7 +132,13 @@ for (const { id } of catalog) for (const now of [ANCHOR_MS, ANCHOR_MS + 123_456_
         const instants = thread.items.map((entry) => parseTimestamp(entry.timestamp))
         expect(instants).toEqual([...instants].sort((a, b) => a - b))
         expect(instants.every((instant) => instant <= now)).toBe(true)
-        expect(thread.items.map((entry) => entry.sequence)).toEqual(thread.items.map((_entry, index) => index + 1))
+        const sequences = thread.items.map((entry) => entry.sequence)
+        if (thread.history !== undefined) {
+          // A seeded history carries the absolute sequences of the whole conversation: contiguous
+          // and anchored at its newest committed entry.
+          for (let index = 1; index < sequences.length; index += 1) expect(sequences[index], `${id}:${variant} sequence at ${index}`).toBe(sequences[index - 1]! + 1)
+          expect(sequences.at(-1), `${id}:${variant} newest sequence`).toBe(thread.history.total_entries)
+        } else expect(sequences).toEqual(sequences.map((_sequence, index) => index + 1))
       }
     }
     if (kind === 'terminal' && variant === 'running') {
