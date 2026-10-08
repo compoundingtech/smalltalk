@@ -1,5 +1,5 @@
 //! Bounded immutable native images at the Installer's exact deferred revision.
-//! Adattention only appends references and images. No reducer or dependency fanout
+//! Admission only appends references and images. No reducer or dependency fanout
 //! runs in a native trigger. Images remain until the source owner acknowledges
 //! that every consumer has advanced past them. This helper does not inventory existing
 //! native rows, qualify a source, or enable a production reader.
@@ -46,8 +46,8 @@ mod tests {
         let installer = Installer::new(vec![])?;
         installer.create_schema(&c)?;
         let tx = c.transaction()?;
-        installer.register_source(&tx, "attentions-native", "native-images-test.v1", 7)?;
-        let position = installer.position(&tx, "attentions-native")?;
+        installer.register_source(&tx, "attention-native", "native-images-test.v1", 7)?;
+        let position = installer.position(&tx, "attention-native")?;
         installer.enable_deferred(
             &tx,
             &position,
@@ -78,7 +78,7 @@ mod tests {
         tx.execute("INSERT OR REPLACE INTO native VALUES('c',X'00FF',NULL)", [])?;
         capture.commit(&tx)?;
         tx.commit()?;
-        assert_eq!(installer.position(&c, "attentions-native")?.revision, 6);
+        assert_eq!(installer.position(&c, "attention-native")?.revision, 6);
         let first = capture.image(&c, 1, 1, "native")?;
         assert_eq!(first["number"], json!(["integer", i64::MAX]));
         assert_eq!(first["body"], json!(["blob", "00FF"]));
@@ -107,16 +107,16 @@ mod tests {
         tx.rollback()?;
         assert_eq!(count(&c, "native")?, 1);
         assert_eq!(count(&c, "local_attention_native_images")?, 7);
-        assert_eq!(installer.position(&c, "attentions-native")?.revision, 6);
+        assert_eq!(installer.position(&c, "attention-native")?.revision, 6);
         assert!(capture.compatible(&c)?);
         Ok(())
     }
     #[test]
-    fn raw_writes_and_oversized_images_preserve_adattention_and_fence_source() -> Result<()> {
+    fn raw_writes_and_oversized_images_preserve_admission_and_fence_source() -> Result<()> {
         let (c, installer, capture) = fixture(64)?;
         c.execute("INSERT INTO native VALUES('raw',X'01',0)", [])?;
         assert_eq!(count(&c, "native")?, 1);
-        assert!(installer.position(&c, "attentions-native").is_err());
+        assert!(installer.position(&c, "attention-native").is_err());
         assert!(!capture.compatible(&c)?);
         assert_eq!(count(&c, "local_attention_native_images")?, 0);
         let (mut c, installer, capture) = fixture(64)?;
@@ -126,7 +126,7 @@ mod tests {
         capture.commit(&tx)?;
         tx.commit()?;
         assert_eq!(count(&c, "native")?, 1);
-        assert!(installer.position(&c, "attentions-native").is_err());
+        assert!(installer.position(&c, "attention-native").is_err());
         assert_eq!(count(&c, "local_attention_native_images")?, 0);
         Ok(())
     }
@@ -146,7 +146,7 @@ mod tests {
             tx.execute("UPDATE native SET number=1", [])?;
             capture.commit(&tx)?;
             tx.commit()?;
-            assert!(installer.position(&c, "attentions-native").is_err());
+            assert!(installer.position(&c, "attention-native").is_err());
             assert_eq!(count(&c, "native")?, 1);
             assert_eq!(count(&c, "local_attention_native_images")?, 1);
         }
@@ -169,7 +169,7 @@ mod tests {
         capture.begin(&tx, &installer)?;
         tx.execute("INSERT INTO native VALUES('still-admitted',X'01',0)", [])?;
         tx.commit()?;
-        assert!(installer.position(&c, "attentions-native").is_err());
+        assert!(installer.position(&c, "attention-native").is_err());
         assert_eq!(count(&c, "native")?, 1);
         Ok(())
     }
@@ -186,7 +186,7 @@ mod tests {
         tx.execute("UPDATE native SET number=42", [])?;
         capture.commit(&tx)?;
         tx.commit()?;
-        let position = installer.position(&c, "attentions-native")?;
+        let position = installer.position(&c, "attention-native")?;
         let references = c
             .prepare("SELECT payload FROM ivm_install_journal ORDER BY revision")?
             .query_map([], |r| r.get::<_, String>(0))?
@@ -225,6 +225,8 @@ mod tests {
         for action in [
             "UPDATE local_attention_native_images SET body='{}'",
             "DELETE FROM local_attention_native_images",
+            "UPDATE local_attention_native_capture SET reclaiming=1; DELETE FROM local_attention_native_images",
+            "INSERT INTO local_attention_native_images VALUES('attention-native',8,2,1,'native','{}',2)",
         ] {
             let (mut c, installer, capture) = fixture(64)?;
             let tx = c.transaction()?;
@@ -234,10 +236,28 @@ mod tests {
             capture.commit(&tx)?;
             tx.commit()?;
             c.execute_batch(action)?;
-            assert!(installer.position(&c, "attentions-native").is_err());
+            assert!(installer.position(&c, "attention-native").is_err());
             assert!(installer.position(&c, "other").is_ok());
             assert_eq!(count(&c, "native")?, 1);
         }
+        Ok(())
+    }
+    #[test]
+    fn rolled_back_schema_revision_cannot_mask_later_trigger_loss() -> Result<()> {
+        let (mut c, installer, capture) = fixture(64)?;
+        let tx = c.transaction()?;
+        tx.execute_batch("CREATE TABLE unrelated(id TEXT PRIMARY KEY)")?;
+        let checked: i64 = tx.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+        assert!(capture.compatible(&tx)?);
+        tx.rollback()?;
+        let tx = c.transaction()?;
+        tx.execute_batch(&format!("DROP TRIGGER {}", quoted(&capture.triggers[1].0)?))?;
+        let reused: i64 = tx.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+        assert_eq!(checked, reused);
+        assert!(!capture.compatible(&tx)?);
+        capture.begin(&tx, &installer)?;
+        tx.commit()?;
+        assert!(installer.position(&c, "attention-native").is_err());
         Ok(())
     }
 }
@@ -464,7 +484,7 @@ impl NativeCapture {
                         "image_insert",
                         "INSERT",
                         format!(
-                            "NEW.source={source} AND NEW.epoch={} AND NOT ({scope} AND NEW.revision={} AND {})",
+                            "NEW.source={source} AND NOT (NEW.epoch={} AND {scope} AND NEW.revision={} AND {})",
                             position.epoch,
                             plan.revision_sql(),
                             plan.available_sql()
@@ -479,8 +499,10 @@ impl NativeCapture {
                         "image_delete",
                         "DELETE",
                         format!(
-                            "OLD.source={source} AND OLD.epoch={} AND NOT EXISTS(SELECT 1 FROM local_attention_native_capture WHERE source={source} AND epoch={} AND reclaiming=1)",
-                            position.epoch, position.epoch
+                            "OLD.source={source} AND NOT (OLD.epoch={} AND EXISTS(SELECT 1 FROM local_attention_native_capture WHERE source={source} AND epoch={} AND reclaiming=1) AND OLD.revision<={} AND NOT EXISTS(SELECT 1 FROM ivm_install_journal WHERE source={source} AND revision<=OLD.revision))",
+                            position.epoch,
+                            position.epoch,
+                            plan.revision_sql()
                         ),
                     ),
                 ] {
@@ -643,7 +665,7 @@ impl NativeCapture {
     }
 
     /// Paired writer hooks. A raw write outside this scope permanently fences
-    /// the source in that write transaction, preserving native adattention.
+    /// the source in that write transaction, preserving native admission.
     pub(crate) fn begin(&self, tx: &Transaction<'_>, installer: &Installer) -> Result<()> {
         let inactive = tx
             .query_row(
@@ -804,7 +826,7 @@ impl NativeCapture {
             "attention image reclaim source changed"
         );
         // The retained journal is a contiguous suffix; a missing reference in
-        // its interior is a source gap, never perattention to reclaim that image.
+        // its interior is a source gap, never permission to reclaim that image.
         let first: Option<u64> = c.query_row(
             "SELECT MIN(revision) FROM ivm_install_journal WHERE source=?1",
             [&self.source],
