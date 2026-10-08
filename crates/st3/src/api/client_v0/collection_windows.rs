@@ -471,7 +471,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let held = cached.as_ref().unwrap();
         *cached = Some(Arc::new(Cached {
-            revision: held.revision, period: held.period, valid_until_unix_ms: Some(200),
+            revision: held.revision, period: held.period,
+            valid_from: held.valid_from, valid_until: Some(200),
             items: held.items.clone(), has_more: held.has_more,
         }));
         drop(cached);
