@@ -24,6 +24,16 @@ const PAGE: usize = 128;
 pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 type Handles = Arc<Mutex<BTreeMap<String, Namespace>>>;
 
+#[cfg(test)]
+pub(crate) fn diagnostic(store: &Store) -> Result<String> {
+    store
+        .smalltalk
+        .ivm_agent_service
+        .get()
+        .context("agent source service is not installed")?
+        .diagnostic(store)
+}
+
 /// Retains opaque identity only. No SQL, cut, certificate or readiness is produced here.
 struct Observed {
     inner: kernel::Kernel,
