@@ -106,7 +106,7 @@ pub struct Context {
     pub person: String,
     pub cache_path: Option<std::path::PathBuf>,
     pub cached: Option<Model>,
-    /// `stui --glasses` / `--glass NAME`: open glasses instead of the sidebar layout, at the
+    /// `st ui --glasses` / `--glass NAME`: open glasses instead of the sidebar layout, at the
     /// named glass or the last one used on this device.
     pub glass: Option<Option<String>>,
 }
@@ -283,7 +283,7 @@ pub fn run(context: Context) -> Result<()> {
     ui.show_focused();
     if ui.glasses.is_none() {
         ui.flash(
-            "The classic layout is going away: plain stui opens spaces, with Ctrl+S for this list",
+            "The classic layout is going away: plain st opens spaces, with Ctrl+S for this list",
         );
     } else if std::env::args().any(|arg| arg == "--old") {
         ui.flash("The old screens are gone: this is spaces, and ? shows its keys");

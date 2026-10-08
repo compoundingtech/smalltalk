@@ -91,7 +91,7 @@ Every agent resource in the client API carries `subagents`: the ones running now
 ended and whose lease runs past the read. The read starts from the leases, through their indexes,
 so it costs what runs rather than all history, and a lease that runs out leaves the list at the
 next read without a claim. `st agents show` prints a `SUBAGENT` line for each, with what it
-does, its type and when it started. `st agents tree` hangs them beneath their agent. stui shows
+does, its type and when it started. `st agents tree` hangs them beneath their agent. The terminal UI shows
 them beneath the agent's row in the agents list and tree and in the details panel. They are part
 of the agent there: they select and click as the agent and have no actions of their own.
 

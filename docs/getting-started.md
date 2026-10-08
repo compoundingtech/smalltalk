@@ -38,7 +38,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 #### macOS Apple Silicon
 
-**Not yet verified on a fresh Mac:** the prebuilt tools need macOS 15+, `curl`, `tar`, and Python 3. The source installer (`scripts/install`) and extracted release installer put `st3` and `stui` inside `~/Applications/SmallTalk.app`, with links in your bin directory. macOS ties permissions, such as the microphone for stui's voice mode, to this stable app identity so grants can survive updates. Without a signing identity, the app is ad-hoc signed and macOS may ask again after each update. An optional Developer ID setting avoids that repeated approval; configure it **before installing**, using [macOS signing](st3/macos-installation.md).
+**Not yet verified on a fresh Mac:** the prebuilt tools need macOS 15+, `curl`, `tar`, and Python 3. The source installer (`scripts/install`) and extracted release installer put `st3` inside `~/Applications/SmallTalk.app`, with links in your bin directory. macOS ties permissions, such as the microphone for the terminal UI's voice mode, to this stable app identity so grants can survive updates. Without a signing identity, the app is ad-hoc signed and macOS may ask again after each update. An optional Developer ID setting avoids that repeated approval; configure it **before installing**, using [macOS signing](st3/macos-installation.md).
 
 The optional voice helper, `StListen.app`, needs Xcode with the macOS 26 SDK to build. You can use st without it; voice mode says when the helper is missing.
 
@@ -73,10 +73,10 @@ The command uses v0.3.16 as an example; choose a release after reading its Upgra
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' profile install github:compoundingtech/smalltalk/v0.3.16
-command -v st stui pty
+command -v st pty
 ```
 
-Nix builds `st3`, its `st` alias, `stui`, and `st3-migrate`, and supplies the pinned `pty` runtime and build dependencies. You do not need a separate Rust toolchain or PTY install. Use this **instead of** the archive route; the commands below are the same. Check that the paths above belong to your Nix profile, then continue with the daemon setup.
+Nix builds `st3`, its `st` alias, and `st3-migrate`, and supplies the pinned `pty` runtime and build dependencies. You do not need a separate Rust toolchain or PTY install. Use this **instead of** the archive route; the commands below are the same. Check that the paths above belong to your Nix profile, then continue with the daemon setup.
 
 For a declarative setup, use the [Home Manager module](home-manager.md): it installs the tools, writes the person configuration, and starts the user daemon on Linux or macOS. If that module owns your daemon, configure its person there and skip the manual config/service-install block in step 3. Lingering on Linux, macOS permissions, harness login, and fleet joining remain host setup. Nix profile installs use store paths; the macOS app-bundle setup above belongs to the source/release installers.
 
@@ -205,10 +205,10 @@ EOF
 st apply first-mission.kdl --as person/ada
 st missions start garden/first-note --id garden/first-note/one \
   --workspace "$PWD" --as person/ada
-stui
+st
 ```
 
-The new step wakes the seat automatically. In `stui`, open **Missions** and select `garden/first-note`; open **Agents** to see the worker. Use the sidebar or **Ctrl+K** to find them. **Ctrl+Q** quits the UI and leaves the work running.
+The new step wakes the seat automatically. In `st`, open **Missions** and select `garden/first-note`; open **Agents** to see the worker. Use the sidebar or **Ctrl+K** to find them. **Ctrl+Q** quits the UI and leaves the work running.
 
 Back in the shell, inspect the run. Once it says `completed`, read the result:
 
@@ -222,7 +222,7 @@ cat garden-note.md
 ```sh
 st conversations send agent/garden/worker --from person/ada \
   --subject 'Hello' --body 'What did you finish in the first mission?'
-stui
+st
 ```
 
 Open the worker under **Agents** to read its answer. Messages are conversation; put new work in a mission so its result is tracked.
@@ -268,7 +268,7 @@ at either socket path is never replaced; choose a different path instead.
 
 ## Next
 
-- [Using stui and the iOS app](stui-and-ios.md): follow work, talk to agents, and install the phone app.
+- [Using the terminal UI and the iOS app](stui-and-ios.md): follow work, talk to agents, and install the phone app.
 - [Two machines](two-machines.md): connect your machines and check graph replication.
 - [Missions in practice](missions-in-practice.md): revise work, queue runs, and ask for human decisions.
 - [Talking to agents](talking-to-agents.md): UI, phone, CLI, attachments, and structured requests.

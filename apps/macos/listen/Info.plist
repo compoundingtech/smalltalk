@@ -21,7 +21,7 @@
   <key>LSUIElement</key>
   <true/>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Small Talk listens while you dictate a message in stui, and transcribes it on this Mac.</string>
+  <string>Small Talk listens while you dictate a message in Small Talk, and transcribes it on this Mac.</string>
   <key>NSSpeechRecognitionUsageDescription</key>
   <string>Small Talk transcribes your dictated messages on this Mac.</string>
 </dict>

@@ -38,7 +38,7 @@ not replace it. The ready state is written before the diagnosis. Diagnostic and 
 are logged without failing admission or execution. The next evaluation records recovery when
 the run no longer waits for first readiness, and termination also closes the fault. Its durable
 fault and recovery history remain available. An open fault appears immediately in `st missions show
-mission-run/EXAMPLE`, `st doctor` (`mission-first-readiness`), and the mission blocker in stui.
+mission-run/EXAMPLE`, `st doctor` (`mission-first-readiness`), and the mission blocker in the terminal UI.
 The leaf mission-run response adds optional `scheduler_fault`. Mission client views project
 `state: "blocked"` while the fault is open and set `run.blocker.scope` to
 `"scheduler/first-readiness"` with the fault reason. Pending steps also show that reason. These

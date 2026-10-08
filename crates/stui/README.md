@@ -24,7 +24,7 @@ For a laptop without a daemon, run `st devices complete MEMBER_URL PAIRING_ID --
 single-use code, then run `st`. The paired member supplies the person identity. See
 [client-only setup](../../docs/st3/client-only.md) for gateway setup, multiple members, private
 credentials, offline cache, and automatic reconnect. `--client` requires a saved pairing;
-`--local` selects the local daemon even when a pairing exists. While offline, stui keeps its last
+`--local` selects the local daemon even when a pairing exists. While offline, the terminal UI keeps its last
 display, shows the last connection time, queues no mutations, and offers `r` to retry now.
 
 Keys (`?` shows them all): `Ctrl+K` opens anything (agents, missions, machines, spaces, and what
