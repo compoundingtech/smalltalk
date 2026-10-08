@@ -1,0 +1,19 @@
+24.04/baseline: PASS fresh-home: no existing st config or state
+24.04/baseline: PASS clean-tool-path: no gh, developer tools or provider binaries initially installed
+24.04/baseline: PASS archive-extracted: copied bytes match recorded archive; BUILD.json captured
+24.04/baseline: PASS guide-install: release installer as ada
+24.04/baseline: PASS linker-warning: clean stderr
+24.04/baseline: XFAIL release-version: st 0.1.0 — running from local source (f4cec96, 13 hours ago)
+24.04/baseline: XFAIL setup-command: setup subcommand absent in baseline
+24.04/baseline: XFAIL first-run-ui: plain st prints help instead of onboarding
+24.04/baseline: XFAIL first-run-person: requires a manually authored person config
+24.04/baseline: XFAIL daemon-down-guidance: human receives setup/start guidance
+24.04/baseline: PASS service-active: real systemd user service
+24.04/baseline: PASS doctor-no-failure: doctor has no failed check
+24.04/baseline: XFAIL doctor-user-tools: developer-tool warnings absent
+24.04/baseline: PASS now-no-gh: no gh CLI installed
+24.04/baseline: XFAIL missing-harness: systemd 249 option failure or bounded silent start loop
+24.04/baseline: XFAIL plain-mcp-idle: channel exits instead of idling when subject is absent
+24.04/baseline: PASS machine-restart: Docker restart is a container restart; Incus is a real guest restart
+24.04/baseline: XFAIL survives-reboot: guide omitted lingering
+24.04/baseline: {"PASS": 9, "XFAIL": 9}

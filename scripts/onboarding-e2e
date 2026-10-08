@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""Manual clean-machine onboarding rig; no builds, paid models, or CI VM runs."""
+import argparse
+import collections
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import uuid
+import urllib.request
+
+DOCKERFILE = '''ARG UBUNTU=22.04
+FROM ubuntu:${UBUNTU}
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv dbus dbus-user-session libpam-systemd python3 curl ca-certificates \\
+ && rm -rf /var/lib/apt/lists/* \\
+ && if getent passwd 1000 >/dev/null; then userdel $(getent passwd 1000 | cut -d: -f1); fi \\
+ && useradd -m -u 1000 -s /bin/bash ada \\
+ && systemctl mask getty@tty1.service console-getty.service
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
+'''
+
+# Same device-attributes handshake, dimensions and Ctrl+Q as the TUI PTY smoke suite.
+# The UI owner confirmed the marker and Home palette spelling for the fold.
+PTY_PROBE = r'''
+import fcntl,json,os,pty,re,select,signal,struct,subprocess,sys,termios,time
+request=json.loads(sys.argv[1])
+master,slave=pty.openpty()
+fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack("HHHH",32,120,0,0))
+env=dict(os.environ,TERM="xterm-256color")
+for key in ("ST_AGENT","ST3_INCARNATION","ST3_ENDPOINT"): env.pop(key,None)
+proc=subprocess.Popen(request["argv"],stdin=slave,stdout=slave,stderr=slave,env=env,start_new_session=True)
+os.close(slave)
+raw=bytearray(); handled=[]; frame=False; navigated=False; quit_sent=False; home_start=0
+deadline=time.monotonic()+request.get("timeout",45)
+rules=[("Your name",b"ada\r"),("This machine's name",b"studio\r"),
+       ("Keep st running in the background",b"\r"),("The st daemon is not running. Start it?",b"\r"),
+       ("Which harness",b"1\r")]
+while time.monotonic()<deadline:
+ if select.select([master],[],[],0.1)[0]:
+  try: chunk=os.read(master,65536)
+  except OSError: break
+  raw.extend(chunk)
+  if b"\x1b[c" in chunk: os.write(master,b"\x1b[?62;c")
+  plain=re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]",b"",raw)
+  compact=re.sub(rb"\s+",b"",plain)
+  for text,answer in rules:
+   if text not in handled and re.sub(rb"\s+",b"",text.encode()) in compact:
+    os.write(master,answer); handled.append(text)
+  # Never answer passwords or provider login requests.
+  if b"\x1b[?1049h" in raw and b" working" in plain and not frame:
+   frame=True; os.write(master,b"\x0b"); time.sleep(0.2); os.write(master,b"home"); time.sleep(0.2); os.write(master,b"\r")
+   navigated=True; home_start=len(raw); quit_at=time.monotonic()+2
+  if frame and not quit_sent and time.monotonic()>=quit_at:
+   os.write(master,b"\x11"); quit_sent=True
+ if proc.poll() is not None: break
+if proc.poll() is None:
+ os.killpg(proc.pid,signal.SIGTERM)
+ try: proc.wait(timeout=3)
+ except subprocess.TimeoutExpired: os.killpg(proc.pid,signal.SIGKILL); proc.wait()
+os.close(master)
+plain=re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]",b"",raw).decode(errors="replace")
+home=re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]",b"",raw[home_start:]).decode(errors="replace") if navigated else ""
+print(json.dumps({"argv":request["argv"],"exit":proc.returncode,"frame":frame,
+ "home_navigation":navigated,"home_frame":any(s in home for s in ("Now","Nothing needs you","Checking what needs you")),"quit_sent":quit_sent,"answers":handled,
+ "restored":b"\x1b[?1049l" in raw,"screen":plain}))
+'''
+
+SCENARIOS = ("baseline", "setup", "first-run", "no-harness", "claude-policy-absent",
+    "claude-policy-present", "codex", "both", "no-gh", "gh-logged-out", "gh-broken",
+    "no-manager", "hostname-localhost", "hostname-spaces", "hostname-long",
+    "existing-store", "linger-on", "linger-off")
+
+def command(argv, **kwargs):
+    return subprocess.run(argv, capture_output=True, **kwargs)
+
+class Machine:
+    def __init__(self, args, ubuntu, scenario):
+        self.args,self.ubuntu,self.scenario=args,ubuntu,scenario
+        self.name="st-onboarding-"+uuid.uuid4().hex[:12]
+        self.created=False
+        self.uid=1000
+
+    def prefix(self, root=False):
+        if self.args.backend=="docker":
+            if root: return ["docker","exec","-i",self.name]
+            return ["docker","exec","-i","-u","ada","-e","HOME=/home/ada",
+                    "-e",f"XDG_RUNTIME_DIR=/run/user/{self.uid}",
+                    "-e",f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{self.uid}/bus",self.name]
+        if self.args.backend=="incus":
+            base=["incus","exec",self.name,"--force-noninteractive","--"]
+            if not root: base += ["runuser","-u","ada","--","env","HOME=/home/ada",
+                f"XDG_RUNTIME_DIR=/run/user/{self.uid}",f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{self.uid}/bus"]
+            return base
+        value=os.environ.get("ST_VM_ROOT_EXEC" if root else "ST_VM_EXEC")
+        if not value: raise RuntimeError("set "+("ST_VM_ROOT_EXEC" if root else "ST_VM_EXEC"))
+        return shlex.split(value)
+
+    def run(self, script, root=False, timeout=75):
+        # The transport is argv, never eval. Scripts arrive on stdin in a fresh login shell.
+        start=time.monotonic()
+        try:
+            r=command(self.prefix(root)+["bash","-l","-s"],input=script.encode(),timeout=timeout)
+            return {"script":script,"exit":r.returncode,"stdout":r.stdout.decode(errors="replace"),
+                "stderr":r.stderr.decode(errors="replace"),"seconds":round(time.monotonic()-start,3)}
+        except subprocess.TimeoutExpired as e:
+            return {"script":script,"exit":124,"stdout":(e.stdout or b"").decode(errors="replace"),
+                "stderr":(e.stderr or b"").decode(errors="replace"),"seconds":round(time.monotonic()-start,3)}
+
+    def send(self, data, path):
+        r=command(self.prefix()+["bash","-c","mkdir -p ~/smalltalk-install; cat > "+shlex.quote(path)],input=data,timeout=60)
+        if r.returncode: raise RuntimeError(r.stderr.decode(errors="replace"))
+
+    def start(self):
+        if self.args.backend=="external": return
+        if self.args.backend=="incus":
+            r=command(["incus","launch",f"images:ubuntu/{self.ubuntu}/cloud",self.name,"--vm",
+                "-c","limits.cpu=2","-c","limits.memory=3GiB"],timeout=300)
+        else:
+            image=self.args.image or "st-onboarding-ubuntu-"+self.ubuntu
+            if not self.args.image:
+                with tempfile.TemporaryDirectory(prefix="st-onboarding-image-") as d:
+                    Path(d,"Dockerfile").write_text(DOCKERFILE)
+                    r=command(["docker","build","--build-arg","UBUNTU="+self.ubuntu,"-t",image,d],timeout=300)
+                    if r.returncode: raise RuntimeError(r.stderr.decode(errors="replace"))
+            hostname={"hostname-localhost":"localhost","hostname-long":"x"*63}.get(self.scenario,"studio")
+            argv=["docker","run","-d","--name",self.name,"--hostname",hostname,"--cpus","2","--memory","3g"]
+            if self.scenario=="no-manager": argv += [image,"sleep","infinity"]
+            else: argv += ["--privileged","--cgroupns=private","--tmpfs","/run","--tmpfs","/run/lock",image]
+            r=command(argv,timeout=60)
+        if r.returncode: raise RuntimeError(r.stderr.decode(errors="replace"))
+        self.created=True
+        if self.args.backend=="incus":
+            r=self.run("cloud-init status --wait",root=True,timeout=180)
+            if r["exit"]: raise RuntimeError(str(r))
+            r=self.run("set -e\napt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y python3 curl ca-certificates dbus-user-session\nid ada || useradd -m -s /bin/bash ada",root=True,timeout=240)
+            if r["exit"]: raise RuntimeError(str(r))
+            self.uid=int(self.run("id -u ada",root=True)["stdout"].strip())
+        if self.scenario!="no-manager":
+            until=time.monotonic()+40
+            while time.monotonic()<until:
+                r=self.run("systemctl start user@"+str(self.uid)+".service",root=True,timeout=10)
+                if r["exit"]==0: break
+                time.sleep(0.5)
+            else: raise RuntimeError("systemd user manager failed to start")
+        if self.scenario=="hostname-spaces":
+            # Kernel hostnames cannot contain spaces. hostnamectl's pretty name can.
+            self.run("hostnamectl --pretty set-hostname 'Ada Studio'",root=True)
+        if self.scenario=="linger-on": self.run("loginctl enable-linger ada",root=True)
+
+    def reboot(self):
+        if self.args.backend=="docker": return command(["docker","restart",self.name],timeout=60).returncode==0
+        before=self.run("cat /proc/sys/kernel/random/boot_id",root=True,timeout=10)
+        if before["exit"] or not before["stdout"].strip(): return False
+        if self.args.backend=="incus":
+            if command(["incus","restart",self.name],timeout=120).returncode: return False
+        elif os.environ.get("ST_VM_REBOOT"):
+            if command(shlex.split(os.environ["ST_VM_REBOOT"]),timeout=120).returncode: return False
+        else: self.run("systemctl reboot",root=True,timeout=10)
+        # An immediate successful exec may still be the old boot. Require a new boot ID.
+        deadline=time.monotonic()+180
+        while time.monotonic()<deadline:
+            after=self.run("cat /proc/sys/kernel/random/boot_id",root=True,timeout=5)
+            if after["exit"]==0 and after["stdout"].strip() and after["stdout"]!=before["stdout"]: return True
+            time.sleep(2)
+        return False
+
+    def close(self):
+        if not self.created or self.args.keep: return
+        argv=["docker","rm","-f",self.name] if self.args.backend=="docker" else ["incus","delete","--force",self.name]
+        r=command(argv,timeout=60)
+        if r.returncode: raise RuntimeError("cleanup failed: "+r.stderr.decode(errors="replace"))
+
+def unwrap(v):
+    return v.get("value",v) if isinstance(v,dict) else v
+
+def mission_runs(page):
+    if not isinstance(page,dict) or not isinstance(page.get("items"),list): return None
+    return sorted((item["id"], sorted(item.get("runs",[]))) for item in page["items"])
+
+class Run:
+    def __init__(self,machine,out,archive,metadata):
+        self.m,self.out,self.archive,self.metadata=machine,out,archive,metadata
+        out.mkdir(parents=True)
+        self.commands=[]; self.checks=[]
+        self.st="st"
+
+    def execute(self,title,script,**kw):
+        r=self.m.run(script,**kw); r["title"]=title; self.commands.append(r); self.save(); return r
+
+    def check(self,key,ok,detail,expected=False):
+        status=("XPASS" if ok else "XFAIL") if expected else ("PASS" if ok else "FAIL")
+        self.checks.append({"id":key,"status":status,"detail":detail})
+        print(f"{self.m.ubuntu}/{self.m.scenario}: {status} {key}: {detail}",flush=True)
+        self.save(); return ok
+
+    def save(self):
+        result={"ubuntu":self.m.ubuntu,"scenario":self.m.scenario,"backend":self.m.args.backend,
+            "machine":self.m.name,"archive":self.metadata,"checks":self.checks,"commands":self.commands}
+        (self.out/"result.json").write_text(json.dumps(result,indent=2)+"\n")
+        lines=[f"# Onboarding: {self.m.ubuntu} / {self.m.scenario}","",f"Archive SHA256: `{self.metadata['sha256']}`.",""]
+        lines += [f"- **{c['status']}** `{c['id']}`: {c['detail']}" for c in self.checks]
+        for c in self.commands:
+            lines += ["",f"## {c['title']}","","```sh",c['script'],"```","",f"Exit {c['exit']}, {c['seconds']} seconds.","","```",c['stdout']+c['stderr'],"```"]
+        (self.out/"report.md").write_text("\n".join(lines)+"\n")
+
+    def output(self,r): return r["stdout"]+r["stderr"]
+
+    def cli(self,title,*argv,timeout=75):
+        return self.execute(title,shlex.join([self.st,*argv]),timeout=timeout)
+
+    def json_cli(self,title,*argv):
+        r=self.cli(title,*argv,"--json")
+        if r["exit"]: return None
+        try: return unwrap(json.loads(r["stdout"]))
+        except ValueError: return None
+
+    def pty(self,title,argv):
+        request=json.dumps({"argv":argv,"timeout":55})
+        r=self.execute(title,shlex.join(["python3","-c",PTY_PROBE,request]),timeout=65)
+        try: return json.loads(r["stdout"])
+        except ValueError: return {"frame":False,"screen":self.output(r),"exit":r["exit"]}
+
+    def install(self,baseline):
+        r=self.execute("Fresh machine", "id; cat /etc/os-release; systemctl --version | head -1; test ! -e ~/.config/st3 && test ! -e ~/.local/state/st3")
+        if not self.check("fresh-home",r["exit"]==0,"no existing st config or state"): return False
+        if not self.check("guest-release",f'VERSION_ID="{self.m.ubuntu}"' in r["stdout"],"actual guest matches requested Ubuntu release"): return False
+        tools=self.execute("No developer tools or harnesses", "for t in gh cargo rustc mold sccache nix claude codex opencode pi omp; do command -v \"$t\" || true; done")
+        self.check("clean-tool-path",not tools["stdout"].strip(),"no gh, developer tools or provider binaries initially installed")
+        self.m.send(self.archive.read_bytes(),"/home/ada/smalltalk-install/candidate.tar.gz")
+        pkg=self.metadata["package"]
+        r=self.execute("Extract verified archive", "set -e\ncd ~/smalltalk-install\nsha256sum candidate.tar.gz\ntar -xzf candidate.tar.gz\ncat "+shlex.quote(pkg+"/BUILD.json"))
+        if not self.check("archive-extracted",r["exit"]==0 and r["stdout"].split()[0]==self.metadata["sha256"],"copied bytes match recorded archive; BUILD.json captured"): return False
+        self.pkg="/home/ada/smalltalk-install/"+pkg
+        self.st=self.pkg+"/bin/st"
+        if baseline:
+            r=self.execute("Guide installer",shlex.join([self.pkg+"/install.sh","--bin-dir","/home/ada/.local/bin"]))
+            if not self.check("guide-install",r["exit"]==0,"release installer as ada"): return False
+            self.st="/home/ada/.local/bin/st"
+        return True
+
+    def baseline(self):
+        if not self.install(True): return
+        v=self.cli("Release version","--version"); text=self.output(v)
+        self.check("linker-warning","weak version" not in text,"GLIBC_2.39 weak-version warning" if "weak version" in text else "clean stderr",self.m.ubuntu=="22.04")
+        self.check("release-version","running from local source" not in text,text.strip(),True)
+        r=self.cli("Setup availability","setup","--help")
+        self.check("setup-command",r["exit"]==0,"setup subcommand absent in baseline",True)
+        p=self.pty("Bare st before configuration",[self.st])
+        self.check("first-run-ui",p.get("frame",False),"plain st prints help instead of onboarding",True)
+        r=self.cli("No person configured","now")
+        self.check("first-run-person",r["exit"]==0,"requires a manually authored person config",True)
+        r=self.cli("Daemon down","doctor")
+        self.check("daemon-down-guidance",bool(re.search(r"run [`']?st( setup)?[`']?",self.output(r),re.I)),"human receives setup/start guidance",True)
+        self.execute("Guide's manual configuration", "mkdir -p ~/.config/st3; printf 'person = \"person/ada\"\\n' > ~/.config/st3/config.toml")
+        self.cli("User service install","service","install")
+        status=self.cli("Service status","service","status")
+        if not self.check("service-active","active/running" in self.output(status),"real systemd user service"): return
+        self.execute("Try lingering without elevated access","loginctl --no-ask-password enable-linger ada; loginctl show-user ada -p Linger")
+        d=self.cli("Doctor","doctor")
+        self.check("doctor-no-failure",not re.search(r"^fail\b",self.output(d),re.M),"doctor has no failed check")
+        self.check("doctor-user-tools",not re.search(r"^warn.*(cargo|rustc|nix|sccache|mold|gh\b)",self.output(d),re.M|re.I),"developer-tool warnings absent",True)
+        r=self.cli("Now without gh","now")
+        self.check("now-no-gh",r["exit"]==0,"no gh CLI installed")
+        r=self.cli("Missing harness with bounded wait","agents","new","onboarding/seat","--harness","claude","--workspace","/home/ada/work",timeout=15)
+        text="\n".join(x for x in self.output(r).splitlines() if "weak version" not in x)
+        clear="spawn PTY failed" not in text and bool(re.search(r"(not (found|installed|executable)|harness.*missing|install (claude|codex))",text,re.I))
+        known="--expand-environment=no" in text or "Still starting" in text or "waiting" in text.lower() or r["exit"]==124
+        self.check("missing-harness",clear,"systemd 249 unsupported option" if "--expand-environment=no" in text else "bounded silent start loop" if known else text[-300:],known)
+        self.cli("Stop baseline seat","agents","stop","agent/onboarding/seat")
+        r=self.cli("Plain Claude MCP without a subject","driver","claude-mcp")
+        self.check("plain-mcp-idle",r["exit"]==0,"channel exits instead of idling when subject is absent",True)
+        self.reboot_check(baseline=True)
+
+    def setup(self):
+        if not self.install(False): return
+        scenario=self.m.scenario
+        if scenario in ("gh-logged-out","gh-broken"):
+            body="#!/bin/sh\necho 'fixture gh unavailable' >&2\nexit "+("127" if scenario=="gh-broken" else "1")+"\n"
+            self.execute("Logged-out/broken gh fixture","mkdir -p ~/.local/bin; printf %s "+shlex.quote(body)+" > ~/.local/bin/gh; chmod +x ~/.local/bin/gh")
+        if scenario in ("claude-policy-absent","claude-policy-present","codex","both","no-gh","gh-logged-out","gh-broken"):
+            self.install_harnesses(scenario)
+        interactive=scenario in ("first-run","hostname-localhost","hostname-spaces","hostname-long","both")
+        if not interactive:
+            self.execute("Config merge sentinel","mkdir -p ~/.config/st3; printf '[checkpoint]\\nenabled = false\\n' > ~/.config/st3/config.toml")
+        service="true"
+        argv=[self.st,"setup","--person","ada","--node","studio","--yes","--service",service]
+        if scenario=="existing-store":
+            r=self.execute("Seed existing store",shlex.join(argv))
+            if not self.check("seed-store",r["exit"]==0,"first setup creates real state before the second run"): return
+            source='version 2\nmission "fixture/fleet-existing" state="ready" {\n goal "Preserve an existing fleet run."\n step "hold" { assigned-to "person/ada" goal "Manual fixture hold." }\n}\n'
+            self.m.send(source.encode(),"/home/ada/smalltalk-install/existing.kdl")
+            r=self.cli("Publish existing fleet mission","apply","/home/ada/smalltalk-install/existing.kdl","--as","person/ada")
+            if not self.check("existing-mission-published",r["exit"]==0,"unrelated mission published to the existing store"): return
+            r=self.cli("Start existing fleet run","missions","start","fixture/fleet-existing","--id","fixture-existing","--as","person/ada")
+            if not self.check("existing-fleet-run",r["exit"]==0,"real unrelated run exists before setup repeats"): return
+            existing_before=self.json_cli("Existing runs before setup","missions","ls","--all")
+        if interactive:
+            p=self.pty("Scripted first terminal run",[self.st]); ok=p.get("frame",False)
+            text=p.get("screen","")
+            self.check("first-run-questions",all(x in p.get("answers",[]) for x in ("Your name","This machine's name","Keep st running in the background")),"name, machine and default service answered in PTY")
+            if scenario=="both":
+                self.check("harness-choice",p.get("answers",[]).count("Which harness")==1,"several harnesses ask one choice; scripted selection is Claude")
+        else:
+            r=self.execute("Setup flags",shlex.join(argv)); ok=r["exit"]==0; text=self.output(r)
+        if not self.check("setup-success",ok,"real candidate setup completed"): return
+        if scenario=="existing-store":
+            existing_after=self.json_cli("Existing runs after setup","missions","ls","--all")
+            self.check("existing-store-preserved",mission_runs(existing_before) is not None and mission_runs(existing_before)==mission_runs(existing_after),"setup preserves existing fleet run and adds no onboarding")
+        r=self.execute("Merged persistent configuration","cat ~/.config/st3/config.toml; readlink ~/.local/bin/st; test -x ~/.local/bin/st3 && test -x ~/.local/bin/pty")
+        config=self.output(r)
+        self.check("configured-person",bool(re.search(r'person\s*=\s*"person/ada"',config)),"person/ada persisted")
+        self.check("configured-node",bool(re.search(r'node\s*=\s*"studio"',config)),"node persisted and is not local")
+        if not interactive:
+            self.check("config-merge",bool(re.search(r'enabled\s*=\s*false',config)),"existing checkpoint setting preserved")
+        self.check("self-install",r["exit"]==0 and re.search(r"^st3$",config,re.M) is not None,"st3, relative st link and pty installed")
+        self.st="/home/ada/.local/bin/st"
+        if scenario!="no-manager":
+            r=self.cli("Service status","service","status")
+            self.check("service-active","active/running" in self.output(r),"user service is active/running")
+        else:
+            self.check("foreground-note",bool(re.search(r"(reboot|background|service|foreground)",text,re.I)),"detached fallback lifetime explained")
+        r=self.execute("Fresh login PATH","command -v st; st now")
+        self.check("login-path",r["exit"]==0 and "/home/ada/.local/bin/st" in self.output(r),"st resolves in a fresh login shell")
+        r=self.cli("Doctor without development tools","doctor")
+        self.check("doctor-healthy",r["exit"]==0 and not re.search(r"^fail\b",self.output(r),re.M),"ordinary doctor healthy")
+        self.check("doctor-user-tools",not re.search(r"^warn.*(cargo|rustc|nix|sccache|mold|gh\b)",self.output(r),re.M|re.I),"no irrelevant tool warnings")
+        if scenario!="no-manager" and "Linger=yes" not in self.output(self.execute("Lingering status","loginctl show-user ada -p Linger")):
+            self.check("linger-guidance","loginctl" in text and "enable-linger" in text,"exact command printed when lingering is refused")
+        p=self.pty("Plain st renders; palette selects Home/Now",[self.st])
+        self.check("tui-frame",p.get("frame",False) and p.get("home_frame",False) and p.get("quit_sent",False) and p.get("restored",False) and p.get("exit")==0,"first frame, visible Home/Now, Ctrl+Q and terminal restoration")
+        if scenario not in ("setup","first-run","hostname-localhost","hostname-spaces","hostname-long","no-manager","linger-on","linger-off","existing-store"):
+            self.onboarding_checks(scenario)
+        before=self.json_cli("Runs before rerun","missions","ls","--all")
+        r=self.cli("Idempotent setup","setup","--person","ada","--node","studio","--yes","--service",service)
+        after=self.json_cli("Runs after rerun","missions","ls","--all")
+        self.check("idempotent-setup",r["exit"]==0 and before is not None and mission_runs(before) is not None and mission_runs(before)==mission_runs(after),"second setup creates no second mission run")
+        if scenario.startswith("hostname-"):
+            for invalid in ("local","Ada Studio","x"*64):
+                r=self.cli("Refuse invalid machine name "+repr(invalid),"setup","--person","ada","--node",invalid,"--yes","--start","false")
+                self.check("reject-node-"+str(len(invalid)),r["exit"]!=0,"reserved, spaced and overlong machine names rejected")
+        if self.m.args.strict_release:
+            r=self.cli("Release version and loader stderr","--version")
+            self.check("release-version",r["exit"]==0 and not r["stderr"] and "running from local source" not in r["stdout"],"release-looking version and clean stderr")
+            r=self.execute("Retired executable absent","test ! -e ~/.local/bin/stui")
+            self.check("archive-no-stui",r["exit"]==0,"no stui executable installed")
+        self.reboot_check()
+
+    def install_harnesses(self,scenario):
+        fixtures=self.m.args.fixtures
+        if fixtures is None: raise RuntimeError("stub harness scenarios require --fixtures scripts/st3-boot-canaries")
+        with tempfile.TemporaryDirectory(prefix="st-onboarding-fixtures-") as d:
+            bundle=Path(d,"fixtures.tar")
+            with tarfile.open(bundle,"w") as t:
+                for name in ("stub-claude.py","stub-codex.py","stubmodel.py","codex-schemas"):
+                    t.add(fixtures/name,arcname=name)
+            self.m.send(bundle.read_bytes(),"/home/ada/smalltalk-install/fixtures.tar")
+        self.execute("Native provider fixture install","mkdir -p ~/.local/lib/onboarding-stubs ~/.local/bin; tar -xf ~/smalltalk-install/fixtures.tar -C ~/.local/lib/onboarding-stubs")
+        adapter=Path(__file__).resolve().parent/"onboarding-fixtures/claude.py"
+        if not adapter.is_file(): raise RuntimeError("harness scenarios require scripts/onboarding-fixtures/claude.py")
+        self.m.send(adapter.read_bytes(),"/home/ada/smalltalk-install/claude-adapter.py")
+        self.execute("Claude plugin/dialog adapter","cp ~/smalltalk-install/claude-adapter.py ~/.local/lib/onboarding-stubs/claude-adapter.py")
+        harnesses=["claude","codex"] if scenario=="both" else ["claude" if scenario.startswith("claude-") else "codex"]
+        for h in harnesses:
+            entry="claude-adapter.py" if h=="claude" else "stub-codex.py"
+            wrapper=f'#!/bin/sh\nexec python3 "$HOME/.local/lib/onboarding-stubs/{entry}" "$@"\n'
+            self.execute("Put "+h+" on login PATH","printf %s "+shlex.quote(wrapper)+" > ~/.local/bin/"+h+"; chmod +x ~/.local/bin/"+h)
+        if scenario=="claude-policy-present":
+            # The product verifies its own exact fragment, including formatting.
+            policy=json.dumps({"channelsEnabled":True,"allowedChannelPlugins":[{"marketplace":"st","plugin":"st-channel"}]},indent=2,sort_keys=True)+"\n"
+            self.execute("Fixture managed policy", "mkdir -p /etc/claude-code/managed-settings.d; printf %s "+shlex.quote(policy)+" > /etc/claude-code/managed-settings.d/50-st-channel.json",root=True)
+
+    def onboarding_checks(self,scenario):
+        if scenario=="no-harness":
+            self.check("no-harness-explained",bool(re.search(r"(no .*harness|no .*provider|install (claude|codex)|harness.*not .*found)","\n".join(c["stdout"]+c["stderr"] for c in self.commands if c["title"]=="Setup flags"),re.I)),"wizard explains that no provider is installed")
+            seats=self.json_cli("All seats without a harness","agents","ls","--all")
+            runs=self.json_cli("All missions without a harness","missions","ls","--all")
+            self.check("no-harness-no-seat",isinstance(seats,dict) and isinstance(seats.get("items"),list) and not any(s["id"]=="agent/st/expert" for s in seats["items"]),"no expert created without a harness; daemon list succeeds")
+            self.check("no-harness-no-mission",isinstance(runs,dict) and isinstance(runs.get("items"),list) and not any(m["id"]=="mission/st/onboarding" for m in runs["items"]),"no onboarding mission created without a harness; daemon list succeeds")
+            r=self.cli("Missing harness diagnosis","agents","new","fixture/missing","--harness","claude","--workspace","/home/ada/work",timeout=8)
+            text="\n".join(line for line in self.output(r).splitlines() if "weak version" not in line)
+            self.check("missing-harness",r["exit"] not in (0,124) and bool(re.search(r"(not (found|installed|executable)|harness.*missing|install claude)",text,re.I)) and "spawn PTY failed" not in text,"clear diagnosis within eight seconds")
+        else:
+            deadline=time.monotonic()+35
+            while True:
+                seats=self.json_cli("Expert seat","agents","show","agent/st/expert","--all")
+                incarnation=isinstance(seats,dict) and (seats.get("incarnation_id") or seats.get("operational",{}).get("runtime_incarnation"))
+                ready=bool(incarnation and seats.get("reachability")=="reachable" and not seats.get("fault"))
+                if ready or time.monotonic()>=deadline: break
+                time.sleep(1)
+            self.check("expert-incarnation",ready,"expert has a reachable observed incarnation without a fault")
+            runs=self.json_cli("Onboarding runs","missions","show","mission/st/onboarding")
+            self.check("onboarding-once",isinstance(runs,dict) and isinstance(runs.get("runs"),list) and len(runs["runs"])==1,"one built-in onboarding run")
+            # Provider receipts are the evidence of the selected route and mailbox consumption.
+            while True:
+                r=self.execute("Stub provider receipts","find ~ -name 'receipts-agent-st-expert.jsonl' -exec cat {} +")
+                records=[json.loads(line) for line in r["stdout"].splitlines() if line.startswith("{")]
+                read=any(x.get("event")=="read" and x.get("exit")==0 for x in records)
+                if read or time.monotonic()>=deadline: break
+                time.sleep(1)
+            self.check("expert-read-message",read,"native fixture successfully consumed a graph message")
+            receipts=r["stdout"]
+            if scenario.startswith("claude-policy"):
+                flag="--channels" if scenario.endswith("present") else "--dangerously-load-development-channels"
+                self.check("claude-route",flag in receipts,"correct policy/development route")
+                if scenario.endswith("absent"):
+                    self.check("claude-dialog",any(x.get("event")=="development-consent" and x.get("accepted") for x in records),"driver answered development dialog")
+            if scenario in ("no-gh","gh-logged-out","gh-broken"):
+                r=self.cli("Optional GitHub watch refuses clearly","gh","watch","example/fixture#1","--as","person/ada",timeout=8)
+                self.check("gh-optional",r["exit"] not in (0,124) and bool(re.search(r"(not (found|installed|authenticated)|unavailable|auth|log.?in|could not|failed.*gh|gh.*failed)",self.output(r),re.I)) and "unexpected argument" not in self.output(r),"unavailable GitHub integration returns a clear error without hanging")
+            if self.m.args.require_wrap_up:
+                deadline=time.monotonic()+self.m.args.mission_timeout
+                while True:
+                    runs=self.json_cli("Mission completion","missions","show","mission/st/onboarding")
+                    done=isinstance(runs,dict) and any(x.get("status")=="completed" for x in runs.get("run_details",[]))
+                    if done or time.monotonic()>=deadline: break
+                    time.sleep(2)
+                self.check("mission-wrap-up",done,"onboarding actually completed; native fixtures alone do not prove model behavior")
+        r=self.cli("Plain Claude MCP without a subject","driver","claude-mcp",timeout=5)
+        self.check("plain-mcp-idle",r["exit"]==0 and not r["stdout"],"no notifications or error outside a seat")
+
+    def reboot_check(self,baseline=False):
+        if self.m.args.no_reboot or self.m.scenario=="no-manager": return
+        linger=self.execute("Lingering before reboot","loginctl show-user ada -p Linger")
+        expected="Linger=yes" in self.output(linger)
+        if not self.check("machine-restart",self.m.reboot(),"Docker restart is a container restart; Incus is a real guest restart"): return
+        time.sleep(3)
+        # Root-only probe first: a test-user login would start its user manager and hide failure.
+        r=self.execute("After restart, before test-user login",f"systemctl is-active user@{self.m.uid}.service",root=True)
+        active=r["stdout"].strip()=="active"
+        if baseline: self.check("survives-reboot",active,"guide omitted lingering",True)
+        else: self.check("linger-reboot-behavior",active==expected,"manager survives only when lingering enabled")
+        if active:
+            r=self.cli("Service after reboot","service","status")
+            self.check("service-returned","active/running" in self.output(r),"daemon returned before user login")
+        if not active and not baseline and self.m.scenario=="linger-off":
+            self.check("linger-off-warning",any("enable-linger" in c["stdout"]+c["stderr"] for c in self.commands if c["title"]=="Setup flags"),"wizard explained the action needed for logout/reboot")
+
+def load_archive(args,directory):
+    value=args.archive or "https://github.com/compoundingtech/smalltalk/releases/download/v0.3.17/smalltalk-x86_64-unknown-linux-gnu.tar.gz"
+    if value.startswith(("https://","http://")):
+        archive=Path(directory,"candidate.tar.gz")
+        with urllib.request.urlopen(value,timeout=45) as r,archive.open("wb") as out: shutil.copyfileobj(r,out)
+        expected=args.sha256 or urllib.request.urlopen(value+".sha256",timeout=30).read().decode().split()[0]
+    else:
+        archive=Path(value).resolve()
+        expected=args.sha256 or Path(str(archive)+".sha256").read_text().split()[0]
+    with archive.open("rb") as source:
+        digest=hashlib.file_digest(source,"sha256").hexdigest() if hasattr(hashlib,"file_digest") else hashlib.sha256(source.read()).hexdigest()
+    if expected!=digest: raise RuntimeError("archive SHA256 mismatch")
+    with tarfile.open(archive) as t:
+        for m in t.getmembers():
+            p=PurePosixPath(m.name)
+            if p.is_absolute() or ".." in p.parts or m.isdev(): raise RuntimeError("unsafe archive member")
+            if (m.issym() or m.islnk()) and (PurePosixPath(m.linkname).is_absolute() or ".." in PurePosixPath(m.linkname).parts): raise RuntimeError("unsafe archive link")
+        build=next(m for m in t.getmembers() if m.name.endswith("/BUILD.json"))
+        package=str(PurePosixPath(build.name).parent)
+        metadata=json.load(t.extractfile(build))
+        for required in ("bin/st3","bin/st","bin/pty"):
+            t.getmember(package+"/"+required)
+    return archive,{"sha256":digest,"package":package,"build":metadata}
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode",nargs="?",choices=("baseline","setup"))
+    parser.add_argument("--scenario",action="append",choices=SCENARIOS)
+    parser.add_argument("--ubuntu",action="append",choices=("22.04","24.04"))
+    parser.add_argument("--archive",help="release URL or local archive; local input needs adjacent .sha256")
+    parser.add_argument("--sha256",help="expected archive hash, for an immutable local candidate")
+    parser.add_argument("--out",type=Path,required=True)
+    parser.add_argument("--backend",choices=("docker","incus","external"),default="external" if Path(sys.argv[0]).name=="onboarding-vm-test" else "docker")
+    parser.add_argument("--image",help="prebuilt Docker image implementing the embedded clean-systemd recipe")
+    parser.add_argument("--fixtures",type=Path,default=Path(__file__).resolve().parent/"st3-boot-canaries")
+    parser.add_argument("--strict-release",action="store_true")
+    parser.add_argument("--require-wrap-up",action="store_true",help="also require mission completion; basic native fixtures only read and claim")
+    parser.add_argument("--mission-timeout",type=int,default=90)
+    parser.add_argument("--no-reboot",action="store_true")
+    parser.add_argument("--keep",action="store_true",help="retain only this run's named disposable instances")
+    args=parser.parse_args()
+    scenarios=args.scenario or [args.mode or "setup"]
+    if args.mode and args.scenario: parser.error("use mode or --scenario")
+    if any(s!="baseline" for s in scenarios) and not args.archive: parser.error("candidate scenarios require --archive")
+    if args.backend in ("incus","external") and any(os.environ.get(k) for k in ("CI","GITHUB_ACTIONS","BUILDKITE")):
+        parser.error("real-machine backends are manual only and are refused in CI")
+    if args.backend=="incus" and (not shutil.which("incus") or not os.access("/dev/kvm",os.R_OK|os.W_OK)):
+        parser.error("Incus or /dev/kvm access unavailable; see the manual runbook. No password is requested")
+    if args.backend=="external" and (not os.environ.get("ST_VM_EXEC") or not args.ubuntu): parser.error("external backend requires ST_VM_EXEC and --ubuntu for the actual guest release")
+    if args.backend=="external" and (len(scenarios)!=1 or len(args.ubuntu or [])>1): parser.error("external backend targets exactly one fresh machine")
+    if args.out.exists(): parser.error("output directory already exists")
+    failed=False
+    # Shared host slot: every matrix scenario is sequential, never concurrent.
+    lock=open("/tmp/st-onboarding-container.lock","a")
+    fcntl.flock(lock,fcntl.LOCK_EX)
+    with tempfile.TemporaryDirectory(prefix="st-onboarding-archive-") as directory:
+        try: archive,metadata=load_archive(args,directory)
+        except (OSError,ValueError,RuntimeError,tarfile.TarError,StopIteration,KeyError) as error:
+            parser.error("invalid archive: "+str(error))
+        args.out.mkdir(parents=True)
+        for ubuntu in args.ubuntu or ["22.04","24.04"]:
+            for scenario in scenarios:
+                machine=Machine(args,ubuntu,scenario)
+                run=Run(machine,args.out/(ubuntu+"-"+scenario),archive,metadata)
+                try:
+                    machine.start()
+                    run.baseline() if scenario=="baseline" else run.setup()
+                except Exception as e:
+                    run.check("runner-error",False,str(e))
+                finally:
+                    try: machine.close()
+                    except Exception as e: run.check("cleanup",False,str(e))
+                counts=collections.Counter(c["status"] for c in run.checks)
+                print(f"{ubuntu}/{scenario}: "+json.dumps(counts),flush=True)
+                failed |= any(c["status"] in ("FAIL","XPASS") for c in run.checks)
+    return int(failed)
+
+if __name__=="__main__":
+    sys.exit(main())
