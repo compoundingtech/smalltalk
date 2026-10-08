@@ -928,7 +928,7 @@ async fn read_native<T: Send + 'static>(
     read_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     operation: impl FnOnce(&Reader<'_>) -> Result<T, ApiError> + Send + 'static,
 ) -> Result<(ClientSnapshot, T), ApiError> {
-    tokio::task::spawn_blocking(move || {
+    blocking_store(move || {
         // A canceled awaiter must not release a slot while its SQLite worker still runs.
         let _read_permit = read_permit;
         state
@@ -948,10 +948,8 @@ async fn read_native<T: Send + 'static>(
                     Ok((client_snapshot_at(&state, index), operation(&reader)?))
                 })())
             })
-            .map_err(ApiError::internal)?
     })
-    .await
-    .map_err(ApiError::internal)?
+    .await?
 }
 
 impl Reader<'_> {

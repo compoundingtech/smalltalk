@@ -110,6 +110,8 @@ claim field. The shared definitions retain the same family, syntax, and UTF-8 by
 Native SQLite workers retain their physical read slot until they finish, even when a
 replacement or unsubscribe cancels delivery. Canceled workers cannot exceed the socket's
 eight-read bound.
+Native HTTP workers inherit the request's read deadline and cancellation budget through the
+same blocking-store boundary as operational reads; expired requests cancel their SQL work.
 
 Every native reread applies current identity visibility, claim audience, and positive field
 disclosure before choosing heads or computing diffs. Glass upserts/deletions and local observation
