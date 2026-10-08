@@ -279,6 +279,7 @@ pub(super) async fn envelope(
 #[derive(Debug)]
 pub(super) enum WorkError {
     Join(tokio::task::JoinError),
+    Panic,
     Deadline(crate::model::St3Error),
     Store(crate::model::St3Error),
 }
@@ -287,6 +288,7 @@ impl std::fmt::Display for WorkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Join(error) => error.fmt(f),
+            Self::Panic => f.write_str("blocking work panicked"),
             Self::Deadline(error) | Self::Store(error) => error.fmt(f),
         }
     }
@@ -372,6 +374,9 @@ where
     }
     // The marker is installed only by spawn_handler, never on an async runtime worker.
     // Both paths retain the same read budget, reader lease and committed mutation result.
+    // Nested queries can reuse the handler's reader loan; simultaneous nested wrappers run
+    // serially on that handler. Keep each call's panic boundary so best-effort callers and
+    // cleanup after an error behave as they did with a separate JoinHandle.
     let inline = IN_HANDLER.with(Cell::get)
         && matches!(
             tokio::runtime::Handle::current().runtime_flavor(),
@@ -382,7 +387,12 @@ where
         // callbacks enter a runtime themselves (for example a forwarded conversation read).
         // This is already a blocking worker, so no second pool slot is needed. A current-thread
         // runtime keeps its existing spawned path because it cannot use block_in_place.
-        Task::Inline(tokio::task::block_in_place(run))
+        Task::Inline(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::block_in_place(run)
+            }))
+            .unwrap_or(Err(WorkError::Panic)),
+        )
     } else {
         Task::Spawned(tokio::task::spawn_blocking(run))
     };
@@ -445,7 +455,7 @@ pub(super) fn error(error: &WorkError) -> Option<ApiError> {
             message: error.message.clone(),
             details: error.details.clone(),
         })),
-        WorkError::Join(_) => None,
+        WorkError::Join(_) | WorkError::Panic => None,
     }
 }
 
@@ -470,6 +480,7 @@ mod tests {
         runtime.block_on(async {
             let (entered, occupied) = tokio::sync::oneshot::channel();
             let (release, released) = std::sync::mpsc::channel();
+            let released_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let blocker = tokio::task::spawn_blocking(move || {
                 entered.send(()).unwrap();
                 released.recv().unwrap();
@@ -478,12 +489,13 @@ mod tests {
             // One pool slot is busy with unrelated work; the handler uses the other.
             // Release it independently so the old nested-submission control fails cleanly,
             // rather than deadlocking or leaving a background worker after an assertion.
+            let release_flag = released_flag.clone();
             let releaser = std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(350));
+                release_flag.store(true, Ordering::SeqCst);
                 release.send(()).unwrap();
             });
             let writing = store.clone();
-            let started = std::time::Instant::now();
             let result = spawn_handler(move || {
                 tokio::runtime::Handle::current().block_on(super::super::blocking_action(move || {
                     // A synchronous callback may need to wait for an async service itself.
@@ -496,7 +508,7 @@ mod tests {
                     }).map_err(|error| crate::model::St3Error::new("internal", error))?
                 }))
             }).await;
-            let elapsed = started.elapsed();
+            let acknowledged_before_release = !released_flag.load(Ordering::SeqCst);
             releaser.join().unwrap();
             blocker.await.unwrap();
             result.unwrap().unwrap();
@@ -504,7 +516,7 @@ mod tests {
                 "SELECT value FROM meta WHERE key='blocking-ack'", [], |row| row.get(0),
             ).unwrap();
             assert_eq!(value, "committed");
-            assert!(elapsed < Duration::from_millis(100), "write ACK took {elapsed:?}");
+            assert!(acknowledged_before_release, "write ACK waited for the unrelated pool slot");
         });
     }
 
@@ -522,6 +534,61 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(result, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn inline_panics_keep_the_nested_error_boundary_and_handler_cleanup() {
+        let result = spawn_handler(|| {
+            let handle = tokio::runtime::Handle::current();
+            let failure = handle.block_on(spawn_blocking(|| panic!("nested callback")));
+            assert!(matches!(failure, Err(WorkError::Panic)));
+            assert!(error(failure.as_ref().unwrap_err()).is_none());
+            // This code must still execute, just like the old JoinError path.
+            handle.block_on(spawn_blocking(|| 42))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn real_envelope_keeps_best_effort_nested_panics_out_of_the_screen_response() {
+        use axum::{Json, Router, middleware::from_fn_with_state, routing::get};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let app = Router::new()
+            .route(
+                "/v1/client/terminal/test/screen",
+                get(|| async {
+                    assert!(IN_HANDLER.with(Cell::get));
+                    // terminal_facts uses this same .await.ok().flatten() contract.
+                    let facts: Option<serde_json::Value> =
+                        spawn_blocking(|| -> Option<serde_json::Value> {
+                            panic!("best effort stats callback");
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                    Json(serde_json::json!({"screen": "available", "facts": facts}))
+                }),
+            )
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let response = app
+            .oneshot(request(Method::GET, "/v1/client/terminal/test/screen"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(envelope["value"]["screen"], "available");
+        assert!(envelope["value"]["facts"].is_null());
     }
 
     fn request(method: Method, path: &str) -> Request<Body> {
