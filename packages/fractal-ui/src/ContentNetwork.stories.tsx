@@ -10,6 +10,7 @@ import type { MarkdownImageOpener, MarkdownImageResolver } from './assistant-ui/
 import type { ConversationItem } from './assistant-ui/embrace-data/model'
 import { workLogTurnFromItems } from './assistant-ui/taste/work-log'
 import { baselineTheme } from './assistant-ui/neutral-theme'
+import { darkTheme as embraceDarkTheme } from './assistant-ui/embrace-theme'
 import { surfaceVars as surface, textVars as ink, typeVars as t } from './assistant-ui/composition-tokens.stylex'
 
 const pixel = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
@@ -30,7 +31,7 @@ function ContentNetworkStory({ boundary, source, allow = false, hostOpens = fals
   const resolveImage: MarkdownImageResolver | undefined = allow ? src => src === '/attachments/allowed.png' ? { _tag: 'Load', src } : { _tag: 'Defer' } : undefined
   const work = workLogTurnFromItems(items, { kindFor: () => 'read', running: false, failed: false, interrupted: false, completeHistory: true })
   const onLoadImage = hostOpens ? openImage : undefined
-  return <main {...stylex.props(styles.root, ...baselineTheme)}><EmbraceRuntimeProvider options={options}>{boundary === 'ToolPreview' ? <EmbraceMarkdownPreview markdown={text} resolveImage={resolveImage} onLoadImage={onLoadImage} /> : boundary === 'Embrace' ? <EmbraceThread items={items} embrace="E3" composer={false} resolveImage={resolveImage} onLoadImage={onLoadImage} /> : <Transcript turns={[{ id: 'network', items, work }]} title="Image privacy" sync={{ _tag: 'Live', since: 0 }} now={0} observedAt={0} resolveImage={resolveImage} onLoadImage={onLoadImage} />}</EmbraceRuntimeProvider></main>
+  return <main {...stylex.props(styles.root, ...baselineTheme, embraceDarkTheme)}><EmbraceRuntimeProvider options={options}>{boundary === 'ToolPreview' ? <EmbraceMarkdownPreview markdown={text} resolveImage={resolveImage} onLoadImage={onLoadImage} /> : boundary === 'Embrace' ? <EmbraceThread items={items} embrace="E3" composer={false} resolveImage={resolveImage} onLoadImage={onLoadImage} /> : <Transcript turns={[{ id: 'network', items, work }]} title="Image privacy" sync={{ _tag: 'Live', since: 0 }} now={0} observedAt={0} resolveImage={resolveImage} onLoadImage={onLoadImage} />}</EmbraceRuntimeProvider></main>
 }
 const meta = { title: 'Fractal UI/Content network safety', component: ContentNetworkStory, parameters: { layout: 'fullscreen' } } satisfies Meta<typeof ContentNetworkStory>
 export default meta
