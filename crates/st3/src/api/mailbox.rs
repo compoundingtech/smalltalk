@@ -2093,15 +2093,76 @@ mod tests {
         }
         let client = Client::new(Endpoint::Unix(path.to_owned()));
         let mut socket = client.open_mailbox(fence).await.unwrap();
-        assert!(
-            matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages.is_empty())
-        );
+        let mut initial = next(&mut socket).await;
+        if matches!(initial, Frame::Seat { .. }) { initial = next(&mut socket).await; }
+        assert!(matches!(initial, Frame::Mailbox { messages } if messages.is_empty()));
         ControlledStream {
             socket,
             recheck,
             heartbeat,
             reads,
             server,
+        }
+    }
+
+    #[tokio::test]
+    async fn argv_bound_stream_refuses_changed_declaration_reads_and_reports() {
+        for change in ["stop", "host", "native", "argv"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut state = super::super::tests::state(root.path());
+            state.store = Arc::new(Store::open_memory("node").unwrap());
+            let name = format!("eval.argv-continuation-{change}");
+            let subject = format!("agent/{name}");
+            let initial = format!("version 2\nagent {name:?} {{ host \"node\"; workspace \"/tmp\"; argv \"python3\" \"probe\"; }}");
+            let intent = crate::graph::parse_intent(&initial,"node").unwrap();
+            state.store.apply_internal(&intent,"argv-stream-initial").unwrap();
+            let runtime = state.store.append_claim(&ClaimInput {
+                subject: subject.clone(), kind: "runtime.observed".into(), actor: Some("daemon/runtime".into()),
+                fields: BTreeMap::from([("status".into(),json!("running")),("incarnation_id".into(),json!("current")),
+                    ("runtime_id".into(),json!("argv-stream")),("host".into(),json!("node"))]),
+                evidence: vec![], expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let member = state.store.desired_subjects_named(std::slice::from_ref(&subject)).unwrap().remove(0).member.unwrap();
+            // Synthetic already-authenticated bind isolates continuation fencing;
+            // actual kernel/process admission is covered by production argv fixtures.
+            let fence = state.store.bind_argv_mailbox_checked(&Fence::new(&subject,"current","delivery"),&member,&|| Ok(())).unwrap();
+            assert!(raw_snapshot(&state.store,&fence).is_ok());
+            let mut stream = controlled_stream(state.clone(),&fence,&root.path().join("argv.sock")).await;
+            let original = format!("accepted-{change}");
+            let report = |reason: &str| Message::Text(json!({"transport":"omp-channel","pid":37,"ready":false,"reason":reason}).to_string().into());
+            stream.socket.send(report(&original)).await.unwrap();
+            let deadline = tokio::time::Instant::now()+Duration::from_secs(2);
+            while delivery_presence::assess_current(&subject,"omp",Some("current")).reason.as_deref()!=Some(&original) {
+                assert!(tokio::time::Instant::now()<deadline,"unchanged argv report was not admitted");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Hold both fixture timers and remove only this fixture's wake route.
+            // The incoming report must recheck authority without a reconnect or
+            // runtime reconciler/snapshot notification doing it first.
+            state.store.miss_mailbox_owner_for_test(&subject,"delivery");
+            let replacement = match change {
+                "stop" => format!("version 2\nstop {subject:?}"),
+                "host" => format!("version 2\nagent {name:?} {{ host \"other\"; workspace \"/tmp\"; argv \"python3\" \"probe\"; }}"),
+                "native" => format!("version 2\nagent {name:?} {{ host \"node\"; workspace \"/tmp\"; harness \"omp\" {{}} }}"),
+                "argv" => format!("version 2\nagent {name:?} {{ host \"node\"; workspace \"/tmp\"; argv \"python3\" \"different-program\"; }}"),
+                _ => unreachable!(),
+            };
+            let intent = crate::graph::parse_intent(&replacement,"node").unwrap();
+            state.store.apply_internal(&intent,"argv-stream-changed").unwrap();
+            assert_eq!(state.store.latest_claim(&subject,Some("runtime.observed")).unwrap().unwrap().id,runtime.id);
+            assert!(raw_snapshot(&state.store,&fence).is_err());
+            stream.socket.send(report("must-not-be-recorded")).await.unwrap();
+            stream.socket.send(Message::Ping(vec![1].into())).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2),async {
+                loop {
+                    let frame=stream.socket.next().await.unwrap().unwrap();
+                    if matches!(frame,Message::Pong(_)) { break; }
+                    if let Message::Text(raw)=frame
+                        && matches!(serde_json::from_str::<Frame>(&raw),Ok(Frame::Fenced { .. })) { break; }
+                }
+            }).await.expect("report processing was not observed");
+            assert_eq!(delivery_presence::assess_current(&subject,"omp",Some("current")).reason.as_deref(),Some(original.as_str()));
+            assert!(state.store.mailbox_lease_authority(&fence).unwrap().is_none());
         }
     }
 

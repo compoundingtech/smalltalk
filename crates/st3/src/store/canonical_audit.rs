@@ -52,6 +52,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_work_lease_renewals",
         "local_mailbox_owners",
         "local_mailbox_bindings",
+        "local_mailbox_argv_bindings",
         "local_mailbox_leases",
         "unread_mail",
         "unread_mail_prefixes",
@@ -157,6 +158,13 @@ fn native_mailbox_ownership_changes_no_shared_projection_digest() {
     assert_eq!(before_tables, projection_digest::tables(&store.readers.get()).unwrap());
     let mut connection = store.connection.write();
     let tx = connection.transaction().unwrap();
+    // Scope-only raw row control, not an authenticated argv admission fixture.
+    tx.execute("INSERT INTO local_mailbox_argv_bindings SELECT token,subject,component,incarnation,epoch,'{}' FROM local_mailbox_bindings WHERE token=?1",[&bound.token]).unwrap();
+    assert_eq!(before, graph_digest(&tx).unwrap());
+    assert_eq!(before_tables, projection_digest::tables(&tx).unwrap());
+    tx.execute("DELETE FROM local_mailbox_argv_bindings WHERE token=?1",[&bound.token]).unwrap();
+    assert_eq!(before, graph_digest(&tx).unwrap());
+    assert_eq!(before_tables, projection_digest::tables(&tx).unwrap());
     tx.execute("UPDATE local_mailbox_leases SET revoked=1 WHERE subject=?1", [&bound.subject]).unwrap();
     assert_eq!(before, graph_digest(&tx).unwrap());
     assert_eq!(before_tables, projection_digest::tables(&tx).unwrap());

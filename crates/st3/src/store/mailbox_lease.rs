@@ -472,6 +472,77 @@ mod tests {
     }
 
     #[test]
+    fn argv_capability_refuses_changed_declarations_before_receipt_commit() {
+        for replacement in [
+            "version 2\nstop \"agent/eval.worker\"",
+            "version 2\nagent \"eval.worker\" { host \"other\"; workspace \"/tmp\"; argv \"python3\" \"probe\"; }",
+            "version 2\nagent \"eval.worker\" { host \"node\"; workspace \"/tmp\"; harness \"omp\" {} }",
+            "version 2\nagent \"eval.worker\" { host \"node\"; workspace \"/tmp\"; argv \"python3\" \"different-program\"; }",
+        ] {
+            let store = fixture();
+            let member = declare_argv(&store, "node");
+            let bound = store.bind_argv_mailbox_checked(&request(), &member, &|| Ok(())).unwrap();
+            let runtime = store.latest_claim(&bound.subject, Some("runtime.observed")).unwrap().unwrap().id;
+            store.append_claim(&ClaimInput {
+                subject: "message/argv-fence".into(), kind: "message.sent".into(), actor: Some("person/fixture".into()),
+                fields: BTreeMap::from([("status".into(), json!("sent")), ("from".into(), json!("person/fixture")),
+                    ("to".into(), json!(bound.subject)), ("content".into(), json!("Original envelope"))]),
+                evidence: vec![], expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let receipt = |phase: &str| ClaimInput {
+                subject: "message/argv-fence".into(), kind: format!("message.{phase}"), actor: Some(bound.subject.clone()),
+                fields: BTreeMap::from([("status".into(), json!(phase))]), evidence: vec![], expected_subject: None,
+                idempotency_key: Some(format!("argv-fence:{phase}")),
+            };
+            // Positive unchanged argv, including a successful receipt and the
+            // pre-I/O admission that a caller may already have observed.
+            store.append_mailbox_receipt_outcome(&receipt("staged"), &bound).unwrap();
+            store.check_mailbox(&bound).unwrap();
+            let changed = crate::graph::parse_intent(replacement, "node").unwrap();
+            store.apply_internal(&changed, "change-argv-without-runtime-reconciliation").unwrap();
+            assert_eq!(store.latest_claim(&bound.subject, Some("runtime.observed")).unwrap().unwrap().id, runtime);
+            let held: (String, u64) = store.readers.get().query_row(
+                "SELECT incarnation,epoch FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
+                params![bound.subject,bound.component], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            assert_eq!(held, (bound.incarnation.clone(),bound.epoch));
+            assert_eq!(store.check_mailbox(&bound).unwrap_err().code, "stale-mailbox-session");
+            for phase in ["staged","delivered","read"] {
+                // Even a cached original receipt must be fenced before its retry;
+                // fresh lifecycle claims are checked under the commit writer.
+                assert_eq!(store.append_mailbox_receipt_outcome(&receipt(phase), &bound).unwrap_err().code, "stale-mailbox-session");
+            }
+            assert!(store.claims_for("message/argv-fence",Some("message.delivered")).unwrap().is_empty());
+            assert!(store.claims_for("message/argv-fence",Some("message.read")).unwrap().is_empty());
+            assert!(store.mailbox_lease_authority(&bound).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn argv_designation_survives_reopen_and_cannot_become_native_custody() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("argv.db");
+        let store = Store::open(&path,"node").unwrap();
+        declare(&store);
+        crate::mailbox::tests::ready(&store,"current");
+        let member = declare_argv(&store,"node");
+        let bound = store.bind_argv_mailbox_checked(&request(), &member, &|| Ok(())).unwrap();
+        drop(store);
+        let store = Store::open(&path,"node").unwrap();
+        store.check_mailbox(&bound).unwrap();
+        declare(&store);
+        assert!(store.check_mailbox(&bound).is_err());
+        assert!(store.bind_mailbox_with_lease(&bound,Some(&authority(1))).is_err());
+        assert!(store.mailbox_lease_authority(&bound).unwrap().is_none());
+        let member = declare_argv(&store,"node");
+        store.connection.write().execute("DELETE FROM local_mailbox_bindings WHERE token=?1",[&bound.token]).unwrap();
+        let mut retired = bound.clone(); retired.epoch=0;
+        assert!(store.bind_argv_mailbox_checked(&retired,&member,&|| Ok(())).is_err());
+        assert_eq!(store.readers.get().query_row("SELECT epoch FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
+            params![bound.subject,bound.component],|row|row.get::<_,u64>(0)).unwrap(),bound.epoch);
+    }
+
+    #[test]
     fn same_process_session_reexec_advances_ownership_without_reissuing_capability() {
         let store = fixture();
         let owner = authority(1);
@@ -614,11 +685,49 @@ fn refused(reason: &str) -> St3Error {
     St3Error::new("stale-mailbox-session", reason)
 }
 
+/// Durable designation of a physically admitted argv capability. It is not a
+/// native provider lease and cannot be inferred from the current declaration.
+fn argv_binding(connection: &Connection, fence: &Fence) -> Result<Option<MemberSpec>, St3Error> {
+    let held: Option<(Fence, String)> = connection.prepare_cached(
+        "SELECT subject,component,incarnation,epoch,member FROM local_mailbox_argv_bindings WHERE token=?1",
+    ).map_err(internal)?.query_row([&fence.token], |row| Ok((Fence {
+        token: fence.token.clone(), subject: row.get(0)?, component: row.get(1)?,
+        incarnation: row.get(2)?, epoch: row.get(3)?,
+    }, row.get(4)?))).optional().map_err(internal)?;
+    let Some((held, member)) = held else { return Ok(None); };
+    if held.subject != fence.subject || held.component != fence.component
+        || held.incarnation != fence.incarnation || held.epoch != fence.epoch
+    {
+        return Err(refused("the argv capability belongs to another binding"));
+    }
+    serde_json::from_str(&member).map(Some).map_err(internal)
+}
+
+pub(super) fn refuse_argv_native_adoption(connection: &Connection, fence: &Fence) -> Result<(), St3Error> {
+    let retained: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_mailbox_argv_bindings WHERE token=?1)",
+        [&fence.token], |row| row.get(0),
+    ).map_err(internal)?;
+    if retained { return Err(refused("an argv capability cannot be reissued or adopted as native custody")); }
+    Ok(())
+}
+
+pub(super) fn record_argv_binding(connection: &Connection, fence: &Fence, member: &MemberSpec) -> Result<(), St3Error> {
+    connection.execute(
+        "INSERT INTO local_mailbox_argv_bindings VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(token) DO NOTHING",
+        params![fence.token,fence.subject,fence.component,fence.incarnation,fence.epoch,serde_json::to_string(member).map_err(internal)?],
+    ).map_err(internal)?;
+    Ok(())
+}
+
 pub(super) fn check_lease_fence(
     connection: &Connection,
     fence: &Fence,
     host: &str,
 ) -> Result<(), St3Error> {
+    if let Some(member) = argv_binding(connection, fence)? {
+        check_argv_declaration(connection, fence, &member, host)?;
+    }
     let Some((held, owner, revoked)) = lease(connection, fence)? else {
         return Ok(());
     };

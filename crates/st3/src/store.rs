@@ -600,6 +600,14 @@ CREATE TABLE IF NOT EXISTS local_mailbox_bindings (
     incarnation TEXT NOT NULL,
     epoch INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS local_mailbox_argv_bindings (
+    token TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    component TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    member TEXT NOT NULL
+);
 -- Authenticated process/session custody, independent of the connection binding.
 CREATE TABLE IF NOT EXISTS local_mailbox_leases (
     subject TEXT NOT NULL,
@@ -15874,6 +15882,7 @@ impl Store {
         }
         validate()?;
         if let Some(authority) = authority {
+            mailbox_lease::refuse_argv_native_adoption(&tx, request)?;
             mailbox_lease::check_declaration(&tx, request, authority, &self.origin)?;
             mailbox_lease::admit(&tx, request, authority)?;
         }
@@ -15881,6 +15890,11 @@ impl Store {
             check_mailbox_fence(&tx, request, &self.origin)?;
             if let Some(authority) = authority {
                 mailbox_lease::record(&tx, request, authority)?;
+            }
+            if let Some(member) = argv_member {
+                mailbox_lease::record_argv_binding(&tx, request, member)?;
+            }
+            if authority.is_some() || argv_member.is_some() {
                 tx.commit().map_err(internal)?;
             }
             return Ok(request.clone());
@@ -15914,10 +15928,18 @@ impl Store {
             check_mailbox_fence(&tx, &bound, &self.origin)?;
             if let Some(authority) = authority {
                 mailbox_lease::record(&tx, &bound, authority)?;
+            }
+            if let Some(member) = argv_member {
+                mailbox_lease::record_argv_binding(&tx, &bound, member)?;
+            }
+            if authority.is_some() || argv_member.is_some() {
                 tx.commit().map_err(internal)?;
             }
             return Ok(bound);
         }
+        // A revoked argv capability must not be recreated even if its binding row
+        // was removed; its durable authenticated designation remains terminal.
+        mailbox_lease::refuse_argv_native_adoption(&tx, request)?;
         let previous: Option<u64> = tx
             .query_row(
                 "SELECT epoch FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
@@ -15947,6 +15969,9 @@ impl Store {
             params![bound.subject, bound.component, bound.incarnation, bound.epoch]).map_err(internal)?;
         if let Some(authority) = authority {
             mailbox_lease::record(&tx, &bound, authority)?;
+        }
+        if let Some(member) = argv_member {
+            mailbox_lease::record_argv_binding(&tx, &bound, member)?;
         }
         tx.commit().map_err(internal)?;
         if let Some(wakes) = self.smalltalk.mailbox_wakes.get() {
