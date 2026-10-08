@@ -547,3 +547,74 @@ fn installer_membership_values_preserve_the_entire_clock_domain() {
     let restored: Input = serde_json::from_value(value).unwrap();
     assert_eq!(restored.runs, input.runs);
 }
+
+#[test]
+fn owned_person_renderer_matches_native_ask_actor_rekey_and_ordinary_step() {
+    use crate::store::attention_snapshot::{
+        person_attention_item, person_attention_item_from_facts,
+    };
+    fn assert_row(store: &Store, subject: &str) {
+        let (view, ask, activated, current, expected) = store
+            .read_snapshot(|_| {
+                let c = store.readers.get();
+                let clock = now_ms();
+                let view = person_work::step(&c, subject)?.unwrap();
+                let ask = person_work::request(&c, subject)?;
+                let current = if let Some(ask) = &ask {
+                    person_work::current(&c, ask, clock)?
+                } else {
+                    person_work::run_live(&c, &view.run, Some(&view.generation), false)?
+                };
+                let activated: Option<String> = c.query_row(
+                    "SELECT activated_at_unix_ms FROM step_runs WHERE subject=?1",
+                    [subject],
+                    |r| r.get(0),
+                )?;
+                let expected = person_attention_item(&c, subject, clock)?;
+                Ok((
+                    view,
+                    ask,
+                    activated.and_then(|value| value.parse().ok()),
+                    current,
+                    expected,
+                ))
+            })
+            .unwrap();
+        let actual = person_attention_item_from_facts(subject, view, ask, activated, current);
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+    let (store, origin, request) = person_work::tests::fixture();
+    let ask = store.ask_person(&request).unwrap();
+    assert_row(&store, &ask.subject);
+    store.connection.batched(|tx| -> Result<()> {
+        tx.execute("UPDATE step_runs SET assignee='person/operator',goals='[\"Updated question\"]' WHERE subject=?1", [&ask.subject])?;
+        Ok(())
+    }).unwrap().unwrap();
+    assert_row(&store, &ask.subject);
+    store
+        .set_step_state(&origin.subject, "failed", Some("retry"))
+        .unwrap();
+    store.retry_step(&origin.subject, "new attempt", 0).unwrap();
+    assert_row(&store, &ask.subject);
+
+    let (store, origin, _) = person_work::tests::fixture();
+    store
+        .set_step_state(&origin.subject, "completed", None)
+        .unwrap();
+    let run = store.mission_run(&origin.run).unwrap().unwrap();
+    let review = run.steps.iter().find(|step| step.step == "review").unwrap();
+    store
+        .set_step_state(&review.subject, "ready", None)
+        .unwrap();
+    assert!(
+        store
+            .person_attention_items(None, now_ms())
+            .unwrap()
+            .iter()
+            .any(|item| item.subject == review.subject)
+    );
+    assert_row(&store, &review.subject);
+}

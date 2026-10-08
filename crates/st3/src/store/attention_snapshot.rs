@@ -1190,3 +1190,90 @@ pub(super) fn person_attention_item(
         request,
     }))
 }
+
+/// Render one source-selected person row from owned native facts, after read release.
+/// `current` is supplied by a complete same-cut currency/run evaluator. The producer
+/// retains source absence, admission-time eligibility and the native lowercase assignee
+/// range independently; this function does not supply capture/actor coverage.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn person_attention_item_from_facts(
+    subject: &str,
+    view: StepRunView,
+    ask: Option<ClaimRecord>,
+    activated: Option<u128>,
+    current: bool,
+) -> Option<AttentionItemView> {
+    if !current
+        || !matches!(view.status.as_str(), "pending" | "ready")
+        || view.assigned_to.as_deref().is_none_or(|a| {
+            !a.get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("person/"))
+        })
+        || (ask.is_none() && view.status != "ready")
+    {
+        return None;
+    }
+    let person = view.assigned_to.as_deref().unwrap_or_default();
+    let episode = ask.as_ref().map(|ask| ask.id.clone()).unwrap_or_else(|| {
+        format!(
+            "{}:{}:{}",
+            view.generation, view.attempt, view.readiness_epoch
+        )
+    });
+    let since = ask
+        .as_ref()
+        .map_or(activated.unwrap_or(view.created_at_unix_ms), |ask| {
+            ask.body["fields"]["waiting_since"]
+                .as_str()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(ask.accepted_at_unix_ms)
+        });
+    let request = ask
+        .as_ref()
+        .and_then(|ask| ask.body["fields"].get("request"))
+        .filter(|request| request.is_object())
+        .cloned();
+    let (label, response): (&str, &[&str]) = match request.as_ref().and_then(|r| r["type"].as_str())
+    {
+        Some("decision" | "choice") => ("done", &["--answer", "ANSWER_ID"]),
+        // An update clears when the person opens it or presses read.
+        Some("update") => ("read", &["--answer", "read"]),
+        Some(_) => ("done", &["--text", "FEEDBACK"]),
+        None => ("done", &["--summary", "RESPONSE"]),
+    };
+    Some(AttentionItemView {
+        episode,
+        priority: "normal".into(),
+        kind: "person-step".into(),
+        review_mode: None,
+        subject: subject.to_owned(),
+        person: person.into(),
+        requester_id: ask.and_then(|ask| ask.actor),
+        launch_id: None,
+        variant_id: None,
+        message_id: None,
+        title: view
+            .title
+            .unwrap_or_else(|| "A step needs your response".into()),
+        detail: view.goals.join("\n"),
+        mission: None,
+        mission_run: Some(view.run),
+        step: Some(subject.to_owned()),
+        targets: vec![subject.to_owned()],
+        requested_at_unix_ms: since,
+        actions: vec![attention_action(
+            label,
+            &[
+                "st",
+                "work",
+                "done",
+                subject,
+                "--as",
+                person,
+                response[0],
+                response[1],
+            ],
+        )],
+        request,
+    })
+}
