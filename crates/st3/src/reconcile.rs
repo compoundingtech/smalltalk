@@ -1366,6 +1366,38 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// a running watch has none. A mission's subscription to a standing observer, such as an
     /// intake's, keeps it running the same way. Stop each standing observer this host declared
     /// once no running subscription uses it, and look again at the next deadline.
+    fn reconcile_github_watches_stage(&self) {
+        const ITEM: &str = "stage/github-watches";
+        let daemon = format!("daemon/{}", self.host);
+        // Earlier stages may change declarations or end watches. Observe those writes before
+        // selecting; the evaluation then reads a fresh complete roster inside its read record.
+        if let Err(error) = self.incremental.observe(&self.store) {
+            self.isolate(ITEM, &daemon, || Err::<(), _>(error));
+            self.incremental.touch(ITEM);
+            return;
+        }
+        let skip = self.skip_unneeded && !self.incremental.take_full_pass("github-watches", now_ms());
+        if skip && !self.incremental.needs(ITEM, now_ms()) {
+            // Keep the previous reads, due time and fault. No evaluation means no recovery.
+            return;
+        }
+        if self
+            .isolate(ITEM, &daemon, || {
+                self.reconcile_item("github-watches", ITEM, false, || {
+                    // The self-key makes a failed full pass retry without discarding prior reads.
+                    smallclaims::touched::note_read(|| ITEM.into());
+                    smallclaims::touched::note_read(|| "kind:record.repaired".into());
+                    smallclaims::touched::note_read(|| "desired-subject-membership".into());
+                    let desired = self.store.github_watch_declarations()?;
+                    self.reconcile_github_watches(&desired)
+                })
+            })
+            .is_none()
+        {
+            self.incremental.touch(ITEM);
+        }
+    }
+
     pub(crate) fn reconcile_github_watches(&self, desired: &[DesiredSubject]) -> Result<()> {
         let now = now_ms();
         let mut next_deadline: Option<u128> = None;
@@ -1987,6 +2019,17 @@ impl<R: RuntimeControl> Reconciler<R> {
         drop(_runners_span);
         let desired_span = crate::profile::span("pass/desired");
         let mut desired = self.store.desired_subjects()?;
+        // Eval cleanup can delete desired rows without appending a claim. Watch selection must
+        // see those removals through the complete roster this pass already reads, not only the
+        // claim/local-observation feed or the host/authority-filtered active member list.
+        self.incremental.observe_value(
+            "desired-subject-membership",
+            desired
+                .iter()
+                .map(|declaration| declaration.subject.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         self.incoming_resumes(&desired)?;
         let terminal_owned = self.store.terminal_owned_runtime_subjects()?;
         drop(desired_span);
@@ -2808,9 +2851,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         });
         self.isolate("stage/faults", &daemon, || self.deliver_faults(&desired));
         self.isolate("stage/subagents", &daemon, || self.end_stale_subagents());
-        self.isolate("stage/github-watches", &daemon, || {
-            self.reconcile_github_watches(&desired)
-        });
+        self.reconcile_github_watches_stage();
         self.file_watchers_used
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -15728,6 +15769,7 @@ mod tests {
     mod channel_recovery;
     mod differential;
     mod first_readiness_tests;
+    mod github_watch_selection;
     mod incremental_deadlines;
     mod ownership_guard_tests;
     mod pull_request_run_tests;
