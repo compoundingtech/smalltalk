@@ -190,9 +190,9 @@ mod tests {
     }
 
     fn insert(connection: &Connection, position: u64) {
-        let subject = if position % 2 == 0 { "resource/selected/a" } else { "resource/selected/z" };
-        let kind = if position % 3 == 0 { "resource.observed" } else { "other.kind" };
-        let actor = (position % 5 != 0).then_some(if position % 2 == 0 { "person/a" } else { "person/other" });
+        let subject = if position.is_multiple_of(2) { "resource/selected/a" } else { "resource/selected/z" };
+        let kind = if position.is_multiple_of(3) { "resource.observed" } else { "other.kind" };
+        let actor = (!position.is_multiple_of(5)).then_some(if position.is_multiple_of(2) { "person/a" } else { "person/other" });
         connection.execute(
             "INSERT INTO claims VALUES(?1,?2,?3,?4,?5)",
             params![position, format!("claim-{position}"), subject, kind, actor],
