@@ -712,6 +712,11 @@ impl Store {
         actions: &mut Vec<CheckpointAction>,
     ) -> Result<()> {
         self.runtime.checkpoint_preflight()?;
+        if terms.rules_digest != self.runtime.checkpoint_rules_digest() {
+            // Verification is for these seal terms, never a different build's drop rules.
+            // The normal step publishes replacement terms before attempting proof again.
+            return Ok(());
+        }
         let (sealed, plan, proof) =
             self.plan_checkpoint_through(terms.cut_unix_ms, Some(seal_rowid), &context.scratch)?;
         if plan.sealed_digest != terms.sealed_digest {

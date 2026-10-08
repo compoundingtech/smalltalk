@@ -34,7 +34,25 @@ pub struct SmalltalkRuntime {
     pub(crate) subject_cache: Mutex<SubjectCache>,
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
-    pub(crate) agent_resources_cache: Mutex<VecDeque<(u64, bool, Arc<Vec<Value>>)>>,
+    pub(crate) agent_resources_cache: Mutex<VecDeque<AgentResourcesEntry>>,
+    /// Ordering and queue metadata for lazy HTTP pages, shared at the same graph cuts.
+    pub(crate) agent_page_refs_cache: Mutex<VecDeque<AgentResourcesEntry>>,
+    /// Acquire before opening a SQLite snapshot, never while pinning a WAL read mark.
+    pub(crate) agent_resources_admission: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    pub(crate) agent_resources_builds: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentResourcesEntry {
+    pub(crate) index: u64,
+    pub(crate) local: u64,
+    pub(crate) history: bool,
+    /// None certifies the whole roster; Some records the lazily materialized page subjects.
+    pub(crate) covered: Option<BTreeSet<String>>,
+    /// Earliest wall-clock boundary in queue metadata; absent means no expiring work lease.
+    pub(crate) valid_until_unix_ms: Option<u128>,
+    pub(crate) items: Arc<Vec<Value>>,
 }
 
 impl SmalltalkRuntime {
@@ -316,6 +334,10 @@ impl Runtime for SmalltalkRuntime {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.agent_page_refs_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     fn digest_tables(&self) -> &'static [(&'static str, &'static [&'static str])] {
@@ -349,6 +371,15 @@ impl Runtime for SmalltalkRuntime {
         cut: u128,
     ) -> Result<Value> {
         checkpoint_rules::subject_answers(connection, subject, cut)
+    }
+
+    fn checkpoint_subject_answers_with_sources(
+        &self,
+        connection: &Connection,
+        subject: &str,
+        cut: u128,
+    ) -> Result<(Value, smallclaims::store::checkpoint::CheckpointAnswerSources)> {
+        checkpoint_rules::subject_answers_with_sources(connection, subject, cut)
     }
 }
 

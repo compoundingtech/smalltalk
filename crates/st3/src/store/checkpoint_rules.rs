@@ -26,7 +26,8 @@ use smallclaims::store::checkpoint_agreement::*;
 /// Version 10 retains native credential edges and their bounded status transitions.
 /// Version 11 includes arrangement tables in the graph proof and rebuilds them during replay.
 /// Version 12 ages out the sekrets claims written before they became local observations.
-pub const RULES_VERSION: u32 = 12;
+/// Version 13 retains status transitions selected by the reader after filtering stamped heartbeats.
+pub const RULES_VERSION: u32 = 13;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -65,7 +66,7 @@ pub(crate) const REQUEST_CLOSERS: [&str; 3] = [
 /// A canonical description of every rule. The rules digest hashes it with `RULES_VERSION`.
 pub(crate) const RULES_DESCRIPTION: &str = "\
 harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field,current-native-auth-run-start
-seat.status-history slot=subject keep=last-200-transition-including-native-auth-and-runtime-reset-sources-within-7d-before-cut,current-state-run-start
+seat.status-history slot=subject sources=exclude-status_transition-false-or-numeric-zero-heartbeats keep=last-200-transition-including-native-auth-and-runtime-reset-sources-within-7d-before-cut,current-state-run-start
 harness.timeline slot=subject,incarnation_id keep=newest min-age-before-cut=5d
 loop.state slot=subject keep=first-and-last-of-each-run-of-status-and-round,first-with-items
 subscription.mission-deferred slot=subject,request keep=all-while-open,newest
@@ -453,7 +454,9 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
     let mut status_seats: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for index in first.iter().copied() {
         let claim = &claims[index].claim;
-        if matches!(claim.kind.as_str(), "harness.observed" | "runtime.observed" | "harness.diagnostic") {
+        if matches!(claim.kind.as_str(), "harness.observed" | "runtime.observed" | "harness.diagnostic")
+            && seat_status::history_source(claim)
+        {
             status_seats.entry(&claim.subject).or_default().push(index);
         }
     }
@@ -756,6 +759,16 @@ pub(crate) fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
 
 /// Every answer about `subject` that a checkpoint must leave unchanged, as of the cut.
 pub(crate) fn subject_answers(connection: &Connection, subject: &str, cut: u128) -> Result<Value> {
+    subject_answers_inner(connection, subject, cut, None)
+}
+
+pub(crate) fn subject_answers_with_sources(connection: &Connection, subject: &str, cut: u128) -> Result<(Value, CheckpointAnswerSources)> {
+    let mut sources = CheckpointAnswerSources::new();
+    let answer = subject_answers_inner(connection, subject, cut, Some(&mut sources))?;
+    Ok((answer, sources))
+}
+
+fn subject_answers_inner(connection: &Connection, subject: &str, cut: u128, sources: Option<&mut CheckpointAnswerSources>) -> Result<Value> {
     let mut answers = serde_json::Map::new();
     if subject.starts_with("glass/") {
         let person = st3_schema::glasses::owner(subject).map_err(anyhow::Error::new)?;
@@ -784,9 +797,14 @@ pub(crate) fn subject_answers(connection: &Connection, subject: &str, cut: u128)
     if subject.starts_with("agent/") {
         // Completeness metadata may change deliberately when old claims are tombstoned;
         // every transition still inside the published retention bound must stay identical.
-        answers.insert("status_history".into(), seat_status::history_at(
-            connection, subject, cut, i64::MAX as u64,
-        )?["items"].clone());
+        let history = if let Some(sources) = sources {
+            let (history, items) = seat_status::history_at_with_sources(connection, subject, cut, i64::MAX as u64)?;
+            sources.insert("status_history".into(), items);
+            history
+        } else {
+            seat_status::history_at(connection, subject, cut, i64::MAX as u64)?
+        };
+        answers.insert("status_history".into(), history["items"].clone());
     }
     // Which claim a status shows, its origin, and whether its runtime observations conflict.
     answers.insert(

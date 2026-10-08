@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Seek legacy harness observations without scanning named heartbeats",
+  "replay": {
+    "status": "none",
+    "detail": "No projection replay, retention, frontier or folding change."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Additive local partial claims index, created automatically on Store open; numeric schema version is unchanged. The exact existing legacy eligibility predicate is preserved. First creation on a retained 5.9 GB / 433016-claim capture took 179 ms (152 ms process CPU), with 149 indexed rows in 16 KiB. This is one component measurement with warmed filesystem cache, not full startup or other store sizes. Existing claim-index insert components gained 4.3% VM steps and about 2.7% CPU for 4096 named plus 128 legacy observations; projection triggers and durable production transactions were not included."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules, proof comparisons and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No wire, client, authority or harness interpretation changes; the index is local and needs no coordinated member upgrade."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "First open waits for the new index to build. Its isolated creation took 179 ms on one retained capture; full restart-to-API/health and larger-store costs are unmeasured. Subsequent opens reuse the index."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual migration; Store initialization creates the index."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No data format or correctness dependency is introduced. Older binaries can read the same database; the additive index remains present until explicitly dropped."
+  }
+}

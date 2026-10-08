@@ -58,8 +58,9 @@ const CLIENT_READ_MAX_WAIT_MS: u64 = 10_000;
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// The most nodes a client read may be forwarded through on its way to its owner.
 pub const CLIENT_READ_MAX_HOPS: u8 = 4;
-/// Each node on a relayed read waits this much longer than the node after it, so an answer on its
-/// way back is never cut short by an earlier hop giving up first.
+/// The peer HTTP client allows this extra wait per hop. The daemon's forwarded-read
+/// envelope independently caps local work at 15 seconds plus the operation wait; an
+/// earlier relay can therefore return its generic deadline before the owner's reply.
 const CLIENT_READ_HOP_MARGIN: Duration = Duration::from_secs(10);
 /// How long a relay reuses the fleet's observed links before it reads them again.
 const CLIENT_READ_LINKS_TTL: Duration = Duration::from_secs(5);
@@ -158,7 +159,7 @@ pub struct ClientReadRoute {
 
 impl ClientReadOperation {
     /// How long the owner may hold this read open before it answers.
-    fn wait(&self) -> Duration {
+    pub(crate) fn wait(&self) -> Duration {
         match self {
             Self::ConversationChanges { wait_ms, .. }
             | Self::TerminalScreenChange { wait_ms, .. } => {

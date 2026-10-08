@@ -21,7 +21,7 @@ function asStui(body) {
   }
 }
 
-for (const name of ['claude', 'codex', 'deliveries', 'native-claude-run']) {
+for (const name of ['claude', 'codex', 'deliveries', 'native-claude-run', 'native-omp-run']) {
   const expected = fixture(`${name}.expected.json`);
   const phone = conversationEntries(fixture(`${name}.json`), new Map()).map(entry => ({ body: asStui(entry.body), id: entry.id }));
   assert.deepEqual(phone, expected, `${name}: the phone reads this transcript differently from stui`);

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Document asynchronous catch-up recovery and liveness limits with deterministic lifecycle controls",
+  "replay": {
+    "status": "none",
+    "detail": "Documentation and tests add no replay or automatic recovery. Queue processing is ordered by local store_index and applies canonical contribution rank."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No additional schema or trigger changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Admission, complete-prefix certification and canonical rank rules are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No Rust interface or production activation changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No live restart or migration."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "IVM_ASYNCHRONOUS.md now explicitly describes receiver ownership, global-prefix wait starvation, panic diagnostics and unbounded stop; owners share one Publisher per Store."
+  },
+  "recovery": {
+    "status": "unknown",
+    "detail": "There is no implemented recovery for capture/quota/oversized-input fences. Poison operator panics roll back and repeat on restart. Production adoption requires a defined recovery or prevention contract; these controls qualify the existing fail-closed behavior only."
+  }
+}

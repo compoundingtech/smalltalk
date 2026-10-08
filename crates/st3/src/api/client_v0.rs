@@ -204,6 +204,11 @@ async fn collection_items_with_windows(
         Some(prepared) => Some(prepared.admit().await),
         None => None,
     };
+    let roster_admission = if request.collection == "agents" {
+        Some(state.store.admit_agent_resources().await)
+    } else {
+        None
+    };
     let state = state.clone();
     let session = session.clone();
     let request = request.clone();
@@ -218,6 +223,7 @@ async fn collection_items_with_windows(
             // Keep the physical read slot even if its awaiting subscription is canceled.
             let _read_permit = read_permit;
             let _admission = admission;
+            let _roster_admission = roster_admission;
             let store = state.store.clone();
             let commits = windows.as_ref().map(|windows| windows.commits());
             store.read_snapshot(|index| {
@@ -979,9 +985,11 @@ async fn collection_stream_socket_with_sources<F, Fut>(
                         conversations.stop(&request.id);
                         if request.collection == "conversation" {
                             let target = request.conversation.as_deref().unwrap_or_default();
-                            let opened = conversation_session_id(&state, target).and_then(|session_id| {
-                                let remote = conversation_owner_host(&state, &session, &session_id)?;
-                                Ok((session_id, remote))
+                            let opened = crate::performance::task("conversation/admission", || {
+                                conversation_session_id(&state, target).and_then(|session_id| {
+                                    let remote = conversation_owner_host(&state, &session, &session_id)?;
+                                    Ok((session_id, remote))
+                                })
                             });
                             match opened {
                                 Ok((session_id, remote)) => {
@@ -3367,6 +3375,42 @@ fn operation_resources(state: &AppState, at: &str) -> Result<Vec<Value>, ApiErro
     Ok(values)
 }
 
+struct MissionPageRead {
+    items: Vec<Value>,
+    has_more: bool,
+    after_key: Option<(u128, String)>,
+}
+
+/// Read and materialize only the requested cards plus one continuation identifier.
+/// The caller pins the SQLite snapshot for the whole page.
+fn read_mission_page(
+    store: &Store,
+    history: bool,
+    offset: usize,
+    limit: usize,
+    after_key: Option<&(u128, String)>,
+) -> anyhow::Result<MissionPageRead> {
+    let mut ids =
+        store.mission_collection_page(history, offset, limit.saturating_add(1), after_key)?;
+    let mut has_more = ids.len() > limit;
+    ids.truncate(limit);
+    let mut items = mission_list_cards(
+        store,
+        &ids.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+    )?;
+    has_more |= bound_mission_cards(&mut items)?;
+    let after_key = items.last().and_then(|item| {
+        ids.iter()
+            .find(|(id, _)| Some(id.as_str()) == item["id"].as_str())
+            .map(|(id, time)| (*time, id.clone()))
+    });
+    Ok(MissionPageRead {
+        items,
+        has_more,
+        after_key,
+    })
+}
+
 pub(super) async fn missions(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
@@ -3427,25 +3471,8 @@ pub(super) async fn missions(
         let store = reader.store.clone();
         store.read_snapshot(|index| {
             let snapshot = client_snapshot_at(&reader, index);
-            let mut ids = store.mission_collection_page(
-                history,
-                offset,
-                limit.saturating_add(1),
-                after_key.as_ref(),
-            )?;
-            let mut has_more = ids.len() > limit;
-            ids.truncate(limit);
-            let mut items = mission_list_cards(
-                &store,
-                &ids.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
-            )?;
-            has_more |= bound_mission_cards(&mut items)?;
-            let after_key = items.last().and_then(|item| {
-                ids.iter()
-                    .find(|(id, _)| Some(id.as_str()) == item["id"].as_str())
-                    .map(|(id, time)| (*time, id.clone()))
-            });
-            Ok(Some((snapshot, items, has_more, after_key)))
+            let page = read_mission_page(&store, history, offset, limit, after_key.as_ref())?;
+            Ok(Some((snapshot, page.items, page.has_more, page.after_key)))
         })
     })
     .await?;
@@ -4728,6 +4755,18 @@ pub(super) fn timeline_value(
             "page": page.page
         })));
     }
+    crate::performance::task("conversation/first-page", || {
+        timeline_first_page(state, snapshot, session, session_id, query)
+    })
+}
+
+fn timeline_first_page(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    session_id: String,
+    query: &ClientListQuery,
+) -> Result<Json<Value>, ApiError> {
     let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
         .map_err(ApiError::internal)?;
     let Some((owner, incarnation, _)) = managed else {
@@ -7569,7 +7608,6 @@ fn consume_terminal_attachment(
     capability: Option<&str>,
 ) -> Result<(), ApiError> {
     consume_terminal_attachment_mode(state, session, terminal_id, incarnation, capability, None)
-        .map(|_| ())
 }
 
 fn consume_terminal_attachment_mode(
@@ -7579,7 +7617,7 @@ fn consume_terminal_attachment_mode(
     incarnation: &str,
     capability: Option<&str>,
     raw_mode: Option<&str>,
-) -> Result<Option<String>, ApiError> {
+) -> Result<(), ApiError> {
     let lookup_span = crate::profile::span("terminal/capability-lookup");
     let capability = capability
         .filter(|value| !value.is_empty())
@@ -7602,9 +7640,7 @@ fn consume_terminal_attachment_mode(
         && raw_mode.is_none_or(|_| {
             field("person_id").and_then(Value::as_str) == Some(session.authority_actor.as_str())
         })
-        && (raw_mode != Some("peek")
-            || field("raw_authorization_epoch").and_then(Value::as_str)
-                == Some(raw_terminal::authorization_epoch(state, session)?.as_str()))
+        && raw_mode != Some("peek")
         && raw_live.as_ref().is_none_or(|live| {
             field("owner_host_id").and_then(Value::as_str) == Some(live.owner_host_id.as_str())
                 && field("runtime_id").and_then(Value::as_str) == Some(live.runtime_id.as_str())
@@ -7631,7 +7667,7 @@ fn consume_terminal_attachment_mode(
     }
     if raw_mode.is_none() {
         // A projected-screen capability is a lease and stays valid for more streams.
-        return Ok(None);
+        return Ok(());
     }
     let _span = crate::profile::span("terminal/capability-consume");
     state
@@ -7652,9 +7688,7 @@ fn consume_terminal_attachment_mode(
         })
         .map_err(|_| forbidden("the terminal stream capability was already consumed"))?;
     signal_changed(state);
-    Ok(field("raw_authorization_epoch")
-        .and_then(Value::as_str)
-        .map(str::to_owned))
+    Ok(())
 }
 
 fn detach_terminal_attachment(
@@ -10185,6 +10219,69 @@ mod tests {
     }
 
     #[test]
+    fn missions_first_page_has_bounded_queries_with_thousands_of_definitions() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("large.sqlite");
+        let store = Arc::new(Store::open(&db, "client-v0-baseline").unwrap());
+        let source = "version 2\nmission \"base\" state=\"ready\" { goal \"Page quickly\" }\n";
+        let intent = crate::graph::parse_intent(source, "client-v0-baseline").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "large-page-base")
+            .unwrap();
+        let base = store.mission_definitions().unwrap().remove(0).mission;
+        let claim_id: String = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT claim_id FROM mission_definitions WHERE mission_id='base'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut connection = rusqlite::Connection::open(&db).unwrap();
+        crate::store::configure_projection_writer(&connection).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for index in 0..3000 {
+            let id = format!("large-{index:04}");
+            let mut mission = base.clone();
+            mission.id = id.clone();
+            mission.subject = format!("mission/{id}");
+            transaction.execute(
+                "INSERT INTO mission_revisions(mission_id,revision,state,body,claim_id,created_index) VALUES(?1,?2,'ready',?3,?4,1)",
+                rusqlite::params![id, mission.revision, serde_json::to_string(&mission).unwrap(), claim_id],
+            ).unwrap();
+            transaction.execute(
+                "INSERT INTO mission_definitions(mission_id,revision,state,claim_id) VALUES(?1,?2,'ready',?3)",
+                rusqlite::params![id, mission.revision, claim_id],
+            ).unwrap();
+        }
+        transaction.commit().unwrap();
+        // Measure on this thread inside the same read used by the HTTP handler. Other tests'
+        // connections cannot contribute to STATEMENTS_RUN, even under parallel libtest load.
+        let before = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get);
+        let page = store
+            .read_snapshot(|_| read_mission_page(&store, false, 0, 50, None))
+            .unwrap();
+        let statements = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get) - before;
+        assert_eq!(page.items.len(), 50);
+        assert!(page.has_more);
+        assert_eq!(page.after_key.as_ref().unwrap().1, page.items[49]["id"]);
+        // Six overview queries per card, plus the page, attention and snapshot reads.
+        assert!(
+            statements > 0 && statements <= 50 * 6 + 10,
+            "a 50-card page must query only its cards, not all 3001 definitions: {statements} statements"
+        );
+    }
+
+    #[test]
     fn terminal_contention_preserves_retryable_code_and_service_close() {
         for code in ["database-busy", "database-locked"] {
             let envelope = terminal_stream_error(&ApiError::bad(St3Error::new(code, "fixture contention")));
@@ -10218,6 +10315,78 @@ mod tests {
         let mut bad_retry = frame.clone();
         bad_retry["retryable"] = json!("yes");
         assert!(!validator.is_valid(&bad_retry));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_subscribers_share_one_build_and_http_reuses_it() {
+        const SUBSCRIBERS: usize = 22;
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/shared-roster".into(), kind: "runtime.observed".into(),
+            actor: None, fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"shared-roster", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(SUBSCRIBERS));
+        let barrier = Arc::new(tokio::sync::Barrier::new(SUBSCRIBERS));
+        for phase in 0..3 {
+            let builds_before = state.store.agent_resources_builds_for_test();
+            let mut readers = Vec::new();
+            for subscriber in 0..SUBSCRIBERS {
+                let state = state.clone();
+                let semaphore = semaphore.clone();
+                let barrier = barrier.clone();
+                readers.push(tokio::spawn(async move {
+                    let request: CollectionSubscribe = serde_json::from_value(json!({
+                        "kind":"subscribe", "id":format!("roster-{subscriber}"),
+                        "collection":"agents", "limit":200,
+                    })).unwrap();
+                    let permit = semaphore.acquire_owned().await.unwrap();
+                    barrier.wait().await;
+                    collection_items(&state, &ClientSession::local(None).unwrap(), &request, permit)
+                        .await.unwrap()
+                }));
+            }
+            let mut expected = None;
+            for reader in readers {
+                let (snapshot, items, has_more) = reader.await.unwrap();
+                assert_eq!(snapshot.store_index, state.store.index().unwrap());
+                assert!(!has_more);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0]["last_activity_at"].is_null(), phase < 2);
+                if let Some(expected) = &expected { assert_eq!(&items, expected); }
+                else { expected = Some(items); }
+            }
+            assert_eq!(state.store.agent_resources_builds_for_test(), builds_before + 1);
+            let snapshot = new_client_snapshot(&state);
+            let (_, Json(page)) = client_agents(State(state.clone()), Extension(snapshot),
+                Query(ClientListQuery::default())).await.unwrap();
+            assert_eq!(page.items, expected.unwrap());
+            assert_eq!(state.store.agent_resources_builds_for_test(), builds_before + 1);
+            if phase == 0 {
+                state.store.append_claim(&ClaimInput {
+                    subject: "agent/shared-roster".into(), kind: "harness.observed".into(),
+                    actor: None, fields: serde_json::from_value(json!({"state":"working",
+                        "driver":"codex", "incarnation_id":"one"})).unwrap(),
+                    evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+                }).unwrap();
+            }
+            if phase == 1 {
+                let index = state.store.index().unwrap();
+                state.store.append_claim(&ClaimInput {
+                    subject: "agent/shared-roster".into(), kind: "harness.timeline".into(),
+                    actor: Some("agent/shared-roster".into()),
+                    fields: serde_json::from_value(json!({"operation":"append",
+                        "entry_id":"local-activity", "source_id":"fixture/local-activity",
+                        "sequence":1, "revision":1, "role":"assistant", "entry_type":"message",
+                        "final":true, "driver":"codex", "incarnation_id":"one",
+                        "observed_at_unix_ms":client_now_ms(), "body":{"text":"local activity"}})).unwrap(),
+                    evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+                }).unwrap();
+                assert_eq!(state.store.index().unwrap(), index, "local activity must not advance the graph");
+            }
+        }
     }
 
     #[tokio::test]

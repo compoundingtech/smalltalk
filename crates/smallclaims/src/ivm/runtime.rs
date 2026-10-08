@@ -23,6 +23,7 @@ pub struct ViewRuntime {
     pub views: Views,
     pub claim_source: Option<super::claim_source::ClaimSource>,
     schema_digest: String,
+    pub(super) asynchronous: Option<super::asynchronous::Limits>,
 }
 impl ViewRuntime {
     pub fn new(views: Views) -> Result<Self> {
@@ -76,7 +77,35 @@ impl ViewRuntime {
             views,
             claim_source: None,
             schema_digest,
+            asynchronous: None,
         })
+    }
+    /// Explicit fresh-store asynchronous mode. Compatible files resume; existing synchronous
+    /// or nonempty unregistered files require a separately reviewed installation and are refused.
+    pub fn asynchronous(views: Views, limits: super::asynchronous::Limits) -> Result<Self> {
+        limits.validate()?;
+        ensure!(views.views.len() <= 256, "async view registry exceeds 256");
+        let declared = views
+            .views
+            .iter()
+            .try_fold(0usize, |total, view| {
+                total.checked_add(view.definition().max_contributions)
+            })
+            .context("async declared dependency bound overflow")?;
+        ensure!(
+            declared <= 256,
+            "async combined declared dependency bound exceeds 256"
+        );
+        ensure!(
+            views
+                .views
+                .iter()
+                .all(|view| view.definition().local_kinds.is_empty()),
+            "async local-source/deadline adapter is not installed"
+        );
+        let mut runtime = Self::new(views)?;
+        runtime.asynchronous = Some(limits);
+        Ok(runtime)
     }
     /// Opt-in claims-only retained source. Registration/installation remain explicit.
     pub fn with_claim_source(
@@ -107,7 +136,15 @@ impl Runtime for ViewRuntime {
     }
 
     fn create_schema(&self, connection: &Connection) -> Result<()> {
+        ensure!(
+            self.asynchronous.is_none() || self.claim_source.is_none(),
+            "asynchronous retained-source installer adapter is not installed"
+        );
+        super::asynchronous::check_owner(connection, self.asynchronous)?;
         self.views.create_schema(connection)?;
+        if let Some(limits) = self.asynchronous {
+            super::asynchronous::create_schema(connection, limits)?;
+        }
         if let Some(source) = &self.claim_source {
             source.create_schema(connection)?;
         }
@@ -121,7 +158,11 @@ impl Runtime for ViewRuntime {
             projected: 0,
             local_generation: 0,
         });
-        self.views.initialize_empty(transaction, cut)
+        self.views.initialize_empty(transaction, cut)?;
+        if let Some(limits) = self.asynchronous {
+            super::asynchronous::initialize(transaction, &self.views, cut, limits)?;
+        }
+        Ok(())
     }
 
     fn schema_digest(&self) -> String {
@@ -178,6 +219,22 @@ impl Runtime for ViewRuntime {
         if !relevant {
             return Ok(());
         }
+        if self.asynchronous.is_some() {
+            let mut affected = BTreeSet::new();
+            for kind in kinds.query_map([repaired, replacement], |row| row.get::<_, String>(0))? {
+                affected.extend(self.views.subscribers(&kind?));
+            }
+            for index in affected {
+                fence_error(
+                    transaction,
+                    self.views.views[index].definition().name,
+                    &anyhow::anyhow!(
+                        "async accepted repair requires explicit bounded view recovery"
+                    ),
+                )?;
+            }
+            return Ok(());
+        }
         let old = record(transaction, repaired)?;
         let new = record(transaction, replacement)?;
         let cut = source_cut(transaction)?.context("IVM source unready")?;
@@ -209,7 +266,7 @@ impl Runtime for ViewRuntime {
             forced_batch,
         )?;
         let previous = source_cut(transaction)?.context("IVM source unready")?;
-        if self.views.reads_kind(&claim.kind) {
+        if self.asynchronous.is_none() && self.views.reads_kind(&claim.kind) {
             let key = canonical::claim_key(transaction, &claim.id)?;
             self.views
                 .change(transaction, None, Some((&claim, &key)), previous.epoch)?;
@@ -217,7 +274,8 @@ impl Runtime for ViewRuntime {
         if let Some(source) = &self.claim_source {
             source.capture(transaction, &claim)?;
         }
-        let contiguous = previous.projected.checked_add(1) == Some(claim.store_index);
+        let contiguous = self.asynchronous.is_none()
+            && previous.projected.checked_add(1) == Some(claim.store_index);
         self.views.publish_cut(
             transaction,
             SourceCut {
@@ -241,6 +299,18 @@ impl Runtime for ViewRuntime {
     ) -> Result<IncrementalProjection, Error> {
         let project = || -> Result<()> {
             let previous = source_cut(transaction)?.context("IVM source unready")?;
+            if self.asynchronous.is_some() {
+                // The admission transaction's queue trigger already captured every inserted
+                // claim. Store's base admission projection can advance without view CPU.
+                self.views.publish_cut(
+                    transaction,
+                    SourceCut {
+                        admitted: current_index_tx(transaction)?,
+                        ..previous
+                    },
+                )?;
+                return Ok(());
+            }
             if through <= previous.projected {
                 return Ok(());
             }
