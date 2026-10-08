@@ -127,6 +127,9 @@ impl Fixture {
             let graph_health: Option<(String,u64)> = c.query_row(
                 "SELECT status,last_good_store_index FROM projection_health WHERE aggregate='graph'",
                 [], |r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            // The Source-owned export obtains its genuine held staging Namespace. Errors
+            // remain diagnostic values; this child never reconstructs an identity or cut.
+            let source_diagnostic = crate::store::collection_ivm::agent_source::service::diagnostic(&self.state.store);
             let views = self.state.store.ivm_views().unwrap();
             let installer = self.state.store.ivm_installer().unwrap();
             let root = installer.root(&c, super::cards::VIEW);
@@ -143,7 +146,7 @@ impl Fixture {
             for table in ["local_agent_source_dirty","local_agent_source_fanout","local_agent_queue_dirty","local_agent_card_source_work","local_agent_card_rows"] {
                 counts.push((table,c.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get::<_,u64>(0))?));
             }
-            Ok(format!("deferred={deferred}, sql_index={sql_index}, graph_health={graph_health:?}, cut={cut:?}, readiness={:?}, root={root:?}, footprint={footprint:?}, work={pending:?}, capture={:?}, position={:?}, jobs={jobs:?}, clocks={clocks:?}, counts={counts:?}",
+            Ok(format!("deferred={deferred}, sql_index={sql_index}, graph_health={graph_health:?}, source={source_diagnostic:?}, cut={cut:?}, readiness={:?}, root={root:?}, footprint={footprint:?}, work={pending:?}, capture={:?}, position={:?}, jobs={jobs:?}, clocks={clocks:?}, counts={counts:?}",
                 views.readiness(&c,super::cards::VIEW,cut.map_or(0,|cut|cut.epoch)),
                 crate::store::collection_ivm::status(&c), installer.position(&c,super::cards::SOURCE)))
         }).unwrap()
