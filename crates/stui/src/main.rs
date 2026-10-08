@@ -804,10 +804,12 @@ fn main() -> Result<()> {
         .and_then(|(path, actor)| cache::load(path, actor));
     let (updates, incoming) = mpsc::channel::<feed::Update>();
     let (commands, command_receiver) = tokio::sync::mpsc::unbounded_channel();
-    runtime.spawn(feed::run_members(
+    // Missions are large: the UI asks for that window only while a mission list is on screen.
+    runtime.spawn(feed::run_members_with(
         clients,
         profile.is_some(),
         ui::glass_request(&args).is_some(),
+        false,
         updates,
         command_receiver,
     ));

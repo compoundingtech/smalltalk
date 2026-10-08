@@ -1906,6 +1906,8 @@ export const Snapshot = /*#__PURE__*/ (() => Schema.Struct({
   "host_id": HostId,
   "id": SnapshotId,
   "projection_version": Schema.Literal("client-projection.v0"),
+  /** For rows a background refresher prepared, such as the agents roster: when it published them. They reflect `store_index`, and local activity up to this time. */
+  "published_at": optionalKey(Timestamp),
   "store_index": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 }).annotate({ identifier: "Snapshot", description: "The complete projected state at one local store index and projection version." }))()
 export type Snapshot = typeof Snapshot.Type

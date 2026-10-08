@@ -1124,16 +1124,28 @@ impl Store {
         self.runtime.checkpoint_preflight()?;
         let sealed = self.checkpoint_sealed_set_through(cut_unix_ms, through_rowid)?;
         let plan = self.runtime.plan_checkpoint_drops(&sealed);
+        let proof = self.prove_checkpoint_plan(&sealed, &plan, scratch)?;
+        Ok((sealed, plan, proof))
+    }
+
+    /// Prove an already captured plan. Agreement checks persisted failed inputs before
+    /// entering this expensive copy/replay phase.
+    pub fn prove_checkpoint_plan(
+        &self,
+        sealed: &SealedSet,
+        plan: &DropPlan,
+        scratch: &Path,
+    ) -> Result<CheckpointProof> {
+        self.runtime.checkpoint_preflight()?;
         fs::create_dir_all(scratch)?;
         let copy = scratch.join(format!("proof-{}.sqlite3", Uuid::now_v7().simple()));
         let result = self
             .copy_store_to(&copy)
-            .and_then(|()| prove_on_copy(&*self.runtime, &copy, &sealed, &plan));
+            .and_then(|()| prove_on_copy(&*self.runtime, &copy, sealed, plan));
         for suffix in ["", "-journal", "-wal", "-shm"] {
             let _ = fs::remove_file(format!("{}{suffix}", copy.display()));
         }
-        let proof = result?;
-        Ok((sealed, plan, proof))
+        result
     }
 
     /// `st replication checkpoint plan`: plan and prove one checkpoint without changing anything.

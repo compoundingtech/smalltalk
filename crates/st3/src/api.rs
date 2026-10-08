@@ -64,6 +64,7 @@ mod client_presence;
 mod client_v0;
 mod custom;
 mod delivery_presence;
+pub(crate) mod agent_harness;
 mod delivery_probes;
 mod github_watch;
 mod harness_events;
@@ -149,6 +150,9 @@ struct ClientSnapshot {
     store_index: u64,
     projection_version: String,
     created_at: String,
+    /// For rows a background refresher folded: when it published them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_at: Option<String>,
 }
 
 /// A client page and the snapshot it was read in, which the envelope names.
@@ -444,6 +448,17 @@ impl IntoResponse for ApiError {
 pub fn router(state: AppState) -> Router {
     delivery_presence::start();
     router_for_transport(state, ClientTransportBoundary::Unix)
+}
+
+/// Already-admitted snapshot/receipt transport fixtures only. There is no CLI/API switch
+/// into this router: real native custody controls and the daemon use `router`.
+#[cfg(feature = "test-support")]
+pub(crate) fn admitted_mailbox_protocol_router(state: AppState) -> Router {
+    Router::new()
+        .route("/v1/mailbox/bind", post(mailbox::bind_admitted_fixture))
+        .route("/v1/mailbox", get(mailbox::subscribe_admitted_fixture))
+        .fallback_service(router(state.clone()))
+        .with_state(state)
 }
 
 /// Build the loopback-only client gateway. Unlike the local Unix boundary, every ordinary
@@ -1250,6 +1265,7 @@ fn client_snapshot_at(state: &AppState, store_index: u64) -> ClientSnapshot {
         store_index,
         projection_version: CLIENT_PROJECTION_VERSION.into(),
         created_at,
+        published_at: None,
     }
 }
 
@@ -2266,7 +2282,19 @@ fn client_agent_cards_for_page(
         .iter()
         .filter_map(|r| r["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    let cards = store.cached_agent_resources_for(index, history, Some(&selected), |changed| {
+    let cards = client_agent_cards_selected(store, history, index, &selected)
+        .map_err(ApiError::internal)?;
+    client_agent_cards_from_cached(store, cards, refs, at)
+}
+
+/// The cards of `selected` agents at `index`, folding only those not already cached there.
+fn client_agent_cards_selected(
+    store: &Store,
+    history: bool,
+    index: u64,
+    selected: &BTreeSet<String>,
+) -> anyhow::Result<Vec<Value>> {
+    store.cached_agent_resources_for(index, history, Some(selected), |changed| {
         let (subjects, previous) = changed.expect("a selected page always names its missing cards");
         // Delta metadata is current and already diffed; only cold pages need shallow refs.
         // Frozen continuation refs remain response metadata, never shared cache inputs.
@@ -2282,8 +2310,7 @@ fn client_agent_cards_for_page(
         )?;
         add_agent_todos(store, &mut cards, index)?;
         Ok(cards)
-    }).map_err(ApiError::internal)?;
-    client_agent_cards_from_cached(store, cards, refs, at)
+    })
 }
 
 fn client_agent_cards_from_cached(
@@ -2364,7 +2391,7 @@ fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyh
             Some(_) => "current",
         };
         item["observation"] = json!(observation);
-        if observation == "stale" && item["harness_state"] == "idle" {
+        if observation == "stale" && matches!(item["harness_state"].as_str(), Some("ready" | "idle" | "working")) {
             item["harness_state"] = json!("indeterminate");
             if item["state"] == "running" {
                 item["state"] = json!("waiting");
@@ -2447,7 +2474,7 @@ fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
     let Some(recipient) = item.get("id").and_then(Value::as_str) else {
         return;
     };
-    let assessment = delivery_presence::assess(recipient, &driver);
+    let assessment = delivery_presence::assess_current(recipient, &driver, item["incarnation_id"].as_str());
     if assessment.stale() {
         item["state"] = Value::String("waiting".into());
     }
@@ -2566,6 +2593,7 @@ fn client_agent_resources_from_status(
         .collect::<BTreeMap<_, _>>();
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
     let member_faults = store.member_reconcile_faults_for(&agent_subjects, snapshot_index)?;
+    let mailbox_faults = store.mailbox_faults_for(&agent_subjects, snapshot_index)?;
     // Cards without a harness need only their actual claim's acceptance time, not its body.
     // Keep the existing per-claim fallback if the bulk metadata read cannot be completed.
     let actual_claim_times = store.claim_acceptance_times(
@@ -2598,7 +2626,9 @@ fn client_agent_resources_from_status(
         .filter(|subject| history || subject.projection.layer == "current")
         .map(|mut subject| -> anyhow::Result<(String, Value)> {
             subject.harness = store.observed_harness_at(&subject.subject, snapshot_index)?;
-            let fault = member_faults.get(&subject.subject);
+            let member_fault = member_faults.get(&subject.subject);
+            let mailbox_fault = mailbox_faults.get(&subject.subject);
+            let fault = member_fault.or(mailbox_fault);
             let fields = subject
                 .actual
                 .as_ref()
@@ -2606,11 +2636,14 @@ fn client_agent_resources_from_status(
             let observed = fields
                 .and_then(|fields| fields.get("status"))
                 .and_then(Value::as_str);
-            let driver = subject
-                .harness
-                .as_ref()
-                .and_then(|harness| harness.driver.clone())
-                .or_else(|| subject.desired.as_ref().and_then(desired_harness_driver));
+            let declared_provider = subject.desired.as_ref().and_then(desired_harness_driver);
+            subject.harness = agent_harness::eligible(
+                declared_provider.as_deref(),
+                fields.and_then(|fields| fields.get("incarnation_id")).and_then(Value::as_str),
+                subject.harness.take(),
+            );
+            subject.harness = agent_harness::availability(subject.harness.take(), mailbox_fault.map(String::as_str));
+            let driver = declared_provider.or_else(|| subject.harness.as_ref().and_then(|harness| harness.driver.clone()));
             let harness_state = subject.harness.as_ref().map(|harness| harness.state.clone());
             let last_activity_at = store.agent_last_activity_at(
                 &subject.subject,
@@ -2694,7 +2727,7 @@ fn client_agent_resources_from_status(
                 .map(|token| crate::placement::handoff(store, &subject.subject, token, snapshot_index))
                 .transpose()?.flatten();
             let moving = handoff.as_ref().is_some_and(|h| h.phase != "running");
-            let state = if fault.is_some() { "failed" } else if moving { "waiting" } else { state };
+            let state = if member_fault.is_some() { "failed" } else if mailbox_fault.is_some() || moving { "waiting" } else { state };
             let suspension = crate::suspension::current(store, &subject.subject)?;
             // A suspended seat has no process by design: it is neither stopped nor failed.
             let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
@@ -4232,6 +4265,10 @@ async fn client_agents(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<ClientPageResponse, ApiError> {
+    // A daemon's readers never fold the roster: they answer from its refresher's publications.
+    if state.store.agent_roster_refresher_running() {
+        return client_agents_published(state, snapshot, query).await;
+    }
     // A warm request never queues behind a cold projection. Drop the probe's SQLite
     // snapshot before waiting, then recheck all cache fences in the admitted snapshot.
     for admitted in [false, true] {
@@ -4261,6 +4298,222 @@ async fn client_agents(
         }
     }
     unreachable!("an admitted roster read always builds missing cards")
+}
+
+/// An agents page from the refresher's publications. A first page waits briefly for a roster
+/// at or after its own cut, then answers from the newest one, or says not ready. A
+/// continuation answers from the roster published at exactly its first page's cut, or says the
+/// page expired. Neither folds a card.
+async fn client_agents_published(
+    state: AppState,
+    snapshot: ClientSnapshot,
+    query: ClientListQuery,
+) -> Result<ClientPageResponse, ApiError> {
+    if query.cursor.is_some() {
+        let reader = state.clone();
+        return blocking_store(move || Ok(client_agents_published_continuation(&reader, snapshot, &query)))
+            .await?;
+    }
+    wait_for_agent_roster(&state.store, query.history).await;
+    let reader = state.clone();
+    let history = query.history;
+    match blocking_store(move || Ok(client_agents_published_page(&reader, &query))).await?? {
+        Some(page) => Ok(page),
+        None => {
+            if history {
+                state.store.request_agent_roster_history();
+            } else {
+                state.store.request_agent_roster_refresh();
+            }
+            Err(agent_roster_not_ready())
+        }
+    }
+}
+
+fn agent_roster_not_ready() -> ApiError {
+    ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "agent-roster-not-ready".into(),
+        message: "the agents roster is still being prepared; retry shortly".into(),
+        details: Box::default(),
+    }
+}
+
+/// How many agents one short snapshot reduces while the refresher warms the roster.
+const AGENT_ROSTER_WARM_CHUNK: usize = 250;
+
+/// Reduce every agent's current-view and card status in short snapshots of at most
+/// [`AGENT_ROSTER_WARM_CHUNK`] agents. These per-agent reductions stay cached until a claim
+/// they depend on arrives, so the folds that follow at one cut read them instead of the log.
+fn warm_agent_roster(store: &Store) -> anyhow::Result<()> {
+    let subjects = store.read_snapshot(|index| {
+        Ok(store.readers.get()
+            .prepare_cached(crate::store::RANGE_SUBJECTS)?
+            .query_map(rusqlite::params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    })?;
+    for chunk in subjects.chunks(AGENT_ROSTER_WARM_CHUNK) {
+        let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
+        store.read_snapshot(|index| store.agent_card_status_at(Some(&names), index, false).map(drop))?;
+    }
+    Ok(())
+}
+
+/// Publish the complete roster at a new cut. When the newest complete roster tells which cards
+/// changed since, one short snapshot refolds only those. Otherwise the cards fold in short
+/// snapshots of at most [`AGENT_ROSTER_WARM_CHUNK`]: each folds the next agents at its own cut
+/// and refolds the already folded cards whose claims changed, so the last step completes a
+/// roster coherent at its cut. Readers keep the previous complete roster meanwhile.
+fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
+    if !store.read_snapshot(|index| store.agent_roster_delta_known(index, history))? {
+        let order = store.read_snapshot(|index| {
+            Ok(client_agent_page_refs(store, history, index)?.iter()
+                .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>())
+        })?;
+        for chunk in order.chunks(AGENT_ROSTER_WARM_CHUNK) {
+            let chunk = chunk.iter().cloned().collect::<BTreeSet<_>>();
+            store.read_snapshot(|index| {
+                client_agent_cards_selected(store, history, index, &chunk).map(drop)
+            })?;
+        }
+    }
+    store.read_snapshot(|index| client_agent_resources_cached(store, history, index).map(drop))
+}
+
+/// Every current agent's refs, and the cards of as many as the largest window or page shows.
+fn client_agent_roster_head(store: &Store, index: u64) -> anyhow::Result<()> {
+    let refs = client_agent_page_refs(store, false, index)?;
+    let head = refs.iter().take(CLIENT_MAX_PAGE_ITEMS + 1)
+        .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    client_agent_cards_selected(store, false, index, &head).map(drop)
+}
+
+/// A page read once answers with what was written before it: wait, briefly, for the refresher
+/// to publish a roster at or after the current cut. The read itself folds nothing.
+async fn wait_for_agent_roster(store: &Store, history: bool) {
+    let Ok(wanted) = store.index() else { return };
+    let published = |store: &Store| {
+        let index = store.index().ok()?;
+        store.published_agent_roster(index, history).map(|(cut, _, _)| cut).or_else(|| {
+            (!history).then(|| store.published_agent_roster_head(index, 1)).flatten()
+                .map(|(cut, _, _, _)| cut)
+        })
+    };
+    let mut publications = store.subscribe_agent_roster();
+    let _ = tokio::time::timeout(AGENT_ROSTER_READ_WAIT, async {
+        while published(store).is_none_or(|cut| cut < wanted) {
+            if history {
+                store.request_agent_roster_history();
+            } else {
+                store.request_agent_roster_refresh();
+            }
+            if publications.changed().await.is_err() {
+                return;
+            }
+        }
+    }).await;
+}
+
+/// The snapshot of a roster published at `cut`: that cut, its time, and when it was folded.
+fn roster_snapshot(state: &AppState, cut: u64, published_at_unix_ms: u128) -> ClientSnapshot {
+    ClientSnapshot {
+        published_at: Some(client_timestamp(published_at_unix_ms)),
+        ..client_snapshot_at(state, cut)
+    }
+}
+
+/// A first page of the newest published roster, under the snapshot it was folded at.
+fn client_agents_published_page(
+    state: &AppState,
+    query: &ClientListQuery,
+) -> Result<Option<ClientPageResponse>, ApiError> {
+    let store = &state.store;
+    let index = store.index().map_err(ApiError::internal)?;
+    let Some((index, cards, published_at)) = store.published_agent_roster(index, query.history) else {
+        // Before the first complete roster, an unfiltered first page can come from its head.
+        if query.status.is_some() || query.history {
+            return Ok(None);
+        }
+        let Some((index, refs, head, published_at)) =
+            store.published_agent_roster_head(index, CLIENT_MAX_PAGE_ITEMS + 1)
+        else {
+            return Ok(None);
+        };
+        store.request_agent_roster_refresh();
+        let snapshot = roster_snapshot(state, index, published_at);
+        let mut page = client_page_read(state, &snapshot, "agents", (*refs).clone(), query, true)?;
+        page.items = client_agent_cards_from_cached(
+            store, page_cards(&head, &page.items), &page.items, &snapshot.created_at,
+        )?;
+        return Ok(Some((Extension(snapshot), Json(page))));
+    };
+    if query.history {
+        store.request_agent_roster_history();
+    } else {
+        store.request_agent_roster_refresh();
+    }
+    let snapshot = roster_snapshot(state, index, published_at);
+    if let Some(status) = query.status.as_deref() {
+        let mut cards = (*cards).clone();
+        overlay_agent_resources(store, &mut cards, &snapshot.created_at)
+            .map_err(ApiError::internal)?;
+        cards.retain(|card| card["state"].as_str() == Some(status));
+        let page = client_page_read(state, &snapshot, "agents", cards, query, true)?;
+        return Ok(Some((Extension(snapshot), Json(page))));
+    }
+    // Continuations keep the same membership, order and queue metadata as the exact path's
+    // refs, and read their cards from this same publication.
+    let refs = cards.iter().map(|card| {
+        let mut reference = serde_json::Map::new();
+        for field in ["id", "name", "host_id"].into_iter().chain(AGENT_QUEUE_FIELDS) {
+            reference.insert(field.to_owned(), card[field].clone());
+        }
+        Value::Object(reference)
+    }).collect();
+    let mut page = client_page_read(state, &snapshot, "agents", refs, query, true)?;
+    page.items = client_agent_cards_from_cached(
+        store, page_cards(&cards, &page.items), &page.items, &snapshot.created_at,
+    )?;
+    Ok(Some((Extension(snapshot), Json(page))))
+}
+
+/// A page continuing a first page served from a publication: its cards come from the roster
+/// published at exactly that page's cut. Once that roster is gone, pagination restarts.
+fn client_agents_published_continuation(
+    state: &AppState,
+    snapshot: ClientSnapshot,
+    query: &ClientListQuery,
+) -> Result<ClientPageResponse, ApiError> {
+    let store = &state.store;
+    let mut page = client_page_read(state, &snapshot, "agents", Vec::new(), query, true)?;
+    let published = store.published_agent_roster_at(snapshot.store_index, query.history);
+    let snapshot = match &published {
+        Some((_, published_at)) => roster_snapshot(state, snapshot.store_index, *published_at),
+        None => snapshot,
+    };
+    // A status-filtered first page kept its whole overlaid cards for its continuations.
+    if query.status.is_some() {
+        return Ok((Extension(snapshot), Json(page)));
+    }
+    let Some((cards, _)) = published else {
+        return Err(client_page_expired(
+            "the roster this page was read from is no longer published; restart pagination",
+        ));
+    };
+    page.items = client_agent_cards_from_cached(
+        store, page_cards(&cards, &page.items), &page.items, &snapshot.created_at,
+    )?;
+    Ok((Extension(snapshot), Json(page)))
+}
+
+/// The cards a page's refs name, from published cards.
+fn page_cards(cards: &[Value], refs: &[Value]) -> Vec<Value> {
+    let selected = refs.iter().filter_map(|item| item["id"].as_str()).collect::<BTreeSet<_>>();
+    cards.iter()
+        .filter(|card| card["id"].as_str().is_some_and(|id| selected.contains(id)))
+        .cloned().collect()
 }
 
 fn client_agents_page_at(
@@ -5138,6 +5391,75 @@ pub fn start_operation_report(state: &AppState) {
 /// instead of walking the transcript trees, so a cold tree cannot hold those requests.
 pub fn start_native_session_discovery(state: &AppState) {
     crate::external_sessions::start_history_inventory(state.native_session_home.as_deref());
+}
+
+/// The shortest pause between two roster refreshes. A refresh also pauses as long as it took,
+/// so refreshing never takes more than about half a core however often readers ask.
+const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_millis(20);
+
+/// How long a first page waits for the refresher to publish a roster at or after its own cut.
+const AGENT_ROSTER_READ_WAIT: Duration = Duration::from_secs(1);
+
+/// Keep the complete agents roster published off the request path. As the daemon starts it
+/// folds every agent's refs and the cards the largest window shows, then the rest of the cards.
+/// A roster read that misses its exact cut serves the newest publication under
+/// that publication's own snapshot and wakes this one task, so readers neither fold the fleet's
+/// cards nor wait behind a fold once the first has published. Each refresh reuses the previous
+/// publication and refolds only the cards whose claims changed, when it can tell which.
+pub fn start_agent_roster(state: &AppState) {
+    let Some(wake) = state.store.start_agent_roster_refresher() else {
+        return;
+    };
+    let store = state.store.clone();
+    tokio::spawn(async move {
+        let mut head = true;
+        loop {
+            let started = tokio::time::Instant::now();
+            let mut admission = store.admit_agent_resources().await;
+            let reader = store.clone();
+            let first = std::mem::take(&mut head);
+            if first {
+                // Warm without admission: nothing is published, and no reader folds.
+                drop(admission);
+                let reader = store.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::performance::task("roster/warm", || warm_agent_roster(&reader))
+                }).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("st3: agents roster warm-up failed: {error:#}"),
+                    Err(error) => eprintln!("st3: agents roster warm-up stopped: {error}"),
+                }
+                admission = store.admit_agent_resources().await;
+            }
+            let refreshed = tokio::task::spawn_blocking(move || {
+                let _admission = admission;
+                // The first fold publishes only what windows and first pages show; the rest
+                // follows at once.
+                crate::performance::task("roster/refresh", || if first {
+                    reader.read_snapshot(|index| client_agent_roster_head(&reader, index))
+                } else {
+                    reader.answer_agent_roster_requests(|| {
+                        refresh_agent_roster(&reader, false)?;
+                        if reader.take_agent_roster_history_request() {
+                            refresh_agent_roster(&reader, true)?;
+                        }
+                        Ok(())
+                    })
+                })
+            })
+            .await;
+            match refreshed {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("st3: agents roster refresh failed: {error:#}"),
+                Err(error) => eprintln!("st3: agents roster refresh stopped: {error}"),
+            }
+            if first {
+                continue;
+            }
+            tokio::time::sleep(started.elapsed().max(AGENT_ROSTER_REFRESH_PAUSE)).await;
+            wake.notified().await;
+        }
+    });
 }
 
 /// The local daemon binds a Unix peer to the harness identity inherited by that peer or one of
@@ -23282,6 +23604,46 @@ mission "agent-health" state="ready" {
         let resources =
             client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
         assert_eq!(resources[0]["state"], "running");
+
+        let healthy_cut = store.index().unwrap();
+        let harness = |driver: &str, incarnation: &str, key: &str| {
+            store.append_claim(&ClaimInput {
+                subject: subject.clone(), kind: "harness.observed".into(), actor: Some(subject.clone()),
+                fields: serde_json::from_value(json!({"state":"ready","driver":driver,"incarnation_id":incarnation})).unwrap(),
+                evidence: vec![], expected_subject: None, idempotency_key: Some(key.into()),
+            }).unwrap();
+        };
+        harness("claude", "incarnation-1", "agent-health-foreign-provider");
+        let resources = client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["driver"], "codex");
+        assert_eq!(resources[0]["state"], "starting");
+        assert!(resources[0]["harness_state"].is_null(), "wrong-provider readiness must not survive the cached card");
+        assert_eq!(resources[0]["queued_work_count"], 1);
+        harness("codex", "incarnation-1", "agent-health-native-provider-restored");
+        let fault = crate::model::AttentionRequest {
+            reviewer: "person/test".into(), title: "Mailbox unavailable".into(), reason: "The current mailbox lost delivery custody.".into(),
+            severity: "error".into(), targets: vec![subject.clone()], actor: "daemon/runtime".into(), idempotency_key: "agent-health-mailbox-loss".into(),
+        };
+        let episode = "attention/agent-health-mailbox";
+        let recorded = store.record_runtime_failure(episode, &fault, "mailbox-channel-lost").unwrap();
+        let repeated = store.record_runtime_failure(episode, &fault, "mailbox-channel-lost").unwrap();
+        assert_eq!(recorded.request, repeated.request);
+        let resources = client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["state"], "waiting");
+        assert_eq!(resources[0]["harness_state"], "indeterminate");
+        assert_eq!(resources[0]["blocked_on"], "channel");
+        assert_eq!(resources[0]["fault"], fault.reason);
+        harness("codex", "incarnation-1", "agent-health-superficial-ready");
+        let resources = client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["state"], "waiting", "ready alone cannot clear a mailbox fault");
+        let historic = client_agent_resources(&store, false, "snapshot", healthy_cut).unwrap();
+        assert_eq!(historic[0]["state"], "running");
+        assert!(historic[0]["fault"].is_null(), "the historical cut must not observe a later fault");
+        store.recover_operational_failure(episode, "authenticated replay control", "agent-health-repaired").unwrap();
+        let resources = client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["state"], "running");
+        assert!(resources[0]["fault"].is_null());
+        assert_eq!(resources[0]["next_work_id"], queued);
 
         store
             .append_claim(&ClaimInput {

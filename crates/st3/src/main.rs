@@ -5904,6 +5904,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
     st3::api::start_operation_report(&state);
     // Nor does the first session list wait to read every native transcript's header.
     st3::api::start_native_session_discovery(&state);
+    // Nor does the first agents roster read fold every agent's card.
+    st3::api::start_agent_roster(&state);
     startup.phase("bind-listeners");
     let bound = std::sync::atomic::AtomicUsize::new(0);
     let ready = || {
@@ -18182,8 +18184,9 @@ async fn drive_st2_native(
             }
             _ = work_interval.tick(), if !completion_announced => {
                 let tick: Result<()> = async {
-                    let minute = unix_minute()?;
-                    if renewed_minute != Some(minute) {
+                    if let Some(minute) = renewal_minute(subject)?
+                        && renewed_minute != Some(minute)
+                    {
                         renew_claimed_work(client, subject, minute).await?;
                         renewed_minute = Some(minute);
                     }
@@ -19750,6 +19753,9 @@ async fn run_pi_channel(
                         state.failed_diagnostics.retain(|message| active.contains(message));
                         pushed_messages = messages;
                     },
+                    Some(st3::mailbox::Frame::Replay { nonce }) => {
+                        if let Some(subscription) = &subscription { subscription.acknowledge_replay(nonce); }
+                    },
                     Some(st3::mailbox::Frame::Drain { operation }) => {
                         if let Some(subscription) = &subscription { subscription.acknowledge_drain(operation); }
                     },
@@ -20059,9 +20065,11 @@ async fn run_pi_channel(
                         }
                     }
                 }
-                if renewed_minute != Some(minute) {
-                    match renew_claimed_work(client, subject, minute).await {
-                        Ok(()) => renewed_minute = Some(minute),
+                if let Some(renew_minute) = renewal_minute(subject)?
+                    && renewed_minute != Some(renew_minute)
+                {
+                    match renew_claimed_work(client, subject, renew_minute).await {
+                        Ok(()) => renewed_minute = Some(renew_minute),
                         Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
                     }
                 }
@@ -20749,52 +20757,59 @@ fn spawn_codex_provider(
     let paths = paths.clone();
     let state_dir = state_dir.to_path_buf();
     let argv = argv.to_vec();
-    tokio::task::spawn_blocking(move || match start {
-        // A resumed seat's launch environment names the thread it suspended on, and any other
-        // relaunch the thread it continues.
-        ProviderStart::Launch(
-            _,
-            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
-            _,
-            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
-        ) => {
-            let thread = st3::native_resume::requested().or_else(|| codex_continued_thread(&argv));
-            st_drivers::codex_app_server::run_controlled_paths(
+    tokio::task::spawn_blocking(move || {
+        let outcome = match start {
+            // A resumed seat's launch environment names the thread it suspended on, and any other
+            // relaunch the thread it continues.
+            ProviderStart::Launch(
+                _,
+                // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+                _,
+                // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+            ) => {
+                let thread = st3::native_resume::requested().or_else(|| codex_continued_thread(&argv));
+                st_drivers::codex_app_server::run_controlled_paths(
+                    &paths.driver_root,
+                    &state_dir,
+                    &paths.agent_dir,
+                    paths.identity,
+                    paths.runtime_id,
+                    argv,
+                    paths.delivery_gate,
+                    thread,
+                )
+            }
+            ProviderStart::Adopt(st_drivers::provider_session::DetachedSession::Codex {
+                tui_pid,
+                server_pid,
+                watchdog_pid,
+                owner_write_fd,
+                socket_path,
+                safe_fallback,
+            }) => st_drivers::codex_app_server::adopt_controlled_paths(
                 &paths.driver_root,
                 &state_dir,
                 &paths.agent_dir,
                 paths.identity,
                 paths.runtime_id,
                 argv,
+                tui_pid,
+                server_pid,
+                watchdog_pid,
+                owner_write_fd,
+                socket_path,
+                safe_fallback,
                 paths.delivery_gate,
-                thread,
-            )
+            ),
+            ProviderStart::Adopt(session) => {
+                anyhow::bail!("a Codex driver cannot adopt this provider session: {session:?}")
+            }
+        };
+        #[cfg(feature = "test-support")]
+        if env!("CARGO_BIN_NAME") == "st3-fixture" {
+            st3::test_support::hold_provider_completion(&outcome)?;
         }
-        ProviderStart::Adopt(st_drivers::provider_session::DetachedSession::Codex {
-            tui_pid,
-            server_pid,
-            watchdog_pid,
-            owner_write_fd,
-            socket_path,
-            safe_fallback,
-        }) => st_drivers::codex_app_server::adopt_controlled_paths(
-            &paths.driver_root,
-            &state_dir,
-            &paths.agent_dir,
-            paths.identity,
-            paths.runtime_id,
-            argv,
-            tui_pid,
-            server_pid,
-            watchdog_pid,
-            owner_write_fd,
-            socket_path,
-            safe_fallback,
-            paths.delivery_gate,
-        ),
-        ProviderStart::Adopt(session) => {
-            anyhow::bail!("a Codex driver cannot adopt this provider session: {session:?}")
-        }
+        outcome
     })
 }
 
@@ -20890,24 +20905,38 @@ async fn drive_codex_native(
     let mut last_capacity_fingerprint = None;
     let mut delivery = NativeDeliverySupervisor::resumed(loop_state.delivery_episode);
     let mut replacement = DriverReplacement::new();
+    // Defer only this provider's exact owned terminal observation until its task
+    // returns; a foreign or superseded mailbox fence still ends the wrapper.
+    let mut completion_announced = false;
     loop {
         tokio::select! {
             frame = mailbox.recv() => {
+                #[cfg(feature = "test-support")]
+                if env!("CARGO_BIN_NAME") == "st3-fixture"
+                    && matches!(&frame, Some(st3::mailbox::Frame::Fenced { .. }))
+                    && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION")
+                {
+                    fs::write(PathBuf::from(root).join("fence-received"),
+                        if task.is_finished() { "finished" } else { "pending" })?;
+                }
                 let mail_changed = matches!(&frame, Some(st3::mailbox::Frame::Mailbox { .. }));
                 mailbox.accept(frame, &runtime_id)?;
-                if mail_changed
+                if !completion_announced && mail_changed
                     && let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "app-server").await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
             }
 
-            wake = observations.recv() => {
+            wake = observations.recv(), if !completion_announced => {
                 wake?;
-                if let Err(error) = observations.drain(client, subject, "codex", &mut loop_state.ready).await {
-                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                match observations.drain_live(client, subject, "codex", &mut loop_state.ready).await {
+                    Ok(ended) => completion_announced |= ended,
+                    Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
                 }
+                #[cfg(feature = "test-support")]
+                if completion_announced { fixture_codex_completion_phase(&task).await?; }
             }
-            result = &mut task => {
+            result = &mut task, if completion_announced || fixture_completion_task_enabled() => {
                 let outcome = result.context("joining the Codex driver")?;
                 if let Some(session) = detached_session(&outcome) {
                     loop_state.delivery_episode = delivery.episode;
@@ -20921,6 +20950,7 @@ async fn drive_codex_native(
                     let _ = replacement.exec(subject, &root, &resume);
                     loop_state = resume.loop_state;
                     task = spawn_codex_provider(&paths, &state_dir, &argv, ProviderStart::Adopt(session));
+                    completion_announced = false;
                     continue;
                 }
                 // A resume that ended before its thread bound was refused by Codex itself, such
@@ -20983,14 +21013,20 @@ async fn drive_codex_native(
                 }
                 return outcome;
             },
-            _ = interval.tick() => {
+            _ = interval.tick(), if !completion_announced => {
                 if let Err(error) = observations.expire_due() {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
 
                 if observations.retry_pending {
-                    if let Err(error) = observations.drain(client, subject, "codex", &mut loop_state.ready).await {
-                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    match observations.drain_live(client, subject, "codex", &mut loop_state.ready).await {
+                        Ok(ended) => completion_announced |= ended,
+                        Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
+                    }
+                    if completion_announced {
+                        #[cfg(feature = "test-support")]
+                        fixture_codex_completion_phase(&task).await?;
+                        continue;
                     }
                 }
 
@@ -21165,10 +21201,11 @@ async fn drive_codex_native(
                     replacement.check();
                 }
             }
-            _ = work_interval.tick() => {
+            _ = work_interval.tick(), if !completion_announced => {
                 let tick: Result<()> = async {
-                    let minute = unix_minute()?;
-                    if renewed_minute != Some(minute) {
+                    if let Some(minute) = renewal_minute(subject)?
+                        && renewed_minute != Some(minute)
+                    {
                         renew_claimed_work(client, subject, minute).await?;
                         renewed_minute = Some(minute);
                     }
@@ -21180,6 +21217,37 @@ async fn drive_codex_native(
             }
         }
     }
+}
+
+/// Called only after the actual live Codex drain deferred its matching terminal event.
+/// This fixture controls JoinHandle ordering; it performs no drain, claim or fence itself.
+#[cfg(feature = "test-support")]
+async fn fixture_codex_completion_phase(task: &tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+    if env!("CARGO_BIN_NAME") != "st3-fixture" { return Ok(()); }
+    let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION").map(PathBuf::from) else {
+        return Ok(());
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !root.join("provider-return.json").exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "Codex fixture provider completion timed out");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    fs::write(root.join("observation-drained"), b"deferred")?;
+    let after = fs::read_to_string(root.join("order"))? == "after";
+    if after {
+        while !task.is_finished() {
+            anyhow::ensure!(tokio::time::Instant::now() < deadline, "Codex fixture JoinHandle completion timed out");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    } else {
+        anyhow::ensure!(!task.is_finished(), "Codex fixture must retain pending provider JoinHandle");
+    }
+    fs::write(root.join("join-phase"), if after { "finished" } else { "pending" })?;
+    while !root.join("poll-driver").exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "Codex fixture driver release timed out");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
 }
 
 const PROVIDER_CAPACITY_MAX_RETRIES: u32 = 6;
@@ -21591,6 +21659,27 @@ fn work_claim_has_active_harness(
 
 fn unix_minute() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() / 60)
+}
+
+/// Seconds into each minute at which this seat renews its work leases, 0 to 49, fixed per seat.
+/// Every driver once renewed the moment the minute changed, so every running seat reached the
+/// daemon's single writer in the same second and the renewals queued behind one another there
+/// (about 45 of them, 2 to 70 ms each, an average wait of 800 ms and a tail of 2 s on the production host). A
+/// lease lasts ten minutes and is renewed every minute, so an offset inside the minute costs it
+/// nothing.
+fn renewal_offset_secs(subject: &str) -> u64 {
+    let digest = Sha256::digest(subject.as_bytes());
+    u64::from(u16::from_be_bytes([digest[0], digest[1]])) % 50
+}
+
+/// The minute this seat should renew in once `unix_secs` is past its offset in that minute.
+fn renewal_minute_at(subject: &str, unix_secs: u64) -> Option<u64> {
+    (unix_secs % 60 >= renewal_offset_secs(subject)).then_some(unix_secs / 60)
+}
+
+fn renewal_minute(subject: &str) -> Result<Option<u64>> {
+    let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    Ok(renewal_minute_at(subject, seconds))
 }
 
 fn current_unix_ms() -> Result<u128> {
@@ -22256,6 +22345,10 @@ impl NativeMailbox {
     }
     fn accept(&mut self, frame: Option<st3::mailbox::Frame>, runtime_id: &str) -> Result<()> {
         match frame {
+            Some(st3::mailbox::Frame::Replay { nonce }) => {
+                if let Some(subscription) = &self.subscription { subscription.acknowledge_replay(nonce); }
+                Ok(())
+            }
             Some(st3::mailbox::Frame::Drain { operation }) => {
                 if let Some(subscription) = &self.subscription {
                     subscription.acknowledge_drain(operation);
@@ -24233,6 +24326,36 @@ mod claude_attachment_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seats_renew_once_a_minute_each_at_its_own_second_not_all_on_the_minute_boundary() {
+        let seats: Vec<String> = (0..120).map(|n| format!("agent/example/seat-{n}")).collect();
+        let mut renewals_per_second = [0usize; 60];
+        for seat in &seats {
+            let offset = renewal_offset_secs(seat);
+            assert!(offset < 50, "{seat}: {offset}");
+            // A driver ticking each second from a minute's start renews exactly once in each
+            // minute, at its offset, and every minute is still covered.
+            let mut renewed = None;
+            let mut renewals = Vec::new();
+            for second in 0..180u64 {
+                if let Some(minute) = renewal_minute_at(seat, 1_000 * 60 + second)
+                    && renewed != Some(minute)
+                {
+                    renewed = Some(minute);
+                    renewals.push(second);
+                }
+            }
+            assert_eq!(renewals, vec![offset, 60 + offset, 120 + offset], "{seat}");
+            renewals_per_second[offset as usize] += 1;
+        }
+        let busiest = renewals_per_second.iter().max().copied().unwrap();
+        assert!(
+            busiest <= 8,
+            "120 seats should spread across the minute, not queue together: {renewals_per_second:?}"
+        );
+        assert!(renewals_per_second.iter().filter(|n| **n > 0).count() >= 35);
+    }
 
     // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
     #[test]

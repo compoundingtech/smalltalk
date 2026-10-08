@@ -144,7 +144,7 @@ does not change page-cache targets, statement caching, or the allocator. Legacy 
 checkout and non-API background reads remain ungated: 32 is a worker-admission bound, not a
 global physical connection count or a process memory limit.
 
-Each reader requests a fixed 2 MiB page-cache target by default. Set
+Each reader requests a fixed 8 MiB page-cache target by default. Set
 `SMALLCLAIMS_READ_CACHE_KIB` in the **daemon's** environment to override it in KiB; positive
 integers through 2,147,483,647 are accepted, and invalid or zero values use the default.
 The value is read once per process. Retention still defaults to 128, preserving schema and
@@ -309,9 +309,14 @@ background reads and retained idle connections can exceed the admitted-worker co
 
 The doctor planning envelope uses the larger of current open readers and idle retention,
 multiplied by the per-reader target, plus the writer's 32 MiB target and a 512 MiB reserve for
-schema/statements, projections, tasks and allocator overhead. At defaults this is 800 MiB,
-leaving 224 MiB beyond that reserve under a 1 GiB service cap. The reserve is a planning
-allowance, not an enforced limit or a guarantee for every graph or workload. On Linux, doctor
+schema/statements, projections, tasks and allocator overhead. At defaults this is 1,568 MiB:
+1 GiB for 128 retained reader caches, 32 MiB for the writer and the 512 MiB reserve.
+The 1 GiB cap used in diagnostic examples is illustrative, not the service default:
+the Home Manager module defaults `memoryMax` to `"8G"` and installations can override it.
+For an installation limited to 1 GiB, set `SMALLCLAIMS_READ_CACHE_KIB=2048` to restore
+the 800 MiB planning envelope, or adjust its service limit.
+The reserve is a planning allowance, not an enforced limit or a guarantee for every graph
+or workload. On Linux, doctor
 locates the daemon's own cgroup v2 mount and checks `memory.max` and `memory.events` in that
 cgroup and its visible ancestors. It warns when the tightest limit is below the planning
 envelope, any `max` counter records pressure, or the files cannot be inspected. Ancestor

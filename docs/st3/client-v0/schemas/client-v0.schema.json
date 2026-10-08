@@ -90,7 +90,8 @@
         "host_id": { "$ref": "#/$defs/HostId" },
         "store_index": { "type": "integer", "minimum": 0 },
         "projection_version": { "const": "client-projection.v0" },
-        "created_at": { "$ref": "#/$defs/Timestamp" }
+        "created_at": { "$ref": "#/$defs/Timestamp" },
+        "published_at": { "$ref": "#/$defs/Timestamp", "description": "For rows a background refresher prepared, such as the agents roster: when it published them. They reflect `store_index`, and local activity up to this time." }
       }
     },
     "CanonicalNode": {

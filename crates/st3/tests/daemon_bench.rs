@@ -93,6 +93,7 @@ const READS: &[(&str, &str)] = &[
     ("attention list", "/v1/attention"),
     ("replication status", "/v1/replication/status"),
     ("usage", "/v1/usage"),
+    ("client usage", "/v1/client/usage"),
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -200,6 +201,7 @@ const PERSON_READS: &[(&str, &str)] = &[
     ("messages", "/v1/client/messages"),
     ("message read", "/v1/messages/read/{message}"),
     ("terminals", "/v1/client/terminals"),
+    ("client usage", "/v1/client/usage"),
 ];
 
 /// The load test that runs with every other test: thirty seats and a busy writer against a
@@ -1425,6 +1427,28 @@ fn generate(store: &Store, prefix: &str, scale: f64) {
                 }
                 "harness.timeline" => {
                     fields.insert("sequence".into(), Value::from(written as u64));
+                }
+                "harness.usage" => {
+                    // These are long-lived standing sessions, not a different mission step
+                    // on every observation. Changing synthetic ownership would turn each
+                    // cumulative reading into its own series and erase the history workload.
+                    fields.remove("owner_run");
+                    fields.remove("owner_step");
+                    let sample = *index / *subjects;
+                    let at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                    fields.extend(BTreeMap::from([
+                        ("semantics".into(), json!("response_rollup")),
+                        ("incarnation_id".into(), json!(format!("bench-{prefix}-usage"))),
+                        ("observed_at_unix_ms".into(), json!(at.saturating_sub(86_400_000).saturating_add(sample as u64 * 600_000))),
+                        ("total_tokens".into(), json!(sample as u64 * 1000)),
+                        ("input_tokens".into(), json!(sample as u64 * 800)),
+                        ("output_tokens".into(), json!(sample as u64 * 200)),
+                        ("cost_microusd".into(), json!(sample as u64 * 2000)),
+                        ("model".into(), json!("fixture-model")),
+                        ("account".into(), json!("fixture-account")),
+                        ("host".into(), json!(prefix)),
+                    ]));
                 }
                 _ => {}
             }

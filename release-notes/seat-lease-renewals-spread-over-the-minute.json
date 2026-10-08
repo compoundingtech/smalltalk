@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Spread seat lease renewals across the minute instead of sending every one in the same second",
+  "replay": {"status": "none", "detail": "No replay or rebuild. Each driver still renews every claimed step once a minute with the same request and idempotency key."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Claim authority, lease length (ten minutes), order and commit-before-ACK are unchanged."},
+  "compatibility": {"status": "none", "detail": "Driver-side timing only. A driver started before this release keeps renewing on the minute boundary until it restarts."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step. Running seats pick it up when their driver restarts."},
+  "recovery": {"status": "none", "detail": "Revert the driver change. A renewal that lands up to 49 s later in the minute cannot expire a ten-minute lease renewed every minute."}
+}

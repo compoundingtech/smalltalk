@@ -4,9 +4,12 @@ mod glass_heads;
 mod arrangements;
 #[cfg(test)]
 mod arrangements_tests;
+#[cfg(test)]
+mod authored_pull_requests_tests;
 mod glasses;
 pub(crate) mod mailbox_wakes;
 mod mailbox_changes;
+mod mailbox_lease;
 #[cfg(test)]
 mod message_send_tests;
 pub mod owned_sets;
@@ -141,6 +144,7 @@ mod unread_mail;
 mod agent_messages;
 pub mod agent_view;
 mod conversation_reads;
+mod usage_period;
 mod runtime;
 #[cfg(test)]
 mod tombstones_tests;
@@ -215,10 +219,6 @@ WHERE kind IN ('mission-run.state','step-run.state','work.failed')
 CREATE INDEX IF NOT EXISTS claims_terminal_capability_hash_index
 ON claims(json_extract(body, '$.fields.capability_hash'), store_index)
 WHERE kind='custom.client.terminal-attached';
--- The period usage report reads response rollups only: 8,700 of the 90,000 harness.usage claims
--- on a real store (the rest are context occupancy and session totals, written every few seconds).
-CREATE INDEX IF NOT EXISTS claims_usage_rollup_index ON claims(store_index)
-WHERE kind='harness.usage' AND json_extract(body,'$.fields.semantics')='response_rollup';
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
@@ -276,6 +276,14 @@ WHERE kind='subscription.mission-started';
 CREATE INDEX IF NOT EXISTS claims_subscription_mission_resource_index
 ON claims(json_extract(body, '$.fields.mission'), json_extract(body, '$.fields.resource'))
 WHERE kind='subscription.mission-requested';
+-- Authored PR ownership is looked up by URL or repository/number. Keep ordinary observed
+-- resources out of both indexes; the lookup unions two seeks before canonical ordering.
+CREATE INDEX IF NOT EXISTS claims_authored_pull_request_url_index
+ON claims(json_extract(body, '$.fields.facts.url'))
+WHERE kind='resource.observed' AND subject LIKE 'resource/mission-run/%/pull-request';
+CREATE INDEX IF NOT EXISTS claims_authored_pull_request_number_index
+ON claims(json_extract(body, '$.fields.facts.repository'), json_extract(body, '$.fields.facts.number'))
+WHERE kind='resource.observed' AND subject LIKE 'resource/mission-run/%/pull-request';
 CREATE INDEX IF NOT EXISTS claims_subscription_deferred_request_index
 ON claims(subject, json_extract(body, '$.fields.request'), store_index)
 WHERE kind='subscription.mission-deferred';
@@ -602,6 +610,29 @@ CREATE TABLE IF NOT EXISTS local_mailbox_bindings (
     incarnation TEXT NOT NULL,
     epoch INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS local_mailbox_argv_bindings (
+    token TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    component TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    member TEXT NOT NULL
+);
+-- Authenticated process/session custody, independent of the connection binding.
+CREATE TABLE IF NOT EXISTS local_mailbox_leases (
+    subject TEXT NOT NULL,
+    component TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    session TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    pid INTEGER NOT NULL,
+    process_token TEXT NOT NULL,
+    token TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(subject, component)
+);
 CREATE TABLE IF NOT EXISTS local_work_lease_renewals (
     subject TEXT PRIMARY KEY,
     attempt INTEGER NOT NULL,
@@ -630,6 +661,8 @@ ON local_observations(subject, kind, id);
 -- subject-and-kind index made it read every observation the seat ever had.
 CREATE INDEX IF NOT EXISTS local_observations_subject_id_index
 ON local_observations(subject, id);
+CREATE INDEX IF NOT EXISTS local_observations_after_store_index
+ON local_observations(after_store_index);
 CREATE INDEX IF NOT EXISTS local_observations_time_index
 ON local_observations(observed_at_unix_ms);
 CREATE UNIQUE INDEX IF NOT EXISTS local_observations_dedupe_index
@@ -903,6 +936,13 @@ pub(crate) struct SubjectCache {
 }
 
 const AGENT_CARD_STATUS_LIMIT: usize = 4096;
+
+/// A roster head: its cut, every agent's refs, the first cards in order, and when published.
+pub(crate) type PublishedRosterHead = (u64, Arc<Vec<Value>>, Vec<Value>, u128);
+
+/// How long a roster refresh request may go unanswered before readers stop serving published
+/// rows and say the roster is not ready.
+const AGENT_ROSTER_OVERDUE_MS: u64 = 30_000;
 
 /// One subject's reduction, read at snapshot `read_at`, so it holds from there on.
 struct StatusEntry {
@@ -2074,6 +2114,7 @@ pub(crate) fn watch_ended_tx(
     subject: &str,
     watch: &crate::model::WatchSpec,
 ) -> Result<Option<Value>, St3Error> {
+    smallclaims::touched::note_read(|| subject.to_owned());
     let since = watch.since_unix_ms.to_string();
     let mut statement = connection
         .prepare_cached(
@@ -2530,6 +2571,18 @@ fn new_mentions(prior: Option<&(Value, u128)>, facts: &Value) -> Vec<Value> {
 /// The mission runs that published a `resource/mission-run/RUN/pull-request` naming this pull
 /// request, by URL or by repository and number, at the same head when both name one. An
 /// authoring mission publishes that resource when it opens the pull request.
+const AUTHORING_PULL_REQUEST_RUNS_QUERY: &str =
+    "SELECT subject, body FROM claims WHERE id IN (
+         SELECT id FROM claims WHERE kind='resource.observed'
+           AND subject LIKE 'resource/mission-run/%/pull-request'
+           AND json_extract(body, '$.fields.facts.url')=?1
+         UNION
+         SELECT id FROM claims WHERE kind='resource.observed'
+           AND subject LIKE 'resource/mission-run/%/pull-request'
+           AND json_extract(body, '$.fields.facts.repository')=?2
+           AND json_extract(body, '$.fields.facts.number')=?3
+     ) ORDER BY CANONICAL_ASC(claims)";
+
 fn authoring_pull_request_runs_tx(
     connection: &Connection,
     facts: &Value,
@@ -2541,14 +2594,11 @@ fn authoring_pull_request_runs_tx(
         return Ok(Vec::new());
     }
     let head = facts.get("head_sha").and_then(Value::as_str);
-    let mut statement = connection.prepare(&canonical_sql(
-        "SELECT subject, body FROM claims WHERE kind='resource.observed'
-         AND subject LIKE 'resource/mission-run/%/pull-request'
-         AND (json_extract(body, '$.fields.facts.url')=?1
-           OR (json_extract(body, '$.fields.facts.repository')=?2
-               AND json_extract(body, '$.fields.facts.number')=?3))
-         ORDER BY CANONICAL_ASC(claims)",
-    ))?;
+    // An OR can scan the whole partial index. UNION locates matching claim IDs with one
+    // expression-index seek per identity, deduplicates dual matches, then orders only those
+    // claims with the same canonical order as the original query.
+    let mut statement =
+        connection.prepare_cached(&canonical_sql(AUTHORING_PULL_REQUEST_RUNS_QUERY))?;
     let candidates = statement
         .query_map(params![url, repository, number], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -2757,6 +2807,14 @@ impl Store {
                 row.get::<_, Option<String>>(2)?))
         })? {
             let (subject, kind, actor) = row?;
+            // A card reads claims about its agent, the runs, generations and steps that own or
+            // queue agents, and messages; work activity is read by actor on step claims. A
+            // claim about any other subject, of any kind, changes no card.
+            if !["agent/", "mission-run/", "run-generation/", "step-run/", "message/"]
+                .iter().any(|prefix| subject.starts_with(prefix))
+            {
+                continue;
+            }
             if self.smalltalk.claim_registry().claim(&kind).is_none() {
                 return Ok(None);
             }
@@ -2814,19 +2872,8 @@ impl Store {
                     .filter(|party| party.starts_with("agent/")));
                 continue;
             }
-            // These projections touch neither card reductions nor queue/label inputs. Keep
-            // the subject guards: a claim on an agent also changes its fallback revision.
-            let irrelevant = match kind.as_str() {
-                "daemon.diagnostic" | "daemon.started" => subject.starts_with("daemon/"),
-                "glass.upserted" | "glass.deleted" => subject.starts_with("glass/"),
-                "arrangement.edited" => subject.starts_with("arrangement/"),
-                "fleet.invite-created" | "fleet.invite-redeemed" | "fleet.invite-revoked" => subject.starts_with("fleet-invite/"),
-                "fleet.member-admitted" | "fleet.member-endpoints" | "fleet.member-left" | "fleet.member-removed" => subject.starts_with("host/"),
-                _ => false,
-            };
-            if !irrelevant {
-                return Ok(None);
-            }
+            // Any other claim about a card input subject: refold conservatively.
+            return Ok(None);
         }
         if !owners.is_empty() {
             // Existing cards carry their historical ownership; current declarations also
@@ -2926,6 +2973,148 @@ impl Store {
             .and_then(|entry| entry.valid_until_unix_ms)
     }
 
+    /// Register the one task that keeps the complete roster published, and return its wake.
+    /// `None` when one is already registered.
+    pub(crate) fn start_agent_roster_refresher(&self) -> Option<Arc<tokio::sync::Notify>> {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        self.smalltalk.agent_roster_refresh.set(Arc::clone(&wake)).ok()?;
+        Some(wake)
+    }
+
+    /// Whether a fold at `index` can start from the newest complete roster and refold only the
+    /// cards whose claims changed since, rather than every card.
+    pub(crate) fn agent_roster_delta_known(&self, index: u64, history: bool) -> Result<bool> {
+        let previous = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
+            .max_by_key(|entry| (entry.index, entry.local)).cloned();
+        let Some(previous) = previous else { return Ok(false) };
+        Ok(previous.index == index
+            || self.changed_agent_resources(previous.index, index, &previous.items)?.is_some())
+    }
+
+    /// Whether a refresher keeps the roster published, so readers must never fold it.
+    pub(crate) fn agent_roster_refresher_running(&self) -> bool {
+        self.smalltalk.agent_roster_refresh.get().is_some()
+    }
+
+    /// Ask the refresher, if one runs, to publish the roster at the newest cut. Requests made
+    /// while it folds coalesce into one more refresh.
+    pub(crate) fn request_agent_roster_refresh(&self) {
+        if let Some(wake) = self.smalltalk.agent_roster_refresh.get() {
+            let _ = self.smalltalk.agent_roster_requested_at.compare_exchange(
+                0, now_ms() as u64, std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            wake.notify_one();
+        }
+    }
+
+    /// Ask the refresher, if one runs, to also publish the history roster.
+    pub(crate) fn request_agent_roster_history(&self) {
+        self.smalltalk.agent_roster_history_wanted.store(true, std::sync::atomic::Ordering::Release);
+        self.request_agent_roster_refresh();
+    }
+
+    /// Whether a reader asked for the history roster since the last time this was taken.
+    pub(crate) fn take_agent_roster_history_request(&self) -> bool {
+        self.smalltalk.agent_roster_history_wanted.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Run one refresh, answering the requests made before it began only if it publishes.
+    pub(crate) fn answer_agent_roster_requests<T>(&self, refresh: impl FnOnce() -> Result<T>) -> Result<T> {
+        let requested = &self.smalltalk.agent_roster_requested_at;
+        let pending = requested.swap(0, std::sync::atomic::Ordering::AcqRel);
+        let result = refresh();
+        if result.is_err() && pending != 0 {
+            // Still unanswered: keep the oldest request time unless a newer request is waiting.
+            let _ = requested.compare_exchange(0, pending, std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Whether a refresh request has gone unanswered so long that the refresher must be failing
+    /// or stopped: published rows are then no longer served, and readers are told not ready.
+    fn agent_roster_refresh_overdue(&self) -> bool {
+        let requested = self.smalltalk.agent_roster_requested_at.load(std::sync::atomic::Ordering::Acquire);
+        requested != 0 && (now_ms() as u64).saturating_sub(requested) > AGENT_ROSTER_OVERDUE_MS
+    }
+
+    /// The newest complete current roster published at or before `index`, with its own graph
+    /// index, while a refresher keeps advancing it. A reader serves these rows under that
+    /// index's snapshot, never under its own newer one, and wakes the refresher. Without a
+    /// refresher there is none: readers then fold exactly their own cut, as before.
+    pub(crate) fn published_agent_roster(
+        &self,
+        index: u64,
+        history: bool,
+    ) -> Option<(u64, Arc<Vec<Value>>, u128)> {
+        self.smalltalk.agent_roster_refresh.get()?;
+        if self.agent_roster_refresh_overdue() {
+            return None;
+        }
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
+            .max_by_key(|entry| (entry.index, entry.local))
+            .map(|entry| (entry.index, Arc::clone(&entry.items), entry.published_at_unix_ms))
+    }
+
+    /// The complete roster published at exactly `cut`, for a page continuing from a first page
+    /// served at that cut, with when it was published.
+    pub(crate) fn published_agent_roster_at(
+        &self,
+        cut: u64,
+        history: bool,
+    ) -> Option<(Arc<Vec<Value>>, u128)> {
+        self.smalltalk.agent_roster_refresh.get()?;
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index == cut)
+            .max_by_key(|entry| entry.local)
+            .map(|entry| (Arc::clone(&entry.items), entry.published_at_unix_ms))
+    }
+
+    /// When no complete roster is published yet: the newest current refs at or before `index`
+    /// (membership, order and queue metadata of every agent) and the cards of their first
+    /// `count` agents, all at that one cut. The refresher publishes this head first as the
+    /// daemon starts, so a window or first page need not wait for every card to fold.
+    pub(crate) fn published_agent_roster_head(
+        &self,
+        index: u64,
+        count: usize,
+    ) -> Option<PublishedRosterHead> {
+        self.smalltalk.agent_roster_refresh.get()?;
+        if self.agent_roster_refresh_overdue() {
+            return None;
+        }
+        let (cut, refs) = self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned").iter()
+            .filter(|entry| !entry.history && entry.index <= index)
+            .max_by_key(|entry| entry.index)
+            .map(|entry| (entry.index, Arc::clone(&entry.items)))?;
+        let cache = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned");
+        let head = cache.iter().filter(|entry| entry.index == cut && !entry.history)
+            .find_map(|entry| {
+                let cards = entry.items.iter()
+                    .filter_map(|card| Some((card["id"].as_str()?, card)))
+                    .collect::<HashMap<_, _>>();
+                refs.iter().take(count)
+                    .map(|reference| cards.get(reference["id"].as_str()?).map(|card| (*card).clone()))
+                    .collect::<Option<Vec<_>>>()
+                    .map(|head| (head, entry.published_at_unix_ms))
+            })?;
+        Some((cut, refs, head.0, head.1))
+    }
+
+    /// Follows the revision of complete current roster publications: it rises with every one,
+    /// including a replacement at the same graph index after local activity or a deadline.
+    pub(crate) fn subscribe_agent_roster(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.smalltalk.agent_roster_published.subscribe()
+    }
+
     /// Queue selection changes at lease expiry even when the claim frontier is unchanged.
     /// Scan only on a cache miss, inside the same SQLite snapshot as the queue projection.
     fn agent_queue_valid_until(&self, now: u128) -> Result<Option<u128>> {
@@ -2978,6 +3167,7 @@ impl Store {
             .expect("agent page refs cache poisoned");
         cache.push_back(runtime::AgentResourcesEntry {
             index, local: 0, history, covered: None, valid_until_unix_ms, items: Arc::clone(&items),
+            published_at_unix_ms: now,
         });
         let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
         drop(cache);
@@ -3121,6 +3311,7 @@ impl Store {
                         index, local, history, covered,
                         valid_until_unix_ms,
                         items: Arc::clone(&previous.items),
+                        published_at_unix_ms: now_ms(),
                     });
                 }
                 #[cfg(test)]
@@ -3141,6 +3332,7 @@ impl Store {
                     index, local, history, covered,
                     valid_until_unix_ms,
                     items: Arc::new(items),
+                    published_at_unix_ms: now_ms(),
                 })
             }
             None => {
@@ -3158,6 +3350,7 @@ impl Store {
                     index, local, history, covered: selected.cloned(),
                     valid_until_unix_ms: self.agent_queue_valid_until(now)?,
                     items: Arc::new(items),
+                    published_at_unix_ms: now_ms(),
                 })
             }
         }
@@ -3169,6 +3362,7 @@ impl Store {
         let published = cache.iter().filter(valid).find(|entry| {
             agent_resources_entry_hits(entry, now, index, local, history, selected)
         }).map(|entry| Arc::clone(&entry.items));
+        let complete = entry.covered.is_none();
         let items = if let Some(published) = published { published } else {
             cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
             let items = Arc::clone(&entry.items);
@@ -3177,6 +3371,9 @@ impl Store {
             items
         };
         drop(cache);
+        if complete {
+            self.smalltalk.agent_roster_published.send_modify(|revision| *revision += 1);
+        }
         Ok(select(&items))
     }
 
@@ -3191,6 +3388,16 @@ impl Store {
         history: bool,
         selected: Option<&BTreeSet<String>>,
     ) -> Result<Option<Arc<Vec<Value>>>> {
+        Ok(self.agent_resources_published_at(index, history, selected)?.map(|(items, _)| items))
+    }
+
+    /// [`Self::agent_resources_cached_at`], with when the rows were published.
+    pub(crate) fn agent_resources_published_at(
+        &self,
+        index: u64,
+        history: bool,
+        selected: Option<&BTreeSet<String>>,
+    ) -> Result<Option<(Arc<Vec<Value>>, u128)>> {
         if index < current_index(&self.readers.get())? {
             return Ok(None);
         }
@@ -3202,7 +3409,7 @@ impl Store {
             .expect("agent resources cache poisoned");
         let hit = cache.iter()
             .find(|entry| agent_resources_entry_hits(entry, now, index, local, history, selected))
-            .map(|entry| Arc::clone(&entry.items));
+            .map(|entry| (Arc::clone(&entry.items), entry.published_at_unix_ms));
         drop(cache);
         Ok(hit.map(|hit| crate::performance::task("roster/cache-hit", || hit)))
     }
@@ -7921,15 +8128,41 @@ impl Store {
                         ));
                     }
                 };
+                // Most renewals only extend the local operational lease. Publish an
+                // anchor before the last replicated expiry is within five minutes, so
+                // another replica never sees a normally renewed lease as expired.
+                let quiet_renewal = action == "renew"
+                    && request.summary.is_none()
+                    && request.reason.is_none()
+                    && request.evidence.is_empty();
+                let last_replicated_expiry = if quiet_renewal {
+                    transaction
+                        .query_row(
+                            &canonical_sql("SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
+                             FROM claims WHERE subject=?1
+                               AND kind IN ('work.claimed','work.renewed','work.progress')
+                             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                            [&subject],
+                            |row| row.get::<_, Option<u64>>(0),
+                        )
+                        .optional()
+                        .map_err(internal)?
+                        .flatten()
+                        .map(u128::from)
+                } else {
+                    None
+                };
+                let publish = !quiet_renewal
+                    || last_replicated_expiry.is_none_or(|expiry| expiry <= now.saturating_add(300_000));
                 let readiness_epoch = current
                     .readiness_epoch
                     .saturating_add(u32::from(status == "ready" && current.status != "ready"));
                 transaction
                     .execute(
                         "UPDATE step_runs SET status=?2, worker_reported=?3, lease_owner=?4, lease_incarnation=?5,
-                                lease_expires_at_unix_ms=?6, blocked_reason=?7, readiness_epoch=?8,
+                                lease_expires_at_unix_ms=?6, blocked_reason=CASE WHEN ?10 THEN ?7 ELSE blocked_reason END, readiness_epoch=?8,
                                 updated_at_unix_ms=?9 WHERE subject=?1",
-                        params![subject, status, worker_reported, claimant, claim_incarnation, claim_expiry.map(|value| value.to_string()), request.reason, readiness_epoch, now.to_string()],
+                        params![subject, status, worker_reported, claimant, claim_incarnation, claim_expiry.map(|value| value.to_string()), request.reason, readiness_epoch, now.to_string(), publish],
                     )
                     .map_err(internal)?;
                 renew_nested_ancestor_leases_tx(
@@ -7967,32 +8200,6 @@ impl Store {
                     "extend" => "work.extended",
                     _ => unreachable!("the work action was validated above"),
                 };
-                // Most renewals only extend the local operational lease. Publish an
-                // anchor before the last replicated expiry is within five minutes, so
-                // another replica never sees a normally renewed lease as expired.
-                let quiet_renewal = action == "renew"
-                    && request.summary.is_none()
-                    && request.reason.is_none()
-                    && request.evidence.is_empty();
-                let last_replicated_expiry = if quiet_renewal {
-                    transaction
-                        .query_row(
-                            &canonical_sql("SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
-                             FROM claims WHERE subject=?1
-                               AND kind IN ('work.claimed','work.renewed','work.progress')
-                             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
-                            [&subject],
-                            |row| row.get::<_, Option<u64>>(0),
-                        )
-                        .optional()
-                        .map_err(internal)?
-                        .flatten()
-                        .map(u128::from)
-                } else {
-                    None
-                };
-                let publish = !quiet_renewal
-                    || last_replicated_expiry.is_none_or(|expiry| expiry <= now.saturating_add(300_000));
                 if publish {
                     append_receipt_claim_tx(
                         transaction,
@@ -9813,7 +10020,8 @@ impl Store {
         }
         self.graph.ensure_principal_key(input.actor.as_deref().unwrap())?;
         let signature = serde_json::to_string(signature).map_err(internal)?;
-        append_claim_with_signature(&self.graph, input, None, None, None, None, Some(&signature))
+        append_claim_with_commit_context(&self.graph, input, None, None, None, None,
+            ClaimCommitContext { signature: Some(&signature), ..Default::default() })
     }
 
     pub(crate) fn append_claim_outcome(
@@ -10077,8 +10285,7 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                "SELECT COALESCE(MIN(id), (SELECT COALESCE(MAX(id), 0) + 1 FROM local_observations))
-                 FROM local_observations WHERE after_store_index >= ?1",
+                LOCAL_OBSERVATION_FLOOR_QUERY,
                 [store_index],
                 |row| row.get::<_, i64>(0),
             )
@@ -15251,6 +15458,21 @@ impl Store {
         since_ms: u64,
         until_ms: u64,
     ) -> Result<(Vec<Value>, Vec<agent_messages::DailyUsage>)> {
+        self.read_snapshot(|_| {
+            let mut boundaries = BTreeSet::from([since_ms, until_ms]);
+            for (since, until) in agent_messages::windows(since_ms, until_ms) {
+                boundaries.extend([since, until]);
+            }
+            let rows = usage_period::boundary_rows(&self.readers.get(), &boundaries)?;
+            Self::usage_period_data_from_rows(rows.into_iter().map(Ok), since_ms, until_ms)
+        })
+    }
+
+    fn usage_period_data_from_rows(
+        rows: impl IntoIterator<Item = rusqlite::Result<(String, u64, String)>>,
+        since_ms: u64,
+        until_ms: u64,
+    ) -> Result<(Vec<Value>, Vec<agent_messages::DailyUsage>)> {
         #[derive(Clone, Default)]
         struct Snapshot {
             at: u64,
@@ -15264,20 +15486,6 @@ impl Store {
             at: u64,
             buckets: [u64; USAGE_BUCKETS.len()],
         }
-        let connection = self.readers.get();
-        let mut statement = connection.prepare(&canonical_sql(
-            "SELECT subject, store_index, body FROM claims INDEXED BY claims_usage_rollup_index
-             WHERE kind='harness.usage'
-             AND json_extract(body, '$.fields.semantics')='response_rollup'
-             ORDER BY CANONICAL_ASC(claims)",
-        ))?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, u64>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
         type Key = (String, String, String, String, String, String, String);
         let mut days = agent_messages::windows(since_ms, until_ms)
             .into_iter()
@@ -15929,11 +16137,67 @@ impl Store {
         &self,
         request: &crate::mailbox::Fence,
     ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_lease(request, None)
+    }
+
+    pub(crate) fn bind_mailbox_with_lease(
+        &self,
+        request: &crate::mailbox::Fence,
+        authority: Option<&crate::mailbox::Authority>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_lease_checked(request, authority, &|| Ok(()))
+    }
+
+    /// Recheck captured physical custody under the writer, before any capability mutation.
+    pub(crate) fn bind_mailbox_with_lease_checked(
+        &self,
+        request: &crate::mailbox::Fence,
+        authority: Option<&crate::mailbox::Authority>,
+        validate: &dyn Fn() -> Result<(), St3Error>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_admission_checked(request, authority, None, validate)
+    }
+
+    /// Explicit argv-only transports retain their legacy protocol, never provider custody.
+    pub(crate) fn bind_argv_mailbox_checked(
+        &self,
+        request: &crate::mailbox::Fence,
+        member: &crate::model::MemberSpec,
+        validate: &dyn Fn() -> Result<(), St3Error>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_admission_checked(request, None, Some(member), validate)
+    }
+
+    fn bind_mailbox_with_admission_checked(
+        &self,
+        request: &crate::mailbox::Fence,
+        authority: Option<&crate::mailbox::Authority>,
+        argv_member: Option<&crate::model::MemberSpec>,
+        validate: &dyn Fn() -> Result<(), St3Error>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
         let mut connection = self.connection.write();
         let tx = connection.transaction().map_err(internal)?;
         check_mailbox_incarnation(&tx, request)?;
+        if let Some(member) = argv_member {
+            mailbox_lease::check_argv_declaration(&tx, request, member, &self.origin)?;
+        }
+        validate()?;
+        if let Some(authority) = authority {
+            mailbox_lease::refuse_argv_native_adoption(&tx, request)?;
+            mailbox_lease::check_declaration(&tx, request, authority, &self.origin)?;
+            mailbox_lease::admit(&tx, request, authority)?;
+        }
         if request.epoch != 0 {
-            check_mailbox_fence(&tx, request)?;
+            check_mailbox_fence(&tx, request, &self.origin)?;
+            if let Some(authority) = authority {
+                mailbox_lease::record(&tx, request, authority)?;
+            }
+            if let Some(member) = argv_member {
+                mailbox_lease::record_argv_binding(&tx, request, member)?;
+            }
+            if authority.is_some() || argv_member.is_some() {
+                tx.commit().map_err(internal)?;
+            }
             return Ok(request.clone());
         }
         if request.token.is_empty() || request.token.len() > 128 {
@@ -15962,9 +16226,21 @@ impl Store {
             }
             bound.epoch = epoch;
             // Retired tokens cannot allocate another epoch and retake their successor's mailbox.
-            check_mailbox_fence(&tx, &bound)?;
+            check_mailbox_fence(&tx, &bound, &self.origin)?;
+            if let Some(authority) = authority {
+                mailbox_lease::record(&tx, &bound, authority)?;
+            }
+            if let Some(member) = argv_member {
+                mailbox_lease::record_argv_binding(&tx, &bound, member)?;
+            }
+            if authority.is_some() || argv_member.is_some() {
+                tx.commit().map_err(internal)?;
+            }
             return Ok(bound);
         }
+        // A revoked argv capability must not be recreated even if its binding row
+        // was removed; its durable authenticated designation remains terminal.
+        mailbox_lease::refuse_argv_native_adoption(&tx, request)?;
         let previous: Option<u64> = tx
             .query_row(
                 "SELECT epoch FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
@@ -15992,6 +16268,12 @@ impl Store {
         tx.execute("INSERT INTO local_mailbox_owners VALUES (?1,?2,?3,?4)
             ON CONFLICT(subject,component) DO UPDATE SET incarnation=excluded.incarnation, epoch=excluded.epoch",
             params![bound.subject, bound.component, bound.incarnation, bound.epoch]).map_err(internal)?;
+        if let Some(authority) = authority {
+            mailbox_lease::record(&tx, &bound, authority)?;
+        }
+        if let Some(member) = argv_member {
+            mailbox_lease::record_argv_binding(&tx, &bound, member)?;
+        }
         tx.commit().map_err(internal)?;
         if let Some(wakes) = self.smalltalk.mailbox_wakes.get() {
             wakes.owner_changed(&bound.subject, &bound.component);
@@ -16000,7 +16282,7 @@ impl Store {
     }
 
     pub(crate) fn check_mailbox(&self, fence: &crate::mailbox::Fence) -> Result<(), St3Error> {
-        check_mailbox_fence(&self.readers.get(), fence)
+        check_mailbox_fence(&self.readers.get(), fence, &self.origin)
     }
 
     /// First observation of the current boot, including its index to distinguish messages
@@ -18826,6 +19108,13 @@ fn registered_client_claim_kind(kind: &str) -> bool {
 
 const LOCAL_OBSERVATION_COLUMNS: &str = "SELECT id, after_store_index, subject, kind, actor, body, observed_at_unix_ms FROM local_observations";
 
+// MIN(id) makes SQLite walk rowids from the beginning until it finds a match, even with the
+// frontier index present. Unary + disables that shortcut so this reads only the covering
+// after_store_index range; id is the integer primary key carried by each index entry.
+const LOCAL_OBSERVATION_FLOOR_QUERY: &str =
+    "SELECT COALESCE(MIN(+id), (SELECT COALESCE(MAX(id), 0) + 1 FROM local_observations))
+     FROM local_observations WHERE after_store_index >= ?1";
+
 const LOCAL_OBSERVATION_ID_PREFIX: &str = "local-observation/";
 
 fn local_retention(kind: &str) -> bool {
@@ -21407,8 +21696,10 @@ fn mailbox_owner_key(
 fn check_mailbox_fence(
     connection: &Connection,
     fence: &crate::mailbox::Fence,
+    host: &str,
 ) -> Result<(), St3Error> {
     check_mailbox_incarnation(connection, fence)?;
+    mailbox_lease::check_lease_fence(connection, fence, host)?;
     let owner: Option<(String, u64)> = connection
         .prepare_cached(
             "SELECT owner.incarnation, owner.epoch FROM local_mailbox_owners owner
@@ -39958,6 +40249,50 @@ version 2
         );
     }
 
+    #[test]
+    fn quiet_renewals_preserve_the_shared_step_reason_and_projection_digest() {
+        for working in [false, true] {
+            let (controller, worker, step) = replicated_step_pair();
+            let request = |reason: Option<&str>, key: &str| WorkRequest {
+                actor: Some("agent/worker.one".into()),
+                incarnation: Some("worker-generation".into()),
+                summary: None, reason: reason.map(str::to_owned), evidence: Vec::new(),
+                idempotency_key: key.into(),
+            };
+            worker.work_action(&step, "claim", &request(Some("durable claim reason"), "reason-claim")).unwrap();
+            if working {
+                worker.work_action(&step, "progress", &request(Some("durable progress reason"), "reason-progress")).unwrap();
+            }
+            receive_and_project(&controller, "worker", &exchange_from(&worker, &controller.replication_inventory().unwrap()));
+            let before = worker.step_run(&step).unwrap().unwrap();
+            let snapshot = worker.replication_snapshot().unwrap();
+            let claims_before = worker.claims_for(&step, Some("work.renewed")).unwrap().len();
+            // Use the ordinary clock and the existing renewal cadence: this stays inside
+            // the five-minute replicated anchor margin and changes no production deadline.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let renewed = worker.work_action(&step, "renew", &request(None, "reason-quiet-renew")).unwrap();
+            assert!(renewed.claim_expires_at_unix_ms > before.claim_expires_at_unix_ms);
+            assert_eq!(renewed.blocked_reason, before.blocked_reason);
+            assert_eq!(worker.claims_for(&step, Some("work.renewed")).unwrap().len(), claims_before);
+            let after = worker.replication_snapshot().unwrap();
+            assert_eq!(after.authority_digest, snapshot.authority_digest);
+            assert_eq!(after.projection_digests, snapshot.projection_digests);
+            assert_eq!(after.projection_digests, controller.replication_snapshot().unwrap().projection_digests);
+            worker.replay_replication_graph().unwrap();
+            let replayed = worker.step_run(&step).unwrap().unwrap();
+            assert_eq!(replayed.blocked_reason, before.blocked_reason);
+            assert_eq!(replayed.claim_expires_at_unix_ms, renewed.claim_expires_at_unix_ms);
+            assert_eq!(worker.replication_snapshot().unwrap().projection_digests, after.projection_digests);
+            // A published renewal still updates the shared reason through its durable claim.
+            let published = worker.work_action(&step, "renew", &request(Some("new durable reason"), "reason-published-renew")).unwrap();
+            assert_eq!(published.blocked_reason.as_deref(), Some("new durable reason"));
+            assert_eq!(worker.claims_for(&step, Some("work.renewed")).unwrap().len(), claims_before + 1);
+            receive_and_project(&controller, "worker", &exchange_from(&worker, &controller.replication_inventory().unwrap()));
+            assert_eq!(controller.step_run(&step).unwrap().unwrap().blocked_reason, published.blocked_reason);
+            assert_eq!(worker.replication_snapshot().unwrap().projection_digests, controller.replication_snapshot().unwrap().projection_digests);
+        }
+    }
+
     /// A seat's own lease renewals, and the lane, runtime-action and intake claims its node writes,
     /// were projected when they were written. Every one of them used to make the next peer
     /// exchange replay the whole graph while holding the store's only writer. The exchange now
@@ -47289,6 +47624,53 @@ mission "nested-work" state="ready" {
     }
 
     #[test]
+    fn local_observation_floor_seeks_the_claim_frontier() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        {
+            let store = Store::open(&path, "node").unwrap();
+            assert_eq!(store.local_observation_floor_after_claim(0).unwrap(), 0);
+            let connection = store.connection.write();
+            connection
+                .execute_batch(
+                    "INSERT INTO local_observations(id,after_store_index,subject,kind,body,observed_at_unix_ms)
+                     VALUES(3,10,'agent/node.a','harness.timeline','{}',1),
+                           (7,30,'agent/node.a','harness.timeline','{}',1),
+                           (12,20,'agent/node.a','harness.timeline','{}',1);
+                     DROP INDEX local_observations_after_store_index;",
+                )
+                .unwrap();
+        }
+        // Opening an existing schema adds the index without replaying or changing rows.
+        let store = Store::open(&path, "node").unwrap();
+        assert_eq!(store.local_observation_floor_after_claim(0).unwrap(), 2);
+        assert_eq!(store.local_observation_floor_after_claim(10).unwrap(), 2);
+        assert_eq!(store.local_observation_floor_after_claim(11).unwrap(), 6);
+        assert_eq!(store.local_observation_floor_after_claim(20).unwrap(), 6);
+        assert_eq!(store.local_observation_floor_after_claim(21).unwrap(), 6);
+        assert_eq!(store.local_observation_floor_after_claim(31).unwrap(), 12);
+        let connection = store.readers.get();
+        let plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {LOCAL_OBSERVATION_FLOOR_QUERY}"))
+            .unwrap()
+            .query_map([30], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("; ");
+        assert!(
+            plan.contains("USING COVERING INDEX local_observations_after_store_index (after_store_index>?)"),
+            "{plan}"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM local_observations", [], |row| row.get::<_, u64>(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
     fn the_per_subject_cap_trims_every_subject_over_it_and_only_those() {
         let store = Store::open_memory("node").unwrap();
         for (subject, entries) in [("agent/node.a", 7), ("agent/node.b", 5), ("agent/node.c", 2)] {
@@ -54246,17 +54628,25 @@ fn append_claim_with_subject_fences(
     expected_subjects: Option<&BTreeMap<String, String>>,
     observer_completion: Option<(&str, &str, &(dyn Fn() -> bool + Sync))>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
-    append_claim_with_signature(graph, input, fence, event_runtime, expected_subjects, observer_completion, None)
+    append_claim_with_commit_context(graph, input, fence, event_runtime, expected_subjects, observer_completion, Default::default())
 }
 
-fn append_claim_with_signature(
+type ClaimAdmission<'a> = dyn Fn(&Connection) -> Result<(), St3Error> + Sync + 'a;
+
+#[derive(Default)]
+struct ClaimCommitContext<'a> {
+    admission: Option<&'a ClaimAdmission<'a>>,
+    signature: Option<&'a str>,
+}
+
+fn append_claim_with_commit_context(
     graph: &GraphStore,
     input: &ClaimInput,
     fence: Option<&crate::mailbox::Fence>,
     event_runtime: Option<&str>,
     expected_subjects: Option<&BTreeMap<String, String>>,
     observer_completion: Option<(&str, &str, &(dyn Fn() -> bool + Sync))>,
-    signature: Option<&str>,
+    context: ClaimCommitContext<'_>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;
     if local_retention(&input.kind)
@@ -54272,10 +54662,11 @@ fn append_claim_with_signature(
     // batch commits.
     graph.connection
         .batched(|transaction| -> Result<(ClaimRecord, bool), St3Error> {
+            if let Some(admission) = context.admission { admission(transaction)?; }
             if let Some((subject, revision, current)) = observer_completion {
                 check_observer_completion(transaction, subject, revision, Some(current))?;
             }
-            if let Some(signature) = signature {
+            if let Some(signature) = context.signature {
                 transaction.execute(
                     "INSERT OR REPLACE INTO expected_claim_signatures(subject,kind,actor,signature) VALUES (?1,?2,?3,?4)",
                     params![input.subject,input.kind,input.actor,signature],
@@ -54284,7 +54675,7 @@ fn append_claim_with_signature(
             let outcome = (|| {
             check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
             let settled_receipt = if let Some(fence) = fence {
-                check_mailbox_fence(transaction, fence)?;
+                check_mailbox_fence(transaction, fence, &graph.origin)?;
                 let index = transaction.query_row(
                     "SELECT MIN(store_index) FROM claims WHERE subject=?1 AND subject LIKE 'message/%'",
                     [&input.subject], |row| row.get::<_, Option<u64>>(0),
@@ -54528,7 +54919,7 @@ fn append_claim_with_signature(
             if let Some((subject, revision, current)) = observer_completion {
                 check_observer_completion(transaction, subject, revision, Some(current))?;
             }
-            if signature.is_some() {
+            if context.signature.is_some() {
                 // An idempotent repeat does not append/consume a signature. Remove its
                 // temporary expectation before commit; any failure rolls it back with the message.
                 transaction.execute(

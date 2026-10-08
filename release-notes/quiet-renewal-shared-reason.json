@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Preserve replicated work reasons during local quiet lease renewals",
+  "replay": {
+    "status": "none",
+    "detail": "No full replay or source rewrite; quiet renewal retains the last durable reason. Existing corrupted projections remain an explicit forward-repair/integration concern."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No DDL, index, schema-version, immutable claim, envelope or signature change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Canonical projection ordering, checkpoint retention/proof digests and complete projection digest coverage are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Published work events retain existing reason updates and wire fields; local renewal still publishes the existing five-minute anchor."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal binary restart and replication lifecycle only."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No live replay, reset, policy or manual database action is requested."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Rollback can again clear a shared reason on an unpublished renewal. Preserve durable work evidence and use reviewed forward repair for already affected projections."
+  }
+}

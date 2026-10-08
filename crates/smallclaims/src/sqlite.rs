@@ -14,6 +14,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::read_budget::ReadBudget;
 
+pub mod writer_budget;
 mod transaction_finalizer;
 mod writer_queue;
 
@@ -80,7 +81,7 @@ fn constructor_read_limit() -> usize {
 
 /// A fixed page-cache target per reader, leaving retained schema and statement caches intact.
 /// SQLite's page-cache target excludes statements, schema, query results and allocator overhead.
-pub const READ_CACHE_KIB: usize = 2048;
+pub const READ_CACHE_KIB: usize = 8192;
 pub const WRITE_CACHE_KIB: usize = 32768;
 
 pub fn read_cache_kib() -> usize {
@@ -321,6 +322,7 @@ pub struct WriterConnection {
     observers: Arc<CommitObservers>,
     finalizers: Arc<TransactionFinalizers>,
     background: Arc<writer_queue::BackgroundAdmission>,
+    handler_policy: Arc<Mutex<Option<Arc<writer_budget::OwnedHandlerPolicy>>>>,
     mutation_observer: Option<Arc<writer_observer::MutationState>>,
     /// Transactions the writer committed for batched writes, and the batched writes in them.
     /// Tests read them; `st replication status` counts every commit.
@@ -368,6 +370,7 @@ pub struct WriterGuard<'a> {
     pub committed_index: &'a AtomicU64,
     observers: &'a CommitObservers,
     finalizers: &'a Arc<TransactionFinalizers>,
+    handler_policy: &'a Mutex<Option<Arc<writer_budget::OwnedHandlerPolicy>>>,
     mutation_observer: Option<&'a Arc<writer_observer::MutationState>>,
     /// When profiling, when this thread took the writer.
     pub acquired: Option<std::time::Instant>,
@@ -378,7 +381,7 @@ pub struct WriterGuard<'a> {
 
 impl WriterConnection {
     pub fn new(connection: Connection, committed_index: Arc<AtomicU64>) -> Self {
-        Self::new_inner(connection, committed_index, None)
+        Self::new_inner(connection, committed_index, None, None)
             .expect("writer without an observer needs no schema check")
     }
 
@@ -390,14 +393,19 @@ impl WriterConnection {
         committed_index: Arc<AtomicU64>,
         observer: Arc<dyn WriterObserver>,
     ) -> Result<Self> {
-        Self::new_inner(connection, committed_index, Some(observer))
+        Self::new_inner(connection, committed_index, Some(observer), None)
     }
 
     fn new_inner(
         connection: Connection,
         committed_index: Arc<AtomicU64>,
         observer: Option<Arc<dyn WriterObserver>>,
+        policy: Option<writer_budget::OwnedHandlerPolicy>,
     ) -> Result<Self> {
+        if let Some(policy) = &policy {
+            policy.install(&connection)?;
+        }
+        let handler_policy = Arc::new(Mutex::new(policy.map(Arc::new)));
         let mutation_observer = observer
             .map(|observer| writer_observer::MutationState::new(&connection, observer))
             .transpose()?;
@@ -433,6 +441,7 @@ impl WriterConnection {
             observers,
             finalizers,
             background,
+            handler_policy,
             mutation_observer,
             batches,
         })
@@ -564,6 +573,7 @@ impl WriterConnection {
             committed_index: &self.committed_index,
             observers: &self.observers,
             finalizers: &self.finalizers,
+            handler_policy: &self.handler_policy,
             mutation_observer: self.mutation_observer.as_ref(),
             acquired: crate::profile::writer_acquired(wait),
         }
@@ -1561,6 +1571,35 @@ pub mod work {
     static SORTS: AtomicU64 = AtomicU64::new(0);
     static AUTOINDEX_ROWS: AtomicU64 = AtomicU64::new(0);
 
+    thread_local! {
+        static THREAD_WORK: std::cell::Cell<SqliteWork> = const { std::cell::Cell::new(SqliteWork {
+            statements:0,vm_steps:0,fullscan_steps:0,sorts:0,autoindex_rows:0,
+        }) };
+    }
+
+    /// Completed traced statements on this thread within one explicit scope. It counts every
+    /// traced connection used by this thread (including writer-return callbacks), not work
+    /// done by other threads while this caller waits for a lend. Start before the first phase
+    /// and finish after guard return, before a test callback or its verification queries.
+    /// Only connections already using this module's trace accounting contribute.
+    pub struct SqliteWorkScope {
+        before: SqliteWork,
+        // A scope cannot be carried to another thread and subtracted from its counters.
+        _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl SqliteWorkScope {
+        pub fn start() -> Self {
+            Self {
+                before: THREAD_WORK.with(std::cell::Cell::get),
+                _same_thread: std::marker::PhantomData,
+            }
+        }
+        pub fn finish(self) -> SqliteWork {
+            THREAD_WORK.with(std::cell::Cell::get) - self.before
+        }
+    }
+
     /// Everything counted so far, in every connection of this process.
     pub fn total() -> SqliteWork {
         SqliteWork {
@@ -1622,8 +1661,94 @@ pub mod work {
         FULLSCAN_STEPS.fetch_add(spent(1), Ordering::Relaxed);
         SORTS.fetch_add(spent(2), Ordering::Relaxed);
         AUTOINDEX_ROWS.fetch_add(spent(3), Ordering::Relaxed);
+        THREAD_WORK.with(|total| {
+            let mut next = total.get();
+            next.statements = next.statements.saturating_add(1);
+            next.vm_steps = next.vm_steps.saturating_add(spent(0));
+            next.fullscan_steps = next.fullscan_steps.saturating_add(spent(1));
+            next.sorts = next.sorts.saturating_add(spent(2));
+            next.autoindex_rows = next.autoindex_rows.saturating_add(spent(3));
+            total.set(next);
+        });
         0
     }
+
+    #[cfg(test)]
+    mod scope_tests {
+        use super::*;
+
+        #[test]
+        fn scoped_vm_is_actual_statement_work_and_excludes_other_threads() {
+            let connection = Connection::open_in_memory().unwrap();
+            count(&connection);
+            let scope = SqliteWorkScope::start();
+            std::thread::spawn(|| {
+                let other = Connection::open_in_memory().unwrap();
+                count(&other);
+                other.query_row("WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT SUM(x) FROM n", [], |row| row.get::<_, i64>(0)).unwrap();
+            }).join().unwrap();
+            let mut statement = connection.prepare("SELECT 42").unwrap();
+            assert_eq!(
+                statement.query_row([], |row| row.get::<_, u64>(0)).unwrap(),
+                42
+            );
+            let actual_vm = statement.get_status(rusqlite::StatementStatus::VmStep) as u64;
+            let work = scope.finish();
+            assert_eq!(work.statements, 1);
+            assert_eq!(work.vm_steps, actual_vm);
+            assert!(work.vm_steps > 0);
+            assert_eq!(work.fullscan_steps, 0);
+            assert_eq!(work.sorts, 0);
+        }
+
+        #[test]
+        fn nested_scopes_include_only_their_completed_statement_interval() {
+            let connection = Connection::open_in_memory().unwrap();
+            count(&connection);
+            let outer = SqliteWorkScope::start();
+            connection
+                .query_row("SELECT 1", [], |row| row.get::<_, u64>(0))
+                .unwrap();
+            let inner = SqliteWorkScope::start();
+            connection
+                .query_row("SELECT 2", [], |row| row.get::<_, u64>(0))
+                .unwrap();
+            let inside = inner.finish();
+            let all = outer.finish();
+            assert_eq!(inside.statements, 1);
+            assert_eq!(all.statements, 2);
+            assert!(all.vm_steps > inside.vm_steps);
+        }
+
+        #[test]
+        fn scope_spans_complete_writer_return_observers() {
+            use crate::sqlite::WriterConnection;
+            use std::sync::Arc;
+            let connection = Connection::open_in_memory().unwrap();
+            connection
+                .execute_batch("CREATE TABLE claims(store_index INTEGER PRIMARY KEY AUTOINCREMENT)")
+                .unwrap();
+            count(&connection);
+            let writer = WriterConnection::new(connection, Arc::new(AtomicU64::new(0)));
+            let observed_vm = Arc::new(AtomicU64::new(0));
+            let capture = observed_vm.clone();
+            let _observer = writer.observe_commits(move |connection| {
+                let mut statement = connection.prepare("WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x+1 FROM n WHERE x<50) SELECT SUM(x) FROM n").unwrap();
+                statement.query_row([],|row|row.get::<_,u64>(0)).unwrap();
+                capture.store(statement.get_status(rusqlite::StatementStatus::VmStep) as u64,Ordering::Relaxed);
+            });
+            let scope = SqliteWorkScope::start();
+            drop(writer.write());
+            let work = scope.finish();
+            assert_eq!(
+                work.statements, 2,
+                "committed index read plus returned-guard observer"
+            );
+            assert!(observed_vm.load(Ordering::Relaxed) > 0);
+            assert!(work.vm_steps > observed_vm.load(Ordering::Relaxed));
+        }
+    }
+
 }
 
 pub fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connection> {
@@ -1884,6 +2009,7 @@ mod tests {
 
     #[test]
     fn reader_cache_override_rejects_values_that_disable_the_cache_limit() {
+        assert_eq!(READ_CACHE_KIB, 8192);
         for invalid in [
             None,
             Some(""),
@@ -1895,6 +2021,7 @@ mod tests {
             assert_eq!(configured_read_cache_kib(invalid), READ_CACHE_KIB);
         }
         assert_eq!(configured_read_cache_kib(Some("1024")), 1024);
+        assert_eq!(configured_read_cache_kib(Some("2048")), 2048);
         assert_eq!(configured_read_cache_kib(Some("8192")), 8192);
     }
 
