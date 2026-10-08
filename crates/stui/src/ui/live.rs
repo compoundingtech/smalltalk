@@ -400,6 +400,7 @@ pub fn run(context: Context) -> Result<()> {
                     items,
                     has_more,
                 } => {
+                    extras.window_errors.remove(&format!("{window:?}"));
                     // Back in touch: glass changes st has not confirmed go again, same keys.
                     if !extras.live {
                         for write in ui.unsent_glass_writes() {
@@ -469,6 +470,8 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 feed::Update::WindowFailed(window, error) => {
                     ui.flash(format!("Could not load {window:?}: {error}"));
+                    extras.window_errors.insert(format!("{window:?}"), error);
+                    changed = true;
                 }
                 feed::Update::Offline(error) => {
                     extras.live = false;
@@ -1210,6 +1213,7 @@ pub fn run(context: Context) -> Result<()> {
         }
         ui.step_voice();
         ui.step_terminal_hold();
+        ui.step_default_view();
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         let mut links = Vec::new();
         terminal.draw(|frame| {

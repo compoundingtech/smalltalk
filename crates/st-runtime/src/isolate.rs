@@ -30,6 +30,7 @@ pub enum Isolation {
 }
 
 static MODE: OnceLock<Isolation> = OnceLock::new();
+static SCOPE_EXPANSION_FLAG: OnceLock<bool> = OnceLock::new();
 static WARNED: AtomicBool = AtomicBool::new(false);
 static SCOPE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -40,39 +41,47 @@ pub fn mode() -> Isolation {
 /// Select daemon isolation before constructing runtimes, using its captured login environment.
 /// Other callers retain the existing ambient-environment default.
 pub fn initialize_isolation(environment: &std::collections::BTreeMap<String, String>) -> Isolation {
-    *MODE.get_or_init(|| {
-        if !cfg!(target_os = "linux") {
-            Isolation::Detached
-        } else if systemd_user_available_in(environment) {
-            Isolation::Scope
-        } else {
-            Isolation::DegradedDetached
-        }
-    })
+    *MODE.get_or_init(|| detect_in(environment))
 }
 
-fn systemd_user_available_in(environment: &std::collections::BTreeMap<String, String>) -> bool {
-    if !environment.contains_key("XDG_RUNTIME_DIR") {
-        return false;
+// --collect arrived in v236. Before v254, scope mode execs the original argv
+// directly; percent and dollar escaping would change the task's literal bytes.
+fn scope_expansion_flag(output: &[u8]) -> Option<bool> {
+    let mut words = std::str::from_utf8(output).ok()?.split_ascii_whitespace();
+    if words.next()? != "systemd" {
+        return None;
     }
-    [
-        ("systemd-run", vec!["--version"]),
-        ("systemctl", vec!["--user", "show-environment"]),
-    ]
-    .into_iter()
-    .all(|(program, arguments)| {
-        let Ok(program) = crate::resolve_executable(program, environment) else {
-            return false;
-        };
-        Command::new(program)
-            .args(arguments)
-            .env_clear()
-            .envs(environment)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    })
+    let version = words.next()?.parse::<u32>().ok()?;
+    (version >= 236).then_some(version >= 254)
+}
+
+fn systemd_scope_in(environment: &std::collections::BTreeMap<String, String>) -> Option<bool> {
+    if !environment.contains_key("XDG_RUNTIME_DIR") {
+        return None;
+    }
+    let systemd_run = crate::resolve_executable("systemd-run", environment).ok()?;
+    let output = Command::new(systemd_run)
+        .arg("--version")
+        .env_clear()
+        .envs(environment)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let expansion_flag = scope_expansion_flag(&output.stdout)?;
+    let systemctl = crate::resolve_executable("systemctl", environment).ok()?;
+    Command::new(systemctl)
+        .args(["--user", "show-environment"])
+        .env_clear()
+        .envs(environment)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?
+        .success()
+        .then_some(expansion_flag)
 }
 
 pub fn warn_if_degraded(product: &str) {
@@ -84,38 +93,23 @@ pub fn warn_if_degraded(product: &str) {
 }
 
 fn detect() -> Isolation {
-    if cfg!(target_os = "linux") {
-        if systemd_user_available() {
-            Isolation::Scope
-        } else {
-            Isolation::DegradedDetached
-        }
+    detect_in(&std::env::vars().collect())
+}
+
+fn detect_in(environment: &std::collections::BTreeMap<String, String>) -> Isolation {
+    if !cfg!(target_os = "linux") {
+        return Isolation::Detached;
+    }
+    if let Some(expansion_flag) = systemd_scope_in(environment) {
+        let _ = SCOPE_EXPANSION_FLAG.set(expansion_flag);
+        Isolation::Scope
     } else {
-        Isolation::Detached
+        Isolation::DegradedDetached
     }
 }
 
 pub fn systemd_user_available() -> bool {
-    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
-        return false;
-    }
-    if !Command::new("systemd-run")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    Command::new("systemctl")
-        .args(["--user", "show-environment"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    cfg!(target_os = "linux") && systemd_scope_in(&std::env::vars().collect()).is_some()
 }
 
 pub fn scope_unit(product: &str, task_id: &str) -> String {
@@ -142,7 +136,23 @@ pub(crate) fn sanitize(value: &str) -> String {
 }
 
 pub fn wrap(unit: &str, program: &OsStr, arguments: &[&OsStr]) -> Command {
-    match mode() {
+    wrap_for_mode(
+        mode(),
+        *SCOPE_EXPANSION_FLAG.get().unwrap_or(&true),
+        unit,
+        program,
+        arguments,
+    )
+}
+
+fn wrap_for_mode(
+    isolation: Isolation,
+    expansion_flag: bool,
+    unit: &str,
+    program: &OsStr,
+    arguments: &[&OsStr],
+) -> Command {
+    match isolation {
         Isolation::Scope => {
             let mut command = Command::new("systemd-run");
             command
@@ -151,12 +161,14 @@ pub fn wrap(unit: &str, program: &OsStr, arguments: &[&OsStr]) -> Command {
                     "--scope",
                     "--collect",
                     "--quiet",
-                    "--expand-environment=no",
+                    "--no-ask-password",
                 ])
                 .arg(format!("--unit={unit}"))
-                .arg("--")
-                .arg(program)
-                .args(arguments);
+                .arg("--description=st seat");
+            if expansion_flag {
+                command.arg("--expand-environment=no");
+            }
+            command.arg("--").arg(program).args(arguments);
             command
         }
         Isolation::Detached | Isolation::DegradedDetached => {
@@ -391,6 +403,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scope_version_selects_only_known_argv_semantics() {
+        assert_eq!(scope_expansion_flag(b"systemd 249 (249.11)\n"), Some(false));
+        assert_eq!(scope_expansion_flag(b"systemd 253\n"), Some(false));
+        assert_eq!(scope_expansion_flag(b"systemd 254\n"), Some(true));
+        assert_eq!(scope_expansion_flag(b"systemd 260\n"), Some(true));
+        assert_eq!(scope_expansion_flag(b"systemd 235\n"), None);
+        assert_eq!(scope_expansion_flag(b"unexpected 249\n"), None);
+        assert_eq!(scope_expansion_flag(b"systemd unknown\n"), None);
+    }
+
+    #[test]
+    fn modern_scope_preserves_raw_argv_with_expansion_disabled() {
+        let arguments = [OsStr::new("%n:$HOME:${UNSET}:$$:%%"), OsStr::new("")];
+        let command = wrap_for_mode(
+            Isolation::Scope,
+            true,
+            "st-studio.scope",
+            OsStr::new("provider"),
+            &arguments,
+        );
+        let actual = command.get_args().collect::<Vec<_>>();
+        let separator = actual
+            .iter()
+            .position(|arg| *arg == OsStr::new("--"))
+            .unwrap();
+        assert_eq!(&actual[separator + 2..], &arguments);
+        assert!(actual[..separator].contains(&OsStr::new("--expand-environment=no")));
+    }
+
+    #[test]
+    fn legacy_scope_keeps_literal_percent_dollar_and_non_utf8_argv() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let bytes = std::ffi::OsString::from_vec(b"%n:$HOME:${UNSET}:$$:%%:\xff".to_vec());
+        let arguments = [bytes.as_os_str(), OsStr::new(""), OsStr::new("two words")];
+        let program = OsStr::new("/tmp/provider%$literal");
+        let command = wrap_for_mode(
+            Isolation::Scope,
+            false,
+            "st-studio.scope",
+            program,
+            &arguments,
+        );
+        let actual = command.get_args().collect::<Vec<_>>();
+        let separator = actual
+            .iter()
+            .position(|arg| *arg == OsStr::new("--"))
+            .unwrap();
+        assert_eq!(actual[separator + 1], program);
+        assert_eq!(&actual[separator + 2..], &arguments);
+        assert!(!actual.contains(&OsStr::new("--expand-environment=no")));
+        assert!(actual[..separator].contains(&OsStr::new("--description=st seat")));
+        assert!(actual.contains(&OsStr::new("--no-ask-password")));
+        assert_eq!(command.get_program(), OsStr::new("systemd-run"));
+    }
+
+    #[test]
     fn isolation_probe_resolves_tools_from_the_captured_path() {
         use std::os::unix::fs::PermissionsExt as _;
         let root = tempfile::tempdir().unwrap();
@@ -399,13 +467,22 @@ mod tests {
             ("XDG_RUNTIME_DIR".into(), root.path().display().to_string()),
             ("ORCHID_CONTROL".into(), "captured".into()),
         ]);
-        assert!(!systemd_user_available_in(&environment));
+        assert_eq!(systemd_scope_in(&environment), None);
         for program in ["systemd-run", "systemctl"] {
             let path = root.path().join(program);
-            std::fs::write(&path, "#!/bin/sh\n[ \"$ORCHID_CONTROL\" = captured ]\n").unwrap();
+            std::fs::write(&path, "#!/bin/sh\n[ \"$ORCHID_CONTROL\" = captured ] || exit 1\nprintf 'systemd 249 (249.11)\\n'\n").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        assert!(systemd_user_available_in(&environment));
+        assert_eq!(systemd_scope_in(&environment), Some(false));
+        let systemd_run = root.path().join("systemd-run");
+        std::fs::write(
+            &systemd_run,
+            "#!/bin/sh\n[ \"$ORCHID_CONTROL\" = captured ] || exit 1\nprintf 'systemd 260\\n'\n",
+        )
+        .unwrap();
+        assert_eq!(systemd_scope_in(&environment), Some(true));
+        std::fs::write(root.path().join("systemctl"), "#!/bin/sh\nexit 1\n").unwrap();
+        assert_eq!(systemd_scope_in(&environment), None);
     }
 
     #[test]
@@ -465,7 +542,10 @@ mod tests {
                 assert_eq!(command.get_program(), OsStr::new("systemd-run"));
                 assert!(arguments.contains(&"--scope".to_owned()));
                 assert!(arguments.contains(&"--unit=st3-work.scope".to_owned()));
-                assert!(arguments.contains(&"--expand-environment=no".to_owned()));
+                assert_eq!(
+                    arguments.contains(&"--expand-environment=no".to_owned()),
+                    *SCOPE_EXPANSION_FLAG.get().unwrap()
+                );
             }
             Isolation::Detached | Isolation::DegradedDetached => {
                 assert_eq!(command.get_program(), OsStr::new("sh"));

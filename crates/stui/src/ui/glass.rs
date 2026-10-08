@@ -553,6 +553,8 @@ enum Action {
     NewMission,
     /// Every conversation simplified, or in full again (Ctrl+P).
     ToggleSimple,
+    /// Agents open on their terminal, or on their conversation.
+    ToggleTerminalFirst,
     /// Ask for a name, for a glass to rename, make or copy.
     Name(Naming),
     /// A conversation where the query was said: open it, found at what was said.
@@ -839,6 +841,16 @@ impl Ui {
             "shift+o · tool calls to a line each, runs of them to one",
             "simplified simple full conversations tools compact".into(),
             Action::ToggleSimple,
+        ));
+        choices.push(start(
+            if self.terminal_first() {
+                "Open agents on their conversation".into()
+            } else {
+                "Open agents on their terminal".into()
+            },
+            "this device; the conversation is the default",
+            "terminal conversation default view open agents attach tui".into(),
+            Action::ToggleTerminalFirst,
         ));
         choices.extend(self.said_choices(name));
         let Some(glasses) = &self.glasses else {
@@ -1918,6 +1930,7 @@ impl Ui {
         let mut spans = vec![Span::styled(" ", bar(theme::strong(theme::ACCENT)))];
         let (glyph, word, color) = match &self.world.link {
             Link::Live if !self.world.diverged.is_empty() => ("⚠", "diverged", theme::RED),
+            Link::Live if !self.world.stale.is_empty() => ("◐", "stale", theme::YELLOW),
             Link::Live => ("●", "live", theme::GREEN),
             Link::Connecting => (self.spinner(), "connecting", theme::YELLOW),
             Link::Offline(_) => ("○", "offline", theme::RED),
@@ -2755,6 +2768,7 @@ impl Ui {
             Action::NewTerminal => self.open_new_terminal(),
             Action::NewMission => self.open_new_mission(),
             Action::ToggleSimple => self.toggle_simple(),
+            Action::ToggleTerminalFirst => self.toggle_terminal_first(),
             Action::Said { agent, query } => {
                 self.open_in_glass(Pane::Agent(Some(agent.clone())), how);
                 self.find_in(&agent, &query);
@@ -3671,6 +3685,12 @@ impl Ui {
         // A message box belongs to the pane it was opened in: once another pane or tab has the
         // focus, typing must not go on into a draft nobody can see (Nathan, 2026-10-07).
         if before != (self.tab, self.selected_id()) {
+            if self.terminal_first
+                && let Some(Pane::Agent(Some(id))) = self.focused_pane()
+                && id.starts_with("agent/")
+            {
+                self.attach_when = Some((id, Instant::now()));
+            }
             self.editing = false;
             self.chat = None;
             self.answering = None;
@@ -4040,6 +4060,43 @@ mod tests {
             draft_before,
             "nothing is typed into the draft of a tab that is not shown"
         );
+    }
+
+    #[test]
+    fn a_terminal_first_device_attaches_an_agent_after_the_tab_stays_in_front() {
+        // Nathan, 2026-10-07: a setting for the terminal as the default view; the conversation
+        // stays the default, and flicking through tabs attaches nothing.
+        let mut ui = glass();
+        ui.live = true;
+        assert!(!ui.terminal_first(), "the conversation is the default");
+        ui.toggle_terminal_first();
+        assert!(ui.terminal_first());
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".to_owned())),
+            Open::Tab,
+        );
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/atlas/store-move".into())),
+            Open::Tab,
+        );
+        ui.effects.clear();
+        // Passing through the agent's tab: nothing attaches.
+        ui.show_tab(0);
+        ui.show_tab(1);
+        ui.step_default_view();
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+        // Staying on it does.
+        ui.show_tab(0);
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        ui.step_default_view();
+        assert!(
+            ui.effects.iter().any(|effect| matches!(effect, Effect::OpenTerminal { agent } if agent == "agent/example/atlas/builder")),
+            "{:?}",
+            ui.effects
+        );
+        // Switched back, the conversation is the default again.
+        ui.toggle_terminal_first();
+        assert!(!ui.terminal_first());
     }
 
     #[test]
