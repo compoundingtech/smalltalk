@@ -61,6 +61,8 @@ export interface LiveSource {
   readonly selectConversation: (ref: string) => void
   /** Initialize the shared tracer before the first DOM commit. */
   readonly ready: Promise<void>
+  readonly suspendSockets: () => void
+  readonly resumeSockets: () => void
   readonly dispose: () => Promise<void>
 }
 
@@ -182,6 +184,8 @@ export const liveSource = ({
       Layer.provideMerge(telemetryLayer ?? Layer.empty),
     ),
   )
+  let sdk: St3['Service'] | undefined
+  let disposed = false
   const ingest = makeFrameIngest<() => void, () => void>({ write: ({ value }) => value() })
 
   const retain = <A, TSpec extends FollowSpec>({
@@ -800,7 +804,11 @@ export const liveSource = ({
   return {
     selectConversation,
     registry,
-    ready: runtime.runPromise(Effect.void),
+    ready: runtime.runPromise(Effect.map(St3, (service) => { sdk = service })),
+    suspendSockets: () => sdk?.suspendSockets(),
+    resumeSockets: () => {
+      if (!disposed && sdk !== undefined) runtime.runFork(sdk.resumeSockets)
+    },
     source: {
       mode: 'live',
       subjectReads,
@@ -854,6 +862,7 @@ export const liveSource = ({
       },
     },
     dispose: async () => {
+      disposed = true
       releaseSelection?.()
       ingest.dispose()
       for (const entry of recentConversations.values()) entry.release()

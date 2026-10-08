@@ -13,6 +13,7 @@
  */
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
@@ -42,6 +43,10 @@ const events = []
 const connections = []
 const commands = []
 const upgraded = new Set()
+const observed = new EventEmitter()
+const lifecycleOrder = []
+const reports = []
+const nextEvent = (name) => new Promise((resolve) => observed.once(name, resolve))
 let releaseModule
 const subscribed = new Promise((resolve) => { releaseModule = resolve })
 let finish
@@ -66,7 +71,14 @@ const proofMiddleware = (req, res, next) => {
   } else if (url.pathname === '/done' && req.method === 'POST') {
     let body = ''
     req.on('data', (chunk) => { body += chunk })
-    req.on('end', () => { res.writeHead(204); res.end(); finish(JSON.parse(body)) })
+    req.on('end', () => {
+      const report = JSON.parse(body)
+      reports.push(report)
+      res.writeHead(204)
+      res.end()
+      finish(report)
+      observed.emit(`report:${reports.length}`, report)
+    })
   } else if (url.pathname === '/v1/client/capabilities') {
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ api_version: 'st3.client.v0', snapshot: { id: 'snapshot/proof', created_at: '2026-10-08T00:00:00Z', host_id: 'host/proof', projection_version: 'client-projection.v0', store_index: 1 }, value: { capabilities: [] } }))
@@ -92,7 +104,7 @@ const vite = await createViteServer({
 const server = vite.httpServer
 
 /** Text frames from a masked client stream; returns the unconsumed tail. */
-const readFrames = (buffer, onText) => {
+const readFrames = (buffer, onText, onClose) => {
   let offset = 0
   for (;;) {
     if (buffer.length - offset < 2) break
@@ -106,6 +118,7 @@ const readFrames = (buffer, onText) => {
     const payload = Buffer.from(buffer.subarray(offset + header + 4, offset + header + 4 + length))
     for (let index = 0; index < payload.length; index += 1) payload[index] ^= mask[index % 4]
     if (opcode === 1) onText(payload.toString('utf8'))
+    if (opcode === 8) onClose(payload.length >= 2 ? payload.readUInt16BE(0) : 1005)
     offset += header + 4 + length
   }
   return buffer.subarray(offset)
@@ -125,6 +138,7 @@ server.on('upgrade', (req, socket) => {
   upgraded.add(socket)
   socket.on('close', () => upgraded.delete(socket))
   connections.push({ traceparent: url.searchParams.get('traceparent'), protocol: req.headers['sec-websocket-protocol'] })
+  const ordinal = connections.length - 1
   events.push('socket-opened')
   const accept = createHash('sha1').update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
   socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\nSec-WebSocket-Protocol: st3.client.collections.v0\r\n\r\n`)
@@ -132,14 +146,22 @@ server.on('upgrade', (req, socket) => {
   socket.on('data', (chunk) => {
     pending = readFrames(Buffer.concat([pending, chunk]), (text) => {
       const command = JSON.parse(text)
-      commands.push(command)
+      commands.push({ connection: ordinal, ...command })
       if (command.kind !== 'subscribe') return
       events.push('subscribe-received')
+      if (command.collection === 'agents') {
+        lifecycleOrder.push(`roster:${ordinal}`)
+        observed.emit(`roster:${ordinal}`)
+      }
       socket.write(textFrame(JSON.stringify({
         kind: 'snapshot', id: command.id, collection: command.collection, has_more: false, items: [], order: [],
         snapshot: { id: 'snapshot/proof', created_at: '2026-10-08T00:00:00Z', host_id: 'host/proof', projection_version: 'client-projection.v0', store_index: 1 },
       })))
       releaseModule()
+    }, (code) => {
+      lifecycleOrder.push(`close:${ordinal}:${code}`)
+      observed.emit(`close:${ordinal}`, code)
+      socket.end(Buffer.from([0x88, 0x02, code >> 8, code & 0xff]))
     })
   })
 })
@@ -160,9 +182,26 @@ const failures = []
 const expect = (condition, message) => { if (!condition) failures.push(message) }
 let result
 try {
-  void run([`-s=${session}`, 'open', `http://127.0.0.1:${port}/`])
+  const opening = run([`-s=${session}`, 'open', `http://127.0.0.1:${port}/`])
   result = await Promise.race([
-    done,
+    (async () => {
+      const initial = await done
+      await opening
+      const cachedClose = nextEvent('close:0')
+      await run([`-s=${session}`, 'eval', `() => window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }))`])
+      expect(await cachedClose === 1001, 'persisted pagehide did not send close 1001')
+      const restoredRoster = nextEvent('roster:1')
+      await run([`-s=${session}`, 'eval', `() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))`])
+      await restoredRoster
+      const navigationClose = nextEvent('close:1')
+      const newRoster = nextEvent('roster:2')
+      const newReport = nextEvent('report:2')
+      await run([`-s=${session}`, 'reload'])
+      expect(await navigationClose === 1001, 'navigation pagehide did not send close 1001')
+      await newRoster
+      await newReport
+      return initial
+    })(),
     new Promise((resolve) => setTimeout(() => resolve(undefined), DEADLINE_MS).unref()),
   ])
 } finally {
@@ -175,10 +214,11 @@ try {
 
 const subscribes = commands.filter((command) => command.kind === 'subscribe' && command.collection === 'agents')
 expect(result !== undefined, 'the proof module never reported (subscribe never sent before evaluation?)')
-expect(connections.length === 1, `expected exactly one collections socket, saw ${connections.length}`)
+expect(connections.length === 3, `expected initial, restored and reloaded sockets, saw ${connections.length}`)
 expect(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/.test(connections[0]?.traceparent ?? ''), 'upgrade URL lacks a valid traceparent')
+expect(connections.every((connection) => /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/.test(connection.traceparent ?? '')), 'a resumed upgrade lost W3C trace context')
 expect(connections[0]?.protocol === 'st3.client.collections.v0', 'upgrade lacks the collections subprotocol')
-expect(subscribes.length === 1, `expected exactly one subscribe, saw ${subscribes.length}`)
+expect(subscribes.length === 3, `expected one roster subscribe per initial/restore/reload, saw ${subscribes.length}`)
 expect(/^wf-early-[0-9a-f]{16}$/.test(subscribes[0]?.id ?? ''), 'early subscribe id is not the bounded early id')
 expect(subscribes[0]?.collection === 'agents' && subscribes[0]?.limit === 100, 'early subscribe is not the fleet roster window')
 expect(subscribes[0]?.trace?.traceparent === connections[0]?.traceparent, 'subscribe trace differs from the upgrade trace')
@@ -187,10 +227,13 @@ expect(result?.subscribeSentAt !== undefined && result.subscribeSentAt < result.
 expect((result?.framesAtTake ?? 0) >= 1, 'the snapshot was not buffered for adoption')
 expect(result?.earlyTaken === true, 'the real SDK did not take the early socket')
 expect(result?.actualShellRendered === true, 'the real main bundle did not render the shell')
+expect(lifecycleOrder.indexOf('close:0:1001') < lifecycleOrder.indexOf('roster:1'), 'bfcache restore subscribed before old close')
+expect(lifecycleOrder.indexOf('close:1:1001') < lifecycleOrder.indexOf('roster:2'), 'new document subscribed before old close')
 
-console.log(JSON.stringify({ events, connections, subscribes, result }, null, 2))
+console.log(JSON.stringify({ events, lifecycleOrder, connections, subscribes, result }, null, 2))
 if (failures.length > 0) {
   for (const failure of failures) console.error(`FAIL ${failure}`)
   process.exit(1)
 }
 console.log('PASS early roster subscribe precedes actual main-module evaluation and SDK adoption')
+console.log('PASS synchronous pagehide close 1001 precedes restore and next-document roster subscribes')

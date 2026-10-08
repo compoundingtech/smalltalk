@@ -40,7 +40,7 @@
           ended = true
           clearTimeout(timer)
           socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null
-          removeEventListener('pagehide', end)
+          removeEventListener('pagehide', onPageHide)
           if (globalThis[key] === handle) delete globalThis[key]
         }
         const end = () => {
@@ -63,13 +63,19 @@
         }
         socket.onclose = end
         socket.onerror = end
+        const onPageHide = () => {
+          if (ended) return
+          detach()
+          handle.frames = []
+          socket.close(1001)
+        }
         handle.take = () => {
           if (ended) return undefined
           detach()
           return { socket, id, command, traceparent, startedAt, subscribeSentAt: handle.subscribeSentAt, frames: handle.frames }
         }
         timer = setTimeout(end, 15000)
-        addEventListener('pagehide', end)
+        addEventListener('pagehide', onPageHide)
         globalThis[key] = handle
       })()
     </script>

@@ -100,6 +100,8 @@ const exportedSpanNames: Readonly<Record<string, true>> = {
   ...Object.fromEntries(uxSpanNames.map((name) => [name, true as const])),
   'st3.follow.subscribe': true,
   'st3.capabilities': true,
+  'st3.socket.probe': true,
+  'st3.socket.create': true,
   'wf.ui.interaction': true,
   'wf.main.long_frame': true,
   'wf.page.vitals': true,
