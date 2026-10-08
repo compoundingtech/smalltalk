@@ -81,8 +81,9 @@ const ROSTER_CONNECT_SNAPSHOT: &str = "agents roster connect+snapshot";
 const ROSTER_BUDGET: Duration = Duration::from_millis(300);
 
 /// The statements a cold full roster rebuild may run per agent card. Main ran about 23 per card
-/// on 2026-10-08, reading each agent's status inputs one agent at a time.
-const COLD_ROSTER_STATEMENTS_PER_CARD: u64 = 30;
+/// on 2026-10-08, reading each agent's status inputs one agent at a time; reading them a chunk
+/// of agents at a time leaves about 12, all in the per-card loop.
+const COLD_ROSTER_STATEMENTS_PER_CARD: u64 = 12;
 
 /// Held by each test that measures the whole process, its CPU or its statements, so that one
 /// does not count the other's work when both run in one test process.
