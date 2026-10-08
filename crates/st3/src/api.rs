@@ -174,6 +174,10 @@ struct ClientListQuery {
     state: Option<String>,
     #[serde(default)]
     native_only: bool,
+    /// Agents only: wait briefly for a roster at least as new as this request, rather than
+    /// answering at once from the newest published one.
+    #[serde(default)]
+    fresh: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4300,8 +4304,9 @@ async fn client_agents(
     unreachable!("an admitted roster read always builds missing cards")
 }
 
-/// An agents page from the refresher's publications. A first page waits briefly for a roster
-/// at or after its own cut, then answers from the newest one, or says not ready. A
+/// An agents page from the refresher's publications. A first page answers at once from the
+/// newest one, or says not ready; one that asks for a fresh roster first waits briefly for a
+/// roster at or after its own cut. A
 /// continuation answers from the roster published at exactly its first page's cut, or says the
 /// page expired. Neither folds a card.
 async fn client_agents_published(
@@ -4314,7 +4319,9 @@ async fn client_agents_published(
         return blocking_store(move || Ok(client_agents_published_continuation(&reader, snapshot, &query)))
             .await?;
     }
-    wait_for_agent_roster(&state.store, query.history).await;
+    if query.fresh {
+        wait_for_agent_roster(&state.store, query.history).await;
+    }
     let reader = state.clone();
     let history = query.history;
     match blocking_store(move || Ok(client_agents_published_page(&reader, &query))).await?? {
@@ -4390,7 +4397,7 @@ fn client_agent_roster_head(store: &Store, index: u64) -> anyhow::Result<()> {
     client_agent_cards_selected(store, false, index, &head).map(drop)
 }
 
-/// A page read once answers with what was written before it: wait, briefly, for the refresher
+/// For a read that asked to see what was written before it: wait, briefly, for the refresher
 /// to publish a roster at or after the current cut. The read itself folds nothing.
 async fn wait_for_agent_roster(store: &Store, history: bool) {
     let Ok(wanted) = store.index() else { return };
