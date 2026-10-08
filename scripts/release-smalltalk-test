@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the real Cargo stamp with the files present on warm release runners."""
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -19,6 +20,7 @@ with tempfile.TemporaryDirectory() as temporary:
     checkout.mkdir()
     shutil.copy(repo / '.gitignore', checkout / '.gitignore')
     shutil.copy(repo / 'build.rs', checkout / 'build.rs')
+    shutil.copy(repo / 'Cargo.toml', checkout / 'Cargo.toml')
     run('git', 'init', '-q', cwd=checkout)
     run('git', 'add', '.', cwd=checkout)
     run('git', '-c', 'user.name=Example', '-c', 'user.email=example@example.invalid',
@@ -27,6 +29,7 @@ with tempfile.TemporaryDirectory() as temporary:
     stamp_binary = root / 'build-stamp'
     run('rustc', '--edition=2024', str(checkout / 'build.rs'), '-o', str(stamp_binary), cwd=root)
     revision = run('git', 'rev-parse', '--short', 'HEAD', cwd=checkout)
+    release_revision = run('git', 'rev-parse', 'HEAD', cwd=checkout)[:12]
 
     def stamp():
         output = run(str(stamp_binary), cwd=checkout)
@@ -35,6 +38,22 @@ with tempfile.TemporaryDirectory() as temporary:
                                if line.startswith(prefix)))
 
     assert stamp()['dirty'] is False
+
+    def release_stamp(tag=''):
+        return subprocess.run(['python3', str(repo / 'scripts/release-build-stamp.py')],
+                              cwd=checkout, env={**os.environ, 'RELEASE_TAG': tag},
+                              text=True, capture_output=True)
+
+    release = release_stamp()
+    assert release.returncode == 0, release.stderr
+    assert json.loads(release.stdout) == {
+        'type': 'release', 'version': '0.1.0', 'rev': release_revision,
+        'commitTs': json.loads(release.stdout)['commitTs'], 'dirty': False}
+    run('git', 'config', 'core.abbrev', '5', cwd=checkout)
+    assert json.loads(release_stamp().stdout)['rev'] == release_revision
+    run('git', 'config', '--unset', 'core.abbrev', cwd=checkout)
+    assert json.loads(release_stamp('v0.3.18').stdout)['version'] == '0.3.18'
+    assert release_stamp('../bad').returncode != 0
     # setup-zig restores this before Cargo runs. A previous archive or Cargo cache
     # must also leave a clean source stamp on a subsequent release build.
     for directory in ('.zig-cache', 'dist', 'target', 'scripts/__pycache__'):
@@ -47,8 +66,10 @@ with tempfile.TemporaryDirectory() as temporary:
     # Ignoring generated outputs must still detect actual source changes.
     (checkout / 'build.rs').write_text('// changed source\n')
     assert stamp()['dirty'] is True
+    assert release_stamp().returncode != 0
     shutil.copy(repo / 'build.rs', checkout / 'build.rs')
     (checkout / 'new-source.rs').write_text('// untracked source\n')
     assert stamp()['dirty'] is True
+    assert release_stamp().returncode != 0
 
 print('Native release build stamp tests passed')

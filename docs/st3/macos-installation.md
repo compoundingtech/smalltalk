@@ -50,7 +50,16 @@ Before replacing anything, the installer signs and verifies a complete candidate
 An unchanged payload with the same signing settings keeps its existing signed bundle.
 A changed app replaces the whole bundle through an atomic directory swap on the same
 filesystem. The installer keeps the prior app, CLI links/files and service plists under
-`~/.local/state/st3/macos-installs/`; if installation fails, it restores them.
+`~/.local/state/st3/macos-installs/`. The helper restores them if its own installation
+fails, while still holding its shared transaction lock.
+
+The extracted archive caller also keeps prior command files and transaction locks.
+If a later archive step fails after the helper completes its backup, the caller leaves
+the current app and command links intact and reports the retained job and files.
+The helper's existing restore API cannot check ownership atomically against other
+source or historical installers, so the archive caller does not restore the app
+automatically after that point. Inspect any newer installation before using the
+retained job for recovery, and remove the reported locks only after recovery.
 
 Automation can use the helper's explicit transaction modes (`--prepare-only`,
 `--backup-only`, `--install-app APP`, `--verify-app APP`, `--restore-app`) with a

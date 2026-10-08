@@ -8,6 +8,12 @@ and preview, or `--dry-run --check` to run the exec gates too.
 One daemon runs on each machine; your machines can join a fleet. Use the terminal UI, CLI,
 or iOS app to follow work and talk to agents. Each person currently runs their own fleet.
 
+Install the latest binary release and open Smalltalk:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/compoundingtech/smalltalk/main/install.sh | sh
+```
+
 **[Get started](docs/getting-started.md)** — install Smalltalk and give your first agent a mission.
 
 Platforms/status: Linux x86_64 and macOS Apple Silicon; fresh-Mac setup is not yet verified, and macOS CI is currently disabled.
