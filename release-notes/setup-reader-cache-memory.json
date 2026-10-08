@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "First-run setup automatically reduces daemon reader page caches on small machines and persists the setting in its user service.",
+  "replay": {"status": "none", "detail": "No claim replay or projection rebuilding changes."},
+  "schema": {"status": "none", "detail": "No schema or config keys change; the existing SMALLCLAIMS_READ_CACHE_KIB override is persisted in the service environment."},
+  "rules": {"status": "none", "detail": "No rules or coordinated fleet transition changes."},
+  "compatibility": {"status": "changed", "detail": "Setup and service installation derive a smaller cache target from installed memory and enforced Linux cgroup limits on small machines, using this build's reader/cache defaults. Larger machines retain the default, and valid explicit overrides take precedence. Detached setup startup receives the same environment."},
+  "downtime": {"status": "none", "detail": "Running daemons are not restarted automatically. The selection takes effect on the existing service-install or detached-start paths; service restart retains the written environment."},
+  "manual": {"status": "changed", "detail": "Setup prints a single plain cache selection line when an override is selected. New users need no manual environment configuration."},
+  "recovery": {"status": "none", "detail": "The existing environment override works with prior binaries, and repeating service installation recomputes sizing. Page cache targets are planning budgets, not total RSS ceilings."}
+}
