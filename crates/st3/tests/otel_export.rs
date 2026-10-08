@@ -350,23 +350,33 @@ struct ExportDaemon {
 #[cfg(target_os = "linux")]
 impl ExportDaemon {
     fn start(collector: &Path, root: &Path) -> Self {
+        Self::launch(Some(collector), root)
+    }
+
+    fn start_without_export(root: &Path) -> Self {
+        Self::launch(None, root)
+    }
+
+    fn launch(collector: Option<&Path>, root: &Path) -> Self {
         use std::os::unix::process::CommandExt as _;
         let socket = root.join("run/api.sock");
         let log = root.join("daemon.log");
         let output = std::fs::File::create(&log).unwrap();
-        let mut command = isolated_command(collector, root);
+        let mut command = isolated_command(collector.unwrap_or_else(|| st3()), root);
         // Own a process group so failed startup also cannot orphan otelite's child.
         command.process_group(0);
-        command
-            // SDK 0.30 reads all three intervals in milliseconds from the environment.
-            .env("OTEL_BSP_SCHEDULE_DELAY", "100")
-            .env("OTEL_BLRP_SCHEDULE_DELAY", "100")
-            .env("OTEL_METRIC_EXPORT_INTERVAL", "250")
-            .args(["run", "--out"])
-            .arg(root.join("capture"))
-            .args(["--protocol", "http/json", "--"])
-            .arg(st3())
-            .args(["up", "--node", "otel-test", "--state-dir"])
+        if collector.is_some() {
+            command
+                // SDK 0.30 reads all three intervals in milliseconds from the environment.
+                .env("OTEL_BSP_SCHEDULE_DELAY", "100")
+                .env("OTEL_BLRP_SCHEDULE_DELAY", "100")
+                .env("OTEL_METRIC_EXPORT_INTERVAL", "250")
+                .args(["run", "--out"])
+                .arg(root.join("capture"))
+                .args(["--protocol", "http/json", "--"])
+                .arg(st3());
+        }
+        command.args(["up", "--node", "otel-test", "--state-dir"])
             .arg(root.join("daemon-state"))
             .arg("--socket")
             .arg(&socket)
@@ -622,6 +632,23 @@ fn daemon_request_metric_recorded_without_trace_sampling() {
                 })
             })
     });
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_collection_stream_without_export_delivers_first_frame() {
+    let root = tempfile::tempdir().unwrap();
+    // Direct launch uses env_clear, so there is no inherited OTLP endpoint or provider.
+    let daemon = ExportDaemon::start_without_export(root.path());
+    let client = st3_client::Client::unix_as(&daemon.socket, "person/ada");
+    let mut stream = client.collection_stream().await.unwrap();
+    stream.subscribe("missions", "missions", 2, None, None).await.unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(15), stream.next())
+        .await.unwrap().unwrap().unwrap();
+    assert_eq!(frame["kind"], "snapshot", "{frame}");
+    assert_eq!(frame["id"], "missions", "{frame}");
+    assert!(frame["items"].is_array(), "{frame}");
+    stream.close().await;
 }
 
 #[cfg(target_os = "linux")]

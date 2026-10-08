@@ -142,11 +142,16 @@ pub(crate) async fn stream(
     websocket: WebSocketUpgrade,
     State(state): State<AppState>,
     Extension(session): Extension<ClientSession>,
+    upgrade: Option<Extension<crate::otel::UpgradeContext>>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<StreamQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let upgrade = upgrade.and_then(|Extension(context)| context.0);
     authorize(&session, query.mode)?;
+    // This protocol subscribes in the upgrade request, without a JSON subscribe command.
+    let first_frame = subscription_first_frame("terminal", "raw", upgrade.as_ref())
+        .map(|first| first.span);
     let protocols = headers
         .get_all(SEC_WEBSOCKET_PROTOCOL)
         .iter()
@@ -270,7 +275,7 @@ pub(crate) async fn stream(
         .protocols([SUBPROTOCOL])
         .max_message_size(CHUNK * 4)
         .max_frame_size(CHUNK * 4)
-        .on_upgrade(move |socket| splice(socket, transport, Some(query.mode), lease, control)))
+        .on_upgrade(move |socket| splice(socket, transport, Some(query.mode), lease, control, upgrade, first_frame)))
 }
 
 /// One bounded byte splice; closing either direction drops the persistent owner connection.
@@ -281,6 +286,8 @@ pub(crate) async fn splice(
     mode: Option<st3_client::RawTerminalMode>,
     lease: Option<Arc<Lease>>,
     control: Option<tokio::sync::mpsc::Sender<Value>>,
+    _upgrade: Option<opentelemetry::trace::SpanContext>,
+    mut first_frame: Option<tracing::Span>,
 ) {
     let (mut sink, mut source) = socket.split();
     let (mut reader, mut writer) = transport.into_split();
@@ -385,7 +392,14 @@ pub(crate) async fn splice(
                 read = reader.read(&mut bytes), if lease.as_ref().is_none_or(|lease| !lease.owner_side() || lease.has_proof()) => {
                     let Ok(count) = read else { break; };
                     if count == 0 || lease.as_ref().is_some_and(|lease| lease.check().is_err()) { break; }
-                    if sink.send(axum::extract::ws::Message::Binary(bytes[..count].to_vec().into())).await.is_err() { break; }
+                    if let Some(span) = &first_frame {
+                        span.record("st.page.rows", 0_i64);
+                        span.record("st.page.bytes", count as i64);
+                        span.record("span.label", format!("terminal raw {count}"));
+                    }
+                    let first_span = first_frame.clone();
+                    if first_frame_work(first_span, sink.send(axum::extract::ws::Message::Binary(bytes[..count].to_vec().into()))).await.is_err() { break; }
+                    first_frame = None;
                 }
             }
         }

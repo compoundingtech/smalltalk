@@ -390,6 +390,8 @@ The root attributes are `http.request.method`, `http.route`, `http.response.stat
 `st3.client.class`, and `span.label` equal to the route. A 5xx response or a handler error
 sets status `ERROR`; a 4xx response alone does not. WebSocket routes end the server span at
 the 101 response, not when the socket closes.
+Upgrade handlers accept absent telemetry context: an unset exporter never changes
+handshake authorization or first-frame delivery.
 
 The server extracts W3C `traceparent` and `tracestate` from HTTP request and WebSocket
 upgrade headers and uses the extracted context as the parent. When a remote parent exists,

@@ -992,6 +992,15 @@ async fn response_envelope_unbounded(
         request.headers(),
         &request_id,
     );
+    if let Some(server) = otel.as_ref()
+        && request.headers().contains_key(axum::http::header::UPGRADE)
+    {
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        request.extensions_mut().insert(crate::otel::UpgradeContext(
+            Some(server.context().span().span_context().clone()),
+        ));
+    }
     let profile = crate::profile::Op::start(
         format!("{} {request_route}", request.method()),
         Some(caller.clone()),
@@ -5708,7 +5717,9 @@ where
 {
     let profile = crate::profile::current();
     let cpu_kind = crate::performance::current();
+    let trace = crate::otel::export_enabled().then(tracing::Span::current);
     crate::api::read_deadline::spawn_blocking(move || {
+        let _trace = trace.as_ref().map(tracing::Span::enter);
         let _entered = crate::profile::enter(profile.as_ref());
         crate::performance::with_charged(cpu_kind, operation)
     })
@@ -5724,7 +5735,9 @@ where
 {
     let profile = crate::profile::current();
     let cpu_kind = crate::performance::current();
+    let trace = crate::otel::export_enabled().then(tracing::Span::current);
     crate::api::read_deadline::spawn_blocking(move || {
+        let _trace = trace.as_ref().map(tracing::Span::enter);
         let _entered = crate::profile::enter(profile.as_ref());
         crate::performance::with_charged(cpu_kind, operation)
     })
@@ -5742,7 +5755,9 @@ where
 {
     let profile = crate::profile::current();
     let cpu_kind = crate::performance::current();
+    let trace = crate::otel::export_enabled().then(tracing::Span::current);
     crate::api::read_deadline::spawn_blocking(move || {
+        let _trace = trace.as_ref().map(tracing::Span::enter);
         let _entered = crate::profile::enter(profile.as_ref());
         crate::performance::with_charged(cpu_kind, operation)
     })
