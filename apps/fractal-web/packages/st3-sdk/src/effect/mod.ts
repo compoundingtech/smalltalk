@@ -215,11 +215,6 @@ export interface ConversationChunk {
   readonly entries: readonly (TimelineEntry | UnrecognizedEntry)[]
   /** Raw page evidence before decoding/filtering; only explicit has_more=false proves emptiness. */
   readonly observation?: { readonly empty: boolean }
-  /**
-   * Serial of the subscribe generation whose wire id delivered this chunk; serials increase per
-   * (re)subscribe, so a chunk from a later subscription is distinguishable.
-   */
-  readonly subscription?: number
 }
 
 /** Scoped collection follows and gateway state carried by one shared socket. */
@@ -253,8 +248,6 @@ export class St3 extends Context.Service<
     readonly followSyncStatus: (key: string) => Stream.Stream<SyncStatus>
     /** Socket reachability is not Live: only a successfully decoded data frame establishes it. */
     readonly gatewaySyncStatus: Stream.Stream<SyncStatus>
-    /** The newest subscribe serial sent for a follow; undefined before its first subscribe. */
-    readonly subscribeSerial: (spec: FollowSpec) => number | undefined
   }
 >()('@st3/sdk/St3') {}
 
@@ -362,20 +355,6 @@ const make = (options: St3Options) =>
       fetchImpl: options.fetch ?? globalThis.fetch.bind(globalThis),
     })
     const followKeys = new Map<string, string>()
-    /**
-     * The current subscribe generation of each follow, keyed by follow id: its wire id and a
-     * serial that increases per (re)subscribe across all follows.
-     */
-    const sentSerials = new Map<string, { readonly wire: string; readonly serial: number }>()
-    let subscribeCount = 0
-    /** The newest subscribe serial sent for a follow spec; undefined before its first subscribe. */
-    const subscribeSerial = (spec: FollowSpec): number | undefined => {
-      const key = followKey(spec)
-      let latest: number | undefined
-      for (const [id, sent] of sentSerials)
-        if (followKeys.get(id) === key && (latest === undefined || sent.serial > latest)) latest = sent.serial
-      return latest
-    }
     /** Per-follow freshness keyed by followKey while the follow's stream runs. */
     const freshnessTable = new Map<string, FollowFreshness>()
     const freshnessRef = yield* SubscriptionRef.make<ReadonlyMap<string, FollowFreshness>>(
@@ -449,7 +428,6 @@ const make = (options: St3Options) =>
         : {}),
       onSubscribeSent: ({ id, wire }) => {
         options.onSubscribeSent?.(wire)
-        sentSerials.set(id, { wire, serial: (subscribeCount += 1) })
         fresheners.get(id)?.({ _tag: 'SubscribeSent' })
         const key = followKeys.get(id)
         if (key !== undefined) options.onFollowSubscribeSent?.({ id: wire, key })
@@ -480,11 +458,7 @@ const make = (options: St3Options) =>
       makeProtocol,
     }: {
       readonly spec: FollowSpec
-      readonly makeProtocol: (args: {
-        readonly observe: (value: A, snapshot?: unknown) => void
-        /** The follow id whose subscribe generations deliver this run's frames. */
-        readonly id: string
-      }) => FollowProtocol<A>
+      readonly makeProtocol: (observe: (value: A, snapshot?: unknown) => void) => FollowProtocol<A>
     }) =>
       Stream.callback<FollowEvent<A>>((queue) =>
         Effect.gen(function* () {
@@ -527,7 +501,7 @@ const make = (options: St3Options) =>
             channel.onDecodedFrame()
             emit({ _tag: 'Observed', value })
           }
-          const protocol = makeProtocol({ observe, id })
+          const protocol = makeProtocol(observe)
           // Status writes precede the terminal FollowEvent so no consumer teardown races a verdict.
           const fail = (error: FollowFailure, status = syncStatusFromFailure(error)) => {
             setSync(status)
@@ -536,7 +510,6 @@ const make = (options: St3Options) =>
           }
           const stop = () => {
             followKeys.delete(id)
-            sentSerials.delete(id)
             fresheners.delete(id)
             if (freshnessTable.get(key) === freshness) {
               freshnessTable.delete(key)
@@ -702,7 +675,7 @@ const make = (options: St3Options) =>
     const followWindow = (spec: Extract<FollowSpec, { _tag: 'Window' }>) =>
       follow<WindowValue>({
         spec,
-        makeProtocol: ({ observe }) => {
+        makeProtocol: (observe) => {
           const ingest = makeWindowIngest<Resource>({
             publish: (window) => observe(window, window.snapshot),
             ...(options.onDiagnostics === undefined
@@ -735,16 +708,12 @@ const make = (options: St3Options) =>
     const followConversation = (spec: Extract<FollowSpec, { _tag: 'Conversation' }>) =>
       follow<ConversationChunk>({
         spec,
-        makeProtocol: ({ id }) => ({
-          subscribe: ({ stream, id: wire }) =>
-            Effect.sync(() => stream.subscribeConversation(wire, spec.ref)),
+        makeProtocol: () => ({
+          subscribe: ({ stream, id }) =>
+            Effect.sync(() => stream.subscribeConversation(id, spec.ref)),
           onData: (frame) => {
             if (frame.kind !== 'conversation') return undefined
-            const chunk = decodeConversationChunk(frame)
-            // The channel routes only the current generation's frames; the serial is bound to
-            // the wire id that generation was subscribed under, never to a later resubscribe.
-            const sent = sentSerials.get(id)
-            return sent?.wire === frame.id ? { ...chunk, subscription: sent.serial } : chunk
+            return decodeConversationChunk(frame)
           },
           reset: () => {},
         }),
@@ -900,7 +869,6 @@ const make = (options: St3Options) =>
       followWindow,
       followConversation,
       followTerminal,
-      subscribeSerial,
       setVisible: (spec, visible) =>
         Effect.sync(() => {
           const lane = spec._tag === 'Conversation' ? 'conversation' : 'shared'
