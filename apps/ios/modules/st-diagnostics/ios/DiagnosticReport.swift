@@ -121,8 +121,10 @@ struct DiagnosticReport: Codable {
     self.launch_id_basis = launchBasis
     self.app_version = context.app_version
     self.native_build = context.native_build
-    // No Expo Updates dependency: native/MetricKit reports cannot identify a JS update.
-    self.runtime_version = String((context.app_version + "-" + context.native_build).prefix(128))
+    // Match Expo's nativeVersion policy without an Expo Updates dependency.
+    // Native/MetricKit reports cannot identify a JS update.
+    let runtime = context.app_version + "(" + context.native_build + ")"
+    self.runtime_version = runtime.utf8.count <= 128 ? runtime : "unknown"
     self.update_id = "embedded"
     self.platform = "ios"
     self.os_version = context.os_version

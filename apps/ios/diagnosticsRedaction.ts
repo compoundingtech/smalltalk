@@ -2,6 +2,9 @@ import type { ClientDiagnosticEvent } from '../../clients/typescript/st3-client'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+// Expo's nativeVersion policy appends a parenthesized native build.
+// Require the actual end of input; `$` alone also accepts a trailing newline.
+const RUNTIME = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\([A-Za-z0-9][A-Za-z0-9._-]*\))?(?![\s\S])/;
 const names = ['Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError', 'UnknownError'] as const;
 const breadcrumbs = ['native-start', 'js-start', 'root-mounted', 'foreground', 'background', 'previous-launch-unclean'] as const;
 const severities = ['info', 'warning', 'error', 'fatal'] as const;
@@ -14,7 +17,7 @@ const integer = (value: unknown, max = Number.MAX_SAFE_INTEGER): value is number
 const nullableU32 = (value: unknown): value is number | null => value === null || integer(value, 0xffffffff);
 const token = (value: unknown, max: number, pattern: RegExp): value is string => typeof value === 'string' && value.length <= max && pattern.test(value);
 export const safeVersion = (value: unknown, max = 64): string => token(value, max, TOKEN) ? value : 'unknown';
-export const safeRuntime = (value: unknown): string => token(value, 128, TOKEN) ? value : 'unknown';
+export const safeRuntime = (value: unknown): string => token(value, 128, RUNTIME) ? value : 'unknown';
 export const safeOsVersion = (value: unknown): string => token(value, 32, TOKEN) ? value : 'unknown';
 export const safeUpdateId = (value: unknown): string => typeof value === 'string' && UUID.test(value) ? value.toLowerCase() : 'embedded';
 

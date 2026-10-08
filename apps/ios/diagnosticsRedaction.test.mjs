@@ -25,6 +25,18 @@ test('metadata is bounded ASCII tokens, never URLs/paths/user strings', () => {
   assert.equal(safeUpdateId('https://private.example'), 'embedded');
 });
 
+test('Expo nativeVersion runtime survives JS and native report redaction', () => {
+  assert.equal(safeRuntime('0.1.0(1)'), '0.1.0(1)');
+  for (const capture_source of ['js', 'native-marker']) {
+    const input = { ...event, capture_source, runtime_version: '0.1.0(1)', payload: { kind: 'launch', breadcrumb: capture_source === 'js' ? 'js-start' : 'native-start', inferred: false } };
+    assert.equal(redactDiagnosticEvent(input).runtime_version, '0.1.0(1)');
+  }
+  for (const value of ['0.1.0(1)/private', '0.1.0(secret message)', '0.1.0(1)\n', `${'x'.repeat(126)}(1)`]) {
+    assert.equal(safeRuntime(value), 'unknown');
+    assert.equal(redactDiagnosticEvent({ ...event, runtime_version: value }).runtime_version, 'unknown');
+  }
+});
+
 test('event redaction rebuilds exact allowlisted payload and frame fields', () => {
   const clean = redactDiagnosticEvent({ ...event, headers: { Authorization: 'Bearer secret' }, message: 'private', path: '/work/private',
     payload: { ...event.payload, message: 'secret', stack: 'private stack', arbitrary: 'private', frames: [{ module: 'app', line: 12, column: 34, url: 'https://secret', method: 'user-string' }] } });

@@ -92,7 +92,7 @@ const capture = (payload: ClientDiagnosticEvent['payload'], severity: ClientDiag
       event_id: Crypto.randomUUID(), launch_id: launch.launch_id, sequence: sequence++,
       occurred_at_unix_ms: now, captured_at_unix_ms: now, occurrence_time_basis: 'exact', launch_id_basis: 'process',
       app_version: safeVersion(launch.app_version), native_build: safeVersion(launch.native_build),
-      runtime_version: safeRuntime(updates?.runtimeVersion ?? `${launch.app_version}-${launch.native_build}`.slice(0, 128)),
+      runtime_version: safeRuntime(updates?.runtimeVersion ?? `${launch.app_version}(${launch.native_build})`),
       update_id: updates?.isEnabled && !updates.isEmbeddedLaunch ? safeUpdateId(updates.updateId) : 'embedded',
       platform: 'ios', os_version: safeOsVersion(launch.os_version), severity, capture_source: 'js', payload,
     };
