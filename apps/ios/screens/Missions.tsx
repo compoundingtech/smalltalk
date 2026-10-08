@@ -5,7 +5,7 @@ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { LaunchVariant, Mission } from '../../../clients/typescript/st3-client';
 import { agentName } from '../agentsView';
 import SegmentedControl from '@react-native-segmented-control/segmented-control';
-import { Banners, Empty, StatusLine, useDebugScroll, useListsOnFocus, useRefresh } from '../chrome';
+import { Banners, Empty, StatusLine, useDebugScroll, useListsOnFocus, useMissionsOnFocus, useRefresh } from '../chrome';
 import { MISSION_LEGEND, missionRows, missionSections, missionTitle, missionWord, stepStyle, wordName, wordStyle, type MissionRow } from '../missionsView';
 import type { RootParams, RootScreen } from '../navigation';
 import { missionSteps } from '../presentation';
@@ -25,9 +25,10 @@ function Meter({ done, total, color }: { done: number; total: number; color: str
 
 // Missions: one word per mission for who has to move, in stui's order.
 export function MissionsScreen() {
-  const { data, truncated, hasSynced, loadErrors } = useStore();
+  const { data, truncated, hasSynced, missionsLoaded, loadErrors } = useStore();
   const navigation = useNavigation<NativeStackNavigationProp<RootParams>>();
   useListsOnFocus(['launches']);
+  useMissionsOnFocus();
   const refresh = useRefresh(['launches']);
   const [showSystem, setShowSystem] = useState(false);
   const list = useRef<SectionList<MissionRow>>(null);
@@ -63,7 +64,7 @@ export function MissionsScreen() {
         second={row.progress ?? `${row.path} · ${row.age}`}
         onPress={() => navigation.navigate('Mission', { id: row.mission.id, title: row.title })}
       />}
-      ListEmptyComponent={<Empty text={loadErrors.missions ? `Missions could not be loaded: ${loadErrors.missions}` : hasSynced ? 'No missions yet.' : 'Loading missions…'} />}
+      ListEmptyComponent={<Empty text={loadErrors.missions ? `Missions could not be loaded: ${loadErrors.missions}` : hasSynced && missionsLoaded ? 'No missions yet.' : 'Loading missions…'} />}
       ListFooterComponent={<View style={{ paddingBottom: 24 }}>
         {truncated.missions ? <Note tone="warning">More missions exist beyond these 200.</Note> : null}
         {hidden ? <Pressable onPress={() => setShowSystem(true)}><Note>{hidden} hidden (st's own, and failures before today) · tap to show</Note></Pressable> : null}
@@ -79,6 +80,7 @@ export function MissionsScreen() {
 // One mission: what finished, what is happening, what is next, and who holds each step.
 export function MissionScreen({ route, navigation }: RootScreen<'Mission'>) {
   const { data, status, actions, caps } = useStore();
+  useMissionsOnFocus();
   const listed = data.missions.find(mission => mission.id === route.params.id);
   const [detail, setDetail] = useState<Mission | null>(null);
   useEffect(() => { let live = true; void actions.mission(route.params.id).then(found => { if (live && found) setDetail(found); }); return () => { live = false; }; }, [route.params.id, listed?.revision, status]); // eslint-disable-line react-hooks/exhaustive-deps

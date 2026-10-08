@@ -97,6 +97,8 @@ function useAppStore(proof?: FabricProfile) {
   capsRef.current = caps;
   const [status, setStatus] = useState<Status>('setup');
   const [hasSynced, setHasSynced] = useState(false);
+  // Whether the missions window (followed only while a missions screen shows) has delivered its rows.
+  const [missionsLoaded, setMissionsLoaded] = useState(false);
   const [error, setError] = useState(''), [pairingIssue, setPairingIssue] = useState(''), [busy, setBusy] = useState(false);
   const [historicalSessions, setHistoricalSessions] = useState<SessionView[]>([]);
   // The Agents tab shows a list or a tree, as stui's `t` toggles. Debug links can set it, and ask
@@ -185,6 +187,7 @@ function useAppStore(proof?: FabricProfile) {
         setData(previous => ({ ...previous, [name]: name === 'attention' && seen ? keepClosed(previous.attention, shown as Attention[], acted.current, capsRef.current?.session_actor) : shown }));
         setTruncated(previous => ({ ...previous, [name]: hasMore }));
         setLoadErrors(previous => { if (!(name in previous)) return previous; const rest = { ...previous }; delete rest[name]; return rest; });
+        if (name === 'missions') setMissionsLoaded(true);
         proofRef.current?.record('window', { name, rows: shown.length });
         setSnapshot(at); setCachedHostId(at.host_id); setHasSynced(true);
       },
@@ -196,8 +199,10 @@ function useAppStore(proof?: FabricProfile) {
         if (state === 'live') { setError(''); void loadCapabilities(); }
       },
       onWindowError: (name, message) => { if (current()) setLoadErrors(previous => ({ ...previous, [name]: message })); },
+      // The missions window is followed only while a missions screen shows: what it held is out of date.
+      onWindowStopped: name => { if (current() && name === 'missions') { setData(previous => ({ ...previous, missions: [] })); setMissionsLoaded(false); } },
       onConversationFrame: (rows, replace) => { if (current()) proofRef.current?.record('conversation', { rows, replace }); },
-    }, foreground.current, actionId);
+    }, foreground.current, actionId, undefined, undefined, false);
     // Paired: connecting from here on, even while the app waits to be active before it dials.
     setStatus(previous => previous === 'setup' ? 'connecting' : previous);
     setFeed(opened);
@@ -554,7 +559,7 @@ function useAppStore(proof?: FabricProfile) {
   const canControlTerminal = caps?.capabilities.some(capability => capability.id === 'terminal.input' && capability.state === 'granted') ?? false;
 
   return {
-    order, url, urlDraft, setUrlDraft, credential, data, truncated, loadErrors, feed, connectionIssue, caps, snapshot, status, hasSynced,
+    order, url, urlDraft, setUrlDraft, credential, data, truncated, loadErrors, feed, connectionIssue, caps, snapshot, status, hasSynced, missionsLoaded,
     error, setError, pairingIssue, setPairingIssue, pairDraft, busy, historicalSessions, conversationCache, draftCache, client,
     gatewayMachineId, gatewayHost, canControlTerminal, loadLists, actions,
     treeView, setTreeView, scrollRequest, requestScroll: (y: number) => setScrollRequest({ y, at: Date.now() }),

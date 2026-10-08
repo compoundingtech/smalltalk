@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Compile native source trigger references into the existing deferred IVM journal",
+  "replay": {"status": "none", "detail": "No replay, automatic install or migration; explicit library setup only."},
+  "schema": {"status": "none", "detail": "Reuses existing opt-in Installer deferred metadata and journal. The API itself installs no schema or triggers."},
+  "rules": {"status": "none", "detail": "No admission, authority, canonical ordering or checkpoint changes."},
+  "compatibility": {"status": "changed", "detail": "New literal-only capture plan API for full-PK native tables. Existing capture and publication APIs remain unchanged."},
+  "downtime": {"status": "none", "detail": "Default Store path is unchanged; no native production activation."},
+  "manual": {"status": "changed", "detail": "A source owner explicitly installs complete AFTER mutation triggers and retains immutable old/new cells at each Installer revision."},
+  "recovery": {"status": "changed", "detail": "Logical capture gaps preserve valid raw writes while fencing source roots/jobs. Storage errors require source rollback. Explicit complete fresh publication is required to recover."}
+}

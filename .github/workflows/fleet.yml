@@ -334,11 +334,11 @@ jobs:
         shell: bash
         run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'"
       - name: Save Nix outputs
-        if: success() && env.CI_LOCAL_CACHES != '1'
+        if: success() && env.CI_LOCAL_CACHES != '1' && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')
         run: bash scripts/ci-nix-cache save
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
-        if: "!cancelled()"
+        if: "!cancelled() && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')"
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
@@ -537,7 +537,7 @@ jobs:
           retention-days: 3
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
-        if: "!cancelled()"
+        if: "!cancelled() && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')"
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
@@ -676,7 +676,7 @@ jobs:
         shell: bash
         run: nix develop -c bash scripts/ci-linux tests
       - name: Save Nix outputs to the local Nix cache
-        if: success() && env.CI_LOCAL_CACHES != '1'
+        if: success() && env.CI_LOCAL_CACHES != '1' && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - name: Retain stage logs and timings
         uses: actions/upload-artifact@v4
@@ -791,7 +791,7 @@ jobs:
         shell: bash
         run: nix develop -c bash scripts/ci-linux tests
       - name: Save Nix outputs to the local Nix cache
-        if: success() && env.CI_LOCAL_CACHES != '1'
+        if: success() && env.CI_LOCAL_CACHES != '1' && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - name: Retain stage logs and timings
         uses: actions/upload-artifact@v4
@@ -896,11 +896,11 @@ jobs:
         shell: bash
         run: nix develop -c bash scripts/ci-linux clippy
       - name: Save Nix outputs to the local Nix cache
-        if: success() && env.CI_LOCAL_CACHES != '1'
+        if: success() && env.CI_LOCAL_CACHES != '1' && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
-        if: "!cancelled()"
+        if: "!cancelled() && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')"
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
@@ -1034,11 +1034,11 @@ jobs:
         shell: bash
         run: nix develop -c bash scripts/ci-linux fleet-compat
       - name: Save Nix outputs to the local Nix cache
-        if: success() && env.CI_LOCAL_CACHES != '1'
+        if: success() && env.CI_LOCAL_CACHES != '1' && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
-        if: "!cancelled()"
+        if: "!cancelled() && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')"
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
@@ -1180,7 +1180,7 @@ jobs:
         shell: bash
         run: nix develop -c bash scripts/ci-linux mail-redelivery-canaries
       - name: Save Nix outputs to the local Nix cache
-        if: success() && env.CI_LOCAL_CACHES != '1'
+        if: success() && env.CI_LOCAL_CACHES != '1' && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - name: Save main nix-cache
         if: success() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && env.CI_LOCAL_CACHES != '1' && steps.nix-cache.outputs.cache-hit != 'true'
@@ -1190,7 +1190,7 @@ jobs:
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
-        if: "!cancelled()"
+        if: "!cancelled() && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')"
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
@@ -1363,7 +1363,7 @@ jobs:
         shell: bash
         run: nix develop -c bash scripts/ci-perf cost
       - name: Save Nix outputs to the local Nix cache
-        if: success() && env.CI_LOCAL_CACHES != '1'
+        if: success() && env.CI_LOCAL_CACHES != '1' && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - name: Save main cargo-cache
         if: success() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && env.CI_LOCAL_CACHES != '1' && steps.cargo-cache.outputs.cache-hit != 'true'
@@ -1382,7 +1382,7 @@ jobs:
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
-        if: "!cancelled()"
+        if: "!cancelled() && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')"
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
@@ -1566,7 +1566,7 @@ jobs:
           "$RUNNER_TEMP/sekrets-vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/sekrets-vm-out"
           printf '| sekrets VM test | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"
       - name: Save Nix outputs
-        if: success() && env.CI_LOCAL_CACHES != '1'
+        if: success() && env.CI_LOCAL_CACHES != '1' && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')
         run: bash scripts/ci-nix-cache save
       - name: Report job cache coverage
         if: always()
