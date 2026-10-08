@@ -55,3 +55,18 @@ active while waiting. Forced success/failure schedules demonstrate this ordering
 the historical `stale-mailbox-session` logs do not contain enough runtime/harness receipts
 to prove that every prior failure had this cause. This runtime correction stays in its
 own PR and is not duplicated in the fixture fixes.
+
+## Rejoining fleet comparison
+
+`fleet::rejoining_under_a_new_name_reports_post_leave_history_as_divergent` waited
+for equal envelope inventories and a settled graph comparison, discarded that response,
+then queried the diff again. Replication can advance between the two CLI calls. The
+second response can therefore have pending coverage and `graph.equal = null` even
+though the wait observed a settled comparison. In merge-group run 37718777141 at
+`5bf27196f40cb38686b86ae26b131e826e2faa33`, the first attempt failed on that null value
+while the later `fleet wait` receipt still reported divergent projections; a retry passed.
+
+The fixture now retains the response that satisfies the existing readiness predicate
+and checks its graph divergence and differing tables. Admission warnings and rejection
+by `fleet wait` remain independently checked. The predicate, timeout, replication
+implementation, and divergence assertions are unchanged; there is no failure retry.

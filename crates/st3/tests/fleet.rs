@@ -2393,18 +2393,25 @@ async fn rejoining_under_a_new_name_reports_post_leave_history_as_divergent() {
     assert!(after.is_subset(&c.notes().await));
     assert!(after.is_disjoint(&a.notes().await));
     assert!(after.is_disjoint(&b.notes().await));
+    let mut settled_diff = None;
     wait_until(
         "rejoining node compares the common inventory and settled projections",
         90,
-        || async {
+        || {
             let diff = c.st_json(&["replication", "diff", "orchard"]);
-            diff["authority"]["equal"] == true
+            let settled = diff["authority"]["equal"] == true
                 && diff["status"] == "up"
-                && diff["graph"]["equal"].is_boolean()
+                && diff["graph"]["equal"].is_boolean();
+            if settled {
+                settled_diff = Some(diff);
+            }
+            async move { settled }
         },
     )
     .await;
-    let diff = c.st_json(&["replication", "diff", "orchard"]);
+    // Replication can advance between CLI calls and make coverage pending again. Assert
+    // against the settled comparison that satisfied the wait, including its table diff.
+    let diff = settled_diff.unwrap();
     let doctor = c.st(&["--json", "doctor"]);
     let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
     let admission = doctor["checks"]
