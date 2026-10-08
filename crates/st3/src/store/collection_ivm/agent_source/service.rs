@@ -950,7 +950,7 @@ mod tests {
         let exchange = sender
             .export_replication_exchange(
                 fleet,
-                &smallclaims::store::ReplicationInventory::default(),
+                &smallclaims::replication::ReplicationInventory::default(),
             )
             .unwrap();
         store
