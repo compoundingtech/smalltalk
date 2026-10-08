@@ -1702,6 +1702,18 @@ limited to 32 MiB, with explicit errors. Transcript URLs are never fetched by th
 payloads show an 8 KiB UTF-8 prefix labelled as truncated JSON text, and a reference
 recovers the full valid JSON. The existing 1 MB page bound still applies.
 
+Current stui and phone views use these existing references for explicit full-content
+loading. Expansion starts at offset zero and follows `next_offset` until it is null;
+the assembled JSON is the complete original value, not a suffix to splice into the
+clipped preview. A ref may cover a payload, an open metadata/view subtree, or the
+complete native body, so clients preserve fetched JSON without guessing its location.
+`continuation.size`, when present, describes that original value's encoded byte size.
+Native image refs initially use `application/octet-stream` and may omit size; the
+fetched chunks report the detected passive image media type and exact byte count.
+Clients keep expanded values, image bytes and inline image data URIs/protocols in
+memory only, scoped to the conversation and reference. Loading does not create a
+temporary file, persistent cache, stored conversation history or outbox.
+
 Edited records, replacement, managed binding changes and owner restarts invalidate references;
 append-only growth preserves existing refs:
 HTTP 410 `conversation-content-invalidated`, `retryable: true`, and

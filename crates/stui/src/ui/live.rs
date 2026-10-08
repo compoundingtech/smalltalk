@@ -185,6 +185,7 @@ fn usage_error(error: &st3_client::ClientError) -> String {
 }
 
 enum Fetched {
+    Content(super::content::Key, Result<(String, Vec<u8>), String>),
     Read(String, ReceiptOutcome),
     /// A page before the oldest entry of a conversation's session: its entries, whether st
     /// holds more before them, and the cursor for that next page; or why it could not be read.
@@ -611,6 +612,9 @@ pub fn run(context: Context) -> Result<()> {
         }
         while let Ok(result) = fetched.try_recv() {
             match result {
+                Fetched::Content(key, result) => {
+                    ui.content.complete(key, result);
+                }
                 Fetched::Read(id, result) => {
                     read_receipts.completed(id, result, Instant::now());
                 }
@@ -1034,11 +1038,22 @@ pub fn run(context: Context) -> Result<()> {
                 continue;
             }
             if !extras.live && !matches!(effect, Effect::CloseTerminal) {
+                if let Effect::LoadContent(key) = effect {
+                    ui.content.complete(key, Err("Offline · reconnect, then load again".into()));
+                }
                 ui.flash("Offline · reconnect before acting; nothing was queued");
                 continue;
             }
             ui.note_acted(&effect);
             match effect {
+                Effect::LoadContent(key) => {
+                    let client = client.clone();
+                    let tx = fetched_tx.clone();
+                    runtime.spawn(async move {
+                        let result = super::content::fetch(&client, &key).await;
+                        let _ = tx.send(Fetched::Content(key, result));
+                    });
+                }
                 Effect::OpenTerminal { agent } => {
                     // The PTY session's own bytes, through st's raw stream to whichever host owns
                     // it; st's screen view (the feed follows it on its socket) only when st cannot
@@ -1295,6 +1310,11 @@ pub fn run(context: Context) -> Result<()> {
         }
 
         if changed {
+            ui.content.index(&timelines);
+            if extras.live {
+                ui.effects.extend(ui.content.request_expanded(&ui.conversation_state.expanded)
+                    .into_iter().map(Effect::LoadContent));
+            }
             extras.conversations = conversations(&model, &person, &timelines, &failed, &conversing);
             for entry in &pending {
                 if let Some(Load::Ready(entries)) = extras.conversations.get_mut(&entry.agent) {
@@ -1864,7 +1884,7 @@ async fn perform(
 ) -> Result<(String, Option<String>)> {
     match effect {
         // Glass writes and retries never reach here: the loop handles them itself.
-        Effect::SaveGlass(_) | Effect::Resend { .. } | Effect::Forget { .. } => {
+        Effect::SaveGlass(_) | Effect::Resend { .. } | Effect::Forget { .. } | Effect::LoadContent(_) => {
             Ok((String::new(), None))
         }
         Effect::AgentControl { agent, control } => {
@@ -2020,21 +2040,6 @@ async fn perform(
             Ok((
                 "Sent; the reply will show here and in their conversation".into(),
                 id,
-            ))
-        }
-        Effect::OpenImage { image } => {
-            let bytes = client.blob(&image.sha256, Some(&image.message)).await?;
-            let dir = super::attach::dir()
-                .ok_or_else(|| anyhow::anyhow!("No place to keep the image (HOME is not set)"))?;
-            let path = super::attach::received(&dir, &image, &bytes)?;
-            let shown = super::attach::show(&path);
-            Ok((
-                if shown {
-                    format!("Opened {}", path.display())
-                } else {
-                    format!("Saved to {}", path.display())
-                },
-                None,
             ))
         }
         Effect::CancelRun { mission } => {

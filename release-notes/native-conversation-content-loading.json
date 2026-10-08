@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Native conversation views load complete clipped tool output and display fetched images inline without storing conversation data.",
+  "replay": {
+    "status": "none",
+    "detail": "Explicit UI reads use the existing owner-native content chunk route; no claims are replayed or projections rebuilt."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema, migrations or generated client wire fields change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, retention or fleet coordination rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Clients reuse conversation-blocks.v1 continuation refs and conversation-content-chunk responses. Continuation byte sizes describe the original owner value rather than its clipped display preview."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No coordinated outage or API interruption is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No configuration change is required. Full output and image loading are explicit conversation-view actions."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Expanded JSON, image bytes and inline rendering data remain in memory only; no new stored state or rollback procedure is introduced."
+  }
+}

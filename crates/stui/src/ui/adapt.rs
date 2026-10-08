@@ -856,11 +856,47 @@ pub fn names(model: &Model, person: &str) -> BTreeMap<String, String> {
 
 #[cfg(test)]
 use st3_conversation_ui::adapt::from_harness;
-pub use st3_conversation_ui::adapt::{conversation, unreadable_transcript};
+pub use st3_conversation_ui::adapt::unreadable_transcript;
+
+/// Standalone native images need a focusable row even when the text adapter has no words.
+pub fn conversation(timeline: &[st3_client::TimelineEntry], names: &BTreeMap<String, String>) -> Vec<Entry> {
+    let mut entries = st3_conversation_ui::adapt::conversation(timeline, names);
+    for (index, source) in timeline.iter().enumerate() {
+        let st3_client::TimelineBody::Content(content) = &source.body else { continue };
+        if !super::content::has_images(&content.blocks) { continue; }
+        let at = entries.iter().rposition(|entry| entry.id == source.id || entry.id.starts_with(&format!("{}#", source.id)))
+            .map(|at| at + 1)
+            .or_else(|| timeline[index + 1..].iter().find_map(|next| {
+                entries.iter().position(|entry| entry.id == next.id || entry.id.starts_with(&format!("{}#", next.id)))
+            })).unwrap_or(entries.len());
+        entries.insert(at, Entry {
+            id: format!("{}#images", source.id),
+            at: source.timestamp.get(11..16).unwrap_or("").into(),
+            body: Body::Tool { title: "image · Ctrl+Enter details · Ctrl+U load inline".into(),
+                state: st3_conversation_ui::ToolState::Ok, output: Vec::new() },
+        });
+    }
+    entries
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_native_image_blocks_get_a_focusable_inline_row() {
+        let timeline = serde_json::from_value::<Vec<TimelineEntry>>(json!([{
+            "id":"picture","sequence":1,"revision":1,"timestamp":"2026-10-08T10:00:00Z",
+            "role":"assistant","type":"content","final":true,"body":{"media_type":"image/png","blocks":[{
+                "id":"picture-block","kind":"image","source_type":"native","payload":{},
+                "continuation":{"ref":"picture-ref","media_type":"application/octet-stream","reason":"on-demand"}
+            }]}
+        }])).unwrap();
+        let entries = conversation(&timeline, &BTreeMap::new());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "picture#images");
+        assert!(matches!(&entries[0].body, Body::Tool { title, .. } if title.contains("load inline")));
+    }
     use serde_json::json;
 
     #[test]

@@ -14,6 +14,15 @@ st devices --as person/ada pair --full-control 'Garden phone'
 
 Enter the returned pairing ID and code in the app with your paired-only gateway URL. Use [gateway setup](st3/client-v0/README.md#tailnet-carrier) and [the phone connection guide](../apps/ios/README.md#connect); never forward the privileged daemon socket. `--full-control` lets this trusted device send messages and use the work controls. An offline app keeps its last view; reconnect before sending an action.
 
+Large native tool output is a preview, not the complete result. In stui, use
+**Ctrl+Up/Down** to focus a tool or image and **Ctrl+Enter** to expand or collapse tool
+output; **Ctrl+U**, outside the composer, loads or hides its native images inline
+using the terminal's image renderer. **Ctrl+O** keeps its pane-zoom action. On the phone,
+**Show all** loads the clipped result and **Show less** collapses it; **Load image**
+displays the fetched image inline. Image media type and byte size
+become exact after loading. Expanded output and fetched images stay in memory
+only: viewing a conversation does not write its contents to files or device storage.
+
 ## From the CLI
 
 Capture the message ID so you can check it or keep the same thread:

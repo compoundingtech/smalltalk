@@ -8,6 +8,7 @@
 pub mod adapt;
 mod attach;
 mod clickable;
+mod content;
 mod context;
 #[cfg(test)]
 mod contract;
@@ -164,10 +165,8 @@ impl AgentControl {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
-    /// Read an image a message carries from st, keep it here, and show it.
-    OpenImage {
-        image: st3_conversation_ui::MailImage,
-    },
+    /// Read complete conversation content into the memory-only UI cache.
+    LoadContent(content::Key),
     Attention {
         id: String,
         action: String,
@@ -313,6 +312,7 @@ pub struct Ui {
     /// Each conversation's header (contract §3) as st last sent it, drawn above its entries.
     pub(crate) conversation_headers: std::collections::BTreeMap<String, serde_json::Value>,
     cache: conversation::Cache,
+    content: content::Content,
     editing: bool,
     confirm: Option<char>,
     /// What an agent's actions menu will do once y confirms it.
@@ -584,6 +584,7 @@ impl Ui {
             anchors: RefCell::new(HashMap::new()),
             picker: None,
             thumbnails: RefCell::new(HashMap::new()),
+            content: content::Content::default(),
             updated: HashMap::new(),
             stalled: HashMap::new(),
         }
@@ -2345,11 +2346,21 @@ impl Ui {
                         .render(entries, width, &expanded, self.spinner(), self.density()),
                     0,
                 );
+                self.content.decorate(&mut doc, &agent.id, &expanded, width);
                 doc.blank();
                 doc
             }
         };
         let key = format!("chat:{}", agent.id);
+        if let Some(entry) = self.content.scroll_to.borrow_mut().remove(&agent.id)
+            && let Some((_, line)) = doc.entries.iter().find(|(id, _)| *id == entry)
+        {
+            self.anchors.borrow_mut().remove(&key);
+            let mut panes = self.conversation_state.panes.borrow_mut();
+            let state = panes.entry(key.clone()).or_default();
+            state.top = *line;
+            state.follow = false;
+        }
         let matches = find
             .map(|find| find_matches(&doc, &find.query))
             .unwrap_or_default();
@@ -2649,7 +2660,19 @@ impl Ui {
                     width: target.width.min(area.width.saturating_sub(target.column)),
                     height: 1,
                 };
-                self.hit(rect, target.hit.clone());
+                if !matches!(target.hit, Hit::InlineImage(_)) { self.hit(rect, target.hit.clone()); }
+            }
+            if let Hit::InlineImage(key) = &target.hit
+                && target.line + 12 <= top + height
+                && target.line >= top
+                && let Some(picker) = &self.picker
+            {
+                self.content.draw_image(picker, key, Rect {
+                    x: area.x + 2,
+                    y: area.y + (target.line - top) as u16,
+                    width: area.width.saturating_sub(3),
+                    height: 12,
+                }, buf);
             }
         }
         if let Some(selection) = &self.conversation_state.selection
@@ -3211,6 +3234,9 @@ impl Ui {
                     "the agent's actions: restart, suspend, retire, terminal…",
                 ),
                 ("ctrl+e", "expand or collapse tool output"),
+                ("ctrl+↑ ctrl+↓", "focus the previous or next tool"),
+                ("ctrl+enter", "expand/collapse the focused tool; read its full content"),
+                ("ctrl+u", "load/hide focused tool images inline (outside a draft)"),
                 (
                     "ctrl+p",
                     "simplified (the default: a tool call is one line, a run of them one) or full (every call and its output); this device",
@@ -3916,6 +3942,8 @@ impl Ui {
             }
             KeyCode::Tab => self.switch_tab((self.tab + 1) % TABS.len()),
             KeyCode::BackTab => self.switch_tab((self.tab + TABS.len() - 1) % TABS.len()),
+            KeyCode::Up if self.tab == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => self.focus_tool(-1),
+            KeyCode::Down if self.tab == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => self.focus_tool(1),
             KeyCode::Up | KeyCode::Char('k') => {
                 self.select(self.selected[self.tab].saturating_sub(1))
             }
@@ -3935,6 +3963,8 @@ impl Ui {
             // Classic's list; in spaces only Ctrl+S has a sidebar.
             KeyCode::Char('s') if self.glasses.is_none() => self.sidebar = !self.sidebar,
             KeyCode::Char('x') if self.tab == 2 => self.system = !self.system,
+            KeyCode::Enter if self.tab == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => self.toggle_focused_tool(),
+            KeyCode::Char('u') if self.tab == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => self.toggle_focused_images(),
             KeyCode::Char('o') if self.tab == 1 => self.toggle_all_tools(),
             KeyCode::Char('O') => self.toggle_simple(),
             KeyCode::Char('/') if self.tab == 1 => {
@@ -4055,6 +4085,83 @@ impl Ui {
             .map(|item| item.kind.word())
     }
 
+    fn content_conversation(&self) -> Option<String> {
+        if self.glasses.is_some() {
+            match self.focused_pane()? {
+                Pane::Agent(id) => id,
+                _ => None,
+            }
+        } else if self.tab == 1 { self.selected_id() } else { None }
+    }
+
+    fn focused_tool(&self, conversation: &str) -> Option<String> {
+        let entries = self.world.conversations.get(conversation)?.items();
+        let focused = self.content.focused.get(conversation);
+        if let Some(entry) = entries.iter().find(|entry| focused == Some(&entry.id) && matches!(entry.body, Body::Tool { .. })) {
+            return Some(entry.id.clone());
+        }
+        let frame = self.frame.borrow();
+        let pane = frame.panes.iter().rev().find(|pane| pane.key == format!("chat:{conversation}"));
+        pane.and_then(|pane| pane.entries.iter().rev().find_map(|(id, line)| {
+            (*line >= pane.top && *line < pane.top + pane.rect.height as usize
+                && entries.iter().any(|entry| &entry.id == id && matches!(entry.body, Body::Tool { .. })))
+                .then(|| id.clone())
+        })).or_else(|| entries.iter().rev().find(|entry| matches!(entry.body, Body::Tool { .. })).map(|entry| entry.id.clone()))
+    }
+
+    fn focus_tool(&mut self, direction: isize) {
+        let Some(conversation) = self.content_conversation() else { return };
+        let Some(entries) = self.world.conversations.get(&conversation) else { return };
+        let tools: Vec<_> = entries.items().iter().filter(|entry| matches!(entry.body, Body::Tool { .. }))
+            .map(|entry| entry.id.clone()).collect();
+        if tools.is_empty() { return; }
+        let current = self.focused_tool(&conversation).and_then(|id| tools.iter().position(|tool| *tool == id));
+        let index = current.map_or(tools.len() - 1, |index| index.saturating_add_signed(direction).min(tools.len() - 1));
+        let id = tools[index].clone();
+        self.content.focused.insert(conversation.clone(), id.clone());
+        // A bundled call becomes individually reachable when keyboard-focused.
+        self.conversation_state.expanded.extend(tools.iter().map(|id| st3_conversation_ui::bundle_id(id)));
+        self.content.scroll_to.borrow_mut().insert(conversation.clone(), id);
+        self.flash(format!("Tool {} of {} focused · Ctrl+Enter expand · Ctrl+U images", index + 1, tools.len()));
+    }
+
+    fn toggle_focused_tool(&mut self) {
+        let Some(conversation) = self.content_conversation() else { return };
+        let Some(id) = self.focused_tool(&conversation) else { return };
+        self.toggle_content_tool(&conversation, id);
+    }
+
+    fn toggle_content_tool(&mut self, conversation: &str, id: String) {
+        self.content.focused.insert(conversation.to_owned(), id.clone());
+        self.reveal_tool_bundles(conversation);
+        self.conversation_state.expand(id.clone());
+        if self.conversation_state.expanded.contains(&id) {
+            self.content.scroll_to.borrow_mut().insert(conversation.to_owned(), id.clone());
+            for key in self.content.request_tool(conversation, &id) {
+                self.effects.push(Effect::LoadContent(key));
+            }
+        }
+    }
+
+    fn toggle_focused_images(&mut self) {
+        let Some(conversation) = self.content_conversation() else { return };
+        let Some(id) = self.focused_tool(&conversation) else { return };
+        self.conversation_state.expanded.insert(id.clone());
+        self.reveal_tool_bundles(&conversation);
+        self.content.scroll_to.borrow_mut().insert(conversation.clone(), id.clone());
+        for key in self.content.tool_images(&conversation, &id) {
+            if self.content.toggle_image(&key) { self.effects.push(Effect::LoadContent(key)); }
+        }
+    }
+
+    fn reveal_tool_bundles(&mut self, conversation: &str) {
+        if let Some(entries) = self.world.conversations.get(conversation) {
+            self.conversation_state.expanded.extend(entries.items().iter()
+                .filter(|entry| matches!(entry.body, Body::Tool { .. }))
+                .map(|entry| st3_conversation_ui::bundle_id(&entry.id)));
+        }
+    }
+
     fn toggle_all_tools(&mut self) {
         let Some(id) = self.selected_id() else { return };
         let Some(Load::Ready(entries)) = self.world.conversations.get(&id) else {
@@ -4074,6 +4181,11 @@ impl Ui {
             }
         } else {
             self.conversation_state.expanded.extend(tools);
+            for tool in self.conversation_state.expanded.clone() {
+                for key in self.content.request_tool(&id, &tool) {
+                    self.effects.push(Effect::LoadContent(key));
+                }
+            }
         }
     }
 
@@ -5491,15 +5603,26 @@ impl Ui {
                 }
             }
             Hit::ToggleTool(id) | Hit::Pane(PaneIntent::Expand(id)) => {
-                self.conversation_state.expand(id);
+                if let Some(conversation) = self.content_conversation() {
+                    self.toggle_content_tool(&conversation, id);
+                } else {
+                    self.conversation_state.expand(id);
+                }
             }
+            Hit::ContentImage(key) => {
+                if let Some((_, entry)) = self.content.image_owner(&key) {
+                    self.conversation_state.expanded.insert(entry.clone());
+                    self.conversation_state.expanded.insert(st3_conversation_ui::bundle_id(&entry));
+                }
+                if self.content.toggle_image(&key) { self.effects.push(Effect::LoadContent(key)); }
+            }
+            Hit::InlineImage(_) => {}
             Hit::Pane(PaneIntent::Open(id)) => self.open(&id),
             Hit::Pane(PaneIntent::Image(image)) => {
-                self.flash(format!(
-                    "Reading {} from st…",
-                    image.name.as_deref().unwrap_or("the image")
-                ));
-                self.effects.push(Effect::OpenImage { image });
+                if let Some(key) = self.content.mail_key(&image) {
+                    self.conversation_state.expanded.insert(image.message);
+                    if self.content.toggle_image(&key) { self.effects.push(Effect::LoadContent(key)); }
+                }
             }
             Hit::Pane(PaneIntent::Send(text)) => {
                 if let Some(key) = self.draft_key() {
@@ -6092,6 +6215,26 @@ fn dump(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focused_tool_chords_expand_and_collapse_without_toggling_all_tools() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        let conversation = ui.selected_id().unwrap();
+        let entries = vec![
+            Entry { id: "one".into(), at: "10:00".into(), body: Body::Tool { title: "one".into(), state: ToolState::Ok, output: vec![] } },
+            Entry { id: "two".into(), at: "10:00".into(), body: Body::Tool { title: "two".into(), state: ToolState::Ok, output: vec![] } },
+        ];
+        ui.world.conversations.insert(conversation.clone(), Load::Ready(entries));
+        ui.content.focused.insert(conversation.clone(), "one".into());
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert!(ui.conversation_state.expanded.contains("one"));
+        assert!(!ui.conversation_state.expanded.contains("two"));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert!(!ui.conversation_state.expanded.contains("one"));
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        assert_eq!(ui.content.focused.get(&conversation).map(String::as_str), Some("two"));
+    }
 
     #[test]
     fn a_custom_request_sends_the_generic_reply_and_has_no_yes_no_shortcut() {
