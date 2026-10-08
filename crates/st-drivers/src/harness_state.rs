@@ -26,9 +26,9 @@ use serde::{Deserialize, Serialize};
 /// than an alias of [`crate::status::STATUS_STALE`]: retuning presence must not silently retune
 /// observed harness state.
 pub const HARNESS_STATE_STALE: Duration = Duration::from_secs(15 * 60);
-/// How often a live writer re-stamps evidence it still holds. This must fit inside st3's
-/// ninety-second observation horizon, including its once-per-minute replicated heartbeat.
-pub const HARNESS_STATE_REFRESH: Duration = Duration::from_secs(20);
+/// How often a live writer re-stamps unchanged evidence it still holds. State changes
+/// publish immediately; quiet sessions retain the cadence used before the twenty-second refresh.
+pub const HARNESS_STATE_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// Maximum accepted positive difference between the writer's UTC clock and the reader's clock.
 pub const HARNESS_STATE_FUTURE_SKEW: Duration = Duration::from_secs(60);
 

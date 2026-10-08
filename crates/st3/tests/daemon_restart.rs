@@ -594,7 +594,7 @@ fn declare_claude(daemon: &Daemon, seat: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_quiet_idle_seat_reports_current_after_daemon_restart_without_seat_restart() {
+async fn a_quiet_idle_seat_ages_stale_and_recovers_new_evidence_after_daemon_restart() {
     use sha2::{Digest as _, Sha256};
     use st_drivers::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
 
@@ -608,7 +608,7 @@ async fn a_quiet_idle_seat_reports_current_after_daemon_restart_without_seat_res
     daemon.observe_running(seat, incarnation);
     daemon.start_isolated().await;
     // A healthy quiet Claude seat includes its initialized delivery channel. The provider
-    // emits no further hook events; the wrapper must keep the owned idle evidence current.
+    // emits no further hook events while the retained idle evidence ages between refreshes.
     let provider = r#"
 import json, os, subprocess, sys, time
 channel = subprocess.Popen(
@@ -653,9 +653,9 @@ time.sleep(300)
         daemon.has_diagnostic(seat, incarnation, "claude-channel-attached")
     })
     .await;
-    // Stand in for this wrapper's Stop hook. The live wrapper must heartbeat that exact
-    // owned idle evidence; no subsequent provider event or test observation is supplied.
-    Writer::new(
+    // Stand in for this wrapper's Stop hook. Retain the same provider ownership for a
+    // genuine transition after the restart; quiet evidence is allowed to become stale.
+    let mut writer = Writer::new(
         &agent_dir,
         "grove/quiet-cedar",
         "claude",
@@ -664,8 +664,8 @@ time.sleep(300)
     .with_ownership(
         owned.evidence_incarnation.unwrap(),
         owned.ownership_sequence.unwrap(),
-    )
-    .observe(Observation::new(
+    );
+    writer.observe(Observation::new(
         Activity::Idle,
         BlockedOn::None,
         InputBuffer::Empty,
@@ -695,6 +695,19 @@ time.sleep(300)
     assert_alive(&mut driver, "the quiet driver");
     daemon.store = Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap());
     daemon.start_isolated().await;
+    let stale: Value = client.get("/v1/client/agents").await.unwrap();
+    let stale = stale["items"].as_array().unwrap().iter().find(|row| row["id"] == seat).unwrap();
+    assert_eq!(stale["observation"], "stale", "{stale}");
+    assert_eq!(stale["harness_state"], "indeterminate", "{stale}");
+    assert_eq!(stale["operational"]["runtime_incarnation"], incarnation, "{stale}");
+    assert_eq!(stale["delivery"]["transport"], "claude-channel", "{stale}");
+    assert!(daemon.has_diagnostic(seat, incarnation, "claude-channel-attached"));
+    assert_alive(&mut driver, "the same quiet driver after daemon restart");
+    assert_eq!(driver.id(), original_pid);
+    // A provider transition bypasses the five-minute unchanged-evidence guard. Require the
+    // fresh idle record to recover through the restarted daemon without restarting the seat.
+    writer.observe(Observation::new(Activity::Active, BlockedOn::None, InputBuffer::Empty)).unwrap();
+    writer.observe(Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Empty)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(40);
     let recovered = loop {
         let view: Value = client.get("/v1/client/agents").await.unwrap();
