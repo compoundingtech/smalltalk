@@ -11,14 +11,19 @@ const sha256 = 'b'.repeat(64)
 const upload = { blob: `blob/${sha256}`, sha256, size: 731, media_type: 'image/webp' }
 const chunk = { sha256, size: 731, offset: 512, data: 'cmVhbCB0YWls' }
 const request: AttachmentSendRequest = {
+  _tag: 'Send',
   api_version: 'st3.client.v0', type: 'message.send', id: 'action/image-send',
-  idempotency_key: 'image-send-stable-key',
   fence: { snapshot_id: 'snapshot/user-observed', subject_revisions: {} },
   parameters: {
     to: 'agent/recipient', session_id: 'session/current', content: 'Here is the image',
     title: 'Actual title', in_reply_to: 'message/parent', tags: ['actual-tag'],
     attachments: [{ blob: upload.blob, media_type: 'image/webp', name: 'paste.webp' }],
   },
+}
+/** The exact body a first send puts on the wire: its fields plus a generated key. */
+const firstSendBody = (action: typeof request) => {
+  const { _tag: _tag, ...wire } = action
+  return { ...wire, idempotency_key: expect.stringMatching(/^[0-9a-f-]{36}$/) }
 }
 const ack = {
   kind: 'action-result', action_id: 'action/returned', operation_id: 'operation/returned',
@@ -85,7 +90,14 @@ describe('native attachment port', () => {
     expect(await port.send(request)).toEqual({ _tag: 'Success', value: Native.decodeUnknownSync(Native.ActionResult)(actual) })
     expect(calls.map(({ url }) => url.pathname)).toEqual(['/v1/client/capabilities', '/v1/client/actions'])
     expect(calls[1]?.init?.method).toBe('POST')
-    expect(Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(calls[1]?.init?.body)).toEqual(request)
+    expect(Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(calls[1]?.init?.body)).toEqual(firstSendBody(request))
+  })
+
+  it('carries an explicit retry key unchanged instead of generating a fresh one', async () => {
+    const { port, calls } = attachmentClient()
+    expect(await port.send({ ...request, _tag: 'Resend', idempotencyKey: 'image-send-stable-key' })).toMatchObject({ _tag: 'Success' })
+    expect(Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(calls[1]?.init?.body))
+      .toMatchObject({ id: request.id, idempotency_key: 'image-send-stable-key' })
   })
 
   it('sends the generated maximum of four supported image references', async () => {
@@ -94,7 +106,7 @@ describe('native attachment port', () => {
     const action = { ...request, parameters: { ...request.parameters, attachments } }
     const { port, calls } = attachmentClient()
     expect(await port.send(action)).toMatchObject({ _tag: 'Success' })
-    expect(Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(calls[1]?.init?.body)).toEqual(action)
+    expect(Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(calls[1]?.init?.body)).toEqual(firstSendBody(action))
   })
 
   it('uses decoded attachment inputs so an optional wire-null name is not sent to the transport', async () => {
@@ -103,7 +115,7 @@ describe('native attachment port', () => {
     const action = { ...request, parameters: { ...request.parameters, attachments: [{ ...attachment, name: null }] } }
     expect(await port.send(action)).toMatchObject({ _tag: 'Success' })
     expect(Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(calls[1]?.init?.body))
-      .toEqual({ ...action, parameters: { ...action.parameters, attachments: [attachment] } })
+      .toEqual(firstSendBody({ ...action, parameters: { ...action.parameters, attachments: [attachment] } }))
   })
 
   it('rejects five attachments through the generated schema before contacting the gateway', async () => {

@@ -158,10 +158,8 @@ export interface ContentSearchPort {
   }) => Promise<ConversationPortResult<ConversationSearch>>
 }
 
-/** Existing composer action plus uploaded image references, bounded by the generated schema. */
-export type AttachmentSendRequest = Omit<MessageSendInput, 'parameters' | 'idempotency_key'> & {
-  /** Omit for a fresh client-generated key; retain the key when deliberately resubmitting. */
-  readonly idempotency_key?: string
+/** One message action's gateway fields, everything except the idempotency key. */
+type MessageSendFields = Omit<MessageSendInput, 'parameters' | 'idempotency_key'> & {
   readonly api_version: 'st3.client.v0'
   readonly type: 'message.send'
   readonly parameters: Omit<MessageSendInput['parameters'], 'attachments' | 'tags'> & {
@@ -169,6 +167,19 @@ export type AttachmentSendRequest = Omit<MessageSendInput, 'parameters' | 'idemp
     readonly attachments: readonly AttachmentInputEncoded[]
   }
 }
+
+/**
+ * A first send (`Send`) never carries a caller-owned key: the data layer generates one
+ * and paints the optimistic row synchronously. `Resend` is an explicit retry of an
+ * uncertain send with its original key; its authoritative identity is reconciled
+ * before any optimistic row can duplicate mail the stream already shows.
+ */
+export type AttachmentSendRequest =
+  | ({ readonly _tag: 'Send' } & MessageSendFields)
+  | ({ readonly _tag: 'Resend'; readonly idempotencyKey: string } & MessageSendFields)
+
+/** The wire-level message action once its idempotency key is chosen. */
+export type MessageSendAction = MessageSendFields & { readonly idempotency_key: string }
 
 /** Native upload/read/send permissions, independently discovered for /attach and paste. */
 export interface AttachmentCapabilities {

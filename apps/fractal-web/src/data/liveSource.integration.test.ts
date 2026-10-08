@@ -8,7 +8,7 @@ import type {
   Snapshot,
   TerminalScreen,
 } from '@smalltalk/st3-client'
-import type { AttachmentSendRequest } from './source.ts'
+import type { AttachmentSendRequest, MessageSendAction } from './source.ts'
 import { Effect } from 'effect'
 import * as Option from 'effect/Option'
 import * as Atom from 'effect/reactivity/Atom'
@@ -49,7 +49,7 @@ class Gateway {
   runtimeRefusalStatus: number | undefined
   sendGate: Promise<void> | undefined
   rejectSend = false
-  readonly messageActions: AttachmentSendRequest[] = []
+  readonly messageActions: MessageSendAction[] = []
   /** Resolves once the gateway has derived the send action's message identity. */
   readonly nextAction = () =>
     this.echoMessageId !== ''
@@ -501,8 +501,8 @@ describe('terminal dependent-read authority', () => {
 
 describe('optimistic conversation sends', () => {
   const request: AttachmentSendRequest = {
+    _tag: 'Send',
     api_version: 'st3.client.v0', type: 'message.send', id: 'action/optimistic',
-    // Omission exercises the data layer's fresh client-generated idempotency key.
     fence: { snapshot_id: snapshot.id, subject_revisions: {} },
     parameters: { to: agent.id, content: 'hello', tags: [], attachments: [] },
   }
@@ -684,7 +684,7 @@ describe('optimistic conversation sends', () => {
         yield* settle
         let resolvePost!: () => void
         gateway.sendGate = new Promise<void>((resolve) => { resolvePost = resolve })
-        const sending = live.source.attachments!.send({ ...request, idempotency_key: key })
+        const sending = live.source.attachments!.send({ ...request, _tag: 'Resend', idempotencyKey: key })
         yield* Effect.promise(() => gateway.nextAction())
         yield* settle
         // The authoritative copy is already in the window: no second, pending copy.
@@ -713,7 +713,7 @@ describe('optimistic conversation sends', () => {
         yield* settle
         let resolvePost!: () => void
         gateway.sendGate = new Promise<void>((resolve) => { resolvePost = resolve })
-        const sending = live.source.attachments!.send({ ...request, idempotency_key: 'unseen-resend-key' })
+        const sending = live.source.attachments!.send({ ...request, _tag: 'Resend', idempotencyKey: 'unseen-resend-key' })
         yield* Effect.promise(() => gateway.nextAction())
         yield* settle
         expect(live.registry.get(live.source.conversation(agent.id))).toMatchObject({
