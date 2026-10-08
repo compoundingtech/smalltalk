@@ -43,7 +43,7 @@ fn suspended_catalog(root: &Path, keep: bool) {
 }
 
 fn doctor(catalog: &Path, bin: &Path, state: &Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("doctor")
         .arg("--catalog")
         .arg(catalog)
@@ -67,7 +67,7 @@ fn running_agent(catalog: &Path, identity: &str) {
 }
 
 fn send_message(catalog: &Path, from: &str, to: &str, body: &str) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["message", "send", to, "--root"])
         .arg(catalog)
         .args(["--host", "h", "--as", from, "-m", body])
@@ -112,7 +112,7 @@ fn manual_mode_is_healthy_without_a_host_lock_but_can_require_one() {
             .contains("✓ supervision mode manual/--once (no live host-lock)")
     );
 
-    let required = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let required = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("doctor")
         .arg("--catalog")
         .arg(&catalog)
@@ -213,7 +213,7 @@ fn doctor_closes_stdin_for_the_noninteractive_pty_probe() {
         "#!/bin/sh\nIFS= read -r _line\nprintf '[]\\n'\n",
     );
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let mut child = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("doctor")
         .arg("--catalog")
         .arg(&catalog)
@@ -684,7 +684,7 @@ fn native_driver_diagnostic_roster_and_doctor_agree_and_recovery_clears() {
     );
     publisher.publish(Stage::Seed, Reason::UnknownStatus, Source::StatusSnapshot);
 
-    let roster = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let roster = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(&catalog)
         .args(["--host", "h", "--identity", "h.worker", "--json"])
@@ -777,7 +777,7 @@ fn a_rejected_provider_credential_advises_while_absence_stays_silent() {
             Source::TurnResult,
         );
 
-        let roster = Command::new(env!("CARGO_BIN_EXE_st2"))
+        let roster = Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .arg("agents")
             .arg(&catalog)
             .args(["--host", "h", "--identity", "h.worker", "--json"])

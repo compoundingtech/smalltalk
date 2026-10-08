@@ -54,7 +54,7 @@ impl Fixture {
 
         let bin = tmp.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
-        symlink(env!("CARGO_BIN_EXE_st2"), bin.join("st2")).unwrap();
+        symlink(test_env!("CARGO_BIN_EXE_st2"), bin.join("st2")).unwrap();
         let state = tmp.path().join("state");
 
         Self {
@@ -72,7 +72,7 @@ impl Fixture {
 
     /// `overrides` are applied last, so a test can drop `PATH` entries or retune staleness.
     fn run_with(&self, script: &str, overrides: &[(&str, &str)]) -> Output {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let script = Path::new(test_env!("CARGO_MANIFEST_DIR"))
             .join("crates/st-drivers/hooks")
             .join(script);
         let current_path = std::env::var("PATH").unwrap_or_default();

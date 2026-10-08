@@ -119,7 +119,7 @@ impl Daemon {
     }
     async fn cli(&self, args: &[&str]) -> std::process::Output {
         let mut command =
-            st3::test_support::async_command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+            st3::test_support::async_command(test_bin!("st3-fixture"));
         command
             .env("HOME", &self.root)
             .env("XDG_CONFIG_HOME", self.root.join("config"))

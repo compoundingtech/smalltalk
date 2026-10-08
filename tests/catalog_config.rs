@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 fn st2(args: &[&str], home: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(args)
         .env("HOME", home)
         .env("XDG_STATE_HOME", home.join("state"))

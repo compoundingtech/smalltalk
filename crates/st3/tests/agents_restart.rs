@@ -154,12 +154,17 @@ impl Fixture {
         let store = Arc::new(Store::open(&root.path().join("graph.db"), "restart-test").unwrap());
         let notify = Arc::new(Notify::new());
         let runtime = Arc::new(Runtime::default());
-        let reconciler = Arc::new(Reconciler::new(
-            store.clone(),
-            runtime.clone(),
-            "restart-test".into(),
-            notify.clone(),
-        ));
+        // The API publishes concurrently with drive(), as it does in the daemon. Use
+        // the daemon's incremental path; full-pass correction audits require stable inputs.
+        let reconciler = Arc::new(
+            Reconciler::new(
+                store.clone(),
+                runtime.clone(),
+                "restart-test".into(),
+                notify.clone(),
+            )
+            .skipping_unneeded(true),
+        );
         let member = format!(
             r#"agent "example/worker" {{
             workspace {:?}
@@ -286,7 +291,7 @@ async fn st(socket: &Path, args: &[&str]) -> std::process::Output {
     let socket = socket.to_owned();
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
-        st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+        st3::test_support::command(test_bin!("st3-fixture"))
             .env_remove("ST_AGENT")
             .env_remove("ST_MISSION_RUN")
             .args(["--endpoint", socket.to_str().unwrap()])
@@ -303,7 +308,7 @@ async fn cli(socket: &Path, subject: &str, actor: &str, timeout: &str) -> std::p
     let actor = actor.to_owned();
     let timeout = timeout.to_owned();
     tokio::task::spawn_blocking(move || {
-        st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+        st3::test_support::command(test_bin!("st3-fixture"))
             .env_remove("ST_AGENT")
             .env_remove("ST_MISSION_RUN")
             .args([
@@ -554,7 +559,7 @@ fn restart_help_explains_seats_and_the_new_incarnation() {
     if st3::test_support::supervise_test() {
         return;
     }
-    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+    let output = st3::test_support::command(test_bin!("st3-fixture"))
         .env_remove("ST_AGENT")
         .args(["agents", "--help"])
         .output()
@@ -593,6 +598,7 @@ fn restarted_daemon(fixture: &Fixture) -> Reconciler<Runtime> {
         "restart-test".into(),
         Arc::new(Notify::new()),
     )
+    .skipping_unneeded(true)
 }
 
 /// Exercise the daemon's exit path, not a launcher's post-exit cleanup. The API socket,

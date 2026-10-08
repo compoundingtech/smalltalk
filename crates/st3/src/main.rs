@@ -564,18 +564,56 @@ fn services_installed() -> bool {
         .unwrap_or(false)
 }
 
+async fn lock_fleet_admission(
+    client: &Client,
+    config: &Config,
+    services: bool,
+    verb: &str,
+) -> Result<st3::node_identity::StateLock> {
+    if client.get::<Value>("/v1/health").await.is_ok() {
+        anyhow::ensure!(
+            services,
+            "stop the running st3 daemon first: nothing may write while this machine {verb}"
+        );
+        st3::service::stop()?;
+        st3::node_identity::lock_after_stop(&config.state_dir).await
+    } else {
+        st3::node_identity::lock(&config.state_dir)
+    }
+}
+
 async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool) -> Result<()> {
-    let config = Config::load_unvalidated(None)?;
+    let mut config = Config::load_unvalidated(None)?;
+    // Explicit admissions can repair a pin after their prior attempt saved membership.
+    // Other controls must use the daemon's resolved identity, including leave's runtime check.
+    if !matches!(&command, FleetCommand::Join(_) | FleetCommand::Create(_)) {
+        config.apply_fleet_file()?;
+        st3::node_identity::resolve(&mut config)?;
+    }
     let client = Client::new(endpoint.clone());
     match command {
         FleetCommand::Create(args) => {
             anyhow::ensure!(
+                st3::config::FleetFile::load(&config.state_dir)?.is_none(),
+                "this machine is already in a fleet"
+            );
+            anyhow::ensure!(
                 config.fleet_id.is_none(),
                 "config.toml already configures a fleet with config peers; move it to membership with st fleet migrate"
             );
+            st3::node_identity::resolve(&mut config)?;
             let node = args.name.unwrap_or_else(|| config.node.clone());
+            anyhow::ensure!(
+                st3::store::valid_fleet_node_name(&node),
+                "`{node}` cannot name a fleet member; use --name"
+            );
+            let services = !args.no_service && services_installed();
+            let state_identity =
+                lock_fleet_admission(&client, &config, services, "founds a fleet").await?;
             let founded =
                 st3::fleet::join::found(&config.state_dir, &node, &args.member.settings())?;
+            state_identity.record_fleet_found(&founded)?;
+            drop(state_identity);
             if json_output {
                 return print_value(&founded, true);
             }
@@ -583,7 +621,6 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 "Created fleet {} with {} as its first member.",
                 founded.fleet_id, founded.node
             );
-            let services = !args.no_service && services_installed();
             if services {
                 st3::service::install(Config::load_with_fleet(None)?)?;
             }
@@ -732,13 +769,8 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 }
             };
             let use_services = !args.no_service && services_installed();
-            if client.get::<Value>("/v1/health").await.is_ok() {
-                anyhow::ensure!(
-                    use_services,
-                    "stop the running st3 daemon first: nothing may write while this machine joins"
-                );
-                st3::service::stop()?;
-            }
+            let state_identity =
+                lock_fleet_admission(&client, &config, use_services, "joins").await?;
             let joined = st3::fleet::join::join(&st3::fleet::join::JoinOptions {
                 state_dir: config.state_dir.clone(),
                 configured_node: config.node.clone(),
@@ -752,6 +784,8 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 version: env!("CARGO_PKG_VERSION").into(),
             })
             .await?;
+            state_identity.record_fleet_join(&joined)?;
+            drop(state_identity);
             if let Some(path) = code_path {
                 let _ = fs::remove_file(path);
             }
@@ -1468,10 +1502,45 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
         }
         return Ok(());
     }
+    anyhow::ensure!(
+        st3::config::FleetFile::load(&config.state_dir)?.is_none(),
+        "this machine already has fleet membership settings"
+    );
+    anyhow::ensure!(
+        st3::store::valid_fleet_node_name(&config.node),
+        "`{}` cannot name a fleet member",
+        config.node
+    );
     let fleet_id = config
         .fleet_id
         .clone()
         .context("this machine has no config-peer fleet to migrate; use st fleet join")?;
+    // Read only while the daemon may still be running; the locked migration rechecks
+    // its store before writing. Invalid admission must not stop healthy services.
+    {
+        use rusqlite::OptionalExtension as _;
+        let database = config.state_dir.join("claims.sqlite3");
+        anyhow::ensure!(
+            database.exists(),
+            "this store is not bound to a fleet yet; start st3 once first"
+        );
+        let connection = rusqlite::Connection::open_with_flags(
+            database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let bound: Option<String> = connection
+            .query_row("SELECT value FROM meta WHERE key='fleet_id'", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        match bound {
+            Some(bound) => anyhow::ensure!(
+                bound == fleet_id,
+                "this store belongs to fleet {bound}, not the configured {fleet_id}"
+            ),
+            None => anyhow::bail!("this store is not bound to a fleet yet; start st3 once first"),
+        }
+    }
     // fleet.toml resolves a relative path under STATE/fleet, and --finish removes the
     // config.toml override, so record the secret file's absolute path now.
     let configured_secret = config
@@ -1485,13 +1554,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
         )
     })?;
     let use_services = !args.no_service && services_installed();
-    if client.get::<Value>("/v1/health").await.is_ok() {
-        anyhow::ensure!(
-            use_services,
-            "stop the running st3 daemon first: nothing may write while this machine migrates"
-        );
-        st3::service::stop()?;
-    }
+    let state_identity = lock_fleet_admission(client, config, use_services, "migrates").await?;
     let settings = migration_settings(&args.member, config);
     if args.anchor {
         let founded = st3::fleet::join::migrate_anchor(
@@ -1503,6 +1566,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             args.fabric_protocol.clone(),
             st3::store::runtime(),
         )?;
+        state_identity.record_fleet_found(&founded)?;
         println!(
             "{} is the anchor of fleet {}. It admits itself and signs its history when st3 starts.",
             founded.node, founded.fleet_id
@@ -1541,6 +1605,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             joined.migrate,
             "that code is a join code; use st fleet join"
         );
+        state_identity.record_fleet_join(&joined)?;
         if let Some(path) = code_path {
             let _ = fs::remove_file(path);
         }
@@ -1549,6 +1614,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             joined.name, joined.fleet_id, joined.sponsor
         );
     }
+    drop(state_identity);
     if use_services {
         st3::service::install(Config::load_with_fleet(None)?)?;
         println!(
@@ -2539,9 +2605,9 @@ enum ServiceCommand {
 
 #[derive(Subcommand)]
 enum ClaudeChannelCommand {
-    /// Install or update the user plugin and its machine approval policy.
+    /// Install channel assets and approval policy; activate only in st seats.
     Install {
-        /// Install only the user plugin. An administrator will manage the machine policy.
+        /// Install only plugin assets. An administrator will manage the machine policy.
         #[arg(long)]
         no_policy: bool,
     },
@@ -4573,10 +4639,23 @@ fn driver_environment_incarnation(cli: &Cli) -> Result<Option<String>> {
     let Command::Driver(args) = &cli.command else {
         return Ok(None);
     };
-    let subject = args
-        .subject
-        .clone()
-        .or_else(|| args.identity.as_deref().map(normalize_agent_subject));
+    let subject = args.subject.clone().or_else(|| {
+        (args.driver != "claude-mcp")
+            .then(|| args.identity.as_deref().map(normalize_agent_subject))
+            .flatten()
+    });
+    if args.driver == "claude-mcp" {
+        let scoped = subject
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || std::env::var("ST3_SUBJECT")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty());
+        anyhow::ensure!(
+            scoped || args.identity.is_none(),
+            "the Claude channel identity requires a subject"
+        );
+    }
     let Some(subject) = subject.as_deref() else {
         return Ok(None);
     };
@@ -4910,6 +4989,7 @@ async fn run(cli: Cli) -> Result<()> {
             config.peers = args.peer;
         }
         config.apply_fleet_file()?;
+        st3::node_identity::resolve(&mut config)?;
         return st3::peer::run_worker(config).await;
     }
     let config = Config::load_unvalidated(None)?;
@@ -5598,6 +5678,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.peers = args.peer;
     }
     config.apply_fleet_file()?;
+    let _state_identity = st3::node_identity::acquire(&mut config)?;
     config.validate()?;
     st3::resource::configure_github(&config)?;
     validate_unix_socket_path(&config.socket, "--socket")?;
@@ -17336,10 +17417,19 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             args.argv.is_empty(),
             "the Claude channel takes no provider argv"
         );
-        let subject = args
+        let fallback_subject = std::env::var("ST3_SUBJECT").ok();
+        let Some(subject) = args
             .subject
             .as_deref()
-            .context("the Claude channel has no subject")?;
+            .or(fallback_subject.as_deref())
+            .filter(|subject| !subject.trim().is_empty())
+        else {
+            anyhow::ensure!(
+                args.identity.is_none(),
+                "the Claude channel identity requires a subject"
+            );
+            return st3::claude_channel::run_idle().await;
+        };
         let identity = subject.strip_prefix("agent/").unwrap_or(subject);
         let paths = match st_drivers::driver_paths::Paths::from_environment(identity, &|name| {
             std::env::var(name).ok()
@@ -17793,7 +17883,8 @@ fn spawn_st2_provider(
     if push_mailbox_enabled() && driver == "opencode" {
         st_drivers::push_mailbox::register(&paths.agent_dir);
     }
-    tokio::task::spawn_blocking(move || match start {
+    tokio::task::spawn_blocking(move || {
+        let outcome = match start {
         ProviderStart::Launch(
             argv,
             // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
@@ -17889,6 +17980,12 @@ fn spawn_st2_provider(
                 anyhow::bail!("a {driver} driver cannot adopt this provider session: {session:?}")
             }
         },
+        };
+        #[cfg(feature = "test-support")]
+        if env!("CARGO_BIN_NAME") == "st3-fixture" {
+            st3::test_support::hold_provider_completion(&outcome)?;
+        }
+        outcome
     })
 }
 
@@ -18166,9 +18263,29 @@ async fn drive_st2_native(
             st_drivers::subagents::now_ms(),
         )
     });
+    let mut completion_announced = false;
     loop {
+        #[cfg(feature = "test-support")]
+        {
+            completion_announced |= fixture_terminal_completion_barrier(
+                &mut observations, client, subject, driver, &mut loop_state.ready, &task,
+            ).await?;
+            if completion_announced && env!("CARGO_BIN_NAME") == "st3-fixture"
+                && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION")
+            {
+                fs::write(PathBuf::from(root).join("awaiting-completion"), b"awaiting")?;
+            }
+        }
         tokio::select! {
             frame = mailbox.recv() => {
+                #[cfg(feature = "test-support")]
+                if env!("CARGO_BIN_NAME") == "st3-fixture"
+                    && matches!(&frame, Some(st3::mailbox::Frame::Fenced { .. }))
+                    && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION")
+                {
+                    fs::write(PathBuf::from(root).join("fence-received"),
+                        if task.is_finished() { "finished" } else { "pending" })?;
+                }
                 let mail_changed = matches!(&frame, Some(st3::mailbox::Frame::Mailbox { .. }));
                 mailbox.accept(frame, &runtime_id)?;
                 if driver == "opencode" && mail_changed
@@ -18176,13 +18293,14 @@ async fn drive_st2_native(
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
             }
-            wake = observations.recv() => {
+            wake = observations.recv(), if !completion_announced => {
                 wake?;
-                if let Err(error) = observations.drain(client, subject, driver, &mut loop_state.ready).await {
-                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                match observations.drain_live(client, subject, driver, &mut loop_state.ready).await {
+                    Ok(ended) => completion_announced |= ended,
+                    Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
                 }
             }
-            result = &mut task => {
+            result = &mut task, if completion_announced || fixture_completion_task_enabled() => {
                 let outcome = result?;
                 if let Some(session) = detached_session(&outcome) {
                     loop_state.delivery_episode = delivery.episode;
@@ -18196,6 +18314,7 @@ async fn drive_st2_native(
                     let _ = replacement.exec(subject, &paths.state_root(), &resume);
                     loop_state = resume.loop_state;
                     task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(session));
+                    completion_announced = false;
                     continue;
                 }
                 finish_native_exit_report(subject, async {
@@ -18251,7 +18370,7 @@ async fn drive_st2_native(
                 }).await?;
                 return outcome;
             }
-            _ = interval.tick() => {
+            _ = interval.tick(), if !completion_announced => {
                 if driver == "claude" && mailbox.subscription.is_some()
                     && let Err(error) = check_claude_attachment(
                         client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
@@ -18264,9 +18383,11 @@ async fn drive_st2_native(
                 }
 
                 if observations.retry_pending {
-                    if let Err(error) = observations.drain(client, subject, driver, &mut loop_state.ready).await {
-                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    match observations.drain_live(client, subject, driver, &mut loop_state.ready).await {
+                        Ok(ended) => completion_announced |= ended,
+                        Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
                     }
+                    if completion_announced { continue; }
                 }
 
                 if driver == "opencode" && mailbox.subscription.is_some() {
@@ -18530,7 +18651,7 @@ async fn drive_st2_native(
                 }
                 replacement.check();
             }
-            _ = work_interval.tick() => {
+            _ = work_interval.tick(), if !completion_announced => {
                 let tick: Result<()> = async {
                     let minute = unix_minute()?;
                     if renewed_minute != Some(minute) {
@@ -18545,6 +18666,68 @@ async fn drive_st2_native(
             }
         }
     }
+}
+
+// Fixture controls force the actual stream rejection branch before disposing the result.
+// The installed executable always enables the provider completion branch.
+fn fixture_completion_task_enabled() -> bool {
+    #[cfg(feature = "test-support")]
+    if env!("CARGO_BIN_NAME") == "st3-fixture"
+        && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION").map(PathBuf::from)
+        && root.join("join-phase").exists()
+        && !root.join("fence-received").exists()
+    {
+        return false;
+    }
+    true
+}
+
+// Only the separately compiled fixture executable can schedule this control.
+// It holds no production provider, changes no claim or fence, and has a finite deadline.
+#[cfg(feature = "test-support")]
+async fn fixture_terminal_completion_barrier(
+    observations: &mut NativeObservations,
+    client: &Client,
+    subject: &str,
+    driver: &str,
+    ready: &mut bool,
+    task: &tokio::task::JoinHandle<Result<()>>,
+) -> Result<bool> {
+    if env!("CARGO_BIN_NAME") != "st3-fixture" || driver != "claude" {
+        return Ok(false);
+    }
+    let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION").map(PathBuf::from) else {
+        return Ok(false);
+    };
+    if root.join("observation-drained").exists()
+        || !st_drivers::harness_state::read(
+            &st_drivers::harness_state::harness_state_path(&observations.dir), None,
+        ).is_some_and(|state| state.state == st_drivers::harness_state::Activity::Ended)
+    {
+        return Ok(false);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !root.join("provider-return.json").exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "fixture provider completion timed out");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let deferred = observations.drain_live(client, subject, driver, ready).await?;
+    fs::write(root.join("observation-drained"), if deferred { "deferred" } else { "published" })?;
+    let after = fs::read_to_string(root.join("order"))? == "after";
+    if after {
+        while !task.is_finished() {
+            anyhow::ensure!(tokio::time::Instant::now() < deadline, "fixture JoinHandle completion timed out");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    } else {
+        anyhow::ensure!(!task.is_finished(), "fixture must retain pending provider JoinHandle");
+    }
+    fs::write(root.join("join-phase"), if after { "finished" } else { "pending" })?;
+    while !root.join("poll-driver").exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "fixture driver release timed out");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(deferred)
 }
 
 fn reject_noninteractive_claude_argv(argv: &[String]) -> Result<()> {
@@ -18753,6 +18936,16 @@ impl NativeObservations {
         }
         Ok(())
     }
+    async fn drain_live(
+        &mut self,
+        client: &Client,
+        subject: &str,
+        driver: &str,
+        ready: &mut bool,
+    ) -> Result<bool> {
+        self.drain_events(client, subject, driver, ready, true).await
+    }
+
     async fn drain(
         &mut self,
         client: &Client,
@@ -18760,8 +18953,21 @@ impl NativeObservations {
         driver: &str,
         ready: &mut bool,
     ) -> Result<()> {
+        self.drain_events(client, subject, driver, ready, false)
+            .await
+            .map(|_| ())
+    }
+
+    async fn drain_events(
+        &mut self,
+        client: &Client,
+        subject: &str,
+        driver: &str,
+        ready: &mut bool,
+        wait_for_completion: bool,
+    ) -> Result<bool> {
         if !self.enabled {
-            return Ok(());
+            return Ok(false);
         }
         self.retry_pending = true;
         // Bound a wake's work so a backlog does not hold back native delivery.
@@ -18801,6 +19007,29 @@ impl NativeObservations {
                     };
                     let observed = st_drivers::harness_state::read_raw_at(&raw, None, decode_at);
                     if event.runtime_incarnation == self.runtime && source_driver == driver {
+                        // The wrapper writes its terminal receipt before its blocking task
+                        // returns. Publishing it now would fence our mailbox before the task's
+                        // actual success/failure can reach the normal exit-report path. Keep
+                        // this event unacknowledged until that path drains it. Exitless hook
+                        // observations and predecessor/foreign provider records still publish.
+                        if wait_for_completion
+                            && event.kind == "harness-state"
+                            && observed.state == st_drivers::harness_state::Activity::Ended
+                            && observed.exit.is_some()
+                            && observed.evidence_incarnation.is_some()
+                            && st_drivers::harness_events::read_runtime_state(&self.dir, &self.runtime)?
+                                .is_some_and(|current| {
+                                    let current = st_drivers::harness_state::read_raw_at(
+                                        &current, None, event.queued_at_ms,
+                                    );
+                                    current.evidence_incarnation == observed.evidence_incarnation
+                                        && current.ownership_sequence == observed.ownership_sequence
+                                        && current.transition_sequence == observed.transition_sequence
+                                        && current.exit == observed.exit
+                                })
+                        {
+                            return Ok(true);
+                        }
                         // Admission precedes the provider claim. Only a state event fenced to
                         // this runtime can expose its diagnostic; an old snapshot cannot fence
                         // a successor. Refused omp launches are handled on the exit path.
@@ -18938,7 +19167,7 @@ impl NativeObservations {
         }
         self.retry_pending = events.len() == 64;
         self.initial_wake = self.retry_pending;
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -22505,6 +22734,12 @@ impl NativeMailbox {
                 Ok(())
             }
             Some(st3::mailbox::Frame::Seat { seat }) => {
+                #[cfg(feature = "test-support")]
+                if env!("CARGO_BIN_NAME") == "st3-fixture"
+                    && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION")
+                {
+                    fs::write(PathBuf::from(root).join("title-stream-admitted"), b"seat")?;
+                }
                 if let Err(error) = update_native_title(&seat, runtime_id) {
                     let now = Instant::now();
                     if self.last_title_warning.is_none_or(|prior| {

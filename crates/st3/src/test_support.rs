@@ -92,7 +92,7 @@ pub fn supervise_test() -> bool {
             return false;
         }
         let script =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/st3_test_process.py");
+            Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../../scripts/st3_test_process.py");
         let output = Command::new("python3")
             .arg(script)
             .args(["--owner", &std::process::id().to_string(), "--"])
@@ -163,4 +163,36 @@ pub(crate) fn pause_startup_replay() {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+/// Fixture-only barrier AFTER the actual owned provider has exited and its wrapper returned.
+/// The production binary never calls this function; a process environment cannot opt it in.
+#[cfg(feature = "test-support")]
+pub fn hold_provider_completion(outcome: &anyhow::Result<()>) -> anyhow::Result<()> {
+    let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION").map(PathBuf::from) else {
+        return Ok(());
+    };
+    std::fs::write(root.join("provider-return.json"), serde_json::to_vec(&serde_json::json!({
+        "ok": outcome.is_ok(), "error": outcome.as_ref().err().map(|error| format!("{error:#}")),
+    }))?)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !root.join("release-provider").exists() {
+        anyhow::ensure!(std::time::Instant::now() < deadline, "fixture provider release timed out");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+/// Exercise the real Store admission in isolated integration fixtures, without an API bypass
+/// in the installed CLI. This module exists only for test/test-support builds.
+pub fn bind_fixture_mailbox(store: &crate::store::Store, fence: &crate::mailbox::Fence)
+    -> Result<crate::mailbox::Fence, crate::St3Error>
+{
+    store.bind_mailbox(fence)
+}
+
+pub fn check_fixture_mailbox(store: &crate::store::Store, fence: &crate::mailbox::Fence)
+    -> Result<(), crate::St3Error>
+{
+    store.check_mailbox(fence)
 }

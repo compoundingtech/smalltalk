@@ -22,6 +22,11 @@
 //! them without assigning policy, so st2 stays render-agnostic while policy consumers do not need a
 //! second parser.
 
+#[cfg(test)]
+#[macro_use]
+#[path = "../../../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 /// Source revision of the complete public parser and lowering contract.
 ///
 /// Hermetic builds inject the full source revision. Native builds use the full clean Git revision

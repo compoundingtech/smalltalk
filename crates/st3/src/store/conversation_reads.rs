@@ -13,8 +13,20 @@ pub(super) type Owners = BTreeMap<String, Owner>;
 
 #[cfg(test)]
 thread_local! {
+    static BEFORE_OWNER_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static BEFORE_MESSAGE_DECODE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
+
+// Keep the existing physical owner window before selecting the kinds the fallback renders.
+// Filtering kinds before LIMIT would incorrectly bring old entries back into the view.
+const TIMELINE_OWNER_IDS: &str = "WITH owner_window AS (
+    SELECT id, kind, store_index FROM claims
+    WHERE subject=?1 AND store_index>0 AND store_index<?2
+    ORDER BY store_index DESC LIMIT 10000
+) SELECT id FROM owner_window
+  WHERE kind IN ('runtime.observed', 'harness.observed', 'harness.diagnostic',
+                 'harness.usage', 'message.sent')
+  ORDER BY store_index DESC";
 
 impl Store {
     /// A volatile, rebuildable identity map at a logical claim frontier. Only changed agents
@@ -22,7 +34,7 @@ impl Store {
     /// native transcript I/O, display preparation, or a long-poll wait.
     pub(crate) fn conversation_owners_at(&self, through: u64) -> Result<Arc<Owners>> {
         selected_index(self.index()?, Some(through)).map_err(anyhow::Error::new)?;
-        let previous = {
+        let (generation, previous) = {
             let cache = self
                 .smalltalk
                 .conversation_owners
@@ -31,17 +43,23 @@ impl Store {
             if let Some((_, owners)) = cache.iter().find(|(at, _)| *at == through) {
                 return Ok(Arc::clone(owners));
             }
-            cache
+            let previous = cache
                 .iter()
                 .filter(|(at, _)| *at < through)
                 .max_by_key(|(at, _)| *at)
-                .map(|(at, owners)| (*at, Arc::clone(owners)))
+                .map(|(at, owners)| (*at, Arc::clone(owners)));
+            (
+                self.smalltalk
+                    .conversation_owner_generation
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                previous,
+            )
         };
         // Harness reports do not change a runtime identity. Copy only small metadata while the
         // SELECT is live. Rebuild a large catch-up instead of retaining an unbounded delta.
         let changed = previous
             .as_ref()
-            .map(|(after, _)| -> Result<_> {
+            .map(|(after, owners)| -> Result<_> {
                 let connection = self.readers.get();
                 let rows = connection
                     .prepare_cached(
@@ -56,13 +74,14 @@ impl Store {
                     rows.into_iter()
                         .filter(|(name, kind)| {
                             name.starts_with("agent/")
-                                && !kind.starts_with("harness.")
-                                && !matches!(
-                                    kind.as_str(),
-                                    "intent.desired"
-                                        | "runtime.readiness-deadline-reached"
-                                        | "reconcile.fault"
-                                )
+                                && (!owners.contains_key(name)
+                                    || (!kind.starts_with("harness.")
+                                        && !matches!(
+                                            kind.as_str(),
+                                            "intent.desired"
+                                                | "runtime.readiness-deadline-reached"
+                                                | "reconcile.fault"
+                                        )))
                         })
                         .map(|(name, _)| name)
                         .collect::<BTreeSet<_>>()
@@ -133,11 +152,27 @@ impl Store {
             );
         }
         let owners = Arc::new(owners);
+        #[cfg(test)]
+        BEFORE_OWNER_PUBLISH.with(|pause| {
+            if let Some(pause) = pause.borrow_mut().take() {
+                pause();
+            }
+        });
         let mut cache = self
             .smalltalk
             .conversation_owners
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // A repair may have cleared the cache while this build released its SQL readers.
+        // The generation is changed under this same lock, so an older build cannot republish.
+        if self
+            .smalltalk
+            .conversation_owner_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != generation
+        {
+            return Ok(owners);
+        }
         if let Some((_, published)) = cache.iter().find(|(at, _)| *at == through) {
             return Ok(Arc::clone(published));
         }
@@ -193,6 +228,30 @@ impl Store {
                 .query_map(params![owner, floor, before], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        self.conversation_claims_by_ids(&ids)
+    }
+
+    /// The owner records the stored-history fallback actually renders, selected inside the
+    /// same latest-10,000 physical-row window as the previous claims_page read. Timeline
+    /// operations keep their separate incarnation window and missing-history checks.
+    pub(crate) fn conversation_timeline_owner_claims_at(
+        &self,
+        owner: &str,
+        before: Option<u64>,
+    ) -> Result<Vec<ClaimRecord>> {
+        let ids = {
+            let connection = self.readers.get();
+            connection
+                .prepare_cached(TIMELINE_OWNER_IDS)?
+                .query_map(params![owner, before.unwrap_or(i64::MAX as u64)], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        self.conversation_claims_by_ids(&ids)
+    }
+
+    fn conversation_claims_by_ids(&self, ids: &[String]) -> Result<Vec<ClaimRecord>> {
         // Copy at most 64 rows, stopping after 1 MiB plus one complete row, as raw strings.
         // Release the statement and connection
         // before JSON decoding. This avoids both a fleet-wide live cursor and one query per
@@ -420,6 +479,99 @@ mod tests {
             *store.conversation_owners_at(nulled).unwrap(),
             oracle(&store, nulled)
         );
+    }
+
+    #[test]
+    fn conversation_owner_new_declarations_and_harness_only_agents_match_cold_reads() {
+        let store = Store::open_memory("node").unwrap();
+        append(
+            &store,
+            "agent/alder",
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"first","runtime_id":"pty"}),
+        );
+        store
+            .conversation_owners_at(store.index().unwrap())
+            .unwrap();
+        store
+            .connection
+            .batched(|tx| -> Result<()> {
+                append_claim_tx(
+                    tx,
+                    "node",
+                    "agent/birch",
+                    "intent.desired",
+                    None,
+                    &json!({"subject":"agent/birch","kind":"agent","desired":{}}),
+                    &[],
+                    None,
+                )?;
+                append_claim_tx(
+                    tx,
+                    "node",
+                    "agent/cedar",
+                    "harness.observed",
+                    None,
+                    &json!({"fields":{"state":"idle"}}),
+                    &[],
+                    None,
+                )?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        let frontier = store.index().unwrap();
+        let warm = store.conversation_owners_at(frontier).unwrap();
+        assert!(warm.contains_key("agent/birch"));
+        assert!(warm.contains_key("agent/cedar"));
+        assert_eq!(*warm, oracle(&store, frontier));
+        store.forget_current_views();
+        let cold = store.conversation_owners_at(frontier).unwrap();
+        assert_eq!(*warm, *cold);
+    }
+
+    #[test]
+    fn conversation_owner_build_before_repair_cannot_repopulate_the_cleared_cache() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        append(
+            &store,
+            "agent/alder",
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"first","runtime_id":"pty"}),
+        );
+        let frontier = store.index().unwrap();
+        let (ready_send, ready) = std::sync::mpsc::channel();
+        let (resume_send, resume) = std::sync::mpsc::channel();
+        let reader = store.clone();
+        let worker = std::thread::spawn(move || {
+            BEFORE_OWNER_PUBLISH.with(|pause| {
+                *pause.borrow_mut() = Some(Box::new(move || {
+                    ready_send.send(()).unwrap();
+                    resume
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }));
+            });
+            reader.conversation_owners_at(frontier).unwrap()
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        store.forget_current_views();
+        resume_send.send(()).unwrap();
+        let result = worker.join().unwrap();
+        assert!(
+            store
+                .smalltalk
+                .conversation_owners
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "an in-flight build republished a pre-repair cache entry"
+        );
+        assert_eq!(*result, oracle(&store, frontier));
+        assert_eq!(*store.conversation_owners_at(frontier).unwrap(), *result);
+        assert_eq!(store.smalltalk.conversation_owners.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -658,5 +810,147 @@ mod tests {
             assert_eq!(old.operation_id, new.operation_id);
             assert_eq!(old.predecessors, new.predecessors);
         }
+    }
+    #[test]
+    fn conversation_timeline_owner_window_matches_the_old_physical_window() {
+        let store = Store::open_memory("node").unwrap();
+        let owner = "agent/alder";
+        append(
+            &store,
+            owner,
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"first","runtime_id":"pty"}),
+        );
+        let old_frontier = store.index().unwrap() + 1;
+        store.connection.batched(|tx| -> Result<()> {
+            for number in 0..10_005 {
+                append_claim_tx(tx, "node", owner, "harness.timeline", None,
+                    &json!({"fields":{"operation":"append",
+                        "entry_id":format!("timeline-entry/alder-{number}"),
+                        "sequence":number + 1,"revision":1,"role":"assistant",
+                        "entry_type":"content","final":true,"body":{"text":"Native text"},
+                        "driver":"codex","incarnation_id":"first"}}), &[], None)?;
+            }
+            for (kind, fields) in [
+                ("runtime.observed", json!({"status":"idle","incarnation_id":"first"})),
+                ("harness.observed", json!({"state":"idle","incarnation_id":"first"})),
+                ("harness.diagnostic", json!({"code":"provider-error","reason":"Provider stopped","severity":"warning"})),
+                ("harness.usage", json!({"input_tokens":12,"output_tokens":3,"driver":"codex","incarnation_id":"first","semantics":"response"})),
+            ] {
+                append_claim_tx(tx, "node", owner, kind, None,
+                    &json!({"fields":fields}), &[], None)?;
+            }
+            // Large bodies that this fallback never renders must not be copied or parsed.
+            append_claim_tx(tx, "node", owner, "harness.timeline", None,
+                &json!({"fields":{"operation":"append","entry_id":"timeline-entry/alder-large",
+                    "sequence":10_006,"revision":1,"role":"assistant","entry_type":"content",
+                    "final":true,"body":{"text":"x".repeat(2 * 1024 * 1024)},
+                    "driver":"codex","incarnation_id":"first"}}), &[], None)?;
+            append_claim_tx(tx, "node", "agent/birch", "runtime.observed", None,
+                &json!({"fields":{"status":"running"}}), &[], None)?;
+            Ok(())
+        }).unwrap().unwrap();
+        for before in [Some(old_frontier), None] {
+            let expected = store
+                .claims_page(Some(owner), None, 0, before, true, 10_000)
+                .unwrap()
+                .claims
+                .into_iter()
+                .filter(|c| {
+                    matches!(
+                        c.kind.as_str(),
+                        "runtime.observed"
+                            | "harness.observed"
+                            | "harness.diagnostic"
+                            | "harness.usage"
+                            | "message.sent"
+                    )
+                })
+                .collect::<Vec<_>>();
+            let actual = store
+                .conversation_timeline_owner_claims_at(owner, before)
+                .unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_eq!(actual.id, expected.id);
+                assert_eq!(actual.body, expected.body);
+                assert_eq!(actual.predecessors, expected.predecessors);
+            }
+        }
+        assert_eq!(
+            store
+                .conversation_timeline_owner_claims_at(owner, None)
+                .unwrap()
+                .len(),
+            4,
+            "filtering kinds before the physical window would resurrect the old runtime row"
+        );
+        let connection = store.readers.get();
+        let plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {TIMELINE_OWNER_IDS}"))
+            .unwrap()
+            .query_map(params![owner, i64::MAX], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("claims_subject_index"), "{plan}");
+        assert!(!plan.contains("SCAN claims"), "{plan}");
+    }
+
+    #[test]
+    fn conversation_timeline_owner_decode_does_not_pin_the_wal() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "node").unwrap());
+        append(
+            &store,
+            "agent/alder",
+            "harness.diagnostic",
+            json!({"code":"provider-error","reason":"x".repeat(2 * 1024 * 1024),"severity":"warning"}),
+        );
+        let (ready_send, ready) = std::sync::mpsc::channel();
+        let (resume_send, resume) = std::sync::mpsc::channel();
+        let reader = store.clone();
+        let worker = std::thread::spawn(move || {
+            BEFORE_MESSAGE_DECODE.with(|pause| {
+                *pause.borrow_mut() = Some(Box::new(move || {
+                    ready_send.send(()).unwrap();
+                    resume
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }));
+            });
+            reader
+                .conversation_timeline_owner_claims_at("agent/alder", None)
+                .unwrap()
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        append(
+            &store,
+            "agent/alder",
+            "runtime.observed",
+            json!({"status":"idle"}),
+        );
+        let checkpoint: (u64, i64, i64) = store
+            .connection
+            .write()
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        resume_send.send(()).unwrap();
+        let claims = worker.join().unwrap();
+        assert_eq!(checkpoint.0, 0);
+        assert_eq!(
+            checkpoint.1, checkpoint.2,
+            "owner decoding retained a SQLite snapshot: {checkpoint:?}"
+        );
+        assert_eq!(claims.len(), 1, "the new write belongs to the next read");
+        assert_eq!(
+            claims[0].body["fields"]["reason"].as_str().unwrap().len(),
+            2 * 1024 * 1024
+        );
     }
 }

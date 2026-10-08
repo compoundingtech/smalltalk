@@ -107,7 +107,7 @@ fn authored_model_gates(source: &str) -> Vec<String> {
 
 #[test]
 fn planning_mode_eval_uses_one_dynamic_codex_planner() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/planning-mode");
     let source = fs::read_to_string(root.join("eval.kdl")).expect("read planning mode eval");
@@ -125,7 +125,7 @@ fn planning_mode_eval_uses_one_dynamic_codex_planner() {
 
 #[test]
 fn every_tracked_st3_example_uses_the_normative_grammar() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("examples/st3");
     let mut files = walkdir::WalkDir::new(&root)
@@ -151,7 +151,7 @@ fn every_tracked_st3_example_uses_the_normative_grammar() {
 fn github_review_example_removes_its_checkout_and_temp_build_files() {
     use std::process::Command;
 
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let source = fs::read_to_string(root.join("examples/st3/github-intake-work.kdl")).unwrap();
     let document: kdl::KdlDocument = source.parse().unwrap();
     let review = document
@@ -207,7 +207,7 @@ fn github_review_example_removes_its_checkout_and_temp_build_files() {
 }
 
 fn example_files(directory: &str) -> Vec<PathBuf> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(directory);
     let mut files = walkdir::WalkDir::new(&root)
@@ -225,7 +225,7 @@ fn example_files(directory: &str) -> Vec<PathBuf> {
 
 #[test]
 fn walkthrough_work_warns_before_the_worker_seat_exists() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let file = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("examples/st3/walkthrough-work.kdl");
     let source = fs::read_to_string(&file).expect("read walkthrough work mission");
@@ -335,7 +335,7 @@ fn no_example_mission_owns_runtimes_without_work() {
 #[test]
 fn the_declarative_gates_dream_fixture_previews_without_rewriting() {
     let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/declarative-gates.kdl");
+        PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/declarative-gates.kdl");
     let source = fs::read_to_string(&fixture).expect("read declarative gates fixture");
     let intent = st3::parse_intent(&source, "local")
         .unwrap_or_else(|error| panic!("{}: {error}", fixture.display()));
@@ -369,7 +369,7 @@ fn is_eval_document(path: &std::path::Path) -> bool {
 
 #[test]
 fn every_native_st3_eval_uses_the_normative_grammar() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
     let mut files = walkdir::WalkDir::new(&root)
@@ -393,7 +393,7 @@ fn every_native_st3_eval_uses_the_normative_grammar() {
 
 #[test]
 fn eval_personas_do_not_duplicate_runtime_work_instructions() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
     for entry in walkdir::WalkDir::new(root)
@@ -431,7 +431,7 @@ fn eval_personas_do_not_duplicate_runtime_work_instructions() {
 
 #[test]
 fn continuous_stewardship_has_two_serial_cycles_and_a_latest_only_wake() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let file = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/continuous-stewardship/eval.kdl");
     let source = fs::read_to_string(&file).unwrap();
@@ -461,7 +461,7 @@ fn continuous_stewardship_has_two_serial_cycles_and_a_latest_only_wake() {
 
 #[test]
 fn automatic_intake_pins_its_review_mission() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let file = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/automatic-github-intake/eval.kdl");
     let source = fs::read_to_string(&file).unwrap();
@@ -472,7 +472,7 @@ fn automatic_intake_pins_its_review_mission() {
 
 #[test]
 fn migration_rehearsal_uses_an_exact_migration_document_and_no_custom_prompt() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let file = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/agent-migration-rehearsal/eval.kdl");
     let source = fs::read_to_string(&file).unwrap();
@@ -485,7 +485,7 @@ fn migration_rehearsal_uses_an_exact_migration_document_and_no_custom_prompt() {
 
 #[test]
 fn st3_eval_inventory_has_twenty_two_model_free_and_twenty_one_model_backed_evals() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
     let model_free = [
@@ -576,7 +576,7 @@ fn st3_eval_inventory_has_twenty_two_model_free_and_twenty_one_model_backed_eval
 
 #[test]
 fn codex_compaction_delivery_eval_proves_staging_steering_and_post_compaction_delivery() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/codex-compaction-message-delivery");
     let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
@@ -602,7 +602,7 @@ fn codex_compaction_delivery_eval_proves_staging_steering_and_post_compaction_de
 
 #[test]
 fn native_session_import_eval_uses_raw_ptys_and_all_five_drivers() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/native-session-import");
     let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
@@ -634,7 +634,7 @@ fn native_session_import_eval_uses_raw_ptys_and_all_five_drivers() {
 
 #[test]
 fn cross_harness_message_wake_is_black_box_and_uses_all_account_backed_harnesses() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/cross-harness-message-wake");
     let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
@@ -666,7 +666,7 @@ fn cross_harness_message_wake_is_black_box_and_uses_all_account_backed_harnesses
 
 #[test]
 fn work_wake_reliability_covers_normal_lifecycle_wakes_without_priming_the_worker() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/work-wake-reliability");
     let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
@@ -704,7 +704,7 @@ fn work_wake_reliability_covers_normal_lifecycle_wakes_without_priming_the_worke
 
 #[test]
 fn seat_queue_moves_one_run_and_gates_the_head_without_priming_the_seat() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/seat-queue");
     let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
@@ -763,7 +763,7 @@ fn seat_queue_moves_one_run_and_gates_the_head_without_priming_the_seat() {
 
 #[test]
 fn every_selected_eval_has_one_st2_and_one_st3_form() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals");
     let model_free = [
@@ -866,7 +866,7 @@ fn every_selected_eval_has_one_st2_and_one_st3_form() {
 
 #[test]
 fn selected_eval_harness_counts_match_the_inventory() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals");
     let expected = [
@@ -928,7 +928,7 @@ fn selected_eval_harness_counts_match_the_inventory() {
 
 #[test]
 fn license_and_ghost_bug_keep_the_complete_team_loop_in_the_graph() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
     let cases = [
@@ -997,7 +997,7 @@ fn license_and_ghost_bug_keep_the_complete_team_loop_in_the_graph() {
 
 #[test]
 fn mission_document_lift_produces_and_uses_one_exact_mission_output() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/mission-document-lift");
     let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
@@ -1032,7 +1032,7 @@ fn mission_document_lift_produces_and_uses_one_exact_mission_output() {
 
 #[test]
 fn license_mit_st3_fixture_matches_its_claude_team() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/license-mit");
     for seat in ["sup", "worker"] {
@@ -1049,7 +1049,7 @@ fn license_mit_st3_fixture_matches_its_claude_team() {
 
 #[test]
 fn restart_continuity_fixtures_match_their_claude_teams() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals");
     for runtime in ["st2", "st3"] {
@@ -1087,7 +1087,7 @@ fn restart_continuity_fixtures_match_their_claude_teams() {
 
 #[test]
 fn signal_rename_keeps_work_structure_in_the_mission_graph() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let file = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/signal-rename/eval.kdl");
     let source = fs::read_to_string(&file).expect("read Signal Rename eval");
@@ -1210,7 +1210,7 @@ fn signal_rename_keeps_work_structure_in_the_mission_graph() {
 
 #[test]
 fn restart_continuity_keeps_recovery_state_in_the_mission_graph() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let file = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/restart-continuity/eval.kdl");
     let source = fs::read_to_string(&file).expect("read Restart continuity eval");
@@ -1291,7 +1291,7 @@ fn restart_continuity_keeps_recovery_state_in_the_mission_graph() {
 
 #[test]
 fn fork_in_the_road_keeps_parallel_debate_in_the_mission_graph() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let file = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/fork-in-the-road/eval.kdl");
     let source = fs::read_to_string(&file).expect("read Fork in the road eval");
@@ -1428,7 +1428,7 @@ fn fork_in_the_road_keeps_parallel_debate_in_the_mission_graph() {
 
 #[test]
 fn poisoned_pr_keeps_review_state_in_the_mission_graph() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let file = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/poisoned-pr/eval.kdl");
     let source = fs::read_to_string(&file).expect("read Poisoned pull request eval");
@@ -1474,7 +1474,7 @@ fn poisoned_pr_keeps_review_state_in_the_mission_graph() {
 
 #[test]
 fn new_paid_evals_keep_work_and_products_in_the_mission_graph() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
     let cases = [
@@ -1538,7 +1538,7 @@ fn new_paid_evals_keep_work_and_products_in_the_mission_graph() {
 
 #[test]
 fn new_paid_eval_fixtures_match_their_native_harnesses() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals");
 
@@ -1589,7 +1589,7 @@ fn new_paid_eval_fixtures_match_their_native_harnesses() {
 #[test]
 fn every_example_previews_cleanly_once_its_seats_exist() {
     let store = st3::store::Store::open_memory("local").unwrap();
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     for seat in [
         "examples/st3/seats/omp.kdl",
         "examples/st3/seats/chief.kdl",

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Record the provider outcome before publishing its terminal harness event",
+  "replay": {
+    "status": "none",
+    "detail": "No replay cursor or spool format changes. The existing terminal event remains unacknowledged until the provider result reaches the existing exit-report path."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, migrations or schema versions change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digests change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Native drivers preserve the actual provider success or failure when the wrapper terminal receipt precedes task completion. Mailbox admission and fencing remain unchanged; foreign runtime, invocation and token rejection still terminate the driver."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No coordinated restart or startup work is added. Operations deploys the normal binary update."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No configuration or manual action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No graph recovery or repair is required. This corrects a reproduced completion-order failure; historical CI stale-mailbox failures remain unattributed."
+  }
+}

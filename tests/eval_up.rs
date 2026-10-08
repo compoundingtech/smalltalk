@@ -168,7 +168,7 @@ fn st2_up_boots_a_specs_team() {
         return;
     }
 
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap(); // short /tmp/.tmpXXXX path → PTY_ROOT fits the socket limit
     let spec_dir = tmp.path().join("cell");
@@ -260,7 +260,7 @@ team "t" {
 /// refuse it (nothing to supervise) and point at `st2 eval`. No `pty` needed (it errors before any boot).
 #[test]
 fn st2_up_refuses_an_eval_only_file() {
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
     std::fs::create_dir_all(&cell).unwrap();
@@ -299,7 +299,7 @@ fn st2_down_tears_down_a_spec_fleet() {
         eprintln!("SKIP st2_down_tears_down_a_spec_fleet: `pty` not on PATH");
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let spec_dir = tmp.path().join("cell");
@@ -421,7 +421,7 @@ fn st2_up_once_atomically_respawns_a_hard_killed_agent() {
         eprintln!("SKIP st2_up_once_atomically_respawns_a_hard_killed_agent: `pty` not on PATH");
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let spec_dir = tmp.path().join("cell");
@@ -528,7 +528,7 @@ fn st2_up_spec_supervises_and_respawns_a_killed_agent() {
         eprintln!("SKIP st2_up_spec_supervises_and_respawns_a_killed_agent: `pty` not on PATH");
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let spec_dir = tmp.path().join("cell");

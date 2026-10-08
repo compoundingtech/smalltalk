@@ -206,17 +206,19 @@ class Tab:
     def exercise(self, data):
         start = len(self.input())
         self.send(data + BARRIER)
-        received = wait_for(self.input, lambda raw: len(raw) > start and BARRIER_PATTERN.search(raw) is not None,
+        # A previous case ends with Ctrl-B. An a event followed by this case's
+        # first Ctrl-B can look like another barrier across that old boundary.
+        received = wait_for(self.input, lambda raw: BARRIER_PATTERN.search(raw, start) is not None,
                             f"input {data.hex()}")
-        return received[start:BARRIER_PATTERN.search(received).start()]
+        return received[start:BARRIER_PATTERN.search(received, start).start()]
 
     def query(self, data):
         start = len(self.input())
         self.emit(data)
         self.send(BARRIER)
-        received = wait_for(self.input, lambda raw: len(raw) > start and BARRIER_PATTERN.search(raw) is not None,
+        received = wait_for(self.input, lambda raw: BARRIER_PATTERN.search(raw, start) is not None,
                             f"query {data.hex()}")
-        return received[start:BARRIER_PATTERN.search(received).start()]
+        return received[start:BARRIER_PATTERN.search(received, start).start()]
 
     def close(self):
         (self.root / "stop").touch()

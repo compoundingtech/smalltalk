@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Restore Performance's root steady-state report when main also retains a separate upgrade-load report.",
+  "replay": {"status": "none", "detail": "CI report selection only; no deployed runtime or data contract change."},
+  "schema": {"status": "none", "detail": "CI report selection only; no deployed runtime or data contract change."},
+  "rules": {"status": "none", "detail": "CI report selection only; no deployed runtime or data contract change."},
+  "compatibility": {"status": "none", "detail": "CI report selection only; legacy steady reports remain accepted."},
+  "downtime": {"status": "none", "detail": "CI report selection only; no deployment transition."},
+  "manual": {"status": "none", "detail": "No manual step or workflow rerun is introduced."},
+  "recovery": {"status": "none", "detail": "Existing report provenance, workload validation and failure behavior remain required."}
+}

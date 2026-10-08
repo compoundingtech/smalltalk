@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Explicit source-gap triggers fence registered IVM views in the same uncovered source commit",
+  "replay": {
+    "status": "none",
+    "detail": "No historical replay, automatic initialization or recovery."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Explicit library installation creates three local triggers on an existing validated gap singleton. No default schema migration, shared layout or version change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No admission, authority, canonical or checkpoint rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Adds an opt-in Views gap-trigger API. Batch hook failures preserve their anyhow context chain."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No production activation or restart."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Library adopters explicitly install the bounded trigger for their finite shared registry. No st3 capture adapter or read migration is installed."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Same-transaction gaps fence availability without changing output or certified cut. Clearing a gap never restores Ready; source-domain and lifecycle recovery remain adapter-owned."
+  }
+}

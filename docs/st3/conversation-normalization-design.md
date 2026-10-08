@@ -393,8 +393,12 @@ claim frontiers. A changed read folds only agents whose actual-state claims chan
 harness-only and unrelated commits do not repeat agent status/history reductions.
 Catch-up copies at most 4,097 small subject/kind rows before releasing the statement;
 a gap beyond 4,096 rebuilds the identity map. The map contains routing metadata,
-not conversation bytes. Mixed origins and other actual kinds retain the existing
-canonical identity reduction for that agent. This is not a history-independent
+not conversation bytes. A newly seen agent enters the map even when its first
+claim is only a declaration or harness report, so warm and cold reads agree that
+it exists without a current session. Projection repair/trim advances a generation
+under the cache lock; a build started before that reset cannot republish its result.
+Mixed origins and other actual kinds retain the existing canonical identity
+reduction for that agent. This is not a history-independent
 cold-read proof or a replacement for the shared incremental read-model mechanism.
 
 Message reads preserve the newest 10,000 fleet-send window, but existing endpoint
@@ -427,3 +431,28 @@ contract or projection digest. Their first builds on the isolated store took
 reuse them. This startup cost belongs in rollout planning. Older builds ignore
 the additional indexes. The routing cache is cleared with projection repairs and
 rebuilds after restart.
+
+## Stored session timeline graph reads
+
+Until the owner-native reader cutover removes the stored-history fallback, its
+attribution reads only the desired row for the session owner by primary key.
+The owner record query first selects the existing newest 10,000 physical owner
+rows, then selects the kinds that the fallback already renders: runtime and
+harness status, diagnostics, usage and messages. It does not filter kinds before
+the physical window, which would bring older entries back into the view. Timeline
+operations keep their separate incarnation window and missing-history checks.
+
+Selected owner payloads use the same 64-row, 1 MiB-plus-one-complete-row copy
+batches as messages. Statements and connections are released before JSON decoding;
+a paused 2 MiB diagnostic decode allows a concurrent write to be fully checkpointed.
+Existing subject and claim identity indexes suffice. This cuts unnecessary payload
+copies and the long decode-held reader, without changing stored data, retention,
+visible entries, attribution or cursors. The operation fold, native normalization,
+response preparation and serialization remain separate costs; this slice alone
+does not establish the client p99 or attached-client CPU targets.
+
+Existing request profiles distinguish `timeline/native-read`,
+`timeline/stored-fallback` and `timeline/cached-page` stages so deployment evidence
+can identify the path beneath the shared session-detail route label. The native
+incremental fold and bounded prepared pages remain #1665's scope. Session detail
+and session-list collection construction remain separate from timeline reads.

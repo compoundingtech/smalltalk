@@ -99,6 +99,15 @@ pub use smallclaims::store::{
 mod accounts;
 mod adhoc_work;
 mod attention_snapshot;
+// Registration stays opt-in until the shared installer certifies every source family.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "prepared attention operators await certified shared-runtime integration"
+    )
+)]
+pub(crate) mod attention_ivm;
 mod backup;
 mod checkpoint_rules;
 pub(crate) mod delegation;
@@ -122,8 +131,10 @@ mod convergence;
 mod document_index_tests;
 mod lanes;
 mod operations;
+pub(crate) mod mission_ivm;
 mod unread_mail;
 mod agent_messages;
+pub mod agent_view;
 mod conversation_reads;
 mod runtime;
 #[cfg(test)]
@@ -621,6 +632,13 @@ ON local_observations(dedupe_key) WHERE dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS local_observations_timeline_index
 ON local_observations(subject, json_extract(body, '$.fields.incarnation_id'), id)
 WHERE kind='harness.timeline';
+-- The roster cache's local frontier: the newest agent timeline row a graph cut can see. Only
+-- an agent's timeline rows can change a roster card, so this partial covering index bounds the
+-- frontier lookup by newer agent timeline rows alone; heartbeats, telemetry and every other
+-- subject's observations never enter it, and the scan reads no table row.
+CREATE INDEX IF NOT EXISTS local_observations_roster_frontier_index
+ON local_observations(id, after_store_index)
+WHERE kind='harness.timeline' AND subject LIKE 'agent/%';
 -- A mission capacity retry is scheduling state owned by this reconciler. Replicating every
 -- backoff attempt makes every peer reconcile even though only this node can retry it.
 CREATE TABLE IF NOT EXISTS local_subscription_mission_deferrals (
@@ -2581,7 +2599,76 @@ pub fn runtime() -> Arc<dyn smallclaims::Runtime> {
     Arc::new(SmalltalkRuntime::default())
 }
 
+/// The local rows a roster card can read: timeline entries an agent subject made, which date its
+/// activity and its managed session. Heartbeat and telemetry observations never change a card —
+/// the harness fold, working episodes, usage summaries and todos all read replicated claims —
+/// and neither do `Latest` observations, which reach cards only through the claims written when
+/// their state changes. So the frontier is the newest agent timeline row at or before the cut,
+/// an exact `MAX(id)`: it never assumes observation ids and graph cuts rise together, which
+/// repair and trim can break.
+const ROSTER_LOCAL_FRONTIER: &str = "SELECT COALESCE((SELECT id FROM local_observations
+ WHERE kind='harness.timeline' AND subject LIKE 'agent/%' AND after_store_index<=?1
+ ORDER BY id DESC LIMIT 1), 0)";
+
+/// One frontier read, inside the caller's SQLite snapshot when it holds one: the reader pool
+/// lends pinned reads the same connection. The partial frontier index keeps an old cut from
+/// walking newer heartbeat rows.
+fn roster_local_frontier(connection: &Connection, index: u64) -> Result<u64> {
+    Ok(connection.query_row(ROSTER_LOCAL_FRONTIER, [index], |row| row.get::<_, u64>(0))?)
+}
+
+/// The exact cache-hit contract shared by the building path and the read-only warm pin: one
+/// graph cut, one roster-relevant local frontier, one history mode, a queue lease window that
+/// has not ended, and coverage of every requested subject.
+fn agent_resources_entry_hits(
+    entry: &runtime::AgentResourcesEntry,
+    now: u128,
+    index: u64,
+    local: u64,
+    history: bool,
+    selected: Option<&BTreeSet<String>>,
+) -> bool {
+    entry.index == index
+        && entry.local == local
+        && entry.history == history
+        && entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
+        && match selected {
+            None => entry.covered.is_none(),
+            Some(names) => entry
+                .covered
+                .as_ref()
+                .is_none_or(|covered| names.is_subset(covered)),
+        }
+}
+
 impl Store {
+    /// The explicitly registered keyed views for this graph. This getter performs no reads
+    /// or installation; availability and source coverage must be checked in a snapshot.
+    pub fn ivm_views(&self) -> Option<Arc<smallclaims::ivm::Views>> {
+        self.smalltalk.ivm_views.clone()
+    }
+
+    /// Lazily attach the one Store publisher shared by receipt waits and collection
+    /// consumers. Registration and journal installation happen when the Store opens.
+    /// Attachment errors are returned on each call until attachment succeeds; failures
+    /// are not cached. A successful attachment is shared by all later callers.
+    pub fn ivm_publisher(&self) -> Result<Option<Arc<smallclaims::ivm::events::Publisher>>> {
+        if self.smalltalk.ivm_views.is_none() {
+            return Ok(None);
+        }
+        let mut publisher = self
+            .smalltalk
+            .ivm_publisher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(publisher) = &*publisher {
+            return Ok(Some(publisher.clone()));
+        }
+        let attached = Arc::new(smallclaims::ivm::events::Publisher::attach(&self.graph, 128)?);
+        *publisher = Some(attached.clone());
+        Ok(Some(attached))
+    }
+
     pub fn open(path: &Path, origin: impl Into<String>) -> Result<Self> {
         let smalltalk = Arc::new(SmalltalkRuntime::default());
         #[cfg_attr(not(test), allow(unused_mut))]
@@ -2591,6 +2678,18 @@ impl Store {
         {
             graph.heal_replay_backoff_ms = 0;
         }
+        Ok(Self { graph, smalltalk })
+    }
+
+    /// Open explicitly registered shadow views beside Smalltalk's production admission and
+    /// projections. Source adapters own installation and certification before any read switch.
+    pub fn open_with_ivm_views(
+        path: &Path,
+        origin: impl Into<String>,
+        views: Arc<smallclaims::ivm::Views>,
+    ) -> Result<Self> {
+        let smalltalk = Arc::new(SmalltalkRuntime::with_ivm_views(views));
+        let graph = GraphStore::open(path, origin, smalltalk.clone())?;
         Ok(Self { graph, smalltalk })
     }
 
@@ -2666,6 +2765,31 @@ impl Store {
         Ok(Some(subjects))
     }
 
+    /// An allow-list for shallow refs, narrower than card-local invalidation: runtime status
+    /// can move an undeclared or stopped agent into history, so runtime.observed is not safe.
+    fn agent_page_refs_unchanged(&self, after: u64, through: u64, refs: &[Value]) -> Result<bool> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind FROM claims WHERE store_index>?1 AND store_index<=?2",
+        )?;
+        for row in statement.query_map(params![after, through], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (subject, kind) = row?;
+            let unchanged = match kind.as_str() {
+                "daemon.diagnostic" => true,
+                "harness.observed" | "harness.diagnostic" | "harness.timeline"
+                    | "harness.todo.observed" | "harness.session-file" | "harness.usage" => {
+                    subject.starts_with("agent/")
+                        && refs.iter().any(|item| item["id"].as_str() == Some(subject.as_str()))
+                }
+                _ => false,
+            };
+            if !unchanged { return Ok(false); }
+        }
+        Ok(true)
+    }
+
     /// The last claim that can change an agent's status: one about an agent, or about the run
     /// or generation that owns it, whose row decides the agent's projection layer. Steps,
     /// gates, subscriptions and diagnostics commit far more often and change no agent status.
@@ -2681,79 +2805,271 @@ impl Store {
             .unwrap_or_default())
     }
 
-    /// Keep bounded immutable snapshots. Advance the nearest older snapshot by rebuilding
-    /// only cards whose local observations changed; historical reads never advance backwards.
+    /// One physical roster reader across HTTP pages and differently authorized WS windows.
+    /// Waiting happens before SQLite snapshot acquisition, so followers pin no old WAL mark.
+    pub(crate) async fn admit_agent_resources(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        let started = std::time::Instant::now();
+        let guard = self.smalltalk.agent_resources_admission.clone().lock_owned().await;
+        // Waiting here is waiting for the shared admission or for another reader's in-flight
+        // build; the holder keeps the admission until its projection is published.
+        crate::performance::record_request("roster/admission-wait", None, started.elapsed());
+        guard
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_resources_builds_for_test(&self) -> usize {
+        self.smalltalk.agent_resources_builds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn cached_agent_resources(
         &self,
         index: u64,
         history: bool,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
-        let cache = self
-            .smalltalk
-            .agent_resources_cache
-            .lock()
-            .expect("agent resources cache poisoned");
-        if let Some(items) = cache
-            .iter()
-            .find(|(at, all, _)| *at == index && *all == history)
-            .map(|(_, _, items)| Arc::clone(items))
-        {
+        self.cached_agent_resources_for(index, history, None, build)
+    }
+
+    /// The complete agents WS window inherits the queue deadline from its shared projection.
+    pub(crate) fn agent_roster_valid_until(&self, index: u64) -> Option<u128> {
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter().rev()
+            .find(|entry| entry.index == index && !entry.history && entry.covered.is_none())
+            .and_then(|entry| entry.valid_until_unix_ms)
+    }
+
+    /// Queue selection changes at lease expiry even when the claim frontier is unchanged.
+    /// Scan only on a cache miss, inside the same SQLite snapshot as the queue projection.
+    fn agent_queue_valid_until(&self, now: u128) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT lease_expires_at_unix_ms FROM step_runs
+             WHERE agentless=0 AND status IN ('claimed','working','verifying')
+               AND status NOT IN ('completed','failed','cancelled')
+               AND lease_expires_at_unix_ms IS NOT NULL
+               AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)",
+        )?;
+        let mut deadline = None;
+        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            if let Some(expiry) = row?.parse::<u128>().ok().filter(|expiry| *expiry > now) {
+                deadline = Some(deadline.map_or(expiry, |previous: u128| previous.min(expiry)));
+            }
+        }
+        Ok(deadline)
+    }
+
+    /// Membership/order/queue refs contain no local timeline data. Reuse them for unchanged
+    /// graph cuts and agent-only observations, so a warm HTTP page does not scan fleet work.
+    pub(crate) fn cached_agent_page_refs(
+        &self,
+        index: u64,
+        history: bool,
+        build: impl FnOnce() -> Result<Vec<Value>>,
+    ) -> Result<Vec<Value>> {
+        let now = now_ms();
+        let valid = |entry: &&runtime::AgentResourcesEntry| {
+            entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
+        };
+        let cache = self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned");
+        if let Some(entry) = cache.iter().filter(valid).find(|entry| entry.index == index && entry.history == history) {
+            let items = Arc::clone(&entry.items);
             drop(cache);
             return Ok((*items).clone());
         }
-        let previous = cache
-            .iter()
-            .filter(|(at, all, _)| *at < index && *all == history)
-            .max_by_key(|(at, _, _)| *at)
-            .map(|(at, _, items)| (*at, Arc::clone(items)));
-        // A caller already holds a SQLite snapshot. Waiting behind another card build here
-        // pins that old WAL read mark for the whole build, starving checkpoints.
+        let previous = cache.iter().filter(valid).filter(|entry| entry.index < index && entry.history == history)
+            .max_by_key(|entry| entry.index).cloned();
         drop(cache);
-        let items = if let Some((at, previous)) = previous {
-            match self.changed_agent_resources(at, index)? {
-                Some(changed) if changed.is_empty() => (*previous).clone(),
-                Some(changed) => {
-                    let fresh = build(Some((&changed, &previous)))?;
-                    let mut items = previous
-                        .iter()
-                        .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    items.extend(fresh);
-                    items.sort_by(|a, b| {
-                        a["name"]
-                            .as_str()
-                            .cmp(&b["name"].as_str())
-                            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
-                    });
-                    items
-                }
-                None => build(None)?,
+        let (items, valid_until_unix_ms) = match previous {
+            Some(previous) if self.agent_page_refs_unchanged(previous.index, index, &previous.items)? => {
+                (previous.items, previous.valid_until_unix_ms)
             }
-        } else {
-            build(None)?
+            _ => (Arc::new(build()?), self.agent_queue_valid_until(now)?),
         };
-        let mut cache = self
-            .smalltalk
-            .agent_resources_cache
-            .lock()
-            .expect("agent resources cache poisoned");
-        let (items, evicted) = if let Some((_, _, published)) = cache
-            .iter()
-            .find(|(at, all, _)| *at == index && *all == history)
-        {
-            // Concurrent builds still return one immutable result for this snapshot.
-            (Arc::clone(published), None)
-        } else {
-            let items = Arc::new(items);
-            cache.push_back((index, history, Arc::clone(&items)));
-            let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
-            (items, evicted)
-        };
+        let mut cache = self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned");
+        cache.push_back(runtime::AgentResourcesEntry {
+            index, local: 0, history, covered: None, valid_until_unix_ms, items: Arc::clone(&items),
+        });
+        let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
         drop(cache);
         drop(evicted);
         Ok((*items).clone())
+    }
+
+    /// Bounded immutable projections shared by pages and streams. Pages fill only missing
+    /// subjects; a complete stream projection subsumes them. Local agent timeline rows advance
+    /// only affected cards — heartbeats never move the frontier — and historical cuts never
+    /// borrow newer rows.
+    pub(crate) fn cached_agent_resources_for(
+        &self,
+        index: u64,
+        history: bool,
+        selected: Option<&BTreeSet<String>>,
+        build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
+    ) -> Result<Vec<Value>> {
+        let now = now_ms();
+        let valid = |entry: &&runtime::AgentResourcesEntry| {
+            entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
+        };
+        // Local agent timeline rows do not advance the graph index, but do change cards; the
+        // frontier ignores heartbeats and every other local kind, none of which a card reads.
+        // Read it inside the caller's SQLite snapshot, never from a future atomic generation
+        // that could race this cut.
+        let local = crate::performance::task("roster/frontier-read", || {
+            roster_local_frontier(&self.readers.get(), index)
+        })?;
+        let select = |items: &[Value]| items.iter().filter(|item| {
+            selected.is_none_or(|names| names.contains(item["id"].as_str().unwrap_or_default()))
+        }).cloned().collect::<Vec<_>>();
+        let cache = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned");
+        if let Some(entry) = cache.iter().filter(valid).find(|entry| {
+            agent_resources_entry_hits(entry, now, index, local, history, selected)
+        }) {
+            let items = Arc::clone(&entry.items);
+            drop(cache);
+            return crate::performance::task("roster/cache-hit", || Ok(select(&items)));
+        }
+        let previous = cache.iter().filter(valid)
+            .filter(|entry| entry.index <= index && entry.local <= local && entry.history == history)
+            .max_by_key(|entry| (entry.index, entry.local)).cloned();
+        drop(cache);
+        let entry = crate::performance::task("roster/build",
+        || -> Result<runtime::AgentResourcesEntry> {
+        let previous = match previous {
+            Some(entry) if entry.index == index => Some((entry, BTreeSet::new())),
+            Some(entry) => self.changed_agent_resources(entry.index, index)?
+                .map(|changed| (entry, changed)),
+            None => None,
+        };
+        match previous {
+            Some((previous, mut changed)) => {
+                if previous.local != local {
+                    let connection = self.readers.get();
+                    let mut statement = connection.prepare_cached(
+                        "SELECT DISTINCT subject FROM local_observations WHERE id>?1 AND id<=?2
+                         AND after_store_index<=?3 AND kind='harness.timeline' AND subject LIKE 'agent/%'",
+                    )?;
+                    changed.extend(statement.query_map(params![previous.local, local, index],
+                        |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<BTreeSet<_>>>()?);
+                }
+                let covered = match (&previous.covered, selected) {
+                    (None, _) => None,
+                    (Some(covered), Some(names)) => {
+                        changed.retain(|name| covered.contains(name));
+                        changed.extend(names.difference(covered).cloned());
+                        Some(covered.union(names).cloned().collect())
+                    }
+                    (Some(covered), None) => {
+                        let connection = self.readers.get();
+                        let names = connection.prepare_cached(RANGE_SUBJECTS)?
+                            .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+                            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+                        let names = if history { names } else {
+                            self.current_view_candidates(&connection, names, index, true)?
+                        };
+                        changed.extend(names.difference(covered).cloned());
+                        None
+                    }
+                };
+                // Coverage gaps join `changed`, so an empty set means no card this cut can see
+                // moved at all: the previous rows already are this cut's projection, and the
+                // heartbeat or fleet-only claim between two reads costs no clone, sort or build.
+                if changed.is_empty() {
+                    return Ok(runtime::AgentResourcesEntry {
+                        index, local, history, covered,
+                        valid_until_unix_ms: previous.valid_until_unix_ms,
+                        items: Arc::clone(&previous.items),
+                    });
+                }
+                #[cfg(test)]
+                self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut items = previous.items.iter()
+                    .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
+                    .cloned().collect::<Vec<_>>();
+                items.extend(crate::performance::task("roster/card-projection",
+                    || build(Some((&changed, &previous.items))))?);
+                items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
+                    .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+                Ok(runtime::AgentResourcesEntry {
+                    index, local, history, covered,
+                    valid_until_unix_ms: previous.valid_until_unix_ms,
+                    items: Arc::new(items),
+                })
+            }
+            None => {
+                #[cfg(test)]
+                self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut items = crate::performance::task("roster/card-projection",
+                    || build(selected.map(|names| (names, &[][..]))))?;
+                items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
+                    .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+                Ok(runtime::AgentResourcesEntry {
+                    index, local, history, covered: selected.cloned(),
+                    valid_until_unix_ms: self.agent_queue_valid_until(now)?,
+                    items: Arc::new(items),
+                })
+            }
+        }
+        })?;
+        let mut cache = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned");
+        // All endpoint callers hold admission. Direct internal readers may still race; never
+        // replace a complete published projection with a partial one.
+        let published = cache.iter().filter(valid).find(|entry| {
+            agent_resources_entry_hits(entry, now, index, local, history, selected)
+        }).map(|entry| Arc::clone(&entry.items));
+        let items = if let Some(published) = published { published } else {
+            cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
+            let items = Arc::clone(&entry.items);
+            cache.push_back(entry);
+            if cache.len() > 8 { cache.pop_front(); }
+            items
+        };
+        drop(cache);
+        Ok(select(&items))
+    }
+
+    /// The warm pin a shared roster read checks before it admits a builder: the exact cached
+    /// rows for this graph cut, roster-relevant local frontier, history mode and selected
+    /// coverage, or `None` when only a build can answer. Never builds; a miss must drop its
+    /// SQLite snapshot before waiting for admission. The rows are the complete unfiltered
+    /// projection at the cut, so a page still selects its own subjects from them.
+    pub(crate) fn agent_resources_cached_at(
+        &self,
+        index: u64,
+        history: bool,
+        selected: Option<&BTreeSet<String>>,
+    ) -> Result<Option<Arc<Vec<Value>>>> {
+        let now = now_ms();
+        let local = crate::performance::task("roster/frontier-read", || {
+            roster_local_frontier(&self.readers.get(), index)
+        })?;
+        let cache = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned");
+        let hit = cache.iter()
+            .find(|entry| agent_resources_entry_hits(entry, now, index, local, history, selected))
+            .map(|entry| Arc::clone(&entry.items));
+        drop(cache);
+        Ok(hit.map(|hit| crate::performance::task("roster/cache-hit", || hit)))
+    }
+
+    /// The matching warm pin for page refs: membership, ordering and queue metadata for exactly
+    /// this graph cut and history mode while the queue lease window still holds, or `None`.
+    /// Refs carry no local timeline data, so no frontier is read. Never builds.
+    pub(crate) fn agent_page_refs_cached_at(
+        &self,
+        index: u64,
+        history: bool,
+    ) -> Option<Arc<Vec<Value>>> {
+        let now = now_ms();
+        self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned")
+            .iter()
+            .find(|entry| entry.index == index && entry.history == history
+                && entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry))
+            .map(|entry| Arc::clone(&entry.items))
     }
 
     /// Rebuild the operation projection when it no longer matches the claim log, and say
@@ -6389,6 +6705,7 @@ impl Store {
     /// One current-step scan for the whole roster. This avoids replaying wake
     /// history or querying the step table separately for every agent card.
     pub fn agent_work_queues(&self) -> Result<BTreeMap<String, AgentWorkQueue>> {
+        crate::performance::task("agent_work_queues", || -> Result<BTreeMap<String, AgentWorkQueue>> {
         let connection = self.readers.get();
         let orders = seat_run_orders_tx(&connection, None)?;
         let rows = seat_step_rows_tx(&connection, None)?;
@@ -6432,6 +6749,7 @@ impl Store {
             );
         }
         Ok(queues)
+        })
     }
 
     /// The live mission runs queued for every seat, in seat-queue order.
@@ -9246,6 +9564,16 @@ impl Store {
         &self,
         publication: &crate::harness_events::Publication,
     ) -> Result<(ClaimRecord, bool), St3Error> {
+        self.append_harness_event_publication(publication)
+            .map(|(record, appended, _)| (record, appended))
+    }
+
+    /// Admission's transition decision, from the same transaction as its native runtime fence.
+    /// The echoed producer record stays unchanged; it need not carry derived history metadata.
+    pub(crate) fn append_harness_event_publication(
+        &self,
+        publication: &crate::harness_events::Publication,
+    ) -> Result<(ClaimRecord, bool, bool), St3Error> {
         let mut input = publication.claim.clone();
         if publication.sequence == 0
             || publication.runtime_incarnation.is_empty()
@@ -9292,12 +9620,16 @@ impl Store {
             "harness-event:{}:{}:{}:{}:{}",
             input.subject, source_runtime, publication.sequence, input.kind, slot
         ));
-        append_claim_with_fences(
-            &self.graph,
-            &input,
-            None,
-            Some(&publication.runtime_incarnation),
-        )
+        if input.kind == "harness.observed" {
+            validate_claim_input(&input)?;
+            append_latest_observation_publication(
+                &self.graph, &input, now_ms(), Some(&publication.runtime_incarnation),
+            )
+        } else {
+            append_claim_with_fences(
+                &self.graph, &input, None, Some(&publication.runtime_incarnation),
+            ).map(|(record, appended)| (record, appended, false))
+        }
     }
 
     pub fn append_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
@@ -20935,26 +21267,24 @@ fn claude_attachment_fence(
     }))
 }
 
-/// Whether any observation of this runtime epoch of `subject` carries the reason `providerAuth`
-/// or the state `needs-login`, the two ways the observation fold can end in `needs-login`. Today's
-/// claim validation refuses the state `needs-login` in an observation, so only claims written
-/// before that rule can carry it, which is why no test can append one; the probe still asks, so a
-/// store holding such a claim keeps raising its login item:
-/// those that name `incarnation_id`, and those that name no incarnation as text and were accepted
-/// no earlier than the runtime observation (`runtime_accepted_at`), the same two sets the
-/// observation fold reads. The seat's login evidence sits in `claims_harness_login_candidate_index`,
-/// so this reads that partial index, not every observation the seat ever made.
-fn provider_auth_reason_in_epoch(
+/// Whether `subject` has any claim of login evidence in this runtime epoch: a claim in
+/// `claims_harness_login_candidate_index` (a `provider_auth` of false, a reason of `providerAuth`,
+/// a state of `needs-login`, or a `provider-auth-expired` diagnostic) that names `incarnation_id`,
+/// or that names no incarnation as text and was accepted no earlier than the runtime observation
+/// (`runtime_accepted_at`), the same two sets the fold reads. Every way the fold can end in
+/// `needs-login` rests on such a claim: a credential report of false or an expired-login
+/// diagnostic for this incarnation, or an observation of the epoch whose reason is `providerAuth`
+/// or whose own state is `needs-login`. Today's claim validation refuses the state `needs-login`
+/// in an observation, so only claims written before that rule can carry it; the probe still asks,
+/// so a store holding one keeps raising its login item. It reads only that small partial index,
+/// not every observation the seat ever made.
+fn login_evidence_in_epoch(
     connection: &Connection,
     subject: &str,
     at_index: u64,
     incarnation_id: &str,
     runtime_accepted_at: &str,
 ) -> Result<bool> {
-    let reason = "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
-                            THEN '$.reason' ELSE '$.fields.reason' END)";
-    let state = "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
-                            THEN '$.state' ELSE '$.fields.state' END)";
     let sql = format!(
         "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_harness_login_candidate_index
            WHERE claims.subject=?1 AND (
@@ -20966,8 +21296,7 @@ fn provider_auth_reason_in_epoch(
                    THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
              OR (kind='harness.diagnostic'
                AND json_extract(body, '$.fields.code')='provider-auth-expired'))
-           AND kind='harness.observed' AND store_index<=?2
-           AND ({reason}='providerAuth' OR {state}='needs-login')
+           AND store_index<=?2
            AND ({INCARNATION_OF_CLAIM}=?3
                 OR (({INCARNATION_OF_CLAIM} IS NULL OR typeof({INCARNATION_OF_CLAIM})!='text')
                     AND (length(claims.accepted_at_unix_ms)>length(?4)
@@ -20981,10 +21310,10 @@ fn provider_auth_reason_in_epoch(
         })?)
 }
 
-/// `login_only` answers only whether the seat needs a login: it returns as soon as the cheap
-/// fences have spoken and no observation of this runtime epoch says `providerAuth`, which is the
-/// one thing the observation fold below can add to them. Every other view it returns is the one
-/// the full fold would return, and the view it skips is never `needs-login`.
+/// `login_only` answers only whether the seat needs a login: it returns at once, before any
+/// fence, when the seat has no claim of login evidence in this runtime epoch
+/// ([`login_evidence_in_epoch`]). Every view it returns otherwise is the one the full fold would
+/// return, and the view it skips is never `needs-login`.
 fn current_harness_fold_at(
     connection: &Connection,
     subject: &str,
@@ -21011,6 +21340,11 @@ fn current_harness_fold_at(
     let Some(incarnation_id) = runtime_fields.get("incarnation_id").and_then(Value::as_str) else {
         return Ok(None);
     };
+    if login_only
+        && !login_evidence_in_epoch(connection, subject, at_index, incarnation_id, &runtime_key.0.to_string())?
+    {
+        return Ok(None);
+    }
 
     // An admission refusal remains visible even after omp exits, and OpenCode's ready
     // observations cannot claim healthy delivery while its exact build failed the probe.
@@ -21144,12 +21478,6 @@ fn current_harness_fold_at(
 
     if let Some(harness) = claude_attachment_fence(connection, subject, incarnation_id, at_index)? {
         return Ok(Some(harness));
-    }
-
-    if login_only
-        && !provider_auth_reason_in_epoch(connection, subject, at_index, incarnation_id, &runtime_key.0.to_string())?
-    {
-        return Ok(None);
     }
 
     // The observations of this runtime epoch, newest first in canonical order, so every node that
@@ -31669,6 +31997,250 @@ mod tests {
         other.join().unwrap();
         assert_eq!(completed.unwrap().unwrap()[0]["id"], "agent/cached");
         assert_eq!(resumed, published.unwrap());
+    }
+
+    fn roster_cache_store() -> Store {
+        let store = Store::open_memory("node").unwrap();
+        let source = "version 2\nagent \"amber\" { command \"true\" }\n";
+        let intent = parse_intent(source, "node").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store.apply(&intent, &plan.subject_tokens, "roster-cache").unwrap();
+        store.append_claim(&local_observation_for_test("harness.observed", json!({
+            "state":"idle", "driver":"codex", "incarnation_id":"amber-1", "observed_at_ms":1,
+        }))).unwrap();
+        store
+    }
+
+    fn local_observation_for_test(kind: &str, fields: Value) -> ClaimInput {
+        ClaimInput {
+            subject: "agent/node.amber".into(),
+            kind: kind.into(),
+            actor: Some("agent/node.amber".into()),
+            fields: serde_json::from_value(fields).unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        }
+    }
+
+    fn local_timeline_observation_for_test() -> ClaimInput {
+        local_observation_for_test("harness.timeline", json!({
+            "operation":"append", "entry_id":"local-activity", "source_id":"fixture/local-activity",
+            "sequence":1, "revision":1, "role":"assistant", "entry_type":"content", "final":true,
+            "driver":"codex", "incarnation_id":"amber-1",
+            "observed_at_unix_ms":1_900_000_000_000_u64, "body":{"text":"local activity"},
+        }))
+    }
+
+    /// A heartbeat moves no card, so heartbeat-only local deltas keep pinning the same roster
+    /// rows; an agent timeline row is the local delta a card reads.
+    #[test]
+    fn heartbeat_local_deltas_pin_the_same_roster_rows() {
+        let store = roster_cache_store();
+        let index = store.index().unwrap();
+        let card = json!({"id": "agent/node.amber", "name": "amber"});
+        store
+            .cached_agent_resources(index, false, |_| Ok(vec![card.clone()]))
+            .unwrap();
+        let pinned = store
+            .agent_resources_cached_at(index, false, None)
+            .unwrap()
+            .unwrap();
+        for n in 0..8 {
+            let response = store.append_claim(&local_observation_for_test(
+                "harness.observed",
+                json!({"state":"idle", "driver":"codex", "incarnation_id":"amber-1",
+                    "observed_at_ms":300_001 + n}),
+            )).unwrap();
+            assert!(local_observation_position(&response).is_some());
+            assert_eq!(
+                store.index().unwrap(),
+                index,
+                "a local observation keeps the graph cut"
+            );
+            let hit = store
+                .agent_resources_cached_at(index, false, None)
+                .unwrap()
+                .expect("a heartbeat moves no card, so the pinned rows still answer");
+            assert!(Arc::ptr_eq(&hit, &pinned), "heartbeat deltas must reuse the roster rows");
+        }
+        assert_eq!(store.agent_resources_builds_for_test(), 1);
+        store.append_local_observations_for_test(&[local_timeline_observation_for_test()]);
+        assert_eq!(store.index().unwrap(), index);
+        assert!(
+            store
+                .agent_resources_cached_at(index, false, None)
+                .unwrap()
+                .is_none(),
+            "an agent timeline row is the local delta a card reads",
+        );
+        store
+            .cached_agent_resources(index, false, |_| Ok(vec![card]))
+            .unwrap();
+        assert!(
+            store
+                .agent_resources_cached_at(index, false, None)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.agent_resources_builds_for_test(), 2);
+    }
+
+    /// A page that already covered every agent at the cut upgrades to the complete window by
+    /// reusing the pinned rows: no clone, no sort, no build.
+    #[test]
+    fn a_covered_page_upgrade_reuses_the_pinned_roster_rows() {
+        let store = roster_cache_store();
+        let index = store.index().unwrap();
+        let selected = BTreeSet::from(["agent/node.amber".to_string()]);
+        store
+            .cached_agent_resources_for(index, false, Some(&selected), |_| {
+                Ok(vec![json!({"id": "agent/node.amber", "name": "amber"})])
+            })
+            .unwrap();
+        let partial = store
+            .agent_resources_cached_at(index, false, Some(&selected))
+            .unwrap()
+            .unwrap();
+        store
+            .cached_agent_resources_for(index, false, None, |changed| {
+                panic!("nothing moved and nothing is uncovered, so no card is built: {changed:?}")
+            })
+            .unwrap();
+        let complete = store
+            .agent_resources_cached_at(index, false, None)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&complete, &partial));
+        assert_eq!(store.agent_resources_builds_for_test(), 1);
+    }
+
+    /// The frontier answers an old cut exactly — its newest agent timeline row — from the
+    /// partial frontier index, with VM work that newer heartbeats never grow; the pre-followup
+    /// lookup read every newer local row of every kind. Focused fixture: run it explicitly and
+    /// alone, with --ignored --nocapture, because its counters are process-wide.
+    #[test]
+    #[ignore = "focused roster frontier fixture; run explicitly with --ignored --nocapture"]
+    fn the_roster_frontier_old_cut_seek_skips_newer_heartbeats() {
+        let store = roster_cache_store();
+        let cut = store.index().unwrap();
+        store
+            .append_local_observations_for_test(&[local_timeline_observation_for_test()]);
+        let relevant_id = store
+            .readers
+            .get()
+            .query_row(
+                "SELECT id FROM local_observations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap();
+
+        let later = insert_raw_claims(&store, &[("host/one", "transport.observed")]);
+        let insert_newer = |heartbeats: usize, irrelevant: usize, usage: usize| {
+            let connection = store.connection.lock().unwrap();
+            let mut statement = connection
+                .prepare(
+                    "INSERT INTO local_observations(after_store_index, subject, kind, body,
+                                                        observed_at_unix_ms)
+                     VALUES (?1, ?2, ?3, '{}', 1)",
+                )
+                .unwrap();
+            for _ in 0..heartbeats {
+                statement
+                    .execute(params![later, "agent/node.amber", "harness.observed"])
+                    .unwrap();
+            }
+            for _ in 0..irrelevant {
+                statement
+                    .execute(params![later, "mission-run/x", "harness.timeline"])
+                    .unwrap();
+            }
+            for _ in 0..usage {
+                statement
+                    .execute(params![later, "agent/node.amber", "harness.timeline"])
+                    .unwrap();
+            }
+        };
+        insert_newer(4_000, 500, 200);
+
+        let frontier = |at: u64| {
+            store
+                .readers
+                .get()
+                .query_row(ROSTER_LOCAL_FRONTIER, [at], |row| row.get::<_, u64>(0))
+                .unwrap()
+        };
+        assert_eq!(
+            frontier(cut),
+            relevant_id,
+            "an old cut sees exactly its newest agent timeline row"
+        );
+        let usage_frontier = store
+            .readers
+            .get()
+            .query_row(
+                "SELECT id FROM local_observations WHERE subject='agent/node.amber'
+                 AND kind='harness.timeline' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            frontier(later),
+            usage_frontier,
+            "the later cut sees the newest agent timeline row, of any entry type"
+        );
+
+        let plan = query_plan(&store, ROSTER_LOCAL_FRONTIER, params![cut]);
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("local_observations_roster_frontier_index")),
+            "{plan:?}"
+        );
+        assert!(plan.iter().all(|step| !step.contains("TEMP B-TREE")), "{plan:?}");
+
+        let pre_followup = "SELECT COALESCE((SELECT id FROM local_observations
+             WHERE after_store_index<=?1 ORDER BY id DESC LIMIT 1), 0)";
+        let vm_steps = |sql: &str, at: u64| {
+            let connection = store.connection.lock().unwrap();
+            let _: u64 = connection.query_row(sql, [at], |row| row.get(0)).unwrap();
+            let before = smallclaims::sqlite::work::total().vm_steps;
+            let _: u64 = connection.query_row(sql, [at], |row| row.get(0)).unwrap();
+            drop(connection);
+            smallclaims::sqlite::work::total().vm_steps - before
+        };
+        let old_before = vm_steps(pre_followup, cut);
+        let new_before = vm_steps(ROSTER_LOCAL_FRONTIER, cut);
+        insert_newer(4_000, 0, 0);
+        let old_after = vm_steps(pre_followup, cut);
+        let new_after = vm_steps(ROSTER_LOCAL_FRONTIER, cut);
+        println!(
+            "roster frontier fixture: heartbeats=4000..8000 irrelevant_timeline=500 \
+             agent_usage_timeline=200 vm_old_cut_before={old_before} \
+             vm_new_cut_before={new_before} vm_old_cut_after={old_after} \
+             vm_new_cut_after={new_after}"
+        );
+        assert_eq!(
+            new_after, new_before,
+            "the frontier seek's work cannot grow with newer heartbeat rows"
+        );
+        assert!(
+            old_after > old_before,
+            "the pre-followup lookup read every newer row of every kind"
+        );
+        assert!(
+            new_before < old_before,
+            "the frontier index bounds the old-cut lookup"
+        );
     }
 
     #[test]
@@ -53359,6 +53931,16 @@ fn append_latest_observation_fenced(
     now: u128,
     event_runtime: Option<&str>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    append_latest_observation_publication(graph, input, now, event_runtime)
+        .map(|(record, appended, _)| (record, appended))
+}
+
+fn append_latest_observation_publication(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    now: u128,
+    event_runtime: Option<&str>,
+) -> Result<(ClaimRecord, bool, bool), St3Error> {
     validate_local_observation(input)?;
     graph
         .connection
@@ -53367,7 +53949,7 @@ fn append_latest_observation_fenced(
             let (mut local, appended) =
                 insert_local_observation_tx(transaction, &graph.origin, input, now)?;
             if !appended {
-                return Ok((local, false));
+                return Ok((local, false, false));
             }
             let published = match input.kind.as_str() {
                 "harness.observed" => {
@@ -53386,10 +53968,14 @@ fn append_latest_observation_fenced(
                 )?),
                 _ => None,
             };
+            let status_transition = published.as_ref().is_some_and(|claim| {
+                input.kind == "harness.observed"
+                    && claim.body["fields"]["status_transition"] == true
+            });
             if input.kind == "harness.observed" && event_runtime.is_some() {
                 // Native acknowledgements echo the admitted producer event, including on
                 // replay. Derived history metadata belongs to its replicated publication.
-                return Ok((local, true));
+                return Ok((local, true, status_transition));
             }
             if input.kind == "harness.observed" {
                 let source = match published.as_ref() {
@@ -53410,7 +53996,7 @@ fn append_latest_observation_fenced(
                     ]).map_err(internal)?;
                 }
             }
-            Ok((published.unwrap_or(local), true))
+            Ok((published.unwrap_or(local), true, status_transition))
         })
         .map_err(|error| St3Error::new("internal", error))?
 }

@@ -31,9 +31,11 @@ def trusted_snapshot(run):
 
 def valid_report(report):
     # Never substitute tiny fixture reports or measurements with a different workload.
+    # Reports predating the upgrade regime have no regime field and are steady reports.
     def number(value):
         return (type(value) is int or type(value) is float and math.isfinite(value)) and value >= 0
-    return (isinstance(report, dict) and number(report.get('scale')) and report['scale'] == 1
+    return (isinstance(report, dict) and report.get('regime', 'steady-after-migration') == 'steady-after-migration'
+            and number(report.get('scale')) and report['scale'] == 1
             and number(report.get('seconds')) and report['seconds'] >= 120
             and type(report.get('claims')) is int and report['claims'] > 0
             and report.get('long_poll_seats') == 30 and number(report.get('daemon_cores'))
@@ -231,13 +233,15 @@ def restore():
             snapshots(run, names, dest, 'main')
             if trusted(run) and reports < 5 and 'perf-load-logs' in names:
                 download(repo, run, 'perf-load-logs', dest / 'report')
-                files = list((dest / 'report').rglob('load.json'))
-                if len(files) != 1:
-                    raise ValueError('successful main run is missing its load report')
-                report = json.loads(files[0].read_text())
+                # The producer retains upgrade/load.json as a separate diagnostic.
+                # Only the root steady report belongs in the historical baseline.
+                report_file = dest / 'report/load.json'
+                if not report_file.is_file():
+                    raise ValueError('successful main run is missing its steady load report')
+                report = json.loads(report_file.read_text())
                 if not valid_report(report):
                     raise ValueError('main load report has an incompatible workload')
-                shutil.copyfile(files[0], baseline / f"load-{run['id']}.json")
+                shutil.copyfile(report_file, baseline / f"load-{run['id']}.json")
                 reports += 1
         if len(found) == 2 and reports == 5:
             break

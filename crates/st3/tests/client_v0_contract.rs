@@ -12,7 +12,7 @@ use tokio::sync::{Barrier, Notify, watch};
 use tower::ServiceExt as _;
 
 fn asset_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/st3/client-v0")
+    Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../../docs/st3/client-v0")
 }
 
 fn json(path: impl AsRef<Path>) -> Value {

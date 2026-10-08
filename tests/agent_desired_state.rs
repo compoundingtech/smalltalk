@@ -13,7 +13,7 @@ fn write(root: &Path, relative: &str, contents: &str) {
 }
 
 fn author(root: &Path, state: &str, reason: Option<&str>) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+    let mut command = Command::new(test_env!("CARGO_BIN_EXE_st2"));
     command.args([
         "--catalog",
         root.to_str().unwrap(),
@@ -38,7 +38,7 @@ fn author_target(
     reason: Option<&str>,
     managed_by: Option<&str>,
 ) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+    let mut command = Command::new(test_env!("CARGO_BIN_EXE_st2"));
     command.args([
         "--catalog",
         root.to_str().unwrap(),
@@ -60,7 +60,7 @@ fn author_target(
 }
 
 fn author_as(root: &Path, actor: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args([
             "--catalog",
             root.to_str().unwrap(),
@@ -257,7 +257,7 @@ fn cli_managed_by_authority_retires_a_projected_seat_and_refuses_every_inexact_c
     write(root, "h/seat/agent.kdl", projected);
 
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_st2"))
+        Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args([
                 "--catalog",
                 root.to_str().unwrap(),

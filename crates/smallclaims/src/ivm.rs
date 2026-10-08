@@ -25,6 +25,7 @@ pub mod claim_source;
 pub mod events;
 pub mod install;
 pub mod runtime;
+mod source_gap;
 
 /// Changes to local provenance/status bookkeeping require an explicit fenced installation.
 pub const LAYOUT: &str = "smallclaims.ivm.provenance-availability.v3";
@@ -612,6 +613,57 @@ impl Views {
         epoch: u64,
     ) -> Result<Changes> {
         self.change_selected(transaction, old, new, epoch, None)
+    }
+
+    /// Mark one registered view unavailable inside its source transaction. This preserves
+    /// source admission and the existing output/cut/generations; committed availability and
+    /// changed error evidence advance independently. Repeating the same fence is a no-op.
+    /// No recovery or Ready publication is implied; a missing view remains unavailable too.
+    pub fn fence(
+        &self,
+        transaction: &Transaction<'_>,
+        name: &str,
+        reason: &str,
+    ) -> Result<()> {
+        ensure!(
+            self.views.iter().any(|view| view.definition().name == name),
+            "unknown IVM view"
+        );
+        let bounded = reason.chars().take(1024).collect::<String>();
+        fence_error(transaction, name, &anyhow::anyhow!(bounded))
+    }
+
+    /// Fence the finite shared registry on an uncaptured source mutation. This does not
+    /// enumerate claim history and does not certify a new source epoch or processed prefix.
+    pub fn fence_all(&self, transaction: &Transaction<'_>, reason: &str) -> Result<()> {
+        let bounded = reason.chars().take(1024).collect::<String>();
+        let error = anyhow::anyhow!(bounded);
+        for view in &self.views {
+            fence_error(transaction, view.definition().name, &error)?;
+        }
+        Ok(())
+    }
+
+    /// Explicitly fence this finite shared registry when an adapter's singleton source gap
+    /// changes, even in an uncovered raw/autocommit transaction. A nonnull gap, deleted state,
+    /// changed state identity or extra row fences output using existing availability revisions.
+    /// Clearing the gap never restores Ready. Existing nonnull evidence fences on installation.
+    ///
+    /// Identifiers, ordinary main-table shape, one explicit PK and one row are checked before
+    /// DDL. The owner must separately certify capture/schema/restore coverage; table DROP or
+    /// recreation can remove triggers and is not covered. Installation is explicit, not startup.
+    pub fn install_gap_trigger(
+        &self,
+        transaction: &Transaction<'_>,
+        table: &str,
+        gap_column: &str,
+    ) -> Result<()> {
+        source_gap::install(
+            transaction,
+            table,
+            gap_column,
+            self.views.iter().map(|view| view.definition().name),
+        )
     }
 
     /// Apply the runtime's accepted repair using each view's explicit eligibility policy.

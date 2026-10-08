@@ -19,7 +19,7 @@ fn write(path: &Path, contents: impl AsRef<[u8]>) {
 #[test]
 fn task_selector_refusal_initializes_only_the_persistent_coordination_lock() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let out = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["up", "--catalog"])
         .arg(tmp.path())
         .args([
@@ -68,7 +68,7 @@ fn task_selector_materializes_only_owning_agent() {
     );
     write(&catalog.join("_templates/owner"), "owner");
     write(&catalog.join("_templates/sibling"), "sibling");
-    let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let out = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["up", "--catalog"])
         .arg(&catalog)
         .args([
@@ -274,7 +274,7 @@ fn task_selector_ambiguous_refuses_without_mutation() {
             .iter()
             .all(|s| s.tasks.len() == 1 && s.tasks[0].id.as_deref() == Some("dup"))
     );
-    let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let out = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["up", "--catalog"])
         .arg(&catalog)
         .args(["--host", "ExampleMac", "--materialize-only", "--task", "dup"])
@@ -299,7 +299,7 @@ fn task_selector_wrong_host_refuses_without_mutation() {
     let found = st2::discover(&catalog);
     assert!(found.errors.is_empty());
     assert_eq!(found.specs[0].tasks[0].id.as_deref(), Some("example-linux.task"));
-    let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let out = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["up", "--catalog"])
         .arg(&catalog)
         .args([
@@ -345,7 +345,7 @@ fn task_selector_cli_modes_fail_closed() {
             "a",
         ],
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        let out = Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args(args)
             .output()
             .unwrap();
@@ -364,7 +364,7 @@ fn task_selector_single_file_modes_refuse_unchanged() {
         ["--materialize-only", "--task", "ExampleMac.a.agent"],
         ["--once", "--task", "ExampleMac.a.agent"],
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        let out = Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args(["up", spec.to_str().unwrap()])
             .args(extra)
             .output()
@@ -810,7 +810,7 @@ fn content_directives_create_exact_modes_under_a_restrictive_umask() {
         ),
     );
 
-    let mut process = Command::new(env!("CARGO_BIN_EXE_st2"));
+    let mut process = Command::new(test_env!("CARGO_BIN_EXE_st2"));
     process.args(["up", "--catalog"]).arg(&catalog).args([
         "--host",
         "ExampleMac",
@@ -1108,7 +1108,7 @@ fn missing_git_executable_fails_closed_before_workspace_write() {
         agent_kdl(&workspace, r#"    copy "_templates/AGENTS.md" "AGENTS.md""#),
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("up")
         .arg(&catalog)
         .args(["--host", "ExampleMac", "--materialize-only"])
@@ -1206,7 +1206,7 @@ fn up_materialize_only_writes_the_overlay_without_needing_pty() {
         .expect("git is available on the test runner's PATH");
     symlink(git, bin.join("git")).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["up"])
         .arg(&catalog)
         .args(["--host", "ExampleMac", "--materialize-only"])

@@ -371,7 +371,7 @@ impl Daemon {
     }
 
     fn cli_command(&self, actor: &str, args: &[&str]) -> tokio::process::Command {
-        let mut command = st3::test_support::async_command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+        let mut command = st3::test_support::async_command(test_bin!("st3-fixture"));
         command
             .args([
                 "--endpoint",
@@ -2907,10 +2907,10 @@ PY
     let run = |args: Vec<String>| {
         let mut command = if args.get(1).map(String::as_str) == Some("reset") {
             let mut command = tokio::process::Command::new("python3");
-            command.args(["-c", "import os,pty,subprocess,sys; master,slave=pty.openpty(); os.write(master,b'yes\\nfixture-service\\nerase st state\\n'); result=subprocess.run(sys.argv[1:],stdin=slave); os.close(master); os.close(slave); sys.exit(result.returncode)", assert_cmd::cargo::cargo_bin!("st3-fixture").to_str().unwrap()]);
+            command.args(["-c", "import os,pty,subprocess,sys; master,slave=pty.openpty(); os.write(master,b'yes\\nfixture-service\\nerase st state\\n'); result=subprocess.run(sys.argv[1:],stdin=slave); os.close(master); os.close(slave); sys.exit(result.returncode)", test_bin!("st3-fixture").to_str().unwrap()]);
             command
         } else {
-            st3::test_support::async_command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+            st3::test_support::async_command(test_bin!("st3-fixture"))
         };
         command
             .env_clear()
@@ -2928,7 +2928,7 @@ PY
             .env("XDG_DATA_HOME", root.path().join("data"))
             .env("XDG_RUNTIME_DIR", root.path().join("run"))
             .env("ST3_COVERAGE_ROOT", root.path())
-            .env("ST3_COVERAGE_BINARY", assert_cmd::cargo::cargo_bin!("st3-fixture"))
+            .env("ST3_COVERAGE_BINARY", test_bin!("st3-fixture"))
             .args(args);
         async move {
             tokio::time::timeout(Duration::from_secs(30), command.output())
@@ -4003,7 +4003,7 @@ fn action_inventory_matches_contract_and_has_existing_test_references() {
             "{action} is absent from the real typed-client dispatch"
         );
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     for group in [
         "typed_actions",
         "cli",
