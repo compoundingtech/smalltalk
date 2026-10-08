@@ -131,7 +131,7 @@ export const sidebarFolders = ({ gateway, socket }: {
             const winner = sidebarWinner(event.inventory.items)
             if (winner === undefined) {
               shown = undefined
-              publish('unavailable', 'No arrangement exists for this person yet.', emptyDoc())
+              publish('unavailable', 'No arrangement exists for this person yet. Folders appear once a native client creates one.', emptyDoc())
               return
             }
             const key = `${winner.id}\n${JSON.stringify(winner.body)}`
