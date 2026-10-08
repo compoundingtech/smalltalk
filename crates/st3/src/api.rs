@@ -109,7 +109,7 @@ const CLIENT_MAX_PAGE_ITEMS: usize = 200;
 const CLIENT_MAX_RESPONSE_BYTES: usize = 1_048_576;
 // Keep complete result sets briefly so fleet writes cannot reorder or invalidate a traversal.
 // Cursors expire after this bounded window or if the daemon restarts/evicts their snapshot.
-const CLIENT_PAGE_TTL_MS: u128 = 300_000;
+pub(crate) const CLIENT_PAGE_TTL_MS: u128 = 300_000;
 const CLIENT_PAGE_CACHE_CAPACITY: usize = 32;
 
 struct CachedClientPage {
@@ -1207,7 +1207,7 @@ fn new_request_id() -> String {
     )
 }
 
-fn client_now_ms() -> u128 {
+pub(crate) fn client_now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -3316,11 +3316,82 @@ fn client_attachment(attachment: &crate::model::MessageAttachment) -> Value {
     })
 }
 
+fn client_message_resource(
+    message: crate::model::MessageView,
+    metadata: &Value,
+    current: bool,
+    now: u128,
+) -> anyhow::Result<Value> {
+    let sent_at = metadata["sent_at"].as_str().unwrap_or("0").parse::<u128>()?;
+    let updated_at = metadata["updated_at"].as_str().unwrap_or("0").parse::<u128>()?;
+    let reasons = if message.status == "closed" {
+        vec!["closed"]
+    } else if !current {
+        vec!["superseded"]
+    } else {
+        Vec::new()
+    };
+    let current = reasons.is_empty();
+    Ok(json!({
+        "id": message.subject,
+        "kind": "message",
+        "revision": metadata["revision"],
+        "updated_at": client_timestamp(updated_at),
+        "from": message.from,
+        "to": message.to,
+        "title": message.title,
+        "content": message.content,
+        "state": message.status,
+        "delivery": message_delivery_value(&message.to, &message.status, sent_at, now),
+        "sent_at": client_timestamp(sent_at),
+        "session_id": metadata["session_id"],
+        "in_reply_to": message.in_reply_to,
+        "tags": message.tags,
+        "attachments": message.attachments.iter().map(client_attachment).collect::<Vec<_>>(),
+        "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
+    }))
+}
+
 fn client_message_resources(
     store: &Store,
     person: Option<&str>,
     history: bool,
     peer: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
+    let generation = store.client_messages_generation()?;
+    let now = client_now_ms();
+    let mut after = None;
+    let mut resources = Vec::new();
+    loop {
+        let mut page = store.client_messages_page(person, peer, history, generation, after.as_ref(), CLIENT_MAX_PAGE_ITEMS)?;
+        let more = page.len() > CLIENT_MAX_PAGE_ITEMS;
+        page.truncate(CLIENT_MAX_PAGE_ITEMS);
+        for (message, metadata, current) in page {
+            let sent_at = metadata["sent_at"].as_str().unwrap_or("0").parse::<u128>()?;
+            after = Some((sent_at, message.subject.clone()));
+            resources.push(client_message_resource(message, &metadata, current, now)?);
+        }
+        if !more { return Ok(resources); }
+    }
+}
+
+#[cfg(test)]
+fn client_message_resources_old(
+    store: &Store,
+    person: Option<&str>,
+    history: bool,
+    peer: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
+    client_message_resources_at(store, person, history, peer, client_now_ms())
+}
+
+#[cfg(test)]
+fn client_message_resources_at(
+    store: &Store,
+    person: Option<&str>,
+    history: bool,
+    peer: Option<&str>,
+    now: u128,
 ) -> anyhow::Result<Vec<Value>> {
     let current = store.operational_messages(person, false)?;
     let current_ids = current
@@ -3373,7 +3444,7 @@ fn client_message_resources(
             "title": message.title,
             "content": message.content,
             "state": message.status,
-            "delivery": message_delivery_value(&message.to, &message.status, sent_at, client_now_ms()),
+            "delivery": message_delivery_value(&message.to, &message.status, sent_at, now),
             "sent_at": client_timestamp(sent_at),
             "session_id": session_id,
             "in_reply_to": message.in_reply_to,
@@ -4623,7 +4694,7 @@ async fn client_messages(
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
-    let (history, actor) = (query.history, query.actor.clone());
+    let actor = query.actor.clone();
     // An agent another host owns is listed by that host: its messages can reach this node late,
     // and a list that shows only what has arrived reads as empty while the replica lags.
     let owner = match actor.as_deref() {
@@ -4661,19 +4732,99 @@ async fn client_messages(
             Err(error) => return Err(error),
         }
     }
-    let (snapshot, Json(mut page)) = client_snapshot_page(
-        &state,
-        snapshot,
-        "messages",
-        &effective_query,
-        move |state, _| {
-            client_message_resources(&state.store, person.as_deref(), history, actor.as_deref())
-        },
-    )
-    .await
+    let (snapshot, Json(mut page)) =
+        client_messages_sql_page(&state, snapshot, &effective_query).await
     .map(|(Extension(snapshot), page)| (snapshot, page))?;
     page.replicated = replicated;
     Ok((Extension(snapshot), Json(page)))
+}
+
+/// SQL pages retain a projection generation, not a materialized JSON collection. The
+/// generation survives later writes, and delivery age uses the first request's time.
+async fn client_messages_sql_page(
+    state: &AppState,
+    snapshot: ClientSnapshot,
+    query: &ClientListQuery,
+) -> Result<ClientPageResponse, ApiError> {
+    client_messages_sql_page_at(state, snapshot, query, client_now_ms()).await
+}
+
+async fn client_messages_sql_page_at(
+    state: &AppState,
+    snapshot: ClientSnapshot,
+    query: &ClientListQuery,
+    request_time: u128,
+) -> Result<ClientPageResponse, ApiError> {
+    let cursor = query.cursor.as_deref().map(decode_client_cursor).transpose()?;
+    let (limit, expires_at, generation, after, offset) = if let Some(cursor) = &cursor {
+        if cursor.collection != "messages"
+            || cursor.snapshot.id != snapshot.id
+            || cursor.snapshot.store_index != snapshot.store_index
+            || cursor.history != query.history
+            || cursor.person != query.person
+            || cursor.actor != query.actor
+            || cursor.owner_run != query.owner_run
+            || cursor.status != query.status
+            || cursor.native_only != query.native_only
+            || cursor.items_digest != "message-sql-page"
+            || cursor.before_index.is_none()
+            || cursor.after_key.is_none()
+            || query.limit.is_some_and(|limit| limit.clamp(1, CLIENT_MAX_PAGE_ITEMS) != cursor.limit)
+        {
+            return Err(client_page_expired("the page cursor does not match this collection, snapshot, or filter"));
+        }
+        if client_now_ms() > cursor.expires_at_unix_ms {
+            return Err(client_page_expired("the page cursor expired"));
+        }
+        (cursor.limit, cursor.expires_at_unix_ms, cursor.before_index, cursor.after_key.clone(), cursor.offset)
+    } else {
+        (query.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS).clamp(1, CLIENT_MAX_PAGE_ITEMS),
+            request_time.saturating_add(CLIENT_PAGE_TTL_MS), None, None, 0)
+    };
+    let now = expires_at.saturating_sub(CLIENT_PAGE_TTL_MS);
+    let reader = state.clone();
+    let person = query.person.clone();
+    let actor = query.actor.clone();
+    let history = query.history;
+    let continuing = cursor.is_some();
+    let (snapshot, generation, mut rows) = blocking_store(move || {
+        reader.store.clone().read_snapshot(|index| {
+            let snapshot = if continuing { snapshot } else { client_snapshot_at(&reader, index) };
+            let generation = generation.map(Ok).unwrap_or_else(|| reader.store.client_messages_generation())?;
+            let rows = reader.store.client_messages_page(
+                person.as_deref(), actor.as_deref(), history, generation, after.as_ref(), limit,
+            )?;
+            Ok((snapshot, generation, rows))
+        })
+    }).await?;
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let after = rows.last().map(|(message, metadata, _)| {
+        Ok::<_, anyhow::Error>((metadata["sent_at"].as_str().unwrap_or("0").parse::<u128>()?, message.subject.clone()))
+    }).transpose().map_err(ApiError::internal)?;
+    let items = rows.into_iter().map(|(message, metadata, current)| {
+        client_message_resource(message, &metadata, current, now)
+    }).collect::<anyhow::Result<Vec<_>>>().map_err(ApiError::internal)?;
+    let next_cursor = if has_more {
+        Some(encode_client_cursor(&ClientPageCursor {
+            snapshot: snapshot.clone(), collection: "messages".into(),
+            offset: offset.saturating_add(items.len()), limit, history,
+            person: query.person.clone(), actor: query.actor.clone(),
+            owner_run: query.owner_run.clone(), status: query.status.clone(),
+            owner: None, state: None, native_only: query.native_only,
+            items_digest: "message-sql-page".into(), before_index: Some(generation),
+            after_key: after, expires_at_unix_ms: expires_at,
+        })?)
+    } else { None };
+    Ok((Extension(snapshot), Json(ClientResourcePage {
+        kind: "page".into(), collection: "messages".into(),
+        filters: client_page_filters("messages", query), items,
+        page: ClientPageInfo {
+            limit, has_more, next_cursor,
+            cursor_expires_at: has_more.then(|| client_timestamp(expires_at)),
+        },
+        sync: client_sync_notice(state), replicated: None,
+    })))
 }
 
 /// The host that owns `actor`'s runtime, when that is another host.
@@ -25398,3 +25549,5 @@ agent "seat" { workspace "/tmp"; command "true" }
 
 #[cfg(test)]
 mod work_incarnation_tests;
+#[cfg(test)]
+mod client_messages_tests;

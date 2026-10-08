@@ -1108,6 +1108,16 @@ fleet, see `sync`) or `unverified`, and the `reason` the owner was not asked, su
 `timed-out`. A client renders that as waiting, not as no messages. A list that names no remote
 agent has no `replicated`. Page cursors of a relayed list belong to the owner.
 
+Message list pages select the recipient and actor, newest `sent_at` first with ascending message
+ID ties, before loading message bodies. A cursor retains the first page's local projection cut
+and request time: later writes cannot change the traversal's message fields, current/history
+classification, or delivery age. Current lists omit closed and superseded reminder messages;
+history lists retain them with the same operational reasons. Reminder winners are selected in
+the recipient scope before the actor filter. Cursors remain opaque and expire after five minutes;
+a web client restarts pagination when it receives `page-cursor-expired`.
+Recipient delivery presence is live process evidence, not graph state: each page reassesses
+`recipient_delivery`, including its observation age, rather than retaining a stale report.
+
 A read that no peer can carry fails with `remote-unavailable`, and its `details` say why, so a
 client can tell a host nobody reaches from a slow or refusing one: `reason` is `no-route` (this node
 cannot dial the owner and no peer reaches it), `dial-failed`, `timed-out`, `refused` (a peer does
