@@ -49,6 +49,8 @@ export interface SidebarActions {
   /** Owner uses the host workspace ID, without the canonical agent/ prefix. */
   readonly resource?: (ref: string, workspaceId?: string) => void
   readonly select?: (id: string, parentId?: string) => void
+  /** Host-owned split placement; the row offers it only when the host supports it. */
+  readonly split?: (ref: string, placement: 'right' | 'below') => void
 }
 
 export interface SidebarSubagent { readonly id: string; readonly subagent_type?: string; readonly work_id?: string; readonly session_id?: string; readonly started_at?: string; readonly lease_expires_at: string }
