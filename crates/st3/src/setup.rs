@@ -43,6 +43,9 @@ pub struct SetupArgs {
     /// Install the user-owned Claude channel (default: true; never installs policy).
     #[arg(long, action = clap::ArgAction::Set)]
     pub claude_channel: Option<bool>,
+    /// Install st integrations for every discovered harness (default: true).
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub integrations: Option<bool>,
     /// Start onboarding again, including a stopped built-in expert.
     #[arg(long)]
     pub onboarding: bool,
@@ -290,64 +293,60 @@ async fn prepare_harness(
             println!("Choose one of {}.", found.join(", "));
         }
     };
+    let claude_channel = args.claude_channel.unwrap_or(true);
+    let consent = ask_bool(
+        &format!(
+            "Install st integrations for every harness found? {}",
+            crate::integrations::plan(&found, claude_channel)
+        ),
+        "--integrations",
+        args.integrations,
+        args.yes,
+        true,
+    )?;
+    if consent {
+        let environment = crate::environment::snapshot()?;
+        let mut failed = Vec::new();
+        for harness in &found {
+            match crate::integrations::install(
+                harness,
+                claude_channel,
+                executable,
+                &config.state_dir,
+                &environment,
+            ) {
+                Ok(()) => println!("Integration: {harness} installed"),
+                Err(error) => {
+                    println!("Integration: {harness} needs repair: {error:#}");
+                    failed.push(harness.as_str());
+                }
+            }
+        }
+        anyhow::ensure!(
+            failed.is_empty(),
+            "could not install st integrations for {}; configuration is saved; repair the reported error and rerun st setup",
+            failed.join(", ")
+        );
+    } else {
+        println!("Integrations: skipped");
+    }
     if chosen == "claude" {
-        let install = ask_bool(
-            "Install the st Claude channel (no admin rights needed)?",
-            "--claude-channel",
-            args.claude_channel,
-            args.yes,
-            true,
-        )?;
-        if !install {
+        if !consent || !claude_channel {
             println!(
                 "Claude user plugin installation skipped; seats use the inline server:st3 development channel. Provider or organization channel restrictions still apply."
             );
-            println!("Selected harness: {chosen}");
-            return Ok(Some(chosen));
-        }
-        // CLI plugin commands must see the same account login environment as the daemon.
-        let environment = crate::environment::snapshot()?;
-        let status = Command::new(executable)
-            .args(["claude-channel", "status"])
-            .envs(&environment)
-            .stdin(Stdio::null())
-            .output()?;
-        if !status.status.success() {
-            let output = Command::new(executable)
-                .args(["claude-channel", "install", "--no-policy"])
-                .envs(&environment)
-                .stdin(Stdio::null())
-                .output()?;
-            if !output.status.success() {
-                println!(
-                    "Claude channel installation failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                return Ok(fallback_harness(&found));
-            }
-        }
-        if st_drivers::claude_channel::st3_policy_available() {
+        } else if st_drivers::claude_channel::st3_policy_available() {
             println!(
                 "Claude channel policy is present; seats use --channels plugin:st-channel@st."
             );
         } else {
             println!(
-                "Claude channel uses --dangerously-load-development-channels plugin:st-channel@st. st accepts its local-development dialog when starting a seat. Provider or organization channel restrictions still apply.\nOptional administrator approval policy: sudo st claude-channel install-policy"
+                "Claude channel uses --dangerously-load-development-channels plugin:st-channel@st when installed, with inline server:st3 fallback. st accepts its local-development dialog when starting a seat. Provider or organization channel restrictions still apply.\nOptional administrator approval policy: sudo st claude-channel install-policy"
             );
         }
     }
     println!("Selected harness: {chosen}");
     Ok(Some(chosen))
-}
-
-fn fallback_harness(found: &[String]) -> Option<String> {
-    let next = found.iter().find(|h| h.as_str() != "claude").cloned();
-    if let Some(next) = &next {
-        println!("Selected harness: {next}");
-    } else {
-        println!("No usable harness remains; no onboarding seat was created.");
-    }
-    next
 }
 
 fn slug(value: &str) -> String {

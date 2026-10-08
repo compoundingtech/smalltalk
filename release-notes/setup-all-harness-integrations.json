@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Setup offers st integrations for every harness found in one consent prompt, and doctor checks each installed integration including idle Claude MCP.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or projection changes; integration installation writes user skill assets and immutable managed hook sets only."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or claim schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or replication rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Adds st setup --integrations true|false. A single consent plan includes all discovered harnesses, independently of the selected onboarding harness. --claude-channel false omits only the user plugin and retains inline Claude. Codex/OpenCode use existing native drivers; Pi/Omp use the same immutable extensions as managed launches. Doctor adds integration/NAME checks and exercises the unchanged merged idle MCP path from PR1781."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon or active-seat restart is requested during setup; newly added doctor checks appear after the ordinary binary upgrade/restart."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Existing people may rerun st setup to install integrations for every detected login-PATH harness. Declining the bundle skips setup's user skill/plugin installation; the daemon and managed seats continue publishing their required runtime assets through the existing lifecycle. Missing integrations warn and drift fails in doctor, with st setup as the repair command. Setup installs no administrator policy or credentials. Provider authentication and model consumption remain separate from installed asset integrity."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No store transition; replacing binaries does not remove user skills or older immutable extension sets. Existing running seats retain their original verified set until ordinary restart."
+  }
+}
