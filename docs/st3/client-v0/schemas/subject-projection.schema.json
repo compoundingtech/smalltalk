@@ -126663,7 +126663,7 @@
           "const": "subject-schemas"
         },
         "native_registry_digest": {
-          "const": "775fa0fb0606d458f4c7f9f3e51f456b7207af8972e00f5ed0fdfce771552ac1"
+          "const": "ff5d32bcb9b8af733d5e536653dfb7b3731616fc7dac19302f54d87a38880f33"
         },
         "projected_digest_convention": {
           "const": "canonical-effective-definitions-with-transitive-dependencies-excluding-discovery-v1"
@@ -276550,7 +276550,7 @@
       "schema_id": "subject-schema/c77a2ad01777232ed1b219d72e3bf3bbb9b2f5a179fca5a550659604f68ec2e6/subscription"
     }
   ],
-  "native_registry_digest": "775fa0fb0606d458f4c7f9f3e51f456b7207af8972e00f5ed0fdfce771552ac1",
+  "native_registry_digest": "ff5d32bcb9b8af733d5e536653dfb7b3731616fc7dac19302f54d87a38880f33",
   "projected_digest_convention": "canonical-effective-definitions-with-transitive-dependencies-excluding-discovery-v1",
   "projected_schema_sha256": "01033b263e4f687a787830cf6208d69f42c9f91e9418438119b681efe2088d74",
   "resources": {
