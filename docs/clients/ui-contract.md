@@ -80,9 +80,13 @@ Responses distinguish `self` from `including_subagents`, carry an explicit `part
 flag and observation freshness. An observed read is not a claim of continuous liveness.
 
 The live source installs the st-only layer. It reuses native usage rows and the L3
-agent reader: roster meters are labelled `agent-incarnations`, exclude subagents and
-are always partial. These cumulative meters are neither the requested range's totals
-nor the selected root's totals. Missing values never become zero, and unavailable
+agent reader: self-only roster spend meters are labelled `agent-incarnations` and
+always partial. Native aggregate totals can include subagent responses and do not
+establish self-only coverage across historical incarnations. The default therefore
+keeps spend `Unknown('not-attributed')` until accounting evidence establishes that
+coverage; a current driver or a root join alone is not sufficient. These cumulative
+meters are neither the requested range's totals nor the selected root's totals.
+Missing values never become zero, and unavailable
 series/subagent coverage remains `Unknown('no-provider')`, not an empty series.
 Context-only native summaries leave spend unknown; observed context meters remain
 available. Consumers call the live source's `sessionTrace(query)` port, bound to its
