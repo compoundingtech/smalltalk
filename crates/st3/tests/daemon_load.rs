@@ -80,6 +80,10 @@ const ROSTER_SNAPSHOT: &str = "agents roster snapshot";
 const ROSTER_CONNECT_SNAPSHOT: &str = "agents roster connect+snapshot";
 const ROSTER_BUDGET: Duration = Duration::from_millis(300);
 
+/// The statements a cold full roster rebuild may run per agent card. Main ran about 23 per card
+/// on 2026-10-08, reading each agent's status inputs one agent at a time.
+const COLD_ROSTER_STATEMENTS_PER_CARD: u64 = 30;
+
 /// One kind of request, how many the busy host served each second, and its p99 budget.
 struct Load {
     name: &'static str,
@@ -241,6 +245,71 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
         "the daemon missed {} budgets:\n{}",
         failures.len(),
         failures.join("\n")
+    );
+}
+
+/// A cold full rebuild of the agents roster on the generated store, alone on a quiet store: the
+/// statements it runs and how long it takes, as a daemon start or a roster refresher's first fold
+/// pays them. Its gates are those of [`the_daemon_keeps_its_budgets_under_a_busy_hosts_load`]:
+///
+/// ```sh
+/// ST_LOAD_GATE=1 TMPDIR=/var/tmp cargo test --release -p st3 --features perf-load \
+///     --test perf_load daemon_load::a_cold_roster_rebuild -- --nocapture
+/// ```
+#[test]
+fn a_cold_roster_rebuild_reads_the_fleet_in_few_statements() {
+    if std::env::var_os("ST_LOAD_GATE").is_none() {
+        println!("skipped: set ST_LOAD_GATE=1 to run the load test");
+        return;
+    }
+    if cfg!(debug_assertions) {
+        println!("skipped: a debug build is too slow to measure; run with cargo test --release");
+        return;
+    }
+    let scale = env_number("ST_LOAD_SCALE", 1.0_f64);
+    let keep = std::env::var_os("ST_BENCH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../../target/st-bench"));
+    std::fs::create_dir_all(&keep).unwrap();
+    let generation = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (source, _) = generation.block_on(generated_stores(&keep, scale));
+    drop(generation);
+    let work = tempfile::tempdir().unwrap();
+    let database = work.path().join("claims.sqlite3");
+    for suffix in ["", "-wal"] {
+        let from = PathBuf::from(format!("{}{suffix}", source.display()));
+        if from.exists() {
+            std::fs::copy(&from, format!("{}{suffix}", database.display())).unwrap();
+        }
+    }
+    let mut rounds = Vec::new();
+    for _ in 0..3 {
+        // A store just opened has no kept reductions, as at a daemon start.
+        let store = Store::open(&database, NODE).unwrap();
+        let index = store.index().unwrap();
+        let before = smallclaims::sqlite::work::total();
+        let started = Instant::now();
+        let cards = st3::api::cold_agent_roster_rebuild(&store, index).unwrap();
+        let elapsed = started.elapsed();
+        let statements = (smallclaims::sqlite::work::total() - before).statements;
+        println!(
+            "cold roster rebuild: {cards} cards, {statements} statements \
+             ({:.1} per card), {:.0} ms",
+            statements as f64 / cards.max(1) as f64,
+            elapsed.as_secs_f64() * 1_000.0
+        );
+        rounds.push((cards, statements));
+    }
+    let (cards, statements) = rounds[rounds.len() - 1];
+    assert!(cards > 0, "the generated store has no agent cards");
+    assert!(
+        statements <= COLD_ROSTER_STATEMENTS_PER_CARD * cards as u64,
+        "a cold roster rebuild ran {statements} statements for {cards} cards, more than \
+         {COLD_ROSTER_STATEMENTS_PER_CARD} per card"
     );
 }
 
