@@ -63,6 +63,17 @@ struct CollectionSubscription {
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
+const CONVERSATION_MAX_ADMISSIONS: usize = 8;
+const CONVERSATION_MAX_DAEMON_ADMISSIONS: usize = 32;
+
+/// Both slots follow the physical lookup, not its cancelable subscription awaiter.
+struct ConversationAdmissionPermits {
+    _socket: tokio::sync::OwnedSemaphorePermit,
+    _daemon: tokio::sync::OwnedSemaphorePermit,
+}
+
+static CONVERSATION_ADMISSION_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(CONVERSATION_MAX_DAEMON_ADMISSIONS)));
 /// The least time between two rereads of a socket's held windows. A window read can take a
 /// few hundred milliseconds and the fleet commits about once a second, so rereading on every
 /// commit kept a daemon busy for as long as a client stayed connected. Commits in between are
@@ -581,16 +592,20 @@ fn conversation_owner_host(
     state: &AppState,
     session: &ClientSession,
     session_id: &str,
+    subject: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
-    let remote = super::managed_session_owner_at(
-        &state.store,
-        new_client_snapshot(state).store_index,
-        session_id,
-    )
-    .map_err(ApiError::internal)?
-    .and_then(|(_, _, origin)| origin)
-    .filter(|origin| origin != state.store.origin())
-    .map(|origin| client_host_id(&origin));
+    let index = state.store.index().map_err(ApiError::internal)?;
+    let managed = match subject {
+        Some(subject) => super::managed_session_owner_for_subject_at(
+            &state.store, index, session_id, subject,
+        ),
+        None => super::managed_session_owner_at(&state.store, index, session_id),
+    };
+    let remote = managed
+        .map_err(ApiError::internal)?
+        .and_then(|(_, _, origin)| origin)
+        .filter(|origin| origin != state.store.origin())
+        .map(|origin| client_host_id(&origin));
     if let Some(owner) = &remote {
         if !acting_party(session) {
             return Err(forbidden(
@@ -606,6 +621,27 @@ fn conversation_owner_host(
         }
     }
     Ok(remote)
+}
+
+async fn open_conversation_subscription(
+    state: AppState,
+    session: ClientSession,
+    request: CollectionSubscribe,
+    permits: ConversationAdmissionPermits,
+) -> Result<(String, Option<String>), ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let _permits = permits;
+        crate::performance::task("conversation/admission", || {
+            let target = request.conversation.as_deref().unwrap_or_default();
+            let session_id = conversation_session_id(&state, target)?;
+            let remote = conversation_owner_host(
+                &state, &session, &session_id, target.starts_with("agent/").then_some(target),
+            )?;
+            Ok((session_id, remote))
+        })
+    })
+    .await
+    .map_err(ApiError::internal)?
 }
 
 /// A conversation's newest page, read here or relayed from its owner.
@@ -769,9 +805,10 @@ async fn follow_conversation(
     state: AppState,
     session: ClientSession,
     id: String,
+    generation: u64,
     session_id: String,
     remote: Option<String>,
-    outbox: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
+    outbox: tokio::sync::mpsc::UnboundedSender<(String, u64, Value)>,
 ) {
     let remote = remote.as_deref();
     let failed = |error: &ApiError| conversation_stream_error(&id, error);
@@ -781,11 +818,11 @@ async fn follow_conversation(
             Err(error) => {
                 if client_error_retryable(error.status, Some(&error.code)) {
                     // Say why, so a client showing its last copy can say that copy is stale.
-                    if outbox.send((id.clone(), json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true, "code":error.code, "message":error.message}))).is_err() { return; }
+                    if outbox.send((id.clone(), generation, json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true, "code":error.code, "message":error.message}))).is_err() { return; }
                     tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
                     continue;
                 }
-                let _ = outbox.send((id.clone(), failed(&error)));
+                let _ = outbox.send((id.clone(), generation, failed(&error)));
                 return;
             }
         };
@@ -802,7 +839,7 @@ async fn follow_conversation(
             items.drain(..drop);
             frame["has_more"] = Value::Bool(true);
         }
-        if outbox.send((id.clone(), frame)).is_err() {
+        if outbox.send((id.clone(), generation, frame)).is_err() {
             return;
         }
         let mut after = start["next_cursor"].as_str().map(str::to_owned);
@@ -827,7 +864,7 @@ async fn follow_conversation(
                         if frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
                             break;
                         }
-                        if outbox.send((id.clone(), frame)).is_err() {
+                        if outbox.send((id.clone(), generation, frame)).is_err() {
                             return;
                         }
                     }
@@ -843,7 +880,7 @@ async fn follow_conversation(
                     break;
                 }
                 Err(error) => {
-                    let _ = outbox.send((id.clone(), failed(&error)));
+                    let _ = outbox.send((id.clone(), generation, failed(&error)));
                     return;
                 }
             }
@@ -860,11 +897,11 @@ fn frame_bytes(frame: &Value) -> usize {
 
 /// The conversation followers a socket holds; they stop when it closes.
 #[derive(Default)]
-struct ConversationFollowers(BTreeMap<String, tokio::task::AbortHandle>);
+struct ConversationFollowers(BTreeMap<String, (u64, tokio::task::AbortHandle)>);
 
 impl ConversationFollowers {
     fn stop(&mut self, id: &str) {
-        if let Some(follower) = self.0.remove(id) {
+        if let Some((_, follower)) = self.0.remove(id) {
             follower.abort();
         }
     }
@@ -872,7 +909,7 @@ impl ConversationFollowers {
 
 impl Drop for ConversationFollowers {
     fn drop(&mut self) {
-        for follower in self.0.values() {
+        for (_, follower) in self.0.values() {
             follower.abort();
         }
     }
@@ -933,7 +970,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
 }
 
 async fn collection_stream_socket_with_sources<F, Fut>(
-    mut socket: WebSocket,
+    socket: WebSocket,
     state: AppState,
     session: ClientSession,
     presence: Option<super::client_presence::StreamGuard>,
@@ -946,6 +983,25 @@ async fn collection_stream_socket_with_sources<F, Fut>(
         + 'static,
     Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
 {
+    collection_stream_socket_with_admission(
+        socket, state, session, presence, sources, read, open_conversation_subscription,
+    ).await;
+}
+
+async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
+    mut socket: WebSocket,
+    state: AppState,
+    session: ClientSession,
+    presence: Option<super::client_presence::StreamGuard>,
+    sources: Option<Arc<collection_ivm::Sources>>,
+    read: F,
+    admit: A,
+) where
+    F: Fn(AppState, ClientSession, CollectionSubscribe, tokio::sync::OwnedSemaphorePermit) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
+    A: Fn(AppState, ClientSession, CollectionSubscribe, ConversationAdmissionPermits) -> Admission + Clone + Send + 'static,
+    Admission: Future<Output = Result<(String, Option<String>), ApiError>> + Send + 'static,
+{
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
     let mut ivm_notices = sources.as_ref().map(|sources| sources.subscribe());
@@ -956,7 +1012,7 @@ async fn collection_stream_socket_with_sources<F, Fut>(
     let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
     let mut conversations = ConversationFollowers::default();
     let (conversation_outbox, mut conversation_frames) =
-        tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
+        tokio::sync::mpsc::unbounded_channel::<(String, u64, Value)>();
     // The commits already weighed for a reread, whether one is due, and when the last ran.
     let mut attention_clock = tokio::time::interval_at(
         tokio::time::Instant::now() + ATTENTION_CLOCK_INTERVAL,
@@ -973,6 +1029,7 @@ async fn collection_stream_socket_with_sources<F, Fut>(
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
     let mut reads = futures_util::stream::FuturesUnordered::new();
     let read_slots = Arc::new(tokio::sync::Semaphore::new(COLLECTION_MAX_SUBSCRIPTIONS));
+    let admission_slots = Arc::new(tokio::sync::Semaphore::new(CONVERSATION_MAX_ADMISSIONS));
     let mut generation = 0_u64;
     loop {
         // The subscriptions to read after this wake-up.
@@ -1025,23 +1082,31 @@ async fn collection_stream_socket_with_sources<F, Fut>(
                         subscriptions.remove(&request.id);
                         terminals.remove(&request.id);
                         conversations.stop(&request.id);
+                        // Allocate a fresh token for every accepted subscribe, including terminal
+                        // replacements, so queued collection/conversation results cannot reuse it.
+                        generation += 1;
                         if request.collection == "conversation" {
-                            let target = request.conversation.as_deref().unwrap_or_default();
-                            let opened = crate::performance::task("conversation/admission", || {
-                                conversation_session_id(&state, target).and_then(|session_id| {
-                                    let remote = conversation_owner_host(&state, &session, &session_id)?;
-                                    Ok((session_id, remote))
-                                })
+                            let (state, session, outbox, admit) =
+                                (state.clone(), session.clone(), conversation_outbox.clone(), admit.clone());
+                            let subscription_id = request.id.clone();
+                            let id = subscription_id.clone();
+                            let admission_slots = admission_slots.clone();
+                            let follower = tokio::spawn(async move {
+                                let permits = ConversationAdmissionPermits {
+                                    _socket: admission_slots.acquire_owned().await.expect("socket admission slots stay open"),
+                                    _daemon: CONVERSATION_ADMISSION_SLOTS.clone().acquire_owned().await.expect("daemon admission slots stay open"),
+                                };
+                                match admit(state.clone(), session.clone(), request, permits).await {
+                                    Ok((session_id, remote)) => {
+                                        follow_conversation(state, session, id, generation, session_id, remote, outbox).await;
+                                    }
+                                    Err(error) => {
+                                        let frame = json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message});
+                                        let _ = outbox.send((id, generation, frame));
+                                    }
+                                }
                             });
-                            match opened {
-                                Ok((session_id, remote)) => {
-                                    let follower = tokio::spawn(follow_conversation(state.clone(), session.clone(), request.id.clone(), session_id, remote, conversation_outbox.clone()));
-                                    conversations.0.insert(request.id.clone(), follower.abort_handle());
-                                }
-                                Err(error) => {
-                                    if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "collection":"conversation", "code":error.code, "message":error.message})).await { return; }
-                                }
-                            }
+                            conversations.0.insert(subscription_id, (generation, follower.abort_handle()));
                             break 'command;
                         }
                         if request.collection == "terminal" {
@@ -1056,7 +1121,7 @@ async fn collection_stream_socket_with_sources<F, Fut>(
                             break 'command;
                         }
                         refresh.push(request.id.clone());
-                        generation += 1;
+                        // Collection results and conversation frames share the same generation fence.
                         subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, request });
 
                     }
@@ -1151,9 +1216,9 @@ async fn collection_stream_socket_with_sources<F, Fut>(
                 if !send_collection_message(&mut socket, WsMessage::Ping(Vec::new().into())).await { return; }
                 continue;
             }
-            Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
-                // A follower stopped by unsubscribe may still have had a frame on the way.
-                if !conversations.0.contains_key(&id) { continue; }
+            Some((id, frame_generation, frame)) = conversation_frames.recv(), if !command_waiting => {
+                // Replaced or unsubscribed admissions/followers may still have a frame queued.
+                if conversations.0.get(&id).is_none_or(|(generation, _)| *generation != frame_generation) { continue; }
                 if frame["kind"] == "error" { conversations.0.remove(&id); }
                 if !send_collection(&mut socket, frame).await { return; }
                 continue;
@@ -4318,13 +4383,17 @@ fn session_message_body(state: &AppState, claim: &ClaimRecord) -> Value {
     body
 }
 
-fn native_timeline_page(
+fn timeline_order(a: &Value, b: &Value) -> std::cmp::Ordering {
+    a["timestamp"].as_str().cmp(&b["timestamp"].as_str())
+        .then_with(|| a["sequence"].as_u64().cmp(&b["sequence"].as_u64()))
+}
+
+fn native_session_messages(
     state: &AppState,
     snapshot: &ClientSnapshot,
     session_id: &str,
-    query: &ClientListQuery,
-    mut items: Vec<Value>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Vec<Value>, ApiError> {
+    let mut items = Vec::new();
     if let Some((owner, incarnation, _)) =
         super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
@@ -4349,14 +4418,35 @@ fn native_timeline_page(
             items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":session_message_body(state, &claim)}));
             items.push(json!({"id":format!("timeline-entry/{}/{}-content", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base+1, "revision":1, "timestamp":stamp, "role":role, "type":"content", "final":true, "body":{"media_type":"text/plain","text":fields.get("content").and_then(Value::as_str).unwrap_or_default()}}));
         }
-        items.sort_by(|a, b| {
-            a["timestamp"]
-                .as_str()
-                .cmp(&b["timestamp"].as_str())
-                .then_with(|| a["sequence"].as_u64().cmp(&b["sequence"].as_u64()))
-        });
+        items.sort_by(timeline_order);
     }
     items.reverse();
+    Ok(items)
+}
+
+fn native_timeline_page(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session_id: &str,
+    query: &ClientListQuery,
+    mut items: Vec<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let order = native_timeline_order(state, snapshot, session_id)?;
+    let mut keyed: Vec<_> = items.drain(..)
+        .map(|item| {
+            let key = crate::external_sessions::timeline_key(&item, 0);
+            (item, key)
+        })
+        .collect();
+    if order == crate::external_sessions::TimelineOrder::TimestampSequence {
+        keyed.extend(native_session_messages(state, snapshot, session_id)?.into_iter()
+            .map(|item| {
+                let key = crate::external_sessions::timeline_key(&item, 1);
+                (item, key)
+            }));
+    }
+    keyed.sort_by(|(_, a), (_, b)| a.cmp_in(b, order));
+    items = keyed.into_iter().rev().map(|(item, _)| item).collect();
     let mut page = client_page(
         state,
         snapshot,
@@ -4370,6 +4460,212 @@ fn native_timeline_page(
         "session_id": session_id,
         "items": page.items,
         "page": page.page
+    })))
+}
+
+fn native_timeline_order(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session_id: &str,
+) -> Result<crate::external_sessions::TimelineOrder, ApiError> {
+    Ok(if super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
+        .map_err(ApiError::internal)?.is_some()
+    {
+        crate::external_sessions::TimelineOrder::TimestampSequence
+    } else {
+        crate::external_sessions::TimelineOrder::Sequence
+    })
+}
+
+pub(super) const NATIVE_PAGE_CURSOR_PREFIX: &str = "page/native/";
+
+/// All stateless cursor authority is authenticated, including expiry, the source basis, and
+/// the source's content generation. A process restart changes the key, invalidating these
+/// pages just like cached offset pages.
+#[derive(Serialize, Deserialize)]
+struct NativePagePosition {
+    session_id: String,
+    collection: String,
+    order: String,
+    boundary: crate::external_sessions::TimelineKey,
+    limit: usize,
+    filter_digest: String,
+    snapshot: ClientSnapshot,
+    source_basis: String,
+    /// Content generation at the page boundary. An in-place replacement moves it even when
+    /// driver, native id, path and inode are unchanged.
+    source_generation: u64,
+    expires_at_unix_ms: u128,
+}
+
+#[derive(Serialize, Deserialize)]
+struct NativePageCursor {
+    position: NativePagePosition,
+    #[serde(default)]
+    mac: Option<String>,
+}
+
+fn native_page_mac(position: &NativePagePosition) -> Result<hmac::Hmac<Sha256>, ApiError> {
+    use hmac::Mac as _;
+    static KEY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        let mut key = [0_u8; 32];
+        getrandom::fill(&mut key).expect("creating the native page cursor authentication key");
+        key
+    });
+    let mut mac = <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(&*KEY)
+        .expect("HMAC accepts a 32-byte key");
+    // Struct serialization fixes the field order; the position contains no arbitrary JSON.
+    mac.update(&serde_json::to_vec(position).map_err(ApiError::internal)?);
+    Ok(mac)
+}
+
+fn encode_native_page_cursor(position: NativePagePosition) -> Result<String, ApiError> {
+    use hmac::Mac as _;
+    let mac = hex::encode(native_page_mac(&position)?.finalize().into_bytes());
+    let encoded = serde_json::to_vec(&NativePageCursor { position, mac: Some(mac) })
+        .map_err(ApiError::internal)?;
+    Ok(format!("{NATIVE_PAGE_CURSOR_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encoded)))
+}
+
+fn decode_native_page_cursor(encoded: &str) -> Result<NativePagePosition, ApiError> {
+    use hmac::Mac as _;
+    let expired = || client_page_expired("the page snapshot is no longer available; restart pagination");
+    let encoded = encoded.strip_prefix(NATIVE_PAGE_CURSOR_PREFIX).ok_or_else(expired)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)
+        .map_err(|_| expired())?;
+    let cursor: NativePageCursor = serde_json::from_slice(&bytes).map_err(|_| expired())?;
+    let signature = hex::decode(cursor.mac.as_deref().ok_or_else(expired)?)
+        .map_err(|_| expired())?;
+    native_page_mac(&cursor.position)?.verify_slice(&signature).map_err(|_| expired())?;
+    Ok(cursor.position)
+}
+
+pub(super) fn native_page_cursor_snapshot(encoded: &str) -> Result<ClientSnapshot, ApiError> {
+    decode_native_page_cursor(encoded).map(|position| position.snapshot)
+}
+
+fn native_page_filter_digest(query: &ClientListQuery) -> Result<String, ApiError> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&json!([
+        query.history, query.person, query.actor, query.owner_run, query.status,
+        query.native_only, query.owner, query.state
+    ])).map_err(ApiError::internal)?)))
+}
+
+/// Native pages retain no whole-window page cache. Their authenticated boundary names
+/// the entire last-returned key, including source rank, so tied entries survive pagination.
+fn native_slice_page(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    session_id: &str,
+    query: &ClientListQuery,
+    source: &crate::external_sessions::ExternalSession,
+) -> Result<Json<Value>, ApiError> {
+    let cursor = query.cursor.as_deref().map(decode_native_page_cursor).transpose()?;
+    let source_basis = conversation_blocks::basis(source)?;
+    let order = native_timeline_order(state, snapshot, session_id)?;
+    let order_name = match order {
+        crate::external_sessions::TimelineOrder::Sequence => "sequence",
+        crate::external_sessions::TimelineOrder::TimestampSequence => "timestamp-sequence",
+    };
+    let filter_digest = native_page_filter_digest(query)?;
+    let requested_limit = query.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
+        .clamp(1, CLIENT_MAX_PAGE_ITEMS);
+    if let Some(cursor) = &cursor {
+        if cursor.session_id != session_id
+            || cursor.collection != format!("timeline/{session_id}")
+            || cursor.snapshot.id != snapshot.id
+            || cursor.snapshot.store_index != snapshot.store_index
+            || cursor.order != order_name
+            || cursor.filter_digest != filter_digest
+            || cursor.source_basis != source_basis
+            || query.limit.is_some_and(|_| requested_limit != cursor.limit)
+        {
+            return Err(client_page_expired(
+                "the page cursor does not match this collection, snapshot, or filter",
+            ));
+        }
+        if client_now_ms() > cursor.expires_at_unix_ms {
+            return Err(client_page_expired("the page cursor expired"));
+        }
+    }
+    let limit = cursor.as_ref().map_or(requested_limit, |cursor| cursor.limit);
+    let expires_at_unix_ms = cursor.as_ref().map_or_else(
+        || client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
+        |cursor| cursor.expires_at_unix_ms,
+    );
+    let before = cursor.as_ref().map(|cursor| &cursor.boundary);
+    let native = conversation_blocks::read_slice(source, session, session_id, order, before, limit + 1)?;
+    if native.basis != source_basis {
+        return Err(client_page_expired("the transcript changed while reading the page"));
+    }
+    if let Some(cursor) = &cursor
+        && cursor.source_generation != native.generation
+    {
+        return Err(client_page_expired(
+            "the transcript was replaced while paging; restart pagination",
+        ));
+    }
+    let messages = if order == crate::external_sessions::TimelineOrder::TimestampSequence {
+        native_session_messages(state, snapshot, session_id)?
+    } else {
+        Vec::new()
+    };
+    // Message sequences are unique, and native_session_messages already returns them
+    // newest-first by timestamp and sequence. Compute each full key only once.
+    let messages = messages.into_iter().map(|item| {
+        let key = crate::external_sessions::timeline_key(&item, 1);
+        (item, key)
+    }).filter(|(_, key)| before.is_none_or(|before| key.cmp_in(before, order).is_lt()));
+    let mut native_items = native.items.into_iter().map(|item| {
+        let key = crate::external_sessions::timeline_key(&item, 0);
+        (item, key)
+    }).peekable();
+    let mut messages = messages.peekable();
+    let mut items = Vec::with_capacity(limit + 1);
+    while items.len() <= limit {
+        let take_native = match (native_items.peek(), messages.peek()) {
+            (Some((_, native)), Some((_, message))) => native.cmp_in(message, order).is_gt(),
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        items.push(if take_native {
+            native_items.next().expect("peeked native entry")
+        } else {
+            messages.next().expect("peeked message entry")
+        });
+    }
+    let has_more = items.len() > limit || native.has_more;
+    items.truncate(limit);
+    let next_cursor = if has_more {
+        let boundary = items.last()
+            .ok_or_else(|| ApiError::internal("native page has no boundary"))?.1.clone();
+        Some(encode_native_page_cursor(NativePagePosition {
+            session_id: session_id.to_owned(),
+            snapshot: snapshot.clone(),
+            collection: format!("timeline/{session_id}"),
+            order: order_name.to_owned(),
+            boundary,
+            limit,
+            filter_digest,
+            source_basis,
+            source_generation: native.generation,
+            expires_at_unix_ms,
+        })?)
+    } else {
+        None
+    };
+    let items: Vec<_> = items.into_iter().rev().map(|(item, _)| item).collect();
+    Ok(Json(json!({
+        "kind": "timeline-page",
+        "session_id": session_id,
+        "items": items,
+        "page": ClientPageInfo {
+            limit, has_more, next_cursor,
+            cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+        },
     })))
 }
 
@@ -4749,8 +5045,13 @@ pub(super) fn timeline_value(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(session, "read.projections")?;
     let session_id = client_detail_id("session", id);
-    if query.cursor.is_some() {
+    if let Some(cursor) = query.cursor.as_deref() {
         let _span = crate::profile::span("timeline/cached-page");
+        if cursor.starts_with(NATIVE_PAGE_CURSOR_PREFIX) {
+            let source = conversation_blocks::source(state, &session_id)
+                .map_err(|_| client_page_expired("the page snapshot is no longer available; restart pagination"))?;
+            return native_slice_page(state, snapshot, session, &session_id, query, &source);
+        }
         let mut page = client_page(
             state,
             snapshot,
@@ -4798,6 +5099,9 @@ fn timeline_first_page(
         let items = match conversation {
             Some(crate::external_sessions::ExternalConversation::Readable(external)) => {
                 let _span = crate::profile::span("timeline/native-read");
+                if external.driver != crate::external_sessions::ExternalDriver::OpenCode {
+                    return native_slice_page(state, snapshot, session, &session_id, query, &external);
+                }
                 conversation_blocks::read(&external, session, &session_id)?
             }
             other => external_conversation_items(other, &session_id)?,
@@ -4815,8 +5119,13 @@ fn timeline_first_page(
         let read = {
             let _span = crate::profile::span("timeline/native-read");
             match managed.transcript.as_ref() {
-                Ok(external) => match conversation_blocks::read(external, session, &session_id) {
-                    Ok(items) => Ok(items),
+                Ok(external) => match if external.driver != crate::external_sessions::ExternalDriver::OpenCode {
+                    native_slice_page(state, snapshot, session, &session_id, query, external)
+                } else {
+                    conversation_blocks::read(external, session, &session_id)
+                        .and_then(|items| native_timeline_page(state, snapshot, &session_id, query, items))
+                } {
+                    Ok(page) => Ok(page),
                     Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Err(error),
                     Err(error) => Err(format!("the transcript could not be read: {}", error.message)),
                 },
@@ -4824,7 +5133,7 @@ fn timeline_first_page(
             }
         };
         match read {
-            Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items),
+            Ok(page) => return Ok(page),
             Err(reason) => {
                 transcript_notice_entry = Some(transcript_notice(&session_id, &managed, &reason));
             }
@@ -5327,21 +5636,32 @@ fn conversation_read_now_unbounded(
     after: Option<&str>,
 ) -> Result<Value, ApiError> {
     let snapshot = new_client_snapshot(state);
-    let page = timeline_value(
-        state,
-        &snapshot,
-        session,
-        session_id,
-        &ClientListQuery {
-            limit: Some(200),
-            ..Default::default()
+    let query = ClientListQuery { limit: Some(200), ..Default::default() };
+    let page = match conversation_blocks::source(state, session_id) {
+        // Replay selects only its newest bounded projection, including for OpenCode.
+        Ok(source) => {
+            // Native replay bypasses timeline_first_page after the incremental-fold cutover.
+            #[cfg(test)]
+            if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
+                *rebuilds.entry(session_id.to_owned()).or_default() += 1;
+            }
+            native_slice_page(state, &snapshot, session, session_id, &query, &source)
         },
-    )?
-    .0;
+        Err(_) => timeline_value(state, &snapshot, session, session_id, &query),
+    }?.0;
     let all = page["items"]
         .as_array()
         .ok_or_else(|| ApiError::internal("the timeline has no items"))?;
-    let native_latest = native_latest_sequence(&page);
+    let native_sequences = all
+        .iter()
+        .filter(|item| {
+            item["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("timeline-entry/native-"))
+        })
+        .filter_map(|item| item["sequence"].as_u64());
+    let native_latest = native_sequences.clone().max().unwrap_or(0);
+    let native_oldest = native_sequences.min();
     let local_latest = local_latest_position(state)?;
     let position = after
         .map(|cursor| conversation_position(state, session_id, cursor))
@@ -5482,14 +5802,7 @@ fn conversation_read_now_unbounded(
         .any(|id| !items.iter().any(|item| item["id"].as_str() == Some(id)))
         || (all.len() == 200
             && position.is_some_and(|(_, _, native)| {
-                all.iter()
-                    .find(|item| {
-                        item["id"]
-                            .as_str()
-                            .is_some_and(|id| id.starts_with("timeline-entry/native-"))
-                    })
-                    .and_then(|item| item["sequence"].as_u64())
-                    .is_some_and(|first| first > native)
+                native_oldest.is_some_and(|first| first > native)
             }))
     {
         return Err(ApiError {
@@ -10355,15 +10668,17 @@ mod tests {
                 state.clone(),
                 ClientSession::local(None).unwrap(),
                 "chat".into(),
+                1,
                 "session/missing".into(),
                 remote.map(str::to_owned),
                 sender,
             ));
-            let (_, frame) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            let (_, generation, frame) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
                 .await
                 .unwrap()
                 .unwrap();
             follower.abort();
+            assert_eq!(generation, 1);
             assert_eq!(frame["kind"], expected_kind, "{frame}");
             assert_eq!(frame["retryable"], expected_kind == "resync");
             assert_collection_frame_conforms(&frame);
@@ -10461,6 +10776,241 @@ mod tests {
             &state.store, true, "2026-10-03T09:00:00Z", state.store.index().unwrap(),
         ).unwrap();
         assert!(items.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
+    }
+
+    #[tokio::test]
+    async fn replacing_conversation_admission_bounds_detached_blocking_lookups() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let (release, held) = tokio::sync::watch::channel(false);
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, held, started) = (state.clone(), held.clone(), started.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_admission(
+                            socket, state, ClientSession::local(None).unwrap(), None, None,
+                            |state, session, request, permit| async move {
+                                collection_items(&state, &session, &request, permit).await
+                            },
+                            move |_, _, _, permits| {
+                                let (mut held, started) = (held.clone(), started.clone());
+                                async move {
+                                    tokio::task::spawn_blocking(move || {
+                                        started.send(permits._socket.semaphore().clone()).unwrap();
+                                        let _permits = permits;
+                                        let _ = tokio::runtime::Handle::current()
+                                            .block_on(held.wait_for(|released| *released));
+                                        Err(validation("blocked fixture admission"))
+                                    }).await.unwrap()
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        let command = json!({"kind":"subscribe","id":"replace","collection":"conversation",
+            "conversation":"agent/held"}).to_string();
+        let mut slots = None;
+        for _ in 0..CONVERSATION_MAX_ADMISSIONS {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(command.clone().into())).await.unwrap();
+            slots = Some(tokio::time::timeout(Duration::from_secs(5), starts.recv()).await.unwrap().unwrap());
+        }
+        for _ in 0..32 {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(command.clone().into())).await.unwrap();
+        }
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"unsubscribe","id":"replace"}).to_string().into(),
+        )).await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"barrier","collection":"missions","limit":2}).to_string().into(),
+        )).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        // A delivered snapshot confirms all replacements and unsubscribe were drained.
+        // All physical workers still own their slots; this is not a timing-only assertion.
+        let available = slots.unwrap().available_permits();
+        let extra_started = starts.try_recv().is_ok();
+        release.send(true).unwrap();
+        assert_eq!(frame["id"], "barrier", "{frame}");
+        assert_eq!(frame["kind"], "snapshot", "{frame}");
+        assert_eq!(available, 0, "aborting admission released a live physical slot");
+        assert!(!extra_started, "replacement exceeded the physical admission bound");
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn blocked_conversation_admission_does_not_delay_collection_snapshots() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/admission-worker".into(), kind: "runtime.observed".into(),
+            actor: Some("agent/admission-worker".into()),
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":"runtime",
+                "incarnation_id":"current"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let (release, held) = tokio::sync::watch::channel(false);
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, held, entered) = (state.clone(), held.clone(), entered.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_admission(
+                            socket, state, ClientSession::local(None).unwrap(), None, None,
+                            |state, session, request, permit| async move {
+                                collection_items(&state, &session, &request, permit).await
+                            },
+                            move |state, session, request, permits| {
+                                let (mut held, entered) = (held.clone(), entered.clone());
+                                async move {
+                                    tokio::task::spawn_blocking(move || {
+                                        let _permits = permits;
+                                        entered.send(()).unwrap();
+                                        let _ = tokio::runtime::Handle::current()
+                                            .block_on(held.wait_for(|released| *released));
+                                        let target = request.conversation.as_deref().unwrap_or_default();
+                                        let session_id = conversation_session_id(&state, target)?;
+                                        let remote = conversation_owner_host(
+                                            &state, &session, &session_id, target.starts_with("agent/").then_some(target),
+                                        )?;
+                                        Ok((session_id, remote))
+                                    }).await.unwrap()
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"conversation","collection":"conversation",
+                "conversation":"agent/admission-worker"}).to_string().into(),
+        )).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entries.recv()).await.unwrap().unwrap();
+        for collection in ["agents", "missions", "attention"] {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":collection,"collection":collection,"limit":2}).to_string().into(),
+            )).await.unwrap();
+        }
+        let mut snapshots = BTreeSet::new();
+        for _ in 0..3 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["kind"], "snapshot", "{frame}");
+            snapshots.insert(frame["collection"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(snapshots, BTreeSet::from(["agents".into(), "missions".into(), "attention".into()]));
+        // The admission has remained physically blocked through all three deliveries.
+        release.send(true).unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["kind"], "conversation", "{frame}");
+        assert_eq!(frame["session_id"], managed_session_id("agent/admission-worker", "current"));
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn obsolete_conversation_admissions_are_dropped_after_replace_or_unsubscribe() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() { let _ = sender.send(()); }
+            }
+        }
+        for replace in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_state(root.path());
+            let (release, held) = tokio::sync::watch::channel(false);
+            let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+            let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+            let (completed, mut completions) = tokio::sync::mpsc::unbounded_channel();
+            let app = axum::Router::new().route(
+                "/stream",
+                axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                    let (state, held, entered, dropped, completed) =
+                        (state.clone(), held.clone(), entered.clone(), dropped.clone(), completed.clone());
+                    async move {
+                        upgrade.on_upgrade(move |socket| {
+                            collection_stream_socket_with_admission(
+                                socket, state, ClientSession::local(None).unwrap(), None, None,
+                                |state, session, request, permit| async move {
+                                    collection_items(&state, &session, &request, permit).await
+                                },
+                                move |_, _, _, permits| {
+                                    let (mut held, entered, dropped, completed) =
+                                        (held.clone(), entered.clone(), dropped.clone(), completed.clone());
+                                    async move {
+                                        let (sender, receiver) = tokio::sync::oneshot::channel();
+                                        tokio::spawn(async move { let _ = receiver.await; let _ = dropped.send(()); });
+                                        let _dropped = Dropped(Some(sender));
+                                        tokio::task::spawn_blocking(move || {
+                                            let _permits = permits;
+                                            entered.send(()).unwrap();
+                                            let _ = tokio::runtime::Handle::current()
+                                                .block_on(held.wait_for(|released| *released));
+                                            completed.send(()).unwrap();
+                                            Err(validation("obsolete admission"))
+                                        }).await.unwrap()
+                                    }
+                                },
+                            )
+                        })
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"held","collection":"conversation","conversation":"agent/held"}).to_string().into(),
+            )).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), entries.recv()).await.unwrap().unwrap();
+            if !replace {
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"kind":"unsubscribe","id":"held"}).to_string().into(),
+                )).await.unwrap();
+            }
+            let visible = if replace { "held" } else { "visible" };
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":visible,"collection":"missions","limit":2}).to_string().into(),
+            )).await.unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["kind"], "snapshot", "{frame}");
+            assert_eq!(frame["id"], visible);
+            tokio::time::timeout(Duration::from_secs(5), drops.recv()).await.unwrap().unwrap();
+            release.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), completions.recv()).await.unwrap().unwrap();
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"barrier","collection":"work","limit":2}).to_string().into(),
+            )).await.unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["id"], "barrier", "obsolete admission arrived after release: {frame}");
+            assert_eq!(frame["kind"], "snapshot");
+            socket.close(None).await.unwrap();
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -14256,9 +14806,9 @@ mission "example/zero-run" state="ready" {
             let session = ClientSession::local(Some("person/example")).unwrap();
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
             let follower = tokio::spawn(follow_conversation(
-                state.clone(), session, "chat".into(), session_id.clone(), None, sender,
+                state.clone(), session, "chat".into(), 1, session_id.clone(), None, sender,
             ));
-            let (_, frame) = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
+            let (_, _, frame) = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
             assert_eq!(frame["replace"], true, "{frame}");
             assert_collection_frame_conforms(&frame);
             assert_eq!(frame["items"].as_array().unwrap().len(), (lines * 2).min(200));
@@ -14272,7 +14822,7 @@ mission "example/zero-run" state="ready" {
             writeln!(file, "{}", message(lines)).unwrap();
             drop(file);
             signal_changed(&state);
-            let (_, delta) = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
+            let (_, _, delta) = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
             assert_eq!(delta["replace"], false, "{delta}");
             assert_eq!(delta["items"].as_array().unwrap().len(), 2, "{delta}");
             assert!(delta["items"].as_array().unwrap().iter().any(|item|
@@ -14462,6 +15012,116 @@ mission "example/zero-run" state="ready" {
             .await
             .unwrap();
         assert_eq!(rebuilds(), 3);
+    }
+
+    #[test]
+    fn exact_conversation_lookup_matches_roster_and_fences_restarted_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let append = |subject: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "runtime.observed".into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
+                expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        append("agent/legacy", json!({"status":"running", "runtime_id":"legacy"}));
+        append("agent/worker", json!({"status":"running", "runtime_id":"runtime", "incarnation_id":"first"}));
+        let before = state.store.index().unwrap();
+        append("agent/worker", json!({"status":"running", "runtime_id":"runtime", "incarnation_id":"second"}));
+        append("agent/retired", json!({"status":"stopped", "runtime_id":"old", "incarnation_id":"retired"}));
+        let current = state.store.index().unwrap();
+        for index in [before, current] {
+            let roster = state.store.status_for_subject_prefix_at("agent/", Some(index), true).unwrap();
+            for subject in roster.subjects {
+                let exact = state.store.status_history(Some(&subject.subject), None, Some(index)).unwrap();
+                assert_eq!(serde_json::to_value(&exact.subjects[0]).unwrap(), serde_json::to_value(&subject).unwrap());
+                let fields = subject.actual.as_ref().map(|actual| actual.get("fields").unwrap_or(actual));
+                let incarnation = fields.and_then(|fields| fields.get("incarnation_id")).and_then(Value::as_str)
+                    .or(subject.projection.runtime_incarnation.as_deref());
+                let identity = incarnation.or_else(|| fields.and_then(|fields| fields.get("runtime_id")).and_then(Value::as_str)).unwrap();
+                let session_id = managed_session_id(&subject.subject, identity);
+                assert_eq!(
+                    super::super::managed_session_owner_at(&state.store, index, &session_id).unwrap(),
+                    Some((subject.subject.clone(), incarnation.map(str::to_owned), subject.actual_origin.clone())),
+                );
+                assert_eq!(
+                    super::super::managed_session_owner_for_subject_at(
+                        &state.store, index, &session_id, &subject.subject,
+                    ).unwrap(),
+                    Some((subject.subject.clone(), incarnation.map(str::to_owned), subject.actual_origin.clone())),
+                );
+                if index == current {
+                    assert_eq!(conversation_session_id(&state, &subject.subject).unwrap(), session_id);
+                }
+            }
+        }
+        let first = managed_session_id("agent/worker", "first");
+        assert!(super::super::managed_session_owner_at(&state.store, before, &first).unwrap().is_some());
+        assert!(super::super::managed_session_owner_at(&state.store, current, &first).unwrap().is_none());
+        let second = managed_session_id("agent/worker", "second");
+        assert!(super::super::managed_session_owner_at(&state.store, before, &second).unwrap().is_none());
+        assert!(super::super::managed_session_owner_at(&state.store, current, &second).unwrap().is_some());
+        assert!(super::super::managed_session_owner_at(&state.store, current, "session/native").unwrap().is_none());
+        assert!(super::super::managed_session_owner_for_subject_at(
+            &state.store, current, &first, "agent/worker",
+        ).unwrap().is_none());
+        assert_eq!(
+            super::super::managed_session_owner_for_subject_at(
+                &state.store, current, &second, "agent/worker",
+            ).unwrap(),
+            super::super::managed_session_owner_at(&state.store, current, &second).unwrap(),
+        );
+        assert_eq!(conversation_session_id(&state, "agent/missing").unwrap_err().status, StatusCode::NOT_FOUND);
+        append("agent/no-session", json!({"status":"stopped"}));
+        assert_eq!(conversation_session_id(&state, "agent/no-session").unwrap_err().code, "validation-failed");
+    }
+
+    #[test]
+    fn exact_conversation_lookup_preserves_root_and_partial_identity_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
+        let mut snapshots = Vec::new();
+        for body in [
+            json!({"status":"running", "runtime_id":"legacy", "incarnation_id":"first"}),
+            json!({"fields":{"status":"running", "runtime_id":"next"}}),
+            json!({"fields":{"status":"stopped", "incarnation_id":null}}),
+            json!({"fields":{"status":"running", "incarnation_id":7, "runtime_id":"numeric-fallback"}}),
+        ] {
+            let claim = state.store.append_claim(&ClaimInput {
+                subject: "agent/legacy-body".into(), kind: "runtime.observed".into(),
+                actor: Some("agent/legacy-body".into()),
+                fields: serde_json::from_value(json!({"status":"running", "runtime_id":"fixture"})).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            // Older replicated claims may use root fields or untyped identity values.
+            connection.execute("UPDATE claims SET body=?2 WHERE id=?1",
+                rusqlite::params![claim.id, body.to_string()]).unwrap();
+            snapshots.push(claim.store_index);
+        }
+        state.store.forget_current_views();
+        for index in snapshots {
+            let roster = state.store.status_for_subject_prefix_at("agent/", Some(index), true).unwrap();
+            let subject = &roster.subjects[0];
+            let fields = subject.actual.as_ref().map(|actual| actual.get("fields").unwrap_or(actual)).unwrap();
+            let incarnation = fields.get("incarnation_id").and_then(Value::as_str)
+                .or(subject.projection.runtime_incarnation.as_deref());
+            let identity = incarnation.or_else(|| fields.get("runtime_id").and_then(Value::as_str)).unwrap();
+            let session_id = managed_session_id(&subject.subject, identity);
+            assert_eq!(
+                super::super::managed_session_owner_at(&state.store, index, &session_id).unwrap(),
+                Some((subject.subject.clone(), incarnation.map(str::to_owned), subject.actual_origin.clone())),
+            );
+            assert_eq!(
+                super::super::managed_session_owner_for_subject_at(
+                    &state.store, index, &session_id, &subject.subject,
+                ).unwrap(),
+                Some((subject.subject.clone(), incarnation.map(str::to_owned), subject.actual_origin.clone())),
+            );
+            let exact = state.store.status_history(Some(&subject.subject), None, Some(index)).unwrap();
+            assert_eq!(serde_json::to_value(&exact.subjects[0]).unwrap(), serde_json::to_value(subject).unwrap());
+        }
     }
 
     #[tokio::test]
@@ -14952,6 +15612,263 @@ mission "example/zero-run" state="ready" {
                 .all(|item| item["body"]["text"].is_null()),
             "{next:#}"
         );
+    }
+
+    fn page_test_source(path: &Path, session_id: &str) -> crate::external_sessions::ExternalSession {
+        crate::external_sessions::ExternalSession {
+            id: session_id.into(),
+            revision: "test-revision".into(),
+            driver: crate::external_sessions::ExternalDriver::Codex,
+            native_id: "paging-test".into(),
+            transcript: path.to_owned(),
+            codex_home: None,
+            cwd: None,
+            title: None,
+            started_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            process: None,
+        }
+    }
+
+    #[test]
+    fn managed_native_limit_one_pages_preserve_cross_source_ties() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "native-ties");
+        let owner = "agent/native-ties";
+        let incarnation = "native-ties-one";
+        let session_id = super::managed_session_id(owner, incarnation);
+        // The fourth claim's two message entries have sequences 16 and 17, exactly
+        // those of a native message beginning at byte zero and its first content part.
+        for number in 0..3 {
+            state.store.append_claim(&ClaimInput {
+                subject: owner.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(owner.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("runtime_id".into(), json!("native-ties-runtime")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("terminal".into(), json!(true)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("native-ties-runtime-{number}")),
+            }).unwrap();
+        }
+        let claim = state.store.append_claim(&ClaimInput {
+            subject: "message/native-ties".into(),
+            kind: "message.sent".into(),
+            actor: Some("person/alex".into()),
+            fields: BTreeMap::from([
+                ("from".into(), json!("person/alex")),
+                ("to".into(), json!(owner)),
+                ("session_id".into(), json!(session_id)),
+                ("content".into(), json!("Small Talk message")),
+                ("status".into(), json!("sent")),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        }).unwrap();
+        assert_eq!(claim.store_index, 4);
+        let path = root.path().join("ties.jsonl");
+        std::fs::write(&path, format!("{}\n", json!({
+            "type":"response_item", "timestamp":client_timestamp(claim.accepted_at_unix_ms),
+            "payload":{"type":"message", "role":"assistant", "id":"native-tie",
+                "content":[{"type":"output_text", "text":"Native message"}]}
+        }))).unwrap();
+        let source = page_test_source(&path, &session_id);
+        let snapshot = new_client_snapshot(&state);
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let native = conversation_blocks::read(&source, &session, &session_id).unwrap();
+        let messages = native_session_messages(&state, &snapshot, &session_id).unwrap();
+        assert_eq!(native[0]["sequence"], messages[1]["sequence"]);
+        assert_eq!(native[0]["timestamp"], messages[1]["timestamp"]);
+        let expected = vec![messages[0].clone(), native[1].clone(),
+            messages[1].clone(), native[0].clone()];
+        let mut query = ClientListQuery { limit: Some(1), ..Default::default() };
+        let mut walked = Vec::new();
+        loop {
+            let page = native_slice_page(&state, &snapshot, &session, &session_id, &query, &source)
+                .unwrap().0;
+            walked.extend(page["items"].as_array().unwrap().iter().cloned());
+            query.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+            if query.cursor.is_none() {
+                break;
+            }
+            assert!(walked.len() < expected.len());
+        }
+        assert_eq!(walked, expected);
+    }
+
+    #[test]
+    fn unmanaged_native_pages_use_sequence_order_and_reject_cursor_tampering() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "native-sequence-pages");
+        let session_id = "session/unmanaged-sequence-pages";
+        let path = root.path().join("sequence.jsonl");
+        // Setup headers are explicitly omitted; blank records instead become visible
+        // native-line-unreadable errors and would add thousands of legitimate pages.
+        let mut transcript = "{\"type\":\"session_meta\"}\n".repeat(4_096 - 3);
+        for (stamp, text) in [
+            ("2099-01-01T00:00:00Z", "first"),
+            ("2020-01-01T00:00:00Z", "second"),
+            ("2030-01-01T00:00:00Z", "third"),
+        ] {
+            transcript.push_str(&format!("{}\n", json!({
+                "type":"response_item", "timestamp":stamp,
+                "payload":{"type":"message", "role":"assistant", "id":text,
+                    "content":[{"type":"output_text", "text":text}]}
+            })));
+        }
+        std::fs::write(&path, transcript).unwrap();
+        let source = page_test_source(&path, session_id);
+        let snapshot = new_client_snapshot(&state);
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let mut query = ClientListQuery { limit: Some(1), ..Default::default() };
+        let first = native_slice_page(&state, &snapshot, &session, session_id, &query, &source)
+            .unwrap().0;
+        let encoded = first["page"]["next_cursor"].as_str().unwrap();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded.strip_prefix(NATIVE_PAGE_CURSOR_PREFIX).unwrap()).unwrap();
+        let original: Value = serde_json::from_slice(&bytes).unwrap();
+        for remove_mac in [false, true] {
+            let mut tampered = original.clone();
+            if remove_mac {
+                tampered.as_object_mut().unwrap().remove("mac");
+            } else {
+                tampered["position"]["expires_at_unix_ms"] =
+                    json!(client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS * 10));
+            }
+            let cursor = format!("{NATIVE_PAGE_CURSOR_PREFIX}{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(serde_json::to_vec(&tampered).unwrap()));
+            let error = native_slice_page(&state, &snapshot, &session, session_id,
+                &ClientListQuery { cursor: Some(cursor), ..Default::default() }, &source)
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::GONE);
+            assert_eq!(error.code, "page-cursor-expired");
+        }
+        let mut walked = first["items"].as_array().unwrap().clone();
+        query.cursor = Some(encoded.to_owned());
+        loop {
+            let page = native_slice_page(&state, &snapshot, &session, session_id, &query, &source)
+                .unwrap().0;
+            walked.extend(page["items"].as_array().unwrap().iter().cloned());
+            query.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+            if query.cursor.is_none() {
+                break;
+            }
+            assert!(walked.len() < 7);
+        }
+        assert!(walked.windows(2).all(|pair|
+            pair[0]["sequence"].as_u64().unwrap() > pair[1]["sequence"].as_u64().unwrap()));
+        let texts: Vec<_> = walked.iter().filter_map(|item| item["body"]["text"].as_str()).collect();
+        assert_eq!(texts, ["third", "second", "first"]);
+        assert_eq!(walked.last().unwrap()["type"], "truncation");
+        assert_eq!(walked.last().unwrap()["sequence"], 0);
+    }
+
+    #[test]
+    fn native_page_cursor_expires_after_in_place_transcript_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "native-replaced-pages");
+        let session_id = "session/external-replaced-pages";
+        let path = root.path().join("replaced.jsonl");
+        let record = |id: &str, text: &str, stamp: &str| json!({
+            "type":"response_item", "timestamp":stamp,
+            "payload":{"type":"message", "role":"assistant", "id":id,
+                "content":[{"type":"output_text", "text":text}]}
+        });
+        std::fs::write(&path, format!(
+            "{}\n{}\n{}\n",
+            record("one", "first", "2099-01-01T00:00:00Z"),
+            record("two", "second", "2030-01-01T00:00:00Z"),
+            record("three", "third", "2020-01-01T00:00:00Z"),
+        )).unwrap();
+        let source = page_test_source(&path, session_id);
+        let snapshot = new_client_snapshot(&state);
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let first = native_slice_page(&state, &snapshot, &session, session_id,
+            &ClientListQuery { limit: Some(1), ..Default::default() }, &source).unwrap().0;
+        let cursor = first["page"]["next_cursor"].as_str().unwrap().to_owned();
+        // Rewrite in place: same driver, native id, path and inode, different content.
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+        std::fs::write(&path, format!(
+            "{}\n", record("replaced", "replaced", "2099-01-01T00:00:00Z"),
+        )).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode_before,
+                "the replacement must keep the same inode");
+        }
+        let error = native_slice_page(&state, &snapshot, &session, session_id,
+            &ClientListQuery { cursor: Some(cursor), ..Default::default() }, &source)
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::GONE);
+        assert_eq!(error.code, "page-cursor-expired");
+        // A fresh page sequence reads the replaced transcript normally.
+        let fresh = native_slice_page(&state, &snapshot, &session, session_id,
+            &ClientListQuery { limit: Some(1), ..Default::default() }, &source).unwrap().0;
+        let texts: Vec<_> = fresh["items"].as_array().unwrap().iter()
+            .filter_map(|item| item["body"]["text"].as_str()).collect();
+        assert_eq!(texts, ["replaced"]);
+    }
+
+    #[test]
+    fn native_keyset_pages_exclude_newer_appends_between_pages() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "native-append-pages");
+        let session_id = "session/external-append-pages";
+        let path = root.path().join("append.jsonl");
+        let large_text = "paged chunk ".repeat(1_000);
+        let record = |number| json!({"type":"response_item","timestamp":"2026-10-06T12:00:00Z",
+            "payload":{"type":"message","role":"assistant","id":format!("entry-{number}"),
+            "content":[{"type":"output_text","text":format!("text-{number} {large_text}")}]}});
+        std::fs::write(&path, (0..5).map(|number| format!("{}\n", record(number))).collect::<String>()).unwrap();
+        let source = page_test_source(&path, session_id);
+        let snapshot = new_client_snapshot(&state);
+        let mut session = ClientSession::local(Some("person/alex")).unwrap();
+        session.conversation_blocks = true;
+        let mut expected = conversation_blocks::read(&source, &session, session_id).unwrap();
+        expected.reverse();
+        let mut query = ClientListQuery { limit: Some(3), ..Default::default() };
+        let mut walked = Vec::new();
+        let mut page_number = 0;
+        loop {
+            let page = native_slice_page(&state, &snapshot, &session, session_id, &query, &source).unwrap().0;
+            page_number += 1;
+            if page_number == 2 {
+                let reference = page["items"].as_array().unwrap().iter().flat_map(|entry|
+                    entry["body"]["blocks"].as_array().into_iter().flatten())
+                    .find_map(|block| block["continuation"]["ref"].as_str())
+                    .expect("the second page contains a large native block");
+                let chunk = tokio::runtime::Runtime::new().unwrap().block_on(
+                    conversation_blocks::chunk_local(&state, &session, session_id, reference, 0)
+                ).unwrap();
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(chunk["data"].as_str().unwrap()).unwrap();
+                let payload: Value = serde_json::from_slice(&decoded).unwrap();
+                assert!(payload.to_string().contains(&large_text));
+            }
+            walked.extend(page["items"].as_array().unwrap().iter().rev().cloned());
+            if walked.len() == 3 {
+                writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}", record(99)).unwrap();
+            }
+            query.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+            if query.cursor.is_none() { break; }
+            assert!(walked.len() < expected.len());
+        }
+        // Encrypted continuation refs use random nonces; compare complete entry identity/order.
+        let identities = |items: &[Value]| items.iter().map(|item|
+            (item["id"].clone(), item["sequence"].clone())).collect::<Vec<_>>();
+        assert_eq!(identities(&walked), identities(&expected));
     }
 
     #[test]

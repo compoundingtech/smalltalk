@@ -465,9 +465,8 @@ entries, subject to the existing 1 MiB frame limit, with `has_more` when older c
 Older content remains available through the existing 200-entry timeline pages and owner
 content chunks. Subsequent `replace:false` frames carry new or revised entries by ID.
 
-For a local owner, the first page supplies its own native replay boundary. The graph and
-local-observation frontiers are captured before that page, so a durable message committed
-during the read is replayed afterward. OPEN no longer builds a second full native timeline
+For a local owner, the first page supplies its own native replay boundary. The local-observation frontier precedes the graph snapshot; both precede that page, so a
+durable message or local row committed during the read remains replayable afterward. OPEN no longer builds a second full native timeline
 solely to obtain an empty baseline cursor. Remote owners retain the existing two-read relay
 protocol for mixed-build compatibility.
 
@@ -481,6 +480,6 @@ for an absent owner/endpoint wake at 100 and 10,000 unrelated sends.
 This cut adds no wire field, schema, index, payload class or retention rule. It does not
 establish a production latency percentile: request-to-first-full-frame and reactive-update
 measurements must disclose client, source, payload, window and observed population.
-The native incremental fold and selective entry preparation are the separate #1665 slice;
-a cold local OPEN here still builds the bounded native source once, and a relevant update
-still pays for the existing page read until that slice lands.
+The native incremental fold and selective entry preparation are supplied by #1665 on main.
+This OPEN cut uses that read path for its one page; it adds no second native cache and
+leaves the owner fold and bounded preparation unchanged.
