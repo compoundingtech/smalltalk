@@ -51,7 +51,7 @@ fn st2_eval_runs_a_benign_folder_to_a_pass_verdict() {
         return;
     }
 
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
@@ -250,7 +250,7 @@ fn canonical_agents_run_from_the_hermetic_catalog_with_one_root_and_native_bus()
         return;
     }
 
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
@@ -440,7 +440,7 @@ fn compact_agents_use_canonical_identity_while_fixture_agent_specs_stay_inert() 
         );
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
@@ -538,7 +538,7 @@ fn canonical_agents_accept_path_independent_local_tasks_and_ignore_remote_projec
         );
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
@@ -640,7 +640,7 @@ eval {
 
 #[test]
 fn canonical_agents_reject_an_unknown_kickoff_target_before_spawn() {
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
     let fixture = cell.join("fixture");
@@ -714,7 +714,7 @@ fn canonical_agents_freeze_the_admitted_route_across_post_boot_catalog_mutation(
         );
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
@@ -802,7 +802,7 @@ eval {
 fn canonical_agents_fail_closed_matrix_is_pre_spawn_and_non_vacuous() {
     type Case<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
 
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let cases: Vec<Case<'_>> = vec![
         (
             "unknown-type",
@@ -1043,7 +1043,7 @@ fn supervise_teardown_reaps_a_runtime_spawned_seat_case(judge_command: &str, exp
         eprintln!("SKIP supervise_teardown_reaps_a_runtime_spawned_seat: `pty` not on PATH");
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
@@ -1298,7 +1298,7 @@ fn runtime_peer_signal_case(sig: libc::c_int) {
         eprintln!("SKIP runtime_peer_signal_case: pty not on PATH");
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
@@ -1480,7 +1480,7 @@ fn signal_case_failure_guard_reaps_on_unwind() {
 /// and a judge asserts it). Flat run-collapse form. No `pty` needed (no seats are booted).
 #[test]
 fn team_less_run_stage_captures_and_judges() {
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
@@ -1559,7 +1559,7 @@ fn supervise_crash_dings_up_the_chain_and_is_silent_on_clean_exit() {
         );
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
@@ -1710,7 +1710,7 @@ fn st2_eval_fails_fast_when_a_seat_exits_at_boot() {
         eprintln!("SKIP st2_eval_fails_fast_when_a_seat_exits_at_boot: `pty` not on PATH");
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");

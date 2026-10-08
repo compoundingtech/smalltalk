@@ -137,8 +137,10 @@ mod convergence;
 mod document_index_tests;
 mod lanes;
 mod operations;
+pub(crate) mod mission_ivm;
 mod unread_mail;
 mod agent_messages;
+pub mod agent_view;
 mod conversation_reads;
 mod runtime;
 pub mod collection_ivm;
@@ -2696,6 +2698,8 @@ impl Store {
 
     /// Lazily attach the one Store publisher shared by receipt waits and collection
     /// consumers. Registration and journal installation happen when the Store opens.
+    /// Attachment errors are returned on each call until attachment succeeds; failures
+    /// are not cached. A successful attachment is shared by all later callers.
     pub fn ivm_publisher(&self) -> Result<Option<Arc<smallclaims::ivm::events::Publisher>>> {
         if self.smalltalk.ivm_views.is_none() {
             return Ok(None);

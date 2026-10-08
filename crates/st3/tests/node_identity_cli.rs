@@ -13,7 +13,7 @@ impl Drop for Daemon {
 }
 
 fn command(root: &Path, node: &str, socket: &Path) -> std::process::Command {
-    let mut command = st3::test_support::command(env!("CARGO_BIN_EXE_st3-fixture"));
+    let mut command = st3::test_support::command(test_env!("CARGO_BIN_EXE_st3-fixture"));
     command
         .env_clear()
         .env("HOME", root.join("home"))

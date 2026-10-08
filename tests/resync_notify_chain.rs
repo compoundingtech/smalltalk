@@ -12,17 +12,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const DEMO_WASM_SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/crates/agent-spec/tests/fixtures/demo_resolver.wasm"
-);
+fn demo_wasm_src() -> &'static str {
+    test_env!("CARGO_MANIFEST_DIR", "/crates/agent-spec/tests/fixtures/demo_resolver.wasm")
+}
 
 /// The demo resolver denotes `<agent_dir>/resources/goal.md` for any subject of its scheme, so
 /// each agent's own declaration resolves to that agent's own carrier — exactly the per-layer
 /// shape a composing profile has.
 fn catalog_with_profile(catalog: &Path, notify_chain: bool) {
     fs::create_dir_all(catalog.join("resolvers")).unwrap();
-    fs::copy(DEMO_WASM_SRC, catalog.join("resolvers/goal.wasm")).unwrap();
+    fs::copy(demo_wasm_src(), catalog.join("resolvers/goal.wasm")).unwrap();
     let chain = if notify_chain {
         "  notify-chain #true\n"
     } else {

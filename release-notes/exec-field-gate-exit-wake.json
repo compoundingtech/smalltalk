@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Wake pending exit-code field gates when their exec wrapper ends",
+  "replay": { "status": "none", "detail": "Gate decisions still use durable observations and selected-launch evidence; only the local reconciliation wake changes." },
+  "schema": { "status": "none", "detail": "No database schema or migrations change." },
+  "rules": { "status": "none", "detail": "No checkpoint rules or replicated gate predicates change." },
+  "compatibility": { "status": "none", "detail": "No CLI, client, or protocol contract changes." },
+  "downtime": { "status": "none", "detail": "No service interruption is required." },
+  "manual": { "status": "none", "detail": "No installation or configuration steps are required." },
+  "recovery": { "status": "none", "detail": "No recovery protocol changes; the owner reevaluates pending exit-code gates after its local exec process ends." }
+}

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep terminal-tab protocol probe barriers within each current input observation.",
+  "replay": {
+    "status": "none",
+    "detail": "Test observation and cause documentation only; no product or upgrade behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Test observation and cause documentation only; no product or upgrade behavior changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Test observation and cause documentation only; no product or upgrade behavior changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Test observation and cause documentation only; no product or upgrade behavior changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Test observation and cause documentation only; no product or upgrade behavior changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Test observation and cause documentation only; no product or upgrade behavior changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Test observation and cause documentation only; no product or upgrade behavior changes."
+  }
+}

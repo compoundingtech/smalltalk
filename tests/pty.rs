@@ -32,7 +32,7 @@ fn pty_defaults_to_the_xdg_catalog_and_passes_args_through() {
     let bin = pty_shim();
     let state = tempfile::tempdir().unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+    let out = std::process::Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["pty", "peek", "sess1"])
         .current_dir(elsewhere.path())
         .env("PATH", path_with(bin.path()))
@@ -61,7 +61,7 @@ fn pty_honors_a_preset_catalog_env_over_cwd() {
     let cat = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+    let out = std::process::Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["pty", "ls"])
         .current_dir(elsewhere.path()) // cwd is NOT the catalog
         .env("PATH", path_with(bin.path()))
@@ -83,7 +83,7 @@ fn pty_global_catalog_flag_overrides_the_environment() {
     let bin = pty_shim();
     let selected = tempfile::tempdir().unwrap();
     let ambient = tempfile::tempdir().unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+    let out = std::process::Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("--catalog")
         .arg(selected.path())
         .args(["pty", "attach", "ExampleMac.cos"])
@@ -107,7 +107,7 @@ fn pty_passes_hyphen_flags_through() {
     let bin = pty_shim();
     let state = tempfile::tempdir().unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+    let out = std::process::Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["pty", "ls", "--json"])
         .current_dir(elsewhere.path())
         .env("PATH", path_with(bin.path()))
@@ -129,7 +129,7 @@ fn shell_execs_the_shell_with_the_bus_env() {
     let shell = bin.path().join("pty");
     let state = tempfile::tempdir().unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+    let out = std::process::Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["shell", "-c", "noop"])
         .current_dir(elsewhere.path())
         .env("SHELL", &shell)

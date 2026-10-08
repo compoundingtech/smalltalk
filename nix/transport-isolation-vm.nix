@@ -15,6 +15,9 @@ let
   uid = 1000;
   runTests = pkgs.writeShellScript "run-transport-isolation" ''
     set -euo pipefail
+    export CI_TEST_EXTRACTED="$1" CI_TEST_BUILD_WORKSPACE="$2" CI_TEST_WORKSPACE="$1"
+    export CI_TEST_TARGET_TMPDIR=/tmp/ci-test-scratch
+    mkdir -p "$CI_TEST_TARGET_TMPDIR"
     exec cargo-nextest nextest run \
       --archive-file /tmp/isolation.tar.zst \
       --workspace-remap "$1" \
@@ -46,10 +49,12 @@ pkgs.testers.runNixOSTest {
     import json
     import os
     import re
+    import shlex
     import time
 
     archive = os.environ["ST_ISOLATION_ARCHIVE"]
     workspace = os.environ["ST_ISOLATION_WORKSPACE"]
+    build_workspace = os.environ["ST_ISOLATION_BUILD_WORKSPACE"]
 
     started = time.monotonic()
     machine.wait_for_unit("multi-user.target")
@@ -68,7 +73,7 @@ pkgs.testers.runNixOSTest {
         "su ${user} -s /bin/sh -c '"
         "XDG_RUNTIME_DIR=/run/user/${toString uid} systemd-run --user --wait --pipe --collect --quiet "
         "--setenv=PATH=/run/current-system/sw/bin "
-        f"-- ${runTests} {workspace}' 2>&1"
+        f"-- ${runTests} {shlex.quote(workspace)} {shlex.quote(build_workspace)}' 2>&1"
     )
     test_seconds = time.monotonic() - started
     print(output)

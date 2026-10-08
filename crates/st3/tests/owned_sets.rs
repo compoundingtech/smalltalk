@@ -327,7 +327,7 @@ async fn disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirm
         let previous = previous.clone();
         tokio::task::spawn_blocking(move || {
             let mut command =
-                st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+                st3::test_support::command(test_bin!("st3-fixture"));
             command
                 .env_remove("ST_AGENT")
                 .env_remove("ST_MISSION_RUN")
@@ -501,7 +501,7 @@ async fn disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirm
     ] {
         let socket = root.path().join("amber/st3.sock");
         let output = tokio::task::spawn_blocking(move || {
-            st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+            st3::test_support::command(test_bin!("st3-fixture"))
                 .env_remove("ST_AGENT")
                 .env_remove("ST_MISSION_RUN")
                 .args(["--json", "--endpoint"])
@@ -808,7 +808,7 @@ async fn manual_rollout_publishes_with_automatic_member_and_only_moves_on_explic
     let (shown, output) = tokio::task::spawn_blocking(move || {
         let command = || {
             let mut command =
-                st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+                st3::test_support::command(test_bin!("st3-fixture"));
             command
                 .env_remove("ST_AGENT")
                 .env_remove("ST_MISSION_RUN")

@@ -237,7 +237,7 @@ async fn wait_until(what: &str, limit: Duration, mut condition: impl FnMut() -> 
 /// A seat process launched with the environment the reconciler gives it, but with every home
 /// and state directory inside the test root.
 fn seat_command(root: &Path, socket: &Path) -> Command {
-    let mut command = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+    let mut command = st3::test_support::command(test_bin!("st3-fixture"));
     // Its own process group, so stopping the seat also stops the stand-in provider.
     command
         .process_group(0)
@@ -626,7 +626,7 @@ time.sleep(300)
             .env("ST_AGENT", seat)
             .env("ST3_MAILBOX_TRANSPORT", "push")
             .args(["driver", "claude", "--subject", seat, "--", "python3", "-c", provider,
-                env!("CARGO_BIN_EXE_st3-fixture")])
+                test_env!("CARGO_BIN_EXE_st3-fixture")])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

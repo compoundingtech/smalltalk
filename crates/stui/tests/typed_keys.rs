@@ -3,11 +3,15 @@
 //! such a terminal, must still type `I`, `:` and `J`. (Decoded key events in unit tests cannot
 //! show this: the bug lived between the terminal's bytes and the key event.)
 
+#[macro_use]
+#[path = "../../../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 #[test]
 fn shifted_keys_are_typed_as_a_keyboard_protocol_terminal_sends_them() {
     let output = std::process::Command::new("python3")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty_smoke.py"))
-        .arg(env!("CARGO_BIN_EXE_stui"))
+        .arg(test_env!("CARGO_MANIFEST_DIR", "/tests/pty_smoke.py"))
+        .arg(test_env!("CARGO_BIN_EXE_stui"))
         .arg("--only-shifted-keys")
         .env("ST3_PERSON", "person/alex")
         .env_remove("ST_AGENT")
