@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Prefer foreground writer loans over explicitly queued background pages with bounded background progress",
+  "replay": {"status": "none", "detail": "No replay or projection changes."},
+  "schema": {"status": "none", "detail": "In-memory scheduling only; no database changes."},
+  "rules": {"status": "none", "detail": "Admission, authority, transaction rollback and durable acknowledgements are unchanged."},
+  "compatibility": {"status": "changed", "detail": "New explicit write_background API on the existing writer. Existing foreground write and batched callers retain FIFO ordering; hook installation remains an all-prior-work barrier."},
+  "downtime": {"status": "none", "detail": "No consumer switches to background classification in this library change."},
+  "manual": {"status": "changed", "detail": "Background owners opt in only for bounded pages, release between pages and revalidate source and authority after acquisition."},
+  "recovery": {"status": "none", "detail": "No active holder is preempted. Cancelled borrowers release the connection and failed transactions retain existing rollback behavior."}
+}
