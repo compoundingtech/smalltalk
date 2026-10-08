@@ -626,28 +626,57 @@ impl Service {
     }
 
     fn current_boundary(&self, store: &Store) -> Result<bool> {
+        store.read_snapshot(|_| self.current_boundary_at(&store.readers.get(), store))
+    }
+
+    fn current_boundary_at(&self, c: &Connection, store: &Store) -> Result<bool> {
+        if !super::super::scope::readable(c)? || !self.schema_current(c)? {
+            return Ok(false);
+        }
+        let Ok(cut) = self.current_cut(c, store) else {
+            return Ok(false);
+        };
+        let Ok(root) = self.views.installed_root(c, &self.installer, cards::VIEW) else {
+            return Ok(false);
+        };
+        if smallclaims::ivm::source_cut(c)? != Some(cut)
+            || !cards::coverage(c, &root, &cut, crate::store::now_ms())?
+        {
+            return Ok(false);
+        }
+        let Some(certificate) = boundary::read(c, &root, &cut, &boundary::manifest())? else {
+            return Ok(false);
+        };
+        Ok(producer::read_boundary(&certificate, || Ok(true)).unwrap_or(false))
+    }
+
+    /// Private-source metadata only. The boolean is the actual read boundary, not a token
+    /// usable by another Store or process. No capture, publication or authorization occurs.
+    pub(crate) fn qualification_status(&self, store: &Store) -> Result<serde_json::Value> {
+        let job = self
+            .job
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source job lock poisoned"))?
+            .clone();
         store.read_snapshot(|_| {
-            let reader = store.readers.get();
-            let c = &*reader;
-            if !super::super::scope::readable(c)? || !self.schema_current(c)? {
-                return Ok(false);
-            }
-            let Ok(cut) = self.current_cut(c, store) else {
-                return Ok(false);
-            };
-            let Ok(root) = self.views.installed_root(c, &self.installer, cards::VIEW) else {
-                return Ok(false);
-            };
-            if smallclaims::ivm::source_cut(c)? != Some(cut) {
-                return Ok(false);
-            }
-            if !cards::coverage(c, &root, &cut, crate::store::now_ms())? {
-                return Ok(false);
-            }
-            let Some(certificate) = boundary::read(c, &root, &cut, &boundary::manifest())? else {
-                return Ok(false);
-            };
-            Ok(producer::read_boundary(&certificate, || Ok(true)).unwrap_or(false))
+            let c = store.readers.get();
+            let stopped = self.stopped.lock().map_err(|_| anyhow::anyhow!("source stop lock poisoned"))?.is_some();
+            if stopped { return Ok(serde_json::json!({"ready":false,"stopped":true})); }
+            let status = self.installer.status(&c, cards::VIEW)?;
+            let root = self.installer.root(&c, cards::VIEW).ok();
+            let job = job.as_deref().or_else(|| root.as_ref().map(|r| r.namespace.as_str()));
+            let progress = job.map(|j| self.installer.progress(&c, j)).transpose()?;
+            let cut = smallclaims::ivm::source_cut(&c)?.context("source cut missing")?;
+            let ready = self.current_boundary_at(&c, store)?;
+            let database_id = smallclaims::ivm::events::capture(&c, &self.views, cards::VIEW)?.identity.database_id;
+            Ok(serde_json::json!({
+                "ready":ready,"stopped":false,"compatible":status.compatible,"database_id":database_id,
+                "source_available":status.source_available,
+                "namespace":root.as_ref().map(|r|r.namespace.as_str()),
+                "source":{"name":status.source.source,"fingerprint":status.source.fingerprint,"epoch":status.source.epoch,"revision":status.source.revision},
+                "cut":{"epoch":cut.epoch,"admitted":cut.admitted,"projected":cut.projected,"local_generation":cut.local_generation},
+                "job":progress.map(|p|serde_json::json!({"phase":p.phase,"refused":p.error.is_some(),"pages":p.pages,"extracted_rows":p.extracted_rows,"applied_rows":p.applied_rows,"max_page_us":p.max_page_us,"queued_rows":p.queued_rows,"queued_bytes":p.queued_bytes}))
+            }))
         })
     }
 

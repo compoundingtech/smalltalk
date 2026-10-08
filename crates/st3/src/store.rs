@@ -2665,6 +2665,13 @@ impl Store {
         service.pump()
     }
 
+    /// Inspect actual installed-source metadata for an isolated qualification process.
+    /// This grants neither authorized rows nor a transferable readiness certificate.
+    pub fn agent_collection_qualification_status(&self) -> Result<serde_json::Value> {
+        self.smalltalk.ivm_agent_service.get().context("agent source is not installed")?
+            .qualification_status(self)
+    }
+
     pub fn has_agent_collection_source(&self) -> bool {
         self.smalltalk.ivm_agent_service.get().is_some()
     }

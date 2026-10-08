@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "Provide a single-use bounded scratch applicability check for the opt-in agent collection source.",
+  "commits": ["40570dddb09cb6fc0d647638a16574b0a4178817"],
+  "replay": {"status": "none", "detail": "The runner uses the existing explicit source constructor and bounded Installer lifecycle only on a scratch backup; it introduces no replay or eligibility mechanism."},
+  "schema": {"status": "none", "detail": "Cardinality gauges use TEMP schema in the isolated child only; production schema, source descriptors, fingerprints and limits are unchanged."},
+  "rules": {"status": "none", "detail": "No admission, checkpoint, authority or readiness rule changes."},
+  "compatibility": {"status": "none", "detail": "A standalone example and Python supervisor add metadata inspection without changing socket frames, client code or daemon routes."},
+  "downtime": {"status": "none", "detail": "The vehicle runs on an existing consistent scratch backup, starts no daemon or harness and never opens the live database. Populated-host execution and macOS resource fit remain unqualified."},
+  "manual": {"status": "changed", "detail": "Ops can run one marked scratch qualification with exact binary/source pins, original receiver and online-backup provenance, subject to 900 seconds and explicit resource bounds. Success is scratch applicability only; activation and profiles remain separately gated."},
+  "recovery": {"status": "none", "detail": "Refusal and timeout keep live opt-in disabled. The supervisor terminates its own child and retains private bounded diagnostics; Ops removes only its owned marked scratch after recording evidence. No production restore, trigger uninstall or cap increase is introduced."}
+}

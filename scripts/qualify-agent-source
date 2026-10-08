@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Run the actual source once against a preexisting, explicitly marked scratch backup."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import resource
+import selectors
+import signal
+import subprocess
+import sys
+import time
+
+GIB = 1024 ** 3
+TIME_LIMIT = 900
+DISK_LIMIT = 64 * GIB
+MEMORY_LIMIT = 4 * GIB
+OUTPUT_LIMIT = 16 * 1024 ** 2
+FILE_LIMIT = 128
+
+
+def digest(path):
+    result = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 ** 2), b""):
+            result.update(block)
+    return result.hexdigest()
+
+
+def footprint(root):
+    size, count = 0, 0
+    for current, dirs, files in os.walk(root, followlinks=False):
+        if len(Path(current).relative_to(root).parts) > 4:
+            raise RuntimeError("scratch directory depth limit")
+        for name in dirs + files:
+            path = Path(current) / name
+            if path.is_symlink():
+                raise RuntimeError("scratch symlinks are forbidden")
+        for name in files:
+            count += 1
+            if count > FILE_LIMIT:
+                raise RuntimeError("scratch file-count limit")
+            size += (Path(current) / name).stat().st_size
+            if size > DISK_LIMIT:
+                raise RuntimeError("scratch disk limit")
+    return size
+
+
+def child_limits():
+    os.nice(10)
+    resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (32 * GIB, 32 * GIB))
+    resource.setrlimit(resource.RLIMIT_CPU, (TIME_LIMIT, TIME_LIMIT))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
+
+
+def supervise(binary, database, receiver, scratch, seconds=TIME_LIMIT):
+    environment = {"PATH": "/usr/bin:/bin", "SQLITE_TMPDIR": str(scratch / "tmp")}
+    (scratch / "tmp").mkdir(mode=0o700, exist_ok=True)
+    process = subprocess.Popen(
+        [str(binary), str(database), receiver], cwd=scratch, env=environment,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        preexec_fn=child_limits,
+    )
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    output = {"stdout": bytearray(), "stderr": bytearray()}
+    started = time.monotonic()
+    reason = None
+    try:
+        while selector.get_map() or process.poll() is None:
+            if time.monotonic() - started >= seconds:
+                reason = "TIMEOUT"
+                break
+            footprint(scratch)
+            for key, _ in selector.select(0.1):
+                block = os.read(key.fd, 65536)
+                if not block:
+                    selector.unregister(key.fileobj)
+                    continue
+                target = output[key.data]
+                if len(target) + len(block) > OUTPUT_LIMIT:
+                    reason = "OUTPUT_LIMIT"
+                    break
+                target.extend(block)
+            if reason:
+                break
+    except (OSError, RuntimeError) as error:
+        reason = type(error).__name__ + ": " + str(error)
+    finally:
+        if process.poll() is None or reason:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=2)
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+    return process.returncode, reason, output, time.monotonic() - started
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--binary-sha256", required=True)
+    parser.add_argument("--source-head", required=True)
+    parser.add_argument("--source-tree", required=True)
+    parser.add_argument("--scratch", type=Path, required=True)
+    parser.add_argument("--original-receiver", required=True)
+    parser.add_argument("--backup-receipt", type=Path, required=True)
+    args = parser.parse_args()
+    os.umask(0o077)
+    scratch = args.scratch.resolve(strict=True)
+    binary = args.binary.resolve(strict=True)
+    database = scratch / "backup.sqlite"
+    marker = scratch / ".ivm-qualification-scratch"
+    if not marker.is_file() or not database.is_file():
+        parser.error("existing backup.sqlite and scratch marker required")
+    if (scratch / "qualification.json").exists():
+        parser.error("single-use scratch already has a qualification result")
+    if not args.backup_receipt.is_file():
+        parser.error("consistent SQLite online-backup provenance receipt required")
+    if args.backup_receipt.stat().st_size > 65536:
+        parser.error("backup receipt exceeds metadata byte limit")
+    receipt = json.loads(args.backup_receipt.read_text())
+    receiver_hash = hashlib.sha256(args.original_receiver.encode()).hexdigest()
+    if receipt.get("method") != "sqlite-online-backup" or receipt.get("completed") is not True or receipt.get("original_receiver_sha256") != receiver_hash:
+        parser.error("backup receipt must attest completed online backup and original receiver")
+    if digest(binary) != args.binary_sha256:
+        parser.error("binary digest mismatch")
+    for value in [args.source_head, args.source_tree]:
+        if len(value) != 40 or any(c not in "0123456789abcdef" for c in value):
+            parser.error("exact source head/tree required")
+    footprint(scratch)
+    with (scratch / ".qualification-started").open("x") as started:
+        started.write(args.source_head + "\n")
+    code, reason, output, elapsed = supervise(binary, database, args.original_receiver, scratch)
+    # Never publish raw stderr/rows. Preserve bounded private diagnostics in the scratch.
+    (scratch / "qualification.stderr").write_bytes(output["stderr"])
+    (scratch / "qualification.stdout").write_bytes(output["stdout"])
+    report = None
+    if code == 0 and reason is None:
+        try:
+            report = json.loads(output["stdout"])
+            if report.get("result") != "QUALIFIED_SCRATCH_ONLY":
+                reason = "INVALID_RESULT"
+        except (ValueError, AttributeError):
+            reason = "INVALID_RESULT"
+    result = {"result": "QUALIFIED_SCRATCH_ONLY" if code == 0 and reason is None else "UNAVAILABLE",
+              "exit_code": code, "stop_reason": reason, "elapsed_seconds": elapsed,
+              "binary_sha256": args.binary_sha256, "source_head": args.source_head,
+              "source_tree": args.source_tree, "original_receiver_sha256": receiver_hash,
+              "backup_receipt_sha256": digest(args.backup_receipt),
+              "limits": {"wall_seconds": TIME_LIMIT, "address_space_bytes": MEMORY_LIMIT,
+                         "scratch_bytes": DISK_LIMIT, "individual_file_bytes": 32 * GIB,
+                         "scratch_files": FILE_LIMIT, "output_bytes_per_stream": OUTPUT_LIMIT, "nice": 10},
+              "source_report": report, "live_activation_and_profiles": "UNQUALIFIED"}
+    (scratch / "qualification.json").write_text(json.dumps(result, sort_keys=True) + "\n")
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["result"] == "QUALIFIED_SCRATCH_ONLY" else 124 if reason == "TIMEOUT" else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
