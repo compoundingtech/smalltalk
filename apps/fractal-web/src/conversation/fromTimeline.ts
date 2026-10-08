@@ -315,15 +315,15 @@ export interface TimelineProjection {
 export class LiveTimeline {
   private readonly entries = new Map<string, Entry>()
   private ordered: Array<Entry> = []
-  /** Positions in `ordered` of every `tool_call`, per call id, ascending. */
-  private readonly calls = new Map<string, Array<number>>()
+  /** First position of each call identity: used only to invalidate its projected items. */
+  private readonly calls = new Map<string, number>()
   /**
-   * Joined result per call position: the newest result after that call and before the next call
-   * with the same id (CAG.CLI.WEB.CNV-R04).
+   * Newest result per call identity (CAG.CLI.WEB.CNV-R04), even before its call is loaded.
+   * `firstAt` is the earliest orphan row to invalidate when that call arrives.
    */
-  private readonly joined = new Map<
-    number,
-    { readonly entry: ToolResultEntry; readonly at: number }
+  private readonly results = new Map<
+    string,
+    { readonly entry: ToolResultEntry; readonly firstAt: number }
   >()
   /** Item count before each position in `ordered`, valid below `dirtyFrom`. */
   private itemsBefore: Array<number> = []
@@ -381,42 +381,43 @@ export class LiveTimeline {
         }
       }
       this.dirtyFrom = Math.min(this.dirtyFrom, at)
-      // A revision that re-points a call or result to another call id invalidates the join index.
+      // Re-pointed identities or result sequence changes invalidate identity/result selection.
       if (
         previous !== undefined &&
         (entry.type === 'tool_call' || entry.type === 'tool_result') &&
         previous.type === entry.type &&
-        previous.body.call_id !== entry.body.call_id
+        (previous.body.call_id !== entry.body.call_id ||
+          (entry.type === 'tool_result' && previous.sequence !== entry.sequence))
       ) {
         this.reindex = true
       }
       if (this.reindex) continue
-      if (entry.type === 'tool_call' && previous === undefined) {
-        const positions = this.calls.get(entry.body.call_id)
-        if (positions === undefined) this.calls.set(entry.body.call_id, [at])
-        else positions.push(at)
-      }
-      if (entry.type === 'tool_result') this.join({ entry, at })
+      if (entry.type === 'tool_call' && previous === undefined) this.indexCall(entry, at)
+      if (entry.type === 'tool_result') this.indexResult(entry, at)
     }
     return changed
   }
 
-  /** Joins a result at `at` into the latest same-id call before it, if it is the newest there. */
-  private join({ entry, at }: { readonly entry: ToolResultEntry; readonly at: number }) {
-    const positions = this.calls.get(entry.body.call_id)
-    if (positions === undefined) return
-    let call: number | undefined
-    for (let index = positions.length - 1; index >= 0; index -= 1) {
-      if (positions[index]! < at) {
-        call = positions[index]!
-        break
-      }
-    }
-    if (call === undefined) return
-    const current = this.joined.get(call)
-    if (current !== undefined && current.at > at) return
-    this.joined.set(call, { entry, at })
-    this.dirtyFrom = Math.min(this.dirtyFrom, call)
+  /** Index a call by identity and remove any already-projected orphan results for it. */
+  private indexCall(entry: Extract<Entry, { type: 'tool_call' }>, at: number): void {
+    if (!this.calls.has(entry.body.call_id)) this.calls.set(entry.body.call_id, at)
+    const result = this.results.get(entry.body.call_id)
+    if (result !== undefined) this.dirtyFrom = Math.min(this.dirtyFrom, result.firstAt)
+  }
+
+  /** Retain results independently of call arrival order; sequence selects the newest result. */
+  private indexResult(entry: ToolResultEntry, at: number): void {
+    const id = entry.body.call_id
+    const current = this.results.get(id)
+    this.results.set(id, {
+      entry:
+        current === undefined || current.entry.id === entry.id || current.entry.sequence <= entry.sequence
+          ? entry
+          : current.entry,
+      firstAt: Math.min(at, current?.firstAt ?? at),
+    })
+    const call = this.calls.get(id)
+    if (call !== undefined) this.dirtyFrom = Math.min(this.dirtyFrom, call)
   }
 
   /** Message identities the window currently shows, without consuming projection state. */
@@ -474,14 +475,13 @@ export class LiveTimeline {
         }
       }
       if (entry.type === 'tool_result') {
-        // A result after any same-id call folds into a call (the newest one wins there).
-        const first = this.calls.get(entry.body.call_id)?.[0]
-        if (first === undefined || first > at)
+        // A result is orphaned only when its call identity is absent, not when it arrived first.
+        if (!this.calls.has(entry.body.call_id))
           items.push(this.cached({ entry, result: undefined, active: true }))
         continue
       }
       if (entry.type === 'tool_call')
-        items.push(this.cached({ entry, result: this.joined.get(at)?.entry, active: this.active }))
+        items.push(this.cached({ entry, result: this.results.get(entry.body.call_id)?.entry, active: this.active }))
       else items.push(this.cached({ entry, result: undefined, active: true }))
     }
     this.items = items
@@ -489,20 +489,17 @@ export class LiveTimeline {
     return { items, changedFrom }
   }
 
-  /** Recomputes the call/result join after history was replaced or reordered. */
+  /** Rebuild identity joins after history is replaced or an entry changes type/call identity. */
   private rebuildIndex(): void {
     this.reindex = false
     this.dirtyFrom = 0
     this.itemsBefore = []
     this.items = []
     this.calls.clear()
-    this.joined.clear()
+    this.results.clear()
     this.ordered.forEach((entry, at) => {
-      if (entry.type === 'tool_call') {
-        const positions = this.calls.get(entry.body.call_id)
-        if (positions === undefined) this.calls.set(entry.body.call_id, [at])
-        else positions.push(at)
-      } else if (entry.type === 'tool_result') this.join({ entry, at })
+      if (entry.type === 'tool_call') this.indexCall(entry, at)
+      else if (entry.type === 'tool_result') this.indexResult(entry, at)
     })
   }
 

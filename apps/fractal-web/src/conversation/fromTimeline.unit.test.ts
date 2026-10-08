@@ -264,6 +264,75 @@ The person reads replies in st, not in the agent's session.`,
     expect(items[0]).toMatchObject({ _tag: 'ToolCall', status: 'success' })
   })
 
+  it.each([false, true])('joins a result delivered before its call (separate frames: %s)', (separateFrames) => {
+    const timeline = new LiveTimeline()
+    timeline.apply({ replace: true, hasMore: false, entries: [] })
+    timeline.project()
+    const call = entry('timeline-entry/call', 4, 'tool_call', {
+      call_id: 'call/1', name: 'shell', arguments: { command: 'true' },
+    }, 'assistant', '2026-10-03T00:02:00Z')
+    const result = entry('timeline-entry/result', 7, 'tool_result', {
+      call_id: 'call/1', status: 'success', media_type: 'text/plain', content: 'ok',
+    }, 'tool', '2026-10-03T00:01:00Z')
+    if (separateFrames) {
+      timeline.apply({ replace: false, hasMore: false, entries: [result] })
+      expect(timeline.project().items).toMatchObject([{ callSeen: false }])
+      timeline.apply({ replace: false, hasMore: false, entries: [call] })
+    } else {
+      // The stored fallback's delta poll sorts by timestamp: result(seq 7), call(seq 4).
+      timeline.apply({ replace: false, hasMore: false, entries: [result, call] })
+    }
+    const projected = timeline.project()
+    expect(projected.items.map((item) => item.id)).toEqual(['timeline-entry/call'])
+    expect(projected.items[0]).toMatchObject({
+      _tag: 'ToolCall', status: 'success', callSeen: true, result: { content: 'ok' },
+    })
+    expect(projected.changedFrom).toBe(0)
+  })
+
+  it('removes every orphan row when its call arrives and joins the newest result by sequence', () => {
+    const timeline = new LiveTimeline()
+    const newer = entry('timeline-entry/newer', 8, 'tool_result', {
+      call_id: 'call/1', status: 'success', media_type: 'text/plain', content: 'newer',
+    }, 'tool')
+    const older = entry('timeline-entry/older', 7, 'tool_result', {
+      call_id: 'call/1', status: 'error', media_type: 'text/plain', content: 'older',
+    }, 'tool')
+    timeline.apply({ replace: true, hasMore: false, entries: [newer, older] })
+    expect(timeline.project().items.map((item) => item.id)).toEqual([newer.id, older.id])
+    timeline.apply({
+      replace: false, hasMore: false,
+      entries: [entry('timeline-entry/call', 4, 'tool_call', {
+        call_id: 'call/1', name: 'shell', arguments: { command: 'true' },
+      }, 'assistant')],
+    })
+    const projected = timeline.project()
+    expect(projected.changedFrom).toBe(0)
+    expect(projected.items).toMatchObject([
+      { id: 'timeline-entry/call', callSeen: true, status: 'success', result: { content: 'newer' } },
+    ])
+    // A revision of the same result identity updates the call, without leaving an orphan.
+    timeline.apply({
+      replace: false, hasMore: false,
+      entries: [Schema.decodeUnknownSync(TimelineEntry)({
+        ...Schema.encodeSync(TimelineEntry)(newer), revision: 2, body: { ...newer.body, content: 'revised' },
+      })],
+    })
+    expect(timeline.project().items).toMatchObject([
+      { id: 'timeline-entry/call', callSeen: true, status: 'success', result: { content: 'revised' } },
+    ])
+    // An authoritative replacement cannot retain a result from the previous window.
+    timeline.apply({
+      replace: true, hasMore: false,
+      entries: [entry('timeline-entry/call', 4, 'tool_call', {
+        call_id: 'call/1', name: 'shell', arguments: { command: 'true' },
+      }, 'assistant')],
+    })
+    const reset = timeline.project().items
+    expect(reset).toMatchObject([{ id: 'timeline-entry/call', status: 'running' }])
+    expect(reset[0]).not.toHaveProperty('result')
+  })
+
   it('strips a shown delivery from a native turn and keeps the turn\'s own text', () => {
     const timeline = new LiveTimeline()
     timeline.apply({
