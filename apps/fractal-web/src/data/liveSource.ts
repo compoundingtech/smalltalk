@@ -491,9 +491,11 @@ export const liveSource = ({
     let painted = false
     let publishedItems: ConversationPage['items'] = []
     let changedFrom = Infinity
+    const shownMessageIds = () =>
+      new Set(timeline.project().items.flatMap((item) => item._tag === 'Message' ? [item.messageId] : []))
     const projectPage = (): ConversationPage => {
       const projection = timeline.project()
-      const shown = new Set(projection.items.flatMap((item) => item._tag === 'Message' ? [item.messageId] : []))
+      const shown = shownMessageIds()
       for (const [id, send] of pending)
         if (send.messageIds.some((messageId) => shown.has(messageId))) pending.delete(id)
       changedFrom = Math.min(changedFrom, projection.changedFrom)
@@ -554,13 +556,23 @@ export const liveSource = ({
         },
         messageIds: [],
       }
-      pending.set(id, local)
-      publishPending()
+      // A fresh client key paints immediately: Enter must not wait for any await.
+      // A deliberate resubmission names mail the stream may already show, so its
+      // authoritative identity is reconciled before any optimistic row can duplicate it.
+      if (request.idempotency_key === undefined) {
+        pending.set(id, local)
+        publishPending()
+      }
       try {
         // The public device-signing contract names mail from the first 16 SHA-256 hex digits.
         // Resolve this before POST so an echo that wins the HTTP race still replaces its outbox item.
         const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(idempotencyKey)))
         local.messageIds = [`message/${[...hash.slice(0, 8)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`]
+        if (request.idempotency_key !== undefined) {
+          if (shownMessageIds().has(local.messageIds[0]!)) return attachments.send({ ...request, idempotency_key: idempotencyKey })
+          pending.set(id, local)
+          publishPending()
+        }
         const result = await attachments.send({ ...request, idempotency_key: idempotencyKey })
         if (result._tag === 'Success' && result.value.status !== 'rejected') {
           const affected = result.value.affected_ids.filter((affected) => affected.startsWith('message/'))
