@@ -28,6 +28,48 @@ pub struct Readiness {
     pub total: Option<u64>,
 }
 
+/// Monotonic initialization intervals, reported once when both daemon listeners are ready.
+/// Kept separate from readiness progress so replay chunks never emit timing lines.
+#[derive(Default, Serialize)]
+pub struct PhaseDurations {
+    pub configuration_ms: f64,
+    pub install_hooks_ms: f64,
+    pub open_store_ms: f64,
+    pub judge_claims_ms: f64,
+    pub validate_replication_backlog_ms: f64,
+    pub apply_replication_repairs_ms: f64,
+    pub settlement_projection_ms: f64,
+    pub runtime_prelude_ms: f64,
+    pub login_environment_ms: f64,
+    pub isolation_pty_ms: f64,
+    pub recorder_ms: f64,
+    pub app_state_ms: f64,
+    pub reconciler_ms: f64,
+    pub background_tasks_ms: f64,
+}
+
+impl PhaseDurations {
+    pub fn log_ready(&self, bind_ms: f64, total_ms: f64) {
+        #[derive(Serialize)]
+        struct Report<'a> {
+            #[serde(flatten)]
+            phases: &'a PhaseDurations,
+            bind_ms: f64,
+            total_ms: f64,
+        }
+
+        let report = Report {
+            phases: self,
+            bind_ms,
+            total_ms,
+        };
+        eprintln!(
+            "st3: startup phases {}",
+            serde_json::to_string(&report).expect("finite startup durations serialize")
+        );
+    }
+}
+
 impl Readiness {
     pub fn full_replay(&self) -> bool {
         self.phase == "full-replay" || self.phase.starts_with("full-replay/")

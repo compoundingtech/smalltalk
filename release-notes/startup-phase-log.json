@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Report startup phase durations once when both daemon listeners are ready.",
+  "replay": {
+    "status": "none",
+    "detail": "Replication replay behavior is unchanged; projection chunks do not emit additional timing summaries."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No persisted schema or data changes. The structured startup log contains numeric millisecond durations for initialization phases and their total."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No authorization, judging, or settlement rule changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "API and readiness formats are unchanged. Successful starts add one structured stderr line captured by the service journal."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional migration downtime. Logging measures existing initialization boundaries without changing startup order or readiness."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No profiling configuration is required. The monotonic total starts at daemon initialization entry, not process execution; starts that fail before listener readiness have no summary."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery action is required; prior versions can open the same store."
+  }
+}

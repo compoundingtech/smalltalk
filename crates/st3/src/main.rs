@@ -5624,6 +5624,15 @@ mod private_gateway_tests {
 }
 
 async fn run_up(args: UpArgs) -> Result<()> {
+    let started_at = Instant::now();
+    let mut phase_finished_at = started_at;
+    let mut phase_elapsed_ms = || {
+        let now = Instant::now();
+        let elapsed_ms = now.duration_since(phase_finished_at).as_secs_f64() * 1_000.0;
+        phase_finished_at = now;
+        elapsed_ms
+    };
+    let mut startup_phases = st3::startup::PhaseDurations::default();
     let private_state = args.state_dir.is_some();
     let private_socket = args.socket.is_some();
     let explicit_gateway = args.client_gateway_socket.is_some();
@@ -5669,12 +5678,14 @@ async fn run_up(args: UpArgs) -> Result<()> {
     validate_unix_socket_path(&config.client_gateway_socket, "--client-gateway-socket")?;
     fs::create_dir_all(&config.state_dir)?;
     let startup = Arc::new(st3::startup::Startup::begin(&config.socket)?);
+    startup_phases.configuration_ms = phase_elapsed_ms();
     startup.phase("install-hooks");
     st3::hooks::ensure_installed(&st3::hooks::root(&config.state_dir)).context(
         "publishing this st binary's required lifecycle hook set before starting the daemon",
     )?;
     st3::profile::init_from_env();
     raise_open_file_limit();
+    startup_phases.install_hooks_ms = phase_elapsed_ms();
     startup.phase("open-store");
     let store = Arc::new(st3::profile::task("startup open-store", || {
         Store::open(&config.state_dir.join("claims.sqlite3"), &config.node)
@@ -5693,16 +5704,20 @@ async fn run_up(args: UpArgs) -> Result<()> {
         )?))?;
     }
     store.use_key_directory(&keys)?;
+    startup_phases.open_store_ms = phase_elapsed_ms();
     startup.phase("judge-claims");
     st3::profile::task("startup judge-claims", || store.judge_claims(true))?;
+    startup_phases.judge_claims_ms = phase_elapsed_ms();
     startup.phase("validate-replication-backlog");
     let admission = st3::profile::task("startup validate-replication-backlog", || {
         store.validate_replication_backlog()
     })?;
+    startup_phases.validate_replication_backlog_ms = phase_elapsed_ms();
     startup.phase("apply-replication-repairs");
     st3::profile::task("startup apply-replication-repairs", || {
         store.apply_replication_repairs()
     })?;
+    startup_phases.apply_replication_repairs_ms = phase_elapsed_ms();
     startup.phase("settle-runs");
     for run in st3::profile::task("startup settle-runs", || {
         store.settle_runs_for_canonical_replay()
@@ -5726,6 +5741,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     if admission.invalid != 0 {
         eprintln!("st: replication has {} invalid records", admission.invalid);
     }
+    startup_phases.settlement_projection_ms = phase_elapsed_ms();
     startup.phase("initialize-runtime");
     store.append_claim(&ClaimInput {
         subject: format!("daemon/{}", config.node),
@@ -5765,13 +5781,17 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .pty_root
         .clone()
         .unwrap_or_else(|| config.state_dir.join("pty"));
+    startup_phases.runtime_prelude_ms = phase_elapsed_ms();
     let login_environment = st3::environment::snapshot_at_startup()?;
+    startup_phases.login_environment_ms = phase_elapsed_ms();
     st_runtime::initialize_isolation(&login_environment);
     let pty_binary = match args.pty_binary.clone() {
         Some(pty_binary) => pty_binary,
         None => st_runtime::resolve_executable("pty", &login_environment)?,
     };
+    startup_phases.isolation_pty_ms = phase_elapsed_ms();
     let recorder = install_recorder(&config, &login_environment);
+    startup_phases.recorder_ms = phase_elapsed_ms();
     if let Some(person) = &config.person {
         let _ = st3::sekrets::daemon::PERSON.set(person.clone());
     }
@@ -5798,6 +5818,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         planner_default: config.planner.clone(),
     };
     st3::gate_check::set_endpoint(config.socket.display().to_string());
+    startup_phases.app_state_ms = phase_elapsed_ms();
     let reconciler = Arc::new(Reconciler::native(
         store.clone(),
         &config.state_dir,
@@ -5809,6 +5830,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         event_notify.clone(),
         recorder.map(|installation| installation.directory),
     )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()).with_person(config.person.clone()));
+    startup_phases.reconciler_ms = phase_elapsed_ms();
     tokio::spawn(reconciler.supervise());
     // A start no longer rebuilds the operation projection; check it once the API serves.
     tokio::spawn({
@@ -5901,10 +5923,17 @@ async fn run_up(args: UpArgs) -> Result<()> {
     st3::api::start_operation_report(&state);
     // Nor does the first session list wait to read every native transcript's header.
     st3::api::start_native_session_discovery(&state);
+    startup_phases.background_tasks_ms = phase_elapsed_ms();
+    let bind_started_at = phase_finished_at;
     startup.phase("bind-listeners");
     let bound = std::sync::atomic::AtomicUsize::new(0);
     let ready = || {
         if bound.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            let ready_at = Instant::now();
+            startup_phases.log_ready(
+                ready_at.duration_since(bind_started_at).as_secs_f64() * 1_000.0,
+                ready_at.duration_since(started_at).as_secs_f64() * 1_000.0,
+            );
             startup.serving();
             eprintln!("st: local API listening at {}", config.socket.display());
             eprintln!(
