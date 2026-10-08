@@ -14,6 +14,8 @@ mod resources;
 mod github_workflow_failures;
 pub(crate) mod message_subscriptions;
 mod client_messages;
+#[cfg(test)]
+mod client_messages_version_benchmark;
 mod rollouts;
 mod seat_status;
 #[cfg(test)]
@@ -9683,6 +9685,7 @@ impl Store {
                 }
                 if receipt_attached { repair_operations_tx(transaction,&[opaque_cache_key(idempotency_key)]).map_err(internal)?; }
                 owned_sets::project_tx(transaction)?;
+                #[cfg(test)]
                 client_messages::flush(transaction).map_err(internal)?;
                 let store_index = current_index_tx(transaction).map_err(internal)?;
                 let response = ApplyResponse {
@@ -11922,6 +11925,7 @@ impl Store {
                 .query_map([run_id], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
+        #[cfg(test)]
         client_messages::flush(&transaction)?;
         transaction.commit()?;
         Ok(residue)
@@ -11931,6 +11935,7 @@ impl Store {
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let removed = transaction.execute("DELETE FROM desired WHERE owner_run=?1", [owner_run])?;
+        #[cfg(test)]
         client_messages::flush(&transaction)?;
         transaction.commit()?;
         Ok(removed)
@@ -20362,6 +20367,7 @@ pub(crate) fn append_claim_tx(
     if kind == "message.sent" {
         agent_messages::flush(transaction)?;
     }
+    #[cfg(test)]
     if subject.starts_with("message/") {
         client_messages::flush(transaction)?;
     }
@@ -20748,8 +20754,17 @@ fn message_view_tx(
     subject: &str,
     created_index: u64,
 ) -> Result<MessageView> {
-    let actual = latest_actual(connection, subject)?.unwrap_or(Value::Null);
-    let desired = current_desired_row(connection, subject)?
+    message_view_at(connection, subject, created_index, None)
+}
+
+fn message_view_at(
+    connection: &Connection,
+    subject: &str,
+    created_index: u64,
+    through: Option<u64>,
+) -> Result<MessageView> {
+    let actual = latest_actual_at(connection, subject, through)?.unwrap_or(Value::Null);
+    let desired = desired_row_at(connection, subject, through)?
         .and_then(|row| serde_json::from_str::<Value>(&row.body).ok());
     let field = |name: &str| actual.get(name).and_then(Value::as_str).map(str::to_owned);
     let child = |name: &str| {
@@ -27803,6 +27818,7 @@ fn select_desired_repair_tx(
             desired.owner_step,
         ],
     )?;
+    #[cfg(test)]
     client_messages::flush(transaction)?;
     Ok(())
 }
@@ -53633,6 +53649,7 @@ impl Store {
         project_replicated_mission_runs(&transaction)?;
         rebuild_planning_tx(&transaction).map_err(internal)?;
         custom::flush(&transaction).map_err(internal)?;
+        #[cfg(test)]
         client_messages::flush(&transaction).map_err(internal)?;
         let accepted_heads = replica_heads(&transaction).map_err(internal)?;
         let accepted_through = accepted_heads.get(&input.peer).copied().unwrap_or(0);

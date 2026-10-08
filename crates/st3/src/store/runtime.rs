@@ -199,6 +199,7 @@ impl Runtime for SmalltalkRuntime {
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
+            #[cfg(test)]
             client_messages::open(transaction)?;
             return Ok(());
         }
@@ -230,6 +231,7 @@ impl Runtime for SmalltalkRuntime {
             let _ = rebuilt;
         }
         migrate_occurrence_creation_projections_tx(transaction)?;
+        #[cfg(test)]
         client_messages::open(transaction)?;
         Ok(())
     }
@@ -313,6 +315,7 @@ impl Runtime for SmalltalkRuntime {
         resources::flush(transaction).map_err(internal)?;
         glass_heads::flush(transaction).map_err(internal)?;
         agent_messages::flush(transaction).map_err(internal)?;
+        #[cfg(test)]
         client_messages::flush(transaction).map_err(internal)?;
         limits::flush_limits(transaction).map_err(internal)?;
         reapply_local_work_lease_renewals_tx(transaction)
@@ -367,7 +370,9 @@ impl Runtime for SmalltalkRuntime {
 
     fn replay_checkpoint_projections(&self, transaction: &Transaction<'_>) -> Result<()> {
         checkpoint_rules::replay_from_nothing(transaction)?;
-        client_messages::flush(transaction)
+        #[cfg(test)]
+        client_messages::flush(transaction)?;
+        Ok(())
     }
 
     fn checkpoint_subject_answers(

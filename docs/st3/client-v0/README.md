@@ -1109,12 +1109,15 @@ fleet, see `sync`) or `unverified`, and the `reason` the owner was not asked, su
 agent has no `replicated`. Page cursors of a relayed list belong to the owner.
 
 Message list pages select the recipient and actor, newest `sent_at` first with ascending message
-ID ties, before loading message bodies. A cursor retains the first page's local projection cut
+ID ties, before loading message bodies. A cursor retains the first page's server-issued cut
 and request time: later writes cannot change the traversal's message fields, current/history
 classification, or delivery age. Current lists omit closed and superseded reminder messages;
 history lists retain them with the same operational reasons. Reminder winners are selected in
-the recipient scope before the actor filter. Cursors remain opaque and expire after five minutes;
-a web client restarts pagination when it receives `page-cursor-expired`.
+the recipient scope before the actor filter. Cursors remain opaque and expire after five minutes.
+The server retains only bounded cursor metadata, not message bodies; the cut, expiry, filters,
+snapshot and keyset must exactly match an issued cursor. Tampering, metadata eviction or restart,
+and repair/checkpoint deletion that makes the cut unavailable return `page-cursor-expired`
+(HTTP 410), never a successful incomplete page. A web client restarts pagination on that error.
 Recipient delivery presence is live process evidence, not graph state: each page reassesses
 `recipient_delivery`, including its observation age, rather than retaining a stale report.
 

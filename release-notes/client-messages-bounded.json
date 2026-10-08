@@ -1,32 +1,32 @@
 {
   "version": 1,
-  "summary": "Bound message list reads before materializing a web client's page",
+  "summary": "Read bounded message pages at server-issued claim-log cuts without a body version store",
   "replay": {
-    "status": "changed",
-    "detail": "The first open seeds a local message projection from existing message subjects inside the normal projection transaction. Later writes maintain only changed subjects; no authoritative claim replay is introduced."
+    "status": "none",
+    "detail": "No message inventory seed or authoritative claim replay is introduced. Pages fold only selected message bodies from retained claims at a server-issued store-index cut. Existing runtime recovery remains unchanged."
   },
   "schema": {
     "status": "changed",
-    "detail": "Adds idempotent local message projection, pending-subject and generation tables, lookup indexes and claim/desired triggers. Existing tables and authoritative claim formats are unchanged. Retired projection versions are retained for the cursor lifetime and then reclaimed."
+    "detail": "Uses existing message endpoint and claim-order indexes plus one local cut-invalidation epoch table and claim/desired deletion, claim-update and replica-repair triggers. The earlier local message version, pending, retirement and generation tables and their write-maintenance triggers are removed idempotently on open. Authoritative claims and claim formats are unchanged."
   },
   "rules": {
     "status": "none",
-    "detail": "Checkpoint rules and shared projection digests are unchanged; the new tables are local read accelerators."
+    "detail": "Checkpoint rules and shared projection digests are unchanged. Deletion or repair that destroys a retained message cut invalidates that traversal instead of returning a partial successful page."
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Message fields, filters, ordering and graph snapshot consistency are preserved. New opaque cursors use a retained projection cut and keyset; pre-upgrade cached cursors require restarting pagination. Recipient delivery presence is assessed live on each page rather than frozen in the first page's collection cache."
+    "detail": "Message JSON, recipient/actor filters, ordering, reminder selection and snapshot-consistent traversal are preserved. Continuations require bounded server-issued metadata that binds the exact store cut, snapshot, filters, limit, position and expiry. Tampered, expired, evicted, restarted or deletion-invalidated cursors return HTTP 410/page-cursor-expired and require restarting pagination. Delivery presence remains live on each page while delivery age retains the first request time."
   },
   "downtime": {
     "status": "unknown",
-    "detail": "The one-time local projection seed runs before the API opens. Its startup cost on existing large stores has not been measured; allow time for that seed during the normal runtime rollout."
+    "detail": "The normal runtime restart is required, but this paging design adds no full message inventory seed before API availability. Existing stores with the earlier local version tables remove them during open. Cleanup and overall restart-to-API time on production-sized stores have not been measured."
   },
   "manual": {
     "status": "none",
-    "detail": "No manual migration or identity changes are required. A web client handles expired cursors by restarting pagination."
+    "detail": "No manual migration, identity change or claim-log maintenance is required. Clients restart pagination on page-cursor-expired."
   },
   "recovery": {
     "status": "changed",
-    "detail": "Binary swap-back does not remove the additive local tables or triggers. An older runtime continues using its original message readers; reopening with this runtime drains pending projection changes."
+    "detail": "Binary swap-back cannot restore issued in-memory cursor metadata; clients restart traversals. The authoritative claim log remains intact and older claim-based readers continue to work. A runtime that reintroduces the removed local body version store must recreate and seed it from claims."
   }
 }

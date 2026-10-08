@@ -292,18 +292,6 @@ async fn sql_message_cursor_refreshes_presence_but_keeps_first_delivery_age() {
     assert_eq!(second.items[0], expected_item);
 }
 
-fn process_cpu_time() -> Duration {
-    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: the pointer refers to an initialized, writable timespec.
-    assert_eq!(unsafe {
-        libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut time)
-    }, 0);
-    Duration::new(
-        u64::try_from(time.tv_sec).unwrap(),
-        u32::try_from(time.tv_nsec).unwrap(),
-    )
-}
-
 #[tokio::test]
 async fn sql_message_pages_match_desired_only_legacy_messages() {
     let root = tempfile::tempdir().unwrap();
@@ -372,27 +360,114 @@ async fn sql_message_pages_match_replicated_tied_claims_in_both_arrival_orders()
     }
 }
 
-#[tokio::test]
-#[ignore = "manual isolated old/new message paging timing comparison"]
-async fn benchmark_sql_message_pages_against_full_oracle() {
-    let root = tempfile::tempdir().unwrap();
-    let state = super::tests::state(root.path());
-    for index in 0..2_000 {
-        let sender = if index % 40 == 0 { "agent/sql-narrow" } else { "agent/sql-sender" };
-        append_fixture_claim(
-            &state.store, &format!("message/sql-9-{index:05}"), "message.sent", sender,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageBenchmarkDesign {
+    Version,
+    Small,
+}
+
+impl MessageBenchmarkDesign {
+    fn open(self, path: &Path) -> Store {
+        let store = Store::open(path, "message-page-benchmark").unwrap();
+        if self == Self::Version {
+            store.client_messages_enable_version_benchmark().unwrap();
+        }
+        store
+    }
+}
+
+fn message_benchmark_percentiles(samples: &mut [Duration]) -> Value {
+    samples.sort_unstable();
+    let percentile = |percent: usize| {
+        samples[(samples.len() * percent).div_ceil(100).saturating_sub(1)].as_secs_f64() * 1_000.0
+    };
+    json!({"samples": samples.len(), "p50_ms": percentile(50), "p95_ms": percentile(95)})
+}
+
+fn message_benchmark_storage(path: &Path) -> Value {
+    let bytes = |suffix: &str| {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        match std::fs::metadata(Path::new(&name)) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("benchmark storage measurement failed: {error}"),
+        }
+    };
+    let database = bytes("");
+    let wal = bytes("-wal");
+    let shm = bytes("-shm");
+    json!({"database_bytes": database, "wal_bytes": wal, "shm_bytes": shm,
+        "total_bytes": database + wal + shm})
+}
+
+struct MessageBenchmarkWriter<'a> {
+    store: &'a Store,
+    path: &'a Path,
+    samples: BTreeMap<&'static str, Vec<Duration>>,
+    claims: usize,
+    completed_wal_bytes: u64,
+    peak_wal_bytes: u64,
+}
+
+impl MessageBenchmarkWriter<'_> {
+    fn append(
+        &mut self, class: &'static str, subject: &str, kind: &str,
+        actor: &str, fields: BTreeMap<String, Value>,
+    ) {
+        // Equal accepted times and input order across designs, without timing clock setup.
+        self.store.set_write_clock_at(1_800_000_000_000 + u128::try_from(self.claims).unwrap()).unwrap();
+        let input = ClaimInput {
+            subject: subject.into(), kind: kind.into(), actor: Some(actor.into()), fields,
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        };
+        let start = Instant::now();
+        self.store.append_claim(&input).unwrap();
+        self.samples.entry(class).or_default().push(start.elapsed());
+        self.claims += 1;
+        // Disable SQLite's automatic checkpoint and use identical bounded segments.
+        // Checkpoint/file measurement is outside append timings but inside seed wall time.
+        if self.claims.is_multiple_of(256) {
+            self.record_wal_segment();
+            self.store.client_messages_benchmark_checkpoint().unwrap();
+        }
+    }
+
+    fn record_wal_segment(&mut self) {
+        let bytes = message_benchmark_storage(self.path)["wal_bytes"].as_u64().unwrap();
+        self.completed_wal_bytes += bytes;
+        self.peak_wal_bytes = self.peak_wal_bytes.max(bytes);
+    }
+}
+
+const MESSAGE_BENCHMARK_MESSAGES: usize = 128;
+const MESSAGE_BENCHMARK_METADATA: usize = 32;
+
+fn seed_message_benchmark(store: &Store, path: &Path) -> Value {
+    let mut writer = MessageBenchmarkWriter {
+        store, path, samples: BTreeMap::from([
+            ("message.sent", Vec::with_capacity(MESSAGE_BENCHMARK_MESSAGES)),
+            ("unrelated_metadata", Vec::with_capacity(MESSAGE_BENCHMARK_MESSAGES * MESSAGE_BENCHMARK_METADATA)),
+        ]), claims: 0,
+        completed_wal_bytes: 0, peak_wal_bytes: 0,
+    };
+    let start = Instant::now();
+    for index in 0..MESSAGE_BENCHMARK_MESSAGES {
+        let sender = if index % 3 == 0 { "agent/sql-narrow" } else { "agent/sql-sender" };
+        let recipient = if index % 2 == 0 { "person/sql-alex" } else { "agent/sql-recipient" };
+        writer.append(
+            "message.sent", &format!("message/sql-9-{index:05}"), "message.sent", sender,
             BTreeMap::from([
-                ("from".into(), json!(sender)),
-                ("to".into(), json!("agent/sql-recipient")),
+                ("from".into(), json!(sender)), ("to".into(), json!(recipient)),
                 ("content".into(), json!(format!("cost fixture {index}"))),
                 ("status".into(), json!("sent")),
             ]),
         );
     }
-    for index in 0..2_000 {
-        for metadata in 0..32 {
-            append_fixture_claim(
-                &state.store, &format!("message/sql-9-{index:05}"),
+    for index in 0..MESSAGE_BENCHMARK_MESSAGES {
+        for metadata in 0..MESSAGE_BENCHMARK_METADATA {
+            writer.append(
+                "unrelated_metadata", &format!("message/sql-9-{index:05}"),
                 "publication.operation", "agent/sql-sender",
                 BTreeMap::from([
                     ("operation".into(), json!(format!("fixture/{index}/{metadata}"))),
@@ -402,45 +477,181 @@ async fn benchmark_sql_message_pages_against_full_oracle() {
             );
         }
     }
-    let fixture_claims = state.store.index().unwrap();
-    let query = ClientListQuery {
-        history: true, actor: Some("agent/sql-narrow".into()), limit: Some(20),
-        ..Default::default()
-    };
-    // Fixture generation is outside all measured intervals. Run both orders against
-    // the same isolated store to show cold and warmed algorithm runs, not load.
-    for sql_first in [false, true] {
-        let snapshot = new_client_snapshot(&state);
-        let old = || {
+    let seed_wall = start.elapsed();
+    writer.record_wal_segment();
+    let classes = writer.samples.iter_mut().map(|(class, samples)| {
+        ((*class).to_owned(), message_benchmark_percentiles(samples))
+    }).collect::<serde_json::Map<String, Value>>();
+    assert_eq!(writer.claims, MESSAGE_BENCHMARK_MESSAGES * (MESSAGE_BENCHMARK_METADATA + 1));
+    json!({
+        "seed_wall_ms": seed_wall.as_secs_f64() * 1_000.0, "claims": writer.claims,
+        "append_claim_wall_including_commit": classes,
+        "wal_segment_bytes_total": writer.completed_wal_bytes,
+        "peak_wal_segment_bytes": writer.peak_wal_bytes,
+        "checkpoint_every_claims": 256,
+    })
+}
+
+fn read_message_benchmark_page(
+    store: &Store, design: MessageBenchmarkDesign, person: Option<&str>,
+    actor: Option<&str>, history: bool, after: Option<&(u128, String)>,
+) -> (Vec<Value>, Option<(u128, String)>, bool) {
+    let mut rows = store.read_snapshot(|cut_index| {
+        let generation = match design {
+            MessageBenchmarkDesign::Version => store.client_messages_version_generation()?,
+            MessageBenchmarkDesign::Small => cut_index,
+        };
+        match design {
+            MessageBenchmarkDesign::Version =>
+                store.client_messages_version_page(person, actor, history, generation, after, 20),
+            MessageBenchmarkDesign::Small =>
+                store.client_messages_page(person, actor, history, generation, after, 20),
+        }
+    }).unwrap();
+    let more = rows.len() > 20;
+    rows.truncate(20);
+    let key = rows.last().map(|(message, metadata, _)| {
+        (metadata["sent_at"].as_str().unwrap().parse::<u128>().unwrap(), message.subject.clone())
+    });
+    let items = rows.into_iter().map(|(message, metadata, current)| {
+        client_message_resource(message, &metadata, current, 1_800_000_100_000).unwrap()
+    }).collect::<Vec<_>>();
+    // Measure the same page-only resource construction and JSON serialization on both paths.
+    std::hint::black_box(serde_json::to_vec(&items).unwrap());
+    (items, key, more)
+}
+
+#[test]
+#[ignore = "manual isolated same-fixture version/small message paging comparison"]
+fn benchmark_sql_message_pages_against_full_oracle() {
+    const SAMPLES: usize = 21;
+    let cases = [
+        ("actor_history", None, Some("agent/sql-narrow"), true),
+        ("broad_history", None, None, true),
+        ("person_history", Some("person/sql-alex"), None, true),
+        ("broad_open", None, None, false),
+        ("person_open", Some("person/sql-alex"), None, false),
+    ];
+    let mut reference_pages = BTreeMap::new();
+    let mut small_narrow_within_target = true;
+    // Fresh disk stores, identical inputs. Never access live data. The bounded
+    // 4,224-claim short-content fixture is not a claim about 2–5GB production stores.
+    // Run one order to keep the isolated writer proof bounded.
+    for (round, designs) in [
+        [MessageBenchmarkDesign::Version, MessageBenchmarkDesign::Small],
+    ].into_iter().enumerate() {
+        for design in designs {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("messages.sqlite");
             let start = Instant::now();
-            let cpu = process_cpu_time();
-            let items = client_message_resources_old(
-                &state.store, None, true, query.actor.as_deref(),
-            ).unwrap();
-            (start.elapsed(), process_cpu_time() - cpu, items.len())
-        };
-        let before = (!sql_first).then(old);
-        let start = Instant::now();
-        let cpu = process_cpu_time();
-        let (_, Json(first)) = client_messages_sql_page(&state, snapshot.clone(), &query).await.unwrap();
-        let first_elapsed = start.elapsed();
-        let first_cpu = process_cpu_time() - cpu;
-        let continuation = ClientListQuery {
-            cursor: Some(first.page.next_cursor.expect("narrow actor spans pages")),
-            ..query.clone()
-        };
-        let start = Instant::now();
-        let cpu = process_cpu_time();
-        let (_, Json(second)) = client_messages_sql_page(&state, snapshot, &continuation).await.unwrap();
-        let next_elapsed = start.elapsed();
-        let next_cpu = process_cpu_time() - cpu;
-        let (old_elapsed, old_cpu, old_count) = before.unwrap_or_else(old);
-        eprintln!(
-            "order={} fixture_messages=2000 metadata_claims_per_message=32 fixture_claims={fixture_claims} actor=agent/sql-narrow history=true limit=20 old_wall={old_elapsed:?} old_cpu={old_cpu:?} old_items={old_count} sql_first_wall={first_elapsed:?} sql_first_cpu={first_cpu:?} first_items={} sql_next_wall={next_elapsed:?} sql_next_cpu={next_cpu:?} next_items={}",
-            if sql_first { "sql-before-old" } else { "old-before-sql" },
-            first.items.len(), second.items.len(),
-        );
-        assert_eq!(first.items.len(), 20);
-        assert_eq!(second.items.len(), 20);
+            let store = design.open(&path);
+            let empty_open = start.elapsed();
+            store.client_messages_benchmark_prepare_io().unwrap();
+            let empty_storage = message_benchmark_storage(&path);
+            let seed = seed_message_benchmark(&store, &path);
+            let live_storage = message_benchmark_storage(&path);
+            store.client_messages_benchmark_checkpoint().unwrap();
+            let checkpointed_storage = message_benchmark_storage(&path);
+            let growth = checkpointed_storage["database_bytes"].as_u64().unwrap()
+                - empty_storage["database_bytes"].as_u64().unwrap();
+            eprintln!("{}", json!({
+                "benchmark": "client_messages", "round": round, "design": format!("{design:?}"),
+                "fixture_messages": MESSAGE_BENCHMARK_MESSAGES, "metadata_claims_per_message": MESSAGE_BENCHMARK_METADATA, "limit": 20,
+                "empty_open_including_schema_ms": empty_open.as_secs_f64() * 1_000.0,
+                "seed": seed, "empty_storage": empty_storage, "seeded_live_storage": live_storage,
+                "seeded_checkpointed_storage": checkpointed_storage, "database_growth_bytes": growth,
+            }));
+            drop(store);
+            let start = Instant::now();
+            let store = design.open(&path);
+            let reopen = start.elapsed();
+            store.client_messages_benchmark_prepare_io().unwrap();
+            eprintln!("{}", json!({
+                "benchmark": "client_messages_open", "round": round, "design": format!("{design:?}"),
+                "populated_reopen_including_projection_open_ms": reopen.as_secs_f64() * 1_000.0,
+            }));
+            for (case, person, actor, history) in cases {
+                let start = Instant::now();
+                let (first, key, more) = read_message_benchmark_page(
+                    &store, design, person, actor, history, None,
+                );
+                let first_observed = start.elapsed();
+                assert_eq!(first.len(), 20, "{design:?}/{case}");
+                assert!(more, "{design:?}/{case} spans multiple pages");
+                for (phase, after) in [("first", None), ("next", key.as_ref())] {
+                    let (mut items, _, _) = read_message_benchmark_page(
+                        &store, design, person, actor, history, after,
+                    );
+                    // Claim IDs differ between fresh stores; all other returned fields must match.
+                    for item in &mut items { item.as_object_mut().unwrap().remove("revision"); }
+                    let expected = reference_pages.entry((case, phase)).or_insert_with(|| items.clone());
+                    assert_eq!(&items, expected, "{design:?}/{case}/{phase}");
+                    assert_eq!(items.len(), 20, "{design:?}/{case}/{phase}");
+                    for _ in 0..3 {
+                        std::hint::black_box(read_message_benchmark_page(
+                            &store, design, person, actor, history, after,
+                        ));
+                    }
+                    let mut samples = Vec::with_capacity(SAMPLES);
+                    for _ in 0..SAMPLES {
+                        let start = Instant::now();
+                        std::hint::black_box(read_message_benchmark_page(
+                            &store, design, person, actor, history, after,
+                        ));
+                        samples.push(start.elapsed());
+                    }
+                    let distribution = message_benchmark_percentiles(&mut samples);
+                    if design == MessageBenchmarkDesign::Small && case == "actor_history" {
+                        small_narrow_within_target &= distribution["p95_ms"].as_f64().unwrap() < 100.0;
+                    }
+                    eprintln!("{}", json!({
+                        "benchmark": "client_messages_page", "round": round,
+                        "design": format!("{design:?}"), "case": case, "phase": phase,
+                        "person": person, "actor": actor, "history": history, "limit": 20,
+                        "first_observed_case_page_ms": first_observed.as_secs_f64() * 1_000.0,
+                        "store_snapshot_page_resource_json_wall": distribution,
+                        "os_cache_evicted": false,
+                    }));
+                }
+            }
+            if design == MessageBenchmarkDesign::Small {
+                // A checkpointed copy of the identical source-only fixture models the
+                // original version design's one-time populated legacy-store backfill.
+                // Keep this work after small reads so enabling versions cannot bias them.
+                store.client_messages_benchmark_checkpoint().unwrap();
+                let legacy = root.path().join("legacy-backfill.sqlite");
+                std::fs::copy(&path, &legacy).unwrap();
+                let before = message_benchmark_storage(&legacy);
+                let start = Instant::now();
+                let migrated = MessageBenchmarkDesign::Version.open(&legacy);
+                let open_backfill = start.elapsed();
+                let after = message_benchmark_storage(&legacy);
+                let migrated_page = read_message_benchmark_page(
+                    &migrated, MessageBenchmarkDesign::Version, None, Some("agent/sql-narrow"), true, None,
+                );
+                assert_eq!(migrated_page.0.len(), 20);
+                let mut migrated_items = migrated_page.0;
+                for item in &mut migrated_items {
+                    item.as_object_mut().unwrap().remove("revision");
+                }
+                assert_eq!(
+                    &migrated_items, &reference_pages[&("actor_history", "first")],
+                    "legacy backfill must preserve the same page resources",
+                );
+                migrated.client_messages_benchmark_checkpoint().unwrap();
+                eprintln!("{}", json!({
+                    "benchmark": "client_messages_legacy_backfill", "round": round,
+                    "fixture_messages": MESSAGE_BENCHMARK_MESSAGES, "fixture_claims": MESSAGE_BENCHMARK_MESSAGES * (MESSAGE_BENCHMARK_METADATA + 1),
+                    "open_including_version_backfill_ms": open_backfill.as_secs_f64() * 1_000.0,
+                    "before_storage": before, "after_live_storage": after,
+                    "after_checkpointed_storage": message_benchmark_storage(&legacy),
+                }));
+            }
+        }
     }
+    eprintln!("{}", json!({
+        "benchmark": "client_messages_target", "case": "actor_history",
+        "limit": 20, "target_p95_ms_exclusive": 100,
+        "small_first_and_next_pass": small_narrow_within_target,
+    }));
 }
