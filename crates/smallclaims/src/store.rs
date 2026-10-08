@@ -1009,10 +1009,10 @@ pub struct ReplicationSnapshot {
     pub envelope_rows: usize,
     /// Changes to an existing inventory prefix or its checkpoint tombstones.
     pub inventory_generation: i64,
-    pub inventory: CompactReplicationInventory,
-    pub buckets: Vec<ReplicationInventoryBucket>,
+    pub inventory: Arc<CompactReplicationInventory>,
+    pub buckets: Arc<Vec<ReplicationInventoryBucket>>,
     /// The inventory digest state before each range in `buckets`.
-    pub digest_prefixes: Vec<Sha256>,
+    pub digest_prefixes: Arc<Vec<Sha256>>,
     pub authority_digest: String,
     pub graph_generation: i64,
     pub projection_generation: i64,
@@ -5483,17 +5483,24 @@ impl Store {
             .map(|previous| previous.legacy_graph_digest.clone());
         let inventory_generation = inventory_generation::current(connection)?;
         let full = |connection: &Connection| -> Result<_> {
-            let (inventory, max_rowid, envelope_rows) =
+            let (mut inventory, max_rowid, envelope_rows) =
                 load_compact_replication_inventory(connection)?;
             let buckets = inventory.buckets();
-            Ok((inventory, max_rowid, buckets, Vec::new(), 0, envelope_rows))
+            let mut digest_prefixes = Vec::new();
+            inventory.resume_digest(&buckets, &mut digest_prefixes, 0);
+            Ok((
+                Arc::new(inventory),
+                max_rowid,
+                Arc::new(buckets),
+                Arc::new(digest_prefixes),
+                envelope_rows,
+            ))
         };
         let (
-            mut inventory,
+            inventory,
             max_envelope_rowid,
             buckets,
-            mut digest_prefixes,
-            resume_from,
+            digest_prefixes,
             envelope_count,
         ) = if let Some(previous) = previous {
             let mut statement = connection.prepare(
@@ -5515,10 +5522,9 @@ impl Store {
             if inventory_generation == previous.inventory_generation {
                 let envelope_rows = previous.envelope_rows + additions.len();
                 let mut max_rowid = previous.max_envelope_rowid;
-                // Most snapshots are owned only by this cache. Move their inventory
-                // into the successor so a graph write does not allocate and free
-                // every envelope ID. Keep the old snapshot intact for concurrent
-                // callers that still hold it.
+                // A graph-only change keeps these immutable values shared even when a
+                // concurrent reader still holds the previous snapshot. Additions copy on
+                // write so that reader retains its exact inventory and digest prefixes.
                 let (mut inventory, mut buckets, digest_prefixes) = match Arc::try_unwrap(previous)
                 {
                     Ok(snapshot) => (
@@ -5532,42 +5538,52 @@ impl Store {
                         shared.digest_prefixes.clone(),
                     ),
                 };
-                let mut touched = BTreeSet::new();
-                for (rowid, identity) in additions {
-                    max_rowid = max_rowid.max(rowid);
-                    touched.insert((
-                        identity.writer.clone(),
-                        replication_bucket_start(identity.sequence),
-                    ));
-                    inventory.insert(identity);
-                }
-                // Only the ranges that gained an envelope need a new digest.
-                for (writer, start) in &touched {
-                    let bucket = inventory.bucket(inventory.range(writer, *start));
-                    match buckets.binary_search_by(|existing| {
-                        (existing.writer.as_str(), existing.start).cmp(&(writer.as_str(), *start))
-                    }) {
-                        Ok(position) => buckets[position] = bucket,
-                        Err(position) => buckets.insert(position, bucket),
+                let mut digest_prefixes = digest_prefixes;
+                if !additions.is_empty() {
+                    let mut touched = BTreeSet::new();
+                    let current = Arc::make_mut(&mut inventory);
+                    for (rowid, identity) in additions {
+                        max_rowid = max_rowid.max(rowid);
+                        touched.insert((
+                            identity.writer.clone(),
+                            replication_bucket_start(identity.sequence),
+                        ));
+                        current.insert(identity);
                     }
-                }
-                // Every range before the first one that gained an envelope is unchanged, so
-                // the inventory digest resumes there instead of hashing every identity again.
-                let resume_from = touched
-                    .iter()
-                    .map(|(writer, start)| {
-                        buckets.partition_point(|existing| {
-                            (existing.writer.as_str(), existing.start) < (writer.as_str(), *start)
+                    // Only the ranges that gained an envelope need a new digest.
+                    let ranges = Arc::make_mut(&mut buckets);
+                    for (writer, start) in &touched {
+                        let bucket = current.bucket(current.range(writer, *start));
+                        match ranges.binary_search_by(|existing| {
+                            (existing.writer.as_str(), existing.start)
+                                .cmp(&(writer.as_str(), *start))
+                        }) {
+                            Ok(position) => ranges[position] = bucket,
+                            Err(position) => ranges.insert(position, bucket),
+                        }
+                    }
+                    // Every range before the first addition is unchanged.
+                    let resume_from = touched
+                        .iter()
+                        .map(|(writer, start)| {
+                            ranges.partition_point(|existing| {
+                                (existing.writer.as_str(), existing.start)
+                                    < (writer.as_str(), *start)
+                            })
                         })
-                    })
-                    .min()
-                    .unwrap_or(buckets.len());
+                        .min()
+                        .unwrap_or(ranges.len());
+                    current.resume_digest(
+                        ranges,
+                        Arc::make_mut(&mut digest_prefixes),
+                        resume_from,
+                    );
+                }
                 (
                     inventory,
                     max_rowid,
                     buckets,
                     digest_prefixes,
-                    resume_from,
                     envelope_rows,
                 )
             } else {
@@ -5576,7 +5592,6 @@ impl Store {
         } else {
             full(connection)?
         };
-        inventory.resume_digest(&buckets, &mut digest_prefixes, resume_from);
         // Envelope hashes already commit the complete payload (and chain metadata). The
         // inventory digest therefore commits the authority log without hex-encoding and hashing
         // every payload again on each graph change.
@@ -5633,7 +5648,7 @@ impl Store {
             inventory: ReplicationInventory {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
-                buckets: snapshot.buckets.clone(),
+                buckets: snapshot.buckets.as_ref().clone(),
                 accepts: Some(replication_accepts()),
                 checkpoint: self.trimmed_checkpoint()?,
             },
@@ -5692,7 +5707,7 @@ impl Store {
                 inventory: ReplicationInventory {
                     digest: snapshot.inventory.digest.clone(),
                     envelopes: listed,
-                    buckets: snapshot.buckets.clone(),
+                    buckets: snapshot.buckets.as_ref().clone(),
                     accepts: Some(replication_accepts()),
                     checkpoint: self.trimmed_checkpoint()?,
                 },

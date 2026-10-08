@@ -54297,7 +54297,7 @@ fn replication_snapshot_inserts_new_envelopes_in_canonical_order() {
         incremental.inventory.digest,
         replication_inventory_digest(&full)
     );
-    assert_eq!(incremental.buckets, test_replication_buckets(&full));
+    assert_eq!(incremental.buckets.as_ref(), &test_replication_buckets(&full));
 }
 
 #[cfg(test)]
