@@ -1127,8 +1127,12 @@ fn subject_status_at_with_mode(
         .as_ref()
         .and_then(|row| row.member.as_deref())
         .and_then(|value| serde_json::from_str::<crate::model::MemberSpec>(value).ok());
-    let actual = latest_actual_at(connection, subject, at_index)?;
-    let (actual_claim, actual_origin, actual_origin_conflict) = selected_actual_source_at(
+    let ActualStateAndSource {
+        actual,
+        claim: actual_claim,
+        origin: actual_origin,
+        conflict: actual_origin_conflict,
+    } = actual_state_and_source_at(
         connection,
         subject,
         at_index,
@@ -20950,6 +20954,16 @@ fn selected_actual_source_at(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    selected_actual_source_from_rows(connection, subject, at_index, desired_host, &rows)
+}
+
+fn selected_actual_source_from_rows(
+    connection: &Connection,
+    subject: &str,
+    at_index: u64,
+    desired_host: Option<&str>,
+    rows: &[(String, String, String, Value)],
+) -> Result<(Option<String>, Option<String>, bool)> {
     let selected = rows
         .iter()
         .rev()
@@ -21102,30 +21116,107 @@ fn latest_actual_at(
     let registry = st3_schema::registry();
     for (kind, body) in rows {
         let value: Value = serde_json::from_str(&body)?;
-        let source = value.get("fields").unwrap_or(&value);
-        if let Some(fields) = source.as_object() {
-            if kind == "resource.observed" {
-                resources::merge_observation(&mut merged, fields);
-                continue;
-            }
-            if registry
-                .claim(&kind)
-                .is_some_and(|spec| spec.cardinality == st3_schema::Cardinality::StateTransition)
-            {
-                for field in registry
-                    .claim(&kind)
-                    .into_iter()
-                    .flat_map(|spec| spec.fields.keys())
-                {
-                    merged.remove(field);
-                }
-            }
-            for (key, value) in fields {
-                merged.insert(key.clone(), value.clone());
-            }
-        }
+        merge_actual_fields(&mut merged, registry, &kind, &value);
     }
     Ok(Some(Value::Object(merged)))
+}
+
+fn merge_actual_fields(
+    merged: &mut serde_json::Map<String, Value>,
+    registry: &st3_schema::Registry,
+    kind: &str,
+    value: &Value,
+) {
+    let source = value.get("fields").unwrap_or(value);
+    if let Some(fields) = source.as_object() {
+        if kind == "resource.observed" {
+            resources::merge_observation(merged, fields);
+            return;
+        }
+        if registry
+            .claim(kind)
+            .is_some_and(|spec| spec.cardinality == st3_schema::Cardinality::StateTransition)
+        {
+            for field in registry
+                .claim(kind)
+                .into_iter()
+                .flat_map(|spec| spec.fields.keys())
+            {
+                merged.remove(field);
+            }
+        }
+        for (key, value) in fields {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+struct ActualStateAndSource {
+    actual: Option<Value>,
+    claim: Option<String>,
+    origin: Option<String>,
+    conflict: bool,
+}
+
+/// Status consumes both the actual field fold and its canonical runtime provenance. Read their
+/// common history once, retaining each reducer's different treatment of harness kind casing.
+fn actual_state_and_source_at(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    desired_host: Option<&str>,
+) -> Result<ActualStateAndSource> {
+    let through = at_index.unwrap_or(i64::MAX as u64);
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT claims.id, claims.kind, claims.origin, claims.body,
+                claims.kind NOT LIKE 'harness.%'
+         FROM claims INDEXED BY claims_subject_kind_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND {ACTUAL_STATE_CLAIM} AND claims.store_index<=?2
+         ORDER BY {CANONICAL_ORDER}"
+    ))?;
+    let rows = statement
+        .query_map(params![subject, through], |row| {
+            let fold: bool = row.get(4)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                if fold { row.get::<_, String>(3)? } else { String::new() },
+                fold,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Finish the SQL cursor before JSON reduction, as the standalone actual-field fold does.
+    let registry = st3_schema::registry();
+    let mut merged = serde_json::Map::new();
+    let mut saw_actual = false;
+    let mut sources = Vec::new();
+    for (id, kind, origin, body, fold) in rows {
+        let value = if fold {
+            saw_actual = true;
+            let value: Value = serde_json::from_str(&body)?;
+            merge_actual_fields(&mut merged, registry, &kind, &value);
+            value
+        } else {
+            Value::Null
+        };
+        let runtime = kind == "runtime.observed";
+        sources.push((
+            id,
+            kind,
+            origin,
+            if runtime { value } else { Value::Null },
+        ));
+    }
+    let (claim, origin, conflict) =
+        selected_actual_source_from_rows(connection, subject, through, desired_host, &sources)?;
+    Ok(ActualStateAndSource {
+        actual: saw_actual.then(|| Value::Object(merged)),
+        claim,
+        origin,
+        conflict,
+    })
 }
 
 /// `columns` of subject `?1`'s claims of one `kind` at or before store index `?2`, newest first
@@ -24410,6 +24501,90 @@ mod fleet_admission_tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("runtime.restart-window-reset"))
         );
+    }
+
+    #[test]
+    fn status_actual_and_source_share_a_scan_without_changing_old_cuts() {
+        let subject = "agent/shared-actual-read";
+        let left = Store::open_memory("left").unwrap();
+        let right = Store::open_memory("right").unwrap();
+        let mut cuts = vec![0];
+        let add = |kind, fields| {
+            append(&left, kind, subject, fields);
+            left.index().unwrap()
+        };
+        cuts.push(add("harness.observed", json!({"state":"idle"})));
+        // The source selector includes this case variant, but the actual field fold does not.
+        {
+            let connection = left.connection.lock().unwrap();
+            connection.execute(
+                "UPDATE claims SET kind='Harness.observed' WHERE subject=?1",
+                [subject],
+            ).unwrap();
+        }
+        cuts.push(add("runtime.observed", json!({
+            "status":"running", "runtime_id":"shared-runtime", "incarnation_id":"first",
+            "terminal":true, "host":"left", "reachability":"reachable",
+        })));
+        cuts.push(add("runtime.observed", json!({"reason":"partial update"})));
+        cuts.push(add("runtime.observed", json!({"terminal":null})));
+        append(&right, "runtime.observed", subject, json!({
+            "status":"running", "runtime_id":"rival-runtime", "incarnation_id":"rival",
+            "terminal":false, "host":"right",
+        }));
+        left.import_replication("right", &right.export_replication(0).unwrap()).unwrap();
+        cuts.push(left.index().unwrap());
+        cuts.push(add("runtime.observed", json!({"status":"stopped", "incarnation_id":"first"})));
+        let resource_subject = "resource/shared-actual-read";
+        append(&left, "resource.observed", resource_subject,
+            json!({"kind":"vcs.repository", "facts":{"url":"https://example.invalid/repository"}}));
+        let resource_first_cut = left.index().unwrap();
+        append(&left, "resource.observed", resource_subject,
+            json!({"kind":"vcs.repository", "facts":{"state":"ready"}}));
+        let resource_cuts = vec![0, resource_first_cut, left.index().unwrap()];
+        let connection = left.readers.get();
+        for (subject, cuts) in [(subject, cuts), (resource_subject, resource_cuts)] {
+            for cut in cuts.into_iter().rev() {
+                for owner in [None, Some("left"), Some("right")] {
+                    let actual = latest_actual_at(&connection, subject, Some(cut)).unwrap();
+                    let source = selected_actual_source_at(&connection, subject, Some(cut), owner).unwrap();
+                    let combined = actual_state_and_source_at(&connection, subject, Some(cut), owner).unwrap();
+                    assert_eq!(combined.actual, actual, "actual subject={subject} cut={cut} owner={owner:?}");
+                    assert_eq!((combined.claim, combined.origin, combined.conflict), source,
+                        "source subject={subject} cut={cut} owner={owner:?}");
+                }
+            }
+        }
+        let first_resource = actual_state_and_source_at(&connection, resource_subject, Some(resource_first_cut), None).unwrap();
+        assert_eq!(first_resource.actual.unwrap()["facts"], json!({"url":"https://example.invalid/repository"}));
+        let resource = actual_state_and_source_at(&connection, resource_subject, None, None).unwrap();
+        assert_eq!(resource.actual.unwrap()["facts"], json!({"state":"ready"}));
+        let combined = actual_state_and_source_at(&connection, subject, None, None).unwrap();
+        assert_eq!(combined.actual, latest_actual_at(&connection, subject, None).unwrap());
+        assert_eq!((combined.claim, combined.origin, combined.conflict),
+            selected_actual_source_at(&connection, subject, None, None).unwrap());
+    }
+
+    #[test]
+    fn status_actual_and_source_run_one_history_statement() {
+        let store = Store::open_memory("owner").unwrap();
+        let subject = "agent/shared-actual-cost";
+        for number in 0..64 {
+            append(&store, "runtime.observed", subject, json!({
+                "status":"running", "runtime_id":"shared-runtime", "incarnation_id":"first",
+                "terminal":true, "reason":format!("update-{number}"),
+            }));
+        }
+        let connection = store.readers.get();
+        STATEMENTS_RUN.with(|run| run.set(0));
+        let actual = latest_actual_at(&connection, subject, None).unwrap();
+        let source = selected_actual_source_at(&connection, subject, None, None).unwrap();
+        assert_eq!(STATEMENTS_RUN.with(std::cell::Cell::get), 2);
+        STATEMENTS_RUN.with(|run| run.set(0));
+        let combined = actual_state_and_source_at(&connection, subject, None, None).unwrap();
+        assert_eq!(STATEMENTS_RUN.with(std::cell::Cell::get), 1);
+        assert_eq!(combined.actual, actual);
+        assert_eq!((combined.claim, combined.origin, combined.conflict), source);
     }
 
     #[test]

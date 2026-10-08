@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Read canonical actual state and runtime provenance once per status reduction.",
+  "replay": {"status": "none", "detail": "Existing claim selection and field reduction are unchanged."},
+  "schema": {"status": "none", "detail": "No schema, index or stored data change."},
+  "rules": {"status": "none", "detail": "No checkpoint, digest or admission rule change."},
+  "compatibility": {"status": "none", "detail": "Full status and terminal resources retain all fields, snapshot cuts and runtime authority semantics."},
+  "manual": {"status": "none", "detail": "No configuration or store repair is required."},
+  "recovery": {"status": "none", "detail": "Read-only implementation change; ordinary binary rollback requires no data conversion."},
+  "downtime": {"status": "unknown", "detail": "Normal daemon restart; duration is not measured by this change."}
+}
