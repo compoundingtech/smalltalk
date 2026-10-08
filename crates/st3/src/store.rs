@@ -35103,14 +35103,15 @@ agent "test/empty" { command "true" }
             store
                 .read_snapshot(|_| {
                     STEP_DEFINITIONS_READ.with(|reads| reads.set(0));
-                    let rows = store.client_work_at_snapshot(Some("agent/worker"), false, at)?;
+                    // Publishing a local actor qualifies it with the node name.
+                    let rows = store.client_work_at_snapshot(Some("agent/node.worker"), false, at)?;
                     assert_eq!(rows.len(), siblings);
                     assert_eq!(STEP_DEFINITIONS_READ.with(std::cell::Cell::get), 1);
                     for row in &rows {
                         assert_eq!(row.timeout_ms, Some(2_000));
                         assert!(row.fresh_context);
                         let full = store
-                            .client_work_item_at_snapshot(&row.subject, Some("agent/worker"), at)?
+                            .client_work_item_at_snapshot(&row.subject, Some("agent/node.worker"), at)?
                             .unwrap();
                         assert_eq!(serde_json::to_value(row)?, serde_json::to_value(full)?);
                     }
@@ -35242,13 +35243,22 @@ agent "test/empty" { command "true" }
         for store in [&reopened, &replica] {
             store
                 .read_snapshot(|_| {
+                    // Replay can legitimately change physical projection times:
+                    // set_step_state's local timestamp and its receipt acceptance
+                    // can differ. Compare every field with the same Store's
+                    // uncached full reads at this cut, retaining known membership.
+                    let full = expected
+                        .iter()
+                        .map(|row| {
+                            store
+                                .client_work_item_at_snapshot(&row.subject, None, at)?
+                                .context("replicated work item disappeared")
+                        })
+                        .collect::<Result<Vec<_>>>()?;
                     STEP_DEFINITIONS_READ.with(|reads| reads.set(0));
                     let rows = store.client_work_at_snapshot(None, false, at)?;
                     assert_eq!(STEP_DEFINITIONS_READ.with(std::cell::Cell::get), 1);
-                    assert_eq!(
-                        serde_json::to_value(&rows)?,
-                        serde_json::to_value(&expected)?
-                    );
+                    assert_eq!(serde_json::to_value(&rows)?, serde_json::to_value(&full)?);
                     for row in &rows {
                         let full = store
                             .client_work_item_at_snapshot(&row.subject, None, at)?

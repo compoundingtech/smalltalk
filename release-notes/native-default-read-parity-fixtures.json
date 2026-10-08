@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Correct native current-work and root-tree parity fixtures",
+  "replay": {
+    "status": "none",
+    "detail": "No projection, admission or replay changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers or persisted formats change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Effective work state, visibility, queue ranking and gate evaluation rules are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Production behavior is unchanged. Test fixtures use native actor qualification and the native diagnostic parser; replicated rows retain complete-field parity against uncached reads at the same Store snapshot and captured clock."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Only the normal binary restart is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing stores require no manual action or coordinated upgrade."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No migration is introduced; older binaries can read the unchanged database."
+  }
+}

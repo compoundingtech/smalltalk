@@ -23,7 +23,9 @@ mission "tree-empty" state="ready" {
  concurrent-runs max=8
  gate "exit" { field "exit_code" "exec/probe" "is" 0 }
 }"#;
-    let intent = crate::graph::parse_intent(source, "node").unwrap();
+    // Native fixtures can include the standalone diagnostic runtime retained
+    // by the Store, alongside the public mission declarations.
+    let intent = crate::graph::parse_test_intent(source, "node").unwrap();
     let plan = store
         .mission(
             &intent,
