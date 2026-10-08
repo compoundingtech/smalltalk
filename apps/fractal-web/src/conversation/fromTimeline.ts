@@ -90,26 +90,6 @@ const isTurnHeader = (entry: Entry) =>
 const MAILBOX_CONTENT_ID = /^timeline-entry\/[^/]+\/(?:[0-9a-f]{16}-content|[0-9a-f]{24})$/
 
 /**
- * st merges native and mailbox items by `(timestamp, sequence)` (`client_v0.rs`
- * `native_timeline_page`); the fold mirrors that exact server rule, because mail
- * and harness sequences live in unrelated number spaces.
- */
-const stampOf = (entry: Entry): string =>
-  entry.type === 'unrecognized' ? entry.timestamp ?? '' : DateTime.formatIso(entry.timestamp)
-
-/** Whether `a` sorts at or before `b` under the server's `(timestamp, sequence)` rule. */
-const notAfter = (a: Entry, b: Entry): boolean => {
-  const stamp = stampOf(a).localeCompare(stampOf(b))
-  return stamp < 0 || (stamp === 0 && a.sequence <= b.sequence)
-}
-
-/** Whether `a` sorts strictly before `b` under the same rule. */
-const strictlyBefore = (a: Entry, b: Entry): boolean => {
-  const stamp = stampOf(a).localeCompare(stampOf(b))
-  return stamp < 0 || (stamp === 0 && a.sequence < b.sequence)
-}
-
-/**
  * Join only st-minted mailbox pairs, never adjacent harness prose. Native pairs share a digest;
  * stored pairs have separate digests but share their claim's session, timestamp and sequence slot.
  */
@@ -121,7 +101,6 @@ const mailboxPairKey = (entry: Entry): string | undefined => {
   return stored === null ? undefined
     : `${stored[1]}|${entryTimestamp(entry)}|${entry.sequence - (entry.type === 'content' ? 1 : 0)}`
 }
-
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))
 
 /** st3 explicitly marks unsupported omp entries; ordinary prose/JSON is never guessed at. */
@@ -323,9 +302,15 @@ export interface TimelineProjection {
  * Live frames almost only touch the tail: the streaming entry's next revision, appended entries,
  * a result joining a recent call. `apply` records the lowest touched position and `project`
  * re-projects only from there, so a frame costs O(frame + suffix), not O(session). Anything that
- * reorders history (an older page, a sequence change) or flips session activity (every
+ * replaces history (a replace page, an entry changing type) or flips session activity (every
  * unanswered call becomes `interrupted`) re-projects in full. Items keep their object identity
  * while their entry, joined result and activity input are unchanged.
+ *
+ * Entries keep the order st delivered them in. Each replace page arrives ordered by its own
+ * projection's rule (the native page by `(timestamp, sequence)`, the stored fallback by
+ * `sequence`), but a chunk names neither its projection nor where a delta entry merges into the
+ * window, so the fold imposes no ordering of its own: deltas append, revisions stay in place,
+ * and the next replace page is authoritative.
  */
 export class LiveTimeline {
   private readonly entries = new Map<string, Entry>()
@@ -381,24 +366,19 @@ export class LiveTimeline {
       changed = true
       // Mail may arrive after its native delivery; visibility depends on the whole shown set.
       if (entry.type === 'message' || previous?.type === 'message') this.dirtyFrom = 0
-      const last = this.ordered.at(-1)
       // A later mailbox content entry may absorb a header already rendered in an earlier frame.
       if (entry.type === 'content' && MAILBOX_CONTENT_ID.test(entry.id)) this.dirtyFrom = 0
       let at: number
-      if (
-        previous !== undefined &&
-        previous.sequence === entry.sequence &&
-        previous.type === entry.type
-      ) {
-        at = this.positionOf(previous)
-        this.ordered[at] = entry
-      } else if (previous === undefined && (last === undefined || notAfter(last, entry))) {
+      if (previous === undefined) {
         at = this.ordered.push(entry) - 1
       } else {
-        if (previous !== undefined) this.ordered.splice(this.positionOf(previous), 1)
-        this.ordered.splice(this.insertionIndex(entry), 0, entry)
-        this.reindex = true
-        continue
+        // Revisions almost always touch the streaming tail, so the backward scan is short.
+        at = this.ordered.lastIndexOf(previous)
+        this.ordered[at] = entry
+        if (previous.type !== entry.type) {
+          this.reindex = true
+          continue
+        }
       }
       this.dirtyFrom = Math.min(this.dirtyFrom, at)
       // A revision that re-points a call or result to another call id invalidates the join index.
@@ -549,25 +529,5 @@ export class LiveTimeline {
     }
     this.cache.set(entry.id, { entry, result, active, item })
     return item
-  }
-
-  private insertionIndex(entry: Entry): number {
-    let low = 0
-    let high = this.ordered.length
-    while (low < high) {
-      const mid = (low + high) >>> 1
-      if (notAfter(this.ordered[mid]!, entry)) low = mid + 1
-      else high = mid
-    }
-    return low
-  }
-
-  /** Position of an entry already in `ordered`; searches back from its sort slot. */
-  private positionOf(entry: Entry): number {
-    for (let at = this.insertionIndex(entry) - 1; at >= 0; at -= 1) {
-      if (this.ordered[at]!.id === entry.id) return at
-      if (strictlyBefore(this.ordered[at]!, entry)) break
-    }
-    return this.ordered.findIndex((candidate) => candidate.id === entry.id)
   }
 }
