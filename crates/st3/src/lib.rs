@@ -1,5 +1,10 @@
 //! st3 claims graph, API, reconciliation, and CLI support.
 
+#[cfg(any(test, feature = "test-support"))]
+#[macro_use]
+#[path = "../../../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 pub mod accounts;
 pub mod api;
 pub mod archive;
@@ -28,6 +33,7 @@ pub mod gate_kinds;
 pub mod gate_report;
 pub mod github_watch;
 pub mod graph;
+pub(crate) mod graph_watch_ivm;
 pub mod harness_events;
 /// The lifecycle hook set st3 publishes beneath its own state directory.
 pub mod hooks;

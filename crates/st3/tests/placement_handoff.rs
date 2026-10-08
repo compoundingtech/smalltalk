@@ -505,7 +505,7 @@ agent "example/mover" {{
         let home = self.root.path().to_owned();
         let args = args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
         tokio::task::spawn_blocking(move || {
-            std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+            std::process::Command::new(test_bin!("st3"))
                 .env_remove("ST_AGENT")
                 .env_remove("ST_MISSION_RUN")
                 .env("HOME", &home)

@@ -3,6 +3,10 @@
 //! person on that device. The shared vectors in `fixtures/clients/device-signing-v1.json` are the
 //! bytes every client must build; the TypeScript and Swift clients test against the same file.
 
+#[macro_use]
+#[path = "../../../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1835,7 +1839,7 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
 }
 
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/clients/device-signing-v1.json")
+    PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../../fixtures/clients/device-signing-v1.json")
 }
 
 /// A test-only P-256 key, made for these vectors and used nowhere else.

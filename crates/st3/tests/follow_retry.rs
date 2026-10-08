@@ -68,7 +68,7 @@ async fn scripted_cli(args: &[&str], script: Vec<(String, Reply)>) -> Output {
         }
     });
     let mut command =
-        st3::test_support::async_command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+        st3::test_support::async_command(test_bin!("st3-fixture"));
     command
         .kill_on_drop(true)
         .env("NO_COLOR", "1")

@@ -94,12 +94,38 @@ failure, cancellation or skipping either shard fails the gate. Each shard retain
 durations in its logs, and the primary saves `ci-logs/test-partitions.json` with the tested SHA
 and all three inventories.
 
-Both shards keep their own checkouts and builds because many tests embed build-time source and
-executable paths. Namespace's second shard restores the same main-seeded Cargo and Nix cache
-keys as the primary. Moving portable archives between runners remains a follow-up after those
-tests support relocation. Building selected targets before installing hooks removes the earlier
-standalone `cargo run -p st2` build. Local and macOS runs use the complete selection unless
-`CI_TEST_PARTITION` is explicitly set to `hash:1/2` or `hash:2/2`.
+The Linux `linux-test-build` job compiles the existing two selected Cargo groups once and
+publishes nextest archives. Both shards, the zero-retry mail job and isolation VM require that
+successful producer and download its exact artifact ID. They check the manifest SHA, source/tree,
+run, the successful producer attempt, architecture, nextest/rustc versions and each archive digest before extracting.
+A failed-jobs-only rerun can inherit the earlier successful producer output; its attempt and
+manifest remain explicitly pinned, with the same run/source/tree/tool identities required. Cargo
+target caches remain on the producer; consumers restore only runtime/Nix fixtures. The producer also runs the unchanged standalone conversation-model tests (including doctests)
+and dependency boundary, and builds the gateway binary with its standalone production features.
+Its Cargo JSON and binary hash are retained alongside the archives; the VM does not substitute
+the workspace-unified test binary. A failed producer explicitly fails consumer checks and the gate.
+
+Tests resolve archived executables through nextest's runtime binary paths. A source guard rejects raw compiled binary, manifest and temporary-directory lookups in test code.
+Manifest/fixture paths
+map each compiled package beneath the recorded producer root to the consumer checkout, including
+library fixtures launched by another package. Outside archives the original compiled path remains
+the fallback. Archive mode rejects missing or mismatched roots/binaries. Tests, assertions,
+partitions, retries, eight test threads, real VM checks and required contexts are unchanged.
+Local and macOS runs still use the existing build selection unless `CI_TEST_PARTITION` is set.
+
+New test files and paths are checked automatically by `genie-freshness` on each PR and
+merge group. A guard failure names each file and line and points its author to `test_env!`
+and these repair instructions; it does not allow the raw path through.
+If `genie-freshness` reports `unrelocated test paths: FILE:LINE`, replace the raw test path
+at that location with `test_env!("CARGO_BIN_EXE_st3-fixture")`,
+`test_env!("CARGO_MANIFEST_DIR")` or `test_env!("CARGO_TARGET_TMPDIR")`, as appropriate.
+Use `test_env!("CARGO_MANIFEST_DIR", "/relative/fixture")` instead of a `concat!` fixture
+path, and `test_bin!("st3-fixture")` instead of `cargo_bin!`. The integration test root and
+test-enabled libraries already import `scripts/ci-test-paths.rs`; a separate test target
+must import that helper with `#[macro_use]` and a `#[path = "..."]` relative to its source
+file. Keep the original fixture, executable, arguments and assertions. Run
+`python3 scripts/check-ci-test-paths` and the affected test before pushing. Apply the same
+fix if a merge group finds a raw path introduced by another PR; do not bypass the guard.
 
 Main upkeep probes the exact Cargo and Nix cache keys for each stage before provisioning Nix
 or restoring build archives. When both entries exist it stops after the probes. A miss is flagged

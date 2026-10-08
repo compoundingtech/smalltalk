@@ -7,12 +7,12 @@ fn controller_death_cleanup() {
     if st3::test_support::supervise_test() {
         return;
     }
-    let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = std::path::PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = st3::test_support::command("python3")
         .args(["-m", "unittest", "discover", "-s"])
         .arg(repo.join("scripts/st3-messaging-faults-eval"))
         .args(["-p", "test_*.py"])
-        .env("ST3_MFE_TEST_BINARY", env!("CARGO_BIN_EXE_st3-fixture"))
+        .env("ST3_MFE_TEST_BINARY", test_env!("CARGO_BIN_EXE_st3-fixture"))
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
         .expect("run messaging cleanup, oracle, readiness and timing regressions");
@@ -27,7 +27,7 @@ fn controller_death_cleanup() {
 fn run_case(case: &str) {
     use std::path::PathBuf;
 
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let old = match std::env::var_os("ST3_MESSAGING_COMPAT_BIN") {
         Some(path) => PathBuf::from(path),
         None => {
@@ -76,14 +76,14 @@ fn run_case(case: &str) {
     // artifact filesystem while the Python fixture keeps its Unix sockets in a short /tmp root.
     let scratch = tempfile::Builder::new()
         .prefix("messaging-fault-scratch-")
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .tempdir_in(test_env!("CARGO_TARGET_TMPDIR"))
         .unwrap();
     // Double-fork out of the CI seat's ancestry. A sender is person/eval; an st harness
     // must never impersonate that sender. Captured pipes stay open until the eval exits.
     let output = st3::test_support::command("setsid")
         .args(["-f", "env", "-u", "ST_AGENT", "python3"])
         .arg(repo.join("scripts/st3-messaging-faults-eval/run"))
-        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
+        .arg(test_env!("CARGO_BIN_EXE_st3-fixture"))
         .arg(&evidence)
         .arg("--old-binary")
         .arg(old)

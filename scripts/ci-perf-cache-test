@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import threading
@@ -69,10 +70,21 @@ for field, value in [('head_branch', 'example-branch'), ('conclusion', 'failure'
     assert not module.trusted(dict(run, **{field: value}))
 assert module.trusted_snapshot(dict(run, conclusion='failure'))
 assert not module.trusted_snapshot(dict(run, conclusion='cancelled'))
+# Use the producer's declared serialized names rather than a shortened mock label.
+producer = (root / 'crates/st3/tests/daemon_load.rs').read_text()
+def producer_regime(variant):
+    name = re.search(r'Self::' + variant + r' => "([^"\n]+)"', producer)
+    assert name is not None, f'missing producer regime {variant}'
+    return name[1]
+steady_regime = producer_regime('Steady')
+upgrade_regime = producer_regime('Upgrade')
 assert module.valid_report(report)
+assert module.valid_report(dict(report, regime=steady_regime))
 for field, value in [('scale', 0.1), ('claims', 0), ('seconds', 5), ('long_poll_seats', 1),
                      ('paths', {}), ('paths', []), ('daemon_cores', float('nan')),
-                     ('daemon_cores', True), ('seconds', None)]:
+                     ('daemon_cores', True), ('seconds', None), ('regime', upgrade_regime),
+                     ('regime', 'steady'),
+                     ('regime', None)]:
     assert not module.valid_report(dict(report, **{field: value}))
 assert not module.valid_report([]) and not module.valid_report(None)
 
@@ -195,6 +207,9 @@ with tempfile.TemporaryDirectory() as tmp:
     missing_previous_artifacts = False
     overlap_probe = True
     archive_downloads = threading.Barrier(2)
+    # Match the real two-regime upload, including a deliberately different upgrade cost.
+    report_files = {'load.json': report,
+                    'upgrade/load.json': dict(report, regime=upgrade_regime, daemon_cores=99)}
 
     def api(path):
         if '/pulls/1/commits?' in path:
@@ -222,7 +237,10 @@ with tempfile.TemporaryDirectory() as tmp:
         downloads.append((selected['id'], name))
         dest.mkdir(parents=True)
         if name == 'perf-load-logs':
-            (dest / 'load.json').write_text(json.dumps(report))
+            for name, value in report_files.items():
+                file = dest / name
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text(json.dumps(value))
 
     def unpack(archive, destination, names):
         for name in names:
@@ -236,8 +254,33 @@ with tempfile.TemporaryDirectory() as tmp:
     overlap_probe = False
     assert len(downloads) == 7  # two snapshots, five newest real reports
     assert sorted(p.name for p in (temp / 'perf-baseline').iterdir()) == [f'load-{i}.json' for i in range(4, 9)]
+    assert all(json.loads(p.read_text()) == report for p in (temp / 'perf-baseline').iterdir())
     assert (work / 'target/cached').read_text() == 'snapshot'
     assert (temp / 'st-ci-cache/cached').exists() and (temp / 'st-bench/cached').exists()
+    # Explicit steady and legacy reports remain supported; upgrade-only or mislabeled
+    # root reports must fail before they can supply any historical comparison.
+    original_reports = report_files
+    report_files = {**report_files, 'load.json': dict(report, regime=steady_regime)}
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.restore()
+    assert all(json.loads(p.read_text())['regime'] == steady_regime
+               for p in (temp / 'perf-baseline').iterdir())
+    for layout, message in [
+        ({'upgrade/load.json': report}, 'missing its steady load report'),
+        ({'nested/load.json': report}, 'missing its steady load report'),
+        ({'load.json': dict(report, regime=upgrade_regime)}, 'incompatible workload'),
+        ({'load.json': dict(report, seconds=5)}, 'incompatible workload'),
+    ]:
+        report_files = layout
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                module.restore()
+        except ValueError as error:
+            assert message in str(error)
+        else:
+            raise AssertionError('invalid steady baseline must fail closed')
+        assert list((temp / 'perf-baseline').iterdir()) == []
+    report_files = original_reports
     # Reruns may reuse their successful previous attempt despite the current in-progress status.
     os.environ['GITHUB_RUN_ATTEMPT'] = '2'
     downloads.clear()

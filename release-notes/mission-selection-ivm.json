@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Prepare keyed mission selection and run-count maintenance with real Store parity controls",
+  "replay": {
+    "status": "none",
+    "detail": "Default Store readers and runtime registration are unchanged. The opt-in source operator has no read/open history replay or implicit populated-source seed."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Explicit View registration creates local mission selection/count/dirty/clock tables, source triggers and ordered indexes. No default production schema version changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Canonical source admission, effective work state and checkpoint rules are unchanged. These local shadow outputs are not authority or a checkpoint coverage certificate."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client route, cursor, socket protocol or work-action changes. The prepared selection interface preserves existing timestamp DESC/public-ID ASC seeks and filters before page slots; it does not certify complete mission cards."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No production registration or reader activation. No additional restart or startup recovery work is introduced."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Consumer adoption must explicitly register the operator, certify complete projected-source dependencies, install populated state and process bounded source/clock pages before reading. Full card, work and authorization dependencies need separate proof."
+  },
+  "recovery": {
+    "status": "unknown",
+    "detail": "Prepared shadow rows persist and reopen controls pass. Incompatible source mutations remain fenced; populated installation, checkpoint adoption and cross-runtime restore/rollback activation are not certified."
+  }
+}

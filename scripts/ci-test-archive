@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Build one pair of nextest archives, or verify/extract that run's exact-source pair."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+
+FILES = ('workspace.tar.zst', 'st2.tar.zst', 'sekrets-st3', 'production-build.json')
+
+
+def output(*command):
+    return subprocess.check_output(command, text=True).strip()
+
+
+def digest(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def identity():
+    return {'source': output('git', 'rev-parse', 'HEAD'), 'tree': output('git', 'rev-parse', 'HEAD^{tree}'),
+            'run': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+            'platform': platform.machine(), 'nextest': output('cargo', 'nextest', '--version'),
+            'rustc': output('rustc', '-vV'),
+            'recipe': digest(Path('scripts/ci-nextest')),
+            'paths': digest(Path('scripts/ci-test-paths.rs'))}
+
+
+def verify(manifest, current, directory, producer_attempt):
+    expected = {**current, "attempt": producer_attempt}
+    if not producer_attempt.isdecimal() or not 1 <= int(producer_attempt) <= int(current["attempt"]):
+        raise ValueError("invalid successful producer attempt")
+    if manifest.get('standalone_model') is not True:
+        raise ValueError('standalone model tests and dependency boundary must pass in the producer')
+    if manifest.get('version') != 1 or manifest.get('identity') != expected:
+        raise ValueError('test archive source/run/attempt/platform/tool/recipe identity mismatch')
+    if set(manifest.get('files', {})) != set(FILES):
+        raise ValueError('both selected archive groups are required')
+    if not Path(manifest['workspace']).is_absolute():
+        raise ValueError('build workspace must be absolute')
+    for name in FILES:
+        if digest(directory / name) != manifest['files'][name]:
+            raise ValueError(f'test archive digest mismatch: {name}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('build', 'consume'))
+    args = parser.parse_args()
+    directory = Path(os.environ['RUNNER_TEMP']) / 'ci-test-archives'
+    current = identity()
+    if current['source'] != os.environ['GITHUB_SHA']:
+        raise ValueError('checkout must match the workflow tested SHA')
+    if args.action == 'build':
+        directory.mkdir(parents=True, exist_ok=True)
+        subprocess.run(['cargo', 'nextest', 'archive', '--workspace', '--exclude', 'st2', '--locked',
+                        '--profile', 'ci', '--archive-file', str(directory / FILES[0])], check=True)
+        subprocess.run(['cargo', 'nextest', 'archive', '-p', 'st2', '--test', 'integration', '--test',
+                        'agent_resource', '--test', 'driver_expansion', '--locked', '--profile', 'ci',
+                        '--archive-file', str(directory / FILES[1])], check=True)
+        # Keep the original no-default-features unit/integration/doc tests and dependency gate,
+        # using the producer's compiler cache instead of rebuilding in the runtime consumer.
+        subprocess.run(['bash', 'scripts/ci-linux', 'conversation-model'], check=True)
+        # The real-user gateway must retain the standalone production feature set.
+        with (directory / 'production-build.json').open('w') as stream:
+            subprocess.run(['cargo', 'build', '--locked', '-p', 'st3', '--bin', 'st3',
+                            '--message-format=json'], check=True, stdout=stream)
+        artifacts = [json.loads(line) for line in (directory / 'production-build.json').read_text().splitlines()]
+        binaries = [item for item in artifacts if item.get('reason') == 'compiler-artifact'
+                    and item['target']['name'] == 'st3' and item.get('executable')]
+        if len(binaries) != 1 or 'test-support' in binaries[0]['features'] or binaries[0]['profile']['test']:
+            raise ValueError('standalone production gateway feature/profile identity required')
+        import shutil
+        shutil.copy2(binaries[0]['executable'], directory / 'sekrets-st3')
+        manifest = {'version': 1, 'standalone_model': True, 'identity': current, 'workspace': str(Path.cwd().resolve()),
+                    'files': {name: digest(directory / name) for name in FILES}}
+        (directory / 'manifest.json').write_text(json.dumps(manifest, sort_keys=True, indent=2) + '\n')
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+            stream.write('producer-attempt=' + current['attempt'] + '\n')
+            stream.write('manifest-sha256=' + digest(directory / 'manifest.json') + '\n')
+    else:
+        manifest_path = directory / 'manifest.json'
+        if digest(manifest_path) != os.environ['CI_TEST_ARCHIVE_MANIFEST_SHA256']:
+            raise ValueError('test archive manifest differs from the successful producer output')
+        manifest = json.loads(manifest_path.read_text())
+        verify(manifest, current, directory, os.environ['CI_TEST_ARCHIVE_PRODUCER_ATTEMPT'])
+        extracted = Path(os.environ['RUNNER_TEMP']) / 'ci-test-extracted'
+        for group, name in zip(('workspace', 'st2'), FILES):
+            destination = extracted / group
+            destination.mkdir(parents=True, exist_ok=True)
+            # Extract/list metadata once. Subsequent inventories and runs use these metadata files,
+            # without another extraction or invoking a build.
+            subprocess.run(['cargo', 'nextest', 'list', '--archive-file', str(directory / name),
+                            '--extract-to', str(destination), '--extract-overwrite', '--workspace-remap',
+                            str(Path.cwd()), '--list-type', 'binaries-only', '--message-format', 'json'], check=True)
+        hooks = extracted / 'st2/target/debug/st2'
+        if not hooks.is_file() or not os.access(hooks, os.X_OK):
+            raise ValueError('the matching rendered-hook executable must be archived')
+        scratch = Path(os.environ['RUNNER_TEMP']) / 'ci-test-scratch'
+        scratch.mkdir(exist_ok=True)
+        production = directory / 'sekrets-st3'
+        # Actions artifact transfer does not retain executable permissions; bytes were just
+        # hash-verified against the producer manifest, so restore the intended binary mode.
+        production.chmod(0o755)
+        with open(os.environ['GITHUB_ENV'], 'a') as stream:
+            for key, value in {'CI_TEST_EXTRACTED': str(extracted),
+                               'CI_TEST_BUILD_WORKSPACE': manifest['workspace'],
+                               'CI_TEST_WORKSPACE': str(Path.cwd()),
+                               'CI_TEST_HOOKS_BINARY': str(hooks),
+                               'CI_TEST_TARGET_TMPDIR': str(scratch),
+                               'CI_SEKRETS_BINARY': str(production)}.items():
+                if '\n' in value or '\r' in value:
+                    raise ValueError('invalid workflow environment path')
+                stream.write(f'{key}={value}\n')
+        print('Verified both exact-source test archives:', current, flush=True)
+
+
+if __name__ == '__main__':
+    main()

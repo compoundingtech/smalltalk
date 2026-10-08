@@ -56,4 +56,17 @@ with tempfile.TemporaryDirectory() as temp:
         result = subprocess.run(["bash", "scripts/ci-nextest", action, *extra], cwd=root, env=env, capture_output=True)
         assert result.returncode == 2 and not calls.exists(), "incomplete shard count must fail before Cargo"
 
+    # Archive reuse must preserve both group executions and failure propagation, without Cargo selectors.
+    calls.unlink(missing_ok=True)
+    env.update(CI_TEST_EXTRACTED=str(scratch / 'extracted'), CI_TEST_WORKSPACE=str(root), CI_TEST_PARTITION='hash:2/2')
+    cargo.write_text('#!/usr/bin/env python3\nimport json, os, sys\nwith open(os.environ["CALLS"], "a") as stream: stream.write(json.dumps(sys.argv[1:]) + "\\n")\nsys.exit(1 if "/workspace/" in " ".join(sys.argv) else 0)\n')
+    result = subprocess.run(['bash', 'scripts/ci-nextest', 'run'], cwd=root, env=env, capture_output=True)
+    commands = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert result.returncode == 1 and len(commands) == 2
+    assert all('--binaries-metadata' in command and '--cargo-metadata' in command and '--workspace' not in command for command in commands)
+    assert all(command[command.index('--partition') + 1] == 'hash:2/2' for command in commands)
+    calls.unlink()
+    result = subprocess.run(['bash', 'scripts/ci-nextest', 'run', '--no-run'], cwd=root, env=env, capture_output=True)
+    assert result.returncode == 2 and not calls.exists(), 'archive consumers cannot compile again'
+
 print("Partition tests passed: full selection, duplicate names across binaries, ignored tests, missing/extra/overlapping shards, invalid partition, and failure propagation")

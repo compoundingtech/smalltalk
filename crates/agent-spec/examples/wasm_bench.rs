@@ -12,14 +12,17 @@
 //! nix develop -c cargo run -p agent-spec --release --example wasm_bench
 //! ```
 
+#[macro_use]
+#[path = "../../../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 use agent_spec::profile::{ProfileClass, ResourceProfile, ResourceProfileRegistry};
 use std::path::Path;
 use std::time::Instant;
 
-const DEMO_WASM_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/demo_resolver.wasm"
-);
+fn demo_wasm_path() -> &'static str {
+    test_env!("CARGO_MANIFEST_DIR", "/tests/fixtures/demo_resolver.wasm")
+}
 const N: usize = 1_000;
 
 fn percentile(samples: &mut Vec<u128>, p: f64) -> u128 {
@@ -46,10 +49,10 @@ fn report(label: &str, mut samples: Vec<u128>) {
 }
 
 fn main() {
-    let fixture = Path::new(DEMO_WASM_PATH);
+    let fixture = Path::new(demo_wasm_path());
     if !fixture.exists() {
         panic!(
-            "missing {DEMO_WASM_PATH}; build it with `cargo build -p demo-resolver-wasm --target wasm32-unknown-unknown --release`"
+            "missing {demo_wasm_path()}; build it with `cargo build -p demo-resolver-wasm --target wasm32-unknown-unknown --release`"
         );
     }
 
@@ -63,7 +66,7 @@ fn main() {
     let via_registry = ResourceProfileRegistry::empty()
         .with_profile(ResourceProfile::wasm(
             "dev.schickling.agent-goal",
-            DEMO_WASM_PATH,
+            demo_wasm_path(),
             ProfileClass::Immediate,
         ))
         .resolve(Path::new(agent_dir), uri)

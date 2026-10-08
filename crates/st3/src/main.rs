@@ -17410,7 +17410,8 @@ fn spawn_st2_provider(
     if push_mailbox_enabled() && driver == "opencode" {
         st_drivers::push_mailbox::register(&paths.agent_dir);
     }
-    tokio::task::spawn_blocking(move || match start {
+    tokio::task::spawn_blocking(move || {
+        let outcome = match start {
         ProviderStart::Launch(
             argv,
             // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
@@ -17506,6 +17507,12 @@ fn spawn_st2_provider(
                 anyhow::bail!("a {driver} driver cannot adopt this provider session: {session:?}")
             }
         },
+        };
+        #[cfg(feature = "test-support")]
+        if env!("CARGO_BIN_NAME") == "st3-fixture" {
+            st3::test_support::hold_provider_completion(&outcome)?;
+        }
+        outcome
     })
 }
 
@@ -17783,9 +17790,29 @@ async fn drive_st2_native(
             st_drivers::subagents::now_ms(),
         )
     });
+    let mut completion_announced = false;
     loop {
+        #[cfg(feature = "test-support")]
+        {
+            completion_announced |= fixture_terminal_completion_barrier(
+                &mut observations, client, subject, driver, &mut loop_state.ready, &task,
+            ).await?;
+            if completion_announced && env!("CARGO_BIN_NAME") == "st3-fixture"
+                && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION")
+            {
+                fs::write(PathBuf::from(root).join("awaiting-completion"), b"awaiting")?;
+            }
+        }
         tokio::select! {
             frame = mailbox.recv() => {
+                #[cfg(feature = "test-support")]
+                if env!("CARGO_BIN_NAME") == "st3-fixture"
+                    && matches!(&frame, Some(st3::mailbox::Frame::Fenced { .. }))
+                    && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION")
+                {
+                    fs::write(PathBuf::from(root).join("fence-received"),
+                        if task.is_finished() { "finished" } else { "pending" })?;
+                }
                 let mail_changed = matches!(&frame, Some(st3::mailbox::Frame::Mailbox { .. }));
                 mailbox.accept(frame, &runtime_id)?;
                 if driver == "opencode" && mail_changed
@@ -17793,13 +17820,14 @@ async fn drive_st2_native(
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
             }
-            wake = observations.recv() => {
+            wake = observations.recv(), if !completion_announced => {
                 wake?;
-                if let Err(error) = observations.drain(client, subject, driver, &mut loop_state.ready).await {
-                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                match observations.drain_live(client, subject, driver, &mut loop_state.ready).await {
+                    Ok(ended) => completion_announced |= ended,
+                    Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
                 }
             }
-            result = &mut task => {
+            result = &mut task, if completion_announced || fixture_completion_task_enabled() => {
                 let outcome = result?;
                 if let Some(session) = detached_session(&outcome) {
                     loop_state.delivery_episode = delivery.episode;
@@ -17813,6 +17841,7 @@ async fn drive_st2_native(
                     let _ = replacement.exec(subject, &paths.state_root(), &resume);
                     loop_state = resume.loop_state;
                     task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(session));
+                    completion_announced = false;
                     continue;
                 }
                 finish_native_exit_report(subject, async {
@@ -17868,7 +17897,7 @@ async fn drive_st2_native(
                 }).await?;
                 return outcome;
             }
-            _ = interval.tick() => {
+            _ = interval.tick(), if !completion_announced => {
                 if driver == "claude" && mailbox.subscription.is_some()
                     && let Err(error) = check_claude_attachment(
                         client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
@@ -17881,9 +17910,11 @@ async fn drive_st2_native(
                 }
 
                 if observations.retry_pending {
-                    if let Err(error) = observations.drain(client, subject, driver, &mut loop_state.ready).await {
-                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    match observations.drain_live(client, subject, driver, &mut loop_state.ready).await {
+                        Ok(ended) => completion_announced |= ended,
+                        Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
                     }
+                    if completion_announced { continue; }
                 }
 
                 if driver == "opencode" && mailbox.subscription.is_some() {
@@ -18147,7 +18178,7 @@ async fn drive_st2_native(
                 }
                 replacement.check();
             }
-            _ = work_interval.tick() => {
+            _ = work_interval.tick(), if !completion_announced => {
                 let tick: Result<()> = async {
                     let minute = unix_minute()?;
                     if renewed_minute != Some(minute) {
@@ -18162,6 +18193,68 @@ async fn drive_st2_native(
             }
         }
     }
+}
+
+// Fixture controls force the actual stream rejection branch before disposing the result.
+// The installed executable always enables the provider completion branch.
+fn fixture_completion_task_enabled() -> bool {
+    #[cfg(feature = "test-support")]
+    if env!("CARGO_BIN_NAME") == "st3-fixture"
+        && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION").map(PathBuf::from)
+        && root.join("join-phase").exists()
+        && !root.join("fence-received").exists()
+    {
+        return false;
+    }
+    true
+}
+
+// Only the separately compiled fixture executable can schedule this control.
+// It holds no production provider, changes no claim or fence, and has a finite deadline.
+#[cfg(feature = "test-support")]
+async fn fixture_terminal_completion_barrier(
+    observations: &mut NativeObservations,
+    client: &Client,
+    subject: &str,
+    driver: &str,
+    ready: &mut bool,
+    task: &tokio::task::JoinHandle<Result<()>>,
+) -> Result<bool> {
+    if env!("CARGO_BIN_NAME") != "st3-fixture" || driver != "claude" {
+        return Ok(false);
+    }
+    let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION").map(PathBuf::from) else {
+        return Ok(false);
+    };
+    if root.join("observation-drained").exists()
+        || !st_drivers::harness_state::read(
+            &st_drivers::harness_state::harness_state_path(&observations.dir), None,
+        ).is_some_and(|state| state.state == st_drivers::harness_state::Activity::Ended)
+    {
+        return Ok(false);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !root.join("provider-return.json").exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "fixture provider completion timed out");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let deferred = observations.drain_live(client, subject, driver, ready).await?;
+    fs::write(root.join("observation-drained"), if deferred { "deferred" } else { "published" })?;
+    let after = fs::read_to_string(root.join("order"))? == "after";
+    if after {
+        while !task.is_finished() {
+            anyhow::ensure!(tokio::time::Instant::now() < deadline, "fixture JoinHandle completion timed out");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    } else {
+        anyhow::ensure!(!task.is_finished(), "fixture must retain pending provider JoinHandle");
+    }
+    fs::write(root.join("join-phase"), if after { "finished" } else { "pending" })?;
+    while !root.join("poll-driver").exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "fixture driver release timed out");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(deferred)
 }
 
 fn reject_noninteractive_claude_argv(argv: &[String]) -> Result<()> {
@@ -18370,6 +18463,16 @@ impl NativeObservations {
         }
         Ok(())
     }
+    async fn drain_live(
+        &mut self,
+        client: &Client,
+        subject: &str,
+        driver: &str,
+        ready: &mut bool,
+    ) -> Result<bool> {
+        self.drain_events(client, subject, driver, ready, true).await
+    }
+
     async fn drain(
         &mut self,
         client: &Client,
@@ -18377,8 +18480,21 @@ impl NativeObservations {
         driver: &str,
         ready: &mut bool,
     ) -> Result<()> {
+        self.drain_events(client, subject, driver, ready, false)
+            .await
+            .map(|_| ())
+    }
+
+    async fn drain_events(
+        &mut self,
+        client: &Client,
+        subject: &str,
+        driver: &str,
+        ready: &mut bool,
+        wait_for_completion: bool,
+    ) -> Result<bool> {
         if !self.enabled {
-            return Ok(());
+            return Ok(false);
         }
         self.retry_pending = true;
         // Bound a wake's work so a backlog does not hold back native delivery.
@@ -18418,6 +18534,29 @@ impl NativeObservations {
                     };
                     let observed = st_drivers::harness_state::read_raw_at(&raw, None, decode_at);
                     if event.runtime_incarnation == self.runtime && source_driver == driver {
+                        // The wrapper writes its terminal receipt before its blocking task
+                        // returns. Publishing it now would fence our mailbox before the task's
+                        // actual success/failure can reach the normal exit-report path. Keep
+                        // this event unacknowledged until that path drains it. Exitless hook
+                        // observations and predecessor/foreign provider records still publish.
+                        if wait_for_completion
+                            && event.kind == "harness-state"
+                            && observed.state == st_drivers::harness_state::Activity::Ended
+                            && observed.exit.is_some()
+                            && observed.evidence_incarnation.is_some()
+                            && st_drivers::harness_events::read_runtime_state(&self.dir, &self.runtime)?
+                                .is_some_and(|current| {
+                                    let current = st_drivers::harness_state::read_raw_at(
+                                        &current, None, event.queued_at_ms,
+                                    );
+                                    current.evidence_incarnation == observed.evidence_incarnation
+                                        && current.ownership_sequence == observed.ownership_sequence
+                                        && current.transition_sequence == observed.transition_sequence
+                                        && current.exit == observed.exit
+                                })
+                        {
+                            return Ok(true);
+                        }
                         // Admission precedes the provider claim. Only a state event fenced to
                         // this runtime can expose its diagnostic; an old snapshot cannot fence
                         // a successor. Refused omp launches are handled on the exit path.
@@ -18555,7 +18694,7 @@ impl NativeObservations {
         }
         self.retry_pending = events.len() == 64;
         self.initial_wake = self.retry_pending;
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -22122,6 +22261,12 @@ impl NativeMailbox {
                 Ok(())
             }
             Some(st3::mailbox::Frame::Seat { seat }) => {
+                #[cfg(feature = "test-support")]
+                if env!("CARGO_BIN_NAME") == "st3-fixture"
+                    && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION")
+                {
+                    fs::write(PathBuf::from(root).join("title-stream-admitted"), b"seat")?;
+                }
                 if let Err(error) = update_native_title(&seat, runtime_id) {
                     let now = Instant::now();
                     if self.last_title_warning.is_none_or(|prior| {

@@ -8,6 +8,10 @@
 
 #![cfg(feature = "wasm-resolver")]
 
+#[macro_use]
+#[path = "../../../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 use agent_spec::profile::{ProfileClass, ResourceProfile, ResourceProfileRegistry};
 use agent_spec::profile_wasm::{
     DEFAULT_MODULE_LIMIT_BYTES, DEFAULT_OUTPUT_LIMIT_BYTES, DEFAULT_TABLE_ELEMENT_LIMIT,
@@ -16,13 +20,12 @@ use agent_spec::profile_wasm::{
 use std::path::{Path, PathBuf};
 use wasmtime::Trap;
 
-const DEMO_WASM_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/demo_resolver.wasm"
-);
+fn demo_wasm_path() -> &'static str {
+    test_env!("CARGO_MANIFEST_DIR", "/tests/fixtures/demo_resolver.wasm")
+}
 
 fn demo_profile(class: ProfileClass) -> ResourceProfile {
-    ResourceProfile::wasm("dev.schickling.agent-goal", DEMO_WASM_PATH, class)
+    ResourceProfile::wasm("dev.schickling.agent-goal", demo_wasm_path(), class)
 }
 
 fn demo_registry() -> ResourceProfileRegistry {
@@ -117,7 +120,7 @@ fn valid_v3_descriptor_executes_and_resolve_only_module_stays_passive() {
     assert_eq!(descriptor.abi_version, 3);
 
     assert!(
-        WasmResolver::load(Path::new(DEMO_WASM_PATH))
+        WasmResolver::load(Path::new(demo_wasm_path()))
             .expect("passive resolver loads")
             .describe_once()
             .expect("missing describe is compatible")
@@ -300,7 +303,7 @@ fn resolver_cannot_cross_a_symlink_inside_the_agent_directory() {
         .expect("resources symlink is created");
 
     let resolver =
-        WasmResolver::load(Path::new(DEMO_WASM_PATH)).expect("demo resolver module loads");
+        WasmResolver::load(Path::new(demo_wasm_path())).expect("demo resolver module loads");
     match resolver.resolve_contained("dev.schickling.agent-goal://x", agent_dir.path()) {
         Err(WasmResolveError::BadReturn(error)) => {
             assert!(error.contains("symlink"), "got: {error}");
@@ -566,7 +569,7 @@ fn oversized_module_is_rejected_before_wasmtime_compilation() {
 fn catalog_relative_module_rejects_symlinked_path_ancestors() {
     let catalog = tempfile::tempdir().expect("catalog directory");
     let outside = tempfile::tempdir().expect("outside directory");
-    std::fs::copy(DEMO_WASM_PATH, outside.path().join("demo.wasm"))
+    std::fs::copy(demo_wasm_path(), outside.path().join("demo.wasm"))
         .expect("outside module is copied");
     std::os::unix::fs::symlink(outside.path(), catalog.path().join("resolvers"))
         .expect("resolver ancestor symlink is created");

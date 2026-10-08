@@ -1,8 +1,12 @@
+#[macro_use]
+#[path = "../../../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 use st3_client::*;
 use std::path::{Path, PathBuf};
 
 fn fixture(name: &str) -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let path = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../../docs/st3/client-v0/fixtures")
         .join(name);
     std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))

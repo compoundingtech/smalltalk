@@ -15,7 +15,9 @@ use serde_json::{Value, json};
 use st3::client::Client;
 use st3::model::ClaimInput;
 
-const ST3: &str = env!("CARGO_BIN_EXE_st3-fixture");
+fn st3() -> &'static str {
+    test_env!("CARGO_BIN_EXE_st3-fixture")
+}
 const PERSON: &str = "person/fleet-tester";
 const NOTE: &str = "custom.fleet-test.note";
 
@@ -83,7 +85,7 @@ impl Node {
         }
         Self {
             name: name.into(),
-            binary: PathBuf::from(ST3),
+            binary: PathBuf::from(st3()),
             root,
             port: free_port(),
             env: Vec::new(),
@@ -184,7 +186,7 @@ impl Node {
     async fn start(&mut self) {
         let pty = self.root.join("bin/pty");
         let log = |name: &str| fs::File::create(self.root.join(name)).unwrap();
-        let up: Vec<&str> = if self.binary == Path::new(ST3) {
+        let up: Vec<&str> = if self.binary == Path::new(st3()) {
             vec!["up", "--pty-binary", pty.to_str().unwrap()]
         } else {
             vec!["up"]
@@ -2393,18 +2395,25 @@ async fn rejoining_under_a_new_name_reports_post_leave_history_as_divergent() {
     assert!(after.is_subset(&c.notes().await));
     assert!(after.is_disjoint(&a.notes().await));
     assert!(after.is_disjoint(&b.notes().await));
+    let mut settled_diff = None;
     wait_until(
         "rejoining node compares the common inventory and settled projections",
         90,
-        || async {
+        || {
             let diff = c.st_json(&["replication", "diff", "orchard"]);
-            diff["authority"]["equal"] == true
+            let settled = diff["authority"]["equal"] == true
                 && diff["status"] == "up"
-                && diff["graph"]["equal"].is_boolean()
+                && diff["graph"]["equal"].is_boolean();
+            if settled {
+                settled_diff = Some(diff);
+            }
+            async move { settled }
         },
     )
     .await;
-    let diff = c.st_json(&["replication", "diff", "orchard"]);
+    // Replication can advance between CLI calls and make coverage pending again. Assert
+    // against the settled comparison that satisfied the wait, including its table diff.
+    let diff = settled_diff.unwrap();
     let doctor = c.st(&["--json", "doctor"]);
     let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
     let admission = doctor["checks"]
@@ -3066,7 +3075,7 @@ fn fleet_workflows_have_no_path_filter() {
     if st3::test_support::supervise_test() {
         return;
     }
-    let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
+    let workflows = Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
     let compat = fs::read_to_string(workflows.join("fleet.yml")).unwrap();
     // The Linux gate runs the fleet compatibility stage from this script.
     let stages = fs::read_to_string(workflows.join("../../scripts/ci-linux")).unwrap();
@@ -4068,7 +4077,7 @@ async fn suspended_seat_moves_between_two_daemons_with_its_workspace_and_convers
             }
         }
     }
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let pty = st_runtime::resolve_executable("pty", &std::env::vars().collect()).unwrap();
     let node_program = st_runtime::resolve_executable("node", &std::env::vars().collect()).unwrap();
     let mut cleanup = SeatCleanup { pty: pty.clone(), roots: Vec::new() };
@@ -4402,7 +4411,7 @@ mission "orchard/release" state="ready" {
         "{status}"
     );
     older.stop();
-    older.binary = PathBuf::from(ST3);
+    older.binary = PathBuf::from(st3());
     older.start().await;
     wait_until("upgraded daemon reads the retained sidecar", 60, || async {
         older

@@ -29,6 +29,7 @@ struct Revisions {
 struct Cached {
     revision: u64,
     period: u128,
+    valid_until_unix_ms: Option<u128>,
     items: Vec<Value>,
     has_more: bool,
 }
@@ -347,15 +348,22 @@ impl Windows {
         if let Some(cached) = cached
             && cached.revision == revision
             && cached.period == period
+            && cached.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
         {
             return Ok((cached.items.clone(), cached.has_more));
         }
         let (items, has_more) = compute()?;
+        let valid_until_unix_ms = if request.collection == "agents" {
+            state.store.agent_roster_valid_until(index)
+        } else {
+            None
+        };
         // At most 64 bounded responses per Store. Oversized results remain uncached.
         let cached = (serde_json::to_vec(&items)?.len() <= CLIENT_MAX_RESPONSE_BYTES).then(|| {
             Arc::new(Cached {
                 revision,
                 period,
+                valid_until_unix_ms,
                 items: items.clone(),
                 has_more,
             })
@@ -427,6 +435,31 @@ mod tests {
                 idempotency_key: None,
             })
             .unwrap();
+    }
+
+    #[test]
+    fn shared_windows_agents_recompute_at_the_queue_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let agents = request("agents");
+        let count = AtomicUsize::new(0);
+        let first = read(&windows, &state, &session, &agents, 100, &count);
+        // Exercise the window's deadline independently of the queue reducer's real-clock test.
+        let prepared = windows.prepare(&state, &session, &agents).unwrap();
+        let mut cached = prepared.entry.cached.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = cached.as_ref().unwrap();
+        *cached = Some(Arc::new(Cached {
+            revision: held.revision, period: held.period, valid_until_unix_ms: Some(200),
+            items: held.items.clone(), has_more: held.has_more,
+        }));
+        drop(cached);
+        assert_eq!(read(&windows, &state, &session, &agents, 199, &count), first);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_ne!(read(&windows, &state, &session, &agents, 200, &count), first);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 
     #[test]

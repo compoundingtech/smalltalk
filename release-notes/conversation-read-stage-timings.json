@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Expose conversation admission, owner lookup and first-page timing stages in the existing performance report",
+  "replay": {"status": "none", "detail": "No claim replay or recovery changes; timing samples are process-local and do not write graph claims."},
+  "schema": {"status": "none", "detail": "No database tables, indexes, triggers, schema-version changes or data rewrites."},
+  "rules": {"status": "none", "detail": "No checkpoint rules, digests or coordinated-upgrade changes."},
+  "compatibility": {"status": "none", "detail": "Adds fixed task labels to the existing performance report without changing conversation frames, session IDs, authorization, client schemas or peer transport. Existing incremental ownership lookup and cursor handling are retained."},
+  "downtime": {"status": "none", "detail": "No additional startup work or replay wait; instrumentation uses the existing performance meter."},
+  "manual": {"status": "none", "detail": "No operator actions, client re-pairing or configuration changes required. The existing performance endpoint exposes the stages."},
+  "recovery": {"status": "none", "detail": "No persistent state change or new binary swap-back restriction."}
+}

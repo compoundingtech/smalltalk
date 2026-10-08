@@ -41,7 +41,7 @@ fn stop_escalation_writes_the_terminal_record_before_sigkill() {
     );
 
     // The provider ignores SIGTERM, so the wrapper's grace window expires and it must escalate.
-    let mut wrapper = Command::new(env!("CARGO_BIN_EXE_st2"));
+    let mut wrapper = Command::new(test_env!("CARGO_BIN_EXE_st2"));
     wrapper
         .args(["--catalog"])
         .arg(&catalog)
@@ -201,7 +201,7 @@ fn spawn_opencode_wrapper(
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let mut wrapper = Command::new(env!("CARGO_BIN_EXE_st2"));
+    let mut wrapper = Command::new(test_env!("CARGO_BIN_EXE_st2"));
     wrapper
         .args(["--catalog"])
         .arg(&catalog)

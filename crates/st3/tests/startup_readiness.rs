@@ -20,7 +20,7 @@ impl Drop for Daemon {
 }
 
 fn command(root: &Path) -> Command {
-    let mut command = st3::test_support::command(env!("CARGO_BIN_EXE_st3-fixture"));
+    let mut command = st3::test_support::command(test_env!("CARGO_BIN_EXE_st3-fixture"));
     command
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())

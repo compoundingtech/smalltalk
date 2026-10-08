@@ -11,7 +11,7 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 fn st2() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
 }
 
 fn write_catalog(catalog: &Path, spec: &str) {

@@ -26,11 +26,18 @@ fi
 # Use the same selections for --no-run and execution, on Linux and macOS. Keep both groups
 # running after a test failure, as the ci profile does with fail-fast = false.
 status=0
-cargo nextest "$action" --workspace --exclude st2 --locked --profile ci "${partition[@]}" "$@" || status=$?
-# These are the st2 targets with selected tests. Its lib/bin unit tests, event_e2e and
-# resource_profile_supervisor_e2e are entirely excluded by the ci profile. The integration
-# target is only partly filtered, so it (and its required st2 executable) must still build.
-# When adding a st2 test target, update this list alongside .config/nextest.toml.
-cargo nextest "$action" -p st2 --test integration --test agent_resource --test driver_expansion \
-  --locked --profile ci "${partition[@]}" "$@" || status=$?
+if [[ -n "${CI_TEST_EXTRACTED:-}" ]]; then
+  [[ " $* " != *" --no-run "* ]] || { echo 'archive consumers must not rebuild' >&2; exit 2; }
+  for group in workspace st2; do
+    target="$CI_TEST_EXTRACTED/$group/target"
+    cargo nextest "$action" --binaries-metadata "$target/nextest/binaries-metadata.json" \
+      --cargo-metadata "$target/nextest/cargo-metadata.json" --target-dir-remap "$target" \
+      --workspace-remap "$CI_TEST_WORKSPACE" --profile ci "${partition[@]}" "$@" || status=$?
+  done
+else
+  cargo nextest "$action" --workspace --exclude st2 --locked --profile ci "${partition[@]}" "$@" || status=$?
+  # Keep the original st2 target selection for local and macOS runs.
+  cargo nextest "$action" -p st2 --test integration --test agent_resource --test driver_expansion \
+    --locked --profile ci "${partition[@]}" "$@" || status=$?
+fi
 exit "$status"
