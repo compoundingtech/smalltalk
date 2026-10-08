@@ -687,6 +687,9 @@ ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
 /// The store's schema version, set once the graph's and the runtime's tables exist.
 pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 17;";
 
+/// `(host/NAME, key)` for every member incarnation fleet membership admits.
+pub type MemberRoots = BTreeSet<(String, String)>;
+
 /// The graph half of a store. A runtime's store wraps it and derefs to it, so the runtime's
 /// projections read and write through the same connections.
 pub struct Store {
@@ -705,7 +708,7 @@ pub struct Store {
     /// The membership last folded, and the `fleet_generation` it was folded at.
     pub membership_cache: Mutex<Option<(i64, crate::fleet::Membership)>>,
     /// The member part of the trust roots, folded at the `fleet_generation` shown.
-    pub roots_cache: Mutex<Option<(i64, BTreeSet<(String, String)>)>>,
+    pub roots_cache: Mutex<Option<(i64, MemberRoots)>>,
     /// Serializes projection passes while they lend the writer back between chunks.
     pub projection: Mutex<()>,
     pub replication_timers: ReplicationTimers,
