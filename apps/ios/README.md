@@ -44,7 +44,16 @@ For a step-by-step setup, see [build and run the iOS app](../../docs/ios-app.md)
 
 First install the shared package's locked dependencies from the repository root: `npm ci --prefix clients/typescript/st3-views --ignore-scripts --no-audit --no-fund`. npm links this local package; it does not install the linked package's dependencies from the phone directory. Then from this directory run `npm ci`, `npm run typecheck`, `npm test`, and `npx expo prebuild --platform ios --clean --no-install`. Install CocoaPods, run `npm run pods` (the wrapper sets `LANG` and `LC_ALL` to `en_US.UTF-8`), and open the generated `ios/smalltalk.xcworkspace` in Xcode. For daily development, build the Debug scheme for an iOS Simulator and run `npm run start` for Metro. Keep normal simulator code signing enabled: building with `CODE_SIGNING_ALLOWED=NO` leaves the app without a usable Keychain, so device pairing fails. A physical device is optional for this development proof.
 
-For an offline device build, run `npm run export:ios` and build Release with local Apple Development signing and provisioning for that device. The Release bundle is embedded and runs without Metro. No Expo account, EAS service, App Store, or Shareup signing is part of this path.
+`app.config.js` selects the installed identity with `APP_VARIANT`:
+
+| Variant | Installed identity | Bundle identifier | Use |
+| --- | --- | --- | --- |
+| `dev` (default) | Smalltalk Dev, amber DEV-badged icon | `com.compoundingtech.smalltalk.starter` | Debug with Metro, simulator and device smoke tests |
+| `daily` | Smalltalk, ordinary icon | `com.compoundingtech.smalltalk` | Release build used every day on a phone |
+
+The two apps coexist on one phone and keep separate Keychain profiles, so each is paired on its own. Any other value fails the configuration. Changing variants requires a clean prebuild, and the same `APP_VARIANT` must stay exported for the Xcode build that embeds the bundle. The EAS simulator profile selects dev; preview selects daily. Regenerate the DEV icon with `swift scripts/generate-dev-icon.swift assets/icon.png assets/icon-dev.png`.
+
+For an offline device build of the daily app, run `APP_VARIANT=daily npx expo prebuild --platform ios --clean --no-install`, install pods, and build Release with `APP_VARIANT=daily` exported and local Apple Development signing and provisioning for that device. The Release bundle is embedded and runs without Metro. No Expo account, EAS service, App Store, or Shareup signing is part of this path.
 
 The Debug app accepts a short-lived pairing deep link for headless simulator checks: `com.compoundingtech.smalltalk.starter://pair?gateway=...&id=...&code=...`. The link opens the pairing form with the code prefilled; it does not submit the code until a separately supplied fingerprint or explicit unpinned override is chosen. The handler is disabled in Release. Treat the link as a temporary credential and do not commit or log its populated form.
 
