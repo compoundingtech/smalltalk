@@ -115,3 +115,58 @@ none-installed behavior and clear optional GitHub errors passed. GitHub probes
 returned authentication errors without anonymous requests. No bundled runtime,
 real model, expert/content completion, final release or Ubuntu22 compatibility
 is claimed. Incus remains a separate person-owned manual test.
+
+## Expert plumbing on native Ubuntu 24.04
+
+The expert candidate source78c3e6fae05b4e373a54abe4002779613cdc2282 includes
+expert855d2250ea76de82fd814d6730215040c8f5bba0 and the final one-shot UI adapter
+9dbb0f07c60106c27f5325897748c6c36e206409. Archive SHA256:
+2a157a02875134f3ce9059be97fe92a329b4ad551b228b9fc1c33697ed91e679.
+The corrected runner a97adc1f1649181b82012fcd232f5072e83f3c30 passed all
+**139 assertions**, exit0:
+
+| Scenario | PASS |
+| --- | ---: |
+| Expert first-run focus, stop/cancel and explicit rerun | 32 |
+| Claude before channel install, then restart recovery | 32 |
+| Claude development plugin | 26 |
+| Claude approved plugin | 26 |
+| Codex expert | 23 |
+
+The lifecycle receipt captures the focused Expert composer before navigation,
+the exact expert wake read, explicit stop and terminal cancellation, two ordinary
+setups preserving the stopped/non-actionable expert and one cancelled historical
+run, then one explicit UUID run and a different observed expert incarnation that
+reads a new wake. The Claude recovery receipt starts the actual built-in expert
+through inline `server:st3` with no user plugin. An ordinary-user channel install
+without policy and agent restart switch it to the installed development plugin;
+the different current incarnation resumes its managed transcript, accepts consent
+and reads the exact distinct post-install wake. The public JSON records both
+incarnations and their successful read receipts.
+
+The initial runner9db380173b9e4949aff29927a59c8203ff90d386 matrix exited1
+with eight assertion failures across the five cases. Four assumptions were
+corrected after examining native receipts and confirming the CLI/projection
+contracts with the owner: a single historical run is unwrapped by mission show;
+stopped history retains runtime/reachability fields while non-actionable; inline
+stdout explains a development channel without printing its exact driver flag;
+and restart can return exit2 with its explicit restarted-and-waiting message
+before automatic consent finishes. Only that exact nonzero restart outcome is
+accepted, followed by the new current incarnation's exact wake read, plugin argv
+and consent. The early CLI wait classification remains a limitation. The product
+archive was unchanged; all five affected cases were rerun once.
+
+expert24-initial.txt retains the initial failures; expert24-corrected.txt retains
+the final runner output. expert24-summary.json pins all twenty immutable full
+report/JSON documents, source and packaged binary hashes, checks and limits.
+Immutable summary: doc/fleet/smalltalk/onboarding/2026-10-08d/expert24-summary@61849d62ff6dac0577a2d9987f71d742d1629c7516d5c7276db332bd75bdee7a.
+Full proof: doc/fleet/smalltalk/onboarding/2026-10-08d/expert-seat-proof@4349e6712105264194ae6590fea8a4fb0a7a7e48425c870aa6ef2142ce21b455.
+Twelve local guard/focus/resume/history/restart checks passed and are retained in
+rig-checks-expert-corrected.txt. The shared Tart branch also passes eight local
+Mac guards and the same twelve rig checks, with no native Mac claim.
+
+All ten owned initial/corrected native24 containers were removed and the shared
+slot was released. Each used two CPUs, 3 GiB RAM, UID42420 and no host mounts or
+supplied runtime. This proves expert/channel plumbing with native protocol
+stand-ins; it does not prove paid-model semantics, finalized gate content,
+wrap-up, stock22 expert behavior, macOS/TCC or a real VM.
