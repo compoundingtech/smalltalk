@@ -1,283 +1,181 @@
 # Get started with Smalltalk
 
-Smalltalk turns your coding agents into a team that doesn't need babysitting. Describe the work once as a mission, with its goals, its constraints and the checks that prove it's done right, not just done. Agents on your own machines carry it through, survive restarts, and bring you only the decisions that are yours to make. You plan and decide; your agents do the rest, all day and overnight.
+Download Smalltalk and run `st`. The first run sets up your machine and opens a
+conversation with the built-in expert, when a coding harness is available. The expert
+helps you give agents a mission and follow its progress in the terminal interface.
 
-For now, each person runs their own fleet. Start with one machine; [add your second machine](two-machines.md) when you need it.
+Start with one machine. Each person currently runs their own fleet; a phone, another
+machine and GitHub integration can wait until you need them.
 
-## 1. Install
+## 1. Download and open st
 
-Choose one route. If you already use Nix, go straight to [With Nix](#with-nix).
-
-### Prebuilt release
-
-Use a terminal running Bash or Zsh. Choose the script for your machine.
-
-#### Linux x86_64
-
-The prebuilt tools need glibc 2.35+ (Ubuntu 22.04+) and `curl` and `tar`. On a fresh Ubuntu machine, install the prerequisites:
+Run this in your terminal:
 
 ```sh
-sudo apt-get update
-sudo apt-get install -y curl ca-certificates git
+curl -fsSL https://raw.githubusercontent.com/compoundingtech/smalltalk/main/install.sh | sh
 ```
 
-Download, verify, and install the latest release:
+The installer detects your platform, downloads the latest release and its SHA256
+sidecar, checks the archive, installs `st3`, its `st` link and `pty` in `~/.local/bin`,
+and opens `st`. The checksum comes from the same release endpoint as the archive;
+it checks the downloaded bytes, rather than supplying an independent signature.
+
+Linux x86_64 needs glibc 2.35+ (Ubuntu 22.04+), `curl`, `tar` and `sha256sum` or
+`shasum`. Apple Silicon macOS needs macOS 15+, those download tools and Python 3.
+If a required tool is missing, install it with your operating system's package
+manager before downloading Smalltalk. Neither Rust, Nix nor the GitHub CLI is needed.
+
+For an existing installation, read [upgrading st](upgrading-st.md) and the selected
+release's Upgrade impact before replacing binaries or restarting a populated store.
+To download without opening the interface, use the same installer with `--no-run`.
+`--tag` chooses a release and `--bin-dir` changes the command destination; see
+[binary releases](st3/binary-releases.md).
+
+On macOS, the installer puts `st3` in `~/Applications/SmallTalk.app` and links the
+command to that stable app path. Configure an optional persistent signing identity
+before installation using [macOS installation and signing](st3/macos-installation.md).
+The default is ad-hoc signing, which can require renewed OS approvals after an update.
+Native installer and Darwin archive tests run in CI; clean-machine real-app, launchd
+and TCC permission setup remain a separate manual rehearsal.
+
+## 2. Answer the first-run questions
+
+Choose your person name and a persistent machine name. `ada` and `studio` are invented
+examples; use your own names. Names use lowercase letters, digits, hyphens and
+underscores, and the machine name `local` is reserved. Setup merges these names into
+`~/.config/st3/config.toml` without replacing unrelated settings.
+
+Keep the default background-service option to run agents after closing the terminal.
+Setup installs a user service and starts the daemon. If a user service manager is
+unavailable, it explains the detached-daemon fallback; that fallback does not survive
+a reboot. On Linux, if lingering cannot be enabled automatically, setup prints the
+`loginctl` command needed to keep the user service running after logout. On macOS,
+follow the permission instructions in [daemon details](#daemon-details).
+
+Setup checks for Claude Code, Codex, OpenCode, Pi and Omp on the daemon's login PATH.
+It asks you to choose only when several are available. Install and sign in to a
+supported harness using its own instructions. An installed executable does not prove
+that its account is logged in. With no supported harness, setup creates no expert or
+onboarding run and still opens the interface. After installing one, make the command available in this shell and run:
 
 ```sh
-mkdir -p ~/smalltalk-install
-cd ~/smalltalk-install
-archive=smalltalk-x86_64-unknown-linux-gnu.tar.gz
-release=https://github.com/compoundingtech/smalltalk/releases/latest/download
-curl -fLO "$release/$archive"
-curl -fLO "$release/$archive.sha256"
-sha256sum -c "$archive.sha256"
-tar -xzf "$archive"
-"./${archive%.tar.gz}/install.sh" --bin-dir "$HOME/.local/bin"
 export PATH="$HOME/.local/bin:$PATH"
+st setup
 ```
 
-#### macOS Apple Silicon
+For Claude, setup offers the user-owned Smalltalk message channel without needing
+administrator rights. A machine approval policy is optional: without it, seats use
+the development-channel flag and st handles its admission dialog. Provider or
+organization restrictions can still block the channel. Smalltalk never asks for or
+types a password; optional machine policy, GitHub login and `gh` do not block setup.
 
-**Not yet verified on a fresh Mac:** the prebuilt tools need macOS 15+, `curl`, `tar`, and Python 3. The source installer (`scripts/install`) and extracted release installer put `st3` and `stui` inside `~/Applications/SmallTalk.app`, with links in your bin directory. macOS ties permissions, such as the microphone for stui's voice mode, to this stable app identity so grants can survive updates. Without a signing identity, the app is ad-hoc signed and macOS may ask again after each update. An optional Developer ID setting avoids that repeated approval; configure it **before installing**, using [macOS signing](st3/macos-installation.md).
+Your agents run without permission prompts inside their own workspaces. Choose the
+projects and tasks you give them accordingly.
 
-The optional voice helper, `StListen.app`, needs Xcode with the macOS 26 SDK to build. You can use st without it; voice mode says when the helper is missing.
+## 3. Work with the expert
 
-Download, verify, and install the latest release:
+When a usable harness is available, first-run setup creates `agent/st/expert` and
+starts `mission/st/onboarding`. The first launch opens the expert conversation in
+the terminal interface. Follow its guidance for your first mission; the expert stays
+available after onboarding.
+
+Home shows questions, decisions and failures that need you. Agents shows conversations
+and transcripts; Missions shows work and results. **Ctrl+K** opens the palette and
+**Ctrl+Q** quits the interface while agents keep working.
+
+After quitting, make the installed commands available in this shell and reopen st:
 
 ```sh
-mkdir -p ~/smalltalk-install
-cd ~/smalltalk-install
-archive=smalltalk-aarch64-apple-darwin.tar.gz
-release=https://github.com/compoundingtech/smalltalk/releases/latest/download
-curl -fLO "$release/$archive"
-curl -fLO "$release/$archive.sha256"
-shasum -a 256 -c "$archive.sha256"
-tar -xzf "$archive"
-"./${archive%.tar.gz}/install.sh" --bin-dir "$HOME/.local/bin"
 export PATH="$HOME/.local/bin:$PATH"
+st
 ```
 
-Keep that PATH in new terminals:
+If setup reported that the login PATH lacks `~/.local/bin`, add that export to your
+shell's startup file so new terminals can find `st` too. The installer can open st
+using its full path even before that PATH change.
+
+You can also send the expert a question from the shell. This example assumes you
+chose `ada`; replace `person/ada` with your configured person:
 
 ```sh
-case "$SHELL" in
-  */zsh) printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> ~/.zprofile ;;
-  *) printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> ~/.profile ;;
-esac
+st conversations send agent/st/expert --from person/ada \
+  --subject 'Getting started' --body 'Help me make my first mission.'
+st
 ```
 
-### With Nix
+Ordinary setup consults onboarding run history across the fleet and does not start
+another first run or resurrect a stopped expert. To begin again deliberately, finish
+or cancel the active onboarding run, then use `st setup --onboarding`. That command
+can restore a stopped expert and starts a distinct onboarding run. It does not cancel
+an existing run for you. Use `st setup --help` for scripted answers and other options.
 
-Install the same tools from a pinned release source (this can take a while).
-The command uses v0.3.16 as an example; choose a release after reading its Upgrade impact:
-
-```sh
-nix --extra-experimental-features 'nix-command flakes' profile install github:compoundingtech/smalltalk/v0.3.16
-command -v st stui pty
-```
-
-Nix builds `st3`, its `st` alias, `stui`, and `st3-migrate`, and supplies the pinned `pty` runtime and build dependencies. You do not need a separate Rust toolchain or PTY install. Use this **instead of** the archive route; the commands below are the same. Check that the paths above belong to your Nix profile, then continue with the daemon setup.
-
-For a declarative setup, use the [Home Manager module](home-manager.md): it installs the tools, writes the person configuration, and starts the user daemon on Linux or macOS. If that module owns your daemon, configure its person there and skip the manual config/service-install block in step 3. Lingering on Linux, macOS permissions, harness login, and fleet joining remain host setup. Nix profile installs use store paths; the macOS app-bundle setup above belongs to the source/release installers.
-
-Archive installation replaces files; it does not restart an existing daemon. For an existing
-fleet, use [upgrading st](upgrading-st.md) before running the new build against populated state.
-Keep the downloaded archive, checksum and `BUILD.json` as the installed-source record.
-
-See [binary releases](st3/binary-releases.md) for pinned versions and upgrades, and [macOS installation](st3/macos-installation.md) for Python, signing, and permission setup.
-
-The default, `st`, `st3`, and `small-talk` Nix package names all select this package.
-The previous generation builds separately as `.#st2`; install it explicitly with
-`nix profile install .#st2`. For a source install without Nix, see
-[development](development.md#build-from-source).
-
-## 2. Prepare your workspace
-
-This walkthrough assumes you already installed and logged in to [Claude Code](https://code.claude.com/docs/en/setup) as the OS user who will run `st`. `~/st/garden` is just the test area for these examples; put it anywhere you like:
+## 4. Check the installation
 
 ```sh
-mkdir -p ~/st/garden
-cd ~/st/garden
-git init
-```
-
-Install Smalltalk's Claude message channel (it may ask for your administrator password):
-
-```sh
-st claude-channel install
-st claude-channel status
-```
-
-Installation keeps the plugin's shared assets available and disables user-scope activation.
-Smalltalk seats enable their channel through local and per-process settings. In an ordinary
-Claude session without a seat subject, the channel serves an empty MCP lifecycle. If an older
-install still enables it globally, run `claude plugin disable st-channel@st --scope user`
-and start a fresh ordinary Claude session, keeping agent-local settings intact.
-
-Other harnesses work too; their [seat examples](../examples/st3/README.md#run-a-durable-agent) show the KDL to use.
-
-## 3. Start the daemon
-
-Choose a person identity. `ada` is an invented example; use the same identity on your own machines.
-
-```sh
-mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/st3"
-printf 'person = "person/ada"\n' > "${XDG_CONFIG_HOME:-$HOME/.config}/st3/config.toml"
-st service install
-st service status
+st --version
 st doctor
+st service status
 ```
 
-On Linux, keep the user service running after logout:
+`doctor` should show a reachable daemon and `pty`. A machine with no fleet configured
+is healthy. If an older daemon was already running, compare `st --version --json`
+with its `machine_version` in `st doctor --json` before continuing. See
+[when something is wrong](when-something-is-wrong.md) for failed checks, provider
+login and channel-delivery problems.
 
-```sh
-loginctl enable-linger "$USER"
-```
+## Reference
 
-On macOS, run the permission helper and follow its instructions:
+### With Nix and Home Manager
+
+Nix users can install a pinned release source with `nix profile install` instead of
+using the archive. Choose a source after reading its Upgrade impact; see
+[binary releases](st3/binary-releases.md) and [development](development.md#build-from-source)
+for the package and source-build commands. Nix supplies build dependencies and the
+pinned PTY runtime. Do not mix an archive destination with a Nix-owned command path.
+
+The [Home Manager module](home-manager.md) installs the tools, writes person
+configuration and starts the user daemon on Linux or macOS. If it owns your daemon,
+configure the person there and let the module manage service definitions. Harness
+login, lingering, OS permissions and fleet joining remain host setup. Nix profile
+installs use store paths; source and release installers own the macOS app bundle.
+
+### Daemon details
+
+The background service is a systemd user unit on Linux and a launchd agent on macOS.
+To inspect it, use `st service status`. On Linux, lingering allows the service to run
+after logout and before login after a reboot. Setup prints the needed command if it
+cannot enable it. On macOS, run:
 
 ```sh
 st service permissions
 ```
 
-`doctor` should report a reachable daemon and `pty`.
+Follow the instructions for the OS permissions you must grant, including Full Disk
+Access and Developer Tools. Smalltalk does not automate those approval prompts.
 
-Compare `st --version --json` with the daemon's `machine_version` in `st doctor --json` if
-an older daemon was already running. A machine with no fleet configured is healthy. Warnings about optional build tools, GitHub login, or Linux IO priority do not block this walkthrough. Fix any failed check before continuing; [daemon setup](#daemon-details) has the details.
+For an upgrade, `st service install` refreshes definitions and restarts services;
+`st service restart` suffices when definitions already point at the intended binaries.
+Coordinate that restart with active work and any continuous health checks. Replacing
+archive files alone does not restart running services.
 
-## 4. Start an agent and attach
+State lives in `~/.local/state/st3`. The local API uses a Unix socket. On Linux it
+normally lives in `XDG_RUNTIME_DIR`, with `STATE/run/st3.sock` linking to it; on macOS
+it lives in the state directory. An explicit `--endpoint` or `ST3_ENDPOINT` takes
+precedence. Commands wait up to 30 seconds for a restarting daemon, then exit with
+status 5; `--daemon-wait` and `ST3_DAEMON_WAIT` change that wait. Restarting the daemon
+leaves durable seats running so it can adopt them again. For foreground operation,
+use `st up`.
 
-From your test workspace, start an agent and open its terminal in one command:
-
-```sh
-st agents new garden/explorer --workspace "$PWD" --attach
-```
-
-Finish any first-run login or workspace trust prompts in that terminal. Press **Ctrl+\\** to detach; the agent keeps running. Stop this example when you are done exploring:
-
-```sh
-st agents stop agent/garden/explorer --as person/ada
-```
-
-## 5. Declare a durable seat
-
-A declared seat restarts with its declaration and can be given missions. Save its workspace and harness in a KDL file in your test area:
-
-```sh
-cd ~/st/garden
-cat > worker.kdl <<EOF
-version 2
-agent "garden/worker" {
-  workspace "$PWD"
-  restart "always"
-  harness "claude" {
-    model "sonnet"
-  }
-}
-EOF
-st apply worker.kdl --as person/ada
-st agents show agent/garden/worker
-st terminals attach agent/garden/worker
-```
-
-The harness starts and waits for work. Finish any first-run prompts in its terminal, then press **Ctrl+\\** to detach; the seat keeps running.
-
-## 6. Give it a mission
-
-Create a short work brief and a finite mission. Goals describe the result; the brief supplies instructions.
-
-```sh
-cat > BRIEF.md <<'EOF'
-Create garden-note.md with three sentences about an invented community garden.
-Use only invented names. Keep the note in this workspace.
-EOF
-cat > first-mission.kdl <<'EOF'
-version 2
-mission "garden/first-note" state="ready" {
-  goal "garden-note.md contains a three-sentence introduction to an invented community garden."
-  constraint "Follow BRIEF.md in the workspace."
-  step "write" timeout="20m" {
-    assigned-to "agent/garden/worker"
-    goal "garden-note.md exists and follows the brief."
-  }
-}
-EOF
-st apply first-mission.kdl --as person/ada
-st missions start garden/first-note --id garden/first-note/one \
-  --workspace "$PWD" --as person/ada
-stui
-```
-
-The new step wakes the seat automatically. In `stui`, open **Missions** and select `garden/first-note`; open **Agents** to see the worker. Use the sidebar or **Ctrl+K** to find them. **Ctrl+Q** quits the UI and leaves the work running.
-
-Back in the shell, inspect the run. Once it says `completed`, read the result:
-
-```sh
-st missions show mission-run/garden/first-note/one
-cat garden-note.md
-```
-
-## 7. Send a message
-
-```sh
-st conversations send agent/garden/worker --from person/ada \
-  --subject 'Hello' --body 'What did you finish in the first mission?'
-stui
-```
-
-Open the worker under **Agents** to read its answer. Messages are conversation; put new work in a mission so its result is tracked.
-
-When you are done experimenting:
-
-```sh
-st agents stop agent/garden/worker --as person/ada
-```
-
-## Daemon details
-
-Run `st service install` again after upgrading the binaries. It updates the installed definitions
-and restarts the services so they use the new executables.
-
-On Linux the service is a systemd user unit. It needs a working user manager; enable lingering
-(`loginctl enable-linger`) so seats keep running after you log out. On macOS it is a launchd
-agent; run `st service permissions` once for the Full Disk Access and Developer Tools steps.
-
-State lives in `~/.local/state/st3` and the local API is a Unix socket. Restarting the daemon
-does not stop running seats; it adopts them. While it restarts, a command waits up to 30 seconds
-for it (`--daemon-wait SECONDS` or `ST3_DAEMON_WAIT` changes that) and then exits with status 5.
-Seat drivers wait as long as the restart takes, keep their notes out of the seat's terminal in
-`~/.local/state/st3/driver-api-warnings.log`, and resume from the graph. To run the daemon in the
-foreground instead, use `st up`.
-
-On Linux, the daemon normally listens in `XDG_RUNTIME_DIR`; it also publishes
-`STATE/run/st3.sock` as a link to that socket, so commands without the daemon's
-runtime environment can reach it. On macOS the socket already lives at that state path.
-An explicit `--endpoint` or `ST3_ENDPOINT` still takes precedence.
-
-st records every `git` and `gh` call it starts, including its own, in
-`~/.local/state/st3/recorder/commands.jsonl`, then runs the real program unchanged. A call by
-absolute path is not recorded. The [command recorder](st3/command-recorder.md) describes the
-log.
-
-If the state directory has a long path, set `XDG_RUNTIME_DIR` to a shorter directory or pass
-`--socket` and `--client-gateway-socket` to `st up` so both Unix socket paths fit the OS limit.
-When `st up` receives a private `--state-dir` or `--socket` without an explicit
-`--client-gateway-socket`, its paired gateway is placed beside that private socket (or
-in the private state directory when no socket is specified). An existing live listener
-at either socket path is never replaced; choose a different path instead.
+The [daemon troubleshooting guide](when-something-is-wrong.md),
+[command recorder](st3/command-recorder.md) and [compatibility policy](st3/compatibility.md)
+cover socket paths, recorded commands and recovery details.
 
 ## Next
 
-- [Using stui and the iOS app](stui-and-ios.md): follow work, talk to agents, and install the phone app.
-- [Two machines](two-machines.md): connect your machines and check graph replication.
-- [Missions in practice](missions-in-practice.md): revise work, queue runs, and ask for human decisions.
-- [Talking to agents](talking-to-agents.md): UI, phone, CLI, attachments, and structured requests.
-- [Build and run the iOS app](ios-app.md): local simulator and iPhone builds, then gateway pairing.
-- [Seat lifecycle](seat-lifecycle.md): restart, suspend/resume, native sessions, and stopped seats.
-- [0.x compatibility](st3/compatibility.md): upgrade baselines, clients, harnesses and current platform proof.
-- [Upgrading st](upgrading-st.md): install the same build everywhere and check recovery options.
-- [GitHub integration](github-integration.md): repository intake, review, triage, and landing work.
-- [When something is wrong](when-something-is-wrong.md): health, work, usage, and stop reasons.
-- [Runnable examples](../examples/st3/README.md): other harnesses, schedules, gates, and parallel work.
-- [KDL lifecycle](st3/kdl-lifecycle.md): the complete declaration and revision workflow.
-- [Terminal client](../crates/stui/README.md): UI controls and remote clients.
+- [Missions in practice](missions-in-practice.md): define work, revise it, and answer person-only decisions.
+- [Talking to agents](talking-to-agents.md): UI, phone, CLI, attachments, and requests.
+- [Two machines](two-machines.md): create a fleet, invite another machine and check replication.
+- [Terminal UI and iOS](stui-and-ios.md): follow work and pair the phone app.
+- [Runnable examples](../examples/st3/README.md): seats, other harnesses, schedules and gates.
+- [Seat lifecycle](seat-lifecycle.md): restart, suspend/resume and stopped seats.
+- [GitHub integration](github-integration.md): optional repository intake and review.

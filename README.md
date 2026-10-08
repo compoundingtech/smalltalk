@@ -1,16 +1,35 @@
 # Smalltalk
 
-Smalltalk turns your coding agents into a team that doesn't need babysitting. Describe the work once as a mission, with its goals, its constraints and the checks that prove it's done right, not just done. Agents on your own machines carry it through, survive restarts, and bring you only the decisions that are yours to make. You plan and decide; your agents do the rest, all day and overnight.
+Download Smalltalk, then run `st`. It opens a terminal interface where you can talk to
+your coding agents and follow their work. Give them a mission with goals, constraints
+and checks; durable seats carry it through and bring you the decisions that need you.
 
-`st` runs agents as durable seats and records work, messages, and decisions in a graph.
-Publish seats, missions, and schedules with `st apply FILE...`; add `--dry-run` to validate
-and preview, or `--dry-run --check` to run the exec gates too.
-One daemon runs on each machine; your machines can join a fleet. Use the terminal UI, CLI,
-or iOS app to follow work and talk to agents. Each person currently runs their own fleet.
+```sh
+curl -fsSL https://raw.githubusercontent.com/compoundingtech/smalltalk/main/install.sh | sh
+```
 
-**[Get started](docs/getting-started.md)** — install Smalltalk and give your first agent a mission.
+The installer selects your platform, verifies the downloaded archive and opens `st`.
+On the first run, choose your name and this machine's name, accept the background
+service, and choose an installed coding harness. The built-in expert guides you
+through your first mission and stays available afterward.
 
-Platforms/status: Linux x86_64 and macOS Apple Silicon; fresh-Mac setup is not yet verified, and macOS CI is currently disabled.
+After quitting the interface with **Ctrl+Q**, open it again:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+st
+```
+
+Supported platforms are Linux x86_64 with glibc 2.35+ (Ubuntu 22.04+) and macOS Apple
+Silicon with macOS 15+. The installer needs `curl`, `tar` and a SHA256 checker; macOS
+also needs Python 3. Harness CLIs and their accounts are separate. If none is
+installed, `st` still opens; install a supported harness and run `st setup` later.
+Neither GitHub nor `gh` is required. Native macOS build and installer tests run in CI;
+clean-machine app, launchd and permission setup still need a manual rehearsal.
+
+**[Get started](docs/getting-started.md)** covers first-run questions, the expert,
+installation choices and background services. Each person currently runs their own
+fleet; start with one machine and add others when you need them.
 
 ## Guides
 
@@ -19,19 +38,20 @@ Platforms/status: Linux x86_64 and macOS Apple Silicon; fresh-Mac setup is not y
 - [Talking to agents](docs/talking-to-agents.md): UI, phone, CLI, attachments, and human requests.
 - [Build and run the iOS app](docs/ios-app.md): local simulator and iPhone builds, then pairing.
 - [Seat lifecycle](docs/seat-lifecycle.md): create, restart, suspend, and import seats.
-- [0.x compatibility](docs/st3/compatibility.md): upgrade baselines, client/harness boundaries and platform proof.
-- [Upgrading st](docs/upgrading-st.md): install the same build everywhere and check recovery.
-- [GitHub integration](docs/github-integration.md): repository intake, review, triage, and landing work.
-- [When something is wrong](docs/when-something-is-wrong.md): startup, install/upgrade diagnosis, sanitized issue reports, health and stop reasons.
+- [Upgrading st](docs/upgrading-st.md): choose a build and check recovery before changing an existing fleet.
+- [GitHub integration](docs/github-integration.md): optional repository intake, review, triage, and landing work.
+- [When something is wrong](docs/when-something-is-wrong.md): startup, health, install/upgrade diagnosis, and stop reasons.
 
 ## Reference
 
+- [Binary releases](docs/st3/binary-releases.md): archive contents, versions and verification.
+- [Nix and Home Manager](docs/getting-started.md#with-nix-and-home-manager)
+- [Daemon details](docs/getting-started.md#daemon-details)
+- [macOS installation and signing](docs/st3/macos-installation.md)
 - [Documentation index](docs/st3/README.md)
 - [Runnable examples](examples/st3/README.md)
 - [Guided CLI tour](docs/st3/cli-guided-tour.md)
 - [KDL lifecycle](docs/st3/kdl-lifecycle.md)
-- [Running st with omp](docs/st3/omp.md)
 
 [Contributing](docs/development.md#contributing) covers source builds, checks, and repository layout.
-
 This repository also carries st2, the previous generation; see [its guide](README.st2.md).
