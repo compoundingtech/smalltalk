@@ -25,6 +25,7 @@ const row = Native.decodeUnknownSync(Native.UsageRow)({
 })
 const facts: StTraceFacts = {
   usage: { _tag: 'Known', value: summary }, row: { _tag: 'Known', value: row },
+  selfOnlySpend: { _tag: 'Known', value: true },
   freshness: { _tag: 'Observed', atMs: 1000 },
 }
 const nativeLayer = (observation: StTraceFacts) => stSessionTraceLayer.pipe(
@@ -78,7 +79,7 @@ describe('session trace seam', () => {
   it.effect.prop('Unknown native inputs never turn into fabricated totals', [TraceUnknown], ([absence]) =>
     Effect.gen(function* () {
       const trace = yield* sessionTrace(query).pipe(Effect.provide(nativeLayer({
-        usage: absence, row: absence, freshness: absence,
+        usage: absence, row: absence, selfOnlySpend: absence, freshness: absence,
       })))
       expect(trace.native_session_id).toEqual(absence)
       expect(Object.values(trace.meters.tokens)).toEqual([absence, absence, absence, absence])
@@ -86,6 +87,29 @@ describe('session trace seam', () => {
       for (const value of Object.values(trace.meters.context)) expect(value).toEqual(absence)
       expect(trace.buckets).toEqual({ _tag: 'Unknown', reason: 'no-provider' })
       expect(trace.subagents).toEqual({ _tag: 'Unknown', reason: 'no-provider' })
+    }),
+  )
+
+  it.effect.prop('unknown self-only accounting evidence keeps known aggregate spend Unknown', [TraceUnknown], ([absence]) =>
+    Effect.gen(function* () {
+      const trace = yield* sessionTrace(query).pipe(Effect.provide(nativeLayer({
+        ...facts, selfOnlySpend: absence,
+      })))
+      for (const value of Object.values(trace.meters.tokens)) expect(value).toEqual(absence)
+      expect(trace.meters.cost).toEqual({ amount: absence, currency: absence })
+      expect(trace.meters.context.usedTokens).toEqual({ _tag: 'Known', value: 12 })
+    }),
+  )
+
+  it.effect('mixed subagent aggregate spend is not mislabelled as self-only', () =>
+    Effect.gen(function* () {
+      const trace = yield* sessionTrace(query).pipe(Effect.provide(nativeLayer({
+        ...facts, selfOnlySpend: { _tag: 'Known', value: false },
+      })))
+      for (const value of Object.values(trace.meters.tokens)) expect(value).toEqual({ _tag: 'Unknown', reason: 'not-attributed' })
+      expect(trace.meters.cost.amount).toEqual({ _tag: 'Unknown', reason: 'not-attributed' })
+      expect(trace.meters.context.usedTokens).toEqual({ _tag: 'Known', value: 12 })
+      expect(trace.partial).toBe(true)
     }),
   )
 
@@ -193,7 +217,8 @@ describe('native trace gateway adapter', () => {
       expect(usageRequest).toBeDefined()
       expect(Number(usageRequest?.searchParams.get('until_ms')) - Number(usageRequest?.searchParams.get('since_ms'))).toBe(604_800_000)
       if (mode === 'observed') {
-        expect(trace.meters.tokens.input).toEqual({ _tag: 'Known', value: 101 })
+        expect(trace.meters.tokens.input).toEqual({ _tag: 'Unknown', reason: 'not-attributed' })
+        expect(trace.meters.context.usedTokens).toEqual({ _tag: 'Known', value: 12 })
         expect(trace.native_session_id).toEqual({ _tag: 'Known', value: query.native_session_id })
         expect(requests.some((url) => url.pathname.includes('/agents/'))).toBe(true)
       } else {

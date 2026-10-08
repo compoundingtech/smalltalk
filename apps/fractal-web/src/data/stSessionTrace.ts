@@ -15,6 +15,8 @@ import { SubjectReadPort } from './subjectReadPort.ts'
 export const StTraceFacts = Schema.Struct({
   usage: TraceFact(Schema.toType(Native.UsageSummary)),
   row: TraceFact(Schema.toType(Native.UsageRow)),
+  /** Evidence must cover every spending incarnation, not just the current driver. */
+  selfOnlySpend: TraceFact(Schema.Boolean),
   freshness: TraceFreshness,
 }).annotate({ identifier: 'SessionTrace.NativeFacts' })
 export type StTraceFacts = typeof StTraceFacts.Type
@@ -40,6 +42,8 @@ export const stSessionTraceLayer = Layer.effect(SessionTraceProvider,
           const field = <TValue>(pick: (value: Native.UsageSummary) => TValue | undefined) => {
             if (usage._tag === 'Unknown') return usage
             if (usage.value.incarnation_count === 0) return missing
+            if (observation.selfOnlySpend._tag === 'Unknown') return observation.selfOnlySpend
+            if (!observation.selfOnlySpend.value) return { _tag: 'Unknown' as const, reason: 'not-attributed' as const }
             const value = pick(usage.value)
             return value === undefined || (typeof value === 'string' && value.length === 0) ? missing : known(value)
           }
@@ -106,14 +110,14 @@ export const gatewayStSessionTraceFactsLayer = (client: St3Client) => Layer.effe
             Effect.catch(() => Effect.succeed(undefined)))
           if (period === undefined) {
             const failed: TraceUnknown = { _tag: 'Unknown', reason: 'failed', detail: 'Native usage is unavailable' }
-            return { usage: failed, row: failed, freshness: failed }
+            return { usage: failed, row: failed, selfOnlySpend: failed, freshness: failed }
           }
           const rows = period.rows.filter((row) => row.native_session_id === query.native_session_id)
           const row = rows[0]
           // No summation, path attribution or arbitrary choice between agents sharing an ID.
           if (row === undefined || rows.some((candidate) => candidate.agent !== row.agent)) {
             const unattributed: TraceUnknown = { _tag: 'Unknown', reason: 'not-attributed' }
-            return { usage: unattributed, row: unattributed, freshness: { _tag: 'Observed' as const, atMs: until_ms } }
+            return { usage: unattributed, row: unattributed, selfOnlySpend: unattributed, freshness: { _tag: 'Observed' as const, atMs: until_ms } }
           }
           const agent = yield* subjects.agent.read(row.agent).pipe(
             Effect.map((agent) => ({ _tag: 'Known' as const, value: agent })),
@@ -123,7 +127,12 @@ export const gatewayStSessionTraceFactsLayer = (client: St3Client) => Layer.effe
             onNone: () => missing,
             onSome: known,
           })
-          return { usage, row: known(row), freshness: { _tag: 'Observed' as const, atMs: until_ms } }
+          return {
+            usage, row: known(row),
+            // Native aggregate rows do not establish self-only coverage across incarnations.
+            selfOnlySpend: { _tag: 'Unknown' as const, reason: 'not-attributed' as const },
+            freshness: { _tag: 'Observed' as const, atMs: until_ms },
+          }
         }),
       ),
     }
