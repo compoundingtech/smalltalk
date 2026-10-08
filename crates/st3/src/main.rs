@@ -1840,6 +1840,17 @@ struct MissionCheckArgs {
 
 #[derive(Subcommand)]
 enum GateCommand {
+    /// Check one bundled onboarding step against its current run and person answers.
+    Onboarding {
+        #[arg(value_parser = ["hello", "tour", "first-mission", "your-project", "keep-running", "phone", "second-machine", "github", "wrap-up"])]
+        step: String,
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        generation: String,
+        #[arg(long)]
+        attempt: u32,
+    },
     /// Whether a pull request has merged; one that closed unmerged cannot pass.
     Merged {
         /// OWNER/REPO#NUMBER.
@@ -5206,15 +5217,18 @@ async fn run(cli: Cli) -> Result<()> {
             if matches!(&command, GateCommand::Merged { .. } | GateCommand::CiPassed { .. }) {
                 st3::resource::configure_github(&config)?;
             }
-            run_gate(command).await
+            run_gate(&immediate, command).await
         },
     }
 }
 
 /// `st gate KIND`: print the answer and exit with the status an exec gate reads.
-async fn run_gate(command: GateCommand) -> Result<()> {
+async fn run_gate(client: &Client, command: GateCommand) -> Result<()> {
     use st3::resource::github_gates;
     let answer = match command {
+        GateCommand::Onboarding { step, run, generation, attempt } => {
+            st3::onboarding_checks::check(client, &step, &run, &generation, attempt).await
+        }
         GateCommand::Merged { pull_request } => {
             github_gates::pull_request_merged(&pull_request).await
         }

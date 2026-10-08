@@ -7,40 +7,94 @@ mission "st/onboarding" state="ready" {
   }
   constraint "Read @GUIDE@ before guiding the person. Read the configured person, machines and doctor results from the graph; do not assume installation facts."
   constraint "Never ask for or type a password. Offer exact commands for the person to run when their decision or system privileges are needed."
-  constraint "Keep sample work inside the scratch workspace and graph. Use invented names. Do not publish outside this machine or require GitHub. Optional steps may be skipped."
+  constraint "Keep sample work inside the scratch workspace and graph. Use invented names. Do not publish outside this machine or require GitHub. Optional steps may be skipped only through a current choice answer on Home, not through the expert's own prose. Read the guide's onboarding workflow for exact request IDs and evidence JSON. Use work ask so the step yields while waiting; never record an answer as the person."
   step "hello" {
-    goal "Greet the configured person and check st doctor and machines. Explain seats, missions and Home in five sentences; store the checked results as evidence."
+    gate "the current onboarding facts are checked" {
+      exec "\"$ST3_BIN\" gate onboarding hello --run \"${ST_MISSION_RUN}\" --generation \"${ST_RUN_GENERATION}\" --attempt ${ST_ATTEMPT}"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "30s"
+    }
+    goal "Greet the configured person and check st doctor and machines. Explain seats, missions and Home in five sentences; store the checked results as evidence. Do not describe an absent provider login, device or fleet member as installed."
   }
   step "tour" {
+    gate "the current onboarding facts are checked" {
+      exec "\"$ST3_BIN\" gate onboarding tour --run \"${ST_MISSION_RUN}\" --generation \"${ST_RUN_GENERATION}\" --attempt ${ST_ATTEMPT}"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "30s"
+    }
     depends-on { step "hello" completed }
-    goal "Guide the person through Home, Agents, Missions and the command palette. Explain attaching, detaching and quitting while work keeps running. Ask for a short choice on Home to check that the sidebar opened."
+    goal "Guide the person through Home, Agents, Missions and the command palette. Explain attaching, detaching and quitting while work keeps running. Ask a choice on Home with answers tour-seen (the sidebar opened) and help (show it again). On help, offer a shorter tour and ask again with a fresh idempotency key. Wait for tour-seen before completing."
   }
   step "first-mission" {
+    gate "the current onboarding facts are checked" {
+      exec "\"$ST3_BIN\" gate onboarding first-mission --run \"${ST_MISSION_RUN}\" --generation \"${ST_RUN_GENERATION}\" --attempt ${ST_ATTEMPT}"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "30s"
+    }
     depends-on { step "tour" completed }
-    goal "Show a tiny private garden-note mission, preview its KDL, ask for a decision on Home before starting it, and follow its completed run and answered review."
+    goal "Follow the guide's garden-note example. Write the private draft and KDL inside ${ST_WORKSPACE}/garden-note, use the actual requester as its human reviewer, preview with apply --dry-run, and ask a decision on Home with accept and decline before publication or start. On decline, revise with the person and ask again; do not skip this lesson. Start only after accept. Wait for the sample run to complete after its review on Home, then publish first-mission evidence with sample_run."
   }
   step "your-project" {
+    gate "the current onboarding facts are checked" {
+      exec "\"$ST3_BIN\" gate onboarding your-project --run \"${ST_MISSION_RUN}\" --generation \"${ST_RUN_GENERATION}\" --attempt ${ST_ATTEMPT}"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "30s"
+    }
     depends-on { step "first-mission" completed }
-    goal "Ask which directory and harness the person wants, create their seat through st agents new, send a first message, and check its incarnation and read receipt."
+    goal "Use a feedback request on Home to ask which existing directory and installed harness the person wants. Read agents new --help; explain that the seat runs without permission prompts. Show the proposed directory, harness and seat name in a decision request with accept and decline. Only after accept, create that seat through st agents new, send a first private message, and check a healthy incarnation plus its recipient graph read receipt. Publish your-project evidence with agent, message and absolute workspace. Do not reuse the built-in expert as the project seat."
   }
   step "keep-running" {
+    gate "the current onboarding facts are checked" {
+      exec "\"$ST3_BIN\" gate onboarding keep-running --run \"${ST_MISSION_RUN}\" --generation \"${ST_RUN_GENERATION}\" --attempt ${ST_ATTEMPT}"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "30s"
+    }
     depends-on { step "your-project" completed }
-    goal "Check service status and platform permissions. Explain reboot behavior and give exact manual commands for any missing permissions; never run sudo."
+    goal "Check service status and platform permissions. Explain daemon restarts, reboots and detached fallback in one paragraph. On Linux check loginctl show-user --property=Linger --value; if missing give the exact loginctl enable-linger command for the person in their own terminal. On macOS show st service permissions and ask a choice with permissions-seen and help, then record permissions_shown=true evidence. Offer a normal shell terminal for manual chores; do not assume a typed-but-unsent setup tab exists. Never run sudo, ask for a password or automate an OS permission prompt. Wait for the installed service to be active, and Linux lingering enabled."
   }
   step "phone" {
+    gate "the current onboarding facts are checked" {
+      exec "\"$ST3_BIN\" gate onboarding phone --run \"${ST_MISSION_RUN}\" --generation \"${ST_RUN_GENERATION}\" --attempt ${ST_ATTEMPT}"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "30s"
+    }
     depends-on { step "keep-running" completed }
-    goal "Offer phone pairing through st devices, or record that the person skipped it."
+    goal "Ask a choice on Home with enable (pair the phone now) and skip (continue without it). After enable, guide st devices pairing and check an active paired device for the requester. After skip, complete once and never repeat this question in this run. Do not treat absent phone hardware as a failure."
   }
   step "second-machine" {
+    gate "the current onboarding facts are checked" {
+      exec "\"$ST3_BIN\" gate onboarding second-machine --run \"${ST_MISSION_RUN}\" --generation \"${ST_RUN_GENERATION}\" --attempt ${ST_ATTEMPT}"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "30s"
+    }
     depends-on { step "phone" completed }
-    goal "Explain fleets and invites only if the person wants another machine; otherwise record a skip."
+    goal "Ask a choice on Home with enable (join another machine now) and skip. Explain fleets and invite prerequisites after enable; create or redeem no invite until requested. Check a current member other than this machine after joining. After skip, complete once and never repeat this question in this run."
   }
   step "github" {
+    gate "the current onboarding facts are checked" {
+      exec "\"$ST3_BIN\" gate onboarding github --run \"${ST_MISSION_RUN}\" --generation \"${ST_RUN_GENERATION}\" --attempt ${ST_ATTEMPT}"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "30s"
+    }
     depends-on { step "second-machine" completed }
-    goal "Offer the optional GitHub observer. If gh is absent or the person declines, record a skip and continue. Never require it for onboarding."
+    goal "Ask a choice on Home with enable (configure the optional GitHub observer) and skip. Recommend skip when gh is absent or the person does not need GitHub. On enable, guide login in the person's terminal, configure only the observer they requested, and check the doctor github-observer-auth result. Never run gh at all on the skip path; never require GitHub for any other step. After skip, complete once and never repeat the question in this run."
   }
   step "wrap-up" {
+    gate "the current onboarding facts are checked" {
+      exec "\"$ST3_BIN\" gate onboarding wrap-up --run \"${ST_MISSION_RUN}\" --generation \"${ST_RUN_GENERATION}\" --attempt ${ST_ATTEMPT}"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "30s"
+    }
     depends-on { step "github" completed }
-    goal "List the checked work and objects that now exist, explain messaging agent/st/expert again, and point to @GUIDE@ and st --help. Finish the run and remain available for future messages."
+    goal "List the checked work and objects that now exist, explain messaging agent/st/expert again, and point to @GUIDE@ and st --help. Name any optional skips plainly. Publish wrap-up evidence with a short summary. Complete this step after all eight preceding steps complete; the run itself will then complete. Keep the expert declared and available for future messages; do not delete, stop or suspend it automatically."
   }
 }
