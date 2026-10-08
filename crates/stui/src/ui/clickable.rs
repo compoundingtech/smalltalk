@@ -24,7 +24,7 @@ impl Ui {
         let footer = Rect::new(area.x, area.bottom() - 1, area.width, 1);
         // Text to read stays quiet: moving over messages leaves the normal keys in the footer
         // (Nathan, 2026-10-07).
-        if matches!(hit, Hit::Message | Hit::Subject) {
+        if matches!(hit, Hit::Message | Hit::Subject | Hit::InlineImage(_)) {
             return;
         }
         if rect.intersects(footer)
@@ -46,7 +46,7 @@ impl Ui {
             Hit::Usage => "show/hide Usage".into(),
             Hit::Connection => "connection details".into(),
             Hit::Row(_) => "select row".into(),
-            Hit::Message | Hit::Subject => String::new(),
+            Hit::Message | Hit::Subject | Hit::InlineImage(_) => String::new(),
             Hit::Resize => "drag resize; double-click equalize".into(),
             Hit::Key('s') if self.glasses.is_none() && self.popover.is_none() => {
                 "show/hide list [s]".into()
@@ -55,6 +55,8 @@ impl Ui {
             Hit::ToggleTool(_) | Hit::Pane(PaneIntent::Expand(_)) => "expand/collapse".into(),
             Hit::Pane(PaneIntent::Open(_)) | Hit::Open(_) => "open subject".into(),
             Hit::Pane(PaneIntent::Image(_)) => "open image".into(),
+            Hit::ContentImage(_) => "load image".into(),
+            Hit::ContentOutput(_) => "load full output".into(),
             Hit::Pane(PaneIntent::Send(_)) => "send message".into(),
             Hit::Pane(PaneIntent::LoadOlder) => "load older messages".into(),
             Hit::JumpLatest => "jump to latest [End]".into(),

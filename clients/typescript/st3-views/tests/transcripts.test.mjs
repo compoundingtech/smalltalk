@@ -52,4 +52,16 @@ for (const name of ['claude', 'codex', 'deliveries', 'native-claude-run', 'nativ
   const phone = conversationEntries(page.items, new Map()).map(entry => ({ body: asStui(entry.body), id: entry.id }));
   assert.deepEqual(phone, expected, 'omp-parity: the phone reads this transcript differently from stui');
   assert.equal(headerLine(page.header, '2026-10-06T12:00:00Z'), 'model synthetic/model · context 50 tokens · cost $0.02 · todo 1/5 · jobs 1 · agents 1 · ask Continue? · working [register · 0s ago] · transcript · 0s ago', 'omp-parity: compact header matches stui');
+  for (const status of ['pending', 'completed']) {
+    const items = structuredClone(page.items);
+    const result = items.find(entry => entry.id === 'parity-18');
+    result.body.blocks.find(block => block.view?.type === 'task').view.agents[0].status = status;
+    const entries = conversationEntries(items, new Map());
+    for (const assignment of ['Review synthetic code', 'Report all findings']) {
+      assert.deepEqual(entries.filter(entry => entry.body.kind === 'tool' && entry.body.output.includes(assignment)).map(entry => entry.id), ['parity-10'], `${status}: assignment appears only on the invocation`);
+    }
+    const card = entries.find(entry => entry.id === 'parity-18#child').body;
+    assert.ok(card.title.includes(status));
+    assert.ok(card.output.includes('duration 1200ms') && card.output.includes('open session/child'));
+  }
 }

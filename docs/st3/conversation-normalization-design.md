@@ -146,8 +146,10 @@ have `tool`, `call_id` and `is_error`:
 requests?, tool_count?, conversation?: {session_id}}`. `name` preserves the OMP name
 (native `name`, otherwise `id`); `agent` is its type. `task` preserves the full native
 `assignment`, otherwise `task`. Both clients retain invocation rows when the result
-arrives, draw all assignment lines on expansion, and label the child-open row with
-the name while routing to the actual session id. The owner fills
+arrives and draw all assignment lines only on the invocation's expansion. Subagent
+result cards show status, usage and the child-open link, without repeating the
+assignment. The child-open row names the agent while routing to its actual session
+id. The owner fills
 `conversation.session_id` only when the child transcript exists at
 `<parent transcript without .jsonl>/<id>.jsonl` and is readable; that session id opens
 through the normal conversation routes (same fold, paging and refs), which is how a

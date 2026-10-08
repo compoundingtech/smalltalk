@@ -1732,7 +1732,7 @@ fn job_line(job: &Value) -> String {
     line
 }
 
-/// One subagent's card (q2): who ran, how it went, and the row that opens its transcript.
+/// One subagent's result card (q2): outcome, usage, and transcript link; assignment stays on the call.
 fn agent_card(agent: &Value) -> Body {
     let string = |field: &str| agent.get(field).and_then(Value::as_str).unwrap_or("");
     let named = {
@@ -1750,9 +1750,6 @@ fn agent_card(agent: &Value) -> Body {
     };
     let status = string("status");
     let mut output = Vec::new();
-    if let Some(task) = agent.get("task").and_then(Value::as_str) {
-        output.extend(task.lines().map(str::to_owned));
-    }
     if let Some(ms) = agent.get("duration_ms").and_then(Value::as_u64) {
         output.push(format!("duration {ms}ms"));
     }

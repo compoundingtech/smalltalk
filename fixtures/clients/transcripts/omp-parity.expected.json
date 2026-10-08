@@ -128,7 +128,7 @@
       "value": {
         "title": "task \u00b7 1 agents",
         "state": "ok",
-        "output": ["parent context / contract:", "Synthetic parent context", "Contract: keep every detail", "Review · reviewer", "Review synthetic code"]
+        "output": ["parent context / contract:", "Synthetic parent context", "Contract: keep every detail", "Review · reviewer", "Review synthetic code", "Report all findings"]
       }
     }
   },
@@ -177,8 +177,6 @@
         "title": "Review \u00b7 completed \u00b7 reviewer",
         "state": "ok",
         "output": [
-          "Review synthetic code",
-          "Report all findings",
           "duration 1200ms",
           "tokens 80",
           "cost $0.02",

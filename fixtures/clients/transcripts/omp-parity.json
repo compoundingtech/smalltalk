@@ -318,7 +318,7 @@
                 {
                   "name": "Review",
                   "agent": "reviewer",
-                  "task": "Review synthetic code"
+                  "task": "Review synthetic code\nReport all findings"
                 }
               ]
             }

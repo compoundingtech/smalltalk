@@ -228,8 +228,11 @@ assert.equal(cleanMessageText(rawText, SHOW_EVERYTHING), rawText);
 // text or raw JSON, while plain prose without them is still cleaned, as stui does.
 {
   const base = { id: 'r', timestamp: '2026-10-06T12:00:00Z', role: 'assistant', type: 'content', final: true, sequence: 1 };
-  const reasoning = conversationEntries([{ ...base, body: { media_type: 'text/plain', text: '<thinking>the plan: check the fixtures</thinking>', blocks: [{ id: 'b', kind: 'reasoning', source_type: 'synthetic', payload: {} }] } }], new Map());
+  const reasoning = conversationEntries([{ ...base, body: { media_type: 'text/plain', text: '<thinking>the plan: check the fixtures</thinking>', blocks: [{ id: 'b', kind: 'reasoning', source_type: 'synthetic', payload: { text: 'the plan: check the fixtures' } }] } }], new Map());
   assert.equal(reasoning[0].body.text, '<thinking>the plan: check the fixtures</thinking>', 'reasoning text arrives as data');
+  const thought = text => ({ ...base, body: { media_type: 'text/plain', text: `[reasoning]${text}`, blocks: [{ id: 'b', kind: 'reasoning', source_type: 'synthetic', payload: { text } }] } });
+  assert.deepEqual(conversationEntries([thought('')], new Map()), [], 'empty normalized reasoning is bookkeeping');
+  assert.equal(conversationEntries([thought('the plan')], new Map())[0].body.text, 'Thinking · the plan', 'shared reasoning keeps the human-readable label');
   const prose = conversationEntries([{ ...base, body: { media_type: 'text/plain', text: '<thinking>private</thinking>visible' } }], new Map());
   assert.equal(prose[0].body.text, 'visible', 'prose without data blocks is still cleaned');
   const raw = conversationEntries([{ ...base, role: 'system', body: { media_type: 'text/plain', text: '<tool_result>{"output":1}</tool_result>', blocks: [{ id: 'b', kind: 'unknown', source_type: 'synthetic', payload: {} }] } }], new Map());

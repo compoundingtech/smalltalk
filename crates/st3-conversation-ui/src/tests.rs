@@ -642,8 +642,6 @@ fn a_subagent_card_opens_its_child_conversation() {
     assert_eq!(
         output.as_slice(),
         [
-            "Review synthetic code",
-            "Report all findings",
             "duration 1200ms",
             "tokens 80",
             "cost $0.02",
@@ -696,6 +694,44 @@ fn typed_calls_bundle_in_the_simplified_conversation() {
             && shown.iter().any(|line| line.contains("write demo.txt")),
         "{shown:?}"
     );
+}
+
+#[test]
+fn task_assignments_render_once_on_invocation_for_pending_and_completed_results() {
+    for status in ["pending", "completed"] {
+        let mut page: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/clients/transcripts/omp-parity.json"
+        ))
+        .unwrap();
+        let result = page["items"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["id"] == "parity-18")
+            .unwrap();
+        let block = result["body"]["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|block| block["view"]["type"] == "task")
+            .unwrap();
+        block["view"]["agents"][0]["status"] = status.into();
+        let items = serde_json::from_value::<Vec<st3_client::TimelineEntry>>(page["items"].clone())
+            .unwrap();
+        let entries = adapt::conversation(&items, &Default::default());
+        for assignment in ["Review synthetic code", "Report all findings"] {
+            let owners = entries
+                .iter()
+                .filter(|entry| matches!(&entry.body, Body::Tool { output, .. }
+                    if output.iter().any(|line| line == assignment)))
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(owners, ["parity-10"], "{status}: {assignment}");
+        }
+        let result = entries.iter().find(|entry| entry.id == "parity-18#child").unwrap();
+        assert!(matches!(&result.body, Body::Tool { title, output, .. }
+            if title.contains(status) && output.iter().any(|line| line == "open session/child")));
+    }
 }
 
 /// The omp-parity page's entries, as the shared transcript test reads them.

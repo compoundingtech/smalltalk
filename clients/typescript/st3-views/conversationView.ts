@@ -508,13 +508,11 @@ function viewOutput(view: BlockView, content: unknown, full = false): string[] |
   }
 }
 
-/** A finished subagent as its own card: `agent · status`, its task, what it used, and the
- * conversation it opens (`open session/…`) when the child transcript exists. */
+/** A subagent result as its own card: `agent · status`, what it used, and the conversation
+ * it opens (`open session/…`). The task assignment belongs only to the invocation card. */
 function subagentCard(agent: unknown, state: ToolState): { id: string; title: string; output: string[] } {
   const value = record(agent);
   const lines: string[] = [];
-  const task = str(value.task);
-  if (task) lines.push(...task.split('\n'));
   if (typeof value.duration_ms === 'number') lines.push(`duration ${value.duration_ms}ms`);
   if (typeof value.tokens === 'number') lines.push(`tokens ${value.tokens}`);
   if (typeof value.cost_usd === 'number') lines.push(`cost $${value.cost_usd.toFixed(2)}`);
