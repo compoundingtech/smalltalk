@@ -357,18 +357,19 @@ fn image_refs(
     basis: &str,
     session: &str,
     item: &Value,
-) {
+) -> bool {
     if image(value) {
         if external_image(value) {
-            return;
+            return false;
         }
         *value = json!({"type":"image","content":continuation(reference(source,basis,session,item,pointer),image_media(value),None,"on-demand")});
-        return;
+        return true;
     }
+    let mut changed = false;
     match value {
         Value::Array(values) => {
             for (index, value) in values.iter_mut().enumerate() {
-                image_refs(
+                changed |= image_refs(
                     value,
                     &format!("{pointer}/{index}"),
                     source,
@@ -380,7 +381,7 @@ fn image_refs(
         }
         Value::Object(values) => {
             for (key, value) in values.iter_mut() {
-                image_refs(
+                changed |= image_refs(
                     value,
                     &format!("{pointer}/{}", key.replace('~', "~0").replace('/', "~1")),
                     source,
@@ -392,6 +393,7 @@ fn image_refs(
         }
         _ => {}
     }
+    changed
 }
 
 /// Called before pagination: its held vectors contain only bounded display values and refs.
@@ -515,7 +517,7 @@ pub(super) fn prepare_one(
                 );
                 block["payload"] = json!({});
             } else {
-                image_refs(
+                let images_replaced = image_refs(
                     &mut block["payload"],
                     &pointer,
                     source,
@@ -529,9 +531,20 @@ pub(super) fn prepare_one(
                         reference(source, basis, session_id, &original, &pointer),
                         "application/json",
                         Some(
-                            original["_oversized_payload_bytes"][index]
-                                .as_u64()
-                                .map_or(encoded.len(), |size| size as usize),
+                            if let Some(size) = original["_oversized_payload_bytes"][index].as_u64() {
+                                size as usize
+                            } else if body_ref || images_replaced {
+                                // body_ref previews omit the blocks array, and image refs
+                                // replace native bytes. Size describes the owner value,
+                                // not either of those display-only transformations.
+                                serde_json::to_vec(
+                                    original.pointer(&pointer).expect("native block payload"),
+                                )
+                                .map_err(ApiError::internal)?
+                                .len()
+                            } else {
+                                encoded.len()
+                            },
                         ),
                         "size-limit",
                     );
@@ -1076,6 +1089,58 @@ mod tests {
             offset = next;
         }
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_output_http_chunks_return_complete_native_body_without_writes() {
+        let root = tempfile::tempdir().unwrap();
+        // More than two owner chunks, including UTF-8 split across byte boundaries.
+        let output = format!("{}\nlast native output line", "é".repeat(CHUNK_BYTES + 37));
+        let native = fixture(
+            root.path(),
+            json!([{
+                "type":"toolResult", "call_id":"large-output", "toolName":"shell",
+                "content":output, "details":{"exitCode":0}
+            }]),
+        );
+        let mut state = super::super::tests::test_state_named(root.path(), "tool-output-owner");
+        state.native_session_home = Some(root.path().to_path_buf());
+        let index = state.store.index().unwrap();
+        let local = state
+            .store
+            .changes_since(i64::MAX as u64, i64::MAX)
+            .unwrap()
+            .local;
+        let mut session = ClientSession::local(None).unwrap();
+        session.conversation_blocks = true;
+        let page = read(&native, &session, &native.id).unwrap();
+        let item = page.iter().find(|item| item["type"] == "tool_result").unwrap();
+        let block = &item["body"]["blocks"][0];
+        assert_eq!(block["kind"], "tool_output");
+        assert_eq!(block["continuation"]["reason"], "size-limit");
+        assert_eq!(block["continuation"]["media_type"], "application/json");
+        assert!(item["body"]["content"].as_str().unwrap().contains("truncated"));
+        let token = block["continuation"]["ref"].as_str().unwrap();
+        let location = locator(token, &native.id).unwrap();
+        let original = located_value(&native, &location).unwrap();
+        let encoded = serde_json::to_vec(&original).unwrap();
+        assert!(encoded.len() > CHUNK_BYTES * 2);
+        assert_eq!(block["continuation"]["size"], encoded.len());
+        let fetched = fetch_json_chunks(&state, &native, token).await;
+        assert_eq!(fetched, original);
+        // tool_output's body_ref covers the complete native tool body, not the
+        // clipped preview plus a suffix that a client would need to splice.
+        assert_eq!(location.pointer, "/body");
+        assert_eq!(fetched["content"], output);
+        assert_eq!(state.store.index().unwrap(), index);
+        assert_eq!(
+            state
+                .store
+                .changes_since(i64::MAX as u64, i64::MAX)
+                .unwrap()
+                .local,
+            local
+        );
     }
 
     fn assert_native_keyset_pages_match_full_read(
