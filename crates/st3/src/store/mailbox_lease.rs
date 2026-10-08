@@ -3,6 +3,11 @@ use super::*;
 use crate::mailbox::{Authority, Fence};
 use crate::model::{LaunchSpec, MemberKind, MemberSpec};
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_FAULT_ACQUISITION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn lease(
     connection: &Connection,
     fence: &Fence,
@@ -134,7 +139,20 @@ mod tests {
         let worker_store = store.clone();
         let (sent, received) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            sent.send(worker_store.mailbox_faults_for(&subjects, 0).is_err()).unwrap();
+            assert!(worker_store.mailbox_faults_for(&subjects, 0).is_err());
+            // The acquisition has already failed. Cancel exactly at its result boundary,
+            // so an early outer `?` would miss the authoritative typed deadline check.
+            let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = reached.clone();
+            AFTER_FAULT_ACQUISITION.with(|pause| {
+                *pause.borrow_mut() = Some(Box::new(move || {
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    smallclaims::read_budget::current().unwrap().cancel();
+                }));
+            });
+            let expired = worker_store.mailbox_faults_for(&subjects, 0).unwrap_err();
+            sent.send(reached.load(std::sync::atomic::Ordering::SeqCst)
+                && expired.downcast_ref::<St3Error>().is_some_and(|error| error.code == "read-deadline")).unwrap();
         });
         let result = received.recv_timeout(std::time::Duration::from_secs(1));
         std::fs::rename(&saved, &path).unwrap();
@@ -1280,7 +1298,13 @@ impl Store {
             // through try_get, which fails closed instead of waiting for a returned reader.
             let pinned = smallclaims::sqlite::PINNED_READER.with(|slot|
                 slot.borrow().as_ref().is_some_and(|(key, _)| *key == self.readers.key()));
-            let result = if pinned { read() } else { self.readers.request_read(read)? };
+            let result = if pinned { read() } else {
+                self.readers.request_read(read).map_err(anyhow::Error::from).and_then(|result| result)
+            };
+            #[cfg(test)]
+            AFTER_FAULT_ACQUISITION.with(|pause| {
+                if let Some(pause) = pause.borrow_mut().take() { pause(); }
+            });
             // Preserve the typed retryable deadline after restoring the parent scope,
             // including SQLite interruption before the first row could be decoded.
             checked.check()?;
