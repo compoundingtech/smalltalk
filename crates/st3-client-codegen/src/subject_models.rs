@@ -214,7 +214,7 @@ impl Contract {
         let mut claim_bindings=Map::new();
         for (name,id) in &self.claims {
             let kind=self.definitions[name]["properties"]["kind"]["const"].as_str().context("native kind")?;
-            let family=self.definitions[name]["properties"]["ref"]["x-st-native-ref-families"][0].as_str().context("native reference family")?;
+            let family=self.claim_family(name)?;
             writeln!(rust,"({id:?},{family:?},{kind:?}),")?;
             claim_bindings.insert(id.clone(),json!({"family":family,"kind":kind}));
         }

@@ -41,7 +41,20 @@ fn exact_json_object(value: &Value) -> Value {
     json!({"type":"object", "additionalProperties":reference("NativeJsonValue"),
         "const":value, "x-st-exact-json":value})
 }
-fn field_schema(field: &Value) -> Result<Value, String> {
+// Share reference constraints so validators compile each canonical-reference
+// pattern once, rather than once per field and per claim in the native union.
+fn subject_reference(families: &[String], definitions: &mut Map<String, Value>) -> Value {
+    let schema = crate::subject_reference_schema(families);
+    let registered = schema["x-st-native-ref-families"].as_array().expect("reference families");
+    let name = if registered.len() == crate::registry().subjects.len() {
+        "NativeSubjectRef".to_owned()
+    } else {
+        format!("Native{}SubjectRef", registered.iter().map(|family| pascal(family.as_str().expect("reference family"))).collect::<String>())
+    };
+    definitions.entry(name.clone()).or_insert(schema);
+    reference(&name)
+}
+fn field_schema(field: &Value, definitions: &mut Map<String, Value>) -> Result<Value, String> {
     let schema = if let Some(values) = field["values"].as_array().filter(|values| !values.is_empty()) {
         json!({"enum":values})
     } else {
@@ -49,8 +62,8 @@ fn field_schema(field: &Value) -> Result<Value, String> {
             "any" => reference("NativeJsonValue"),
             "array" => json!({"type":"array", "items":reference("NativeJsonValue")}),
             "object" => reference("NativeJsonObject"),
-            "subject-reference" => crate::subject_reference_schema(&field["reference_families"].as_array()
-                .map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default()),
+            "subject-reference" => subject_reference(&field["reference_families"].as_array()
+                .map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default(), definitions),
             "integer" => json!({"type":"integer", "minimum":-9007199254740991_i64,"maximum":9007199254740991_u64}),
             kind @ ("boolean" | "number" | "string") => json!({"type":kind}),
             other => return Err(format!("unsupported native value type {other}")),
@@ -58,10 +71,10 @@ fn field_schema(field: &Value) -> Result<Value, String> {
     };
     Ok(optional_nullable(schema))
 }
-fn projected_fields(claim: &Value) -> Result<Value, String> {
+fn projected_fields(claim: &Value, definitions: &mut Map<String, Value>) -> Result<Value, String> {
     let mut properties = Map::new();
     for (name, field) in claim["fields"].as_object().ok_or("effective native fields")? {
-        let mut schema = field_schema(field)?;
+        let mut schema = field_schema(field, definitions)?;
         if name == "desired" && matches!(claim["special"].as_str(), Some("agent_desired" | "account_desired")) {
             schema = optional_nullable(reference("CanonicalNode"));
         } else if name == "body" && claim["special"] == "glass_body" {
@@ -105,7 +118,7 @@ impl Contract {
             let mut claim_ids = Map::new();
             for (kind, claim) in descriptor["claims"].as_object().ok_or("effective claims")? {
                 let name = format!("Native{}{}Claim", pascal(family), pascal(kind));
-                let mut fields = projected_fields(claim)?;
+                let mut fields = projected_fields(claim, &mut definitions)?;
                 let claim_id = if kind == "custom.*" {
                     fields = json!({"type":"object", "additionalProperties":reference("NativeJsonValue")});
                     custom_effective = json!({"wire_version":policy::WIRE_VERSION,"family":family,"kind":"",
@@ -126,7 +139,7 @@ impl Contract {
                         let mut branch = fields.clone();
                         branch["properties"]["kind"] = json!({"const":resource_kind});
                         branch["required"] = json!(["kind"]);
-                        branch["properties"]["facts"] = optional_nullable(projected_fields(resource)?);
+                        branch["properties"]["facts"] = optional_nullable(projected_fields(resource, &mut definitions)?);
                         alternatives.push(branch);
                     }
                     fields["properties"]["facts"] = optional_nullable(object(json!({}), &[]));
@@ -134,7 +147,7 @@ impl Contract {
                     fields = json!({"anyOf":alternatives});
                 }
                 definitions.insert(field_name.clone(), fields);
-                let properties = json!({"id":{"type":"string"},"ref":crate::subject_reference_schema(std::slice::from_ref(family)),
+                let properties = json!({"id":{"type":"string"},"ref":subject_reference(std::slice::from_ref(family), &mut definitions),
                     "kind":if kind == "custom.*" { json!({"type":"string","pattern":"^custom\\.[a-zA-Z0-9_-]+(?:\\.[a-zA-Z0-9_-]+)+$"}) } else { json!({"const":kind}) },
                     "schema_id":claim_id,"retention":if kind == "custom.*" { json!({"const":"durable"}) } else { json!({"const":claim["retention"]}) },
                     "provenance":reference("SubjectProvenance"),"payload_availability":{"enum":["available","withheld","unavailable"]},
@@ -147,7 +160,8 @@ impl Contract {
             }
             let heads_name = format!("Native{}Claim",pascal(family));
             definitions.insert(heads_name.clone(),union(family_claims));
-            definitions.insert(family_name.clone(),object(json!({"kind":{"const":"subject"},"id":{"type":"string"},"ref":crate::subject_reference_schema(std::slice::from_ref(family)),
+            let family_ref = subject_reference(std::slice::from_ref(family), &mut definitions);
+            definitions.insert(family_name.clone(),object(json!({"kind":{"const":"subject"},"id":{"type":"string"},"ref":family_ref,
                 "family":{"const":family},"schema_id":{"const":schema_id},"heads":{"type":"array","maxItems":64,"items":reference(&heads_name)},"heads_complete":{"type":"boolean"},"local_fence":reference("SubjectLocalFence")}),&["kind","id","ref","family","schema_id","heads","heads_complete","local_fence"]));
             let descriptor_name = format!("Native{}Descriptor", pascal(family));
             definitions.insert(descriptor_name.clone(),object(json!({"family":{"const":family},"schema_id":{"const":schema_id},"descriptor":exact_json_object(&descriptor),"claim_schema_ids":exact_json_object(&Value::Object(claim_ids.clone()))}),&["family","schema_id","descriptor","claim_schema_ids"]));
@@ -170,7 +184,7 @@ impl Contract {
             definitions.insert(name.into(),page);
         }
         let mut subscription_branches = Vec::new();
-        for selector in [json!({"family":{"enum":crate::registry().subjects.keys().collect::<Vec<_>>()},"ref_prefix":{"type":"string"}}),json!({"ref":crate::subject_reference_schema(&[])})] {
+        for selector in [json!({"family":{"enum":crate::registry().subjects.keys().collect::<Vec<_>>()},"ref_prefix":{"type":"string"}}),json!({"ref":subject_reference(&[], &mut definitions)})] {
             let required_selector = if selector.get("family").is_some() { "family" } else { "ref" };
             let mut properties = selector.as_object().ok_or("selector")?.clone();
             properties.extend(json!({"kind":{"const":"subscribe"},"id":{"type":"string","minLength":1,"maxLength":128},"collection":{"const":"subjects"},"limit":{"type":"integer","minimum":1,"maximum":200}}).as_object().ok_or("subscription properties")?.clone());

@@ -104,6 +104,9 @@ bound and its 1–200 item limit. Their snapshot/change frames use native subjec
 `upserts`, and `removes`; they do not turn operational resources into native claims.
 Per-row descriptor validation permits explicit payload-free unsupported-schema rows while
 rejecting malformed known rows. Retained claim/history pages are separate HTTP reads.
+The generated native schema shares canonical-reference constraints through `$defs`/`$ref`,
+so compiling the collection-frame contract does not recompile a reference pattern for every
+claim field. The shared definitions retain the same family, syntax, and UTF-8 byte bounds.
 Native SQLite workers retain their physical read slot until they finish, even when a
 replacement or unsubscribe cancels delivery. Canceled workers cannot exceed the socket's
 eight-read bound.
