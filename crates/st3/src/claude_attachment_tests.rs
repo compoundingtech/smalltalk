@@ -1153,7 +1153,7 @@ async fn hookless_readiness_never_bypasses_absent_or_rejected_attachment() {
 #[tokio::test]
 async fn hookless_readiness_never_bypasses_native_blocked_ended_or_unknown_state() {
     use st_drivers::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
-    for activity in [Activity::Blocked, Activity::Ended, Activity::Unknown] {
+    for state in ["blocked", "ended", "unknown"] {
         let mut f = Fixture::new().await;
         let dir = f._root.path().join("observations");
         st_drivers::harness_events::enable(&dir, &f.control.owner.incarnation).unwrap();
@@ -1161,15 +1161,50 @@ async fn hookless_readiness_never_bypasses_native_blocked_ended_or_unknown_state
             NativeObservations::start(&dir, &f.control.owner.incarnation).unwrap();
         let seq =
             st_drivers::harness_state::claim(&dir, "example/quartz", "claude", "provider").unwrap();
-        Writer::new(&dir, "example/quartz", "claude", None)
-            .with_ownership("provider", seq)
-            .observe(Observation::new(
-                activity,
-                BlockedOn::Human,
-                InputBuffer::Unknown,
-            ))
-            .unwrap();
+        let mut writer = Writer::new(&dir, "example/quartz", "claude", Some("quartz-pty".into()))
+            .with_ownership("provider", seq);
+        if state == "ended" {
+            writer.ended("0").unwrap();
+        } else {
+            writer
+                .observe(Observation::new(
+                    Activity::Idle,
+                    if state == "blocked" {
+                        BlockedOn::Human
+                    } else {
+                        BlockedOn::None
+                    },
+                    InputBuffer::Empty,
+                ))
+                .unwrap();
+        }
         let now = current_unix_ms().unwrap() as u64;
+        if state == "unknown" {
+            // Unknown is derived from expired evidence; it is never a valid writer input.
+            let mut snapshot: Value = serde_json::from_slice(
+                &st_drivers::harness_events::read_runtime_state(&dir, &f.control.owner.incarnation)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            snapshot["writtenAtMs"] =
+                json!(now - st_drivers::harness_state::HARNESS_STATE_STALE.as_millis() as u64 - 1);
+            st_drivers::harness_events::write_snapshot(
+                &dir,
+                "harness-state",
+                &serde_json::to_vec(&snapshot).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                st_drivers::harness_state::read_raw_at(
+                    &serde_json::to_vec(&snapshot).unwrap(),
+                    None,
+                    now
+                )
+                .state,
+                Activity::Unknown
+            );
+        }
         f.state.claude_readiness_fallback.initialized_at_ms = Some(now - 15_000);
         publish_claude_readiness_fallback(
             &f.client,

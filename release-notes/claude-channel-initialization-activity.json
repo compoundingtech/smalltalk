@@ -7,7 +7,7 @@
   },
   "schema": {
     "status": "none",
-    "detail": "Uses existing harness.diagnostic and harness.observed kinds and fields. No registry/schema bytes or digest change. The component diagnostic remains Durable: one replicated claim per delivery epoch; no new trim rule. The startup-ready fallback is Retention::Latest."
+    "detail": "Uses existing harness.diagnostic and harness.observed kinds and fields. No registry/schema bytes or digest change. The component diagnostic remains Durable: at most one replicated initialization claim per delivery epoch; no new trim rule. The startup-ready fallback is Retention::Latest."
   },
   "rules": {
     "status": "none",
