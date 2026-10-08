@@ -10751,7 +10751,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         drop(release);
-        holder.join().unwrap();
+        holder.join().unwrap().unwrap();
         let (_, actual, _) = tokio::time::timeout(std::time::Duration::from_secs(10), task).await
             .expect("the collection completes once the reader frees")
             .unwrap().unwrap();

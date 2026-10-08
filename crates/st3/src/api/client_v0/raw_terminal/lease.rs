@@ -771,7 +771,7 @@ mod tests {
         };
         assert_eq!(store.readers.usage().open, 1, "no reader was opened");
         drop(release);
-        holder.join().unwrap();
+        holder.join().unwrap().unwrap();
     }
     #[test]
     fn partial_runtime_reports_preserve_leases_but_explicit_nulls_revoke() {

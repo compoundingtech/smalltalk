@@ -128,7 +128,7 @@ fn cross_pool_nesting_reuses_outer_readers_at_bound_one() {
         assert!(first.readers.has_request_reader());
         second.readers.request_read(|| {
             assert!(second.readers.has_request_reader());
-            assert!(!first.readers.has_request_reader(), "the outer loan is not the innermost one");
+            assert!(first.readers.has_request_reader(), "the outer loan remains available below the inner one");
             // Reentering the outer pool must neither open a second connection nor wait on
             // the capacity that pool's own outer loan already holds.
             first.readers.request_read(|| {
@@ -136,7 +136,7 @@ fn cross_pool_nesting_reuses_outer_readers_at_bound_one() {
                 assert!(first.readers.try_admit_read().is_none());
                 assert_eq!(first.readers.usage().open, 1);
             }).unwrap();
-            assert!(!first.readers.has_request_reader());
+            assert!(first.readers.has_request_reader());
             assert!(second.readers.has_request_reader());
         }).unwrap();
         // The inner loan's exit restored this outer loan, not an empty slot.
