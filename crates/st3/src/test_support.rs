@@ -198,8 +198,13 @@ pub fn check_fixture_mailbox(store: &crate::store::Store, fence: &crate::mailbox
 }
 
 #[cfg(feature = "test-support")]
-fn mailbox_transports() -> &'static std::sync::Mutex<std::collections::BTreeMap<(usize, String), tokio::sync::watch::Sender<bool>>> {
-    static CONTROLS: OnceLock<std::sync::Mutex<std::collections::BTreeMap<(usize, String), tokio::sync::watch::Sender<bool>>>> = OnceLock::new();
+type MailboxTransportControls = std::sync::Mutex<
+    std::collections::BTreeMap<(usize, String), tokio::sync::watch::Sender<bool>>,
+>;
+
+#[cfg(feature = "test-support")]
+fn mailbox_transports() -> &'static MailboxTransportControls {
+    static CONTROLS: OnceLock<MailboxTransportControls> = OnceLock::new();
     CONTROLS.get_or_init(Default::default)
 }
 
