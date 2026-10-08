@@ -291,6 +291,10 @@ struct ChatState {
     editing: bool,
 }
 
+/// How long an agent's tab stays in front before its terminal attaches, on a device that opens
+/// agents on their terminal: flicking through tabs attaches nothing.
+const ATTACH_DWELL: Duration = Duration::from_millis(300);
+
 /// How long a second Ctrl+T may follow the first and leave the terminal.
 /// How many closed items Home keeps listed under "Recently closed".
 const RECENTLY_CLOSED: usize = 5;
@@ -337,6 +341,11 @@ pub struct Ui {
     /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
     /// the page before it.
     older_wanted: RefCell<BTreeSet<String>>,
+    /// This device opens an agent's tab on its terminal, not its conversation (a setting).
+    terminal_first: bool,
+    /// The agent whose tab just took the focus, and when: its terminal attaches once the tab has
+    /// stayed in front for a moment, so passing through tabs attaches nothing.
+    attach_when: Option<(String, Instant)>,
     popover: Option<String>,
     chat: Option<ChatState>,
     /// st's conversation search for the palette: the query asked and what came back.
@@ -530,6 +539,8 @@ impl Ui {
             acted: HashSet::new(),
             closed: HashSet::new(),
             older_wanted: RefCell::default(),
+            terminal_first: false,
+            attach_when: None,
             popover: None,
             chat: None,
             parked: Vec::new(),
@@ -685,7 +696,9 @@ impl Ui {
         if let Some(path) = prefs::path() {
             // Simplified is the default, as on the phone (Nathan, 2026-10-04); a device that
             // chose the full view keeps it.
-            self.simple = simplified(&prefs::load(&path));
+            let loaded = prefs::load(&path);
+            self.simple = simplified(&loaded);
+            self.terminal_first = loaded.terminal_first == Some(true);
         }
     }
 
@@ -697,20 +710,62 @@ impl Ui {
         }
     }
 
-    /// Every conversation simplified (a tool call to a line, a run of calls to one line) or in
-    /// full: this device's choice, remembered.
-    pub(crate) fn toggle_simple(&mut self) {
-        self.simple = !self.simple;
-        // Tests never touch the device's own choice.
+    /// Remember this device's choices. Tests never touch the device's own.
+    fn save_prefs(&self) {
         #[cfg(not(test))]
         if let Some(path) = prefs::path() {
             let _ = prefs::save(
                 &path,
                 &prefs::Prefs {
                     simple: Some(self.simple),
+                    terminal_first: Some(self.terminal_first),
                 },
             );
         }
+    }
+
+    /// Open an agent's tab on its terminal, or on its conversation (the default): this device's
+    /// choice, remembered.
+    pub(crate) fn toggle_terminal_first(&mut self) {
+        self.terminal_first = !self.terminal_first;
+        self.save_prefs();
+        self.flash(if self.terminal_first {
+            "Agents open on their terminal · the conversation is a key away (Ctrl+\\ leaves the terminal)"
+        } else {
+            "Agents open on their conversation · Ctrl+] attaches the terminal"
+        });
+    }
+
+    /// Whether this device opens agents on their terminal.
+    pub(crate) fn terminal_first(&self) -> bool {
+        self.terminal_first
+    }
+
+    /// Attach the terminal of an agent whose tab has been in front for a moment, when this device
+    /// opens agents on their terminal.
+    pub(crate) fn step_default_view(&mut self) {
+        let Some((id, at)) = &self.attach_when else {
+            return;
+        };
+        if at.elapsed() < ATTACH_DWELL {
+            return;
+        }
+        let id = id.clone();
+        self.attach_when = None;
+        let still_here = matches!(self.focused_pane(), Some(Pane::Agent(Some(ref now))) if *now == id);
+        let attached = self.terminal.as_ref().is_some_and(|view| view.agent == id)
+            || self.parked.iter().any(|view| view.agent == id);
+        if still_here && !attached && !self.editing && self.terminal_first {
+            self.attach_terminal(&id);
+        }
+    }
+
+    /// Every conversation simplified (a tool call to a line, a run of calls to one line) or in
+    /// full: this device's choice, remembered.
+    pub(crate) fn toggle_simple(&mut self) {
+        self.simple = !self.simple;
+        // Tests never touch the device's own choice.
+        self.save_prefs();
         self.flash(if self.simple {
             "Simplified: each tool call is one line, a run of them one line · ctrl+p for everything"
         } else {
@@ -7290,8 +7345,8 @@ mod tests {
     #[test]
     fn conversations_are_simplified_unless_this_device_chose_the_full_view() {
         assert!(simplified(&prefs::Prefs::default()));
-        assert!(simplified(&prefs::Prefs { simple: Some(true) }));
-        assert!(!simplified(&prefs::Prefs { simple: Some(false) }));
+        assert!(simplified(&prefs::Prefs { simple: Some(true), ..Default::default() }));
+        assert!(!simplified(&prefs::Prefs { simple: Some(false), ..Default::default() }));
     }
 
     #[test]
