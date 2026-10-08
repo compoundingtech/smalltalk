@@ -1,6 +1,9 @@
 """A runner without a user bus must not attempt transient systemd scopes."""
 import importlib.machinery
 import importlib.util
+import contextlib
+import io
+import json
 import os
 from pathlib import Path
 import socket
@@ -51,6 +54,53 @@ class ChannelReadinessTests(unittest.IsolatedAsyncioTestCase):
         node.cli.return_value = '{"value":null}'
         self.assertEqual(await runner.agent(node), {})
         self.assertIsNone(await runner.current_channel(node))
+
+
+class FailureEvidenceTests(unittest.TestCase):
+    def test_sparse_log_keeps_start_and_end_without_reading_the_middle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = root / "harness-restart"
+            case.mkdir()
+            path = case / "cobalt-daemon.log"
+            with path.open("wb") as stream:
+                stream.write(b"fault injection context\n")
+                stream.seek(32 * 1024 * 1024)
+                stream.write(b"native read after recovery\n")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                runner.emit_failure_evidence(root, {"cases": [
+                    {"case": "harness-restart", "verdict": "fail"}]})
+            evidence = json.loads(output.getvalue())
+            self.assertIn("fault injection context", evidence["head"])
+            self.assertIn("native read after recovery", evidence["tail"])
+            self.assertLessEqual(evidence["retained_bytes"], 32 * 1024)
+            self.assertGreater(evidence["omitted_bytes"], 31 * 1024 * 1024)
+
+    def test_failure_capture_has_one_budget_across_cases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for case in ("harness-restart", "receiver-down"):
+                (root / case).mkdir()
+                for node in ("amber", "cobalt"):
+                    for suffix in ("replication.json", "driver-api-warnings.log", "daemon.log",
+                                   "worker.log", "native.log", "error-agent.json", "error-trace.jsonl"):
+                        (root / case / f"{node}-{suffix}").write_bytes(b"x" * 64 * 1024)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                runner.emit_failure_evidence(root, {"cases": [
+                    {"case": case, "verdict": "fail"}
+                    for case in ("harness-restart", "receiver-down")]})
+            rows = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertLessEqual(sum(row.get("retained_bytes", 0) for row in rows), 256 * 1024)
+            self.assertEqual("byte budget exhausted", rows[-1]["native_failure_evidence"])
+
+    def test_passing_case_prints_no_evidence(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            runner.emit_failure_evidence(Path("/no-fixture-evidence"), {"cases": [
+                {"case": "harness-restart", "verdict": "pass"}]})
+        self.assertEqual("", output.getvalue())
 
 
 if __name__ == "__main__":

@@ -98,7 +98,8 @@ def hooks(event, payload, environment=None):
         for hook in group.get("hooks", []):
             result = subprocess.run(["bash", "-c", hook["command"]], input=json.dumps({**base, **payload}),
                                     capture_output=True, text=True, timeout=60, env=environment)
-            receipt("hook", hook_event=event, exit=result.returncode, stderr=result.stderr[-2000:])
+            receipt("hook", hook_event=event, command=hook["command"], exit=result.returncode,
+                    stdout=result.stdout[-2000:], stderr=result.stderr[-2000:])
 
 
 def start_session(source):

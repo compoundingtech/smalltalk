@@ -44,6 +44,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.dont_write_bytecode = True
 from st_boundary import fresh_seat_findings, output_findings
+from st3_failure_evidence import SuspendCliEvidence
 
 HARNESSES = ("claude", "codex", "pi", "omp", "opencode")
 SCENARIOS = ("fresh", "restart", "daemon-restart", "reexec", "concurrent", "suspend", "utf8", "idle-hold", "channel-missing", "channel-uninitialized", "channel-parked", "import")
@@ -98,7 +99,9 @@ class Node:
         # binary. A link, because a debug st3 is hundreds of megabytes and /tmp is a small tmpfs.
         self.binary = root / "bin/st3"
         self.binary.symlink_to(binary)
-        for tool in ("pty", "git"):
+        # Login capture/wrappers need env, Claude runs Bash hooks, and OMP admission needs sh.
+        # Nix checks cannot fall back to host tools in /usr/bin or /bin.
+        for tool in ("pty", "git", "env", "bash", "sh"):
             executable = shutil.which(tool)
             if not executable:
                 raise SystemExit(f"{tool} must be on PATH")
@@ -126,6 +129,7 @@ client_gateway_socket = "{root / 'run/client.sock'}"
 ''')
         self.log = (root / "daemon.log").open("ab")
         self.daemon = None
+        self.suspend_cli_evidence = SuspendCliEvidence()
 
     def start(self):
         if not (self.root / "ws/.git").exists():
@@ -146,8 +150,11 @@ client_gateway_socket = "{root / 'run/client.sock'}"
         return path.read_text(errors="replace")[-3000:] if path.exists() else ""
 
     def cli(self, *args, check=True):
-        result = subprocess.run([str(self.binary), "--endpoint", str(self.endpoint), *args], env=self.env,
+        command = [str(self.binary), "--endpoint", str(self.endpoint), *args]
+        result = subprocess.run(command, env=self.env,
                                 capture_output=True, text=True, timeout=120)
+        if args[:2] == ("agents", "suspend"):
+            self.suspend_cli_evidence.observe(command, result)
         if check and result.returncode:
             raise Failure(f"st {' '.join(args)}: {result.stderr.strip()} {result.stdout.strip()}")
         return result.stdout
@@ -917,6 +924,7 @@ def run(args, root, evidence):
     count = 5 if args.scenario == "concurrent" else 1
     letters = LETTERS[:count]
     seats = Seats(node, letters, args.bound)
+    failed = False
     try:
         if args.scenario == "import":
             if args.harness != "codex":
@@ -960,6 +968,7 @@ def run(args, root, evidence):
                 "catalog_files": len(catalogs_after),
                 "harness_record_files": len(records), "observation_spools": len(spools)}
     except (Failure, subprocess.TimeoutExpired) as error:
+        failed = True
         return {"verdict": "fail", "harness": args.harness, "scenario": args.scenario,
                 "failure": str(error), "seconds_to_boot": seats.timings,
                 "idle_delivery_control": getattr(node, "idle_delivery_control", None)}
@@ -996,6 +1005,12 @@ def run(args, root, evidence):
         for path in [root / "daemon.log", *sorted((root / "ws").glob("receipts-*.jsonl"))]:
             if path.exists():
                 (evidence / path.name).write_text(path.read_text(errors="replace"))
+        if failed:
+            try:
+                node.suspend_cli_evidence.write(evidence)
+            except OSError as error:
+                print(json.dumps({"native_failure_evidence": "suspend-cli-results.json",
+                                  "capture_error": str(error)}), flush=True)
 
 
 def private_root(make=tempfile.mkdtemp):
@@ -1058,10 +1073,13 @@ def main():
         shutil.rmtree(root, ignore_errors=True)
     (args.evidence / "result.json").write_text(json.dumps(result, indent=2, default=str) + "\n")
     print(json.dumps(result, indent=2, default=str))
+    if result["verdict"] != "pass":
+        emit_failure_files(args.evidence)
     return 0 if result["verdict"] == "pass" else 1
 
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from st3_test_process import supervised_main
+    from st3_failure_evidence import emit_failure_files
     raise SystemExit(supervised_main(main))

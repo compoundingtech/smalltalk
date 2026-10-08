@@ -4,6 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    crane.url = "github:ipetkov/crane/47b6b27ed9a3a9181415e4367d0c30ab2a0e0250";
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
     # The runtime, Rust crates and native terminal library share one producer revision.
@@ -22,6 +23,7 @@
       self,
       nixpkgs,
       flake-utils,
+      crane,
       fenix,
       pty,
       effect-utils,
@@ -157,7 +159,7 @@
           { label, flags }:
           ''
             echo "--- cargo test: ${label}"
-            cargo test -j "$NIX_BUILD_CORES" --release \
+            ${pkgs.rust.envVars.setEnv} cargo test -j "$NIX_BUILD_CORES" --release \
               --target ${rustHostTarget} --offline ${pkgs.lib.escapeShellArgs flags}
           '';
 
@@ -180,7 +182,7 @@
             if [ -n "''${cargoCheckFeatures-}" ]; then
               integration_features=(--features "$(echo $cargoCheckFeatures | tr ' ' ,)")
             fi
-            if ! cargo test -j "$NIX_BUILD_CORES" --release \
+            if ! ${pkgs.rust.envVars.setEnv} cargo test -j "$NIX_BUILD_CORES" --release \
               --target ${rustHostTarget} --offline "''${integration_features[@]}" \
               ${pkgs.lib.escapeShellArgs flags} --test integration -- \
               ${pkgs.lib.escapeShellArgs (testFlags ++ prefixes)} > integration-test.log 2>&1; then
@@ -233,7 +235,19 @@
           "stui"
         ];
 
-        st2 = pkgs.rustPlatform.buildRustPackage {
+        cacheCargo = import ./nix/cargo-artifacts.nix {
+          inherit pkgs self;
+          craneLib = crane.mkLib pkgs;
+          # A published dependency calls this patched crate's API. Retain it
+          # instead of replacing its bindings with a workspace stub.
+          extraDummyScript = ''
+            rm -rf "$out/vendor/libghostty-vt-sys"
+            cp -R ${./vendor/libghostty-vt-sys} "$out/vendor/libghostty-vt-sys"
+            chmod -R u+w "$out/vendor/libghostty-vt-sys"
+          '';
+        };
+
+        st2 = cacheCargo (pkgs.rustPlatform.buildRustPackage {
           pname = "st2";
           inherit version;
           src = self;
@@ -353,12 +367,15 @@
             license = pkgs.lib.licenses.mit;
             mainProgram = "st2";
           };
-        };
+        });
 
-        st3Check = pkgs.rustPlatform.buildRustPackage {
+        st3Base = cacheCargo (pkgs.rustPlatform.buildRustPackage {
           pname = "st3";
           inherit version;
           src = self;
+          # Only the dependency-only dummy source omits embedded hooks. Keep
+          # the fail-loud interpreter assertions below for both real builds.
+          passthru.cargoDependencyPostPatch = "";
           # Embedded hooks are published into immutable runtime hook sets. The
           # sandbox has no /usr/bin/env; patch before compilation for package/check.
           postPatch = ''
@@ -415,11 +432,11 @@
           # pollute CPU measurements and outlive the daemon delivery-presence startup grace.
           checkPhase = ''
             runHook preCheck
-            cargo nextest run --release --offline --target ${rustHostTarget} \
+            ${pkgs.rust.envVars.setEnv} cargo nextest run --release --offline --target ${rustHostTarget} \
               --build-jobs "$NIX_BUILD_CORES" --test-threads "$NIX_BUILD_CORES" --retries 0 \
               ${pkgs.lib.escapeShellArgs st3Check.cargoTestFlags} \
               -- ${pkgs.lib.escapeShellArgs st3Check.checkFlags}
-            cargo test --doc --release --offline --target ${rustHostTarget} \
+            ${pkgs.rust.envVars.setEnv} cargo test --doc --release --offline --target ${rustHostTarget} \
               -j "$NIX_BUILD_CORES" ${pkgs.lib.escapeShellArgs st3Check.cargoTestFlags}
             runHook postCheck
           '';
@@ -485,13 +502,25 @@
             license = pkgs.lib.licenses.mit;
             mainProgram = "st3";
           };
-        };
+        });
 
         # Installing the current tools must not depend on running the full runtime suite.
         # Keep that suite as checks.st3; st/ci also runs it in the native test environment.
-        st3 = st3Check.overrideAttrs (_: {
+        st3 = st3Base.overrideAttrs (old: {
           doCheck = false;
           ST3_MESSAGING_COMPAT_BIN = "";
+          outputs = [ "out" "cargoBuildArtifacts" ];
+          meta = old.meta // { outputsToInstall = [ "out" ]; };
+          # Export before cargoInstallHook replaces Cargo's host target directory
+          # with its installation staging tree (which loses proc-macro artifacts).
+          postBuild = (old.postBuild or "") + ''
+            prepareAndInstallCargoArtifactsDir "$cargoBuildArtifacts"
+          '';
+        });
+        # Reuse the actual packaged binaries and libraries when compiling the test targets.
+        # This keeps installation independent of tests while eliminating a second production build.
+        st3Check = st3Base.overrideAttrs (_: {
+          cargoArtifacts = st3.cargoBuildArtifacts;
         });
 
         st3Help = pkgs.runCommand "st3-help-${version}" {
@@ -566,7 +595,7 @@
         #
         # Doubles as `checks.wasm-resolver-feature`: the default hermetic suite runs with the
         # production feature set, and the feature-gated targets reuse that same build.
-        st2WasmResolver = st2.overrideAttrs (old: {
+        st2WasmResolver = cacheCargo (st2.overrideAttrs (old: {
           pname = "st2-wasm-resolver";
           cargoBuildFeatures = (old.cargoBuildFeatures or [ ]) ++ [ "wasm-resolver" ];
           cargoCheckFeatures = (old.cargoCheckFeatures or [ ]) ++ [ "wasm-resolver" ];
@@ -596,7 +625,7 @@
                 "profile_wasm"
               ];
             };
-        });
+        }));
 
         providerComponentPackages = {
           "st2-github-issue-component" = "st2_github_issue_component";
@@ -608,14 +637,14 @@
         # One cargo invocation builds all four guest crates: they share the same wasm32 dependency
         # graph, so a derivation per component compiled it four times. Install paths are unchanged
         # and every component package attr points at this single output.
-        st2ProviderComponents = providerRustPlatform.buildRustPackage {
+        st2ProviderComponents = cacheCargo (providerRustPlatform.buildRustPackage {
           pname = "st2-provider-components";
           inherit version;
           src = self;
           inherit cargoDeps;
           buildPhase = ''
             runHook preBuild
-            cargo build --offline --release --target wasm32-unknown-unknown \
+            cargo build -j "$NIX_BUILD_CORES" --offline --release --target wasm32-unknown-unknown \
               ${
                 pkgs.lib.concatMapStringsSep " " (package: "-p ${package}") (
                   pkgs.lib.attrNames providerComponentPackages
@@ -638,7 +667,7 @@
             '') (pkgs.lib.attrValues providerComponentPackages)}
             runHook postInstall
           '';
-        };
+        });
 
         providerComponentPath =
           wasmName: "${st2ProviderComponents}/share/st2/providers/${wasmName}.component.wasm";
@@ -648,7 +677,7 @@
         # Doubles as `checks.wasip2-resource-providers`: one compile of the runtime feature serves
         # the provider/supervisor end-to-end targets and the Component Model executor's fixture and
         # cache trust boundary. The default workspace remains covered by `checks.st2`.
-        st2ProviderRuntime = st2.overrideAttrs (old: {
+        st2ProviderRuntime = cacheCargo (st2.overrideAttrs (old: {
           pname = "st2-provider-runtime";
           cargoBuildFeatures = (old.cargoBuildFeatures or [ ]) ++ [ "wasip2-provider-runtime" ];
           cargoCheckFeatures = [ ];
@@ -701,7 +730,7 @@
                 "executor"
               ];
             };
-        });
+        }));
 
         # Sandbox-safe integration episodes the package's own release-mode boundary cannot reach,
         # sharing one default-feature build because they differ only by test selection:
@@ -744,7 +773,7 @@
         # compiled only with debug assertions, so they share one derivation. Keep the package's
         # release-mode test boundary unchanged. Both are modules of st2's `integration` binary, so
         # one invocation selects them by name prefix.
-        st2DebugAssertions = st2.overrideAttrs (_: {
+        st2DebugAssertions = cacheCargo (st2.overrideAttrs (_: {
           pname = "st2-debug-assertions-check";
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true";
           checkPhase = ''
@@ -759,7 +788,7 @@
             runHook postCheck
           '';
           postCheck = "";
-        });
+        }));
 
         hookSuccessorSource = pkgs.runCommand "st2-hook-successor-source" { } ''
           cp -R ${self} $out
@@ -809,6 +838,10 @@
         # wants them.
         checks.st2 = st2;
         checks.st3 = st3Check;
+        checks.cargo-artifact-reuse = import ./nix/cargo-artifacts-test.nix {
+          inherit pkgs st3 st3Check;
+          craneLib = crane.mkLib pkgs;
+        };
         checks.st3-help = st3Help;
         checks.install-layout = installLayout;
         checks.st2-install-layout = st2InstallLayout;

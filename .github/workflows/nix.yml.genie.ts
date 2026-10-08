@@ -43,7 +43,8 @@ export default githubWorkflow({
         },
         {
           "name": "Build the package and every native check",
-          "run": "scripts/ci-nix-release build"
+          "shell": "bash",
+          "run": "set -o pipefail\nscripts/ci-nix-release build 2>&1 | tee \"$RUNNER_TEMP/nix-release-build.log\""
         },
         {
           "name": "Prove the warm cache without downloads or builds",
@@ -55,6 +56,17 @@ export default githubWorkflow({
             "name": "nix-release-proof",
             "path": "${{ runner.temp }}/nix-release-build.json",
             "if-no-files-found": "error",
+            "retention-days": 7
+          }
+        },
+        {
+          "name": "Retain native build diagnostics",
+          "if": "always()",
+          "uses": "actions/upload-artifact@v4",
+          "with": {
+            "name": "nix-release-diagnostics",
+            "path": "${{ runner.temp }}/nix-release-build.log\n${{ runner.temp }}/nix-release-attempt.json",
+            "if-no-files-found": "warn",
             "retention-days": 7
           }
         }

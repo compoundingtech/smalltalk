@@ -59,12 +59,18 @@ class Node:
         self.binary = binary
         for sub in ("bin", "home", "run", "state"):
             (root / sub).mkdir(parents=True, exist_ok=True)
-        pty = shutil.which("pty")
-        if not pty:
-            raise SystemExit("pty must be on PATH")
-        (root / "bin/pty").symlink_to(pty)
+        # Keep login capture and Claude hooks independent of host /usr/bin tools.
+        for tool in ("pty", "env", "bash"):
+            executable = shutil.which(tool)
+            if not executable:
+                raise SystemExit(f"{tool} must be on PATH")
+            (root / "bin" / tool).symlink_to(executable)
+        python = shutil.which("python3")
+        if not python:
+            raise SystemExit("python3 must be on PATH")
         stub = root / "bin/claude"
         shutil.copy2(HERE / "claude", stub)
+        stub.write_text(f"#!{python}\n" + stub.read_text().split("\n", 1)[1])
         stub.chmod(0o755)
         self.path = f"{root / 'bin'}:/usr/bin:/bin"
         self.endpoint = root / "run/st.sock"
@@ -745,6 +751,8 @@ def main():
             shutil.rmtree(root, ignore_errors=True)
     (args.evidence / "result.json").write_text(json.dumps(result, indent=2, default=str) + "\n")
     print(json.dumps(result, indent=2, default=str))
+    if result["verdict"] != "pass":
+        emit_failure_files(args.evidence)
     return 0 if result["verdict"] == "pass" else 1
 
 
@@ -752,4 +760,5 @@ if __name__ == "__main__":
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from st3_test_process import supervised_main
+    from st3_failure_evidence import emit_failure_files
     raise SystemExit(supervised_main(main))

@@ -35,7 +35,12 @@ with tempfile.TemporaryDirectory() as temporary:
       outputs = { nixpkgs, ... }: let
         system = "%s";
         pkgs = import nixpkgs { inherit system; };
-        package = pkgs.runCommand "%s" {} "echo example-one > $out";
+        dependencies = pkgs.runCommand "example-dependencies" {} "echo dependencies > $out";
+        package = pkgs.runCommand "%s" {
+          outputs = [ "out" "cargoBuildArtifacts" ];
+          meta.outputsToInstall = [ "out" ];
+          passthru.cargoDependencyArtifacts = dependencies;
+        } "echo example-one > $out; echo production-artifacts > $cargoBuildArtifacts";
         check = pkgs.runCommand "%s-check" {} "echo example-check > $out";
       in {
         packages.${system}.default = package;
@@ -53,11 +58,14 @@ with tempfile.TemporaryDirectory() as temporary:
     subprocess.run([str(script), 'build'], cwd=fixture, env=env, check=True)
     assert '⚠️ **P0: Nix store cache MISS before build' in (root / 'summary').read_text()
     report = json.loads((root / 'nix-release-build.json').read_text())
-    assert len(report['targets']) == 3, report
+    assert len(report['targets']) == 7, report
     contents = {Path(path).read_text().strip() for result in report['results']
                 for path in result['outputs'].values()}
-    assert contents == {'example-one', 'example-check'}, contents
-    assert list((cache / 'smalltalk-nix-release').glob('result*'))
+    assert contents == {'example-one', 'example-check', 'dependencies', 'production-artifacts'}, contents
+    roots = list((cache / 'smalltalk-nix-release').glob('result*'))
+    assert {str(path.resolve()) for path in roots} == {
+        path for result in report['results'] for path in result['outputs'].values()
+    }, 'all build caches must have persistent GC roots'
     subprocess.run([str(script), 'verify-cache'], cwd=fixture, env=env, check=True)
 
     (root / 'summary').write_text('')
@@ -72,6 +80,23 @@ with tempfile.TemporaryDirectory() as temporary:
     assert missing.returncode != 0, missing
     exists = subprocess.run(['nix', 'path-info', uncached], capture_output=True)
     assert exists.returncode != 0, 'cache verification unexpectedly built an uncached output'
+
+    # Preserve real Nix failure diagnostics and status without turning tee into a pass
+    # or retaining the successful proof from the previous attempt.
+    flake.write_text(flake.read_text().replace(
+        'echo example-check > $out', 'echo fixture-node-diagnostic >&2; exit 7'))
+    log = root / 'nix-release-build.log'
+    failed = subprocess.run(
+        ['bash', '-o', 'pipefail', '-c', '"$1" build 2>&1 | tee "$2"',
+         'nix-failure-fixture', str(script), str(log)],
+        cwd=fixture, env=env, capture_output=True, text=True)
+    assert failed.returncode != 0, failed
+    assert 'fixture-node-diagnostic' in log.read_text(), log.read_text()
+    attempt = json.loads((root / 'nix-release-attempt.json').read_text())
+    assert attempt['status'] == 'failed' and attempt['exit_code'] != 0, attempt
+    assert attempt['source'] == report['source'] and len(attempt['targets']) == 7, attempt
+    assert attempt['missing_before_build'], attempt
+    assert not (root / 'nix-release-build.json').exists(), 'failed build retained a stale success proof'
 
     env.pop('CI_LOCAL_CARGO_HOME')
     no_cache = subprocess.run([str(script), 'build'], cwd=fixture, env=env, capture_output=True)
