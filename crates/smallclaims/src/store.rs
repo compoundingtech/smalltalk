@@ -40,6 +40,8 @@ use crate::sqlite::{
 mod projection_busy_tests;
 #[cfg(test)]
 mod receive_writer_tests;
+#[cfg(test)]
+mod membership_query_tests;
 mod binary_payloads;
 pub mod events;
 pub mod idempotency;
@@ -2242,6 +2244,24 @@ pub fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Memb
     fleet_membership_tx_with_local_signer(connection, None)
 }
 
+// Keep signer aggregation correlated to the exact indexed envelope identity. Joining raw
+// signature rows into the outer query would multiply claim bodies for envelopes with many keys.
+fn fleet_claims_with_signers_query() -> String {
+    format!(
+        "SELECT claims.id, claims.kind, claims.subject, claims.body,
+                batches.origin, batches.replica_sequence, envelopes.envelope_hash,
+                (SELECT json_group_array(signatures.member_key)
+                 FROM replica_envelope_signatures AS signatures
+                 WHERE signatures.writer=batches.origin
+                   AND signatures.sequence=batches.replica_sequence
+                   AND signatures.envelope_hash=envelopes.envelope_hash)
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         LEFT JOIN replica_envelopes AS envelopes ON envelopes.batch_id=claims.batch_id
+         WHERE claims.kind IN ({FLEET_CLAIM_KINDS})
+         ORDER BY claims.id"
+    )
+}
+
 pub fn fleet_membership_tx_with_local_signer(
     connection: &Connection,
     local_signer: Option<(&str, &str)>,
@@ -2249,14 +2269,7 @@ pub fn fleet_membership_tx_with_local_signer(
     let Some(anchor) = fleet_meta(connection, "fleet_anchor_key")? else {
         return Ok(crate::fleet::Membership::default());
     };
-    let mut statement = connection.prepare(&format!(
-        "SELECT claims.id, claims.kind, claims.subject, claims.body,
-                batches.origin, batches.replica_sequence, envelopes.envelope_hash
-         FROM claims JOIN batches ON batches.id=claims.batch_id
-         LEFT JOIN replica_envelopes AS envelopes ON envelopes.batch_id=claims.batch_id
-         WHERE claims.kind IN ({FLEET_CLAIM_KINDS})
-         ORDER BY claims.id"
-    ))?;
+    let mut statement = connection.prepare(&fleet_claims_with_signers_query())?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -2267,24 +2280,15 @@ pub fn fleet_membership_tx_with_local_signer(
                 row.get::<_, String>(4)?,
                 row.get::<_, u64>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
             ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(statement);
-    let mut signers_statement = connection.prepare(
-        "SELECT member_key FROM replica_envelope_signatures
-         WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
-    )?;
-    let mut claims: Vec<crate::fleet::FleetClaim> = Vec::with_capacity(rows.len());
-    for (id, kind, subject, body, writer, sequence, envelope_hash) in rows {
-        let mut signers = match &envelope_hash {
-            Some(hash) => signers_statement
-                .query_map(params![writer, sequence, hash], |row| {
-                    row.get::<_, String>(0)
-                })?
-                .collect::<Result<BTreeSet<_>, _>>()?,
-            None => BTreeSet::new(),
-        };
+        })?;
+    // The indexed signer aggregate keeps one row per claim/envelope, including unsigned
+    // envelopes. Judging calls this on its writer transaction; avoid per-row SQL round trips.
+    let mut claims: Vec<crate::fleet::FleetClaim> = Vec::new();
+    for row in rows {
+        let (id, kind, subject, body, writer, sequence, envelope_hash, signers_json) = row?;
+        let mut signers = serde_json::from_str::<BTreeSet<String>>(&signers_json)?;
         // A locally appended batch has not been seeded into an envelope yet.
         // Its eventual signature uses this node's key; include it in the client
         // view without doing that write while a request is being served.
