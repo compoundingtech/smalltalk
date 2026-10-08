@@ -77,14 +77,12 @@ export type CollectionStream = {
 /** A window's rows in display order, as `applyWindow` keeps them. */
 export type CollectionWindow = { items: Resource[]; hasMore: boolean; snapshot: Snapshot };
 
-/** Apply one `snapshot` or `changes` frame to a window: removals and upserts first, then the
- * frame's complete order. A `changes` frame without an earlier snapshot has nothing to apply to. */
+/** Apply one `snapshot` or `changes` frame: patches require an earlier held row, then
+ * removals, full upserts and the frame's complete order. A `changes` frame without an earlier snapshot has nothing to apply to. */
 export function applyWindow(window: CollectionWindow | undefined, frame: CollectionFrame): CollectionWindow | undefined {
     if (frame.kind !== 'snapshot' && frame.kind !== 'changes') return window;
     if (frame.kind === 'changes' && !window) return undefined;
     const rows = new Map<string, Resource>(frame.kind === 'snapshot' ? [] : window!.items.map(item => [item.id, item]));
-    if (frame.kind === 'changes') for (const id of frame.removes) rows.delete(id);
-    for (const item of frame.kind === 'snapshot' ? frame.items : frame.upserts) rows.set(item.id, item);
     if (frame.kind === 'changes') {
         if ((frame.patches?.length ?? 0) > 200) return undefined;
         const ids = new Set<string>();
@@ -103,6 +101,8 @@ export function applyWindow(window: CollectionWindow | undefined, frame: Collect
             rows.set(patch.id, next);
         }
     }
+    if (frame.kind === 'changes') for (const id of frame.removes) rows.delete(id);
+    for (const item of frame.kind === 'snapshot' ? frame.items : frame.upserts) rows.set(item.id, item);
     const items = frame.order.flatMap(id => rows.get(id) ?? []);
     return { items, hasMore: frame.has_more, snapshot: frame.snapshot };
 }

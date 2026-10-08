@@ -383,3 +383,16 @@ test('field delta opt-in is explicit and omitted by ordinary subscriptions', asy
     assert.equal(socket.sent[1].field_deltas, true);
     stream.close();
 });
+
+
+test('field patches require a previously held row before same-frame full upserts', () => {
+    const base = mission('mission/a', 'Original');
+    const initial = applyWindow(undefined, { kind: 'snapshot', id: 'm', collection: 'missions', snapshot, items: [base], order: ['mission/a'], has_more: false });
+    const patch = { id: 'mission/b', fields: { title: 'Patch cannot supply a new base' }, removed_fields: [] };
+    const invalid = { kind: 'changes', id: 'm', collection: 'missions', snapshot, upserts: [mission('mission/b', 'New')], removes: [], order: ['mission/a', 'mission/b'], has_more: false, patches: [patch] };
+    assert.equal(applyWindow(initial, invalid), undefined);
+    assert.deepEqual(initial.items, [base]);
+    const full = mission('mission/a', 'Authoritative full row');
+    const mixed = { ...invalid, upserts: [full], order: ['mission/a'], patches: [{ id: 'mission/a', fields: { title: 'Earlier patch' }, removed_fields: [] }] };
+    assert.equal(applyWindow(initial, mixed).items[0].title, full.title);
+});
