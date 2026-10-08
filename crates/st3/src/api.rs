@@ -21821,19 +21821,10 @@ mission "wake" state="ready" {
     }
 
     fn checked_agent_cache(store: &Store, history: bool, index: u64) -> Vec<Value> {
-        let mut cached = store
-            .cached_agent_resources(index, history, |changed| {
-                client_agent_resources_selected(store, history, index, changed)
-            })
-            .unwrap();
-        // Production cards also cache todo; this comparison isolates the core projection.
-        for item in &mut cached {
-            item.as_object_mut().unwrap().remove("todo");
-        }
-        assert_eq!(
-            cached,
-            client_agent_resources_uncached(store, history, index).unwrap()
-        );
+        let cached = client_agent_resources_cached(store, history, index).unwrap();
+        let mut direct = client_agent_resources_uncached(store, history, index).unwrap();
+        add_agent_todos(store, &mut direct, index).unwrap();
+        assert_eq!(cached, direct);
         cached
     }
 
@@ -21992,6 +21983,47 @@ mission "wake" state="ready" {
                     "the rebuilt timeline cut must become reusable");
                 Ok(())
             }).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_roster_cache_reuse_preserves_changed_for_existing_subscribers() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.store = Arc::new(roster_followup_store());
+        let index = state.store.index().unwrap();
+        checked_agent_cache(&state.store, false, index);
+        let original = state.store.agent_resources_cached_at(index, false, None)
+            .unwrap().unwrap();
+        let mut subscribers = [
+            state.event_notify.subscribe(),
+            state.event_notify.subscribe(),
+        ];
+        for request in [
+            roster_local_observation("harness.observed", json!({
+                "state":"idle", "driver":"codex", "incarnation_id":"amber-1",
+                "observed_at_ms":300_001,
+            })),
+            roster_local_timeline(),
+        ] {
+            let (response, appended) = state.store.append_claim_outcome(&request).unwrap();
+            assert!(appended);
+            assert!(crate::store::local_observation_position(&response).is_some());
+            assert_eq!(state.store.index().unwrap(), index);
+            finish_claim_publication(&state, &request.kind, response, appended)
+                .await.unwrap();
+            for subscriber in &mut subscribers {
+                tokio::time::timeout(Duration::from_secs(1), subscriber.changed())
+                    .await.expect("cache reuse must not suppress a subscriber wake")
+                    .unwrap();
+            }
+            let cached = state.store.agent_resources_cached_at(index, false, None).unwrap();
+            if request.kind == "harness.observed" {
+                assert!(Arc::ptr_eq(&cached.unwrap(), &original));
+            } else {
+                assert!(cached.is_none(), "timeline publication must invalidate the roster");
+                checked_agent_cache(&state.store, false, index);
+            }
         }
     }
 

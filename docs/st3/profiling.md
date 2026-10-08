@@ -180,7 +180,10 @@ or zero when none exists. A partial covering index, `local_observations_roster_f
 contains only those rows. The reverse lookup skips newer heartbeat rows entirely, without
 assuming row IDs and graph indices are monotonic; an old cut still steps over newer agent
 timeline rows in the index. Existing stores create the index automatically on their next open,
-without a schema-version bump or replay migration; initial creation cost is unmeasured.
+without a schema-version bump or replay migration. Initial creation took 0.171 seconds on
+an offline 1.78 GB store copy with 161,048 local observations (118,115 indexed agent timeline
+rows), using SQLite 3.53.3. The 8,701-row synthetic fixture took 0.516 ms; these isolated
+index-creation timings do not measure end-to-end startup or predict other stores.
 Heartbeat-only `harness.observed`, local telemetry and non-agent timeline appends leave cached
 cards reusable. Every agent timeline entry type advances the frontier, including usage entries,
 because managed-session recency reads the latest timeline row even when last activity does not.
@@ -189,6 +192,12 @@ content transcript append misses the read-only getter
 and updates the affected card's `last_activity_at` when rebuilt for both HTTP and WS; ignoring
 timeline rows here would make a shared warm roster instant but stale. Read-only getters never
 build, require selected-subject coverage, and pin immutable rows without filtering or cloning them.
+
+Cache relevance does not filter the existing `changed()` notification signal. Local
+heartbeat and timeline publications still wake every existing event subscriber; a heartbeat
+can then reuse the roster rows, while timeline activity misses and refreshes them. The normal
+`agent_roster_cache_reuse_preserves_changed_for_existing_subscribers` regression checks both
+publications with two subscribers.
 
 The performance report exposes each roster stage under bounded task labels:
 `roster/admission-wait` (waiting for the shared admission or an in-flight build),
