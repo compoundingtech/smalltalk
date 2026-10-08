@@ -104,8 +104,9 @@ mod tests {
         assert!(store.mailbox_faults_for(&[], second_cut).unwrap().is_empty());
         let before = store.index().unwrap();
         let budget = smallclaims::read_budget::ReadBudget::new("expired-card-cut", std::time::Duration::ZERO);
-        assert!(smallclaims::read_budget::with(Some(budget), ||
-            store.mailbox_faults_for(&subjects, second_cut)).is_err());
+        let error = smallclaims::read_budget::with(Some(budget), ||
+            store.mailbox_faults_for(&subjects, second_cut)).unwrap_err();
+        assert_eq!(error.downcast_ref::<St3Error>().unwrap().code, "read-deadline");
         assert_eq!(store.index().unwrap(), before, "failure cannot backfill or return a partial fault map");
     }
 
@@ -1191,7 +1192,10 @@ impl Store {
             || smallclaims::read_budget::ReadBudget::new("mailbox/card-faults", duration),
             |parent| parent.child(duration),
         );
+        let checked = budget.clone();
         smallclaims::read_budget::with(Some(budget), || {
+            checked.check()?;
+            let result = (|| -> Result<BTreeMap<String, String>> {
             let connection = self.readers.get();
             let query = canonical_sql(
                 "WITH selected(subject) AS (SELECT DISTINCT value FROM json_each(?1)),
@@ -1235,6 +1239,11 @@ impl Store {
             }
             smallclaims::read_budget::check()?;
             Ok(faults)
+            })();
+            // Preserve the typed retryable deadline after restoring the parent scope,
+            // including SQLite interruption before the first row could be decoded.
+            checked.check()?;
+            result
         })
     }
 
