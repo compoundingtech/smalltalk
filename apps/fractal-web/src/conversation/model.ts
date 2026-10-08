@@ -69,7 +69,7 @@ export const SendState = Schema.TaggedUnion({
   Pending: {},
   Sent: {},
   Failed: {
-    reason: Schema.Literals(['rejected', 'ungranted', 'invalid', 'failed']),
+    reason: Schema.Literals(['rejected', 'ungranted', 'invalid', 'failed', 'stale-fence', 'snapshot-unavailable']),
     detail: Schema.String,
   },
 })

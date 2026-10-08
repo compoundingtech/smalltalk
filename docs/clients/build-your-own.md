@@ -144,6 +144,18 @@ continue asynchronously, follow the returned operation (`followOperation` in Typ
 `operations_get` in Rust) and display its terminal result. The server enforces actor and fences;
 show stable refusals through the client's plain-error helpers instead of parsing CLI messages.
 
+fractal-web's `source.attachments.send` owns this fence: callers pass `Send` or `Resend`
+with message fields, never a snapshot or fence. It publishes a first send's optimistic
+`Pending` row before awaiting anything, then uses the newest gateway-store snapshot
+already held in the SDK's collection-window sync evidence (highest `store_index`).
+Conversation frames carry no snapshot, and opaque conversation cursors cannot be used
+as fences; remote terminal-owner snapshots are excluded. With no held window snapshot,
+the existing SDK `snapshot` read obtains a fresh capabilities envelope, not cached discovery.
+An unavailable snapshot or `stale-fence` refusal leaves the row `Failed` with a typed
+reason and human-readable detail. After refreshing the observed window, explicit `Resend`
+keeps the original action ID, body and idempotency key while acquiring the refreshed fence;
+it never retries automatically or drops the failed row.
+
 Remote device sends may require a device signature: pairing credentials authenticate the
 gateway connection, while the signature attributes the message to the device's person.
 `deviceSigning` provides canonical bytes and the typed signature parameter; your platform owns

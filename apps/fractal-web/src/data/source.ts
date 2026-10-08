@@ -141,7 +141,7 @@ export type ConversationPortResult<T> =
   | { readonly _tag: 'Success'; readonly value: T }
   | {
       readonly _tag: 'Refused'
-      readonly reason: 'ungranted' | 'invalid' | 'failed'
+      readonly reason: 'ungranted' | 'invalid' | 'failed' | 'stale-fence' | 'snapshot-unavailable'
       readonly detail: string
       /** Preserve the daemon's complete refusal, including its retry policy. */
       readonly error?: ErrorEnvelope
@@ -158,8 +158,8 @@ export interface ContentSearchPort {
   }) => Promise<ConversationPortResult<ConversationSearch>>
 }
 
-/** One message action's gateway fields, everything except the idempotency key. */
-type MessageSendFields = Omit<MessageSendInput, 'parameters' | 'idempotency_key'> & {
+/** Caller-owned message fields; the data layer owns both fence and idempotency key. */
+type MessageSendFields = Omit<MessageSendInput, 'parameters' | 'idempotency_key' | 'fence'> & {
   readonly api_version: 'st3.client.v0'
   readonly type: 'message.send'
   readonly parameters: Omit<MessageSendInput['parameters'], 'attachments' | 'tags'> & {
@@ -179,7 +179,10 @@ export type AttachmentSendRequest =
   | ({ readonly _tag: 'Resend'; readonly idempotencyKey: string } & MessageSendFields)
 
 /** The wire-level message action once its idempotency key is chosen. */
-export type MessageSendAction = MessageSendFields & { readonly idempotency_key: string }
+export type MessageSendAction = MessageSendFields & {
+  readonly idempotency_key: string
+  readonly fence: MessageSendInput['fence']
+}
 
 /** Native upload/read/send permissions, independently discovered for /attach and paste. */
 export interface AttachmentCapabilities {

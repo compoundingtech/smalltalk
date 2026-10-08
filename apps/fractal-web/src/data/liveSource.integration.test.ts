@@ -49,6 +49,9 @@ class Gateway {
   runtimeRefusalStatus: number | undefined
   sendGate: Promise<void> | undefined
   rejectSend = false
+  currentSnapshot: Snapshot | undefined = snapshot
+  staleSendFence = false
+  capabilityReads = 0
   readonly messageActions: MessageSendAction[] = []
   /** Resolves once the gateway has derived the send action's message identity. */
   readonly nextAction = () =>
@@ -62,6 +65,7 @@ class Gateway {
     const path = new URL(String(input)).pathname
     let value: unknown
     if (path === '/v1/client/capabilities') {
+      this.capabilityReads += 1
       await this.capabilityGate
       if (this.rejectedCredential)
         return new Response(
@@ -127,6 +131,11 @@ class Gateway {
         this.actionArrivals.splice(0).forEach((arrived) => arrived())
         await this.sendGate
         if (this.transportFailure) throw new TypeError('Gateway disconnected')
+        if (this.staleSendFence) return Response.json({
+          api_version: 'st3.client.v0', error_version: 'st3.client.error.v0',
+          code: 'stale-fence', message: 'The observed snapshot belongs to an old gateway store.',
+          retryable: false, request_id: 'request/stale-send', details: {},
+        }, { status: 409 })
         if (this.messageGrant !== 'granted') {
           return new Response(
             JSON.stringify({
@@ -170,7 +179,7 @@ class Gateway {
     } else {
       throw new Error(`Unexpected request ${path}`)
     }
-    return new Response(JSON.stringify({ api_version: 'st3.client.v0', snapshot, value }), {
+    return new Response(JSON.stringify({ api_version: 'st3.client.v0', snapshot: this.currentSnapshot, value }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     })
@@ -501,9 +510,119 @@ describe('optimistic conversation sends', () => {
   const request: AttachmentSendRequest = {
     _tag: 'Send',
     api_version: 'st3.client.v0', type: 'message.send', id: 'action/optimistic',
-    fence: { snapshot_id: snapshot.id, subject_revisions: {} },
     parameters: { to: agent.id, content: 'hello', tags: [], attachments: [] },
   }
+
+  it.live('owns the send fence and uses the freshest held gateway snapshot', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.agents)
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        yield* settle
+        const current = { ...snapshot, id: 'snapshot/current', store_index: 7 }
+        gateway.send({
+          kind: 'snapshot', id: gateway.subscription('agents').id, collection: 'agents',
+          has_more: false, items: [agent], order: [agent.id], snapshot: current,
+        })
+        yield* settle
+        const reads = gateway.capabilityReads
+        expect((yield* Effect.promise(() => live.source.attachments!.send(request)))._tag).toBe('Success')
+        expect(gateway.messageActions[0]?.fence).toEqual({ snapshot_id: current.id, subject_revisions: {} })
+        // Only the send permission read, not an unnecessary HTTP snapshot acquisition.
+        expect(gateway.capabilityReads - reads).toBe(1)
+      }),
+    ),
+  )
+
+  it.live('publishes Pending in the same tick while an unheld snapshot is being read', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        const conversation = live.source.conversation(agent.id)
+        live.registry.mount(conversation)
+        yield* settle
+        let release!: () => void
+        gateway.capabilityGate = new Promise<void>((resolve) => { release = resolve })
+        gateway.currentSnapshot = { ...snapshot, id: 'snapshot/http-current', store_index: 8 }
+        const sending = live.source.attachments!.send(request)
+        expect(live.registry.get(conversation)).toMatchObject({
+          _tag: 'Observed', value: { items: [{ _tag: 'Text', sendState: { _tag: 'Pending' } }] },
+        })
+        yield* settle
+        expect(gateway.messageActions).toHaveLength(0)
+        release()
+        expect((yield* Effect.promise(() => sending))._tag).toBe('Success')
+        expect(gateway.messageActions[0]?.fence.snapshot_id).toBe('snapshot/http-current')
+      }),
+    ),
+  )
+
+  it.live('retains a typed stale-fence failure and resends the same key after refresh', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.agents)
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        const conversation = live.source.conversation(agent.id)
+        live.registry.mount(conversation)
+        yield* settle
+        gateway.fleet([agent])
+        yield* settle
+        gateway.staleSendFence = true
+        const refused = yield* Effect.promise(() => live.source.attachments!.send(request))
+        expect(refused).toMatchObject({
+          _tag: 'Refused', reason: 'stale-fence', detail: 'The observed snapshot belongs to an old gateway store.',
+          error: { code: 'stale-fence' },
+        })
+        expect(live.registry.get(conversation)).toMatchObject({
+          _tag: 'Observed', value: { items: [{
+            _tag: 'Text', text: 'hello',
+            sendState: { _tag: 'Failed', reason: 'stale-fence', detail: refused._tag === 'Refused' ? refused.detail : '' },
+          }] },
+        })
+        const first = gateway.messageActions[0]!
+        gateway.staleSendFence = false
+        const refreshed = { ...snapshot, id: 'snapshot/refreshed', store_index: 9 }
+        gateway.send({
+          kind: 'changes', id: gateway.subscription('agents').id, collection: 'agents',
+          has_more: false, upserts: [], removes: [], order: [agent.id], snapshot: refreshed,
+        })
+        yield* settle
+        expect((yield* Effect.promise(() => live.source.attachments!.send({
+          ...request, _tag: 'Resend', idempotencyKey: first.idempotency_key,
+        })))._tag).toBe('Success')
+        expect(gateway.messageActions[1]).toMatchObject({
+          id: first.id, idempotency_key: first.idempotency_key, parameters: first.parameters,
+          fence: { snapshot_id: refreshed.id, subject_revisions: {} },
+        })
+        expect(live.registry.get(conversation)).toMatchObject({
+          _tag: 'Observed', value: { items: [{ _tag: 'Text', sendState: { _tag: 'Sent' } }] },
+        })
+      }),
+    ),
+  )
+
+  it.live('returns a typed failure and retains the row when no snapshot is obtainable', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        const conversation = live.source.conversation(agent.id)
+        live.registry.mount(conversation)
+        yield* settle
+        gateway.currentSnapshot = undefined
+        const result = yield* Effect.promise(() => live.source.attachments!.send(request))
+        expect(result).toMatchObject({
+          _tag: 'Refused', reason: 'snapshot-unavailable', detail: expect.stringContaining('snapshot'),
+        })
+        expect(gateway.messageActions).toHaveLength(0)
+        expect(live.registry.get(conversation)).toMatchObject({
+          _tag: 'Observed', value: { items: [{
+            _tag: 'Text', text: 'hello',
+            sendState: { _tag: 'Failed', reason: 'snapshot-unavailable', detail: expect.stringContaining('snapshot') },
+          }] },
+        })
+      }),
+    ),
+  )
 
   for (const echoFirst of [false, true]) {
     it.live(`publishes pending prose synchronously and replaces it when echo arrives ${echoFirst ? 'before' : 'after'} POST resolves`, () =>
