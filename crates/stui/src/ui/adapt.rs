@@ -668,6 +668,7 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
             Agent {
                 id: agent.header.id.clone(),
                 name: crate::agent_label(agent),
+                lifecycle: agent.lifecycle,
                 harness: harness(agent.driver.as_deref()),
                 state,
                 host,
@@ -765,6 +766,7 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                     .map(|path| path.rsplit('/').next().unwrap_or(path))
                     .unwrap_or("?")
             ),
+            lifecycle: None,
             harness: harness(driver),
             state: AgentState::Unknown,
             host: gateway.clone(),
@@ -1759,6 +1761,26 @@ mod tests {
         );
         assert_eq!(step_progress(&missions, "step-run/example/quiet"), None);
         assert_eq!(step_progress(&missions, "step-run/example/unknown"), None);
+    }
+
+    #[test]
+    fn agent_rows_keep_declared_lifecycle_without_inference() {
+        use st3_client::AgentLifecycle::{Bounded, Owner, Standing};
+
+        for lifecycle in [Some(Standing), Some(Owner), Some(Bounded), None] {
+            let mut resource = json!({
+                "id": "agent/example/keeper", "kind": "agent", "revision": "r1",
+                "updated_at": "2026-10-08T12:00:00Z", "name": "Keeper",
+                "state": "running", "reachability": "local", "harness_state": "idle",
+                "runtime_ids": [], "under": []
+            });
+            if let Some(lifecycle) = lifecycle {
+                resource["lifecycle"] = serde_json::to_value(lifecycle).unwrap();
+            }
+            let mut model = Model::default();
+            model.agents = window(vec![resource]);
+            assert_eq!(agents(&model, &[])[0].lifecycle, lifecycle);
+        }
     }
 
     #[test]

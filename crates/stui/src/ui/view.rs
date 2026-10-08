@@ -305,6 +305,9 @@ pub struct Agent {
     /// The graph path, a stable id.
     pub id: String,
     pub name: String,
+    /// Declared seat intent; absence is unknown, never inferred from activity or ownership.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<st3_client::AgentLifecycle>,
     pub harness: Harness,
     pub state: AgentState,
     pub host: String,
