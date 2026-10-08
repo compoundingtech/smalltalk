@@ -3,8 +3,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   followArrangementInventory,
+  inventoryItemBudget,
+  inventoryPageLimit,
   readArrangementInventory,
   sidebarWinner,
+  st3InventoryGateway,
   type ArrangementInventoryGateway,
   type InventoryEvent,
 } from './arrangements.ts'
@@ -28,6 +31,16 @@ const page = (items: readonly Arrangement[], next?: string): ArrangementPage => 
   items: [...items],
   page: { limit: 100, has_more: next !== undefined, next_cursor: next ?? null, cursor_expires_at: null },
 })
+// Fakes answer malformed pages too; the reader validates them at runtime.
+const envelope = (value: unknown) => ({ api_version: 'st3.client.v0', request_id: 'request/test', snapshot, value }) as EnvelopeOf<ArrangementPage>
+/** A list gateway answering each page from `respond`, counting requests. */
+const lister = (respond: (cursor: string | undefined, call: number) => unknown) => {
+  let calls = 0
+  return {
+    calls: () => calls,
+    gateway: { arrangementsList: async (_person: string, options: { cursor?: string }) => envelope(respond(options.cursor, calls++)) },
+  }
+}
 const subscriptionId = 'arrangements-inventory'
 const changes = (overrides: Record<string, unknown> = {}) => ({ kind: 'changes', id: subscriptionId, collection: 'arrangements', has_more: true, upserts: [], removes: [], order: [], snapshot, ...overrides })
 const initial = { kind: 'snapshot', id: subscriptionId, collection: 'arrangements', has_more: true, items: [], order: [], snapshot }
@@ -35,15 +48,17 @@ const initial = { kind: 'snapshot', id: subscriptionId, collection: 'arrangement
 /** One fake owner: `respond` answers each list page; sockets are recorded per open. */
 const harness = () => {
   const calls: (string | undefined)[] = []
+  const signals: AbortSignal[] = []
   const sockets: { options: CollectionStreamOptions; subscribed: unknown[][]; closed: number }[] = []
   const events: InventoryEvent[] = []
   let respond: (cursor: string | undefined) => Promise<ArrangementPage> = async () => page([])
   const gateway: ArrangementInventoryGateway = {
-    arrangementsList: async (person, options = {}) => {
+    arrangementsList: async (person, options, signal) => {
       expect(person).toBe(owner)
+      expect(options.limit).toBe(inventoryPageLimit)
       calls.push(options.cursor)
-      const value = await respond(options.cursor)
-      return { api_version: 'st3.client.v0', request_id: 'request/test', snapshot, value } as EnvelopeOf<ArrangementPage>
+      signals.push(signal)
+      return envelope(await respond(options.cursor))
     },
     collectionStream: async (options) => {
       const socket = { options, subscribed: [] as unknown[][], closed: 0 }
@@ -65,7 +80,7 @@ const harness = () => {
     sockets[socket]!.options.onFrame(value as Parameters<CollectionStreamOptions['onFrame']>[0])
   const names = () => events.map((event) => event._tag === 'Complete' ? event.inventory.items.map((item) => item.body.name.value) : event._tag)
   return {
-    calls, sockets, events, follow, frame, names,
+    calls, signals, sockets, events, follow, frame, names,
     answer: (next: typeof respond) => { respond = next },
     opened: () => vi.waitFor(() => expect(sockets.at(-1)?.subscribed.length).toBe(1)),
   }
@@ -172,16 +187,91 @@ describe('owner-wide arrangement inventory', () => {
   })
 
   it('fails a page that claims more rows without a cursor rather than publishing a prefix', async () => {
+    const signal = new AbortController().signal
     const truncated = { ...page([arrangement(1)]), page: { limit: 100, has_more: true, next_cursor: null, cursor_expires_at: null } }
-    await expect(readArrangementInventory({ arrangementsList: async () => ({ api_version: 'st3.client.v0', request_id: 'request/test', snapshot, value: truncated }) as EnvelopeOf<ArrangementPage> }, owner))
-      .rejects.toThrow('continuation cursor')
-    let repeated = 0
-    await expect(readArrangementInventory({ arrangementsList: async () => { repeated++; return { api_version: 'st3.client.v0', request_id: 'request/test', snapshot, value: page([arrangement(1)], 'cursor/same') } as EnvelopeOf<ArrangementPage> } }, owner))
-      .rejects.toThrow('repeated its cursor')
-    expect(repeated).toBe(2)
+    await expect(readArrangementInventory(lister(() => truncated).gateway, owner, signal)).rejects.toThrow('continuation cursor')
+    const repeated = lister(() => page([arrangement(1)], 'cursor/same'))
+    await expect(readArrangementInventory(repeated.gateway, owner, signal)).rejects.toThrow('repeated its cursor')
+    expect(repeated.calls()).toBe(2)
     for (const foreign of [{ ...arrangement(1), owner: 'person/other' }, { ...arrangement(1), id: `arrangement/person/other/${uuid(1)}` }])
-      await expect(readArrangementInventory({ arrangementsList: async () => ({ api_version: 'st3.client.v0', request_id: 'request/test', snapshot, value: page([foreign]) }) as EnvelopeOf<ArrangementPage> }, owner))
-        .rejects.toThrow('owner-scoped')
+      await expect(readArrangementInventory(lister(() => page([foreign])).gateway, owner, signal)).rejects.toThrow('owner-scoped')
+  })
+
+  it('rejects arrangement IDs that are not the owner prefix plus one lowercase UUIDv7', async () => {
+    const signal = new AbortController().signal
+    const malformed = [
+      `arrangement/${owner}/!`,
+      `arrangement/${owner}/${uuid(0xabc).toUpperCase()}`,
+      `arrangement/${owner}/00000000-0000-4000-8000-000000000001`,
+      `arrangement/${owner}/${uuid(1)}/extra`,
+      `arrangement/${owner}/${uuid(1)}x`,
+    ]
+    for (const id of malformed)
+      await expect(readArrangementInventory(lister(() => page([{ ...arrangement(1), id }, arrangement(2)])).gateway, owner, signal)).rejects.toThrow('owner-scoped')
+    await expect(readArrangementInventory(lister(() => page([arrangement(1)])).gateway, owner, signal)).resolves.toMatchObject({ items: [arrangement(1)] })
+  })
+
+  it('rejects endless fresh cursors at the item budget instead of paginating forever', async () => {
+    const endless = lister((_cursor, call) => page([arrangement(call + 1)], `cursor/${call + 1}`))
+    await expect(readArrangementInventory(endless.gateway, owner, new AbortController().signal)).rejects.toThrow(`exceeds ${inventoryItemBudget} arrangements`)
+    expect(endless.calls()).toBe(inventoryItemBudget + 1)
+    const stalled = lister((_cursor, call) => page([], `cursor/${call + 1}`))
+    await expect(readArrangementInventory(stalled.gateway, owner, new AbortController().signal)).rejects.toThrow('did not advance')
+    expect(stalled.calls()).toBe(1)
+    const oversized = lister(() => page(Array.from({ length: inventoryPageLimit + 1 }, (_, n) => arrangement(n + 1))))
+    await expect(readArrangementInventory(oversized.gateway, owner, new AbortController().signal)).rejects.toThrow(`for a limit of ${inventoryPageLimit}`)
+  })
+
+  it('close during pagination aborts the in-flight request and issues no further pages or events', async () => {
+    const h = harness()
+    const second = Promise.withResolvers<ArrangementPage>()
+    h.answer((cursor) => cursor === undefined ? Promise.resolve(page([arrangement(1)], 'cursor/2')) : second.promise)
+    await h.opened()
+    h.frame(initial)
+    await vi.waitFor(() => expect(h.calls).toEqual([undefined, 'cursor/2']))
+    expect(h.signals[1]!.aborted).toBe(false)
+    h.follow.close()
+    expect(h.signals[1]!.aborted).toBe(true)
+    second.resolve(page([arrangement(2)], 'cursor/3'))
+    await vi.waitFor(() => expect(h.sockets[0]!.closed).toBe(1))
+    expect(h.calls).toEqual([undefined, 'cursor/2'])
+    expect(h.events).toEqual([])
+  })
+
+  it('refresh during pagination abandons the running read and publishes only the fresh one', async () => {
+    const h = harness()
+    const stale = Promise.withResolvers<ArrangementPage>()
+    let fresh = false
+    h.answer((cursor) => cursor === undefined ? Promise.resolve(page([arrangement(1)], 'cursor/2')) : fresh ? Promise.resolve(page([arrangement(2, 'Fresh')])) : stale.promise)
+    await h.opened()
+    h.frame(initial)
+    await vi.waitFor(() => expect(h.calls).toEqual([undefined, 'cursor/2']))
+    fresh = true
+    h.follow.refresh()
+    expect(h.signals[1]!.aborted).toBe(true)
+    await vi.waitFor(() => expect(h.events).toHaveLength(1))
+    stale.resolve(page([arrangement(2, 'Stale')]))
+    expect(h.calls).toEqual([undefined, 'cursor/2', undefined, 'cursor/2'])
+    expect(h.names()).toEqual([['Arrangement 1', 'Fresh']])
+    h.follow.close()
+  })
+
+  it('binds the generated client request to the read signal', async () => {
+    const requests: { url: string; signal: AbortSignal | null | undefined }[] = []
+    const gateway = st3InventoryGateway({
+      baseUrl: 'http://sidebar.test',
+      fetchImpl: async (input, init) => {
+        requests.push({ url: String(input), signal: init?.signal })
+        return Response.json(String(input).endsWith('/capabilities')
+          ? envelope({ kind: 'capabilities', capabilities: [], event_cursor: 'cursor/1', oldest_event_cursor: 'cursor/1', schemas: [], session_actor: owner, transport: 'fabric-loopback', limits: { max_event_items: 200, max_page_items: 200, max_wait_ms: 30000, max_response_bytes: 1048576 } })
+          : envelope(page([arrangement(1)])))
+      },
+    })
+    await gateway.discover()
+    const read = new AbortController()
+    await expect(readArrangementInventory(gateway, owner, read.signal)).resolves.toMatchObject({ items: [arrangement(1)] })
+    expect(requests.map((request) => request.url)).toEqual(['http://sidebar.test/v1/client/capabilities', 'http://sidebar.test/v1/client/arrangements?person=person%2Fexample&limit=100'])
+    expect(requests[1]!.signal).toBe(read.signal)
   })
 
   it('ignores other subscriptions and resync notices, and stops on a permanent refusal until refreshed', async () => {

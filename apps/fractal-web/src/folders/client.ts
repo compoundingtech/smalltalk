@@ -67,7 +67,7 @@ export const createFoldersClient = (gateway: ArrangementsGateway, selection: Sel
 // only the existing Tree's presentation shape, never a legacy replica or an edit input.
 import * as Atom from 'effect/reactivity/Atom'
 import type { CollectionSocketFactory } from '@smalltalk/st3-client'
-import { followArrangementInventory, sidebarWinner, type ArrangementInventoryGateway, type InventoryFollow } from '../data/arrangements.ts'
+import { followArrangementInventory, sidebarWinner, st3InventoryGateway, type ArrangementInventoryGateway, type InventoryFollow } from '../data/arrangements.ts'
 import { emptyDoc, type FolderDoc, type FolderOp, type Stamp } from './core.mts'
 export interface FolderState {
   readonly doc: FolderDoc
@@ -162,5 +162,5 @@ export const sidebarFolders = ({ gateway, socket }: {
 })
 /** Same-origin paired client API, scoped to the discovered person. */
 export const folders = sidebarFolders({
-  gateway: () => new St3Client({ baseUrl: globalThis.location.origin, fetchImpl: globalThis.fetch.bind(globalThis) }),
+  gateway: () => st3InventoryGateway({ baseUrl: globalThis.location.origin, fetchImpl: globalThis.fetch.bind(globalThis) }),
 })

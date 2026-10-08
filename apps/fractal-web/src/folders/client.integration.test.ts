@@ -47,7 +47,7 @@ it('follows the owner-wide window and re-reads the complete list through the gen
     expect(events.map((event) => event._tag === 'Complete' ? event.inventory.items.map((item) => item.body.name.value) : event._tag))
       .toEqual([['Sidebar'], ['Renamed outside the window']])
     expect(gateway.calls.filter((call) => call.url.startsWith('/v1/client/arrangements?')).map((call) => call.url))
-      .toEqual(['/v1/client/arrangements?person=person%2Fexample', '/v1/client/arrangements?person=person%2Fexample'])
+      .toEqual(['/v1/client/arrangements?person=person%2Fexample&limit=100', '/v1/client/arrangements?person=person%2Fexample&limit=100'])
   } finally { follow.close(); await gateway.close() }
 })
 it('validates generated resource shapes rather than trusting compile-time SDK types', async () => {

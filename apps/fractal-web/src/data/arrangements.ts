@@ -7,12 +7,17 @@
  * snapshot index) trigger a complete re-pagination of the HTTP arrangements list. Invalidations
  * that arrive while a read is in flight coalesce into exactly one follow-up complete read.
  * Only a complete read is published; a partial pagination never replaces the last inventory.
+ * A complete read is finite: it stops at fixed page and item budgets, and closing or refreshing
+ * the follow aborts it between pages and cancels its in-flight request.
  */
-import type { Arrangement, CollectionSocketFactory, CollectionStream, St3Client } from '@smalltalk/st3-client'
-import { ArrangementPage as ArrangementPageSchema } from '@smalltalk/st3-client/schema'
+import { St3Client } from '@smalltalk/st3-client'
+import type { Arrangement, ArrangementPage, CollectionSocketFactory, CollectionStream, EnvelopeOf, PageOptions } from '@smalltalk/st3-client'
+import { ArrangementId as ArrangementIdSchema, ArrangementPage as ArrangementPageSchema } from '@smalltalk/st3-client/schema'
 import { Schema } from 'effect'
 
 const isArrangementPage = Schema.is(Schema.toEncoded(ArrangementPageSchema))
+// Generated Arrangement.id is a generic subject Id; the winner rule needs the full UUIDv7 form.
+const isArrangementId = Schema.is(Schema.toEncoded(ArrangementIdSchema))
 // Frames are invalidation signals: only the routing fields are read, never the window rows.
 const isFrameHeader = Schema.is(Schema.Struct({
   kind: Schema.String,
@@ -21,7 +26,34 @@ const isFrameHeader = Schema.is(Schema.Struct({
   message: Schema.optionalKey(Schema.String),
 }))
 
-export type ArrangementInventoryGateway = Pick<St3Client, 'arrangementsList' | 'collectionStream'>
+export interface ArrangementInventoryGateway {
+  /** One list page; `signal` cancels the request when the read is abandoned. */
+  readonly arrangementsList: (person: string, options: PageOptions, signal: AbortSignal) => Promise<EnvelopeOf<ArrangementPage>>
+  readonly collectionStream: St3Client['collectionStream']
+}
+
+/**
+ * The generated client for ONE follow. A follow runs one list request at a time, so the
+ * request being sent belongs to the most recent read's signal; never share it between follows.
+ */
+export const st3InventoryGateway = ({ baseUrl, fetchImpl }: {
+  readonly baseUrl: string
+  readonly fetchImpl: typeof globalThis.fetch
+}): ArrangementInventoryGateway & Pick<St3Client, 'discover'> => {
+  let signal: AbortSignal | undefined
+  const client = new St3Client({
+    baseUrl,
+    fetchImpl: (input, init) => fetchImpl(input, signal === undefined ? init : { ...init, signal }),
+  })
+  return {
+    discover: () => client.discover(),
+    collectionStream: (options) => client.collectionStream(options),
+    arrangementsList: (person, options, read) => {
+      signal = read
+      return client.arrangementsList(person, options)
+    },
+  }
+}
 
 /** Every live arrangement of one owner, read across all pages of one paginated list. */
 export interface ArrangementInventory {
@@ -56,26 +88,51 @@ const asError = (error: unknown): Error => (error instanceof Error ? error : new
 export const sidebarWinner = (items: readonly Arrangement[]): Arrangement | undefined =>
   items.reduce<Arrangement | undefined>((winner, item) => (winner === undefined || item.id < winner.id ? item : winner), undefined)
 
-/** Read every page; a page that claims more items without a fresh cursor fails the whole read. */
+/** Rows requested per page; a page returning more is malformed. */
+export const inventoryPageLimit = 100
+/**
+ * Whole-read budget. Local admission allows 100 live arrangements per person; replicated unions
+ * may exceed that, so the budget leaves headroom but stays finite. Every non-final page must
+ * carry at least one row, so the item budget also bounds the page count.
+ */
+export const inventoryItemBudget = 1_000
+
+/** Read every page; any malformed, foreign, non-advancing or over-budget page fails the whole read. */
 export const readArrangementInventory = async (
   gateway: Pick<ArrangementInventoryGateway, 'arrangementsList'>,
   owner: string,
+  signal: AbortSignal,
 ): Promise<ArrangementInventory> => {
   const items: Arrangement[] = []
   const visited = new Set<string>()
   const prefix = `arrangement/${owner}/`
-  let cursor: string | undefined
-  for (;;) {
-    const page = (await gateway.arrangementsList(owner, cursor === undefined ? {} : { cursor })).value
-    if (!isArrangementPage(page) || page.items.some((item) => item.owner !== owner || !item.id.startsWith(prefix)))
-      throw new TypeError('Invalid owner-scoped arrangements page')
-    items.push(...page.items)
-    if (!page.page.has_more) return { owner, items }
-    const next = page.page.next_cursor
-    if (next === null || next === undefined) throw new TypeError('Arrangement page omitted its continuation cursor')
-    if (visited.has(next)) throw new TypeError('Arrangement pagination repeated its cursor')
-    visited.add(next)
-    cursor = next
+  // Abandon a request at once even if its transport ignores the signal.
+  const abandoned = Promise.withResolvers<never>()
+  const onAbort = () => abandoned.reject(signal.reason)
+  signal.addEventListener('abort', onAbort, { once: true })
+  try {
+    let cursor: string | undefined
+    for (;;) {
+      signal.throwIfAborted()
+      const options = cursor === undefined ? { limit: inventoryPageLimit } : { cursor, limit: inventoryPageLimit }
+      const page = (await Promise.race([gateway.arrangementsList(owner, options, signal), abandoned.promise])).value
+      if (!isArrangementPage(page) || page.items.some((item) => item.owner !== owner || !item.id.startsWith(prefix) || !isArrangementId(item.id)))
+        throw new TypeError('Invalid owner-scoped arrangements page')
+      if (page.items.length > inventoryPageLimit)
+        throw new TypeError(`Arrangement page returned ${page.items.length} rows for a limit of ${inventoryPageLimit}`)
+      if (items.length + page.items.length > inventoryItemBudget)
+        throw new RangeError(`Arrangement inventory exceeds ${inventoryItemBudget} arrangements`)
+      items.push(...page.items)
+      if (!page.page.has_more) return { owner, items }
+      if (page.items.length === 0) throw new TypeError('Arrangement pagination did not advance')
+      const next = page.page.next_cursor
+      if (next === null || next === undefined) throw new TypeError('Arrangement page omitted its continuation cursor')
+      if (visited.has(next)) throw new TypeError('Arrangement pagination repeated its cursor')
+      visited.add(next)
+      cursor = next
+    }
+  } finally {
+    signal.removeEventListener('abort', onAbort)
   }
 }
 
@@ -99,6 +156,7 @@ export const followArrangementInventory = ({
   let attempt = 0
   let reading = false
   let dirty = false
+  let pending: AbortController | undefined
 
   const emit = (event: InventoryEvent): void => {
     if (!closed) onEvent(event)
@@ -109,14 +167,18 @@ export const followArrangementInventory = ({
     try {
       do {
         dirty = false
+        const current = new AbortController()
+        pending = current
         try {
-          emit({ _tag: 'Complete', inventory: await readArrangementInventory(gateway, owner) })
+          const inventory = await readArrangementInventory(gateway, owner, current.signal)
+          emit({ _tag: 'Complete', inventory })
         } catch (error) {
-          if (!dirty) emit({ _tag: 'ReadFailed', error: asError(error) })
+          if (!dirty && !current.signal.aborted) emit({ _tag: 'ReadFailed', error: asError(error) })
         }
       } while (dirty && !closed)
     } finally {
       reading = false
+      pending = undefined
     }
   }
   const invalidate = (): void => {
@@ -184,7 +246,11 @@ export const followArrangementInventory = ({
     refresh: () => {
       if (closed) return
       if (stream !== undefined) {
-        invalidate()
+        // An explicit refresh abandons the running read for a fresh one.
+        if (reading) {
+          dirty = true
+          pending?.abort()
+        } else void read()
         return
       }
       clearTimeout(timer)
@@ -194,6 +260,7 @@ export const followArrangementInventory = ({
     close: () => {
       closed = true
       generation++
+      pending?.abort()
       clearTimeout(timer)
       stream?.close()
       stream = undefined
