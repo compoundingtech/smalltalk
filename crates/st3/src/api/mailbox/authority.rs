@@ -3,6 +3,7 @@
 use super::*;
 use crate::mailbox::Authority;
 use smallclaims::error::internal;
+use std::path::PathBuf;
 
 fn refused(reason: impl Into<String>) -> St3Error {
     St3Error::new("stale-mailbox-session", reason)
