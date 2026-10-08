@@ -13,6 +13,7 @@ import {
   type Capabilities,
   type EnvelopeOf,
   type CollectionFrame,
+  type CollectionName,
   type CollectionSocketFactory,
   type CollectionStream,
 } from '@smalltalk/st3-client'
@@ -52,6 +53,15 @@ export type St3Diagnostic =
   | { readonly _tag: 'Retry' }
   /** Synchronous protocol decoding/projection of the last routed data frame. */
   | { readonly _tag: 'Decode'; readonly elapsedMs: number }
+  /** A rejected collection row; reported once per identity/revision for each follow lifetime.
+   * Contains no row contents, exception objects or decoder messages.
+   */
+  | {
+      readonly _tag: 'RowDecode'
+      readonly collection: CollectionName
+      readonly rowId: string
+      readonly revision: string
+    }
 
 /** One subscription on the socket, keyed by its registration id. */
 export interface Subscriber {

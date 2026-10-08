@@ -4,6 +4,7 @@
  */
 import type { Capability, CollectionFrame, CollectionSocket } from '@smalltalk/st3-client'
 import type { CollectionName, Snapshot } from '@smalltalk/st3-client'
+import { decodeUnknownSync, Mission as MissionCodec } from '@smalltalk/st3-client/schema'
 import * as Effect from 'effect/Effect'
 import * as Fiber from 'effect/Fiber'
 import * as Stream from 'effect/Stream'
@@ -14,6 +15,7 @@ import {
   type FollowEvent,
   type FollowSpec,
   followKey,
+  type St3Diagnostic,
   St3,
   St3Live,
   type WindowValue,
@@ -156,6 +158,7 @@ const run = (
   maxFollows: number,
   test: (gateway: FakeGateway) => Effect.Effect<void, never, St3>,
   autoOpen = true,
+  onDiagnostics?: (event: St3Diagnostic) => void,
 ) => {
   const gateway = new FakeGateway()
   gateway.autoOpen = autoOpen
@@ -166,6 +169,7 @@ const run = (
     fetch: gateway.fetch,
     onSubscribeSent: (id) => gateway.sentSubscribeIds.push(id),
     onFollowSubscribeSent: (event) => gateway.sentFollowSubscribes.push(event),
+    ...(onDiagnostics === undefined ? {} : { onDiagnostics }),
   })
   return Effect.gen(function* () {
     yield* settle
@@ -178,6 +182,64 @@ const tags = (consumer: Consumer) => consumer.events.map((event) => event._tag)
 describe('follow admission', () => {
   beforeEach(() => vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] }))
   afterEach(() => vi.useRealTimers())
+
+  it('reports a rejected mission row once per revision across frames and resync', async () => {
+    const diagnostics: St3Diagnostic[] = []
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await run(1, (gateway) => Effect.gen(function* () {
+        const consumer = yield* mount(windowSpec('missions'))
+        // The wire type permits any number, but decoding requires a nonnegative attempt.
+        // A person assignee is valid: mission step ownership uses ActorRef, not AgentRef.
+        const mission = (attempt: number) => ({
+          kind: 'mission' as const, id: 'mission/example', revision: '1',
+          updated_at: snapshot.created_at, title: 'Example', state: 'running',
+          mission_revision: '1', runs: [], run_generations: {},
+          run_details: [{
+            id: 'mission-run/example', requester: 'person/example', status: 'running',
+            phase: 'normal', progress: { done: 0, total: 1 }, current_steps: [],
+            must_act: 'you', state_since: snapshot.created_at,
+            steps: [{
+              id: 'step-run/example/ask', path: 'ask', state: 'ready', attempt,
+              since: snapshot.created_at, assignee: 'person/example',
+            }],
+          }],
+        })
+        const decodeMission = decodeUnknownSync(MissionCodec)
+        expect(() => decodeMission(mission(1))).not.toThrow()
+        const row = mission(-1)
+        expect(() => decodeMission(row)).toThrow()
+        const send = (revision: string, title: string) => gateway.send({
+          kind: 'snapshot', id: gateway.idOf('missions'), collection: 'missions',
+          has_more: false, items: [{ ...row, revision, title }], order: [row.id], snapshot,
+        })
+        send('1', 'First frame')
+        yield* settle
+        // Changed wire contents force decoding; the same revision must not report again.
+        send('1', 'Second frame')
+        yield* settle
+        expect(diagnostics.filter((event) => String(event._tag) === 'RowDecode')).toEqual([
+          { _tag: 'RowDecode', collection: 'missions', rowId: row.id, revision: '1' },
+        ])
+        gateway.send({ kind: 'resync', id: gateway.idOf('missions'), reason: 'test' })
+        yield* settle
+        send('1', 'After resync')
+        yield* settle
+        send('2', 'New revision')
+        yield* settle
+        expect(diagnostics.filter((event) => String(event._tag) === 'RowDecode')).toEqual([
+          { _tag: 'RowDecode', collection: 'missions', rowId: row.id, revision: '1' },
+          { _tag: 'RowDecode', collection: 'missions', rowId: row.id, revision: '2' },
+        ])
+        const observed = consumer.events.filter((event) => event._tag === 'Observed')
+        expect(observed).toHaveLength(4)
+        expect(observed.every((event) => event.value.items.length === 0)).toBe(true)
+        expect(warn).not.toHaveBeenCalled()
+      }), true, (event) => diagnostics.push(event))
+    } finally {
+      warn.mockRestore()
+    }
+  })
 
   it('correlates actual subscribe sends through queued open and reconnect', () =>
     run(1, (gateway) =>
