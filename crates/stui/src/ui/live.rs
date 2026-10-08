@@ -330,6 +330,7 @@ pub fn run(context: Context) -> Result<()> {
     let mut cursor_style: Option<crossterm::cursor::SetCursorStyle> = None;
     // The tab shown on the last pass: opening a tab loads what only it needs.
     let mut shown_tab = usize::MAX;
+    let mut machines_read: Option<Instant> = None;
     // When usage was last asked for and over how many hours, and whether that read is out.
     let mut usage_read: Option<(Instant, u64)> = None;
     // When the connected clients were last read, while the fleet shows, and whether a read is out.
@@ -735,6 +736,26 @@ pub fn run(context: Context) -> Result<()> {
                     }
                 });
             }
+        }
+        // Looking at the fleet reads it again, at most every few seconds: a member that joined
+        // since the last read, even one with no agents yet, is then listed as `st machines` has it.
+        if ui.take_machines_wanted()
+            && extras.live
+            && machines_read.is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
+        {
+            machines_read = Some(Instant::now());
+            let client = client.clone();
+            let tx = fetched_tx.clone();
+            runtime.spawn(async move {
+                match model::read_machines(&client).await {
+                    Ok(collection) => {
+                        let _ = tx.send(Fetched::Machines(collection));
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Fetched::Notice(format!("Could not load machines: {error}")));
+                    }
+                }
+            });
         }
         // Ctrl+K asks st's conversation search once what is typed has been still for a moment;
         // an answer to an earlier query is dropped where it lands (Ui::said_choices).

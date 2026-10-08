@@ -2700,6 +2700,7 @@ impl Ui {
     }
 
     pub(crate) fn open_palette(&mut self, section: Option<usize>, enter: Open) {
+        self.machines_wanted.set(true);
         if let Some(glasses) = self.glasses.as_mut() {
             glasses.palette = Some(Palette {
                 section,
@@ -3683,6 +3684,9 @@ impl Ui {
             return;
         };
         self.tab = tab;
+        if tab == 3 {
+            self.machines_wanted.set(true);
+        }
         // Focus only moves focus: an attached terminal stays attached until Ctrl+\\ or its tab
         // closes, and takes keys only while its tab has focus.
         self.kdl = matches!(pane, Pane::Declaration(_));
@@ -4040,6 +4044,19 @@ mod tests {
             draft_before,
             "nothing is typed into the draft of a tab that is not shown"
         );
+    }
+
+    #[test]
+    fn looking_at_the_fleet_reads_it_again() {
+        // Nathan, 2026-10-07: a member that joined (hetz2 with no agents yet) was not listed.
+        let mut ui = glass();
+        assert!(!ui.take_machines_wanted());
+        ctrl(&mut ui, 'k');
+        assert!(ui.take_machines_wanted(), "the palette lists the fleet");
+        assert!(!ui.take_machines_wanted(), "once per look");
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        ui.switch_tab(3);
+        assert!(ui.take_machines_wanted(), "the Fleet tab");
     }
 
     #[test]
