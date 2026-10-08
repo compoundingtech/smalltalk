@@ -69,6 +69,9 @@ native-driver seat, sends a graph message,
 requires a successful read of that exact message plus route/consent or app-server
 receipts, and stops the seat. It does not depend on the built-in expert or publish
 onboarding. The default provider scenarios retain the expert and one-run checks.
+The policy-present fixture runs the candidate's `claude-channel install-policy`
+helper as root inside the disposable guest and verifies ordinary-user readability.
+Optional GitHub probes run as the live test seat, as required by `st gh watch`.
 For example:
 
 ```sh

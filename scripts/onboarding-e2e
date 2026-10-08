@@ -394,9 +394,10 @@ class Run:
             wrapper=f'#!/bin/sh\nexec python3 "$HOME/.local/lib/onboarding-stubs/{entry}" "$@"\n'
             self.execute("Put "+h+" on login PATH","printf %s "+shlex.quote(wrapper)+" > ~/.local/bin/"+h+"; chmod +x ~/.local/bin/"+h)
         if scenario=="claude-policy-present":
-            # The product verifies its own exact fragment, including formatting.
-            policy=json.dumps({"channelsEnabled":True,"allowedChannelPlugins":[{"marketplace":"st","plugin":"st-channel"}]},indent=2,sort_keys=True)+"\n"
-            self.execute("Fixture managed policy", "mkdir -p /etc/claude-code/managed-settings.d; printf %s "+shlex.quote(policy)+" > /etc/claude-code/managed-settings.d/50-st-channel.json",root=True)
+            # The product compares exact bytes; use its installer in the disposable guest.
+            r=self.execute("Fixture managed policy", "umask 022\n"+shlex.join([self.st,"claude-channel","install-policy"]),root=True)
+            readable=self.execute("Policy readable by ordinary user","cat /etc/claude-code/managed-settings.d/50-st-channel.json")
+            self.check("fixture-policy",r["exit"]==0 and readable["exit"]==0,"candidate policy helper succeeds and ordinary user can read its fragment")
 
     def harness_checks(self,scenario):
         """Prove the native driver without depending on the future built-in expert."""
@@ -430,15 +431,15 @@ class Run:
             else:
                 self.check("codex-native-server",any(x.get("event")=="tui-ready" for x in records),"native app-server/TUI handshake completed")
             if scenario in ("no-gh","gh-logged-out","gh-broken"):
-                self.github_check()
+                self.github_check(subject)
             r=self.cli("Plain Claude MCP without a subject","driver","claude-mcp",timeout=5)
             self.check("plain-mcp-idle",r["exit"]==0 and not r["stdout"],"no notifications or error outside a seat")
         finally:
             r=self.cli("Stop disposable provider seat","agents","stop",subject,"--as","person/ada")
             self.check("fixture-seat-stopped",r["exit"]==0,"test-created seat stopped after proof")
 
-    def github_check(self):
-        r=self.cli("Optional GitHub watch refuses clearly","gh","watch","example/fixture#1","--as","person/ada",timeout=8)
+    def github_check(self,subject):
+        r=self.cli("Optional GitHub watch refuses clearly","gh","watch","example/fixture#1","--as",subject,timeout=8)
         self.check("gh-optional",r["exit"] not in (0,124) and bool(re.search(r"(not (found|installed|authenticated)|unavailable|auth|log.?in|could not|failed.*gh|gh.*failed)",self.output(r),re.I)) and "unexpected argument" not in self.output(r),"unavailable GitHub integration returns a clear error without hanging")
 
     def onboarding_checks(self,scenario):
@@ -477,7 +478,7 @@ class Run:
                 if scenario.endswith("absent"):
                     self.check("claude-dialog",any(x.get("event")=="development-consent" and x.get("accepted") for x in records),"driver answered development dialog")
             if scenario in ("no-gh","gh-logged-out","gh-broken"):
-                self.github_check()
+                self.github_check("agent/st/expert")
             if self.m.args.require_wrap_up:
                 deadline=time.monotonic()+self.m.args.mission_timeout
                 while True:

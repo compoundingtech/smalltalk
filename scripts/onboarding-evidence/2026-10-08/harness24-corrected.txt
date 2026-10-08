@@ -1,0 +1,113 @@
+24.04/claude-policy-present: PASS fresh-home: no existing st config or state
+24.04/claude-policy-present: PASS guest-release: actual guest matches requested Ubuntu release
+24.04/claude-policy-present: PASS clean-tool-path: no gh, developer tools or provider binaries initially installed
+24.04/claude-policy-present: PASS archive-extracted: copied bytes match recorded archive; BUILD.json captured
+24.04/claude-policy-present: PASS fixture-policy: candidate policy helper succeeds and ordinary user can read its fragment
+24.04/claude-policy-present: PASS setup-success: real candidate setup completed
+24.04/claude-policy-present: PASS setup-selected-harness: setup discovers/selects claude exactly once on daemon login PATH
+24.04/claude-policy-present: PASS setup-channel-route: setup explains its policy/development plugin route
+24.04/claude-policy-present: PASS configured-person: person/ada persisted
+24.04/claude-policy-present: PASS configured-node: node persisted and is not local
+24.04/claude-policy-present: PASS config-merge: existing checkpoint setting preserved
+24.04/claude-policy-present: PASS self-install: st3, relative st link and pty installed
+24.04/claude-policy-present: PASS service-active: user service is active/running
+24.04/claude-policy-present: PASS login-path: st resolves in a fresh login shell
+24.04/claude-policy-present: PASS doctor-healthy: ordinary doctor healthy
+24.04/claude-policy-present: PASS doctor-user-tools: no irrelevant tool warnings
+24.04/claude-policy-present: PASS linger-guidance: exact command printed when lingering is refused
+24.04/claude-policy-present: PASS tui-frame: first frame, visible Home/Now, Ctrl+Q and terminal restoration
+24.04/claude-policy-present: PASS fixture-workspace: private workspace created for the explicit test seat
+24.04/claude-policy-present: PASS fixture-seat-start: explicit claude seat starts without built-in expert
+24.04/claude-policy-present: PASS fixture-wake: real graph message sent to disposable seat
+24.04/claude-policy-present: PASS fixture-read-message: selected native provider successfully reads the exact wake
+24.04/claude-policy-present: PASS claude-route: actual seat uses the expected policy/development route
+24.04/claude-policy-present: PASS plain-mcp-idle: no notifications or error outside a seat
+24.04/claude-policy-present: PASS fixture-seat-stopped: test-created seat stopped after proof
+24.04/claude-policy-present: PASS idempotent-setup: second setup creates no second mission run
+24.04/claude-policy-present: PASS machine-restart: Docker restart is a container restart; Incus is a real guest restart
+24.04/claude-policy-present: PASS linger-reboot-behavior: manager survives only when lingering enabled
+24.04/claude-policy-present: {"PASS": 28}
+24.04/no-gh: PASS fresh-home: no existing st config or state
+24.04/no-gh: PASS guest-release: actual guest matches requested Ubuntu release
+24.04/no-gh: PASS clean-tool-path: no gh, developer tools or provider binaries initially installed
+24.04/no-gh: PASS archive-extracted: copied bytes match recorded archive; BUILD.json captured
+24.04/no-gh: PASS setup-success: real candidate setup completed
+24.04/no-gh: PASS setup-selected-harness: setup discovers/selects codex exactly once on daemon login PATH
+24.04/no-gh: PASS configured-person: person/ada persisted
+24.04/no-gh: PASS configured-node: node persisted and is not local
+24.04/no-gh: PASS config-merge: existing checkpoint setting preserved
+24.04/no-gh: PASS self-install: st3, relative st link and pty installed
+24.04/no-gh: PASS service-active: user service is active/running
+24.04/no-gh: PASS login-path: st resolves in a fresh login shell
+24.04/no-gh: PASS doctor-healthy: ordinary doctor healthy
+24.04/no-gh: PASS doctor-user-tools: no irrelevant tool warnings
+24.04/no-gh: PASS linger-guidance: exact command printed when lingering is refused
+24.04/no-gh: PASS tui-frame: first frame, visible Home/Now, Ctrl+Q and terminal restoration
+24.04/no-gh: PASS fixture-workspace: private workspace created for the explicit test seat
+24.04/no-gh: PASS fixture-seat-start: explicit codex seat starts without built-in expert
+24.04/no-gh: PASS fixture-wake: real graph message sent to disposable seat
+24.04/no-gh: PASS fixture-read-message: selected native provider successfully reads the exact wake
+24.04/no-gh: PASS codex-native-server: native app-server/TUI handshake completed
+24.04/no-gh: PASS gh-optional: unavailable GitHub integration returns a clear error without hanging
+24.04/no-gh: PASS plain-mcp-idle: no notifications or error outside a seat
+24.04/no-gh: PASS fixture-seat-stopped: test-created seat stopped after proof
+24.04/no-gh: PASS idempotent-setup: second setup creates no second mission run
+24.04/no-gh: PASS machine-restart: Docker restart is a container restart; Incus is a real guest restart
+24.04/no-gh: PASS linger-reboot-behavior: manager survives only when lingering enabled
+24.04/no-gh: {"PASS": 27}
+24.04/gh-logged-out: PASS fresh-home: no existing st config or state
+24.04/gh-logged-out: PASS guest-release: actual guest matches requested Ubuntu release
+24.04/gh-logged-out: PASS clean-tool-path: no gh, developer tools or provider binaries initially installed
+24.04/gh-logged-out: PASS archive-extracted: copied bytes match recorded archive; BUILD.json captured
+24.04/gh-logged-out: PASS setup-success: real candidate setup completed
+24.04/gh-logged-out: PASS setup-selected-harness: setup discovers/selects codex exactly once on daemon login PATH
+24.04/gh-logged-out: PASS configured-person: person/ada persisted
+24.04/gh-logged-out: PASS configured-node: node persisted and is not local
+24.04/gh-logged-out: PASS config-merge: existing checkpoint setting preserved
+24.04/gh-logged-out: PASS self-install: st3, relative st link and pty installed
+24.04/gh-logged-out: PASS service-active: user service is active/running
+24.04/gh-logged-out: PASS login-path: st resolves in a fresh login shell
+24.04/gh-logged-out: PASS doctor-healthy: ordinary doctor healthy
+24.04/gh-logged-out: PASS doctor-user-tools: no irrelevant tool warnings
+24.04/gh-logged-out: PASS linger-guidance: exact command printed when lingering is refused
+24.04/gh-logged-out: PASS tui-frame: first frame, visible Home/Now, Ctrl+Q and terminal restoration
+24.04/gh-logged-out: PASS fixture-workspace: private workspace created for the explicit test seat
+24.04/gh-logged-out: PASS fixture-seat-start: explicit codex seat starts without built-in expert
+24.04/gh-logged-out: PASS fixture-wake: real graph message sent to disposable seat
+24.04/gh-logged-out: PASS fixture-read-message: selected native provider successfully reads the exact wake
+24.04/gh-logged-out: PASS codex-native-server: native app-server/TUI handshake completed
+24.04/gh-logged-out: PASS gh-optional: unavailable GitHub integration returns a clear error without hanging
+24.04/gh-logged-out: PASS plain-mcp-idle: no notifications or error outside a seat
+24.04/gh-logged-out: PASS fixture-seat-stopped: test-created seat stopped after proof
+24.04/gh-logged-out: PASS idempotent-setup: second setup creates no second mission run
+24.04/gh-logged-out: PASS machine-restart: Docker restart is a container restart; Incus is a real guest restart
+24.04/gh-logged-out: PASS linger-reboot-behavior: manager survives only when lingering enabled
+24.04/gh-logged-out: {"PASS": 27}
+24.04/gh-broken: PASS fresh-home: no existing st config or state
+24.04/gh-broken: PASS guest-release: actual guest matches requested Ubuntu release
+24.04/gh-broken: PASS clean-tool-path: no gh, developer tools or provider binaries initially installed
+24.04/gh-broken: PASS archive-extracted: copied bytes match recorded archive; BUILD.json captured
+24.04/gh-broken: PASS setup-success: real candidate setup completed
+24.04/gh-broken: PASS setup-selected-harness: setup discovers/selects codex exactly once on daemon login PATH
+24.04/gh-broken: PASS configured-person: person/ada persisted
+24.04/gh-broken: PASS configured-node: node persisted and is not local
+24.04/gh-broken: PASS config-merge: existing checkpoint setting preserved
+24.04/gh-broken: PASS self-install: st3, relative st link and pty installed
+24.04/gh-broken: PASS service-active: user service is active/running
+24.04/gh-broken: PASS login-path: st resolves in a fresh login shell
+24.04/gh-broken: PASS doctor-healthy: ordinary doctor healthy
+24.04/gh-broken: PASS doctor-user-tools: no irrelevant tool warnings
+24.04/gh-broken: PASS linger-guidance: exact command printed when lingering is refused
+24.04/gh-broken: PASS tui-frame: first frame, visible Home/Now, Ctrl+Q and terminal restoration
+24.04/gh-broken: PASS fixture-workspace: private workspace created for the explicit test seat
+24.04/gh-broken: PASS fixture-seat-start: explicit codex seat starts without built-in expert
+24.04/gh-broken: PASS fixture-wake: real graph message sent to disposable seat
+24.04/gh-broken: PASS fixture-read-message: selected native provider successfully reads the exact wake
+24.04/gh-broken: PASS codex-native-server: native app-server/TUI handshake completed
+24.04/gh-broken: PASS gh-optional: unavailable GitHub integration returns a clear error without hanging
+24.04/gh-broken: PASS plain-mcp-idle: no notifications or error outside a seat
+24.04/gh-broken: PASS fixture-seat-stopped: test-created seat stopped after proof
+24.04/gh-broken: PASS idempotent-setup: second setup creates no second mission run
+24.04/gh-broken: PASS machine-restart: Docker restart is a container restart; Incus is a real guest restart
+24.04/gh-broken: PASS linger-reboot-behavior: manager survives only when lingering enabled
+24.04/gh-broken: {"PASS": 27}

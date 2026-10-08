@@ -88,3 +88,30 @@ limits unchanged. All failed and successful containers were removed. Incus and
 external transports use the guest's actual UID. Six guard/consent checks now pass,
 including packaged selectors in approved, development split and development joined
 forms; their stdout is in rig-checks-harness.txt.
+
+## Composed harness/channel candidate on Ubuntu 24.04
+
+Source48871974cae9ce31e2dd4e4578bf056c986e7f08, harness implementation
+63f0b36215bc4dca159ea17045914d51ee5fe872, archive SHA256
+e5fc412e12db59c74791ca6d467039a334e8642ce2eea3c8f39df49ac7e31554.
+The eight final receipts total **214 PASS, zero FAIL**: no-harness23,
+Claude development28, Claude approved28, Codex26, both28, and each of
+no-gh/logged-out-gh/broken-gh27. Each includes the container restart check.
+
+The initial matrix exited1 with five failed assertions in four scenarios.
+The rig's sorted JSON policy differed from the candidate's exact managed bytes;
+its GitHub watch probe used a person actor despite requiring a running agent seat.
+The policy fixture now uses the candidate root helper only inside its disposable
+guest and verifies ordinary-user readability. GitHub probes use the live fixture
+seat. Only those four affected scenarios were rerun, exit0. Initial failed receipts
+remain in harness24-initial.txt and pinned documents; harness24-corrected.txt records
+the bounded reruns. harness24-summary.json lists every initial/corrected full
+report and JSON document pin, final checks and counts, and archive/source pins.
+
+All runs used fresh native Ubuntu24 systemd containers with two CPUs, 3 GiB RAM,
+UID42420 and no host mounts; all were removed. The approved/development actual
+seat routes, consent, exact graph wake reads, one multiple-provider prompt,
+none-installed behavior and clear optional GitHub errors passed. GitHub probes
+returned authentication errors without anonymous requests. No bundled runtime,
+real model, expert/content completion, final release or Ubuntu22 compatibility
+is claimed. Incus remains a separate person-owned manual test.
