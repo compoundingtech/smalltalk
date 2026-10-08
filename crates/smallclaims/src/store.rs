@@ -5973,6 +5973,7 @@ impl Store {
         let mut envelopes = Vec::with_capacity(missing.len().min(16));
         let mut wire_bytes = 0usize;
         for identity in missing {
+            let mut next_wire_bytes = None;
             if let Some(budget) = wire_budget {
                 let length: Option<(String, i64)> = payload_lengths
                     .as_mut()
@@ -6003,7 +6004,7 @@ impl Store {
                     );
                     break;
                 }
-                wire_bytes += serialized;
+                next_wire_bytes = Some(wire_bytes + serialized);
             }
             // A trim can delete the payload after the snapshot listed the identity. The
             // tombstone stays in the inventory and the peer never needs the envelope.
@@ -6027,6 +6028,11 @@ impl Store {
             let Some(envelope) = envelope else {
                 continue;
             };
+            // The row can be trimmed between the length probe and payload fetch. Only
+            // charge bytes for a payload actually included in this page.
+            if let Some(next) = next_wire_bytes {
+                wire_bytes = next;
+            }
             envelopes.push(envelope);
         }
         Ok(envelopes)
