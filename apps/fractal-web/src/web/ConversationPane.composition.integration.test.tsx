@@ -13,6 +13,8 @@ import type { ConversationItem } from '../conversation/model.ts'
 import type { ConversationPage, Feed } from '../data/source.ts'
 import type { FeedSyncObservation } from '../data/feedSync.ts'
 import { Markdown, type WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
+import type * as Kit from '@smalltalk/fractal-ui/assistant-ui'
+import type { ConversationRuntimeOptions, TranscriptTurn } from '@smalltalk/fractal-ui/assistant-ui'
 
 // The kit compiles StyleX at build time; node tests stub only the CSS runtime, never data hooks.
 vi.mock('@stylexjs/stylex', () => ({
@@ -26,15 +28,40 @@ vi.mock('@stylexjs/stylex', () => ({
 const source = vi.hoisted(() => ({
   feed: { _tag: 'Waiting' } as Feed<ConversationPage>,
   sync: undefined as FeedSyncObservation | undefined,
+  now: 1000,
+  runtimeItems: [] as NonNullable<ConversationRuntimeOptions['messages']>[],
+  transcriptTurns: [] as (readonly TranscriptTurn[])[],
 }))
 
-vi.mock('../data/react.tsx', () => ({
+vi.mock('../data/react.tsx', async () => {
+  // Vitest hoists this factory before static imports are initialized.
+  const Atom = await import('effect/reactivity/Atom')
+  const agents = Atom.make({ _tag: 'Observed' as const, freshness: 'live' as const, value: [] })
+  return ({
   useConversation: () => source.feed,
   useConversationSync: () => source.sync,
-  useDataSource: () => ({ conversationInterest: undefined }),
+  useDataSource: () => ({ agents, conversationInterest: undefined }),
   useFeedInterest: () => {},
-  useNow: () => 1000,
-}))
+  useNow: () => source.now,
+  useGrants: () => ({ actions: 'ungranted', messageSend: 'ungranted', terminalInput: 'ungranted' }),
+  })
+})
+
+// Tap the input seams but keep the real kit/runtime rendering and effects.
+vi.mock('@smalltalk/fractal-ui/assistant-ui', async importOriginal => {
+  const kit = await importOriginal<typeof Kit>()
+  return {
+    ...kit,
+    EmbraceRuntimeProvider: (props: React.ComponentProps<typeof Kit.EmbraceRuntimeProvider>) => {
+      source.runtimeItems.push(props.options.messages ?? [])
+      return <kit.EmbraceRuntimeProvider {...props} />
+    },
+    Transcript: (props: React.ComponentProps<typeof Kit.Transcript>) => {
+      source.transcriptTurns.push(props.turns)
+      return <kit.Transcript {...props} />
+    },
+  }
+})
 
 import { ConversationPane } from './ConversationPane.tsx'
 
@@ -53,6 +80,10 @@ let root: Root | undefined
 const container = document.createElement('div')
 
 beforeEach(() => {
+  source.now = 1000
+  source.runtimeItems = []
+  source.transcriptTurns = []
+  vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true)
   // jsdom has no layout observers; the kit instantiates one while attaching scroll.
   // Test-environment sizing (react-aria renders every row) needs no measured entries.
   vi.stubGlobal('ResizeObserver', class {
@@ -84,6 +115,96 @@ const mount = async () => {
 const text = () => container.textContent ?? ''
 
 describe('ConversationPane composition activation', () => {
+  it('insets the composer dock so its focus outline stays inside the viewport', async () => {
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
+    await mount()
+    const dock = container.querySelector<HTMLElement>('[data-testid="conversation-composer-dock"]')
+    expect(dock?.style.paddingBottom).toBe('12px')
+    expect(dock?.style.flexShrink).toBe('0')
+  })
+  it('bounds the history lane and keeps inbound replies pinned only while following', async () => {
+    let contentHeight = 2000
+    const height = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockImplementation(() => contentHeight)
+    const client = vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(400)
+    const elementFromPoint = Object.getOwnPropertyDescriptor(document, 'elementFromPoint')
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => null })
+    const frames = new Map<number, FrameRequestCallback>()
+    let nextFrame = 0
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frames.set(++nextFrame, callback)
+      return nextFrame
+    })
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => frames.delete(id))
+    const flush = async () => {
+      await act(async () => {
+        const pending = [...frames.values()]
+        frames.clear()
+        pending.forEach(callback => callback(0))
+      })
+    }
+    const reply = (id: string): ConversationItem => ({ _tag: 'Text', id, role: 'assistant', text: `Reply ${id}`, attachments: [], streaming: false, at: at(9) })
+    const show = async (items: readonly ConversationItem[]) => {
+      source.feed = { _tag: 'Observed', freshness: 'live', value: { items, hasOlder: false, observation: { empty: false } } }
+      await mount()
+      await flush()
+    }
+    try {
+      await show(scenario)
+      const host = container.querySelector<HTMLElement>('[data-testid="conversation-history-host"]')
+      expect(host?.style.minHeight).toBe('0')
+      expect(host?.style.flex).toBe('1 1 0px')
+      const lane = container.querySelector<HTMLElement>('[data-testid="transcript-scroll"]')!
+      expect(lane.scrollTop).toBe(1600)
+      contentHeight = 2400
+      await show([...scenario, reply('inbound-1')])
+      expect(lane.scrollTop).toBe(2000)
+      await act(async () => {
+        lane.dispatchEvent(new WheelEvent('wheel', { deltaY: -900 }))
+        lane.scrollTop = 700
+        lane.dispatchEvent(new Event('scroll'))
+      })
+      await flush()
+      contentHeight = 2800
+      await show([...scenario, reply('inbound-1'), reply('inbound-2')])
+      expect(lane.scrollTop).toBe(700)
+    } finally {
+      height.mockRestore()
+      client.mockRestore()
+      if (elementFromPoint === undefined) Reflect.deleteProperty(document, 'elementFromPoint')
+      else Object.defineProperty(document, 'elementFromPoint', elementFromPoint)
+    }
+  })
+  it('keeps runtime items and transcript turns stable for sixty idle clock, sync and no-op frame updates', async () => {
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    for (let second = 1; second <= 60; second += 1) {
+      source.now += 1000
+      const prior: Feed<ConversationPage> = source.feed
+      if (prior._tag !== 'Observed') throw new Error('Expected an observed idle thread')
+      source.feed = { ...prior, value: {
+        ...prior.value,
+        // A replace decode delivers new objects, unlike a heartbeat/delta with no changed rows.
+        items: second % 10 === 0 ? structuredClone(scenario) : prior.value.items,
+      } }
+      source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: source.now }
+      await mount()
+    }
+    const itemChanges = new Set(source.runtimeItems).size - 1
+    const turnChanges = new Set(source.transcriptTurns).size - 1
+    console.log(`idle-reference-changes/60-updates items=${itemChanges} turns=${turnChanges}`)
+    expect(itemChanges).toBe(0)
+    expect(turnChanges).toBe(0)
+    const idleItems = source.runtimeItems.at(-1)
+    source.feed = { _tag: 'Observed', freshness: 'live', value: {
+      items: scenario.map(item => item._tag === 'Text' && item.id === 'p1' ? { ...item, text: 'Revised prompt' } : item),
+      hasOlder: false, observation: { empty: false },
+    } }
+    await mount()
+    expect(source.runtimeItems.at(-1)).not.toBe(idleItems)
+    expect(text()).toContain('Revised prompt')
+  })
+
   it('reproduces the reference transcript for a scenario native page', async () => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: true, observation: { empty: false } } }
     source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
@@ -177,6 +298,19 @@ describe('ConversationPane composition activation', () => {
     expect(text()).not.toContain('unfamiliar_kind')
     expect(text()).not.toContain('synthetic-payload-sentinel')
     expect(container.querySelectorAll('[data-testid="transcript-message"]')).toHaveLength(0)
+  })
+
+  it.each(['running', 'completed'] as const)('renders no unavailable cancel control or raw state text while %s', async status => {
+    source.feed = { _tag: 'Observed', freshness: 'live', value: {
+      items: [scenario[0]!, { _tag: 'Status', id: 'run-status', status, at: at(1) }],
+      hasOlder: false, observation: { empty: false },
+    } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    expect(container.querySelector('textarea')).not.toBeNull()
+    expect(text()).not.toContain('Cancel:')
+    expect(text()).not.toContain('no cancel capability')
+    expect(container.querySelector('button[aria-label*="Cancel"]')).toBeNull()
   })
   it('waits for the first observation inside the lane with the kit skeleton', async () => {
     source.feed = { _tag: 'Waiting' }

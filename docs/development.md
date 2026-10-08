@@ -185,6 +185,45 @@ boundary. `LiveHeader.integration.test.tsx` exercises the actual shell and kit i
 with decoded public conversation frames; `capturedChanges.unit.test.ts` guards the
 capture, count, provenance and selection rules.
 
+## Fractal web composer
+
+The conversation pane mounts the kit's `EmbraceComposer`. Its app-side binding lives in
+`apps/fractal-web/src/web/composerSend.ts`; sending, idempotency, the in-memory outbox and
+echo reconciliation remain owned by `source.attachments.send`. New submissions use `Send`;
+a failed outbox row's Retry uses `Resend` with the exact original source-owned key.
+Pending, Sent and Failed (reason plus disclosed detail) are rendered by kit A.
+Send failures use allowlisted human-readable explanations; raw diagnostics never enter row
+disclosures, composer help, status text or accessible names. Unclassified reasons use generic copy.
+Each pane retains its mapped runtime items and transcript turns across clock/sync updates
+and semantically unchanged frames, including a replacement decode with new object references.
+The cache uses the conversation model's schema equivalence and retains only the latest projection.
+A confirmed Sent row stays visible until its authoritative in-window echo, even if a later
+read omits remotely owned mail. Neither drafts nor the outbox are persisted in the browser.
+
+Only `grants.messageSend` authorizes the composer. An absent send port shows Unknown, and
+non-retryable refusals disable new submissions with their classified human-readable reason. Retryable send failures
+belong only to the failed row; they neither disable the next draft nor replace its footer help.
+The data source owns the action
+fence and the idempotency key; the composer passes only `Send` or `Resend`. Cancel remains Unknown and disabled; no runtime signal is wired.
+The kit's optional `onRetrySend` prop is a callback seam, not regeneration or a send implementation.
+
+The app's node-rendering tests mock only the StyleX runtime, preserving semantic DOM and the folder style-key assertions without a global CSS compiler transform. Browser proofs use the real compiled styles. The shell geometry proof scans its own fixture entry and prebundles React with assistant-ui before first paint, keeping one runtime graph during roster population.
+
+```sh
+pnpm --dir apps/fractal-web exec vitest run src/web/ConversationPane.interest.integration.test.tsx src/web/composerSend.unit.test.ts src/web/ConversationPane.unit.test.tsx src/web/conversationTranscript.unit.test.ts
+pnpm exec tsc --noEmit -p apps/fractal-web
+node apps/fractal-web/scripts/composer-send-proof.mjs
+node apps/fractal-web/scripts/composer-send-proof.mjs --without-binding
+```
+
+The live proof requires a send-granted gateway through the existing `WF_ST_GATEWAY` and
+`WF_ST_AUTHORIZATION` environment variables. It starts its own loopback server on an ephemeral
+port, never uses port 8445, and permits message actions only to the dedicated scratch seat.
+It gates real HTTP/echo delivery to observe Pending→Sent→echo, injects one explicit refusal,
+checks Retry reuses the key, and prints build revision, seat and timings. The negative control
+removes the submit binding and proves the send criterion rejects it without issuing mail.
+Both commands skip all live activity when the one-minute `/proc/loadavg` value is 32 or higher.
+
 ## Continuous integration
 
 Workspace CI runs on pull requests and merge groups. The five required checks are `linux-gate`,

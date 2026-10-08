@@ -14,6 +14,7 @@ import { LiveAgentWorkspace } from './LiveAgentWorkspace.tsx'
 import type { ConversationPage } from '../data/source.ts'
 import { decodeConversationChunk } from '@st3/sdk/effect'
 import { LiveTimeline } from '../conversation/fromTimeline.ts'
+import { createConversationTranscript } from './conversationTranscript.ts'
 
 vi.mock('@stylexjs/stylex', () => ({ create: (styles: unknown) => styles, defineVars: (variables: unknown) => variables, createTheme: () => ({}), keyframes: () => 'animation', props: () => ({}) }))
 
@@ -149,4 +150,18 @@ describe('live header parity', () => {
   })
 })
 
-
+it('invalidates cached transcript rows when the system-event preference changes without exposing kinds or payloads', () => {
+  const project = createConversationTranscript()
+  const feed = observed({ value: { items: [{ _tag: 'UnknownEvent' as const, id: 'internal', eventType: 'credential_pin', data: { private: 'not-for-display' } }, { _tag: 'UnknownEvent' as const, id: 'future', eventType: 'future_kind', data: {} }], hasOlder: false, observation: { empty: false } } })
+  const hidden = project(feed, { showSystemEvents: false })
+  const shown = project(feed, { showSystemEvents: true })
+  expect(hidden._tag).toBe('Observed')
+  expect(shown._tag).toBe('Observed')
+  if (hidden._tag !== 'Observed' || shown._tag !== 'Observed') return
+  expect(hidden.items).toEqual([])
+  expect(shown.items.map(item => item.id)).toEqual(['internal', 'future'])
+  expect(shown.items.every(item => item._tag === 'Notice' && item.text === 'An event this view cannot show yet.')).toBe(true)
+  expect(JSON.stringify(shown)).not.toMatch(/credential_pin|future_kind|not-for-display/)
+  expect(project(feed, { showSystemEvents: false })._tag === 'Observed').toBe(true)
+  expect(project(feed, { showSystemEvents: true })).toBe(project(feed, { showSystemEvents: true }))
+})

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { convertConversationItem } from '../../../../packages/fractal-ui/src/assistant-ui/embrace-converter.ts'
 import type { SyncStatus } from '@smalltalk/fractal-ui/assistant-ui/sync'
 import type { ConversationItem, SendState } from '../conversation/model.ts'
-import { mapConversationFeed, openableImageUrl, prepareTranscriptTurns, transcriptRuntimeOptions, transcriptSendFailureReason, transcriptSyncStatus, transcriptTurnsForItems } from './conversationTranscript.ts'
+import { mapConversationFeed, openableImageUrl, prepareTranscriptTurns, transcriptSendFailureReason, transcriptSyncStatus, transcriptTurnsForItems } from './conversationTranscript.ts'
 
 const at = (seconds: number) => `2026-10-08T12:00:${String(seconds).padStart(2, '0').slice(-2)}.000Z`
 const sender = { kind: 'human', label: 'Reader' } as const
@@ -189,16 +189,16 @@ describe('kit transcript turn mapping', () => {
   })
 
   it.each([
-    ['rejected', 'Rejected'],
-    ['ungranted', 'Ungranted'],
-    ['invalid', 'Invalid'],
-    ['failed', 'Failed'],
-    ['stale-fence', 'StaleFence'],
-    ['snapshot-unavailable', 'SnapshotUnavailable'],
-  ] as const)('maps failed send %s to the kit reason tag %s without losing detail', (reason, tag) => {
-    const failed = prompt('p3', 'Retry me.', 12, { _tag: 'Failed', reason, detail: 'The source refused this send.' })
+    ['rejected', 'Rejected', 'The server did not accept this message.'],
+    ['ungranted', 'Ungranted', 'Message send is not granted for this device.'],
+    ['invalid', 'Invalid', 'The message does not match the supported send format.'],
+    ['failed', 'Failed', 'The message could not be sent. Check your connection and retry.'],
+    ['stale-fence', 'StaleFence', 'The conversation changed before this message could be sent. Retry to use its current state.'],
+    ['snapshot-unavailable', 'SnapshotUnavailable', 'The conversation could not be loaded for sending. Nothing was sent. Retry when it is available.'],
+  ] as const)('maps failed send %s to the kit reason tag %s with fixed human copy', (reason, tag, detail) => {
+    const failed = prompt('p3', 'Retry me.', 12, { _tag: 'Failed', reason, detail: 'raw-send-diagnostic-sentinel' })
     const turns = transcriptTurnsForItems([failed], { firstTurnComplete: true })
-    expect(turns[0]!.prompt?.sendState).toEqual({ _tag: 'Failed', reason: { _tag: tag }, detail: 'The source refused this send.' })
+    expect(turns[0]!.prompt?.sendState).toEqual({ _tag: 'Failed', reason: { _tag: tag }, detail })
   })
 
   it.each(['future-reason', 'constructor', '__proto__'])('maps unclassified send failure %s to the generic kit failure', reason => {
@@ -302,21 +302,6 @@ describe('transcript sync mapping', () => {
     expect(transcriptSyncStatus(undefined, { _tag: 'Observed', freshness: 'stale', value: { items: [], hasOlder: false } }, 456)).toEqual({ _tag: 'Stale', reason: { _tag: 'Unknown' } })
   })
 
-  it('stays read-only and exposes no mutation capabilities', async () => {
-    const items = transcriptTurnsForItems(scenario, { firstTurnComplete: true }).flatMap(turn => turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items])
-    const runtime = transcriptRuntimeOptions(items, true)
-    expect(runtime.messages).toBe(items)
-    expect(runtime.isRunning).toBe(true)
-    expect(runtime.isDisabled).toBe(true)
-    expect(runtime.onEdit).toBeUndefined()
-    expect(runtime.onReload).toBeUndefined()
-    expect(runtime.onCancel).toBeUndefined()
-    await expect(runtime.onNew({
-      role: 'user', content: [{ type: 'text', text: 'No send' }], createdAt: new Date(at(0)),
-      metadata: { custom: {} }, parentId: null, sourceId: null, runConfig: undefined,
-    })).rejects.toThrow('read-only')
-    expect(transcriptRuntimeOptions()).toMatchObject({ messages: [], isRunning: false, isDisabled: true })
-  })
 })
 
 describe('image handoff', () => {

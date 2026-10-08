@@ -41,6 +41,9 @@ const server = await createServer({
   ...loaded.config,
   configFile: false,
   root: `${app}/src/web`,
+  // Scan the fixture, not the app's main entry, and prebundle one shared React/runtime graph.
+  // A late assistant-ui optimization otherwise reloads the fixture across React module copies.
+  optimizeDeps: { ...loaded.config.optimizeDeps, entries: ['shell-geometry.browser.html'], include: ['react', 'react-dom/client', '@assistant-ui/react'] },
   // The fixture owns its data; never connect to an inherited live gateway.
   plugins: loaded.config.plugins.flat().filter((plugin) => plugin?.name !== 'wf:shared-client-gateway'),
   server: { ...loaded.config.server, host: '127.0.0.1', port: 0, strictPort: false, hmr: false },

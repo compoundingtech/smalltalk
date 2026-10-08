@@ -22,13 +22,19 @@ const source = vi.hoisted(() => ({
   feedInterest: vi.fn(),
   retryConversation: vi.fn(),
 }))
-vi.mock('../data/react.tsx', () => ({
+vi.mock('../data/react.tsx', async () => {
+  // Vitest hoists this factory before static imports are initialized.
+  const Atom = await import('effect/reactivity/Atom')
+  const agents = Atom.make({ _tag: 'Observed' as const, freshness: 'live' as const, value: [] })
+  return ({
   useConversation: (ref: string) => { source.conversation(ref); return source.feed },
   useConversationSync: (ref: string) => { source.conversationSync(ref); return source.sync },
-  useDataSource: () => ({ conversationInterest: undefined, retryConversation: source.retryConversation }),
+  useDataSource: () => ({ agents, conversationInterest: undefined, retryConversation: source.retryConversation }),
   useFeedInterest: source.feedInterest,
   useNow: () => 1000,
-}))
+  useGrants: () => ({ actions: 'ungranted', messageSend: 'ungranted', terminalInput: 'ungranted' }),
+  })
+})
 
 import { ConversationPane } from './ConversationPane.tsx'
 
@@ -58,7 +64,7 @@ describe('ConversationPane kit composition', () => {
     source.feedInterest.mockClear()
   })
 
-  it('renders the gated composition transcript for the selected follow, with no composer', () => {
+  it('renders the kit composer disabled with an honest no-send reason and no live spinner', () => {
     const html = render()
     expect(source.conversation).toHaveBeenCalledWith('agent/selected')
     expect(source.conversationSync).toHaveBeenCalledWith('agent/selected')
@@ -66,7 +72,12 @@ describe('ConversationPane kit composition', () => {
     expect(html).toContain('aria-label="Transcript"')
     expect(html).toContain('data-testid="transcript-scroll"')
     expect(html).toContain('No messages yet')
-    expect(html).not.toContain('textarea')
+    expect(html).toContain('textarea')
+    expect(html).toContain('This view cannot send messages.')
+    expect(html).not.toContain('Unknown')
+    expect(html).not.toContain('Cancel:')
+    expect(html).not.toContain('role="progressbar"')
+    expect(html).not.toContain('Connecting')
   })
 
   it('groups a scenario page into turns with rendered markdown and the reasoning disclosure', () => {
@@ -150,6 +161,11 @@ describe('ConversationPane kit composition', () => {
     expect(html).not.toContain('raw')
     expect(html).toContain('Conversation unavailable')
   })
+  it('keeps the composer with its draft slot and a send reason while the conversation cannot be read', () => {
+    const { html } = notFound()
+    expect(html).toContain('textarea')
+    expect(html).toContain('This view cannot send messages.')
+  })
   it('keeps rendering the transcript when the sync status is not Live, with the honest SyncLine', () => {
     source.sync = { status: { _tag: 'Failed', cause: { _tag: 'Server', code: 'forbidden', message: 'Denied' } }, observedAt: 500 }
     source.feed = { _tag: 'Observed', freshness: 'stale', value: { items: scenario.slice(0, 5), hasOlder: false, observation: { empty: false } } }
@@ -177,9 +193,8 @@ describe('ConversationPane kit composition', () => {
 
   it('adds only a layout-neutral diagnostics wrapper, no styling, and is mounted by the workspace', () => {
     const pane = readFileSync(new URL('./ConversationPane.tsx', import.meta.url), 'utf8')
-    expect(pane).not.toMatch(/stylex|className/)
-    // The only host element is a layout-neutral wrapper that carries the data-wf-* diagnostics.
-    expect(pane.match(/<[a-z][a-z\d]*(?:\s|>)/g)).toEqual(['<div '])
+    expect(pane).not.toMatch(/stylex\.props|className/)
+    expect(pane.match(/<[a-z][a-z\d]*(?:\s|>)/g)).toEqual(['<div ', '<div ', '<div '])
     expect(pane).toContain("style={{ display: 'contents' }}")
     const workspace = readFileSync(new URL('./LiveAgentWorkspace.tsx', import.meta.url), 'utf8')
     expect(workspace).toContain('<WorkspaceBody current={current} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} />')

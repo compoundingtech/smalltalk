@@ -7,9 +7,11 @@ import type {
 } from '@smalltalk/fractal-ui/assistant-ui'
 import { workLogTurnFromItems, type WorkKind } from '@smalltalk/fractal-ui/assistant-ui/work-log'
 import type { SyncStatus } from '@smalltalk/fractal-ui/assistant-ui/sync'
-import type { ConversationItem, RunStatus, SendState } from '../conversation/model.ts'
+import { Schema } from 'effect'
+import { ConversationItem, type RunStatus, type SendState } from '../conversation/model.ts'
 import type { FeedSyncObservation } from '../data/feedSync.ts'
 import type { ConversationPage, Feed } from '../data/source.ts'
+import { sendFailureDetail } from './composerSend.ts'
 
 /** Unknown protocol events are hidden by default; explicit inspection uses payload-free notices. */
 type KitConversationItem = NonNullable<ConversationRuntimeOptions['messages']>[number]
@@ -155,7 +157,8 @@ export const prepareTranscriptTurns = (
         ...(sourceItem.at === undefined ? {} : { at: sourceItem.at }) }
       : hasKitSendState(sourceItem) ? sourceItem
         : { ...sourceItem, sendState: sourceItem.sendState?._tag === 'Failed'
-          ? { ...sourceItem.sendState, reason: transcriptSendFailureReason(sourceItem.sendState.reason) }
+          ? { ...sourceItem.sendState, reason: transcriptSendFailureReason(sourceItem.sendState.reason),
+            detail: sendFailureDetail(sourceItem.sendState.reason) }
           : sourceItem.sendState }
     if (isPrompt(item)) {
       flush()
@@ -241,7 +244,35 @@ export const mapConversationFeed = (
   }
 }
 
+const sameConversationItems = Schema.toEquivalence(Schema.Array(ConversationItem))
 
+/** One bounded projection cache per pane; synchronization and clocks do not change its rows. */
+export const createConversationTranscript = (): typeof mapConversationFeed => {
+  let previousFeed: Feed<ConversationPage> | undefined
+  let previousName: string | undefined
+  let previousSystemEvents: boolean | undefined
+  let previousState: ConversationTranscriptState | undefined
+  return (feed, options) => {
+    if (previousState !== undefined && previousName === options.agentName && previousSystemEvents === options.showSystemEvents && (
+      previousFeed === feed
+      || (feed._tag === 'Observed' && previousFeed?._tag === 'Observed'
+        && feed.value.hasOlder === previousFeed.value.hasOlder
+        && feed.value.observation?.empty === previousFeed.value.observation?.empty
+        && sameConversationItems(feed.value.items, previousFeed.value.items))
+      || (feed._tag === 'Waiting' && previousFeed?._tag === 'Waiting')
+      || (feed._tag === 'Unavailable' && previousFeed?._tag === 'Unavailable'
+        && feed.reason === previousFeed.reason && feed.code === previousFeed.code && feed.detail === previousFeed.detail)
+    )) {
+      previousFeed = feed
+      return previousState
+    }
+    previousFeed = feed
+    previousName = options.agentName
+    previousSystemEvents = options.showSystemEvents
+    previousState = mapConversationFeed(feed, options)
+    return previousState
+  }
+}
 
 /**
  * The SDK status stream owns every Live verdict. A source that reports no sync stream (fixtures)
@@ -260,16 +291,6 @@ export const transcriptSyncStatus = (
 export const transcriptObservedAt = (observation: FeedSyncObservation | undefined, now: number): number =>
   observation?.observedAt ?? now
 
-/** Read-only transcript capabilities: no send/edit/retry transport is claimed by this layer. */
-export const transcriptRuntimeOptions = (
-  items: readonly KitConversationItem[] = [],
-  isRunning = false,
-): ConversationRuntimeOptions => ({
-  messages: items,
-  isRunning,
-  isDisabled: true,
-  onNew: async () => { throw new Error('This conversation view is read-only') },
-})
 
 /** Agent text is untrusted: only plain web URLs may leave the app, never javascript:, data: or blob: targets. */
 export const openableImageUrl = (src: string): string | undefined => {
