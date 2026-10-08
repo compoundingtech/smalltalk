@@ -890,25 +890,36 @@ async fn production_transport_control(heads_alive_during_partition: bool) {
         return;
     }
     let before = heads.load(Ordering::Relaxed);
+    // Pause only to reach the retry window. HTTP and SQLite use real I/O, so
+    // yields cannot establish completion before another virtual timer tick.
+    // Measure recovery on the real clock, keeping the same strict ten seconds.
+    tokio::time::resume();
+    awake.abort();
     let clear = tokio::time::Instant::now();
     partition.store(false, Ordering::Relaxed);
-    let mut delivered = false;
-    for _ in 0..10 {
-        for _ in 0..2000 {
-            tokio::task::yield_now().await;
+    let delivered = tokio::time::timeout_at(clear + Duration::from_secs(10), async {
+        loop {
+            if !right
+                .claims_for("note/pending", Some("example.note"))
+                .unwrap()
+                .is_empty()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if !right
-            .claims_for("note/pending", Some("example.note"))
-            .unwrap()
-            .is_empty()
-        {
-            delivered = true;
-            break;
-        }
-        tokio::time::advance(Duration::from_secs(1)).await;
-    }
-    assert!(delivered && clear.elapsed() < Duration::from_secs(10));
+    })
+    .await
+    .is_ok();
     let events = phases.lock().unwrap().clone();
+    assert!(
+        delivered && clear.elapsed() < Duration::from_secs(10),
+        "recovery delivered={delivered}, elapsed={:?}, heads={}, phases={:?}, posts={:?}",
+        clear.elapsed(),
+        heads.load(Ordering::Relaxed),
+        events,
+        posts.lock().unwrap()
+    );
     assert_eq!(
         events
             .iter()
