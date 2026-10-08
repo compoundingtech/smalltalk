@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Allow Swift and TypeScript st3 clients to inject trace context through an optional callback",
+  "replay": {"status": "none", "detail": "SDK-only change; no daemon claim replay or history changes."},
+  "schema": {"status": "none", "detail": "No database schema, version or stored data changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or fleet coordination changes."},
+  "compatibility": {"status": "changed", "detail": "Swift and TypeScript clients expose an optional trace-context callback. Existing callers without the callback retain their behavior; no daemon protocol or harness changes are required."},
+  "downtime": {"status": "none", "detail": "SDK-only change requires no daemon restart or service interruption."},
+  "manual": {"status": "none", "detail": "No mandatory migration or configuration change. Applications may opt into trace propagation by supplying the callback."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or new rollback restrictions. Applications can omit the callback or revert the SDK update."}
+}
