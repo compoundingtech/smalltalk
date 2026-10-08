@@ -151,6 +151,14 @@ const styles = stylex.create({
     cursor: 'pointer',
     outlineColor: tokens['--ds-focus-color'],
   },
+  folder: {
+    display: 'flex',
+    alignItems: 'center',
+    position: 'relative',
+    gap: '4px',
+    padding: '4px 8px',
+    minHeight: '30px',
+  },
   // React Aria Components 1.21.1 Tree hardcodes hasDragButton: true and requires
   // Button slot="drag" for keyboard/screen-reader DnD. Pointer drag is on the
   // TreeItem itself; the text Move action reveals only on focus, never on hover.
@@ -170,6 +178,12 @@ const styles = stylex.create({
     color: tokens['--ds-gray-900'],
     fontSize: '0.6875rem',
     fontVariantNumeric: 'tabular-nums',
+  },
+  notice: { color: tokens['--ds-gray-900'], fontSize: '0.6875rem', padding: scale.space2 },
+  highlight: {
+    color: tokens['--ds-gray-1000'],
+    backgroundColor: tokens['--ds-gray-alpha-200'],
+    fontWeight: 600,
   },
   indent: (depth: number) => ({ marginInlineStart: `${depth * 16}px` }),
 })
