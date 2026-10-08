@@ -3889,48 +3889,45 @@ fn omp_assistant_error_view(message: &Value) -> Option<Value> {
             .and_then(Value::as_str)
             .unwrap_or_default()
     };
-    let (status, presentation, is_error, label) =
-        match retry.and_then(|retry| retry.get("status")).and_then(Value::as_str) {
-            Some("recovered") => ("recovered", "compact-recovered", false, retry_note()),
-            Some("superseded") => ("superseded", "none", false, ""),
-            _ => match stop_reason {
-                Some("error") => (
+    let (status, presentation, is_error, label) = match retry
+        .and_then(|retry| retry.get("status"))
+        .and_then(Value::as_str)
+    {
+        Some("recovered") => ("recovered", "compact-recovered", false, retry_note()),
+        Some("superseded") => ("superseded", "none", false, ""),
+        _ => match stop_reason {
+            Some("error") => ("failed", "full", true, error_message.unwrap_or("Error")),
+            Some("aborted") => {
+                if silent_abort || user_interrupt {
+                    return None;
+                }
+                let custom = error_message.is_some_and(|text| {
+                    !text.is_empty()
+                        && text != GENERIC_ABORT_SENTINEL
+                        && text != SILENT_ABORT_MARKER
+                });
+                (
                     "failed",
                     "full",
                     true,
-                    error_message.unwrap_or("Error"),
-                ),
-                Some("aborted") => {
-                    if silent_abort || user_interrupt {
-                        return None;
-                    }
-                    let custom = error_message.is_some_and(|text| {
-                        !text.is_empty()
-                            && text != GENERIC_ABORT_SENTINEL
-                            && text != SILENT_ABORT_MARKER
-                    });
-                    (
-                        "failed",
-                        "full",
-                        true,
-                        if custom {
-                            error_message.unwrap_or_default()
-                        } else {
-                            "Operation aborted"
-                        },
-                    )
+                    if custom {
+                        error_message.unwrap_or_default()
+                    } else {
+                        "Operation aborted"
+                    },
+                )
+            }
+            _ => {
+                let Some(text) = error_message else {
+                    return None;
+                };
+                if text.is_empty() || silent_abort || user_interrupt {
+                    return None;
                 }
-                _ => {
-                    let Some(text) = error_message else {
-                        return None;
-                    };
-                    if text.is_empty() || silent_abort || user_interrupt {
-                        return None;
-                    }
-                    ("failed", "full", true, text)
-                }
-            },
-        };
+                ("failed", "full", true, text)
+            }
+        },
+    };
     let mut view = json!({
         "type": "assistant_error",
         "status": status,
@@ -3968,7 +3965,11 @@ fn omp_assistant_error_view(message: &Value) -> Option<Value> {
             if let Some(at) = superseded.get("timestamp").and_then(Value::as_i64) {
                 by["timestamp"] = json!(at);
             }
-            for (target, field) in [("response_id", "responseId"), ("provider", "provider"), ("model", "model")] {
+            for (target, field) in [
+                ("response_id", "responseId"),
+                ("provider", "provider"),
+                ("model", "model"),
+            ] {
                 if let Some(value) = superseded.get(field).and_then(Value::as_str) {
                     by[target] = json!(value);
                 }
@@ -3977,7 +3978,10 @@ fn omp_assistant_error_view(message: &Value) -> Option<Value> {
                 projected["superseded_by"] = by;
             }
         }
-        if projected.as_object().is_some_and(|projected| !projected.is_empty()) {
+        if projected
+            .as_object()
+            .is_some_and(|projected| !projected.is_empty())
+        {
             view["retry"] = projected;
         }
     }
@@ -5445,7 +5449,11 @@ mod tests {
                     "model": "gpt-5.6-sol"
                 })
             );
-            assert!(block["view"]["retry"]["superseded_by"].get("responseId").is_none());
+            assert!(
+                block["view"]["retry"]["superseded_by"]
+                    .get("responseId")
+                    .is_none()
+            );
             assert_eq!(error["body"]["text"], "[retry recovered] error; retried");
         }
     }
@@ -5526,14 +5534,35 @@ mod tests {
     #[test]
     fn omp_aborted_assistant_errors_match_native_presentation_rules() {
         let cases = [
-            (json!({"stopReason":"aborted","errorMessage":"__omp.silent_abort__"}), None),
-            (json!({"stopReason":"aborted","errorMessage":"Interrupted by user"}), None),
-            (json!({"stopReason":"aborted","errorId": 0x0400_0000i64, "errorMessage":"synthetic"}), None),
-            (json!({"stopReason":"aborted","errorId": 0x0200_0000i64}), None),
+            (
+                json!({"stopReason":"aborted","errorMessage":"__omp.silent_abort__"}),
+                None,
+            ),
+            (
+                json!({"stopReason":"aborted","errorMessage":"Interrupted by user"}),
+                None,
+            ),
+            (
+                json!({"stopReason":"aborted","errorId": 0x0400_0000i64, "errorMessage":"synthetic"}),
+                None,
+            ),
+            (
+                json!({"stopReason":"aborted","errorId": 0x0200_0000i64}),
+                None,
+            ),
             (json!({"stopReason":"aborted"}), Some("Operation aborted")),
-            (json!({"stopReason":"aborted","errorMessage":"Request was aborted"}), Some("Operation aborted")),
-            (json!({"stopReason":"aborted","errorMessage":"synthetic context limit"}), Some("synthetic context limit")),
-            (json!({"errorMessage":"synthetic late failure"}), Some("synthetic late failure")),
+            (
+                json!({"stopReason":"aborted","errorMessage":"Request was aborted"}),
+                Some("Operation aborted"),
+            ),
+            (
+                json!({"stopReason":"aborted","errorMessage":"synthetic context limit"}),
+                Some("synthetic context limit"),
+            ),
+            (
+                json!({"errorMessage":"synthetic late failure"}),
+                Some("synthetic late failure"),
+            ),
             (json!({"stopReason":"stop"}), None),
             (json!({}), None),
         ];
@@ -5586,7 +5615,10 @@ mod tests {
         let error = items.last().unwrap();
         assert_eq!(error["sequence"], 18);
         assert_eq!(error["body"]["blocks"][0]["kind"], "error");
-        assert_eq!(error["body"]["blocks"][0]["source_type"], "omp/assistant_error");
+        assert_eq!(
+            error["body"]["blocks"][0]["source_type"],
+            "omp/assistant_error"
+        );
         assert_eq!(error["body"]["text"], "[error] synthetic socket closed");
     }
 

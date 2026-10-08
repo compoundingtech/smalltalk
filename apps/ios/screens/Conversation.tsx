@@ -438,12 +438,12 @@ type NativeImage = { uri: string; size: number };
 type ConversationImageProps = { conversationId: string; reference: ConversationContentRef; viewport: ConversationImageViewport; client: St3Client | null };
 
 // Class lifecycle owns native measurement and invalidates late responses on unmount.
-// FlatList mounts overscan rows too, so mounting alone must never start a read.
+// All mounted images share the viewport queue; FlatList overscan never authorizes reads.
 class VisibleConversationImageView extends Component<ConversationImageProps, VisibleImageState<NativeImage>> {
   state: VisibleImageState<NativeImage> = { kind: 'closed' };
   private box = createRef<View>();
   private unregister?: () => void;
-  private image = new VisibleConversationImage<NativeImage>(async current => {
+  private image = new VisibleConversationImage<NativeImage>(this.props.viewport, async current => {
     const { client, conversationId, reference } = this.props;
     if (!client) throw new Error('Connect to the server and try again.');
     const content = await loadConversationContent(reference, async (ref, offset) => {
