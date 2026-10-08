@@ -204,7 +204,7 @@ enum Fetched {
     Sessions(Collection),
     /// The Fleet tab's machines and paired devices.
     Machines(Collection),
-    Terminals(Vec<super::resource_sidebar::ResourceRow>),
+    Terminals(Vec<super::resource_sidebar::ResourceRow>, bool),
     /// Token spend over a period of this many hours, or why st could not say.
     Usage(u64, Result<st3_client::UsagePeriod, String>),
     /// The clients connected to this member, or why they could not be read.
@@ -696,7 +696,10 @@ pub fn run(context: Context) -> Result<()> {
                     machines_reading = false;
                     ui.flash(format!("Could not load machines: {why}"));
                 }
-                Fetched::Terminals(rows) => ui.resource_sidebar.terminals = rows,
+                Fetched::Terminals(rows, has_more) => {
+                    ui.resource_sidebar.terminals = rows;
+                    ui.resource_sidebar.terminals_has_more = has_more;
+                }
                 Fetched::Older {
                     target,
                     session_id,
@@ -837,13 +840,14 @@ pub fn run(context: Context) -> Result<()> {
             let tx = fetched_tx.clone();
             runtime.spawn(async move {
                 if let Ok(reply) = terminal_client.terminals_list(None, Some(200), false).await {
+                    let has_more = reply.value.page.has_more;
                     let rows = reply.value.items.into_iter().filter_map(|item| match item {
                         Resource::Runtime(runtime) => runtime.terminal_id.map(|terminal| super::resource_sidebar::ResourceRow {
                             id: runtime.header.id, kind: "Terminals".into(), title: runtime.owner_id, open: terminal, missing: false,
                         }),
                         _ => None,
                     }).collect();
-                    let _ = tx.send(Fetched::Terminals(rows));
+                    let _ = tx.send(Fetched::Terminals(rows, has_more));
                 }
             });
             if tab == 1 || model.sessions.snapshot.is_none() {

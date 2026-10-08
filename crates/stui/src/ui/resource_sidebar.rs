@@ -28,6 +28,7 @@ pub(crate) enum Row {
         closed: bool,
     },
     Resource(ResourceRow),
+    Notice(String),
     Welcome,
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -40,6 +41,7 @@ struct Choices {
 pub(crate) struct Sidebar {
     pub arrangements: Vec<st3_client::Arrangement>,
     pub terminals: Vec<ResourceRow>,
+    pub terminals_has_more: bool,
     seen: BTreeMap<String, ResourceRow>,
     choices: Choices,
     path: Option<PathBuf>,
@@ -64,24 +66,38 @@ impl Sidebar {
     fn save(&self) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        if let Some(path) = &self.path
-            && let Some(parent) = path.parent()
-            && std::fs::create_dir_all(parent).is_ok()
-            && let Ok(mut file) = std::fs::OpenOptions::new()
+        let Some(path) = &self.path else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let Ok(bytes) = serde_json::to_vec(&Choices {
+            collapsed: self.choices.collapsed.clone(),
+            resources: self.seen.clone(),
+        }) else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::now_v7()));
+        let result = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
-                .open(path)
-            && let Ok(bytes) = serde_json::to_vec(&Choices {
-                collapsed: self.choices.collapsed.clone(),
-                resources: self.seen.clone(),
-            })
-        {
-            let _ = file.write_all(&bytes);
+                .open(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temp, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
         }
     }
     pub fn observe(&mut self, world: &World) {
+        // Retain missing subjects until the person explicitly clears them; never prune by age.
         let before = self.seen.clone();
         for row in self.seen.values_mut() {
             row.missing = true;
@@ -163,6 +179,11 @@ impl Sidebar {
             })
         };
         let mut rows = Vec::new();
+        if self.terminals_has_more {
+            rows.push(Row::Notice(
+                "More terminals exist beyond this 200-item window.".into(),
+            ));
+        }
         let mut append =
             |id: String, title: String, resources: Vec<ResourceRow>, default_closed: bool| {
                 let resources = resources
@@ -317,6 +338,7 @@ impl Ui {
                         theme::fg(theme::TEXT)
                     },
                 ),
+                Row::Notice(message) => (format!(" {message}"), theme::dim()),
                 Row::Welcome => (
                     " Welcome · Ctrl+K: New terminal".into(),
                     theme::fg(theme::ACCENT),
@@ -531,6 +553,54 @@ mod tests {
             serde_json::from_slice(&std::fs::read(sidebar.path.unwrap()).unwrap()).unwrap();
         assert_eq!(choices.collapsed.get("everything"), Some(&false));
         assert!(sidebar.arrangements.is_empty());
+    }
+    #[test]
+    fn saving_replaces_the_catalog_without_truncating_the_previous_file() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sidebar.json");
+        let mut sidebar = Sidebar {
+            path: Some(path.clone()),
+            ..Default::default()
+        };
+        let mut row = resource("agent/atlas", "Agents");
+        row.missing = true;
+        sidebar.seen.insert(row.id.clone(), row);
+        sidebar.save();
+        let previous = std::fs::read(&path).unwrap();
+        let mut old_file = std::fs::File::open(&path).unwrap();
+        sidebar.choices.collapsed.insert("everything".into(), true);
+        sidebar.save();
+        let mut retained = Vec::new();
+        old_file.read_to_end(&mut retained).unwrap();
+        assert_eq!(retained, previous);
+        let restored: Choices = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored.collapsed.get("everything"), Some(&true));
+        assert!(restored.resources["agent/atlas"].missing);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn truncated_terminal_catalog_stays_visible_above_collapsed_groups() {
+        let mut sidebar = Sidebar {
+            terminals_has_more: true,
+            ..Default::default()
+        };
+        sidebar.choices.collapsed.insert("everything".into(), true);
+        assert!(
+            matches!(&sidebar.rows()[0], Row::Notice(message) if message.contains("200-item window"))
+        );
+        sidebar.terminals_has_more = false;
+        assert!(
+            !sidebar
+                .rows()
+                .iter()
+                .any(|row| matches!(row, Row::Notice(_)))
+        );
     }
     #[test]
     fn opening_and_collapsing_only_navigate_and_do_not_edit_arrangements() {

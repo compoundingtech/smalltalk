@@ -73,7 +73,9 @@ Click the filter row or press `/` while the sidebar has focus to narrow it; Esc 
 it. Arrows move through rows and Enter opens a resource or toggles a group. Folder
 groups start open. Everything else and its kind groups start collapsed above 30 items;
 filtering expands matches. Collapse choices and previously seen resource names are
-kept privately on this device. A missing subject remains marked unavailable.
+kept privately on this device, with atomic catalog saves. A missing subject remains
+marked unavailable until explicitly cleared; the catalog is never pruned by age. The
+terminal catalog reads a 200-item window and displays a notice when more exist.
 
 Fresh workspaces show the host and `Ctrl+K: New terminal`, with a welcome row. An
 existing device's explicit sidebar visibility choice is kept. Older daemons lacking
