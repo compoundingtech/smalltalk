@@ -354,7 +354,8 @@ pub fn run(context: Context) -> Result<()> {
     // How images are drawn: asked of a terminal known to draw them, once, inside the
     // alternate screen and before any event is read. A terminal that never answers would
     // leave the query reading stdin and swallow keys, so others get half blocks unasked.
-    ui.picker = Some(if super::attach::graphics_terminal() {
+    ui.auto_images = super::attach::graphics_terminal();
+    ui.picker = Some(if ui.auto_images {
         ratatui_image::picker::Picker::from_query_stdio()
             .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
     } else {

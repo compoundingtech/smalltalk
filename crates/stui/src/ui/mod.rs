@@ -83,6 +83,7 @@ struct FramePane {
     total: usize,
     lines: Rc<Vec<Line<'static>>>,
     entries: Vec<(String, usize)>,
+    images: Vec<(content::Key, usize)>,
     layer: usize,
 }
 
@@ -454,6 +455,8 @@ pub struct Ui {
     terminal_press: Option<(Instant, u16, u16, u8)>,
     /// How this terminal draws images (kitty, sixel, iTerm2, half blocks), asked once at start.
     pub(crate) picker: Option<ratatui_image::picker::Picker>,
+    /// Auto-fetch only on terminals known to support graphics, not half-block fallback.
+    pub(crate) auto_images: bool,
     /// Each attachment's thumbnail, encoded once so a redraw never sends the image again.
     thumbnails: RefCell<HashMap<std::path::PathBuf, Option<ratatui_image::protocol::Protocol>>>,
     /// When st last sent each conversation something, shown above its message box.
@@ -570,18 +573,25 @@ impl Ui {
             let Some(conversation) = pane.key.strip_prefix("chat:") else {
                 continue;
             };
-            if !self.content.expanded_all.contains(conversation)
-                || pane.rect.width == 0
-                || pane.rect.height == 0
-            {
+            if pane.rect.width == 0 || pane.rect.height == 0 {
                 continue;
+            }
+            if self.auto_images {
+                for (key, line) in &pane.images {
+                    if pane.entry_visible(*line, line.saturating_add(1), &frame.covers)
+                        && self.content.request_visible_image(key)
+                    {
+                        return Some(key.clone());
+                    }
+                }
             }
             for (index, (entry, start)) in pane.entries.iter().enumerate() {
                 let end = pane
                     .entries
                     .get(index + 1)
                     .map_or(pane.total, |(_, line)| *line);
-                if self.conversation_state.expanded.contains(entry)
+                if self.content.expanded_all.contains(conversation)
+                    && self.conversation_state.expanded.contains(entry)
                     && pane.entry_visible(*start, end, &frame.covers)
                     && let Some(key) = self.content.request_next_visible_tool(conversation, entry)
                 {
@@ -661,6 +671,7 @@ impl Ui {
             terminal_press: None,
             anchors: RefCell::new(HashMap::new()),
             picker: None,
+            auto_images: false,
             thumbnails: RefCell::new(HashMap::new()),
             content: content::Content::default(),
             updated: HashMap::new(),
@@ -2741,15 +2752,17 @@ impl Ui {
                 if !matches!(target.hit, Hit::InlineImage(_)) { self.hit(rect, target.hit.clone()); }
             }
             if let Hit::InlineImage(key) = &target.hit
-                && target.line + 12 <= top + height
-                && target.line >= top
+                && target.line < top + height
+                && target.line + 12 > top
                 && let Some(picker) = &self.picker
             {
+                let start = target.line.max(top);
+                let end = (target.line + 12).min(top + height);
                 self.content.draw_image(picker, key, Rect {
                     x: area.x + 2,
-                    y: area.y + (target.line - top) as u16,
+                    y: area.y + (start - top) as u16,
                     width: area.width.saturating_sub(3),
-                    height: 12,
+                    height: (end - start) as u16,
                 }, buf);
             }
         }
@@ -2813,6 +2826,13 @@ impl Ui {
             total,
             lines,
             entries: doc.entries,
+            images: doc.targets.iter().filter_map(|target| {
+                if let Hit::ContentImage(key) = &target.hit {
+                    Some((key.clone(), target.line))
+                } else {
+                    None
+                }
+            }).collect(),
             layer,
         });
     }
@@ -2949,6 +2969,7 @@ impl Ui {
                 total: usize::from(body.height) + scrolled,
                 lines: Rc::new(Vec::new()),
                 entries: Vec::new(),
+                images: Vec::new(),
                 layer,
             });
             // The person's own cursor only where nothing is drawn over the terminal.
@@ -6374,6 +6395,7 @@ mod tests {
                 ("image".into(), 3),
                 ("offscreen".into(), 5),
             ],
+            images: Vec::new(),
             layer: 0,
         });
         (ui, conversation)
@@ -6435,6 +6457,52 @@ mod tests {
         assert_eq!(ui.content.request_tool(&conversation, "one").len(), 1);
         assert_eq!(ui.content.request_tool(&conversation, "two").len(), 1);
         assert_eq!(ui.content.request_tool(&conversation, "offscreen").len(), 1);
+    }
+
+    #[test]
+    fn automatic_images_use_visible_image_lines_graphics_and_one_read_at_a_time() {
+        let (mut ui, conversation) = expand_all_viewport_fixture();
+        let items = ["first", "second"].into_iter().enumerate().map(|(sequence, id)| {
+            serde_json::from_value(serde_json::json!({
+                "id":id,"sequence":sequence,"revision":1,"timestamp":"2026-10-08T10:00:00Z","role":"assistant","type":"content","final":true,
+                "body":{"media_type":"image/png","blocks":[{"id":id,"kind":"image","source_type":"native","payload":{},
+                "continuation":{"ref":id,"media_type":"image/png","reason":"on-demand"}}]}
+            })).unwrap()
+        }).collect::<Vec<st3_client::TimelineEntry>>();
+        ui.content.index(&std::collections::BTreeMap::from([(conversation.clone(), st3_conversation_ui::Timeline {
+            items, session_id: Some("session/visible-images".into()), ..Default::default()
+        })]));
+        let first = ui.content.tool_images(&conversation, "first#images").pop().unwrap();
+        let second = ui.content.tool_images(&conversation, "second#images").pop().unwrap();
+        {
+            let mut frame = ui.frame.borrow_mut();
+            let pane = &mut frame.panes[0];
+            pane.total = 40;
+            pane.entries = vec![("first#images".into(), 0), ("second#images".into(), 20)];
+            pane.images = vec![(first.clone(), 12), (second.clone(), 22)];
+        }
+        let mut reads = content::Reads::default();
+        ui.auto_images = true;
+        assert!(ui.next_content_read(&mut reads).is_none(), "visible text in a tall row does not authorize its offscreen image");
+        ui.frame.borrow_mut().panes[0].top = 12;
+        ui.auto_images = false;
+        assert!(ui.next_content_read(&mut reads).is_none(), "half-block fallback does not auto-fetch");
+        ui.auto_images = true;
+        ui.frame.borrow_mut().covers.push((Rect::new(0, 0, 40, 4), 0));
+        assert!(ui.next_content_read(&mut reads).is_none(), "covered images are not visible");
+        ui.frame.borrow_mut().covers.clear();
+        assert_eq!(ui.next_content_read(&mut reads), Some(first.clone()));
+        ui.frame.borrow_mut().panes[0].top = 22;
+        assert!(ui.next_content_read(&mut reads).is_none(), "no concurrent read after scrolling");
+        reads.complete(&first);
+        ui.content.complete(first.clone(), Err("synthetic failure".into()));
+        assert_eq!(ui.next_content_read(&mut reads), Some(second.clone()));
+        assert!(!ui.content.toggle_image(&second), "Ctrl+U hides an automatic load");
+        reads.complete(&second);
+        ui.content.complete(second, Err("late response".into()));
+        assert!(ui.next_content_read(&mut reads).is_none(), "redraw cannot undo Ctrl+U");
+        ui.frame.borrow_mut().panes[0].top = 12;
+        assert!(ui.next_content_read(&mut reads).is_none(), "automatic loading does not retry a failure");
     }
 
     #[test]

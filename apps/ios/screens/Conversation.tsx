@@ -1,11 +1,11 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Component, createRef, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ActionSheetIOS, FlatList, Image, Keyboard, KeyboardAvoidingView, Platform, Pressable, StyleSheet, TextInput, View } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import * as Clipboard from 'expo-clipboard';
 import { useFocusEffect } from '@react-navigation/native';
 import { useHeaderHeight } from '@react-navigation/elements';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import type { TimelineEntry } from '../../../clients/typescript/st3-client';
+import type { St3Client, TimelineEntry } from '../../../clients/typescript/st3-client';
 import type { ConversationContentRef } from '../../../clients/typescript/st3-client';
 import { contentImageUri, contentJsonValue, fetchedConversationEntries, loadConversationContent } from '@smalltalk/st3-views';
 import { checkoutLabel } from '../launcher';
@@ -13,9 +13,10 @@ import { agentGlyph, agentModel, agentName, agentState, agentWord, harnessColor,
 import { Banners } from '../chrome';
 import rules from '../../../fixtures/clients/conversation-style.json';
 import { tokenColor, type ConversationRules } from '../conversationStyle';
-import { COLLAPSED_TOOL_LINES, conversationEntries, staleLine, entryMatches, entryText, folds, headerLine, shownToolLines, subagentSession, unreadableTranscript, type ConversationEntry, type MailImage, simplify, type SimpleRow, sessionPerson, applyConversation, applyOlderPage, isUnresolved, olderFailed, olderLoading, olderNote, type Conversation } from '@smalltalk/st3-views';
+import { conversationEntries, staleLine, entryMatches, entryText, folds, headerLine, shownToolLines, subagentSession, unreadableTranscript, type ConversationEntry, type MailImage, simplify, type SimpleRow, sessionPerson, applyConversation, applyOlderPage, isUnresolved, olderFailed, olderLoading, olderNote, type Conversation } from '@smalltalk/st3-views';
 import { addImages, fromDataUri, MAX_IMAGES, megabytes, picked, type Picked } from '../images';
 import { rememberBounded } from '../boundedCache';
+import { ConversationImageViewport, VisibleConversationImage, type VisibleImageState } from '../visibleConversationImages';
 import { dictationAvailable, startDictation } from '../modules/st-dictation';
 import type { RootScreen } from '../navigation';
 import { openSubagentConversation } from '../conversationNavigation';
@@ -102,6 +103,13 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   // How far from the newest entry the list is scrolled (it is inverted: 0 is the newest).
   const offset = useRef(0);
   const list = useRef<FlatList<Row>>(null);
+  const imageViewport = useMemo(() => new ConversationImageViewport(), []);
+  const imageViewportBox = useRef<View>(null);
+  const measureImageViewport = () => imageViewportBox.current?.measureInWindow((x, y, width, height) => imageViewport.setBounds({ x, y, width, height }));
+  useFocusEffect(useCallback(() => {
+    imageViewport.setActive(true);
+    return () => imageViewport.setActive(false);
+  }, [imageViewport]));
   const headerHeight = useHeaderHeight();
   const insets = useSafeAreaInsets();
   // Above the keyboard the composer needs no home-indicator inset.
@@ -187,14 +195,30 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   }, [entries]);
   const finding = findOpen && find.trim() !== '';
   const found = useMemo(() => finding ? entries.filter(entry => entryMatches(entry, find)) : entries, [entries, find, finding]);
+  const sourceRevisions = useMemo(() => Object.fromEntries(timeline.entries.map(entry => [entry.id, entry.revision])), [timeline.entries]);
+  // Error cards keep their disclosure controls even in this phone's brief mode;
+  // grouping them into a one-line tool bundle would hide the original failure.
+  const simpleRows = useMemo(() => {
+    if (!simpleOn || finding) return [];
+    const rows: SimpleRow[] = [];
+    let start = 0;
+    for (let index = 0; index < found.length; index++) {
+      const entry = found[index];
+      if (entry.body.kind !== 'tool' || !entry.body.title.startsWith('assistant error')) continue;
+      rows.push(...simplify(found.slice(start, index), open), { kind: 'entry', entry });
+      start = index + 1;
+    }
+    rows.push(...simplify(found.slice(start), open));
+    return rows;
+  }, [found, open, simpleOn, finding]);
   const rows: Row[] = useMemo(() => [
     ...(finding ? [] : [...pending].reverse().map(item => ({ kind: 'pending' as const, pending: item }))),
     // Simplified (this phone's choice, on by default): a tool call to a line, a run to one line.
     ...(simpleOn && !finding
-      ? simplify(found, open).reverse().map((row): Row => row)
+      ? [...simpleRows].reverse().map((row): Row => row)
       : [...found].reverse().map(entry => ({ kind: 'entry' as const, entry }))),
     ...(olderNote(timeline) && !finding ? [{ kind: 'older' as const }] : []),
-  ], [found, pending, timeline, finding, simpleOn, open]);
+  ], [found, pending, timeline, finding, simpleOn, open, simpleRows]);
 
   const canSend = !!agent && status === 'online';
   async function send(spoken?: string) {
@@ -299,6 +323,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       <Pressable accessibilityRole="button" onPress={() => { setFinding(false); setFind(''); }}><T color={theme.accent}>Done</T></Pressable>
     </View> : null}
     {finding ? <View style={styles.strip}><T color={theme.yellow}>{found.length === 0 ? `Nothing here says “${find.trim()}”` : `${found.length} ${found.length === 1 ? 'entry says' : 'entries say'} “${find.trim()}”`}</T></View> : null}
+    <View ref={imageViewportBox} collapsable={false} style={{ flex: 1 }} onLayout={measureImageViewport}>
     <FlatList
       ref={list}
       inverted
@@ -310,7 +335,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
         : row.kind === 'bundle' ? <BundleView row={row} onToggle={toggle} />
         : row.kind === 'call' && !open.has(row.entry.id) ? <CallView entry={row.entry} tool={row.tool} onToggle={toggle} />
         // A long press opens the entry's text to select any part of it; iOS text selects only whole.
-        : <Pressable accessible={false} onLongPress={() => navigation.navigate('SelectText', { text: entryText(row.entry), title })} delayLongPress={350}><EntryView entry={row.entry} conversationId={timeline.sessionId ?? sessionId ?? target} open={open.has(row.entry.id)} onToggle={toggle} brief={simpleOn && !finding} onOpenSession={openSession} /></Pressable>}
+        : <Pressable accessible={false} onLongPress={() => navigation.navigate('SelectText', { text: entryText(row.entry), title })} delayLongPress={350}><EntryView entry={row.entry} conversationId={timeline.sessionId ?? sessionId ?? target} revisionKey={row.entry.contentSources?.map(source => `${source.id}:${sourceRevisions[source.id] ?? 0}`).join('|') ?? String(sourceRevisions[row.entry.id] ?? 0)} imageViewport={imageViewport} open={open.has(row.entry.id)} onToggle={toggle} brief={simpleOn && !finding} onOpenSession={openSession} /></Pressable>}
       ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : !loaded ? (issue ? `Not loaded yet: ${issue}. Trying again.` : status === 'online' ? 'Loading the conversation…' : 'Offline; this conversation has not been loaded yet.') : 'No conversation in the recent timeline.'}</T>}</View>}
       // Scrolled up, a new entry must not move what is being read, so the position is kept. At
       // the newest it must not be: the position-keeping scrolls to a new entry with an animation,
@@ -320,7 +345,8 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       keyboardDismissMode="interactive"
       // A tap on the conversation puts the keyboard away, as in Messages; the next tap acts.
       keyboardShouldPersistTaps="never"
-      onScroll={event => { offset.current = event.nativeEvent.contentOffset.y; setAway(offset.current > 240); setReading(offset.current > 60); }}
+      onScroll={event => { offset.current = event.nativeEvent.contentOffset.y; setAway(offset.current > 240); setReading(offset.current > 60); imageViewport.refresh(); }}
+      onContentSizeChange={measureImageViewport}
       onScrollBeginDrag={() => { dragged.current = true; }}
       // Inverted: the end is the oldest entry. Reaching it reads the page before.
       onEndReached={loadOlder}
@@ -328,6 +354,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       scrollEventThrottle={100}
       contentContainerStyle={{ paddingVertical: 8 }}
     />
+    </View>
     {away ? <Pressable accessibilityRole="button" accessibilityLabel="Scroll to latest" style={styles.latest} onPress={() => list.current?.scrollToOffset({ offset: 0, animated: true })}><T bold color={theme.accent}>↓ latest</T></Pressable> : null}
     {agent && listening ? <View style={[styles.composer, { paddingBottom: bottom, flexDirection: 'column', alignItems: 'stretch' }]}>
       <Waveform levels={levels} />
@@ -398,41 +425,88 @@ const PendingView = memo(function PendingView({ pending }: { pending: Pending })
   </View>;
 });
 
-const EntryView = memo(function EntryView(props: { entry: ConversationEntry; conversationId: string; open: boolean; onToggle: (id: string) => void; brief?: boolean; onOpenSession?: (sessionId: string, title: string) => void }) {
+const EntryView = memo(function EntryView(props: { entry: ConversationEntry; conversationId: string; revisionKey: string; imageViewport: ConversationImageViewport; open: boolean; onToggle: (id: string) => void; brief?: boolean; onOpenSession?: (sessionId: string, title: string) => void }) {
   return <View>
     <EntryBodyView {...props} />
-    {props.entry.content?.map(reference => <FetchedContent key={`${props.conversationId}:${reference.ref}`} conversationId={props.conversationId} reference={reference} entry={props.entry} onOpenSession={props.onOpenSession} />)}
+    {props.entry.content?.map(reference => reference.reason === 'on-demand' || reference.media_type.startsWith('image/')
+      ? <ConversationImageView key={`${props.conversationId}:${props.entry.id}:${props.revisionKey}:${reference.ref}`} conversationId={props.conversationId} reference={reference} viewport={props.imageViewport} />
+      : <FetchedContent key={`${props.conversationId}:${reference.ref}`} conversationId={props.conversationId} reference={reference} entry={props.entry} onOpenSession={props.onOpenSession} />)}
   </View>;
 });
+
+type NativeImage = { uri: string; size: number };
+type ConversationImageProps = { conversationId: string; reference: ConversationContentRef; viewport: ConversationImageViewport; client: St3Client | null };
+
+// Class lifecycle owns native measurement and invalidates late responses on unmount.
+// FlatList mounts overscan rows too, so mounting alone must never start a read.
+class VisibleConversationImageView extends Component<ConversationImageProps, VisibleImageState<NativeImage>> {
+  state: VisibleImageState<NativeImage> = { kind: 'closed' };
+  private box = createRef<View>();
+  private unregister?: () => void;
+  private image = new VisibleConversationImage<NativeImage>(async current => {
+    const { client, conversationId, reference } = this.props;
+    if (!client) throw new Error('Connect to the server and try again.');
+    const content = await loadConversationContent(reference, async (ref, offset) => {
+      if (!current()) throw new Error('Image is no longer visible.');
+      return (await client.conversationContentChunk(conversationId, ref, offset)).value;
+    });
+    return { uri: contentImageUri(content), size: content.bytes.length };
+  }, state => this.setState(state));
+
+  componentDidMount() {
+    this.unregister = this.props.viewport.register({
+      measure: done => this.box.current?.measureInWindow((x, y, width, height) => done({ x, y, width, height })),
+      visible: shown => this.image.setVisible(shown),
+    });
+  }
+
+  componentWillUnmount() { this.image.dispose(); this.unregister?.(); }
+
+  render() {
+    const state = this.state;
+    return <View style={styles.entry}>
+      <View ref={this.box} collapsable={false} style={styles.mailImage} onLayout={() => this.props.viewport.refresh()}>
+        {state.kind === 'image'
+          ? <Image accessibilityLabel="Fetched conversation image" source={{ uri: state.image.uri, cache: 'reload' }} style={StyleSheet.absoluteFill} resizeMode="contain" onError={() => this.image.fail('The image could not be displayed. Try again.')} />
+          : <T dim style={{ padding: 6 }}>{state.kind === 'failed' ? 'Image unavailable' : state.kind === 'loading' ? 'Loading image…' : 'Image'}</T>}
+      </View>
+      {state.kind === 'image' ? <T dim>{megabytes(state.image.size)}</T> : null}
+      {state.kind === 'failed' ? <View>
+        <T color={theme.red}>Could not load image: {state.message}</T>
+        <Pressable accessibilityRole="button" onPress={() => this.image.retry()}><T color={theme.accent}>Retry loading image</T></Pressable>
+      </View> : null}
+    </View>;
+  }
+}
+
+function ConversationImageView(props: Omit<ConversationImageProps, 'client'>) {
+  const { client } = useStore();
+  return <VisibleConversationImageView {...props} client={client} />;
+}
 
 // Explicit disclosure only. Identifiable bodies/payloads use the normal typed
 // output view; ambiguous metadata/view references retain a lossless JSON fallback.
 function FetchedContent({ conversationId, reference, entry, onOpenSession }: { conversationId: string; reference: ConversationContentRef; entry: ConversationEntry; onOpenSession?: (sessionId: string, title: string) => void }) {
   const { client } = useStore();
-  const [state, setState] = useState<{ kind: 'closed' } | { kind: 'loading' } | { kind: 'failed'; message: string } | { kind: 'json'; text: string } | { kind: 'typed'; entries: ConversationEntry[] } | { kind: 'image'; uri: string; size: number }>({ kind: 'closed' });
-  const image = reference.reason === 'on-demand' || reference.media_type.startsWith('image/');
+  const [state, setState] = useState<{ kind: 'closed' } | { kind: 'loading' } | { kind: 'failed'; message: string } | { kind: 'json'; text: string } | { kind: 'typed'; entries: ConversationEntry[] }>({ kind: 'closed' });
   const load = async () => {
     setState({ kind: 'loading' });
     try {
       if (!client) throw new Error('Connect to the server and try again.');
       const content = await loadConversationContent(reference, async (ref, offset) => (await client.conversationContentChunk(conversationId, ref, offset)).value);
-      if (image) setState({ kind: 'image', uri: contentImageUri(content), size: content.bytes.length });
-      else {
-        const value = contentJsonValue(content);
-        const entries = fetchedConversationEntries(entry, reference, value);
-        setState(entries?.length ? { kind: 'typed', entries } : { kind: 'json', text: JSON.stringify(value, null, 2) });
-      }
+      const value = contentJsonValue(content);
+      const entries = fetchedConversationEntries(entry, reference, value);
+      setState(entries?.length ? { kind: 'typed', entries } : { kind: 'json', text: JSON.stringify(value, null, 2) });
     } catch (error) { setState({ kind: 'failed', message: error instanceof Error ? error.message : String(error) }); }
   };
-  const expanded = state.kind === 'json' || state.kind === 'typed' || state.kind === 'image';
+  const expanded = state.kind === 'json' || state.kind === 'typed';
   return <View style={styles.entry}>
     <Pressable accessibilityRole="button" accessibilityState={{ expanded, disabled: state.kind === 'loading' }} disabled={state.kind === 'loading'} onPress={() => expanded ? setState({ kind: 'closed' }) : void load()}>
-      <T color={theme.accent}>{state.kind === 'loading' ? 'Loading…' : expanded ? 'Show less' : state.kind === 'failed' ? 'Retry loading' : image ? 'Load image' : 'Show all'}<T dim>{reference.size === undefined ? (image ? ' · size unknown until loaded' : '') : ` · ${megabytes(reference.size)}`}</T></T>
+      <T color={theme.accent}>{state.kind === 'loading' ? 'Loading…' : expanded ? 'Show less' : state.kind === 'failed' ? 'Retry loading' : 'Show all'}<T dim>{reference.size === undefined ? '' : ` · ${megabytes(reference.size)}`}</T></T>
     </Pressable>
-    {state.kind === 'failed' ? <T color={theme.red}>Could not load {image ? 'image' : 'full content'}: {state.message}</T> : null}
+    {state.kind === 'failed' ? <T color={theme.red}>Could not load full content: {state.message}</T> : null}
     {state.kind === 'json' ? <T selectable>{state.text}</T> : null}
     {state.kind === 'typed' ? state.entries.map(shown => <EntryBodyView key={shown.id} entry={shown} open onToggle={() => setState({ kind: 'closed' })} onOpenSession={onOpenSession} />) : null}
-    {state.kind === 'image' ? <View><T dim>{megabytes(state.size)}</T><Image accessibilityLabel="Fetched conversation image" source={{ uri: state.uri, cache: 'reload' }} style={styles.mailImage} resizeMode="contain" onError={() => setState({ kind: 'failed', message: 'The image could not be displayed. Try again.' })} /></View> : null}
   </View>;
 }
 
@@ -459,7 +533,8 @@ const EntryBodyView = memo(function EntryBodyView({ entry, open, onToggle, brief
       const rule = RULES.tool;
       const [glyph, color] = body.state === 'running' ? ['⠿', c(rule.running)] : body.state === 'ok' ? [rule.ok.text, c(rule.ok.color)] : [rule.failed.text, c(rule.failed.color)];
       const shown = shownToolLines(body, open);
-      const expandable = body.output.length > COLLAPSED_TOOL_LINES;
+      // Even a short assignment/code block can contain wrapped lines hidden by quiet mode.
+      const expandable = body.output.length > 0;
       const quiet = !open;
       const look = quiet ? rule.quiet : rule.open;
       // A subagent card's `open session/…` line is the link to that conversation (q2).
@@ -472,7 +547,7 @@ const EntryBodyView = memo(function EntryBodyView({ entry, open, onToggle, brief
         </Pressable>
         {shown.lines.filter(line => !session || line !== `open ${session}`).map((line, index) =>
           <T key={index} numberOfLines={quiet ? 1 : undefined} style={[styles.toolLine, quiet && { opacity: 0.7 }]} color={c(line.startsWith('+') ? rule.added : line.startsWith('-') || line.includes('error') ? rule.removed : look.rows)}>{line || ' '}</T>)}
-        {session ? <Pressable accessibilityRole="link" accessibilityLabel={`Open subagent conversation ${body.title.split(' · ')[0]}`} onPress={() => onOpenSession?.(session, body.title.split(' · ')[0] ?? session)}><T color={theme.accent} style={styles.toolLine}>↗ open {session}</T></Pressable> : null}
+        {session ? <Pressable accessibilityRole="link" accessibilityLabel={`Open subagent conversation ${body.title.split(' · ')[0]}`} onPress={() => onOpenSession?.(session, body.title.split(' · ')[0] ?? session)}><T color={theme.accent} style={styles.toolLine}>↗ open {body.title.split(' · ')[0]}</T></Pressable> : null}
       </View>;
     }
   }

@@ -62,13 +62,31 @@ fn typed_content(
     value: &Value,
     call: Option<&st3_client::TimelineEntry>,
 ) -> Option<Vec<st3_conversation_ui::Entry>> {
-    // Refs are opaque. A full body must decode as the source's body type and
-    // match its tool identity. Otherwise treat a clipped payload as a payload
-    // only when metadata/view were not clipped; ambiguous subtrees stay raw.
+    // Opaque references are located by the source's clipped subtree, never by
+    // parsing their path. Metadata remains raw; an unambiguous typed view is
+    // reattached to the original block and passed through the normal adapter.
     let payload = clipped(&block.payload)
         && !block.metadata.as_ref().is_some_and(clipped)
         && !block.view.as_ref().is_some_and(clipped);
-    let body = match &source.body {
+    let view = block.view.as_ref().is_some_and(clipped)
+        && !clipped(&block.payload)
+        && !block.metadata.as_ref().is_some_and(clipped);
+    let body = if view
+        && value.get("type").and_then(Value::as_str).is_some()
+        && value.get("type") == block.view.as_ref().and_then(|view| view.get("type"))
+    {
+        let mut body = source.body.clone();
+        let blocks = match &mut body {
+            TimelineBody::ToolCall(body) => &mut body.blocks,
+            TimelineBody::ToolResult(body) => &mut body.blocks,
+            TimelineBody::Content(body) => &mut body.blocks,
+            _ => return None,
+        };
+        let full = blocks.iter_mut().find(|candidate| candidate.id == block.id)?;
+        full.view = Some(value.clone());
+        full.continuation = None;
+        body
+    } else { match &source.body {
         TimelineBody::ToolResult(original) => {
             if let Ok(full) =
                 serde_json::from_value::<st3_client::TimelineToolResultBody>(value.clone())
@@ -98,12 +116,12 @@ fn typed_content(
                 return None;
             }
         }
-        TimelineBody::Content(original) if matches!(block.kind.as_str(), "text" | "reasoning") => {
+        TimelineBody::Content(original) => {
             if let Ok(full) =
                 serde_json::from_value::<st3_client::TimelineContentBody>(value.clone())
             {
                 TimelineBody::Content(Box::new(full))
-            } else if payload && value.is_string() {
+            } else if payload && value.is_string() && matches!(block.kind.as_str(), "text" | "reasoning") {
                 let mut full = original.clone();
                 full.text = value.as_str().map(str::to_owned);
                 TimelineBody::Content(full)
@@ -112,7 +130,7 @@ fn typed_content(
             }
         }
         _ => return None,
-    };
+    }};
     let full = st3_client::TimelineEntry {
         id: source.id.clone(),
         sequence: source.sequence,
@@ -154,6 +172,8 @@ pub struct Content {
     /// Explicit expand-all intent, never restored from saved expansion state.
     pub expanded_all: HashSet<String>,
     shown: BTreeSet<Key>,
+    /// Explicit hiding survives redraws and scrolling, but not timeline eviction.
+    hidden: BTreeSet<Key>,
     protocols: RefCell<BTreeMap<Key, (u16, u16, ratatui_image::protocol::Protocol)>>,
     pub scroll_to: RefCell<BTreeMap<String, String>>,
     pub focused: BTreeMap<String, String>,
@@ -333,6 +353,7 @@ impl Content {
             .collect();
         self.loaded.retain(|key, _| active.contains(key));
         self.shown.retain(|key| active.contains(key));
+        self.hidden.retain(|key| active.contains(key));
         self.protocols
             .borrow_mut()
             .retain(|key, _| active.contains(key));
@@ -380,6 +401,19 @@ impl Content {
         self.request(&key).then_some(key)
     }
 
+    /// The caller proves the image label is visible and terminal graphics work.
+    /// Never retry failures or undo a person's explicit hide on a redraw.
+    pub fn request_visible_image(&mut self, key: &Key) -> bool {
+        if self.hidden.contains(key) || self.loaded.contains_key(key)
+            || !self.groups.values().flatten().flat_map(|group| &group.refs)
+                .any(|(candidate, _)| candidate == key)
+        {
+            return false;
+        }
+        self.shown.insert(key.clone());
+        self.request(key)
+    }
+
     pub fn is_loading(&self, key: &Key) -> bool {
         matches!(self.loaded.get(key), Some(Loaded::Loading))
     }
@@ -394,6 +428,9 @@ impl Content {
         };
         for group in groups {
             for (key, _) in &group.refs {
+                if self.shown.contains(key) {
+                    self.hidden.insert(key.clone());
+                }
                 self.loaded.remove(key);
                 self.shown.remove(key);
                 self.protocols.get_mut().remove(key);
@@ -414,15 +451,18 @@ impl Content {
 
     pub fn toggle_image(&mut self, key: &Key) -> bool {
         if matches!(self.loaded.get(key), Some(Loaded::Failed(_))) {
+            self.hidden.remove(key);
             self.shown.insert(key.clone());
             return self.request(key);
         }
         if !self.shown.insert(key.clone()) {
             self.shown.remove(key);
+            self.hidden.insert(key.clone());
             self.loaded.remove(key);
             self.protocols.get_mut().remove(key);
             return false;
         }
+        self.hidden.remove(key);
         self.request(key)
     }
 
@@ -572,8 +612,7 @@ impl Content {
                             format!("  [image {media}, {size}]{exact}  {action}"),
                             theme::fg(theme::LAVENDER),
                         )));
-                        if open
-                            && self.shown.contains(key)
+                        if self.shown.contains(key)
                             && matches!(loaded, Some(Loaded::Image { .. }))
                         {
                             extra.targets.push(Target {
@@ -1216,4 +1255,107 @@ mod tests {
         );
         assert!(matches!(content.loaded.get(&second), Some(Loaded::Loading)));
     }
+    #[test]
+    fn visible_images_auto_load_once_and_explicit_hide_survives_reindex() {
+        let (mut content, mut timelines, entries) = fixture(true);
+        let key = content.tool_images("agent/example", &entries[0].id).pop().unwrap();
+        assert!(content.request_visible_image(&key));
+        assert!(!content.request_visible_image(&key));
+        assert!(!content.toggle_image(&key), "Ctrl+U hides even an in-flight image");
+        content.complete(key.clone(), Err("late result".into()));
+        content.index(&timelines);
+        assert!(!content.request_visible_image(&key), "redraw cannot reverse hiding");
+        assert!(content.toggle_image(&key), "only an explicit toggle shows it again");
+        content.complete(key.clone(), Err("synthetic owner unavailable".into()));
+        assert!(!content.request_visible_image(&key), "failures require explicit retry");
+        assert!(content.toggle_image(&key));
+        timelines.clear();
+        content.index(&timelines);
+        assert!(content.loaded.is_empty());
+        assert!(content.shown.is_empty());
+        assert!(content.hidden.is_empty());
+        assert!(!content.request_visible_image(&key), "a stale frame cannot resurrect an evicted image");
+    }
+
+    #[test]
+    fn auto_loaded_image_renders_without_tool_expansion_and_eviction_releases_pixels() {
+        let (mut content, mut timelines, entries) = fixture(true);
+        let key = content.tool_images("agent/example", &entries[0].id).pop().unwrap();
+        assert!(content.request_visible_image(&key));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 2, image::Rgb([0, 128, 255])))
+            .write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        content.complete(key.clone(), Ok(("image/png".into(), bytes.into_inner())));
+        assert!(render(&content, &entries, false).targets.iter()
+            .any(|target| matches!(target.hit, Hit::InlineImage(_))));
+        let area = Rect::new(0, 0, 16, 12);
+        content.draw_image(&ratatui_image::picker::Picker::halfblocks(), &key, area, &mut Buffer::empty(area));
+        assert_eq!(content.protocols.borrow().len(), 1);
+        timelines.clear();
+        content.index(&timelines);
+        assert!(content.loaded.is_empty());
+        assert!(content.protocols.borrow().is_empty());
+    }
+
+    #[test]
+    fn fetched_view_subtrees_reproject_write_task_eval_and_compaction_without_raw_json() {
+        let marker = "[st truncated this native timeline value]";
+        for (kind, field) in [("write", "content"), ("task", "context"), ("eval", "code"), ("compaction", "summary")] {
+            let mut view = serde_json::json!({"type":kind, "path":"synthetic.txt", "language":"typescript", "method":"automatic"});
+            view[field] = Value::String(marker.into());
+            let block = serde_json::json!({
+                "id":"view-block","kind":if kind == "compaction" { "compaction" } else { "tool_call" },
+                "source_type":"native","payload":{},"view":view,
+                "continuation":{"ref":"opaque-view-reference","media_type":"application/json","reason":"size-limit"}
+            });
+            let body = if kind == "compaction" {
+                serde_json::json!({"media_type":"text/plain","text":"compaction preview","blocks":[block]})
+            } else {
+                serde_json::json!({"call_id":"view-call","name":kind,"arguments":{},"blocks":[block]})
+            };
+            let source: st3_client::TimelineEntry = serde_json::from_value(serde_json::json!({
+                "id":"view-entry","sequence":1,"revision":1,"timestamp":"2026-10-08T10:00:00Z",
+                "role":"assistant","type":if kind == "compaction" { "content" } else { "tool_call" },
+                "final":true,"body":body
+            })).unwrap();
+            let items = vec![source];
+            let entries = super::super::adapt::conversation(&items, &BTreeMap::new());
+            let mut content = Content::default();
+            content.index(&BTreeMap::from([("agent/example".into(), st3_conversation_ui::Timeline {
+                items, session_id: Some("session/example".into()), ..Default::default()
+            })]));
+            let key = content.request_tool("agent/example", "view-entry").pop().unwrap();
+            let full = (0..500).map(|line| format!("synthetic-{kind}-{line}")).collect::<Vec<_>>().join("\n");
+            view[field] = Value::String(full);
+            content.complete(key, Ok(("application/json".into(), serde_json::to_vec(&view).unwrap())));
+            let shown = words(&render(&content, &entries, true));
+            assert!(shown.contains(&format!("synthetic-{kind}-499")), "{kind}: {shown}");
+            assert!(!shown.contains("Full referenced content (JSON)"), "{kind}");
+            assert!(!shown.contains(marker), "{kind}");
+        }
+    }
+
+    #[test]
+    fn fetched_result_view_keeps_original_call_opening_rows() {
+        let call: st3_client::TimelineEntry = serde_json::from_value(serde_json::json!({
+            "id":"call","sequence":1,"revision":1,"timestamp":"2026-10-08T10:00:00Z","role":"assistant","type":"tool_call","final":true,
+            "body":{"call_id":"paired","name":"eval","arguments":{},"blocks":[{"id":"call-block","kind":"tool_call","source_type":"native","payload":{},"view":{"type":"eval","language":"typescript","code":"synthetic opening code"}}]}
+        })).unwrap();
+        let result: st3_client::TimelineEntry = serde_json::from_value(serde_json::json!({
+            "id":"result","sequence":2,"revision":1,"timestamp":"2026-10-08T10:01:00Z","role":"tool","type":"tool_result","final":true,
+            "body":{"call_id":"paired","status":"success","media_type":"text/plain","content":"synthetic result","blocks":[{"id":"result-block","kind":"tool_output","source_type":"native","payload":{},"view":{"type":"edit","diff":"[st truncated this native timeline value]"},"continuation":{"ref":"result-view","media_type":"application/json","reason":"size-limit"}}]}
+        })).unwrap();
+        let items = vec![call, result];
+        let entries = super::super::adapt::conversation(&items, &BTreeMap::new());
+        let mut content = Content::default();
+        content.index(&BTreeMap::from([("agent/example".into(), st3_conversation_ui::Timeline {
+            items, session_id: Some("session/example".into()), ..Default::default()
+        })]));
+        let key = content.request_tool("agent/example", "call").pop().unwrap();
+        content.complete(key, Ok(("application/json".into(), br#"{"type":"edit","diff":"+ synthetic full result"}"#.to_vec())));
+        let shown = words(&render(&content, &entries, true));
+        assert!(shown.contains("synthetic opening code"));
+        assert!(shown.contains("+ synthetic full result"));
+    }
 }
+
