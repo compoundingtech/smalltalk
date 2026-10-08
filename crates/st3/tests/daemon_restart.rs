@@ -2104,13 +2104,13 @@ async fn initialized_channel_still_rejects_a_foreign_binding(replace_token: bool
     daemon.start_isolated().await;
     let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-fence");
     let (mut channel, input, _) = fixture.open(root, &daemon, "wrapper-fence").await;
-    if replace_token {
-        let replacement = st3::mailbox::Fence::new("agent/quartz", "wrapper-fence", "delivery");
-        let bound = daemon.store.bind_mailbox(&replacement).unwrap();
-        assert!(bound.epoch > 1);
+    let replacement = if replace_token {
+        let (channel, input, _) = fixture.open(root, &daemon, "wrapper-fence").await;
+        Some((channel, input))
     } else {
         daemon.observe_running("agent/quartz", "successor-fence");
-    }
+        None
+    };
     wait_until(
         "the real channel rejects revoked ownership",
         Duration::from_secs(15),
@@ -2126,6 +2126,13 @@ async fn initialized_channel_still_rejects_a_foreign_binding(replace_token: bool
         .read_to_string(&mut error)
         .unwrap();
     drop(input);
+    if let Some((mut replacement, input)) = replacement {
+        drop(input);
+        wait_until("the admitted replacement accepts EOF", Duration::from_secs(5), || {
+            replacement.try_wait().unwrap().is_some()
+        }).await;
+        assert!(replacement.try_wait().unwrap().unwrap().success());
+    }
     daemon.stop().await;
     assert!(
         !status.success(),
