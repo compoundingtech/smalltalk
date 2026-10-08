@@ -16,33 +16,6 @@ const PERSON_STEPS_QUERY: &str = "SELECT subject FROM step_runs
     WHERE assignee>='person/' AND assignee<'person0'
     AND status IN ('ready','pending') AND (?1 IS NULL OR assignee=?1) ORDER BY subject";
 
-#[cfg(test)]
-mod person_steps_plan_tests {
-    use super::*;
-
-    #[test]
-    fn the_person_step_read_is_a_search_of_the_assignee_index_not_a_scan() {
-        let store = Store::open_memory("alder").unwrap();
-        let connection = store.readers.get();
-        let plan: Vec<String> = connection
-            .prepare(&format!("EXPLAIN QUERY PLAN {PERSON_STEPS_QUERY}"))
-            .unwrap()
-            .query_map([None::<String>], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert!(
-            plan.iter()
-                .any(|line| line.starts_with("SEARCH step_runs") && line.contains("step_runs_assignee_index")),
-            "the person-step read must search step_runs_assignee_index: {plan:?}"
-        );
-        assert!(
-            !plan.iter().any(|line| line.starts_with("SCAN step_runs")),
-            "the person-step read must not scan step_runs: {plan:?}"
-        );
-    }
-}
-
 impl Store {
     /// The mission context of a person ask a mission step made: its mission, and the step that
     /// waits on the answer with its goal. `None` for a standalone ask or an update, which belong
@@ -1128,5 +1101,32 @@ impl Store {
             items.push(item);
         }
         Ok(items)
+    }
+}
+
+#[cfg(test)]
+mod person_steps_plan_tests {
+    use super::*;
+
+    #[test]
+    fn the_person_step_read_is_a_search_of_the_assignee_index_not_a_scan() {
+        let store = Store::open_memory("alder").unwrap();
+        let connection = store.readers.get();
+        let plan: Vec<String> = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {PERSON_STEPS_QUERY}"))
+            .unwrap()
+            .query_map([None::<String>], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.starts_with("SEARCH step_runs") && line.contains("step_runs_assignee_index")),
+            "the person-step read must search step_runs_assignee_index: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.starts_with("SCAN step_runs")),
+            "the person-step read must not scan step_runs: {plan:?}"
+        );
     }
 }
