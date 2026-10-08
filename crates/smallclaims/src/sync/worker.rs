@@ -2198,7 +2198,7 @@ pub async fn exchange<B: Backend>(
         }
         let started = std::time::Instant::now();
         let first_answer =
-            post_signed(http, backend, peer, node, auth, fleet, &query, false, deadline, &mut polls)
+            post_signed_budgeted(http, backend, peer, node, auth, fleet, &query, false, deadline, &mut polls)
                 .await;
         let (remote, peer_inflates, round_trip) = if needs_legacy_retry(&query, &first_answer) {
             // A peer without the exact projection domain may compare only the old digest.
@@ -2214,7 +2214,7 @@ pub async fn exchange<B: Backend>(
                 query.inventory.buckets.clear();
             }
             let started = std::time::Instant::now();
-            let (answer, inflates) = post_signed(
+            let (answer, inflates) = post_signed_budgeted(
                 http, backend, peer, node, auth, fleet, &query, false, deadline, &mut polls,
             )
             .await?;
@@ -2265,7 +2265,7 @@ pub async fn exchange<B: Backend>(
             };
             let started = std::time::Instant::now();
             // A peer that says it takes compressed requests gets a large push compressed.
-            let first_answer = post_signed(
+            let first_answer = post_signed_budgeted(
                 http, backend, peer, node, auth, fleet, &push, peer_inflates, deadline, &mut polls,
             )
             .await;
@@ -2284,7 +2284,7 @@ pub async fn exchange<B: Backend>(
                     .await?
                     .exchange;
                 let started = std::time::Instant::now();
-                let (answer, _) = post_signed(
+                let (answer, _) = post_signed_budgeted(
                     http, backend, peer, node, auth, fleet, &push, peer_inflates, deadline,
                     &mut polls,
                 )
@@ -2472,8 +2472,28 @@ impl std::error::Error for PeerOverloaded {}
 
 /// Send one signed exchange, compressed when `compress` is set and the body is large, and return
 /// the peer's verified answer and whether the peer takes compressed requests.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn post_signed<B: Backend>(
+    http: &reqwest::Client,
+    backend: &B,
+    peer: &PeerConfig,
+    node: &str,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    exchange: &ReplicationExchange,
+    compress: bool,
+) -> Result<(ReplicationExchange, bool)> {
+    let deadline = tokio::time::Instant::now() + EXCHANGE_POLL_BUDGET;
+    let mut polls = MAX_OVERLOAD_POLLS;
+    post_signed_budgeted(
+        http, backend, peer, node, auth, fleet, exchange, compress, deadline, &mut polls,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn post_signed_budgeted<B: Backend>(
     http: &reqwest::Client,
     backend: &B,
     peer: &PeerConfig,
