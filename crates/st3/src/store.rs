@@ -2633,6 +2633,33 @@ fn agent_resources_entry_hits(
 }
 
 impl Store {
+    /// The explicitly registered keyed views for this graph. This getter performs no reads
+    /// or installation; availability and source coverage must be checked in a snapshot.
+    pub fn ivm_views(&self) -> Option<Arc<smallclaims::ivm::Views>> {
+        self.smalltalk.ivm_views.clone()
+    }
+
+    /// Lazily attach the one Store publisher shared by receipt waits and collection
+    /// consumers. Registration and journal installation happen when the Store opens.
+    /// Attachment errors are returned on each call until attachment succeeds; failures
+    /// are not cached. A successful attachment is shared by all later callers.
+    pub fn ivm_publisher(&self) -> Result<Option<Arc<smallclaims::ivm::events::Publisher>>> {
+        if self.smalltalk.ivm_views.is_none() {
+            return Ok(None);
+        }
+        let mut publisher = self
+            .smalltalk
+            .ivm_publisher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(publisher) = &*publisher {
+            return Ok(Some(publisher.clone()));
+        }
+        let attached = Arc::new(smallclaims::ivm::events::Publisher::attach(&self.graph, 128)?);
+        *publisher = Some(attached.clone());
+        Ok(Some(attached))
+    }
+
     pub fn open(path: &Path, origin: impl Into<String>) -> Result<Self> {
         let smalltalk = Arc::new(SmalltalkRuntime::default());
         #[cfg_attr(not(test), allow(unused_mut))]
@@ -2642,6 +2669,18 @@ impl Store {
         {
             graph.heal_replay_backoff_ms = 0;
         }
+        Ok(Self { graph, smalltalk })
+    }
+
+    /// Open explicitly registered shadow views beside Smalltalk's production admission and
+    /// projections. Source adapters own installation and certification before any read switch.
+    pub fn open_with_ivm_views(
+        path: &Path,
+        origin: impl Into<String>,
+        views: Arc<smallclaims::ivm::Views>,
+    ) -> Result<Self> {
+        let smalltalk = Arc::new(SmalltalkRuntime::with_ivm_views(views));
+        let graph = GraphStore::open(path, origin, smalltalk.clone())?;
         Ok(Self { graph, smalltalk })
     }
 

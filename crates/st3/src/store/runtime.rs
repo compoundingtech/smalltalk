@@ -8,6 +8,11 @@ use super::*;
 /// the graph for the caches its reads use.
 #[derive(Default)]
 pub struct SmalltalkRuntime {
+    /// One registry per graph. Registration alone does not certify source coverage.
+    pub(crate) ivm_views: Option<Arc<smallclaims::ivm::Views>>,
+    /// Receipt waits and collection sockets share this one commit observer. Publisher
+    /// construction is serialized, including simultaneous first subscriptions.
+    pub(crate) ivm_publisher: Mutex<Option<Arc<smallclaims::ivm::events::Publisher>>>,
     pub(crate) mailbox_wakes: std::sync::OnceLock<Arc<mailbox_wakes::Wakes>>,
     #[cfg(test)]
     pub(crate) work_extension_roots_rebuilt: std::sync::atomic::AtomicUsize,
@@ -45,6 +50,15 @@ pub(crate) struct AgentResourcesEntry {
 }
 
 impl SmalltalkRuntime {
+    /// Explicitly register shadow views without changing the production readers.
+    /// The source adapter must initialize/install and certify them separately.
+    pub fn with_ivm_views(views: Arc<smallclaims::ivm::Views>) -> Self {
+        Self {
+            ivm_views: Some(views),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn claim_registry(&self) -> &st3_schema::Registry {
         #[cfg(test)]
         if let Some(registry) = self.claim_registry.get() {
@@ -142,10 +156,37 @@ impl Runtime for SmalltalkRuntime {
         custom::create_schema(connection)?;
         agent_messages::create_schema(connection)?;
         glass_heads::create_schema(connection)?;
-        limits::create_limits_schema(connection)
+        limits::create_limits_schema(connection)?;
+        if let Some(views) = &self.ivm_views {
+            // Registered stores run this on every open; each view's schema hook must
+            // be idempotent, including reopen with persisted outputs and event cursors.
+            views.create_schema(connection)?;
+        }
+        Ok(())
     }
 
     fn open_projections(&self, transaction: &Transaction<'_>, shared_memory: bool) -> Result<()> {
+        if let Some(views) = &self.ivm_views {
+            // An admitted frontier identifies pending work, never successful projection.
+            // Existing sources require an explicit installer and dependency certificate.
+            let admitted = current_index_tx(transaction)?;
+            let cut = match smallclaims::ivm::source_cut(transaction)? {
+                Some(mut cut) => {
+                    // A plain or older writer can admit source while no view adapter is
+                    // attached. Reopen preserves the certified prefix, never promotes it.
+                    cut.admitted = cut.admitted.max(admitted);
+                    cut
+                }
+                None => smallclaims::ivm::SourceCut {
+                    epoch: 1,
+                    admitted,
+                    projected: 0,
+                    local_generation: 0,
+                },
+            };
+            views.initialize_empty(transaction, cut)?;
+            smallclaims::ivm::events::install(transaction, 4096)?;
+        }
         custom::open(transaction)?;
         resources::open(transaction)?;
         glass_heads::open(transaction)?;
@@ -349,4 +390,172 @@ const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.arrangements.v2";
 pub(crate) fn compatibility_digest(registry_digest: &str) -> String {
     canonical_hash(&(SHARED_PROJECTION_LAYOUT, registry_digest))
         .expect("projection compatibility identity serializes")
+}
+
+#[cfg(test)]
+mod ivm_attachment_tests {
+    use super::*;
+    use smallclaims::ivm::{Contribution, Definition, Readiness, View, Views, events};
+    use smallclaims::store::canonical;
+    use std::sync::Barrier;
+
+    struct Shadow;
+    impl View for Shadow {
+        fn definition(&self) -> Definition {
+            Definition {
+                name: "fixture.shadow",
+                fingerprint: "fixture.shadow.v1",
+                kinds: &[],
+                local_kinds: &["fixture.clock"],
+                max_contributions: 1,
+            }
+        }
+        fn contributions(
+            &self,
+            _claim: &ClaimRecord,
+            _rank: &canonical::ClaimKey,
+        ) -> Result<Vec<Contribution>> {
+            Ok(Vec::new())
+        }
+    }
+    fn registry() -> Arc<Views> {
+        Arc::new(Views::new(vec![Box::new(Shadow)]).unwrap())
+    }
+    fn boundary(store: &Store, views: &Views) -> events::Boundary {
+        store
+            .read_snapshot(|_| events::capture(&store.readers.get(), views, "fixture.shadow"))
+            .unwrap()
+    }
+    fn admit_agent(store: &Store) {
+        let source = "version 2\nagent \"ember\" { workspace \"/tmp\"; command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "alder").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &plan.subject_tokens, "fixture")
+            .unwrap();
+        assert!(store.index().unwrap() > 0);
+    }
+
+    #[test]
+    fn ordinary_store_does_not_install_or_attach_shadow_views() {
+        let store = Store::open_memory("alder").unwrap();
+        assert!(store.ivm_views().is_none());
+        assert!(store.ivm_publisher().unwrap().is_none());
+        let installed: bool = store
+            .readers
+            .get()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='ivm_event_state')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!installed);
+    }
+
+    #[test]
+    fn concurrent_consumers_share_one_store_publisher_and_registry() {
+        let root = tempfile::tempdir().unwrap();
+        let views = registry();
+        let store = Arc::new(
+            Store::open_with_ivm_views(&root.path().join("claims.db"), "alder", views.clone())
+                .unwrap(),
+        );
+        assert!(Arc::ptr_eq(&store.ivm_views().unwrap(), &views));
+        assert!(matches!(
+            boundary(&store, &views).availability.readiness,
+            Readiness::Ready(_)
+        ));
+        let start = Arc::new(Barrier::new(8));
+        let threads = (0..8)
+            .map(|_| {
+                let (store, start) = (store.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    store.ivm_publisher().unwrap().unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let publishers = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            publishers
+                .iter()
+                .all(|publisher| Arc::ptr_eq(publisher, &publishers[0]))
+        );
+        assert!(Arc::ptr_eq(
+            &store.ivm_publisher().unwrap().unwrap(),
+            &publishers[0]
+        ));
+        let mut socket = publishers[0].subscribe();
+        let mut receipt = publishers[1].subscribe();
+        store
+            .connection
+            .batched(events::rotate_identity)
+            .unwrap()
+            .unwrap();
+        let socket_notice = socket.try_recv().unwrap();
+        let receipt_notice = receipt.try_recv().unwrap();
+        assert_eq!(socket_notice, receipt_notice);
+        assert!(matches!(socket_notice, events::Notice::Committed(_)));
+    }
+
+    #[test]
+    fn populated_install_and_plain_writer_reopen_preserve_uncertified_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("claims.db");
+        {
+            let store = Store::open(&path, "alder").unwrap();
+            admit_agent(&store);
+        }
+        let views = registry();
+        let old = {
+            let store = Store::open_with_ivm_views(&path, "alder", views.clone()).unwrap();
+            let boundary = boundary(&store, &views);
+            assert!(boundary.source_cut.admitted > 0);
+            assert_eq!(boundary.source_cut.projected, 0);
+            assert!(!matches!(
+                boundary.availability.readiness,
+                Readiness::Ready(_)
+            ));
+            boundary
+        };
+        {
+            let store = Store::open(&path, "alder").unwrap();
+            let source = "version 2\nagent \"cinder\" { workspace \"/tmp\"; command \"true\" }\n";
+            let intent = crate::graph::parse_test_intent(source, "alder").unwrap();
+            let plan = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store
+                .apply(&intent, &plan.subject_tokens, "second-fixture")
+                .unwrap();
+            assert!(store.index().unwrap() > old.source_cut.admitted);
+        }
+        let store = Store::open_with_ivm_views(&path, "alder", views.clone()).unwrap();
+        let current = boundary(&store, &views);
+        assert_eq!(current.identity, old.identity);
+        assert!(current.source_cut.admitted > old.source_cut.admitted);
+        assert_eq!(current.source_cut.projected, old.source_cut.projected);
+        assert!(!matches!(
+            current.availability.readiness,
+            Readiness::Ready(_)
+        ));
+    }
 }
