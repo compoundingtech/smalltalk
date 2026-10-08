@@ -755,6 +755,7 @@ mod tests {
             store.readers.try_admit_read().is_none(),
             "the holder owns the only admission slot"
         );
+        let held_usage = store.readers.usage();
         // Clock expiry and cancellation must both complete while every reader slot is
         // busy: the lease timer is pure local state and never queues for admission.
         let woken_by_clock = lease.expired();
@@ -762,14 +763,16 @@ mod tests {
         let Ok(()) = tokio::time::timeout(Duration::from_secs(5), woken_by_clock).await else {
             panic!("lease expiry must not wait for reader admission");
         };
-        assert_eq!(store.readers.usage().open, 1, "no reader was opened");
+        assert_eq!(store.readers.usage().open, held_usage.open, "no reader was opened");
+        assert_eq!(store.readers.usage().peak, held_usage.peak, "no transient reader was opened");
         // A second lease proves cancellation wakes the same pure timer path.
         let woken_by_cancel = sibling.expired();
         sibling.cancel("superseded");
         let Ok(()) = tokio::time::timeout(Duration::from_secs(5), woken_by_cancel).await else {
             panic!("lease cancellation must not wait for reader admission");
         };
-        assert_eq!(store.readers.usage().open, 1, "no reader was opened");
+        assert_eq!(store.readers.usage().open, held_usage.open, "no reader was opened");
+        assert_eq!(store.readers.usage().peak, held_usage.peak, "no transient reader was opened");
         drop(release);
         holder.join().unwrap().unwrap();
     }

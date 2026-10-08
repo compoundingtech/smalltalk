@@ -10734,10 +10734,15 @@ mod tests {
         let task_session = session.clone();
         let task_request = request.clone();
         let task_semaphore = semaphore.clone();
+        let (request_started, request_ready) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
+            let socket_gate = task_semaphore.acquire_owned().await.unwrap();
+            request_started.send(()).unwrap();
             collection_items_with_windows(&task_state, &task_session, &task_request,
-                task_semaphore.acquire_owned().await.unwrap(), windows).await
+                socket_gate, windows).await
         });
+        tokio::time::timeout(std::time::Duration::from_secs(5), request_ready).await
+            .expect("the collection did not acquire its socket gate").unwrap();
         // While the collection waits bare for the reader, the caller's socket gate must be
         // free for the next request rather than pinned under the reader wait.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
