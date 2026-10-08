@@ -1,4 +1,4 @@
-import { St3Client } from '@smalltalk/st3-client'
+import { ClientError, St3Client } from '@smalltalk/st3-client'
 import { Runtime, decodeUnknownSync } from '@smalltalk/st3-client/schema'
 import type { Agent, Attention, Mission, TerminalScreen } from '@smalltalk/st3-client/schema'
 import {
@@ -290,14 +290,16 @@ export const liveSource = ({
               Effect.sync(() => {
                 if (!active || readRejection !== undefined) return
                 if (event._tag === 'Observed') {
-                            latest = observed({ value: event.value })
+                  latest = observed({ value: event.value })
                   syncLatest = observeFeedSync(syncLatest, event.value, Date.now())
                 } else if (event._tag === 'Failed') {
                   syncLatest = transitionFeedSync(syncLatest, syncStatusFromFailure(event.error), Date.now())
                   terminalFailure = true
-                            // Keep verified content for failed reads, but never display revoked private rows.
+                  // Keep trusted content for failed reads, never authorization-revoked rows.
                   const authorizationRefusal =
-                    (event.error._tag === 'Rejected' || event.error._tag === 'Attach') && event.error.code === 'forbidden'
+                    event.error._tag === 'Attach'
+                      ? event.error.code === 'forbidden' || event.error.status === 401 || event.error.status === 403
+                      : event.error._tag === 'Rejected' && event.error.code === 'forbidden'
                   latest =
                     latest._tag === 'Observed' && !authorizationRefusal
                       ? {
@@ -327,10 +329,12 @@ export const liveSource = ({
 
               terminalFailure = true
               syncLatest = transitionFeedSync(syncLatest, syncStatusFromFailure(error), Date.now())
-              latest = latest._tag === 'Observed'
+              const authorizationRefusal =
+                error.authorizationRefused === true || error.code === 'forbidden' || error.status === 401 || error.status === 403
+              latest = latest._tag === 'Observed' && !authorizationRefusal
                 ? { ...latest, freshness: 'stale', error: { reason: 'failed', detail: error.message } }
-                : unavailable({ reason: 'failed', detail: error.message })
-                    ingest.accept({ key: commit, value: commit })
+                : unavailable({ reason: authorizationRefusal ? 'ungranted' : 'failed', detail: error.message })
+              ingest.accept({ key: commit, value: commit })
             }),
           ),
           Effect.ensuring(
@@ -543,13 +547,18 @@ export const liveSource = ({
       explicitInterest: true,
       resolve: (get) => {
         const ids = get(runtimes)
+        const authority = ids === undefined ? get(agents) : undefined
         return Effect.gen(function* () {
+          if (authority?._tag === 'Unavailable' && authority.reason === 'ungranted')
+            return yield* new AttachFailure({ authorizationRefused: true, message: authority.detail })
           if (ids === undefined)
             return yield* new AttachFailure({ message: `No live agent owns ${ref}` })
           for (const id of ids) {
             const response = yield* Effect.tryPromise({
               try: () => client.runtimesGet(id),
-              catch: (error) => new AttachFailure({ message: String(error) }),
+              catch: (error) => error instanceof ClientError
+                ? new AttachFailure({ code: error.response.code, status: error.status, message: error.response.message })
+                : new AttachFailure({ message: String(error) }),
             })
             const row = yield* Effect.try({
               try: () => decodeUnknownSync(Runtime)(response.value),
