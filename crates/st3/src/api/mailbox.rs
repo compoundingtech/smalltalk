@@ -469,6 +469,7 @@ async fn stream_with_timers<F, S, H>(
     let mut last: Option<(crate::store::MailboxWatermark, Snapshot)> = None;
     loop {
         if dirty {
+            let admission_store = state.store.clone();
             let store = state.store.clone();
             let binding = fence.clone();
             let read = read.clone();
@@ -476,7 +477,7 @@ async fn stream_with_timers<F, S, H>(
             let mut admitted = recovered.clone();
             let mut policies = policy_rechecks.clone();
             let previous = last.take();
-            let result = crate::api::read_deadline::spawn_blocking(move || {
+            let result = crate::api::read_deadline::store_read(&admission_store, move || {
                 crate::profile::task("task mailbox-update", || {
                     let result = update_snapshot(
                         &store,

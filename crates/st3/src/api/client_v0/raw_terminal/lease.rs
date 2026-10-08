@@ -578,7 +578,14 @@ impl Lease {
         Ok(())
     }
 
+    /// The authority store this lease's queries run against, while it is still alive.
+    pub(crate) fn authority(&self) -> Option<Arc<Store>> {
+        self.store.upgrade()
+    }
+
     /// This task is selected alongside both byte pumps, never behind a blocked byte write.
+    /// It is pure local state: no store query, so clock and cancellation wake it directly
+    /// even when every reader admission slot is busy.
     pub(crate) async fn expired(&self) {
         let mut cancelled = self.cancelled.subscribe();
         loop {
@@ -725,6 +732,47 @@ mod tests {
         .unwrap()
     }
 
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_expiry_wakes_without_a_reader_when_admission_is_saturated() {
+        let (_root, state, session) = smallclaims::sqlite::with_read_limit_for_test(1, fixture);
+        // Both leases are registered before the holder saturates the only reader slot:
+        // registration itself runs authority queries.
+        let lease = acquire(&state, &session);
+        let sibling = acquire(&state, &session);
+        let store = state.store.clone();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let holder_store = store.clone();
+        let holder = std::thread::spawn(move || {
+            holder_store.readers.request_read(|| {
+                held.recv_timeout(std::time::Duration::from_secs(30)).ok();
+            })
+        });
+        while store.readers.usage().open == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            store.readers.try_admit_read().is_none(),
+            "the holder owns the only admission slot"
+        );
+        // Clock expiry and cancellation must both complete while every reader slot is
+        // busy: the lease timer is pure local state and never queues for admission.
+        let woken_by_clock = lease.expired();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let Ok(()) = tokio::time::timeout(Duration::from_secs(5), woken_by_clock).await else {
+            panic!("lease expiry must not wait for reader admission");
+        };
+        assert_eq!(store.readers.usage().open, 1, "no reader was opened");
+        // A second lease proves cancellation wakes the same pure timer path.
+        let woken_by_cancel = sibling.expired();
+        sibling.cancel("superseded");
+        let Ok(()) = tokio::time::timeout(Duration::from_secs(5), woken_by_cancel).await else {
+            panic!("lease cancellation must not wait for reader admission");
+        };
+        assert_eq!(store.readers.usage().open, 1, "no reader was opened");
+        drop(release);
+        holder.join().unwrap();
+    }
     #[test]
     fn partial_runtime_reports_preserve_leases_but_explicit_nulls_revoke() {
         for null_fields in [

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Bound concurrent API read workers before opening SQLite readers, with cancellable admission and inline nested reductions",
+  "replay": {"status": "none", "detail": "No claim, projection, or replay changes."},
+  "schema": {"status": "none", "detail": "Admission is in-memory and does not alter the SQLite schema."},
+  "rules": {"status": "none", "detail": "Read authority, snapshots, canonical answers, and durable write acknowledgements are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Each pool admits at most 32 top-level API read workers by default. Queued reads retain their existing cancellation and deadline behavior; upgraded-stream queries add no deadline policy. Nested same-thread reads reuse their loan and status fanout falls back inline when extra capacity is unavailable."},
+  "downtime": {"status": "none", "detail": "The setting takes effect when the daemon starts; no data migration is needed."},
+  "manual": {"status": "changed", "detail": "SMALLCLAIMS_MAX_READ_WORKERS overrides the positive admitted-worker count. Invalid, zero, or oversized values use 32. Idle reader retention, page-cache targets, statement caching, and allocator settings are unchanged; raw/background checkout remains uncapped."},
+  "recovery": {"status": "none", "detail": "Binary swap-back needs no migration and restores the previous unbounded API admission. Cancellation removes queued admission without opening a reader. A returned reader is cleaned up and published before its permit wakes another worker; escaped read guards retain capacity until the connection closes."}
+}
