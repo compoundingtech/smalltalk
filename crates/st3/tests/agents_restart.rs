@@ -154,12 +154,17 @@ impl Fixture {
         let store = Arc::new(Store::open(&root.path().join("graph.db"), "restart-test").unwrap());
         let notify = Arc::new(Notify::new());
         let runtime = Arc::new(Runtime::default());
-        let reconciler = Arc::new(Reconciler::new(
-            store.clone(),
-            runtime.clone(),
-            "restart-test".into(),
-            notify.clone(),
-        ));
+        // The API publishes concurrently with drive(), as it does in the daemon. Use
+        // the daemon's incremental path; full-pass correction audits require stable inputs.
+        let reconciler = Arc::new(
+            Reconciler::new(
+                store.clone(),
+                runtime.clone(),
+                "restart-test".into(),
+                notify.clone(),
+            )
+            .skipping_unneeded(true),
+        );
         let member = format!(
             r#"agent "example/worker" {{
             workspace {:?}
@@ -555,6 +560,7 @@ fn restarted_daemon(fixture: &Fixture) -> Reconciler<Runtime> {
         "restart-test".into(),
         Arc::new(Notify::new()),
     )
+    .skipping_unneeded(true)
 }
 
 /// Exercise the daemon's exit path, not a launcher's post-exit cleanup. The API socket,

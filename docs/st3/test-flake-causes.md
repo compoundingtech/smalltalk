@@ -92,3 +92,23 @@ The fixture now retains the response that satisfies the existing readiness predi
 and checks its graph divergence and differing tables. Admission warnings and rejection
 by `fleet wait` remain independently checked. The predicate, timeout, replication
 implementation, and divergence assertions are unchanged; there is no failure retry.
+
+## Live restart requests
+
+`agents_restart::restarts_top_level_seat_on_a_new_incarnation` drives a reconciler
+while a Unix API accepts restart requests. Its fixture used the test constructor's
+always-full passes and strict incremental correction checker. A request arriving
+between the final change-feed read and the member's claim reads can be acted on
+by that full pass after it was classified as unneeded. The strict checker then
+panics, ending the fixture's driver; the CLI subsequently expires its three-second
+restart deadline. The hosted first failure contains that audit panic before the
+timeout. Its recorded reads include the agent subject, so a later change-feed read
+would mark that restart request. The later passing retry is separate evidence.
+
+The restart fixture now uses `skipping_unneeded(true)`, matching the daemon's normal
+incremental path. The strict checker stays enabled and the existing API, declaration
+and incarnation fences, restart counts, and CLI deadline remain in force. Existing
+quiescent differential and missing-read tests continue to exercise full-pass auditing.
+No production reconciler behavior changes. An attempted control before member
+classification was caught by the existing second change-feed refresh and did not
+reproduce the hosted mid-evaluation panic; it is not claimed as cause proof.
