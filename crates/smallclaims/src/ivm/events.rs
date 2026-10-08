@@ -605,7 +605,7 @@ impl Publisher {
 mod source_progress {
     use super::super::install::SourcePosition;
     use anyhow::{Context, Result, ensure};
-    use rusqlite::{Connection, params_from_iter};
+    use rusqlite::{Connection, params_from_iter, types::ValueRef};
     use std::collections::BTreeMap;
     use std::sync::{
         Mutex,
@@ -831,7 +831,14 @@ mod source_progress {
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
-                        r.get::<_, Option<String>>(1)?,
+                        // SQLite TEXT can contain invalid UTF-8. Attribute a bounded raw
+                        // mismatch to this source before String decoding can fail the scope.
+                        match r.get_ref(1)? {
+                            ValueRef::Text(bytes) if bytes.len() <= MAX_FINGERPRINT_BYTES => {
+                                Some(bytes.to_vec())
+                            }
+                            _ => None,
+                        },
                         r.get::<_, Option<i64>>(2)?,
                         r.get::<_, Option<i64>>(3)?,
                         r.get::<_, Option<i64>>(4)?,
@@ -848,7 +855,7 @@ mod source_progress {
                         .find(|row| row.0 == expected.name)
                         .context("named source missing")?;
                     ensure!(
-                        fingerprint.as_deref() == Some(expected.fingerprint.as_str())
+                        fingerprint.as_deref() == Some(expected.fingerprint.as_bytes())
                             && *epoch == Some(expected.epoch as i64),
                         "named-source identity missing or replaced"
                     );
@@ -1069,6 +1076,38 @@ mod source_progress {
             assert!(matches!(&next[0], SourceWake::Committed(c) if c.sources[0].revision==10));
             assert!(
                 matches!(&next[1], SourceWake::Invalidated(i) if i.source.as_ref()==Some(&identities[0]))
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn malformed_text_fingerprint_does_not_abort_initial_or_peer_capture() -> Result<()> {
+            let (db, identities) = fixture()?;
+            db.execute(
+                "UPDATE ivm_install_sources SET fingerprint=CAST(X'80' AS TEXT) WHERE name='a'",
+                [],
+            )?;
+            let scope = Scope::attach(&db, "db", &identities)?;
+            let mut highwater = BTreeMap::new();
+            let before = scope.capture(&db, "db")?.into_wakes(&mut highwater);
+            assert!(
+                matches!(&before[0], SourceWake::Committed(c) if c.sources.len()==1 && c.sources[0].identity==identities[1] && c.sources[0].revision==9)
+            );
+            assert!(
+                matches!(&before[1], SourceWake::Invalidated(i) if i.source.as_ref()==Some(&identities[0]))
+            );
+            assert!(!highwater.contains_key("a"));
+            db.execute(
+                "UPDATE ivm_install_sources SET revision=10 WHERE name='b'",
+                [],
+            )?;
+            let after = scope.capture(&db, "db")?.into_wakes(&mut highwater);
+            assert_ne!(before, after);
+            assert!(
+                matches!(&after[0], SourceWake::Committed(c) if c.sources.len()==1 && c.sources[0].identity==identities[1] && c.sources[0].revision==10)
+            );
+            assert!(
+                matches!(&after[1], SourceWake::Invalidated(i) if i.source.as_ref()==Some(&identities[0]))
             );
             Ok(())
         }
