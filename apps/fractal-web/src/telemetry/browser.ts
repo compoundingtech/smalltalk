@@ -10,7 +10,7 @@
  *   (INP / LCP / CLS summary on pagehide).
  *
  * The tracer is teed into an in-memory `SpanRing` for the dev perf panel and, when an OTLP URL is
- * given, exported as OTLP/JSON via `fetch` to a same-origin path (dev: Vite proxy → collector).
+ * given, exported as OTLP/JSON via `fetch` directly to that explicitly configured endpoint.
  */
 import { Context, Deferred, Effect, Exit, FiberSet, Layer, Option, Scope, Tracer } from 'effect'
 import * as FetchHttpClient from 'effect/http/FetchHttpClient'
