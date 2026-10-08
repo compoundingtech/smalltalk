@@ -23460,7 +23460,8 @@ impl WalCheckpointLogBucket {
     }
 }
 /// Counts checkpoint samples in a row that left part of the WAL un-copied and copied no more
-/// than the sample before: some reader holds an older snapshot open.
+/// than the sample before. This is neither holder identity nor snapshot age; errors retain
+/// the previous count without advancing it.
 #[derive(Default)]
 struct WalPinTracker {
     last_backfilled: Option<i32>,
@@ -23661,19 +23662,15 @@ fn recycle_idle_wal(path: PathBuf, store: std::sync::Weak<Store>) {
                         None => json!({"outcome":"error", "phase_durations_available":false}),
                     };
                     let pinned = (stuck >= WAL_PIN_REPORT_AFTER).then(|| {
-                        let oldest = smallclaims::sqlite::oldest_live_read();
                         json!({
                             "stuck_samples": stuck,
-                            "oldest_live_read": oldest.as_ref().map(|read| json!({
-                                "age_ms": read.age_ms,
-                                "kind": if read.snapshot { "snapshot" } else { "lent-connection" },
-                                "at": read.at,
-                            })),
-                            "live_reads": oldest.as_ref().map(|read| read.live),
+                            "read_lifetimes": store.readers.live_read_report(),
                         })
                     });
                     eprintln!("st3: WAL checkpoint {}", json!({
                         "bucket": if abnormal { "abnormal" } else { "ordinary" },
+                        "observed_at_unix_ms": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH).ok().map(|age| age.as_millis()),
                         "report": outcome, "duration_ms": duration_ms, "retained": retained,
                         "pinned": pinned,
                     }));
