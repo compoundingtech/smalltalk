@@ -2,7 +2,7 @@
   "generated": "Do not edit; run nix develop .#web -c python3 scripts/ci-fractal-web-licenses",
   "source": "pnpm-lock.yaml packages; installed package.json license (legacy licenses fallback); missing manifests from lock-integrity-verified npm archives",
   "schemaVersion": 1,
-  "lockfileSha256": "45f417a632d060bd5ba9a2d96edf72ceb8971f1f8f9166dd2027bae71b26dd00",
+  "lockfileSha256": "17ae586468bb7868ae70b8400a6c0e0daca30065cb215e5ba019ad3e62a15c4f",
   "packages": [
     {
       "name": "@adobe/css-tools",
@@ -4000,11 +4000,6 @@
       "license": "MIT"
     },
     {
-      "name": "react",
-      "version": "19.2.8",
-      "license": "MIT"
-    },
-    {
       "name": "react-aria",
       "version": "3.52.1",
       "license": "Apache-2.0"
@@ -4032,11 +4027,6 @@
     {
       "name": "react-dom",
       "version": "19.2.3",
-      "license": "MIT"
-    },
-    {
-      "name": "react-dom",
-      "version": "19.2.8",
       "license": "MIT"
     },
     {
