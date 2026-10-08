@@ -2553,6 +2553,16 @@ fn client_agent_resources_selected(
     client_agent_resources_from_status(store, history, snapshot_index, changed, status)
 }
 
+/// Every agent card at `snapshot_index` of a quiet store, folded as the roster folds them but
+/// outside a read snapshot: on a store just opened, nothing is kept yet, as at a daemon start.
+/// For load measurements; it returns how many cards it folded.
+#[doc(hidden)]
+pub fn cold_agent_roster_rebuild(store: &Store, snapshot_index: u64) -> anyhow::Result<usize> {
+    let mut cards = client_agent_resources_selected(store, false, snapshot_index, None)?;
+    add_agent_todos(store, &mut cards, snapshot_index)?;
+    Ok(cards.len())
+}
+
 fn client_agent_resources_from_status(
     store: &Store,
     history: bool,
