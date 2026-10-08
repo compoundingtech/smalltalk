@@ -50,6 +50,8 @@ pub(crate) trait Source: Send + Sync {
     /// After native projection setup, before exposing the Store. Register capture and
     /// compatible lifetimes; start explicit bounded jobs, never scan/replay or mark Ready.
     /// Preserve any unmanaged migration/schema gap; do not heal an unavailable lifetime.
+    /// A retained incompatible identity disables this source, rather than rejecting an
+    /// otherwise usable Store. Keep the expected identity fixed; do not silently rebind it.
     /// Cache-only sources also register their persistent Installer source lifetime.
     fn open(&self, tx: &Transaction<'_>, cx: &Context) -> Result<()>;
     /// Scope/capture bookkeeping only. Native triggers retain immutable OLD/NEW images

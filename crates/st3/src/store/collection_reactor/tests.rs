@@ -861,8 +861,17 @@ impl Source for CacheOnly {
         Ok(())
     }
     fn open(&self, tx: &Transaction<'_>, cx: &Context) -> Result<()> {
-        cx.installer
-            .register_source(tx, self.name(), "fixture.cache-only.v1", 1)
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ivm_install_sources WHERE name=?1)",
+            [self.name()],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            cx.installer
+                .register_source(tx, self.name(), "fixture.cache-only.v1", 1)?;
+        }
+        // A retained incompatible lifetime stays unchanged; capture and reads refuse it.
+        Ok(())
     }
     fn commit(&self, _: &Transaction<'_>, _: &Context) -> Result<()> {
         let fault = self.commit_failure.load(Ordering::SeqCst);
@@ -884,6 +893,11 @@ impl Source for CacheOnly {
         if self.fail.load(Ordering::SeqCst) {
             anyhow::bail!("fixture cache capture failure");
         }
+        let position = cx.installer.position(c, self.name())?;
+        anyhow::ensure!(
+            position.fingerprint == "fixture.cache-only.v1" && position.epoch == 1,
+            "fixture cache identity unavailable"
+        );
         let index = smallclaims::store::current_index(c)?;
         Ok(Capture {
             work: (*self.ready.lock().unwrap() != Some(index)).then(|| {
@@ -898,12 +912,15 @@ impl Source for CacheOnly {
     }
     fn coverage(&self, store: &Store, c: &Connection, cx: &Context, _: u64) -> Result<bool> {
         assert!(Arc::ptr_eq(&store.ivm_views().unwrap(), &cx.views));
-        let available: bool = c.query_row(
-            "SELECT available FROM ivm_install_sources WHERE name=?1",
+        let (fingerprint, epoch, available): (String, u64, bool) = c.query_row(
+            "SELECT fingerprint,epoch,available FROM ivm_install_sources WHERE name=?1",
             [self.name()],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        Ok(available && *self.ready.lock().unwrap() == Some(smallclaims::store::current_index(c)?))
+        Ok(available
+            && fingerprint == "fixture.cache-only.v1"
+            && epoch == 1
+            && *self.ready.lock().unwrap() == Some(smallclaims::store::current_index(c)?))
     }
 }
 struct CacheMarker {
@@ -946,6 +963,10 @@ impl AfterCommit for CacheMarker {
     ) -> Result<bool> {
         assert!(Arc::ptr_eq(&store.ivm_views().unwrap(), &cx.views));
         let position = cx.installer.position(c, "fixture.cache-only")?;
+        anyhow::ensure!(
+            position.fingerprint == "fixture.cache-only.v1" && position.epoch == 1,
+            "fixture cache identity unavailable"
+        );
         if smallclaims::store::current_index(c)? != self.index {
             return Ok(true);
         }
@@ -962,6 +983,178 @@ impl AfterCommit for CacheMarker {
             position,
         })?;
         Ok(false)
+    }
+}
+
+#[test]
+fn retained_source_identity_mismatch_keeps_store_open_without_rebinding() {
+    for (fingerprint, epoch) in [
+        ("fixture.cache-only.retired", 1_u64),
+        ("fixture.cache-only.v1", 2_u64),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("retired-cache.db");
+        let cache = Arc::new(CacheOnly {
+            ready: Arc::new(Mutex::new(None)),
+            fail: AtomicBool::new(false),
+            commit_failure: AtomicUsize::new(0),
+            publications: Arc::new(AtomicUsize::new(0)),
+            refused_commits: AtomicUsize::new(0),
+        });
+        let sibling = source("fixture.sibling", "fixture.sibling.rows", None, false);
+        let store = Store::open_with_collection_sources(
+            &path,
+            "alder",
+            vec![cache.clone(), sibling.clone()],
+        )
+        .unwrap();
+        // Persist the obsolete lifetime before reopening with the fixed configuration.
+        store
+            .connection
+            .batched(|tx| {
+                tx.execute(
+                    "UPDATE ivm_install_sources SET fingerprint=?2,epoch=?3 WHERE name=?1",
+                    params![cache.name(), fingerprint, epoch],
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let index = smallclaims::store::current_index(&store.readers.get()).unwrap();
+        *cache.ready.lock().unwrap() = Some(index);
+        drop(store);
+        let reopened = Store::open_with_collection_sources(
+            &path,
+            "alder",
+            vec![cache.clone(), sibling.clone()],
+        )
+        .unwrap();
+        assert!(reopened.prepared_ivm_publisher().is_some());
+        let registry = reopened.collection_sources().unwrap();
+        let expected = registry.publisher_sources();
+        assert_eq!(expected[0], cache.progress_identity().unwrap());
+        assert!(
+            !reopened
+                .read_snapshot(|_| registry.coverage(
+                    cache.name(),
+                    &reopened,
+                    &reopened.readers.get(),
+                    clock_ms()
+                ))
+                .unwrap()
+        );
+        assert!(
+            cache
+                .capture(
+                    &reopened,
+                    &reopened.readers.get(),
+                    &registry.cx,
+                    clock_ms(),
+                    BUDGET
+                )
+                .is_err()
+        );
+        // Native writer admission and the independent sibling still work.
+        replace(&reopened, sibling.source, 9);
+        assert_eq!(
+            reopened
+                .readers
+                .get()
+                .query_row(
+                    "SELECT value FROM local_fixture_reactor_pending WHERE source=?1",
+                    [sibling.source],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            9
+        );
+        let persisted: (String, u64) = reopened
+            .readers
+            .get()
+            .query_row(
+                "SELECT fingerprint,epoch FROM ivm_install_sources WHERE name=?1",
+                [cache.name()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, (fingerprint.into(), epoch));
+        assert_eq!(*cache.ready.lock().unwrap(), Some(index));
+        assert_eq!(cache.publications.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_source_namespace_and_index_install_keep_named_wakes_live() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = Arc::new(CacheOnly {
+        ready: Arc::new(Mutex::new(None)),
+        fail: AtomicBool::new(false),
+        commit_failure: AtomicUsize::new(0),
+        publications: Arc::new(AtomicUsize::new(0)),
+        refused_commits: AtomicUsize::new(0),
+    });
+    let store = Store::open_with_collection_sources(
+        &root.path().join("late-schema.db"),
+        "alder",
+        vec![cache.clone()],
+    )
+    .unwrap();
+    let registry = store.collection_sources().unwrap();
+    let mut notices = store.prepared_ivm_publisher().unwrap().subscribe();
+    for (revision, ddl) in [
+        (
+            1_u64,
+            "CREATE TABLE local_fixture_late_source(id INTEGER PRIMARY KEY,value INTEGER)",
+        ),
+        (
+            2_u64,
+            "CREATE INDEX local_fixture_late_source_value ON local_fixture_late_source(value)",
+        ),
+    ] {
+        store
+            .connection
+            .batched(|tx| -> Result<()> {
+                // A later source namespace/index install changes the shared schema cookie.
+                tx.execute_batch(ddl)?;
+                tx.execute(
+                    "UPDATE ivm_install_sources SET revision=revision+1 WHERE name=?1",
+                    [cache.name()],
+                )?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        let commit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match notices.recv().await.unwrap() {
+                    events::Notice::Source(events::SourceWake::Committed(commit)) => break commit,
+                    events::Notice::Source(events::SourceWake::Invalidated(reason)) => {
+                        panic!("compatible late DDL invalidated named wakes: {reason:?}");
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(commit.sources.len(), 1);
+        assert_eq!(
+            commit.sources[0].identity,
+            cache.progress_identity().unwrap()
+        );
+        assert_eq!(commit.sources[0].revision, revision);
+        assert!(commit.sources[0].available);
+        assert!(!registry.unavailable[0].load(Ordering::Acquire));
+        // A wake grants no coverage to this still-empty cache.
+        assert!(
+            !store
+                .read_snapshot(|_| registry.coverage(
+                    cache.name(),
+                    &store,
+                    &store.readers.get(),
+                    clock_ms()
+                ))
+                .unwrap()
+        );
     }
 }
 
