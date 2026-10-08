@@ -2,4 +2,4 @@
 export { SyncLine } from './SyncLine.tsx'
 export type { SyncLineProps } from './SyncLine.tsx'
 export { syncLine, observeSyncStatus } from './sync-line.ts'
-export type { SyncLineInput, SyncLineValue, SyncObservation, SyncStatus, SyncStage, StaleReason } from './sync-line.ts'
+export type { SyncLineInput, SyncLineValue, SyncObservation, SyncStatus, SyncStage, StaleReason, SyncFailureCause } from './sync-line.ts'
