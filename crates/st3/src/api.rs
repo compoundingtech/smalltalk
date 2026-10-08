@@ -453,6 +453,7 @@ pub fn fabric_router(state: AppState) -> Router {
 fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> Router {
     let app = Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/harnesses", get(available_harnesses))
         .route("/v1/client/capabilities", get(client_capabilities))
         .route("/v1/client/sets", get(owned_sets::list))
         .route("/v1/client/sets/{*id}", get(owned_sets::get))
@@ -5572,6 +5573,15 @@ pub async fn serve_tcp(address: &str, app: Router) -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+async fn available_harnesses() -> Result<Json<Vec<String>>, ApiError> {
+    let harnesses = read_deadline::spawn_blocking(crate::environment::available_harnesses)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    Ok(Json(harnesses))
+}
+
 
 async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!({

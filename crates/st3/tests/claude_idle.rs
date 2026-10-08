@@ -44,6 +44,8 @@ fn unscoped_claude_channel_serves_mcp_until_eof_without_a_daemon_or_state() {
             .unwrap();
         }
     }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(child.try_wait().unwrap().is_none(), "unscoped MCP must stay alive until its input closes");
     drop(stdin);
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{output:?}");
