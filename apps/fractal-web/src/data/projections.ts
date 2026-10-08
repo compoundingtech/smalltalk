@@ -6,13 +6,14 @@
  * them differently. Open attention rows are the one inbox authority: a subject needs the user
  * exactly when an open attention row names it (`source_id`, `requester_id` or `mission_id`).
  */
-import type * as St3 from '@smalltalk/st3-client/schema'
+import * as St3 from '@smalltalk/st3-client/schema'
 import * as DateTime from 'effect/DateTime'
 import * as Option from 'effect/Option'
+import * as Schema from 'effect/Schema'
 
 import type { MissionView, ProposedMissionFields } from '../missions/model.ts'
 import type { SubjectSummary } from '../shell/context.tsx'
-import type { Agent, Fleet, Host } from './source.ts'
+import type { Agent, Fleet, Host, Known } from './source.ts'
 
 const harnesses = ['omp', 'claude', 'codex'] as const
 
@@ -52,6 +53,10 @@ const statusOf = (agent: St3.Agent): string => {
   )
 }
 
+const unknown = { _tag: 'Unknown' } as const
+const fromOption = <T>(value: Option.Option<T>): Known<T> =>
+  Option.match(value, { onNone: () => unknown, onSome: (value) => ({ _tag: 'Known', value }) })
+
 const agentFromRow = (row: St3.Agent): Agent => {
   const driver = Option.getOrUndefined(row.driver)
   const harness = harnesses.find((candidate) => candidate === driver)
@@ -74,9 +79,14 @@ const agentFromRow = (row: St3.Agent): Agent => {
     status: statusOf(row),
     state: typeof row.state === 'string' ? row.state : row.state.raw,
     ...(description === undefined ? {} : { description }),
-    ...(lastActivityAt === undefined
-      ? {}
-      : { lastActivityAt: DateTime.toEpochMillis(lastActivityAt) }),
+    usage: fromOption(row.usage),
+    checkout: fromOption(row.checkout),
+    workspace: fromOption(row.workspace),
+    startedAt: unknown,
+    endedAt: unknown,
+    lastActivityAt: lastActivityAt === undefined ? unknown : { _tag: 'Known', value: DateTime.toEpochMillis(lastActivityAt) },
+    blockedOn: fromOption(row.blocked_on),
+    ask: fromOption(row.ask),
     ...(suspendedAt === undefined ? {} : { statusSince: DateTime.toEpochMillis(suspendedAt) }),
     ...(mission === undefined ? {} : { mission }),
     connected: isConnected(row),
@@ -195,6 +205,11 @@ export const subjectList = ({
 const sameItems = <T>(left: readonly T[], right: readonly T[]): boolean =>
   left.length === right.length && left.every((item, index) => item === right[index])
 
+const sameKnown = <T>(left: Known<T>, right: Known<T>, equivalent: (left: T, right: T) => boolean = Object.is): boolean =>
+  left._tag === 'Unknown' ? right._tag === 'Unknown' : right._tag === 'Known' && equivalent(left.value, right.value)
+const sameUsage = Schema.toEquivalence(St3.UsageSummary)
+const sameCheckout = Schema.toEquivalence(St3.AgentCheckout)
+
 // oxlint-disable-next-line overeng/named-args -- Retained Agent projection comparator; fixed positional Equivalence shape.
 const sameAgent = (a: Agent, b: Agent): boolean =>
   a.ref === b.ref &&
@@ -206,7 +221,14 @@ const sameAgent = (a: Agent, b: Agent): boolean =>
   a.status === b.status &&
   a.state === b.state &&
   a.description === b.description &&
-  a.lastActivityAt === b.lastActivityAt &&
+  sameKnown(a.lastActivityAt, b.lastActivityAt) &&
+  sameKnown(a.startedAt, b.startedAt) &&
+  sameKnown(a.endedAt, b.endedAt) &&
+  sameKnown(a.usage, b.usage, sameUsage) &&
+  sameKnown(a.checkout, b.checkout, sameCheckout) &&
+  sameKnown(a.workspace, b.workspace) &&
+  sameKnown(a.blockedOn, b.blockedOn) &&
+  sameKnown(a.ask, b.ask) &&
   a.statusSince === b.statusSince &&
   a.mission === b.mission &&
   a.connected === b.connected

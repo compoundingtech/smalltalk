@@ -52,6 +52,20 @@ conversation has committed a native first page through the frame writer. Reading
 hidden snapshot does not acquire a follow. Observations survive warm switches in memory;
 reloads do not restore cached roster or transcript claims from browser storage.
 
+### Native web data ports
+
+Roster usage, requested checkout, workspace, activity, blocking reason and ask are
+`Known(value)` or `Unknown`; missing facts are never fabricated as zero. Session start
+and end remain unknown until the native roster supplies them. Native content search
+reads server conversation content rather than scanning the loaded window. Attachment
+upload, chunk reads and message sending independently honor their native grants and
+preserve refusal envelopes. Upload alone never acknowledges a send; the gateway chooses
+the canonical message identity independently of the client's idempotency key.
+
+Only an actual replacement page with explicit pagination evidence establishes an empty
+conversation. Newer deltas do not change the older-history boundary. `hasOlder` reports
+that boundary, not an available fetch operation.
+
 ## Header
 
 The header's right side names the host and person, led by the connection: `● live`, a spinner

@@ -18,7 +18,16 @@ import type {
   Attention,
   Mission,
   TerminalScreen,
+  AgentCheckout,
+  UsageSummary,
+  ActionResult,
+  AttachmentInputEncoded,
+  BlobChunk,
+  BlobUpload,
+  ConversationSearch,
 } from '@smalltalk/st3-client/schema'
+import type { ErrorEnvelope } from '@smalltalk/st3-client'
+import type { MessageSendInput } from '@st3/sdk/effect'
 import type { ConnectionState } from '@st3/sdk/effect'
 import type { FeedSync } from './feedSync.ts'
 import * as Atom from 'effect/reactivity/Atom'
@@ -67,6 +76,9 @@ export interface Host {
   readonly connected: boolean
 }
 
+/** A missing native observation remains unknown, never zero or an inferred fact. */
+export type Known<T> = { readonly _tag: 'Known'; readonly value: T } | { readonly _tag: 'Unknown' }
+
 /** One agent session as the fleet projection lists it, keyed by `ref` with its terminal ref beside it. */
 export interface Agent {
   readonly ref: string
@@ -79,8 +91,16 @@ export interface Agent {
   readonly status: string
   readonly state?: string
   readonly description?: string
+  readonly usage: Known<UsageSummary>
+  /** Requested checkout, not confirmation of a successful checkout. */
+  readonly checkout: Known<AgentCheckout>
+  readonly workspace: Known<string>
+  readonly startedAt: Known<number>
+  readonly endedAt: Known<number>
+  readonly blockedOn: Known<string>
+  readonly ask: Known<string>
   /** Last observed activity, not the boundary of the current status. */
-  readonly lastActivityAt?: number
+  readonly lastActivityAt: Known<number>
   /** Exact observed state boundary when supplied (currently suspension), not last activity. */
   readonly statusSince?: number
   readonly mission?: string
@@ -92,10 +112,12 @@ export interface Fleet {
   readonly agents: readonly Agent[]
 }
 
-/** The loaded window of one agent conversation; `hasOlder` says whether history continues before `items`. */
+/** The loaded conversation window; older history is a boundary, not an available fetch operation. */
 export interface ConversationPage {
   readonly items: readonly ConversationItem[]
   readonly hasOlder: boolean
+  /** Native page provenance; filtered items cannot establish emptiness. */
+  readonly observation?: { readonly empty: boolean }
   /** Incremental boundary relative to this exact preceding projection. */
   readonly change?: { readonly from: readonly ConversationItem[]; readonly index: number }
 }
@@ -114,6 +136,60 @@ export interface GatewayEvent {
   readonly text: string
 }
 
+/** A one-shot native operation; a refusal never masquerades as an empty page or delivery. */
+export type ConversationPortResult<T> =
+  | { readonly _tag: 'Success'; readonly value: T }
+  | {
+      readonly _tag: 'Refused'
+      readonly reason: 'ungranted' | 'invalid' | 'failed'
+      readonly detail: string
+      /** Preserve the daemon's complete refusal, including its retry policy. */
+      readonly error?: ErrorEnvelope
+    }
+
+/** Search native conversation content, not the loaded timeline or sidebar metadata. */
+export interface ContentSearchPort {
+  readonly search: (request: {
+    readonly text: string
+    readonly agent?: string
+    readonly since?: string
+    readonly cursor?: string
+    readonly limit?: number
+  }) => Promise<ConversationPortResult<ConversationSearch>>
+}
+
+/** Existing composer action plus uploaded image references, bounded by the generated schema. */
+export type AttachmentSendRequest = Omit<MessageSendInput, 'parameters'> & {
+  readonly api_version: 'st3.client.v0'
+  readonly type: 'message.send'
+  readonly parameters: Omit<MessageSendInput['parameters'], 'attachments' | 'tags'> & {
+    readonly tags: readonly string[]
+    readonly attachments: readonly AttachmentInputEncoded[]
+  }
+}
+
+/** Native upload/read/send permissions, independently discovered for /attach and paste. */
+export interface AttachmentCapabilities {
+  readonly upload: 'granted' | 'ungranted'
+  readonly send: 'granted' | 'ungranted'
+  readonly read: 'granted' | 'ungranted'
+}
+
+/** Upload does not send; only the real message action result can acknowledge a send. */
+export interface AttachmentPort {
+  readonly capabilities: () => Promise<ConversationPortResult<AttachmentCapabilities>>
+  readonly upload: (request: {
+    readonly bytes: Blob | ArrayBuffer | Uint8Array
+    readonly mediaType: BlobUpload['media_type']
+  }) => Promise<ConversationPortResult<BlobUpload>>
+  readonly chunk: (request: {
+    readonly sha256: string
+    readonly message?: string
+    readonly offset?: number
+  }) => Promise<ConversationPortResult<BlobChunk>>
+  readonly send: (request: AttachmentSendRequest) => Promise<ConversationPortResult<ActionResult>>
+}
+
 /**
  * Everything a feature may read: one atom (or atom family) per projection plus the source's
  * clock, grants and usage port. Fixtures and live implement the same shape.
@@ -126,6 +202,9 @@ export interface DataSource {
   /** Fixtures: the world's fixed base time. Live: `wallClock`. Every relative timestamp reads this. */
   readonly now: Atom.Atom<number>
   readonly grants: Atom.Atom<Grants>
+  /** Native operations are optional in fixture adapters, never fabricated locally. */
+  readonly contentSearch?: ContentSearchPort
+  readonly attachments?: AttachmentPort
   /** Schema-coupled native family reads; unsupported native producers carry an explicit reason. */
   readonly subjectReads: SubjectReads
   readonly connection: Atom.Atom<ConnectionState>

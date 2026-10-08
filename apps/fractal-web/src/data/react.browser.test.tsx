@@ -213,7 +213,7 @@ it('invalidates folder membership/order only for active filter dependencies', ()
           ...fleet.agents[0]!,
           activity: 'waiting' as const,
           description: 'Changed description',
-          lastActivityAt: 1,
+          lastActivityAt: { _tag: 'Known', value: 1 },
         },
         fleet.agents[1]!,
       ],

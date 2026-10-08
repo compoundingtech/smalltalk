@@ -24,6 +24,8 @@ import { gatewayResources } from '../resources/agent/source.ts'
 import { instrumentFetch } from '../telemetry/transport.ts'
 import { unavailableTerminalHistory } from '../terminal/historySource.ts'
 import { gatewayTerminalResize } from '../terminal/terminal-resize-port.ts'
+import { gatewayAttachments } from './attachmentPort.ts'
+import { gatewayContentSearch } from './contentSearchPort.ts'
 import { makeFrameIngest } from './frameIngest.ts'
 import { nativeAgentFetch } from './nativeAgentFetch.ts'
 import {
@@ -461,7 +463,12 @@ export const liveSource = ({
             const change = { from: publishedItems, index: changedFrom }
             return {
               _tag: 'Observed' as const,
-              value: { items: projection.items, hasOlder: timeline.hasOlder, change },
+              value: {
+                items: projection.items,
+                hasOlder: timeline.hasOlder,
+                change,
+                ...(timeline.observation === undefined ? {} : { observation: timeline.observation }),
+              },
             }
           }),
         ),
@@ -588,6 +595,8 @@ export const liveSource = ({
       gateway: new URL(baseUrl).host,
       now: wallClock,
       grants,
+      contentSearch: gatewayContentSearch(client),
+      attachments: gatewayAttachments(client),
       connection,
       agents,
       missions,

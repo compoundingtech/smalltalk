@@ -306,7 +306,10 @@ export class LiveTimeline {
   private active = true
   private dirtyFrom = 0
   private reindex = false
+  /** Only a replace page describes the older-history edge. */
   hasOlder = false
+  /** Native replace-page evidence, never an empty filtered projection. */
+  observation: { readonly empty: boolean } | undefined
 
   get size(): number {
     return this.entries.size
@@ -321,7 +324,15 @@ export class LiveTimeline {
       this.cache.clear()
       this.reindex = true
     }
-    this.hasOlder = frame.replace ? frame.hasMore : this.hasOlder || frame.hasMore
+    if (frame.replace) {
+      this.hasOlder = frame.hasMore
+      this.observation = frame.observation
+    } else if (
+      (frame.entries.length > 0 || frame.observation?.empty === false) &&
+      this.observation?.empty === true
+    ) {
+      this.observation = { empty: false }
+    }
     for (const entry of frame.entries) {
       const previous = this.entries.get(entry.id)
       if (previous !== undefined && previous.revision >= entry.revision) continue
