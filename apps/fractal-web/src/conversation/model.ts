@@ -59,6 +59,16 @@ export type RunStatus = typeof RunStatus.Type
 export const NoticeKind = Schema.Literals(['error', 'redaction', 'truncation', 'event', 'unknown'])
 export type NoticeKind = typeof NoticeKind.Type
 
+/** Local send lifecycle, not a streaming revision or a server delivery acknowledgement. */
+export const SendState = Schema.TaggedUnion({
+  Pending: {},
+  Failed: {
+    reason: Schema.Literals(['rejected', 'ungranted', 'invalid', 'failed']),
+    detail: Schema.String,
+  },
+})
+export type SendState = typeof SendState.Type
+
 /** Shared renderer contract for live timeline entries and imported session history. */
 export const ConversationItem = Schema.TaggedUnion({
   /** Prose from a participant. `streaming` = the entry is not final yet (revisions replace it). */
@@ -71,6 +81,7 @@ export const ConversationItem = Schema.TaggedUnion({
     model: Schema.optional(Schema.String),
     at: Schema.String,
     sender: Schema.optional(Sender),
+    sendState: Schema.optional(SendState),
   },
   /** A Small Talk message envelope joined into the conversation (st `message` entry). */
   Message: {

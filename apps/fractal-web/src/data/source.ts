@@ -159,7 +159,9 @@ export interface ContentSearchPort {
 }
 
 /** Existing composer action plus uploaded image references, bounded by the generated schema. */
-export type AttachmentSendRequest = Omit<MessageSendInput, 'parameters'> & {
+export type AttachmentSendRequest = Omit<MessageSendInput, 'parameters' | 'idempotency_key'> & {
+  /** Omit for a fresh client-generated key; retain the key when deliberately resubmitting. */
+  readonly idempotency_key?: string
   readonly api_version: 'st3.client.v0'
   readonly type: 'message.send'
   readonly parameters: Omit<MessageSendInput['parameters'], 'attachments' | 'tags'> & {
