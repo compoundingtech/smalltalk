@@ -1,5 +1,23 @@
 # Merge queue test flakes
 
+## Malformed OMP admission fixture
+
+`harness_admission::tests::malformed_probe_cannot_inherit_other_passing_evidence`
+could admit its synthetic child because the fixture published complete passing event
+and channel streams before appending the malformed event. The real probe accepts once
+all required evidence is present, so it could finish within that passing prefix.
+
+The fixture now assembles the malformed record into the event payload and atomically
+publishes each complete capture. Passing channel evidence can only appear after the
+complete malformed event stream is visible. The negative control holds the child alive
+after publication, forcing the old passing-prefix schedule independently of child exit.
+The passing-cache control uses the same hold and still admits valid evidence and reuses
+its cache. Production probe, identity, refusal and cache behavior are unchanged.
+
+The first hosted failure at source `9038d22e` and its later passing retry remain separate.
+The forced schedule qualifies the fixture defect; the hosted log does not retain the
+producer interleave needed to attribute that specific attempt.
+
 ## Terminal tab protocol observation
 
 `ui::terminal_tab::terminal_tab_protocols` appends Ctrl-B, Ctrl-A, Ctrl-B after each
