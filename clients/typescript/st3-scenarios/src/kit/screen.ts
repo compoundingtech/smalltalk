@@ -32,7 +32,7 @@ const applySgr = (style: Style, params: string): Style => {
 
 const sameStyle = (a: Style, b: Style) => a.fg === b.fg && a.bold === b.bold && a.dim === b.dim
 
-const toLine = (cells: Cell[], row: number): TerminalLine => {
+const toLine = (cells: Cell[], row: number, wrapped: boolean): TerminalLine => {
   const runs: TerminalRun[] = []
   for (const cell of cells) {
     const last = runs.at(-1)
@@ -42,7 +42,7 @@ const toLine = (cells: Cell[], row: number): TerminalLine => {
       last.cells = (last.cells ?? 0) + 1
     } else runs.push({ text: cell.ch, cells: 1, ...cell.style })
   }
-  return { row, text: cells.map((cell) => cell.ch).join(''), runs, wrapped: false, redacted: false, truncated: false }
+  return { row, text: cells.map((cell) => cell.ch).join(''), runs, wrapped, redacted: false, truncated: false }
 }
 
 export interface ScreenOptions {
@@ -57,6 +57,8 @@ export interface ScreenOptions {
 export const screenAt = (cast: Asciicast, untilSeconds: number, options: ScreenOptions): TerminalScreen => {
   const { width, height } = cast.header
   const lines: Cell[][] = [[]]
+  /** Rows that continue automatically onto the next row (client-v0 `wrapped`). */
+  const wrapped = new Set<Cell[]>()
   let column = 0
   let style: Style = {}
   let sequence = 0
@@ -78,9 +80,12 @@ export const screenAt = (cast: Asciicast, untilSeconds: number, options: ScreenO
         lines.push([])
         column = 0
       } else {
-        const line = lines.at(-1)!
-        if (column >= width) continue
-        line[column] = { ch, style }
+        if (column >= width) {
+          wrapped.add(lines.at(-1)!)
+          lines.push([])
+          column = 0
+        }
+        lines.at(-1)![column] = { ch, style }
         column += 1
       }
     }
@@ -104,7 +109,7 @@ export const screenAt = (cast: Asciicast, untilSeconds: number, options: ScreenO
       mouse_tracking: 'none',
       mouse_encoding: 'default',
     },
-    lines: visible.map((cells, row) => toLine(cells, row)),
+    lines: visible.map((cells, row) => toLine(cells, row, wrapped.has(cells))),
     next_sequence: sequence,
     truncated: lines.length > height,
   }
