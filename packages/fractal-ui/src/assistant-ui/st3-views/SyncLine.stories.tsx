@@ -18,9 +18,13 @@ function ScenarioSync({ scheme, anchor, now }: { readonly scheme: 'light' | 'dar
 const meta = {
   title: 'Fractal UI/Scenarios/Sync line',
   component: SyncLine,
-  args: { scheme: 'light', sync: 'default' },
+  args: { scheme: 'light', sync: 'default', scenarioAt: 10000 },
   parameters: { scenario: { slices: ['sync'] } },
-  argTypes: { ...scenarioArgTypes(['sync']), scheme: { control: 'radio', options: ['light', 'dark'] } },
+  argTypes: {
+    ...scenarioArgTypes(['sync']),
+    scheme: { control: 'radio', options: ['light', 'dark'] },
+    scenarioAt: { name: 'Elapsed scenario time (ms)', control: { type: 'number', min: 0, step: 1000 } },
+  },
   render: (args, context) => <ScenarioSync scheme={args.scheme === 'dark' ? 'dark' : 'light'} {...scenarioTime(context)} />,
 } satisfies Meta<Args>
 export default meta

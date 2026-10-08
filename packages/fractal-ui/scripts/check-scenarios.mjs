@@ -19,13 +19,16 @@ try {
   for (const path of ['src/assistant-ui/sidebar/ScenarioRoster.stories.tsx', 'src/assistant-ui/EmbraceThread.stories.tsx', 'src/assistant-ui/st3-views/SyncLine.stories.tsx']) {
     const stories = await server.ssrLoadModule(resolve(root, path))
     for (const name of ['Explore', 'Pinned']) {
-      const result = scenarioStoryCheck(stories[name], stories.default, { scenarioNow: '2030-01-01T12:00:00.000Z' })
+      const result = scenarioStoryCheck(stories[name], stories.default, {
+        scenarioNow: '2030-01-01T12:00:00.000Z',
+        atMs: 10000,
+        contrastPairs: { sync: [['live', 'socket-dropped'], ['socket-dropped', 'reconnected'], ['live', 'subscription-limit-local']] },
+      })
       checks.push({ story: path, name, ...result, reads: [...result.reads] })
     }
   }
   const result = { passed: checks.every(check => check._tag === 'Passed'), checks }
-  const json = JSON.stringify(result, null, 2) + '
-'
+  const json = JSON.stringify(result, null, 2) + '\n'
   console.log(json)
   if (receipt !== undefined) {
     await mkdir(resolve(receipt, '..'), { recursive: true })
