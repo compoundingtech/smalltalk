@@ -1013,6 +1013,9 @@ The first envelope has a `ConversationChanges` value with an empty `items`
 array and a `next_cursor` when opening at the live edge. Later envelopes contain
 new chronological `TimelineEntry` values, including st messages, and a cursor to
 save after applying the batch. The owner sends no WebSocket data while idle.
+Clients load existing rows from the timeline endpoint, not from this live-edge envelope.
+After a `cursor-gap`, reload that authoritative timeline page and reopen at the live edge
+to obtain a fresh change cursor; reopening alone does not replay the page's rows.
 
 The gateway routes managed sessions to their owning host using the authenticated
 daemon relay. The owner holds a bounded change read for up to ten seconds. A

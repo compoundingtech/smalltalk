@@ -16624,10 +16624,18 @@ mission "example/zero-run" state="ready" {
                     .map(|block| (item["sequence"].as_u64().unwrap(), block["view"].clone()))
             })
         };
-        let opened = conversation_read_now(&state, &session, &session_id, None).unwrap();
-        let (failed_sequence, view) = error_view(&opened).expect("the failed turn renders an error");
+        let newest_page = || timeline_value(
+            &state, &new_client_snapshot(&state), &session, &session_id,
+            &ClientListQuery { limit: Some(200), ..Default::default() },
+        ).unwrap().0;
+        // Existing rows come from the timeline page; opening changes at the live edge
+        // only establishes the follower cursor and deliberately returns no rows.
+        let page = newest_page();
+        let (failed_sequence, view) = error_view(&page).expect("the failed turn renders an error");
         assert_eq!(view["status"], "failed");
         assert_eq!(view["presentation"], "full");
+        let opened = conversation_read_now(&state, &session, &session_id, None).unwrap();
+        assert!(opened["items"].as_array().unwrap().is_empty(), "{opened}");
         // The retry's answer is a pure append: it stays an incremental delta.
         writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(), "{reply}").unwrap();
         let appended = conversation_read_now(
@@ -16652,13 +16660,15 @@ mission "example/zero-run" state="ready" {
             assert_eq!(gap.code, "cursor-gap");
             assert_eq!(gap.details["full_resync"], true);
             // The follower's reload carries the updated presentation under the same sequence.
-            let reloaded = conversation_read_now(&state, &session, &session_id, None).unwrap();
+            let reloaded = newest_page();
             let (sequence, view) = error_view(&reloaded).expect("the settled turn keeps its error block");
             assert_eq!(sequence, failed_sequence);
             assert_eq!(view["status"], status);
             assert_eq!(view["presentation"], presentation);
             assert_eq!(view["message"], "synthetic socket closed");
-            cursor = reloaded["next_cursor"].as_str().unwrap().to_owned();
+            let reopened = conversation_read_now(&state, &session, &session_id, None).unwrap();
+            assert!(reopened["items"].as_array().unwrap().is_empty(), "{reopened}");
+            cursor = reopened["next_cursor"].as_str().unwrap().to_owned();
         }
         // With nothing rewritten since the reload, the follower resumes incrementally.
         let quiet = conversation_read_now(&state, &session, &session_id, Some(&cursor)).unwrap();
