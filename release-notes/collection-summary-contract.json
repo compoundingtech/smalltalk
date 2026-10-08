@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "Define optional typed client summary rows on the existing collection protocol.",
+  "commits": ["b74ccdaa37b9b14d393195a65257ff70a9c8508f"],
+  "replay": {"status": "none", "detail": "No claim projection or replay changes."},
+  "schema": {"status": "none", "detail": "No database schema changes. Client JSON schema and generated models add Summary and SummaryMachines resources and the summary collection name."},
+  "rules": {"status": "none", "detail": "No checkpoint or fleet rules changes."},
+  "compatibility": {"status": "changed", "detail": "The generated client vocabulary gains optional summary rows. Older clients preserve unknown resource compatibility. This contract definition alone installs no provider or source and does not advertise server availability; clients select optional collections using daemon capabilities."},
+  "downtime": {"status": "none", "detail": "No additional interruption beyond the normal replacement restart."},
+  "manual": {"status": "none", "detail": "No manual setup; consumers adopt optional resources with their generated clients."},
+  "recovery": {"status": "none", "detail": "No persisted state changes. Previous clients and ordinary collection names retain their existing behavior."}
+}
