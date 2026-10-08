@@ -1,8 +1,6 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
-import Markdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import type { Components } from 'react-markdown'
+import { Markdown, type MarkdownImageResolver } from './composition/Markdown'
 import { accentTokens, tokens } from './embrace-tokens.stylex'
 import type { ToolDiff } from './embrace-tool-preview'
 
@@ -40,32 +38,10 @@ export const EmbraceDiffPreview = ({ diffs }: { readonly diffs: readonly ToolDif
   </div>
 )
 
-// Each generated Markdown element consumes semantic StyleX tokens; no global prose CSS.
-const markdownComponents: Components = {
-  h1: ({ children }) => <h1 {...stylex.props(styles.heading, styles.h1)}>{children}</h1>,
-  h2: ({ children }) => <h2 {...stylex.props(styles.heading, styles.h2)}>{children}</h2>,
-  h3: ({ children }) => <h3 {...stylex.props(styles.heading, styles.h3)}>{children}</h3>,
-  h4: ({ children }) => <h4 {...stylex.props(styles.heading, styles.h3)}>{children}</h4>,
-  h5: ({ children }) => <h5 {...stylex.props(styles.heading, styles.h3)}>{children}</h5>,
-  h6: ({ children }) => <h6 {...stylex.props(styles.heading, styles.h3)}>{children}</h6>,
-  p: ({ children }) => <p {...stylex.props(styles.paragraph)}>{children}</p>,
-  a: ({ children, href, title }) => <a href={href} title={title} rel="noreferrer" {...stylex.props(styles.link)}>{children}</a>,
-  pre: ({ children }) => <pre {...stylex.props(styles.pre)}>{children}</pre>,
-  code: ({ children }) => <code {...stylex.props(styles.code)}>{children}</code>,
-  blockquote: ({ children }) => <blockquote {...stylex.props(styles.quote)}>{children}</blockquote>,
-  ul: ({ children }) => <ul {...stylex.props(styles.list)}>{children}</ul>,
-  ol: ({ children, start }) => <ol start={start} {...stylex.props(styles.list)}>{children}</ol>,
-  table: ({ children }) => <div {...stylex.props(styles.diffScroll)}><table {...stylex.props(styles.markdownTable)}>{children}</table></div>,
-  th: ({ children, style }) => <th {...stylex.props(styles.tableCell, styles.tableHeading)} style={style}>{children}</th>,
-  td: ({ children, style }) => <td {...stylex.props(styles.tableCell)} style={style}>{children}</td>,
-  hr: () => <hr {...stylex.props(styles.rule)} />,
-}
 
-/** Safe Markdown AST rendering, including GFM lists, tables and fenced code. */
-export const EmbraceMarkdownPreview = ({ markdown }: { readonly markdown: string }) => (
-  <div {...stylex.props(styles.markdown)}>
-    <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{markdown}</Markdown>
-  </div>
+/** Shared consent-gated Markdown rendering for tool output. */
+export const EmbraceMarkdownPreview = ({ markdown, resolveImage }: { readonly markdown: string; readonly resolveImage?: MarkdownImageResolver }) => (
+  <Markdown text={markdown} resolveImage={resolveImage} />
 )
 
 const styles = stylex.create({
@@ -83,19 +59,4 @@ const styles = stylex.create({
   removed: { backgroundColor: tokens.removed },
   hunk: { backgroundColor: tokens.recess, color: tokens.muted },
   visuallyHidden: { position: 'absolute', width: 1, height: 1, padding: 0, margin: -1, overflow: 'hidden', clipPath: 'inset(50%)', whiteSpace: 'nowrap', borderWidth: 0 },
-  markdown: { color: tokens.ink, fontSize: 13, lineHeight: 1.65, overflowWrap: 'anywhere', minWidth: 0 },
-  heading: { marginBlockStart: 16, marginBlockEnd: 6, lineHeight: 1.3, fontWeight: 600 },
-  h1: { fontSize: 20 },
-  h2: { fontSize: 17 },
-  h3: { fontSize: 14 },
-  paragraph: { marginBlock: 8 },
-  link: { color: accentTokens.accent, textDecoration: 'underline', outlineOffset: 3 },
-  pre: { overflowX: 'auto', padding: 10, borderRadius: 5, backgroundColor: tokens.recess, marginBlock: 10 },
-  code: { fontFamily: 'monospace', fontSize: '0.9em', backgroundColor: tokens.recess, borderRadius: 3 },
-  quote: { marginInline: 0, paddingInlineStart: 12, borderInlineStartWidth: 3, borderInlineStartStyle: 'solid', borderInlineStartColor: tokens.line, color: tokens.muted },
-  list: { paddingInlineStart: 24, marginBlock: 8 },
-  markdownTable: { borderCollapse: 'collapse', marginBlock: 10, width: '100%' },
-  tableCell: { padding: 6, borderWidth: 1, borderStyle: 'solid', borderColor: tokens.line },
-  tableHeading: { backgroundColor: tokens.recess, fontWeight: 600 },
-  rule: { borderWidth: 0, borderBlockStartWidth: 1, borderBlockStartStyle: 'solid', borderBlockStartColor: tokens.line, marginBlock: 16 },
 })

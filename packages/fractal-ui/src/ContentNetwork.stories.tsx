@@ -4,6 +4,7 @@ import type { Meta, StoryObj } from '@storybook/react-vite'
 import { expect, userEvent, waitFor, within } from 'storybook/test'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
 import { EmbraceThread } from './assistant-ui/EmbraceThread'
+import { EmbraceMarkdownPreview } from './assistant-ui/EmbraceToolPreview'
 import { Transcript } from './assistant-ui/composition/Transcript'
 import type { MarkdownImageResolver } from './assistant-ui/composition/Markdown'
 import type { ConversationItem } from './assistant-ui/embrace-data/model'
@@ -20,18 +21,19 @@ const sources = {
   Linked: 'https://example.invalid/linked.png',
 } as const
 const at = '2026-01-15T12:00:00Z'
-function ContentNetworkStory({ boundary, source, allow = false }: { boundary: 'Transcript' | 'Embrace'; source: string; allow?: boolean }) {
+type Boundary = 'Transcript' | 'Embrace' | 'ToolPreview'
+function ContentNetworkStory({ boundary, source, allow = false }: { boundary: Boundary; source: string; allow?: boolean }) {
   const text = `${source.endsWith('/linked.png') ? `[![Network image](${source})](https://example.invalid/image-link)` : `![Network image](${source})`}\n\n![Other image](https://example.invalid/other.png)\n\n<https://example.invalid/autolink>\n\n<img src="https://example.invalid/raw.png" srcset="https://example.invalid/raw2.png 2x" />\n\n<style>body { background-image: url(https://example.invalid/css.png) }</style>`
   const items = React.useMemo<readonly ConversationItem[]>(() => [{ _tag: 'Text', id: 'network/answer', role: 'assistant', text, attachments: [], streaming: false, at }], [text])
   const options = React.useMemo(() => ({ messages: items, isRunning: false, onNew: async () => {} }), [items])
   const resolveImage: MarkdownImageResolver | undefined = allow ? src => src === '/attachments/allowed.png' ? { _tag: 'Load', src } : { _tag: 'Defer' } : undefined
   const work = workLogTurnFromItems(items, { kindFor: () => 'read', running: false, failed: false, interrupted: false, completeHistory: true })
-  return <main {...stylex.props(styles.root, ...baselineTheme)}><EmbraceRuntimeProvider options={options}>{boundary === 'Embrace' ? <EmbraceThread items={items} embrace="E3" composer={false} resolveImage={resolveImage} /> : <Transcript turns={[{ id: 'network', items, work }]} title="Image privacy" sync={{ _tag: 'Live', since: 0 }} now={0} observedAt={0} resolveImage={resolveImage} />}</EmbraceRuntimeProvider></main>
+  return <main {...stylex.props(styles.root, ...baselineTheme)}><EmbraceRuntimeProvider options={options}>{boundary === 'ToolPreview' ? <EmbraceMarkdownPreview markdown={text} resolveImage={resolveImage} /> : boundary === 'Embrace' ? <EmbraceThread items={items} embrace="E3" composer={false} resolveImage={resolveImage} /> : <Transcript turns={[{ id: 'network', items, work }]} title="Image privacy" sync={{ _tag: 'Live', since: 0 }} now={0} observedAt={0} resolveImage={resolveImage} />}</EmbraceRuntimeProvider></main>
 }
 const meta = { title: 'Fractal UI/Content network safety', component: ContentNetworkStory, parameters: { layout: 'fullscreen' } } satisfies Meta<typeof ContentNetworkStory>
 export default meta
 type Story = StoryObj<typeof meta>
-const deferredStory = (boundary: 'Transcript' | 'Embrace', source: string): Story => ({
+const deferredStory = (boundary: Boundary, source: string): Story => ({
   args: { boundary, source },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
@@ -65,11 +67,17 @@ export const EmbraceLoopback: Story = deferredStory('Embrace', sources.Loopback)
 export const EmbraceMetadata: Story = deferredStory('Embrace', sources.Metadata)
 export const EmbraceData: Story = deferredStory('Embrace', sources.Data)
 export const EmbraceLinked: Story = deferredStory('Embrace', sources.Linked)
-const allowedStory = (boundary: 'Transcript' | 'Embrace'): Story => ({ args: { boundary, source: '/attachments/allowed.png', allow: true }, play: async ({ canvasElement }) => {
+export const ToolPreviewRemote: Story = deferredStory('ToolPreview', sources.Remote)
+export const ToolPreviewLoopback: Story = deferredStory('ToolPreview', sources.Loopback)
+export const ToolPreviewMetadata: Story = deferredStory('ToolPreview', sources.Metadata)
+export const ToolPreviewData: Story = deferredStory('ToolPreview', sources.Data)
+export const ToolPreviewLinked: Story = deferredStory('ToolPreview', sources.Linked)
+const allowedStory = (boundary: Boundary): Story => ({ args: { boundary, source: '/attachments/allowed.png', allow: true }, play: async ({ canvasElement }) => {
   await waitFor(() => expect(canvasElement.querySelectorAll('img')).toHaveLength(1))
   await expect(canvasElement.querySelector('img')).toHaveAttribute('src', '/attachments/allowed.png')
   await expect(within(canvasElement).getAllByTestId('deferred-image')).toHaveLength(1)
 } })
 export const TranscriptAllowedAttachment: Story = allowedStory('Transcript')
 export const EmbraceAllowedAttachment: Story = allowedStory('Embrace')
+export const ToolPreviewAllowedAttachment: Story = allowedStory('ToolPreview')
 const styles = stylex.create({ root: { height: '100vh', backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans } })
