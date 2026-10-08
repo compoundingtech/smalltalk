@@ -1005,6 +1005,37 @@ impl Store {
                 continue;
             }
             if source.starts_with("mission-run/") {
+                if claim.body["fields"]["condition"] == MISSING_AGENT_CONDITION {
+                    let Some(run) = self.mission_run(source)? else {
+                        continue;
+                    };
+                    let generation = failure.targets.get(1);
+                    if generation != Some(&run.generation) {
+                        continue;
+                    }
+                    let Some(step) = failure
+                        .targets
+                        .get(2)
+                        .and_then(|subject| run.steps.iter().find(|s| &s.subject == subject))
+                    else {
+                        continue;
+                    };
+                    if !self.missing_agent_fault_is_current(&run, step)? {
+                        continue;
+                    }
+                    if claim.body["fields"]["episode"].as_str()
+                        != Some(mission_eligibility::episode(&run, step).as_str())
+                    {
+                        continue;
+                    }
+                    let latest: Option<String> = connection.query_row(
+                        &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='operational.failure' AND json_extract(body,'$.fields.condition')=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                        params![source, MISSING_AGENT_CONDITION], |row| row.get(0),
+                    ).optional()?;
+                    if latest.as_deref() != Some(claim.id.as_str()) {
+                        continue;
+                    }
+                }
                 // A finished run's failed cleanup is a fault on a run that completed, so the run
                 // is no longer live. It stays for a day, then the failed step is all that remains.
                 let cleanup_fault = claim.body["fields"]["episode"]
@@ -1081,6 +1112,10 @@ impl Store {
             }
             let mut item = attention_item_from_failure(failure);
             item.kind = "fault".into();
+            if f["condition"] == MISSING_AGENT_CONDITION {
+                item.mission_run = Some(source.clone());
+                item.step = item.targets.get(2).cloned();
+            }
             item.subject = source.clone();
             item.episode = claim.id;
             item.priority = if claim.body["fields"]["severity"] == "warning" {

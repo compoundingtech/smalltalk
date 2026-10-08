@@ -1,0 +1,23 @@
+# Seats across mission revision
+
+A revision carries an unchanged completed declaring step's **currently selected agents** into the successor generation. Each agent keeps its public identity, placement, terminal binding and launch configuration. The revision writes a new canonical `intent.desired` claim with the successor generation and declaring step, and updates the declared managed mission environment for future launches, in the same transaction that creates the successor steps and supersedes the predecessor. Replication and agent cards read that same declaration. Retained processes keep their launch-time environment; authority follows current store ownership. A completed outcome stays completed; this does not fabricate a worker claim, wake acknowledgment or runtime readiness.
+
+The cutover then retires declarations that were removed or whose declaring step changed. A changed declaring step executes again under its ordinary dependency, baseline and lifecycle rules. A root stop remains selected when an unchanged completed step is carried; revision does not resurrect that seat. Normal cancellation and finally cleanup still stop run-owned agents.
+
+This is deliberately limited to selected agents with readable members and stable declaration text after interpolation. A carried completed step that still owns an exec, schedule or other non-agent declaration is rejected with `unsafe-completed-declaration-carry`. A declaration whose name or configuration changes through generation, revision or step interpolation is also rejected. Change the declaring step explicitly when its effects should run again. Reopening a failed terminal run with completed declaring steps requires that explicit change, because its cleanup may already have ended those declarations. The API checks before publishing the candidate, and both immediate and declared revision writers recheck under the cutover transaction; a refusal leaves the current generation intact.
+
+## Missing desired agents
+
+After dependencies, baselines and admission deadlines permit a step, an absent assigned or available agent blocks it with `no eligible agent is present in the desired graph`. This includes ready work whose binding was subsequently removed. Agentless steps, person assignments, dependency waits and legitimate seat queues do not trigger this diagnosis. Cleanup stops that retain a seat for already-ready work in another run preserve that queue. An explicit root stop blocks quietly.
+
+The reconciler raises an existing `operational.failure` with stable `fields.condition = "mission-no-eligible-agent"`. Its targets are the mission run, current generation and blocked step. Existing fault ownership routes it to the requester or owning agent. The reason identifies the missing binding and suggests declaring a seat or revising the assignment. A run with no advancing work and an assignment-blocked step reports `blocked`.
+
+Episodes are deduplicated by generation, step and readiness epoch. Only the latest episode for a run is visible. It disappears when the targeted step regains an eligible desired binding, the generation changes, or the run leaves its normal phase or ends. A later loss of eligibility after readiness has a new epoch. Desired presence is not proof that a runtime or harness is ready.
+
+Eligibility reads register the absent binding as a dependency. Its later publication dirties the settled blocked run directly. The fault writer rechecks the run, generation, step and bindings under its transaction and uses an indexed source lookup for deduplication; it adds no polling loop or replay of historical operational episodes.
+
+## Controls
+
+`cargo test -p st3 --lib revision_seat_tests -- --test-threads=4` covers completed four-seat declarations, repeated cutover, current agent-card ownership, explicit stops, changed/removed declarations, both revision writers, transactional rollback, dynamic declaration refusal, failed reopen refusal, replication, dependency waits, retry backoff, stale-generation fencing, recurring readiness episodes, fault deduplication and event-driven recovery.
+
+`scripts/st3-revision-seat-eval/run ST3_FIXTURE_BINARY OUTPUT_DIR` runs actual CLI controls on a private daemon and real PTYs, using invented garden seats and `sleep` commands. It checks four builders across repeated revisions, explicit stop, removal and intentional cancellation with finally cleanup. It also removes a mission-owned binding after its declaring step completes, checks the missing-agent fault delivered to the requester, restores eligibility and cancels the control. All sockets, HOME/XDG directories and terminal roots are isolated. It writes `result.json` and tears down its own runtimes.

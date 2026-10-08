@@ -7399,7 +7399,19 @@ impl<R: RuntimeControl> Reconciler<R> {
                             .blocked_reason
                             .as_deref()
                             .is_some_and(|reason| reason.starts_with("step baseline `"));
-                    if view.status == "pending" || assignment_blocked || baseline_blocked {
+                    let ready_missing_agent = view.status == "ready"
+                        && !view.agentless
+                        && view.claimant.is_none()
+                        && !view
+                            .assigned_to
+                            .as_deref()
+                            .is_some_and(|a| a.starts_with("person/"))
+                        && self.ready_step_binding_missing(run, view)?;
+                    if view.status == "pending"
+                        || assignment_blocked
+                        || baseline_blocked
+                        || ready_missing_agent
+                    {
                         if view
                             .not_before_unix_ms
                             .is_some_and(|not_before| not_before > now_ms())
@@ -7681,8 +7693,20 @@ impl<R: RuntimeControl> Reconciler<R> {
             let failed = normal
                 .iter()
                 .any(|view| matches!(view.status.as_str(), "failed" | "cancelled"));
+            let missing_agent = normal.iter().find(|view| {
+                view.status == "blocked"
+                    && view
+                        .blocked_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.starts_with("no eligible agent is present"))
+            });
+            if let Some(view) = missing_agent {
+                changed |= self.store.record_missing_agent_failure(&refreshed, view)?;
+            }
             let (status, reason) = if advancing {
                 ("running", None)
+            } else if missing_agent.is_some() {
+                ("blocked", Some("the mission has no eligible desired agent"))
             } else if failed {
                 ("blocked", Some("the mission has no available step"))
             } else if mission.completion.is_none() && !changed {
@@ -7695,6 +7719,33 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .set_mission_run_state(&run.id, status, "normal", reason)?;
         }
         Ok(changed)
+    }
+
+    /// Cleanup may have selected a stop while a seat still owns ready work in another run.
+    /// Keep that existing queue alive until ordinary seat retention lets the runtime end.
+    fn ready_step_binding_missing(&self, run: &MissionRunView, step: &StepRunView) -> Result<bool> {
+        let names = step
+            .assigned_to
+            .iter()
+            .chain(step.available_to.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        for desired in self.store.desired_subjects_named(&names)? {
+            if desired.kind == "agent" {
+                return Ok(false);
+            }
+            if desired.kind == "stop"
+                && let Some(owner) = desired.owner_run.as_deref()
+                && owner != run.subject
+                && self
+                    .store
+                    .seat_work_in_other_runs(&desired.subject, owner)?
+                    .contains(&step.subject)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn record_first_readiness_wait(&self, run: &MissionRunView, now: u128) -> Result<()> {
@@ -15635,6 +15686,7 @@ mod tests {
     mod ownership_guard_tests;
     mod pull_request_run_tests;
     mod ref_watch_tests;
+    mod revision_seat_tests;
     mod rollout_tests;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {

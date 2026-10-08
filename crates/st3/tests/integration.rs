@@ -50,6 +50,7 @@ mod owned_sets;
 mod placement_handoff;
 mod reconcile_pass_perf;
 mod recorder_report;
+mod revision_seats;
 mod seat_queue_perf;
 mod startup_readiness;
 mod subagent_publisher;
