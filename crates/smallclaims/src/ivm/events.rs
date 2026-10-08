@@ -477,9 +477,13 @@ impl Publisher {
     }
 
     /// Explicitly observe at most sixteen already-installed named sources on this same bridge.
-    /// Setup is read-only and must follow source/capture schema installation. Source owners
-    /// prove complete native capture and lifetime coverage; these tuples only wake consumers.
-    /// The opt-in observer adds two bounded metadata statements to the ordinary frontier read.
+    /// Setup is read-only and must follow source/capture schema installation. Invalid configured
+    /// identities or unsupported metadata schema/storage reject setup; a missing or mismatched
+    /// persisted source initializes an unavailable wake scope without rebinding its identity.
+    /// Source owners prove complete native capture and lifetime coverage; tuples only wake
+    /// consumers. A schema-cookie change revalidates metadata before refreshing the cookie.
+    /// Ordinary captures add two metadata statements; schema revalidation adds bounded result
+    /// sets, but their actual SQLite work still needs qualification by the adopting owner.
     pub fn attach_with_sources(
         store: &Store,
         capacity: usize,
@@ -493,17 +497,29 @@ impl Publisher {
             let connection = store.readers.get();
             let initial = frontiers(&connection)?;
             let scope = source_progress::Scope::attach(&connection, &initial.database_id, sources)?;
-            let progress = scope.capture(&connection, &initial.database_id)?;
+            let progress = match scope.capture(&connection, &initial.database_id) {
+                Ok(progress) => SourceWake::Committed(progress),
+                // Structural schema and storage failures remain hard setup failures.
+                // A retained identity/missing-coverage mismatch only disables this wake
+                // scope; it never rebinds identities or repairs the source on startup.
+                Err(error) if error.downcast_ref::<rusqlite::Error>().is_some() => {
+                    return Err(error);
+                }
+                Err(error) => scope.unavailable(&format!("{error:#}")),
+            };
             Ok((initial, Arc::new(scope), progress))
         })?;
-        let highwater = progress
-            .sources
-            .iter()
-            .map(|source| source.revision)
-            .collect::<Vec<_>>();
+        let highwater = match &progress {
+            SourceWake::Committed(commit) => commit
+                .sources
+                .iter()
+                .map(|source| source.revision)
+                .collect(),
+            _ => vec![0; sources.len()],
+        };
         let last = Arc::new(Mutex::new((
             Notice::Committed(initial),
-            SourceWake::Committed(progress),
+            progress,
             highwater,
         )));
         let (notices, _) = broadcast::channel(capacity);
@@ -614,6 +630,10 @@ mod source_progress {
     use super::super::install::SourcePosition;
     use anyhow::{Context, Result, ensure};
     use rusqlite::{Connection, params_from_iter};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     const MAX_SOURCES: usize = 16;
     const MAX_NAME_BYTES: usize = 128;
@@ -667,7 +687,8 @@ mod source_progress {
     pub(super) struct Scope {
         database_id: String,
         identities: Vec<SourceIdentity>,
-        schema_version: i64,
+        schema: Mutex<SchemaStamp>,
+        schema_invalidated: AtomicBool,
         query: String,
     }
 
@@ -717,70 +738,7 @@ mod source_progress {
                 bytes <= MAX_METADATA_BYTES,
                 "named-source metadata exceeds bound"
             );
-            // Explicit setup only. The hot callback checks the cookie before querying any
-            // source rows. An altered/reset schema requires owner-reviewed reattachment.
-            let kind: (String, i64, i64) = db.query_row(
-                "SELECT type,wr,ncol FROM pragma_table_list WHERE schema='main' AND name='ivm_install_sources'",
-                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-            ensure!(
-                kind == ("table".into(), 0, 7),
-                "named-source table schema incompatible"
-            );
-            let mut statement = db.prepare("SELECT name,type,pk,hidden FROM pragma_table_xinfo('ivm_install_sources','main') LIMIT 8")?;
-            let columns = statement
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let expected = [
-                ("name", "TEXT", 1),
-                ("fingerprint", "TEXT", 0),
-                ("epoch", "INTEGER", 0),
-                ("revision", "INTEGER", 0),
-                ("available", "INTEGER", 0),
-                ("journal_rows", "INTEGER", 0),
-                ("journal_bytes", "INTEGER", 0),
-            ];
-            ensure!(
-                columns.len() == expected.len()
-                    && columns
-                        .iter()
-                        .zip(expected)
-                        .all(|(actual, expected)| actual.0 == expected.0
-                            && actual.1 == expected.1
-                            && actual.2 == expected.2
-                            && actual.3 == 0),
-                "named-source columns incompatible"
-            );
-            // Check the actual ordered primary-key index and BINARY comparison, not just
-            // the column declaration, so the fixed exact-name queries remain point seeks.
-            let mut indexes = db.prepare("SELECT name FROM pragma_index_list('ivm_install_sources','main') WHERE origin='pk' LIMIT 2")?;
-            let indexes = indexes
-                .query_map([], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            ensure!(indexes.len() == 1, "named-source primary index missing");
-            let mut keys = db.prepare(
-                "SELECT name,coll,desc FROM pragma_index_xinfo(?1,'main') WHERE key=1 LIMIT 2",
-            )?;
-            let keys = keys
-                .query_map([&indexes[0]], |r| {
-                    Ok((
-                        r.get::<_, Option<String>>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            ensure!(
-                keys == vec![(Some("name".into()), "BINARY".into(), 0)],
-                "named-source primary key incompatible"
-            );
-            let schema_version = db.query_row("PRAGMA main.schema_version", [], |r| r.get(0))?;
+            let schema = validate_schema(db)?;
             let placeholders = (1..=identities.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
@@ -796,7 +754,8 @@ mod source_progress {
             Ok(Self {
                 database_id: database_id.into(),
                 identities,
-                schema_version,
+                schema: Mutex::new(schema),
+                schema_invalidated: AtomicBool::new(false),
                 query,
             })
         }
@@ -808,9 +767,43 @@ mod source_progress {
             );
             let cookie: i64 = db.query_row("PRAGMA main.schema_version", [], |r| r.get(0))?;
             ensure!(
-                cookie == self.schema_version,
-                "named-source schema changed; explicit reattachment required"
+                !self.schema_invalidated.load(Ordering::Acquire),
+                "named-source schema invalidated; explicit reattachment required"
             );
+            let previous = {
+                let schema = self
+                    .schema
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (cookie != schema.version).then(|| schema.clone())
+            };
+            if let Some(previous) = previous {
+                // No SQL runs while the metadata-cache mutex is held. Unrelated DDL may
+                // refresh the cookie only after the actual source shape/index is checked.
+                let current = match validate_schema(db) {
+                    Ok(current) => current,
+                    Err(error) => {
+                        self.schema_invalidated.store(true, Ordering::Release);
+                        return Err(error);
+                    }
+                };
+                if current.root_page != previous.root_page
+                    || current.declaration != previous.declaration
+                {
+                    self.schema_invalidated.store(true, Ordering::Release);
+                    anyhow::bail!(
+                        "named-source metadata table changed; explicit reattachment required"
+                    );
+                }
+                ensure!(
+                    current.version == cookie,
+                    "schema changed during named-source revalidation"
+                );
+                *self
+                    .schema
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = current;
+            }
             let mut statement = db.prepare_cached(&self.query)?;
             let rows = statement.query_map(
                 params_from_iter(self.identities.iter().map(|i| &i.name)),
@@ -904,6 +897,95 @@ mod source_progress {
                 reason: bounded_reason(reason),
             })
         }
+    }
+
+    // A repeated root page/DDL is not an incarnation token: an identical DROP/recreate may
+    // reuse both. Source owners must fence such replacement, file restore and cookie resets
+    // with their native lifetime guard. This stamp only permits compatible unrelated DDL.
+    #[derive(Clone)]
+    struct SchemaStamp {
+        version: i64,
+        root_page: i64,
+        declaration: String,
+    }
+
+    fn validate_schema(db: &Connection) -> Result<SchemaStamp> {
+        // Refuse oversized/altered declarations before collecting column/index metadata.
+        // Direct-column length avoids fetching an unbounded declaration into Rust.
+        let (root_page, declaration): (i64, Option<String>) = db.query_row(
+            "SELECT rootpage, CASE WHEN typeof(sql)='text' AND octet_length(sql)<=16384 THEN sql END FROM main.sqlite_schema WHERE type='table' AND name='ivm_install_sources'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        ensure!(root_page > 0, "named-source table root missing");
+        let declaration = declaration.context("named-source table declaration unsupported")?;
+        let kind: (String, i64, i64) = db.query_row(
+        "SELECT type,wr,ncol FROM pragma_table_list WHERE schema='main' AND name='ivm_install_sources'",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        ensure!(
+            kind == ("table".into(), 0, 7),
+            "named-source table schema incompatible"
+        );
+        let mut statement = db.prepare("SELECT name,type,pk,hidden FROM pragma_table_xinfo('ivm_install_sources','main') LIMIT 8")?;
+        let columns = statement
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let expected = [
+            ("name", "TEXT", 1),
+            ("fingerprint", "TEXT", 0),
+            ("epoch", "INTEGER", 0),
+            ("revision", "INTEGER", 0),
+            ("available", "INTEGER", 0),
+            ("journal_rows", "INTEGER", 0),
+            ("journal_bytes", "INTEGER", 0),
+        ];
+        ensure!(
+            columns.len() == expected.len()
+                && columns
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual.0 == expected.0
+                        && actual.1 == expected.1
+                        && actual.2 == expected.2
+                        && actual.3 == 0),
+            "named-source columns incompatible"
+        );
+        // Check the actual ordered primary-key index and BINARY comparison, not just
+        // the column declaration, so the fixed exact-name queries remain point seeks.
+        let mut indexes = db.prepare("SELECT name FROM pragma_index_list('ivm_install_sources','main') WHERE origin='pk' LIMIT 2")?;
+        let indexes = indexes
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(indexes.len() == 1, "named-source primary index missing");
+        let mut keys = db.prepare(
+            "SELECT name,coll,desc FROM pragma_index_xinfo(?1,'main') WHERE key=1 LIMIT 2",
+        )?;
+        let keys = keys
+            .query_map([&indexes[0]], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(
+            keys == vec![(Some("name".into()), "BINARY".into(), 0)],
+            "named-source primary key incompatible"
+        );
+        let version = db.query_row("PRAGMA main.schema_version", [], |r| r.get(0))?;
+        Ok(SchemaStamp {
+            version,
+            root_page,
+            declaration,
+        })
     }
 
     fn bounded_reason(reason: &str) -> String {
