@@ -159,6 +159,18 @@ describe('conversation dispatch and consumer fold', () => {
     expect(h.frames.filter((frame) => frame.kind === 'conversation' && !frame.replace)).toHaveLength(h.world.slices.conversation.timeline.length * 2)
   })
 
+  it('delivers live entries to a session selector without the session/ prefix', async () => {
+    const h = setup()
+    const thread = h.world.slices.conversation.state.threads.find((thread) => h.world.slices.conversation.timeline.some((event) => event.agent === thread.agent))!
+    const stream = await h.connect()
+    stream.subscribeConversation('stripped', thread.session_id.replace(/^session\//, ''))
+    h.clock.advance(0)
+    const live = h.world.slices.conversation.timeline.filter((event) => event.agent === thread.agent)
+    for (const next of live) h.clock.advance(h.world.now + next.at_ms - h.clock.now())
+    const delivered = h.frames.filter((frame) => frame.kind === 'conversation' && frame.id === 'stripped')
+    expect(delivered).toHaveLength(1 + live.length)
+  })
+
   it('dispatches replace with the newest page and its own history availability', async () => {
     const world = base()
     const thread = world.slices.conversation.state.threads[0]!
