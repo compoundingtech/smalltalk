@@ -21,6 +21,7 @@ import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import { incrDebug, setDebug } from '../telemetry/meters.tsx'
 
 import { LiveTimeline } from '../conversation/fromTimeline.ts'
+import type { TextItem } from '../conversation/model.ts'
 import { undeclared } from '../monitor/source.ts'
 import { gatewayResources } from '../resources/agent/source.ts'
 import { instrumentFetch } from '../telemetry/transport.ts'
@@ -38,6 +39,7 @@ import {
 } from './feedSync.ts'
 import {
   type ConversationPage,
+  type AttachmentPort,
   type DataSource,
   type Feed,
   type Grants,
@@ -61,8 +63,18 @@ interface RetainedFeed<A> {
   readonly snapshot: Atom.Atom<Feed<A>>
   readonly controller: Atom.Atom<Feed<A>>
   readonly sync: Atom.Atom<FeedSync<A>>
+  readonly publish: (value: A) => void
   readonly prefetch: () => void
   readonly release: () => void
+}
+
+interface RetainedConversation extends RetainedFeed<ConversationPage> {
+  readonly send: AttachmentPort['send']
+}
+
+interface PendingSend {
+  item: TextItem
+  messageIds: readonly string[]
 }
 
 /** Connect retained workbench projections through one SDK runtime and frame writer. */
@@ -397,6 +409,10 @@ export const liveSource = ({
       snapshot: data,
       controller: following,
       sync: syncData,
+      publish: (value) => {
+        latest = latest._tag === 'Observed' ? { ...latest, value } : observed({ value })
+        registry.set(data, latest)
+      },
       prefetch: () => {
         unmount ??= registry.mount(following)
         if (ended && !terminalFailure) {
@@ -462,12 +478,28 @@ export const liveSource = ({
 
   // Atom.family is weakly memoized. Keep the 24 recent snapshot controllers explicitly.
   const visibleConversations = new Map<string, boolean>()
-  const conversationFamily = Atom.family((ref: string) => {
+  const attachments = gatewayAttachments(client)
+  const conversationFamily = Atom.family((ref: string): RetainedConversation => {
     const timeline = new LiveTimeline()
+    // This is a local outbox, not a cache: entries disappear only on authoritative identity echo.
+    const pending = new Map<string, PendingSend>()
     let painted = false
     let publishedItems: ConversationPage['items'] = []
     let changedFrom = Infinity
-    return retain<ConversationPage, Extract<FollowSpec, { _tag: 'Conversation' }>>({
+    const projectPage = (): ConversationPage => {
+      const projection = timeline.project()
+      const shown = new Set(projection.items.flatMap((item) => item._tag === 'Message' ? [item.messageId] : []))
+      for (const [id, send] of pending)
+        if (send.messageIds.some((messageId) => shown.has(messageId))) pending.delete(id)
+      changedFrom = Math.min(changedFrom, projection.changedFrom)
+      return {
+        items: pending.size === 0 ? projection.items : [...projection.items, ...[...pending.values()].map((send) => send.item)],
+        hasOlder: timeline.hasOlder,
+        change: { from: publishedItems, index: changedFrom },
+        ...(timeline.observation === undefined ? {} : { observation: timeline.observation }),
+      }
+    }
+    const retained = retain<ConversationPage, Extract<FollowSpec, { _tag: 'Conversation' }>>({
       keepAlive: false,
       explicitInterest: true,
       resolve: () => Effect.succeed({ _tag: 'Conversation', ref }),
@@ -489,24 +521,63 @@ export const liveSource = ({
             timeline.apply(event.value)
             // Entries are identity-deduplicated by the retained timeline, not counted per chunk.
             incrDebug('Wf.conversationEntries', timeline.size - previousSize)
-            const projection = timeline.project()
-            // Coalesced deltas share the earliest dirty suffix of the published frame.
-            changedFrom = Math.min(changedFrom, projection.changedFrom)
-            const change = { from: publishedItems, index: changedFrom }
-            return {
-              _tag: 'Observed' as const,
-              value: {
-                items: projection.items,
-                hasOlder: timeline.hasOlder,
-                change,
-                ...(timeline.observation === undefined ? {} : { observation: timeline.observation }),
-              },
-            }
+            return { _tag: 'Observed' as const, value: projectPage() }
           }),
         ),
     })
+    const publishPending = () => {
+      changedFrom = Math.min(changedFrom, timeline.project().items.length)
+      const page = projectPage()
+      retained.publish(page)
+      publishedItems = page.items
+      changedFrom = Infinity
+    }
+    const send: AttachmentPort['send'] = async (request) => {
+      const idempotencyKey = request.idempotency_key ?? crypto.randomUUID()
+      const id = `pending/${idempotencyKey}`
+      const local: PendingSend = {
+        item: {
+          _tag: 'Text', id, role: 'user',
+          text: request.parameters.content ?? '',
+          attachments: request.parameters.attachments.map((attachment) => ({
+            id: attachment.blob, mediaType: attachment.media_type,
+            ...(attachment.name === undefined ? {} : { name: attachment.name }),
+          })),
+          streaming: false, at: new Date().toISOString(), sendState: { _tag: 'Pending' },
+        },
+        messageIds: [],
+      }
+      pending.set(id, local)
+      publishPending()
+      try {
+        // The public device-signing contract names mail from the first 16 SHA-256 hex digits.
+        // Resolve this before POST so an echo that wins the HTTP race still replaces its outbox item.
+        const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(idempotencyKey)))
+        local.messageIds = [`message/${[...hash.slice(0, 8)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`]
+        const result = await attachments.send({ ...request, idempotency_key: idempotencyKey })
+        if (result._tag === 'Success' && result.value.status !== 'rejected') {
+          const affected = result.value.affected_ids.filter((affected) => affected.startsWith('message/'))
+          if (affected.length > 0) local.messageIds = affected
+        } else {
+          local.item = {
+            ...local.item,
+            sendState: result._tag === 'Refused'
+              ? { _tag: 'Failed', reason: result.reason, detail: result.detail }
+              : { _tag: 'Failed', reason: 'rejected', detail: 'The message action was rejected.' },
+          }
+        }
+        publishPending()
+        return result
+      } catch (cause) {
+        const detail = cause instanceof Error ? cause.message : String(cause)
+        local.item = { ...local.item, sendState: { _tag: 'Failed', reason: 'failed', detail } }
+        publishPending()
+        return { _tag: 'Refused', reason: 'failed', detail }
+      }
+    }
+    return { ...retained, send }
   })
-  const recentConversations = new Map<string, RetainedFeed<ConversationPage>>()
+  const recentConversations = new Map<string, RetainedConversation>()
   const retainConversation = (ref: string) => {
     const entry = conversationFamily(ref)
     recentConversations.delete(ref)
@@ -650,7 +721,7 @@ export const liveSource = ({
       now: wallClock,
       grants,
       contentSearch: gatewayContentSearch(client),
-      attachments: gatewayAttachments(client),
+      attachments: { ...attachments, send: (request) => retainConversation(request.parameters.to).send(request) },
       connection,
       agents,
       missions,

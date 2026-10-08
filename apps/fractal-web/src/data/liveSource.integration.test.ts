@@ -8,6 +8,7 @@ import type {
   Snapshot,
   TerminalScreen,
 } from '@smalltalk/st3-client'
+import type { AttachmentSendRequest } from './source.ts'
 import { Effect } from 'effect'
 import * as Option from 'effect/Option'
 import * as Atom from 'effect/reactivity/Atom'
@@ -46,6 +47,10 @@ class Gateway {
   capabilityGate: Promise<void> | undefined
   rejectedCredential = false
   runtimeRefusalStatus: number | undefined
+  sendGate: Promise<void> | undefined
+  rejectSend = false
+  readonly messageActions: AttachmentSendRequest[] = []
+  echoMessageId = ''
 
   readonly fetch: typeof fetch = async (input, init) => {
     const path = new URL(String(input)).pathname
@@ -110,6 +115,10 @@ class Gateway {
     } else if (path === '/v1/client/actions' && typeof init?.body === 'string') {
       const action = JSON.parse(init.body)
       if (action.type === 'message.send') {
+        this.messageActions.push(action)
+        const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(action.idempotency_key)))
+        this.echoMessageId = `message/${[...hash.slice(0, 8)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`
+        await this.sendGate
         if (this.transportFailure) throw new TypeError('Gateway disconnected')
         if (this.messageGrant !== 'granted') {
           return new Response(
@@ -139,8 +148,8 @@ class Gateway {
           kind: 'action-result',
           action_id: action.id,
           operation_id: 'operation/send',
-          status: 'completed',
-          affected_ids: ['message/gateway-selected'],
+          status: this.rejectSend ? 'rejected' : 'completed',
+          affected_ids: [this.echoMessageId],
           snapshot_id: snapshot.id,
         }
       } else if (action.type === 'terminal.attach') {
@@ -186,6 +195,22 @@ class Gateway {
 
   send(frame: CollectionFrame) {
     this.socket?.onmessage?.({ data: JSON.stringify(frame) })
+  }
+
+  mailEcho() {
+    this.send({
+      kind: 'conversation', id: this.subscription('conversation').id,
+      collection: 'conversation', session_id: 'session/example',
+      replace: false, has_more: false,
+      items: [
+        { id: 'timeline-entry/echo/message', sequence: 1, revision: 1,
+          type: 'message', role: 'user', final: true, timestamp: snapshot.created_at,
+          body: { message_id: this.echoMessageId, from: 'person/operator', to: agent.id } },
+        { id: 'timeline-entry/echo/content', sequence: 2, revision: 1,
+          type: 'content', role: 'user', final: true, timestamp: snapshot.created_at,
+          body: { media_type: 'text/plain', text: 'hello' } },
+      ],
+    })
   }
 
   fleet(rows: Agent[]) {
@@ -465,4 +490,92 @@ describe('terminal dependent-read authority', () => {
       }),
     ),
   )
+})
+
+describe('optimistic conversation sends', () => {
+  const request: AttachmentSendRequest = {
+    api_version: 'st3.client.v0', type: 'message.send', id: 'action/optimistic',
+    // Omission exercises the data layer's fresh client-generated idempotency key.
+    fence: { snapshot_id: snapshot.id, subject_revisions: {} },
+    parameters: { to: agent.id, content: 'hello', tags: [], attachments: [] },
+  }
+
+  for (const echoFirst of [false, true]) {
+    it.live(`publishes pending prose synchronously and replaces it when echo arrives ${echoFirst ? 'before' : 'after'} POST resolves`, () =>
+      withGateway((live, gateway) =>
+        Effect.gen(function* () {
+          live.registry.mount(live.source.conversationInterest!(agent.id))
+          const conversation = live.source.conversation(agent.id)
+          live.registry.mount(conversation)
+          yield* settle
+          let resolvePost!: () => void
+          gateway.sendGate = new Promise<void>((resolve) => { resolvePost = resolve })
+          const sending = live.source.attachments.send(request)
+          // No microtask, timer or animation frame occurs between send and this read.
+          expect(live.registry.get(conversation)).toMatchObject({
+            _tag: 'Observed', value: { items: [
+              { _tag: 'Text', role: 'user', text: 'hello', sendState: { _tag: 'Pending' } },
+            ] },
+          })
+          gateway.send({
+            kind: 'conversation', id: gateway.subscription('conversation').id,
+            collection: 'conversation', session_id: 'session/example',
+            replace: true, has_more: false, items: [],
+          })
+          yield* settle
+          expect(live.registry.get(conversation)).toMatchObject({
+            _tag: 'Observed', value: { items: [
+              { _tag: 'Text', text: 'hello', sendState: { _tag: 'Pending' } },
+            ] },
+          })
+          if (echoFirst) {
+            yield* settle
+            expect(gateway.echoMessageId).toMatch(/^message\/[0-9a-f]{16}$/)
+            gateway.mailEcho()
+            yield* settle
+            expect(live.registry.get(conversation)).toMatchObject({
+              _tag: 'Observed', value: { items: [
+                { _tag: 'Message', messageId: gateway.echoMessageId },
+                { _tag: 'Text', id: 'timeline-entry/echo/content', text: 'hello' },
+              ] },
+            })
+          }
+          resolvePost()
+          expect((yield* Effect.promise(() => sending))._tag).toBe('Success')
+          if (!echoFirst) gateway.mailEcho()
+          yield* settle
+          const feed = live.registry.get(conversation)
+          expect(feed._tag).toBe('Observed')
+          if (feed._tag !== 'Observed') return
+          expect(feed.value.items.filter((item) => item._tag === 'Text')).toEqual([
+            expect.objectContaining({ id: 'timeline-entry/echo/content', text: 'hello' }),
+          ])
+          expect(feed.value.items.every((item) => item._tag !== 'Text' || item.sendState === undefined)).toBe(true)
+          expect(gateway.messageActions[0]?.idempotency_key).toMatch(/^[0-9a-f-]{36}$/)
+        }),
+      ),
+    )
+  }
+
+  for (const failure of ['rejected', 'failed', 'ungranted'] as const) {
+    it.live(`retains typed failed prose on ${failure} send`, () =>
+      withGateway((live, gateway) =>
+        Effect.gen(function* () {
+          live.registry.mount(live.source.conversationInterest!(agent.id))
+          const conversation = live.source.conversation(agent.id)
+          live.registry.mount(conversation)
+          yield* settle
+          gateway.rejectSend = failure === 'rejected'
+          gateway.transportFailure = failure === 'failed'
+          gateway.messageGrant = failure === 'ungranted' ? 'ungranted' : 'granted'
+          yield* Effect.promise(() => live.source.attachments.send(request))
+          expect(live.registry.get(conversation)).toMatchObject({
+            _tag: 'Observed', value: { items: [
+              { _tag: 'Text', role: 'user', text: 'hello', sendState: { _tag: 'Failed', reason: failure } },
+            ] },
+          })
+        }),
+      ),
+    )
+  }
 })

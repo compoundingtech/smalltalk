@@ -46,10 +46,11 @@ export const gatewayAttachments = (client: St3Client): AttachmentPort => ({
     }
   },
   send: async (request) => {
+    const idempotencyKey = request.idempotency_key ?? crypto.randomUUID()
     let attachments: readonly Native.AttachmentInput[]
     // Validate the actual generated action contract (including max four PNG/JPEG/GIF/WebP references).
     try {
-      const action = Native.decodeUnknownSync(Native.ActionRequest)(request)
+      const action = Native.decodeUnknownSync(Native.ActionRequest)({ ...request, idempotency_key: idempotencyKey })
       if (action.type !== 'message.send') {
         return { _tag: 'Refused', reason: 'invalid', detail: 'Attachment sending requires a message.send action.' }
       }
@@ -65,7 +66,7 @@ export const gatewayAttachments = (client: St3Client): AttachmentPort => ({
       }
       const response = await client.messageSend({
         id: request.id,
-        idempotency_key: request.idempotency_key,
+        idempotency_key: idempotencyKey,
         fence: request.fence,
         parameters: {
           ...request.parameters,
