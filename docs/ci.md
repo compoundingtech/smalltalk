@@ -570,6 +570,15 @@ failed lookups separately. A missing exact key or failed restore emits a P0 warn
 both the log and the job summary; a skipped archive on ci1 is identified as a persistent
 runner store, rather than called an archive hit.
 
+If checkout/setup did not provide the audit script, the always-running reporter says
+coverage is unavailable without inventing a hit or miss. This includes archive consumers
+stopped by a failed shared producer before checkout; the producer precondition still fails.
+Once checkout succeeds, a missing audit script or an audit error remains a failure.
+Copied audit tools remain usable when a later checkout is skipped.
+The snapshot finalizer uses the same checkout status: if its helper is unavailable before
+checkout completes, it reports that no snapshot was created and sets `publish=false`.
+An available pack helper still runs, including after a build failure, and its errors propagate.
+
 Cargo keys include the lockfiles, workspace manifests and linker configuration. Nix keys
 include the flake, Nix expressions and compatibility pins. Both cover macOS as well as
 Linux, with isolated Cargo and Nix-cache directories. Genie freshness and isolation have

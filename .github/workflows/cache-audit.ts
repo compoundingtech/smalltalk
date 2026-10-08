@@ -27,8 +27,27 @@ export const auditCaches = <T extends { jobs: Record<string, any> }>(workflow: T
       return { ...step, id }
     })
     if (entries.length) {
+      const checkoutIndex = steps.findIndex((step: any) => /^actions\/checkout@/.test(step.uses ?? ''))
+      const checkoutId = checkoutIndex < 0 ? undefined : steps[checkoutIndex].id ?? `cache-audit-checkout-${checkoutIndex}`
+      if (checkoutId) steps[checkoutIndex] = { ...steps[checkoutIndex], id: checkoutId }
+      const checkoutOutcome = checkoutId ? `\${{ steps.${checkoutId}.outcome }}` : ''
+      for (const [index, step] of steps.entries()) {
+        if (step.id === 'build-snapshot-save') {
+          steps[index] = { ...step, env: { ...step.env, CI_CACHE_CHECKOUT_OUTCOME: checkoutOutcome } }
+        }
+      }
       steps.push({ name: 'Report job cache coverage', if: 'always()', shell: 'bash',
-        env: { CACHE_ENTRIES: JSON.stringify(entries) }, run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"' })
+        env: { CACHE_ENTRIES: JSON.stringify(entries),
+          CI_CACHE_CHECKOUT_OUTCOME: checkoutOutcome },
+        // A failed producer can stop archive consumers before checkout or Python setup.
+        // Once checkout succeeds, a missing audit script must remain an error.
+        run: `audit_script="\${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"
+if [ ! -f "$audit_script" ] && [ "$CI_CACHE_CHECKOUT_OUTCOME" != success ]; then
+  printf '%s\\n' 'Cache coverage: **UNAVAILABLE (checkout/setup incomplete)** — audit script is absent; no cache hit/miss verdict.' >> "$GITHUB_STEP_SUMMARY"
+  echo '::notice::Cache coverage unavailable: checkout/setup did not provide the audit script'
+  exit 0
+fi
+python3 "$audit_script"` })
     } else if (noBuild[name]) {
       steps.push(noBuildCache(noBuild[name]))
     } else {
