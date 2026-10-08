@@ -132,7 +132,14 @@ impl Source for Fixture {
         )?;
         hook_fault(self.commit_failure.load(Ordering::SeqCst))
     }
-    fn capture(&self, c: &Connection, _: &Context, _: u64, budget: Budget) -> Result<Capture> {
+    fn capture(
+        &self,
+        _: &Store,
+        c: &Connection,
+        _: &Context,
+        _: u64,
+        budget: Budget,
+    ) -> Result<Capture> {
         assert!(budget.rows >= 1 && budget.bytes >= 16);
         self.captures.fetch_add(1, Ordering::SeqCst);
         let value = c
@@ -158,7 +165,7 @@ impl Source for Fixture {
             wake_at_unix_ms: None,
         })
     }
-    fn coverage(&self, _: &Connection, _: &Context, _: u64) -> Result<bool> {
+    fn coverage(&self, _: &Store, _: &Connection, _: &Context, _: u64) -> Result<bool> {
         Ok(self.covered.load(Ordering::SeqCst))
     }
 }
@@ -194,7 +201,13 @@ impl Captured for Facts {
     }
 }
 impl Page for Facts {
-    fn publish(self: Box<Self>, tx: &Transaction<'_>, _: &Context, _: u64) -> Result<bool> {
+    fn publish(
+        self: Box<Self>,
+        _: &Store,
+        tx: &Transaction<'_>,
+        _: &Context,
+        _: u64,
+    ) -> Result<bool> {
         let current = tx
             .query_row(
                 "SELECT value FROM local_fixture_reactor_pending WHERE source=?1",
@@ -622,7 +635,12 @@ async fn failed_durable_fence_refuses_reads_even_if_native_coverage_claims_ready
     let registry = store.collection_sources().unwrap();
     assert!(
         store
-            .read_snapshot(|_| registry.coverage(fixture.source, &store.readers.get(), clock_ms()))
+            .read_snapshot(|_| registry.coverage(
+                fixture.source,
+                &store,
+                &store.readers.get(),
+                clock_ms()
+            ))
             .unwrap()
     );
     replace(&store, fixture.source, 17);
@@ -639,12 +657,17 @@ async fn failed_durable_fence_refuses_reads_even_if_native_coverage_claims_ready
     );
     assert!(
         fixture
-            .coverage(&store.readers.get(), &registry.cx, clock_ms())
+            .coverage(&store, &store.readers.get(), &registry.cx, clock_ms())
             .unwrap()
     );
     assert!(
         !store
-            .read_snapshot(|_| registry.coverage(fixture.source, &store.readers.get(), clock_ms()))
+            .read_snapshot(|_| registry.coverage(
+                fixture.source,
+                &store,
+                &store.readers.get(),
+                clock_ms()
+            ))
             .unwrap()
     );
     assert_eq!(output(&store, fixture.source), None);
@@ -742,4 +765,153 @@ async fn an_idle_siblings_capture_hook_failure_does_not_fence_valid_publication(
             );
         }
     }
+}
+
+// A cache marker is an honest independent source without an IVM row namespace.
+// It echoes one bounded native index only; it certifies no production snapshot.
+struct CacheOnly {
+    ready: Arc<Mutex<Option<u64>>>,
+    fail: AtomicBool,
+}
+impl Source for CacheOnly {
+    fn name(&self) -> &'static str {
+        "fixture.cache-only"
+    }
+    fn views(&self) -> Vec<Box<dyn View>> {
+        vec![]
+    }
+    fn operators(&self) -> Vec<Box<dyn Operator>> {
+        vec![]
+    }
+    fn create_schema(&self, _: &Connection) -> Result<()> {
+        Ok(())
+    }
+    fn open(&self, tx: &Transaction<'_>, cx: &Context) -> Result<()> {
+        cx.installer
+            .register_source(tx, self.name(), "fixture.cache-only.v1", 1)
+    }
+    fn capture(
+        &self,
+        store: &Store,
+        c: &Connection,
+        cx: &Context,
+        _: u64,
+        budget: Budget,
+    ) -> Result<Capture> {
+        assert!(Arc::ptr_eq(&store.ivm_views().unwrap(), &cx.views));
+        assert!(budget.rows >= 1 && budget.bytes >= 8);
+        if self.fail.load(Ordering::SeqCst) {
+            anyhow::bail!("fixture cache capture failure");
+        }
+        let index = smallclaims::store::current_index(c)?;
+        Ok(Capture {
+            work: (*self.ready.lock().unwrap() != Some(index)).then(|| {
+                Box::new(CacheMarker {
+                    index,
+                    ready: self.ready.clone(),
+                }) as Box<dyn Captured>
+            }),
+            wake_at_unix_ms: None,
+        })
+    }
+    fn coverage(&self, store: &Store, c: &Connection, cx: &Context, _: u64) -> Result<bool> {
+        assert!(Arc::ptr_eq(&store.ivm_views().unwrap(), &cx.views));
+        Ok(*self.ready.lock().unwrap() == Some(smallclaims::store::current_index(c)?))
+    }
+}
+struct CacheMarker {
+    index: u64,
+    ready: Arc<Mutex<Option<u64>>>,
+}
+impl Captured for CacheMarker {
+    fn prepare(self: Box<Self>, _: &Context) -> Result<Box<dyn Page>> {
+        Ok(self)
+    }
+}
+impl Page for CacheMarker {
+    fn publish(
+        self: Box<Self>,
+        store: &Store,
+        tx: &Transaction<'_>,
+        cx: &Context,
+        _: u64,
+    ) -> Result<bool> {
+        assert!(Arc::ptr_eq(&store.ivm_views().unwrap(), &cx.views));
+        if smallclaims::store::current_index(tx)? != self.index {
+            return Ok(true);
+        }
+        // No DML and no strong Store retained: the stable native cut is the sole marker.
+        *self.ready.lock().unwrap() = Some(self.index);
+        Ok(false)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_only_source_uses_borrowed_owner_and_guarded_shared_lifecycle() {
+    let root = tempfile::tempdir().unwrap();
+    let source = Arc::new(CacheOnly {
+        ready: Arc::new(Mutex::new(None)),
+        fail: AtomicBool::new(false),
+    });
+    let store = Arc::new(
+        Store::open_with_collection_sources(
+            &root.path().join("cache.db"),
+            "alder",
+            vec![source.clone()],
+        )
+        .unwrap(),
+    );
+    assert!(store.prepared_ivm_publisher().is_some());
+    let registry = store.collection_sources().unwrap();
+    assert!(registry.names[0].is_empty());
+    assert!(
+        !store
+            .read_snapshot(|_| registry.coverage(
+                source.name(),
+                &store,
+                &store.readers.get(),
+                clock_ms()
+            ))
+            .unwrap()
+    );
+    assert!(store.start_collection_reactor().unwrap());
+    assert!(!store.start_collection_reactor().unwrap());
+    wait_for(|| source.ready.lock().unwrap().is_some()).await;
+    assert!(
+        store
+            .read_snapshot(|_| registry.coverage(
+                source.name(),
+                &store,
+                &store.readers.get(),
+                clock_ms()
+            ))
+            .unwrap()
+    );
+    source.fail.store(true, Ordering::SeqCst);
+    registry.wake();
+    wait_for(|| registry.unavailable[0].load(Ordering::Acquire)).await;
+    assert!(
+        !store
+            .read_snapshot(|_| registry.coverage(
+                source.name(),
+                &store,
+                &store.readers.get(),
+                clock_ms()
+            ))
+            .unwrap()
+    );
+    // The factory guard refuses even though this fixture's raw cache marker still matches.
+    assert!(
+        store
+            .read_snapshot(|_| source.coverage(
+                &store,
+                &store.readers.get(),
+                &registry.cx,
+                clock_ms()
+            ))
+            .unwrap()
+    );
+    let weak = Arc::downgrade(&store);
+    drop(store);
+    wait_for(|| weak.upgrade().is_none()).await;
 }

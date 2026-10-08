@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "New crate-internal source lifecycle and scheduler API; explicitly registered Stores attach their shared publisher before exposure and consumer getters only clone prepared state. Collection adapters must independently check native coverage even on silent pages. No production source is registered or selected by this change."
+    "detail": "New crate-internal source lifecycle and scheduler API, including named cache-only sources with no views/operators and borrowed Store access for bounded capture/cut checks; explicitly registered Stores attach their shared publisher before exposure and consumer getters only clone prepared state. Collection adapters must independently check native coverage even on silent pages. No production source is registered or selected by this change."
   },
   "downtime": {
     "status": "none",

@@ -36,12 +36,15 @@ pub(crate) struct Context {
 /// Source implementations must not retain a strong Store or another runtime owner.
 pub(crate) trait Source: Send + Sync {
     fn name(&self) -> &'static str;
+    /// Cache-only sources may return zero views/operators. They still own a named,
+    /// persistent source lifetime, complete cut coverage and guarded cache reads.
     fn views(&self) -> Vec<Box<dyn View>>;
     fn operators(&self) -> Vec<Box<dyn Operator>>;
     fn create_schema(&self, connection: &Connection) -> Result<()>;
     /// After native projection setup, before exposing the Store. Register capture and
     /// compatible lifetimes; start explicit bounded jobs, never scan/replay or mark Ready.
     /// Preserve any unmanaged migration/schema gap; do not heal an unavailable lifetime.
+    /// Cache-only sources also register their persistent Installer source lifetime.
     fn open(&self, tx: &Transaction<'_>, cx: &Context) -> Result<()>;
     /// Scope/capture bookkeeping only. Native triggers retain immutable OLD/NEW images
     /// at Installer revisions; callbacks must not extract bodies or run operators.
@@ -55,8 +58,11 @@ pub(crate) trait Source: Send + Sync {
     }
     /// Indexed bounded facts in one read snapshot, including exact source identity/revision
     /// and all required native/local/producer evidence. Return None for unrelated commits.
+    /// Borrowed Store permits Core cache/metadata access only within this call; it must
+    /// not initialize or rebuild caches inline, or escape into the owned preparation.
     fn capture(
         &self,
+        store: &Store,
         connection: &Connection,
         cx: &Context,
         now_ms: u64,
@@ -64,7 +70,15 @@ pub(crate) trait Source: Send + Sync {
     ) -> Result<Capture>;
     /// Independently prove coverage at this read cut, even for a silent collection page.
     /// Neither registration, a queue revision nor MAX claim index proves coverage.
-    fn coverage(&self, connection: &Connection, cx: &Context, now_ms: u64) -> Result<bool>;
+    /// Borrowed Store access is prepared state/metadata only, never lazy repair/build.
+    /// Check persisted lifetime availability plus the source's complete native cut.
+    fn coverage(
+        &self,
+        store: &Store,
+        connection: &Connection,
+        cx: &Context,
+        now_ms: u64,
+    ) -> Result<bool>;
 }
 
 pub(crate) struct Capture {
@@ -83,7 +97,17 @@ pub(crate) trait Page: Send {
     /// captured rows. Recheck independent coverage before publishing through Views.
     /// Return true when more work remains, including a stale page with no output applied.
     /// Logical source gaps fence source/views; storage errors propagate and roll back.
-    fn publish(self: Box<Self>, tx: &Transaction<'_>, cx: &Context, now_ms: u64) -> Result<bool>;
+    /// Cache-only publication may perform no DML, but uses this same writer admission
+    /// to recheck its native cut. Store is borrowed, never retained by a page/source.
+    /// A cache exposed before commit must independently refuse a rolled-back cursor or
+    /// generation; publication must not make uncommitted evidence appear ready.
+    fn publish(
+        self: Box<Self>,
+        store: &Store,
+        tx: &Transaction<'_>,
+        cx: &Context,
+        now_ms: u64,
+    ) -> Result<bool>;
 }
 
 pub(crate) struct Registry {
@@ -115,7 +139,7 @@ impl Registry {
             let views = source.views();
             let ops = source.operators();
             anyhow::ensure!(
-                !views.is_empty() && views.len() <= 16 && views.len() == ops.len(),
+                views.len() <= 16 && views.len() == ops.len(),
                 "collection view/operator registry mismatch"
             );
             let mut view_names = BTreeSet::new();
@@ -239,7 +263,13 @@ impl Registry {
 
     /// Source factories must use this guard for adapter reads, including silent pages.
     /// A failed durable fence cannot leave that Store's old namespace served.
-    pub fn coverage(&self, source: &str, connection: &Connection, now_ms: u64) -> Result<bool> {
+    pub fn coverage(
+        &self,
+        source: &str,
+        store: &Store,
+        connection: &Connection,
+        now_ms: u64,
+    ) -> Result<bool> {
         let index = self
             .sources
             .iter()
@@ -248,7 +278,7 @@ impl Registry {
         if self.unavailable[index].load(Ordering::Acquire) {
             return Ok(false);
         }
-        let covered = self.sources[index].coverage(connection, &self.cx, now_ms)?;
+        let covered = self.sources[index].coverage(store, connection, &self.cx, now_ms)?;
         Ok(covered && !self.unavailable[index].load(Ordering::Acquire))
     }
 
@@ -317,7 +347,13 @@ async fn run(store: Weak<Store>, registry: Arc<Registry>, stopped: Arc<AtomicBoo
                 let source = &worker.sources[index];
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let capture = reader.read_snapshot(|_| {
-                        source.capture(&reader.readers.get(), &worker.cx, clock_ms(), BUDGET)
+                        source.capture(
+                            &reader,
+                            &reader.readers.get(),
+                            &worker.cx,
+                            clock_ms(),
+                            BUDGET,
+                        )
                     })?;
                     // The source snapshot has ended before preparation or writer admission.
                     let page = capture
@@ -335,7 +371,7 @@ async fn run(store: Weak<Store>, registry: Arc<Registry>, stopped: Arc<AtomicBoo
                         return Ok((false, None));
                     }
                     let tx = writer.transaction()?;
-                    let more = page.publish(&tx, &worker.cx, clock_ms())?;
+                    let more = page.publish(&reader, &tx, &worker.cx, clock_ms())?;
                     tx.commit()?;
                     Ok((more, capture.wake_at_unix_ms))
                 }))
