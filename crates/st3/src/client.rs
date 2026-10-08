@@ -2581,6 +2581,22 @@ mod tests {
         runtime_id: &str,
         created_at: &str,
     ) -> std::thread::JoinHandle<Vec<u8>> {
+        pty_session_with_tail(
+            root,
+            runtime_id,
+            created_at,
+            pty_core::protocol::encode_exit(0),
+            false,
+        )
+    }
+
+    fn pty_session_with_tail(
+        root: &Path,
+        runtime_id: &str,
+        created_at: &str,
+        tail: Vec<u8>,
+        close: bool,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
         use std::io::{Read as _, Write as _};
         std::fs::create_dir_all(root).unwrap();
         std::fs::write(
@@ -2610,9 +2626,10 @@ mod tests {
                     stream
                         .write_all(&pty_core::protocol::encode_screen(b"straight from the pty"))
                         .unwrap();
-                    stream
-                        .write_all(&pty_core::protocol::encode_exit(0))
-                        .unwrap();
+                    stream.write_all(&tail).unwrap();
+                    if close {
+                        return received;
+                    }
                 }
             }
         })
@@ -2663,6 +2680,41 @@ mod tests {
         output.rewind().unwrap();
         output.read_to_string(&mut shown).unwrap();
         assert!(shown.contains("straight from the pty"), "{shown:?}");
+    }
+
+    #[tokio::test]
+    async fn a_local_attachment_loss_never_claims_that_the_child_exited() {
+        use std::io::{Read as _, Seek as _};
+        for tail in [Vec::new(), vec![12, 0, 0], vec![12, 0, 0, 0, 1, 0]] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("pty");
+            let session = pty_session_with_tail(
+                &root,
+                "worker",
+                "2026-09-29T08:00:00.000Z",
+                tail.clone(),
+                true,
+            );
+            let terminal = LocalTerminal {
+                subject: "agent/worker".into(),
+                runtime_id: "worker".into(),
+                incarnation_id: format!("{}:2026-09-29T08:00:00.000Z", std::process::id()),
+                pty_root: root,
+            };
+            let (io, _input, mut output) = silent_io();
+            let exit = attach_local_terminal_with_io(&terminal, io).await.unwrap();
+            session.join().unwrap();
+            let mut shown = String::new();
+            output.rewind().unwrap();
+            output.read_to_string(&mut shown).unwrap();
+            assert_eq!(exit, 1, "attachment tail {tail:?}: {shown:?}");
+            assert!(shown.contains("connection lost"), "{shown:?}");
+            assert!(!shown.contains("session ended"), "{shown:?}");
+            assert!(!shown.contains("exited with code"), "{shown:?}");
+            if tail.len() == 6 {
+                assert!(shown.contains("client too slow"), "{shown:?}");
+            }
+        }
     }
 
     #[tokio::test]
