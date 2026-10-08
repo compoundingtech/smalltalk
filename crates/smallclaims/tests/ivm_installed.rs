@@ -758,3 +758,261 @@ fn runtime_digest_binds_installed_source_and_preserves_legacy_bytes() {
     assert_ne!(legacy, installed);
     assert_ne!(installed, digest(Some("different-source")));
 }
+
+#[test]
+fn prepared_namespace_publication_and_pending_availability_are_atomic() {
+    use rusqlite::types::Value as Sql;
+    use smallclaims::ivm::install::prepared::{CaptureLimits, PublicationLimits};
+    use smallclaims::ivm::installed::PreparedPublication;
+    let f = fixture();
+    let mut writer = f.store.connection.write();
+    let tx = writer.transaction().unwrap();
+    let position = f.installer.position(&tx, SOURCE).unwrap();
+    f.installer
+        .enable_deferred(
+            &tx,
+            &position,
+            CaptureLimits {
+                rows: 32,
+                bytes: 65536,
+                reference_bytes: 4096,
+            },
+        )
+        .unwrap();
+    let job = f.installer.start(&tx, NAME, limits(), 0).unwrap();
+    tx.commit().unwrap();
+    drop(writer);
+    let mut page = f
+        .store
+        .read_snapshot(|_| {
+            let db = f.store.readers.get();
+            let mut page = f.installer.prepare_scan(
+                &db,
+                &ScanPage {
+                    job: job.clone(),
+                    expected_cursor: vec![],
+                    next_cursor: vec![1],
+                    position: f.installer.position(&db, SOURCE)?,
+                    rows: vec![Mutation {
+                        key: "agent/amber".into(),
+                        old: None,
+                        new: Some(card("alder", "idle")),
+                    }],
+                    finished: true,
+                },
+                PublicationLimits::default(),
+            )?;
+            page.capture_table(&db, "installed_agent_cards")?;
+            Ok(page)
+        })
+        .unwrap();
+    let payload = card("alder", "idle").to_string();
+    page.upsert(
+        "installed_agent_cards",
+        vec![Sql::Text("agent/amber".into()), Sql::Text(payload.clone())],
+    )
+    .unwrap();
+    let mut writer = f.store.connection.write();
+    let tx = writer.transaction().unwrap();
+    f.installer.publish_prepared(&tx, &page, 1).unwrap();
+    tx.commit().unwrap();
+    drop(writer);
+    let mut page = f
+        .store
+        .read_snapshot(|_| {
+            let db = f.store.readers.get();
+            let mut page = f
+                .installer
+                .prepare_catch_up(&db, &job, PublicationLimits::default())?;
+            page.capture_table(&db, "installed_agent_cards")?;
+            Ok(page)
+        })
+        .unwrap();
+    page.require_row(
+        "installed_agent_cards",
+        vec![Sql::Text("agent/amber".into())],
+        vec![("payload".into(), Sql::Text(payload))],
+    )
+    .unwrap();
+    let mut writer = f.store.connection.write();
+    let tx = writer.transaction().unwrap();
+    let position = f.installer.position(&tx, SOURCE).unwrap();
+    assert_eq!(
+        f.views
+            .publish_prepared_installed(
+                &tx,
+                &f.installer,
+                &page,
+                PreparedPublication {
+                    expected_position: &position,
+                    cut: cut(&f, 0),
+                    changed: Changed::Refresh,
+                    now_ms: 2
+                },
+            )
+            .unwrap(),
+        Outcome::Published
+    );
+    tx.commit().unwrap();
+    drop(writer);
+    let before = f
+        .views
+        .availability(&f.store.readers.get(), NAME, 9)
+        .unwrap();
+    let mut writer = f.store.connection.write();
+    let tx = writer.transaction().unwrap();
+    f.installer
+        .capture_deferred(
+            &tx,
+            SOURCE,
+            &Mutation {
+                key: "agent/amber".into(),
+                old: Some(json!({"version":0})),
+                new: Some(json!({"version":1})),
+            },
+        )
+        .unwrap();
+    tx.commit().unwrap();
+    drop(writer);
+    let pending = f
+        .views
+        .availability(&f.store.readers.get(), NAME, 9)
+        .unwrap();
+    assert_eq!(pending.readiness, Readiness::SourcePending);
+    assert_ne!(before.token, pending.token);
+    let mut page = f
+        .store
+        .read_snapshot(|_| {
+            let db = f.store.readers.get();
+            let mut page = f
+                .installer
+                .prepare_live(&db, NAME, PublicationLimits::default())?;
+            page.capture_table(&db, "installed_agent_cards")?;
+            Ok(page)
+        })
+        .unwrap();
+    page.upsert(
+        "installed_agent_cards",
+        vec![
+            Sql::Text("agent/amber".into()),
+            Sql::Text(card("alder", "busy").to_string()),
+        ],
+    )
+    .unwrap();
+    page.mark_visible_change();
+    let mut writer = f.store.connection.write();
+    let tx = writer.transaction().unwrap();
+    let position = f.installer.position(&tx, SOURCE).unwrap();
+    // Oversized semantic metadata must roll back prepared rows and applied prefix together.
+    let bad = vec!["x".repeat(4097)];
+    assert!(
+        f.views
+            .publish_prepared_installed(
+                &tx,
+                &f.installer,
+                &page,
+                PreparedPublication {
+                    expected_position: &position,
+                    cut: cut(&f, 0),
+                    changed: Changed::Keys(&bad),
+                    now_ms: 3
+                },
+            )
+            .is_err()
+    );
+    tx.commit().unwrap();
+    drop(writer);
+    assert_eq!(
+        f.views
+            .availability(&f.store.readers.get(), NAME, 9)
+            .unwrap()
+            .readiness,
+        Readiness::SourcePending
+    );
+    let mut writer = f.store.connection.write();
+    let tx = writer.transaction().unwrap();
+    let keys = vec!["agent/amber".into()];
+    f.views
+        .publish_prepared_installed(
+            &tx,
+            &f.installer,
+            &page,
+            PreparedPublication {
+                expected_position: &position,
+                cut: cut(&f, 0),
+                changed: Changed::Keys(&keys),
+                now_ms: 4,
+            },
+        )
+        .unwrap();
+    tx.commit().unwrap();
+    drop(writer);
+    let after = f
+        .views
+        .availability(&f.store.readers.get(), NAME, 9)
+        .unwrap();
+    assert!(matches!(after.readiness, Readiness::Ready(_)));
+    assert_ne!(pending.token, after.token);
+    let generation = f
+        .installer
+        .root(&f.store.readers.get(), NAME)
+        .unwrap()
+        .generation;
+    let mut writer = f.store.connection.write();
+    let tx = writer.transaction().unwrap();
+    f.installer
+        .capture_deferred(
+            &tx,
+            SOURCE,
+            &Mutation {
+                key: "agent/amber".into(),
+                old: Some(json!({"version":1})),
+                new: Some(json!({"version":2})),
+            },
+        )
+        .unwrap();
+    tx.commit().unwrap();
+    drop(writer);
+    let pending = f
+        .views
+        .availability(&f.store.readers.get(), NAME, 9)
+        .unwrap();
+    let page = f
+        .store
+        .read_snapshot(|_| {
+            f.installer
+                .prepare_live(&f.store.readers.get(), NAME, PublicationLimits::default())
+        })
+        .unwrap();
+    let mut writer = f.store.connection.write();
+    let tx = writer.transaction().unwrap();
+    let position = f.installer.position(&tx, SOURCE).unwrap();
+    f.views
+        .publish_prepared_installed(
+            &tx,
+            &f.installer,
+            &page,
+            PreparedPublication {
+                expected_position: &position,
+                cut: cut(&f, 0),
+                changed: Changed::Keys(&[]),
+                now_ms: 5,
+            },
+        )
+        .unwrap();
+    tx.commit().unwrap();
+    drop(writer);
+    assert_eq!(
+        f.installer
+            .root(&f.store.readers.get(), NAME)
+            .unwrap()
+            .generation,
+        generation
+    );
+    let ready = f
+        .views
+        .availability(&f.store.readers.get(), NAME, 9)
+        .unwrap();
+    assert!(matches!(ready.readiness, Readiness::Ready(_)));
+    assert_ne!(ready.token, pending.token);
+}

@@ -34,6 +34,13 @@ building Smalltalk does not require Zig or a Ghostty source checkout.
 The runtime, screen projector and terminal UI pin their PTY protocol crates to the same
 producer revision, keeping one shared protocol source in the workspace.
 
+Nix vendors the PTY Cargo git dependencies from the existing `pty` flake input's
+GitHub archive, not an anonymous Git checkout. Vendoring fails during evaluation
+if the resolved PTY revision in `Cargo.lock` differs from the flake input, so update
+the Cargo dependency pins and the `pty` input together. The input's locked NAR hash
+also supplies the Cargo source hash. Any new Cargo git dependency needs an
+archive-backed source before Nix can vendor it.
+
 Without Nix, build and install from a checkout with a Rust toolchain and the matching
 `libghostty-vt` artifact. Set `PKG_CONFIG_PATH` to its `share/pkgconfig` directory;
 `pkg-config --static --libs libghostty-vt-static` must resolve before building:

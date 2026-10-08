@@ -1345,24 +1345,43 @@ impl Store {
         .map_err(internal)
     }
     /// Fence an external effect prepared from a declaration against the selected set.
+    /// Effect callers must enter outside an enclosing read snapshot and wait for this
+    /// method to return before writing or performing the effect.
     pub fn owned_desired_guard(&self, desired: &DesiredSubject) -> Result<(), St3Error> {
-        let connection = self.readers.get();
-        guard_member(&connection, &desired.subject)?;
-        if let Some(set) = owner(&connection, &desired.subject, None)? {
-            let view = selected(&connection, None)?
-                .into_iter()
-                .find(|v| v.id == set)
-                .ok_or_else(|| St3Error::new("owned-set-pending", "missing owning set"))?;
-            let members = effective_members(&connection, &view, None)?;
-            let member = members.get(&desired.subject);
-            if member.is_none_or(|(m, _, _)| m.revision != desired_revision(desired)) {
-                return Err(St3Error::new(
-                    "stale-set-member",
-                    "declaration changed since this effect was prepared",
-                ));
-            }
-        }
-        Ok(())
+        smallclaims::sqlite::debug_assert_no_pinned_read();
+        // Every invocation starts a current read snapshot. Reuse receipt rows only within
+        // this fence, so its several authority checks agree without refolding the history.
+        self.read_snapshot(|_| {
+            Ok(self.with_owned_set_snapshot_reads(|| {
+                let connection = self.readers.get();
+                if let Some(set) = owner(&connection, &desired.subject, None)? {
+                    let view = selected(&connection, None)?
+                        .into_iter()
+                        .find(|v| v.id == set)
+                        .ok_or_else(|| St3Error::new("owned-set-pending", "missing owning set"))?;
+                    if !view.blockers.is_empty() {
+                        return Err(St3Error::new("owned-set-pending", view.blockers.join("; ")));
+                    }
+                    let members = effective_members(&connection, &view, None)?;
+                    let member = members.get(&desired.subject);
+                    if member.is_none_or(|(m, _, _)| m.revision != desired_revision(desired)) {
+                        return Err(St3Error::new(
+                            "stale-set-member",
+                            "declaration changed since this effect was prepared",
+                        ));
+                    }
+                } else {
+                    let staged: bool = connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND json_extract(body,'$.owned_set') IS NOT NULL)",
+                        [&desired.subject], |row| row.get(0),
+                    ).map_err(internal)?;
+                    if staged {
+                        return Err(St3Error::new("owned-set-pending", "staged member awaits its owning set revision"));
+                    }
+                }
+                Ok(())
+            }))
+        }).map_err(internal)?
     }
     pub fn apply_owned_set(
         &self,

@@ -221,3 +221,71 @@ mod heartbeat_tests {
         assert!(notified(&state).await);
     }
 }
+
+#[cfg(test)]
+mod acknowledgement_budget_tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::Poll;
+
+    #[test]
+    fn admitted_non_timeline_events_need_zero_more_blocking_tasks_to_acknowledge() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let state = super::super::tests::state(root.path());
+            super::tests::runtime(&state, "native-one");
+            let input = super::tests::event(1, "ready");
+            let (record, appended, transition) = state
+                .store
+                .append_harness_event_publication(&input)
+                .unwrap();
+            let (ready, waiting) = std::sync::mpsc::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            struct Release(Option<std::sync::mpsc::Sender<()>>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    if let Some(sender) = self.0.take() {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+            let guard = Release(Some(release));
+            let blocker = tokio::task::spawn_blocking(move || {
+                ready.send(()).unwrap();
+                let _ = held.recv();
+            });
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Count scheduling hops, not noisy wall time: the sole blocking worker is occupied.
+            // A second task would leave this admitted write waiting after its durable commit.
+            for is_retry in [false, true] {
+                let future = finish_claim_publication(
+                    &state,
+                    &input.claim.kind,
+                    record.clone(),
+                    appended && !is_retry,
+                    Some(transition),
+                );
+                tokio::pin!(future);
+                let response =
+                    std::future::poll_fn(|context| match future.as_mut().poll(context) {
+                        Poll::Ready(value) => Poll::Ready(value),
+                        Poll::Pending => panic!(
+                            "non-timeline acknowledgement exceeded its zero blocking-hop CI budget"
+                        ),
+                    })
+                    .await
+                    .unwrap()
+                    .0;
+                assert_eq!(response.id, record.id);
+            }
+            drop(guard);
+            blocker.await.unwrap();
+        });
+    }
+}

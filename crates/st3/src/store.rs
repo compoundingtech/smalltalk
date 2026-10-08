@@ -15,6 +15,8 @@ mod github_workflow_failures;
 pub(crate) mod message_subscriptions;
 mod rollouts;
 mod seat_status;
+#[cfg(test)]
+mod roster_controls;
 pub(crate) mod step_labels;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -21660,7 +21662,7 @@ fn current_harness_fold_at(
                 Some(row) => {
                     let (claim, body, observed_at_unix_ms) = row?;
                     Some((
-                        canonical::claim_key(connection, &claim)?,
+                        None,
                         claim,
                         body,
                         observed_at_unix_ms,
@@ -21669,13 +21671,22 @@ fn current_harness_fold_at(
                 None => None,
             };
         }
-        let take_unnamed = match (next_named.as_ref(), unnamed.peek()) {
-            (Some((named_key, ..)), Some((unnamed_key, ..))) => unnamed_key > named_key,
+        // SQL already streams named observations in canonical order. Looking their keys up
+        // again adds one query per sparse heartbeat; only the merge with an unnamed row
+        // needs a key here. A work overlay resolves the selected key below if necessary.
+        let take_unnamed = match (next_named.as_mut(), unnamed.peek()) {
+            (Some((named_key, claim, ..)), Some((unnamed_key, ..))) => {
+                let key = match named_key {
+                    Some(key) => key,
+                    None => named_key.insert(canonical::claim_key(connection, claim)?),
+                };
+                unnamed_key > key
+            }
             (None, Some(_)) => true,
             (_, None) => false,
         };
         let next = if take_unnamed {
-            unnamed.next()
+            unnamed.next().map(|(key, claim, body, at)| (Some(key), claim, body, at))
         } else {
             next_named.take()
         };
@@ -21741,6 +21752,13 @@ fn current_harness_fold_at(
         })
         .transpose()?
     } else { None };
+    let harness_key = match (&work_activity, current.as_ref()) {
+        (Some(_), Some((_, claim, _, key))) => Some(match key {
+            Some(key) => key.clone(),
+            None => canonical::claim_key(connection, claim)?,
+        }),
+        _ => None,
+    };
     if let Some((claim, _store_index, observed_at_unix_ms, key)) = work_activity
         && include_work_activity
         && key > runtime_key
@@ -21749,9 +21767,7 @@ fn current_harness_fold_at(
             optional.get("blocked_on").and_then(|v| v.as_deref()),
             optional.get("ask").and_then(|v| v.as_deref()),
         )
-        && current
-            .as_ref()
-            .is_none_or(|(_, _, _, harness_key)| key > *harness_key)
+        && harness_key.as_ref().is_none_or(|harness_key| key > *harness_key)
     {
         return Ok(Some(crate::model::CurrentHarnessView {
             state: "working".into(),
