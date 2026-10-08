@@ -515,8 +515,9 @@ impl Store {
         plan: Option<&DropPlan>,
     ) -> Result<()> {
         self.runtime.checkpoint_preflight()?;
-        let connection = self.connection.write();
-        connection.execute(
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "INSERT INTO checkpoints(id, cut_unix_ms, state, seal_rowid, sealed_digest,
                                      drop_digest, updated_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -533,6 +534,7 @@ impl Store {
                 i64::try_from(now_ms())?,
             ],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -794,8 +796,9 @@ impl Store {
                 "a person resumes checkpoints, with a reason",
             ));
         }
-        let connection = self.connection.write();
-        connection
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction().map_err(internal)?;
+        transaction
             .execute(
                 "UPDATE checkpoints SET state='set-aside', detail=?1, updated_at_unix_ms=?2
                  WHERE state='graph-changed'",
@@ -805,6 +808,7 @@ impl Store {
                 ],
             )
             .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
         Ok(())
     }
 
