@@ -29,6 +29,31 @@ module.exports = config => {
       path.join(__dirname, 'native/StPairedGateway.swift'),
       path.join(path.dirname(packagePath), 'ios/EXUpdates/StPairedGateway.swift'),
     );
+    // Keep cache identity build-owned; authorize only the URLRequest sent over the wire.
+    const downloaderPath = path.join(path.dirname(packagePath), 'ios/EXUpdates/AppLoader/FileDownloader.swift');
+    const original = await fs.readFile(downloaderPath, 'utf8');
+    const replacements = [
+      ['self.session = URLSession(configuration: sessionConfiguration)',
+        'self.session = URLSession(configuration: sessionConfiguration, delegate: SmalltalkPairedGatewayTransport.shared, delegateQueue: nil)'],
+      ['    let task = session.dataTask(with: request) { data, response, error in',
+        `    let transportRequest: URLRequest
+    do {
+      transportRequest = try SmalltalkPairedGatewayTransport.shared.request(request, updateURL: config.updateUrl)
+    } catch {
+      errorBlock(UpdatesError.fileDownloaderUnknownError(cause: error))
+      return
+    }
+    let task = session.dataTask(with: transportRequest) { data, response, error in`],
+    ];
+    let patched = original;
+    for (const [before, after] of replacements) {
+      if (patched.includes(after)) continue; // Prebuild is repeatable.
+      if (patched.split(before).length !== 2) {
+        throw new Error('SDK 57 FileDownloader transport boundary changed; review the paired update integration');
+      }
+      patched = patched.replace(before, after);
+    }
+    if (patched !== original) await fs.writeFile(downloaderPath, patched);
     // Xcode's bundle and EXUpdates resource phases both source this file. Keep their
     // config variant identical to prebuild even when Xcode launches without shell env.
     const envPath = path.join(result.modRequest.platformProjectRoot, '.xcode.env');

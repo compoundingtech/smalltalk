@@ -8,7 +8,7 @@ export type AppUpdatePort = {
   enabled: boolean;
   mint(gateway: string, credential: string): Promise<AppUpdateToken>;
   setGateway(gateway: string): Promise<void>;
-  setHeaders(headers: Record<string, string> | null): void;
+  setToken(token: AppUpdateToken | null): void;
   check(): Promise<{ isAvailable: boolean; isRollBackToEmbedded: boolean }>;
   fetch(): Promise<{ isNew: boolean; isRollBackToEmbedded: boolean }>;
   reload(): Promise<void>;
@@ -55,7 +55,7 @@ export class AppUpdateSession {
       if (this.ready) this.offerReload();
       else void this.check();
     });
-    if (port.enabled) port.setHeaders(null); // Clear any previous narrow token before a new pairing read.
+    if (port.enabled) port.setToken(null); // Clear in-memory authorization before a new pairing read.
   }
 
   /** Called only with the result of the store's SecureStore read or completed verified pairing. */
@@ -67,7 +67,7 @@ export class AppUpdateSession {
     this.pairing = next;
     this.generation++;
     this.ready = undefined;
-    if (this.port.enabled) this.port.setHeaders(null);
+    if (this.port.enabled) this.port.setToken(null);
     if (next && this.running) this.requested = true;
     if (next) void this.check();
   }
@@ -93,8 +93,8 @@ export class AppUpdateSession {
         if (remaining <= 0 || remaining > 15 * 60 * 1000) throw new Error('Invalid app update token expiry');
         await this.port.setGateway(pairing.gateway);
         if (!current() || !this.foreground.active) continue;
-        // Expo persists this header to UserDefaults: ONLY the short-lived app/channel token.
-        this.port.setHeaders({ Authorization: `Bearer ${token.token}` });
+        // Only the transport sees this bearer; Expo's compared/persisted config stays build-owned.
+        this.port.setToken(token);
         const available = await this.port.check();
         if (!current() || !this.foreground.active || token.expiresAtUnixMs <= this.port.now()) continue;
         if (!available.isAvailable && !available.isRollBackToEmbedded) continue;
@@ -105,7 +105,7 @@ export class AppUpdateSession {
       } catch {
         if (current()) this.port.onFailure(); // No credentials, URLs or response bodies in diagnostics.
       } finally {
-        this.port.setHeaders(null);
+        this.port.setToken(null);
       }
     }
   }
@@ -126,6 +126,6 @@ export class AppUpdateSession {
     this.pairing = undefined;
     this.ready = undefined;
     this.unsubscribe();
-    if (this.port.enabled) this.port.setHeaders(null);
+    if (this.port.enabled) this.port.setToken(null);
   }
 }

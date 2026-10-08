@@ -11,7 +11,10 @@ export const createAppUpdates = (foreground: ForegroundGate): AppUpdateSession =
     if (!appUpdatesNative) throw new Error('Paired app updates are unavailable on this build');
     await appUpdatesNative.setPairedGateway(gateway);
   },
-  setHeaders: Updates.setUpdateRequestHeadersOverride,
+  setToken: token => {
+    if (!appUpdatesNative) throw new Error('Paired app updates are unavailable on this build');
+    appUpdatesNative.setUpdateToken(token?.token ?? null, token?.expiresAtUnixMs ?? 0);
+  },
   check: Updates.checkForUpdateAsync,
   fetch: Updates.fetchUpdateAsync,
   reload: Updates.reloadAsync,

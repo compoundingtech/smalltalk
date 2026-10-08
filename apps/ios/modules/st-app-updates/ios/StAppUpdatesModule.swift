@@ -11,5 +11,12 @@ public final class StAppUpdatesModule: Module {
       }
       try controller.setSmalltalkPairedGateway(gateway)
     }.runOnQueue(.main)
+    Function("setUpdateToken") { (token: String?, expiresAtUnixMs: Double) in
+      guard AppController.isInitialized(),
+        let controller = AppController.sharedInstance as? EnabledAppController else {
+        throw NSError(domain: "StAppUpdates", code: 3)
+      }
+      try controller.setSmalltalkUpdateToken(token, expiresAtUnixMs: expiresAtUnixMs)
+    }
   }
 }

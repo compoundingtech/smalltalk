@@ -11,7 +11,7 @@ const fixture = (overrides = {}, initialState = 'active') => {
     enabled: true,
     mint: async (gateway, credential) => { events.push(['mint', gateway, credential]); return { token: 'narrow-update-token', expiresAtUnixMs: 901000 }; },
     setGateway: async gateway => { events.push(['gateway', gateway]); },
-    setHeaders: headers => { events.push(['headers', headers]); },
+    setToken: token => { events.push(['token', token]); },
     check: async () => { events.push(['check']); return { isAvailable: true, isRollBackToEmbedded: false }; },
     fetch: async () => { events.push(['fetch']); return { isNew: true, isRollBackToEmbedded: false }; },
     reload: async () => { events.push(['reload']); },
@@ -33,7 +33,7 @@ test('no missing Keychain credential or dev build can initiate OTA', async () =>
   const daily = fixture();
   daily.session.setPairing('https://gateway.example', null);
   await daily.session.check();
-  assert.deepEqual(daily.events, [['headers', null]]);
+  assert.deepEqual(daily.events, [['token', null]]);
   daily.session.close();
   const dev = fixture({ enabled: false });
   dev.session.setPairing('https://gateway.example', 'paired-secret');
@@ -42,14 +42,14 @@ test('no missing Keychain credential or dev build can initiate OTA', async () =>
   assert.deepEqual(dev.events, []);
 });
 
-test('mint happens before native headers, only narrow bearer reaches Expo, reload requires consent', async () => {
+test('mint happens before native transport, only narrow bearer reaches transport, reload requires consent', async () => {
   const f = fixture();
   f.session.setPairing('https://gateway.example/', 'paired-secret');
   await f.session.check();
   assert.deepEqual(f.events, [
-    ['headers', null], ['headers', null],
+    ['token', null], ['token', null],
     ['mint', 'https://gateway.example', 'paired-secret'], ['gateway', 'https://gateway.example'],
-    ['headers', { Authorization: 'Bearer narrow-update-token' }], ['check'], ['fetch'], ['consent'], ['headers', null],
+    ['token', { token: 'narrow-update-token', expiresAtUnixMs: 901000 }], ['check'], ['fetch'], ['consent'], ['token', null],
   ]);
   assert.equal(f.events.some(event => event[0] === 'reload'), false);
   f.consent[0]();
@@ -57,7 +57,7 @@ test('mint happens before native headers, only narrow bearer reaches Expo, reloa
   f.session.close();
 });
 
-test('revocation, expiry and signature/download failure leave current bundle and clear headers', async () => {
+test('revocation, expiry and signature/download failure leave current bundle and clear transport token', async () => {
   for (const overrides of [
     { mint: async () => { throw new Error('revoked'); } },
     { mint: async () => ({ token: 'expired', expiresAtUnixMs: 1000 }) },
@@ -70,7 +70,7 @@ test('revocation, expiry and signature/download failure leave current bundle and
     assert.equal(f.consent.length, 0);
     assert.equal(f.events.some(event => event[0] === 'reload'), false);
     assert.equal(f.events.some(event => event[0] === 'failure'), true);
-    assert.deepEqual(f.events.at(-1), ['headers', null]);
+    assert.deepEqual(f.events.at(-1), ['token', null]);
     f.session.close();
   }
 });
@@ -84,7 +84,7 @@ test('re-pairing fences a pending mint and serializes the replacement gateway', 
   pending.resolve({ token: 'stale', expiresAtUnixMs: 901000 });
   await running;
   assert.deepEqual(f.events.filter(event => event[0] === 'gateway'), [['gateway', 'https://new.example']]);
-  assert.deepEqual(f.events.filter(event => event[0] === 'headers' && event[1]), [['headers', { Authorization: 'Bearer replacement' }]]);
+  assert.deepEqual(f.events.filter(event => event[0] === 'token' && event[1]), [['token', { token: 'replacement', expiresAtUnixMs: 901000 }]]);
   f.session.close();
 });
 
@@ -106,7 +106,7 @@ test('background completion waits for foreground consent and never reloads in ba
   f.session.close();
 });
 
-test('closing or unpairing fences consent and clears persisted header', async () => {
+test('closing or unpairing fences consent and clears in-memory authorization', async () => {
   for (const close of [false, true]) {
     const f = fixture();
     f.session.setPairing('https://gateway.example', 'paired-secret');
@@ -114,7 +114,7 @@ test('closing or unpairing fences consent and clears persisted header', async ()
     if (close) f.session.close(); else f.session.setPairing('', null);
     f.consent[0]();
     assert.equal(f.events.some(event => event[0] === 'reload'), false);
-    assert.deepEqual(f.events.at(-1), ['headers', null]);
+    assert.deepEqual(f.events.at(-1), ['token', null]);
     f.session.close();
   }
 });

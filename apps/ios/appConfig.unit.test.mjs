@@ -14,7 +14,7 @@ test('daily keeps embedded recovery, signing and inert Authorization placeholder
     const daily = configure();
     assert.equal(daily.name, 'Smalltalk');
     assert.equal(daily.ios.bundleIdentifier, 'com.compoundingtech.smalltalk');
-    assert.equal(daily.ios.buildNumber, '1');
+    assert.equal(daily.ios.buildNumber, '2');
     assert.deepEqual(daily.runtimeVersion, { policy: 'nativeVersion' });
     assert.equal(daily.updates.checkAutomatically, 'NEVER');
     assert.equal(daily.updates.useEmbeddedUpdate, true);

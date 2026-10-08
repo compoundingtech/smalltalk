@@ -22,7 +22,7 @@ module.exports = () => {
       ...base.ios,
       bundleIdentifier: daily ? 'com.compoundingtech.smalltalk' : 'com.compoundingtech.smalltalk.starter',
       // Increase for every native dependency/configuration/certificate change.
-      buildNumber: '1',
+      buildNumber: '2',
     },
     plugins: [...base.plugins, './plugins/with-paired-app-updates.js'],
     ...(daily ? {
