@@ -3495,6 +3495,59 @@ pub const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 /// framing. A page stops before fetching the next payload once this wire-size budget is spent.
 const REPLICATION_EXCHANGE_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
 
+/// Count the exact uncompressed JSON bytes without constructing another copy of a page.
+/// The serializer stops at the transport cap, even for malformed legacy TEXT payloads.
+fn serialized_bytes_bounded<T: Serialize>(value: &T, limit: usize) -> Result<Option<usize>> {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let Some(next) = self.bytes.checked_add(bytes.len()) else {
+                return Err(std::io::Error::other("replication response size overflow"));
+            };
+            if next > self.limit {
+                return Err(std::io::Error::other("replication response exceeds byte limit"));
+            }
+            self.bytes = next;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { bytes: 0, limit };
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => Ok(Some(counter.bytes)),
+        Err(error) if error.is_io() => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The complete inventory and signature proof is indivisible. Only the payload envelope suffix
+/// may be shortened; the next exchange resumes from the prefix the peer received.
+fn fit_replication_exchange_body(exchange: &mut ReplicationExchange, limit: usize) -> Result<()> {
+    let pending = std::mem::take(&mut exchange.envelopes);
+    let mut bytes = serialized_bytes_bounded(exchange, limit)?
+        .ok_or_else(|| anyhow::anyhow!("complete replication inventory or signatures exceed the exchange byte limit"))?;
+    for envelope in pending {
+        let separator = usize::from(!exchange.envelopes.is_empty());
+        let remaining = limit.saturating_sub(bytes.saturating_add(separator));
+        let Some(envelope_bytes) = serialized_bytes_bounded(&envelope, remaining)? else {
+            anyhow::ensure!(
+                !exchange.envelopes.is_empty(),
+                "one replication envelope exceeds the exchange byte limit"
+            );
+            break;
+        };
+        bytes += separator + envelope_bytes;
+        exchange.envelopes.push(envelope);
+    }
+    Ok(())
+}
+
 /// Maximum envelopes admitted per writer transaction. Admission can take several milliseconds
 /// per envelope on a populated store; leave room for queued write acknowledgements below 50 ms.
 pub const ADMISSION_CHUNK_ENVELOPES: usize = 8;
@@ -5758,6 +5811,7 @@ impl Store {
         let _timing = time_stage(&self.replication_timers.export);
         exchange.signatures = self.replication_signatures_for(signature_requests)?;
         exchange.signature_requests = self.replication_signature_requests()?;
+        fit_replication_exchange_body(&mut exchange, crate::sync::MAX_EXCHANGE_BYTES)?;
         Ok(exchange)
     }
 
@@ -5766,7 +5820,9 @@ impl Store {
         fleet_id: &str,
         remote: &ReplicationInventory,
     ) -> Result<ReplicationExchange> {
-        self.export_replication_difference_with_legacy(fleet_id, remote, true)
+        let mut exchange = self.export_replication_difference_with_legacy(fleet_id, remote, true)?;
+        fit_replication_exchange_body(&mut exchange, crate::sync::MAX_EXCHANGE_BYTES)?;
+        Ok(exchange)
     }
 
     fn export_replication_difference_with_legacy(

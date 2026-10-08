@@ -127,6 +127,38 @@ fn export_payload_page_sql_work_ignores_the_unfetched_tail() {
     );
 }
 
+#[test]
+fn export_body_limit_counts_complete_inventory_and_signature_proofs() {
+    let source = node("birch");
+    let target = node("cedar");
+    let mut exchange = page(&source, &target, 3);
+    assert_eq!(exchange.envelopes.len(), 3);
+    exchange.signature_requests.push(ReplicaEnvelopeId {
+        writer: "birch".into(),
+        sequence: 3,
+        hash: "f".repeat(512),
+    });
+    let original = exchange.clone();
+    let mut without_payloads = exchange.clone();
+    without_payloads.envelopes.clear();
+    let base_bytes = serde_json::to_vec(&without_payloads).unwrap().len();
+    let first_bytes = serde_json::to_vec(&exchange.envelopes[0]).unwrap().len();
+    let limit = base_bytes + first_bytes;
+
+    fit_replication_exchange_body(&mut exchange, limit).unwrap();
+    assert_eq!(exchange.envelopes.len(), 1);
+    assert_eq!(serde_json::to_vec(&exchange).unwrap().len(), limit);
+    assert_eq!(exchange.inventory.digest, original.inventory.digest);
+    assert_eq!(exchange.inventory.envelopes, original.inventory.envelopes);
+    assert_eq!(exchange.inventory.buckets.len(), original.inventory.buckets.len());
+    assert_eq!(exchange.signature_requests.len(), 1);
+
+    let mut missing_first = original.clone();
+    assert!(fit_replication_exchange_body(&mut missing_first, limit - 1).is_err());
+    let mut oversized_proof = original;
+    assert!(fit_replication_exchange_body(&mut oversized_proof, base_bytes - 1).is_err());
+}
+
 /// The injected SQL cost represents a populated runtime's per-claim admission work. The
 /// queued write must commit before the remainder of the page, and its ACK has a 100ms CI
 /// budget (including scheduler/commit overhead), separately from production's 50ms p99.
