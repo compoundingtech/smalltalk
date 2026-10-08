@@ -2965,14 +2965,15 @@ impl Store {
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| entry.history == history && entry.index <= index)
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
-        let Some(previous) = previous else { return Ok(false) };
-        let changed = if previous.index == index {
-            0
-        } else {
-            match self.changed_agent_resources(previous.index, index, &previous.items)? {
+        // Without rows to start from, every agent is missing: a small roster, or an empty
+        // one, still completes in one bounded fold.
+        let changed = match &previous {
+            None => 0,
+            Some(previous) if previous.index == index => 0,
+            Some(previous) => match self.changed_agent_resources(previous.index, index, &previous.items)? {
                 Some(delta) => delta.subjects.len(),
                 None => return Ok(false),
-            }
+            },
         };
         let connection = self.readers.get();
         let names = connection.prepare_cached(RANGE_SUBJECTS)?
@@ -2982,8 +2983,8 @@ impl Store {
             self.current_view_candidates(&connection, names, index, true)?
         };
         drop(connection);
-        let folded = previous.items.iter().filter_map(|item| item["id"].as_str())
-            .collect::<HashSet<_>>();
+        let folded = previous.iter().flat_map(|previous| previous.items.iter())
+            .filter_map(|item| item["id"].as_str()).collect::<HashSet<_>>();
         let missing = names.iter().filter(|name| !folded.contains(name.as_str())).count();
         Ok(changed.saturating_add(missing) <= bound)
     }

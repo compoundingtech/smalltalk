@@ -23113,6 +23113,30 @@ mission "wake" state="ready" {
     }
 
     #[test]
+    fn agent_roster_refresh_publishes_an_empty_or_small_roster_at_once() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let _wake = store.start_agent_roster_refresher().unwrap();
+        for history in [false, true] {
+            refresh_agent_roster(store, history).unwrap();
+            let (cut, cards, _) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
+            assert_eq!((cut, cards.len()), (store.index().unwrap(), 0), "history {history}");
+        }
+        store.append_claim(&ClaimInput {
+            subject: "agent/small-roster".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":"small",
+                "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        for history in [false, true] {
+            refresh_agent_roster(store, history).unwrap();
+            let (_, cards, _) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
+            assert_eq!(cards.len(), 1, "history {history}");
+        }
+    }
+
+    #[test]
     fn agent_roster_refresh_never_folds_more_than_a_chunk_in_one_call() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
