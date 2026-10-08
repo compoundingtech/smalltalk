@@ -429,17 +429,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1791222025,
-        "narHash": "sha256-iUey+Jj6CT+Oqa0bWDGFXubqYBbpzlLUvpZ9CLFisBo=",
+        "lastModified": 1791443335,
+        "narHash": "sha256-L7Z29/L/TEVFLRazz3SztkmGMxj5u5h3vSgLmf04Aj4=",
         "owner": "compoundingtech",
         "repo": "pty",
-        "rev": "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c",
+        "rev": "ad6cce5ab74d2594dbd0c86d46747b0e6c17b440",
         "type": "github"
       },
       "original": {
         "owner": "compoundingtech",
         "repo": "pty",
-        "rev": "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c",
+        "rev": "ad6cce5ab74d2594dbd0c86d46747b0e6c17b440",
         "type": "github"
       }
     },

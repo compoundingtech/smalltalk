@@ -3172,10 +3172,12 @@ fn build_run_command_expands_direct_argv_with_the_managed_agent_environment() {
 }
 
 #[test]
-fn build_run_command_persists_the_complete_managed_environment_before_the_command() {
+fn build_run_command_names_the_complete_managed_environment_without_its_values() {
     let cli = PtyCli::new(PathBuf::from("/my/catalog"));
     let mut t = target("example-linux.demo.agent", "exec codex 'boot'");
     t.env.insert("CUSTOM".into(), "task-value".into());
+    t.env
+        .insert("SEAT_TOKEN".into(), "synthetic-secret-value-0c9d".into());
     t.env.insert("ST_AGENT".into(), "example-linux.demo".into());
     t.env.insert("ST_ROOT".into(), "$CATALOG/custom-bus".into());
     t.env.insert("TERM".into(), "screen-256color".into());
@@ -3188,16 +3190,19 @@ fn build_run_command_persists_the_complete_managed_environment_before_the_comman
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     let separator = args.iter().position(|arg| arg == "--").unwrap();
-    let mut persisted = BTreeMap::new();
+    // Every `--env` names one managed key: name-only, never a KEY=VALUE pair.
+    let mut named = BTreeSet::new();
     let mut index = 0;
     while index < separator {
         if args[index] == "--env" {
-            let (key, value) = args[index + 1].split_once('=').unwrap();
+            let name = &args[index + 1];
             assert!(
-                persisted
-                    .insert(key.to_string(), value.to_string())
-                    .is_none(),
-                "the final managed overlay needs only one persisted value per key"
+                !name.contains('='),
+                "an environment value leaked onto the launcher argv: {name}"
+            );
+            assert!(
+                named.insert(name.clone()),
+                "the final managed overlay needs only one named value per key"
             );
             index += 2;
         } else {
@@ -3216,19 +3221,20 @@ fn build_run_command_persists_the_complete_managed_environment_before_the_comman
         })
         .collect::<BTreeMap<_, _>>();
     assert_eq!(
-        persisted, inherited,
-        "initial process env and restart-persisted env must be the same resolved overlay"
+        named,
+        inherited.keys().cloned().collect::<BTreeSet<_>>(),
+        "the named overlay and the launcher's inherited overlay must be the same resolved map"
     );
     assert_eq!(
-        persisted.get("CATALOG").map(String::as_str),
+        inherited.get("CATALOG").map(String::as_str),
         Some("/my/catalog")
     );
     assert_eq!(
-        persisted.get("ST_ROOT").map(String::as_str),
+        inherited.get("ST_ROOT").map(String::as_str),
         Some("/my/catalog/custom-bus")
     );
     assert_eq!(
-        persisted.get("PTY_ROOT").map(String::as_str),
+        inherited.get("PTY_ROOT").map(String::as_str),
         Some(
             effective_pty_root(&cli.catalog_root)
                 .to_string_lossy()
@@ -3236,18 +3242,26 @@ fn build_run_command_persists_the_complete_managed_environment_before_the_comman
         )
     );
     assert_eq!(
-        persisted.get("TERM").map(String::as_str),
+        inherited.get("TERM").map(String::as_str),
         Some("screen-256color")
     );
     assert_eq!(
-        persisted.get("ST_AGENT").map(String::as_str),
+        inherited.get("ST_AGENT").map(String::as_str),
         Some("example-linux.demo")
     );
     assert_eq!(
-        persisted.get("CUSTOM").map(String::as_str),
+        inherited.get("CUSTOM").map(String::as_str),
         Some("task-value")
     );
-    assert!(persisted.contains_key("ST_HOOKS"));
+    assert!(inherited.contains_key("ST_HOOKS"));
+    // The seat's secret-bearing value still reaches the launcher, but only
+    // through its inherited environment — never on the argument list.
+    let secret = &inherited["SEAT_TOKEN"];
+    assert!(args.iter().all(|arg| !arg.contains(secret)));
+    assert!(
+        cmd.get_program().to_string_lossy() != *secret,
+        "unreachable: the program slot never holds the value"
+    );
 }
 
 #[test]

@@ -67,3 +67,28 @@ pass-throughs.
   program-and-argv path.
 - Scope lifetime and I/O behavior are unchanged. The supporting live evidence
   is recorded in the [systemd scope argv experiment](../.experiments/2026-09-05-systemd-scope-argv-transparency.md).
+
+## Amendment 1 — 2026-10-08
+
+Launch environment values were passed on process command lines, where service
+managers and process listings can record them. The launchers now export the
+resolved environment to the PTY process and pass only `--env NAME`. PTY resolves
+each name from that inherited environment and persists the resolved overlay
+for restart. The runtime-selected `PTY_ROOT` wins over a seat declaration;
+the other resolved environment precedence remains unchanged.
+
+Both scope wrappers also pin the description to the unit name instead of
+systemd's default full command line. The amended outer argument order is:
+
+```text
+systemd-run --user --scope --collect --quiet --unit=<unit> --description=<unit> --expand-environment=no -- <program> <arg>...
+```
+
+This removes environment values from generated environment arguments and unit
+descriptions, not from explicitly authored argv or tag expansions. Seat-declared
+environment values stored in replicated graph claims remain a known exposure
+outside this amendment's fix.
+
+Evidence: launcher environment/argv regression tests, runtime-selected registry
+precedence with a seat-declared `PTY_ROOT`, and fixed-description wrapper tests.
+R42's ratified requirements text is unchanged.

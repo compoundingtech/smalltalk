@@ -37,9 +37,9 @@ libc = "0.2"
 libghostty-vt = "=0.2.1"
 libghostty-vt-sys = { version = "=0.2.1", features = ["pkg-config"] }
 notify = "8"
-pty-client = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }
-pty-core = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }
-pty-terminal = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }
+pty-client = { git = "https://github.com/compoundingtech/pty", rev = "ad6cce5ab74d2594dbd0c86d46747b0e6c17b440" }
+pty-core = { git = "https://github.com/compoundingtech/pty", rev = "ad6cce5ab74d2594dbd0c86d46747b0e6c17b440" }
+pty-terminal = { git = "https://github.com/compoundingtech/pty", rev = "ad6cce5ab74d2594dbd0c86d46747b0e6c17b440" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 ring = "0.17"
 rusqlite = { version = "0.32", features = ["bundled", "trace", "functions"] }
