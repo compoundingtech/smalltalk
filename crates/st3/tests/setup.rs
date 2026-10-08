@@ -264,7 +264,7 @@ fn removing_services_skips_absent_replication_but_preserves_installed_unit_error
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$HOME/manager.log"
 if [ "$2" = show ]; then
-    if [ -f "$HOME/.config/systemd/user/$3" ] || [ -f "$HOME/loaded-replication" ]; then
+    if [ -f "$HOME/.config/systemd/user/$3" ] || { [ "$3" = st3-replication.service ] && [ -f "$HOME/loaded-replication" ]; }; then
         printf 'LoadState=loaded\nActiveState=active\nSubState=running\n'
         exit 0
     fi
