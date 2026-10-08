@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Align the pty pin with the source downstream builds already use",
+  "replay": {"status": "none", "detail": "No runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "The pty flake input and Cargo dependencies now agree on 1ae8c187301034d2b343b6ec638f2b74c009f92e, the source already used by downstream flakes that override pty to follow that revision."},
+  "downtime": {"status": "none", "detail": "No additional service interruption introduced."},
+  "manual": {"status": "none", "detail": "No manual action required; the aligned pins satisfy the existing evaluation-time assertion."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}
