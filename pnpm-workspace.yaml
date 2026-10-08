@@ -1,7 +1,13 @@
 # Generated file - DO NOT EDIT
 # Source: pnpm-workspace.yaml.genie.ts
 
-packages: [apps/ios, clients/typescript/st3-client, clients/typescript/st3-views]
+packages:
+  [
+    apps/ios,
+    clients/typescript/st3-client,
+    clients/typescript/st3-scenarios,
+    clients/typescript/st3-views,
+  ]
 
 peerDependencyRules:
   allowedVersions:

@@ -19,6 +19,8 @@ PATTERNS = (
     "packages/fractal-ui/**",
     "clients/typescript/st3-client/**",
     "clients/typescript/st3-views/**",
+    "clients/typescript/st3-scenarios/**",
+    "fixtures/scenarios/**",
     "crates/st3-client*/**",
     "crates/st3-schema/**",
     "docs/st3/client-v0/**",
