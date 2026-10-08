@@ -265,6 +265,65 @@ fn belongs_to_runtime(_pid: u32, _runtime_pid: u32) -> bool {
     false
 }
 
+#[derive(Deserialize)]
+struct TerminalAuthorityStats {
+    name: String,
+    daemon: TerminalAuthorityDaemon,
+    process: TerminalAuthorityProcess,
+}
+#[derive(Deserialize)]
+struct TerminalAuthorityDaemon {
+    pid: u32,
+}
+#[derive(Deserialize)]
+struct TerminalAuthorityProcess {
+    alive: bool,
+    pid: Option<u32>,
+}
+
+/// The registry incarnation names the supporting daemon. Resolve its live terminal
+/// child through that exact daemon; it is the wrapper for managed launch or the bound shell.
+fn terminal_process(
+    state: &AppState,
+    physical: &st_runtime::PtyObservation,
+) -> Result<u32, St3Error> {
+    let daemon_pid = physical
+        .pid
+        .ok_or_else(|| refused("the runtime has no daemon identity"))?;
+    let daemon_birth = st_runtime::process_start_token(daemon_pid).map_err(internal)?;
+    let raw = pty_core::registry::with_root(&state.pty_root, || {
+        pty_client::query_status_json(&physical.name, pty_client::STATS_TIMEOUT)
+    })
+    .map_err(|error| {
+        refused(format!(
+            "the terminal process identity is unavailable: {error}"
+        ))
+    })?;
+    let stats: TerminalAuthorityStats = serde_json::from_str(&raw)
+        .map_err(|_| refused("the terminal process identity is malformed"))?;
+    if stats.name != physical.name
+        || stats.daemon.pid != daemon_pid
+        || !stats.process.alive
+        || st_runtime::process_start_token(daemon_pid).ok() != Some(daemon_birth)
+    {
+        return Err(refused(
+            "the physical runtime changed while checking terminal custody",
+        ));
+    }
+    let terminal_pid = stats
+        .process
+        .pid
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| refused("the runtime has no live terminal process"))?;
+    st_runtime::process_start_token(terminal_pid).map_err(internal)?;
+    if !belongs_to_runtime(terminal_pid, daemon_pid) {
+        return Err(refused(
+            "the terminal process is outside its physical runtime",
+        ));
+    }
+    Ok(terminal_pid)
+}
+
 pub(super) fn with_authority<T>(
     state: &AppState,
     fence: &Fence,
@@ -374,17 +433,22 @@ pub(super) fn with_authority<T>(
         .filter(|(runtime, _)| runtime == &fence.incarnation)
         .map(|(_, raw)| raw);
     let Some(bytes) = bytes else {
-        let current_wrapper = peer.pid == runtime_pid
-            || (member.terminal_binding.is_some()
-                && runtime_parent(peer.pid) == Some(runtime_pid)
-                && arguments.windows(2).any(|pair| pair == ["driver", "codex"])
-                && arguments
-                    .windows(2)
-                    .any(|pair| pair[0] == "--subject" && pair[1] == fence.subject));
-        if provider != "codex" || fence.component != "delivery" || !current_wrapper {
+        if provider != "codex" || fence.component != "delivery" {
             return Err(St3Error::new(
                 "mailbox-session-starting",
                 "waiting for provider ownership",
+            ));
+        }
+        let terminal_pid = terminal_process(state, &physical)?;
+        let current_wrapper = (member.terminal_binding.is_none() && peer.pid == terminal_pid
+            || member.terminal_binding.is_some() && runtime_parent(peer.pid) == Some(terminal_pid))
+            && arguments.windows(2).any(|pair| pair == ["driver", "codex"])
+            && arguments
+                .windows(2)
+                .any(|pair| pair[0] == "--subject" && pair[1] == fence.subject);
+        if !current_wrapper {
+            return Err(refused(
+                "this process is not the current physical Codex wrapper",
             ));
         }
         // Codex launches its provider only after binding. Physical custody grants no
