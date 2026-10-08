@@ -12,7 +12,7 @@
 //! events and claims, paging their mailboxes and reading their desired state, the replication
 //! worker exporting and receiving exchanges with a peer, lease renewals, status and work reads,
 //! and a person moving through stui. Thirty seats also hold event long-polls open, and 22 client
-//! WebSockets subscribe to agents, missions and work together and stay subscribed. Only kinds and rates;
+//! WebSockets subscribe to agents, missions, work and attention together and stay subscribed. Only kinds and rates;
 //! no contents. Every collection snapshot has a 300 ms budget, including connect-to-snapshot
 //! measurement. Their HTTP correctness oracle runs afterward, not as a cache-warming pre-read.
 //!
@@ -79,7 +79,7 @@ const ROSTER_LIMIT: usize = 200;
 const ROSTER_SNAPSHOT: &str = "agents roster snapshot";
 const ROSTER_CONNECT_SNAPSHOT: &str = "agents roster connect+snapshot";
 const ROSTER_BUDGET: Duration = Duration::from_millis(300);
-const COLLECTIONS: [&str; 3] = ["agents", "missions", "work"];
+const COLLECTIONS: [&str; 4] = ["agents", "missions", "work", "attention"];
 
 fn snapshot_label(collection: &str, connection: bool) -> String {
     let name = if collection == "agents" {
@@ -303,7 +303,7 @@ fn report_failures(report: &Report) -> Vec<String> {
             ));
         }
     }
-    for collection in ["missions", "work"] {
+    for collection in ["missions", "work", "attention"] {
         if report
             .collection_subscribers
             .get(collection)
@@ -650,7 +650,7 @@ fn print(report: &Report) {
         "agents roster: {}/{} concurrent subscribers with correct snapshots; {} validated change frames; window limit {}",
         report.roster_subscribers, ROSTER_SUBSCRIBERS, report.roster_change_frames, ROSTER_LIMIT
     );
-    for collection in ["missions", "work"] {
+    for collection in ["missions", "work", "attention"] {
         println!(
             "{collection}: {}/{} subscribers with correct snapshots; {} validated change frames",
             report
@@ -1389,6 +1389,18 @@ fn collection_row_ids(collection: &str, items: &Value) -> Result<BTreeSet<String
                     .map_err(|error| format!("invalid work card: {error}"))?;
                 (row.header.id, "work", "step-run/")
             }
+            "attention" => {
+                let row = <st3_client::Attention as serde::Deserialize>::deserialize(item)
+                    .map_err(|error| format!("invalid attention card: {error}"))?;
+                if row.person_id != "person/bench-operator"
+                    || row.state != "open"
+                    || row.title.is_empty()
+                    || row.episode.is_empty()
+                {
+                    return Err("attention row is not an open card for the generated person".into());
+                }
+                (row.header.id, "attention", "attention/")
+            }
             _ => return Err("unknown collection".into()),
         };
         if item["kind"] != kind || !id.starts_with(prefix) {
@@ -1486,6 +1498,12 @@ fn collection_matches_oracle(
         || frame["has_more"] != oracle["page"]["has_more"]
     {
         return Err("snapshot membership/pagination differs from the HTTP collection".into());
+    }
+    if collection == "attention" {
+        if frame["items"] != oracle["items"] {
+            return Err("attention snapshot rows/order differ from HTTP".into());
+        }
+        return Ok(());
     }
     for (row, reference) in frame["items"]
         .as_array()
@@ -1673,7 +1691,7 @@ fn missions_and_work_snapshots_have_budgets_and_require_all_subscribers() {
         report: Report::default(),
         runs: BASELINE_RUNS,
     };
-    for collection in ["missions", "work"] {
+    for collection in ["missions", "work", "attention"] {
         for connection in [false, true] {
             let name = snapshot_label(collection, connection);
             assert_eq!(budget(&BTreeMap::new(), &name), Duration::from_millis(300));
@@ -1704,11 +1722,13 @@ fn missions_and_work_snapshots_have_budgets_and_require_all_subscribers() {
             .collection_subscribers
             .insert(collection.into(), ROSTER_SUBSCRIBERS);
     }
-    assert_eq!(compare(&report, &baseline).len(), 4);
+    assert_eq!(compare(&report, &baseline).len(), 6);
     assert!(
         !report_failures(&report)
             .iter()
-            .any(|failure| failure.starts_with("missions") || failure.starts_with("work"))
+            .any(|failure| failure.starts_with("missions")
+                || failure.starts_with("work")
+                || failure.starts_with("attention"))
     );
     report.paths.get_mut("missions snapshot").unwrap().count -= 1;
     assert!(
@@ -1735,6 +1755,55 @@ fn missions_and_work_snapshots_have_budgets_and_require_all_subscribers() {
     let legacy: Report = serde_json::from_value(value).unwrap();
     assert!(legacy.collection_subscribers.is_empty());
     assert!(legacy.collection_change_frames.is_empty());
+}
+
+#[test]
+fn attention_snapshots_require_actor_visibility_and_match_the_full_http_card() {
+    let card = json!({
+        "kind": "attention", "id": "attention/bench-question", "revision": "episode/bench",
+        "updated_at": "2026-10-01T00:00:00Z", "attention_kind": "person-step",
+        "source_id": "step-run/bench/question", "episode": "episode/bench",
+        "person_id": "person/bench-operator", "state": "open", "title": "Invented question",
+        "detail": "An invented decision", "priority": "normal", "requested_at": "2026-10-01T00:00:00Z"
+    });
+    let frame = json!({
+        "kind": "snapshot", "id": "load-attention-0", "collection": "attention",
+        "snapshot": {"id": "snapshot/load", "host_id": "host/bench", "store_index": 2,
+            "projection_version": "client-projection.v0", "created_at": "2026-10-01T00:00:00Z"},
+        "items": [card], "order": ["attention/bench-question"], "has_more": false
+    });
+    let oracle = json!({"items": frame["items"], "page": {"has_more": false}});
+    let mut rows = BTreeSet::new();
+    assert!(
+        apply_collection_frame("attention", &frame, "load-attention-0", true, &mut rows).is_ok()
+    );
+    assert!(collection_matches_oracle("attention", &frame, &oracle).is_ok());
+    assert!(
+        apply_collection_frame("attention", &frame, "load-attention-0", false, &mut rows).is_err()
+    );
+    for (field, value) in [
+        ("person_id", json!("person/robin")),
+        ("state", json!("closed")),
+        ("kind", json!("agent")),
+        ("episode", json!("")),
+        ("title", json!("")),
+    ] {
+        let mut invalid = frame.clone();
+        invalid["items"][0][field] = value;
+        assert!(
+            apply_collection_frame(
+                "attention",
+                &invalid,
+                "load-attention-0",
+                true,
+                &mut BTreeSet::new()
+            )
+            .is_err()
+        );
+    }
+    let mut changed = frame.clone();
+    changed["items"][0]["detail"] = json!("wrong detail");
+    assert!(collection_matches_oracle("attention", &changed, &oracle).is_err());
 }
 
 /// One request of the kind `name`, and the name to record it under when that is more exact.
