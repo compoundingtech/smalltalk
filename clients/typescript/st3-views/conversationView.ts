@@ -1,4 +1,5 @@
-import type { TimelineEntry } from '@smalltalk/st3-client';
+import type { ConversationContentRef, TimelineEntry } from '@smalltalk/st3-client';
+import { contentReferences } from './conversationContent.ts';
 
 // A conversation drawn the way stui draws it (crates/stui/src/ui/adapt.rs conversation and
 // from_harness, conversation.rs): the person's turns as tinted blocks, replies as markdown, tool
@@ -14,7 +15,7 @@ export type Body =
   /** `delivered`: the recipient's harness has it, seen in the agent's own transcript. */
   | { kind: 'mail'; from: string; to: string; subject: string; text: string; delivered?: boolean; dictated?: boolean; signed?: string; images?: MailImage[] }
   | { kind: 'event'; text: string; tone: 'quiet' | 'warning' | 'fault' };
-export type ConversationEntry = { id: string; at: string; timestamp: string; body: Body };
+export type ConversationEntry = { id: string; at: string; timestamp: string; body: Body; content?: ConversationContentRef[] };
 
 // ------------------------------------------------------------ typed views (OMP parity)
 
@@ -636,7 +637,10 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
   const shown = new Set(timeline.filter(entry => entry.type === 'message').map(entry => str(record(entry.body).message_id) ?? '').filter(id => id.startsWith('message/')));
   const delivered = new Set<string>();
   let mail: Record<string, unknown> | undefined;
-  const push = (entry: Entry, id: string, body: Body) => stamped.push({ id, at: clock(entry.timestamp), timestamp: entry.timestamp, body });
+  const push = (entry: Entry, id: string, body: Body) => {
+    const content = contentReferences(entry.body);
+    stamped.push({ id, at: clock(entry.timestamp), timestamp: entry.timestamp, body, ...(content.length ? { content } : {}) });
+  };
   // Entries arrive in st's order (applyConversation keeps them by time, then sequence).
   for (const entry of timeline) {
     const body = record(entry.body);
@@ -671,12 +675,15 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
           ...(images.length ? { images } : {}),
         });
       }
+      const content = contentReferences(message);
+      const last = stamped[stamped.length - 1];
+      if (last && content.length) last.content = [...(last.content ?? []), ...content];
       continue;
     }
     mail = undefined;
     switch (entry.type) {
       case 'content': {
-        const raw = contentText(entry.body);
+        const raw = contentText(entry.body) || (contentReferences(entry.body).length ? '[content available on demand]' : '');
         const nativeBlocks = Array.isArray(body.blocks) && body.blocks.some(block => record(block).kind !== 'text');
         // Typed extension blocks (irc, job, status) replace the entry's text fallback, role
         // aside; `tool_start` belongs to its call and is never drawn alone.
@@ -715,7 +722,11 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
         const state: ToolState = body.status === 'error' || view?.is_error === true || view?.timed_out === true ? 'failed' : 'ok';
         const index = tools.get(str(body.call_id) ?? '');
         const call = index === undefined ? undefined : stamped[index];
-        if (call?.body.kind === 'tool') call.body = { ...call.body, state, output };
+        if (call?.body.kind === 'tool') {
+          call.body = { ...call.body, state, output };
+          const content = contentReferences(entry.body);
+          if (content.length) call.content = [...(call.content ?? []), ...content];
+        }
         else push(entry, entry.id, { kind: 'tool', title: 'tool result', state, output });
         // Each finished subagent is its own card, opening its child conversation when it has one.
         if (view?.type === 'task' && Array.isArray(view.agents)) {
