@@ -785,6 +785,10 @@ impl NativeCapture {
         if !inactive || !self.compatible(tx)? {
             // The library compiles this explicitly main-bound standalone fence.
             // Do not call unqualified Installer::source_gap under TEMP metadata.
+            ensure!(
+                !self.gap_main_sql.trim().is_empty(),
+                "attention capture main fence missing"
+            );
             tx.execute_batch(&self.gap_main_sql)?;
             return Ok(());
         }

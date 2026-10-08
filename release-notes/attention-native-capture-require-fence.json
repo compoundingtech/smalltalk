@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Require the inactive native capture helper's main fence before execution",
+  "replay": {"status": "none", "detail": "No replay, scan or source installation."},
+  "schema": {"status": "none", "detail": "No table, index or trigger changes."},
+  "rules": {"status": "none", "detail": "Native admission and projection rules are unchanged."},
+  "compatibility": {"status": "none", "detail": "Only the inactive capture helper changes: a missing compiled standalone fence returns an error before execute_batch instead of allowing an empty successful batch."},
+  "downtime": {"status": "none", "detail": "No production source or startup callback is registered."},
+  "manual": {"status": "none", "detail": "No existing installation action is required."},
+  "recovery": {"status": "none", "detail": "No recovery or Ready restoration is added. Capture compatibility and all complete native, lifecycle, coverage and writer cleanup prerequisites remain source-owned."}
+}
