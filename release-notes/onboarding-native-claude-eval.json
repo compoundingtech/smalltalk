@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add native Claude idle-MCP checks and bounded onboarding evaluation fixtures; retain failed evaluation limits",
+  "replay": {
+    "status": "none",
+    "detail": "Manual disposable-guest test tooling only; no production replay behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No production database or protocol schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No production checkpoint or fleet rule changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Production harness behavior is unchanged. Native Claude 2.1.293 fixture results and untested semantic gates are documented separately."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No deployment or running production service change is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No user upgrade action. The optional paid evaluation runner requires separate explicit credential and attempt authorization; the recorded two attempts are exhausted."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No production recovery changes. The fixtures stop their own seats and remove their disposable guests; preserved failed receipts do not authorize provider retries."
+  }
+}

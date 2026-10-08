@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Exactly two isolated native Claude onboarding evaluations; never retry a run.
+
+Requires explicit credential authorization. The key is read through guarded I/O
+and piped into a private guest broker, not copied into files or environments.
+"""
+import argparse
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+
+HERE=Path(__file__).resolve().parent
+sys.path.insert(0,str(HERE/"onboarding-fixtures"))
+from content_persona import Persona
+loader=importlib.machinery.SourceFileLoader("rig",str(HERE/"onboarding-e2e"))
+spec=importlib.util.spec_from_loader(loader.name,loader)
+rig=importlib.util.module_from_spec(spec); loader.exec_module(rig)
+MODEL="claude-haiku-4-5-20251001"
+KEY_HELPER='''import socket,sys
+s=socket.socket(socket.AF_UNIX); s.connect("/home/ada/.local/state/onboarding-eval/key.sock")
+s.sendall(b"key\\n"); data=b""
+while not data.endswith(b"\\n"):
+ chunk=s.recv(8192)
+ if not chunk: raise SystemExit(1)
+ data+=chunk
+sys.stdout.buffer.write(data)
+'''
+WRAPPER='''#!/usr/bin/python3
+import os,sys
+args=sys.argv[1:]
+env=dict(os.environ)
+for name in ("ANTHROPIC_API_KEY","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_OAUTH_TOKEN","CLAUDE_CODE_OAUTH_TOKEN"):
+ env.pop(name,None)
+env.pop("ANTHROPIC_BASE_URL",None); env.pop("CLAUDE_CODE_RETRY_WATCHDOG",None)
+env.update(HTTPS_PROXY="http://127.0.0.1:18443",NODE_EXTRA_CA_CERTS="/home/ada/.local/state/onboarding-eval/proxy-cert.pem",ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-4-5-20251001",CLAUDE_CODE_MAX_RETRIES="0",CLAUDE_CODE_GZIP_REQUEST_BODIES="0",CLAUDE_CODE_MAX_OUTPUT_TOKENS="2048",DISABLE_ERROR_REPORTING="1",DISABLE_AUTOUPDATER="1")
+if not any(x in args for x in ("--help","--version","-h","-v")) and not (args and args[0] in ("plugin","mcp","auth")):
+ clean=[]; skip=False
+ for x in args:
+  if skip: skip=False; continue
+  if x=="--model": skip=True; continue
+  if not x.startswith("--model="): clean.append(x)
+ args=["--model","claude-haiku-4-5-20251001","--disallowedTools","Agent,WebSearch,WebFetch",*clean]
+os.execve("/home/ada/.local/lib/claude-native",["claude",*args],env)
+'''
+
+def guarded_key(path):
+ fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+ with os.fdopen(fd,"rb") as source:
+  meta=os.fstat(source.fileno())
+  if not stat.S_ISREG(meta.st_mode) or meta.st_uid!=os.getuid() or stat.S_IMODE(meta.st_mode)!=0o600:
+   raise ValueError("key source must be an owned mode0600 regular file")
+  raw=source.read(8193)
+ if len(raw)>8192: raise ValueError("key source is oversized")
+ key=raw.decode("ascii").strip()
+ if not key or any(c.isspace() or ord(c)<33 for c in key): raise ValueError("invalid key source")
+ return key
+
+class Evaluation(rig.Run):
+ def __init__(self,*args,key,variant):
+  self.key=key; self.variant=variant; self.actions=[]; self.provider={}; self.semantic_started=False
+  super().__init__(*args)
+ def scrub(self,value):
+  value=value.replace(self.key,"[REDACTED]")
+  if len(self.key)>32: value=value.replace(self.key[-20:],"[REDACTED]")
+  return value
+ def execute(self,title,script,**kw):
+  r=self.m.run(script,**kw)
+  r={k:self.scrub(v) if isinstance(v,str) else v for k,v in r.items()}
+  r["title"]=title; self.commands.append(r); self.save(); return r
+ def save(self):
+  super().save()
+  manifest={"variant":self.variant,"model":MODEL,"semantic_started":self.semantic_started,
+   "credential_route":"guarded loader -> private stdin -> guest memory/socket -> native apiKeyHelper; guest HTTPS proxy preserves native Anthropic endpoint; differs from original omp wrapper suggestion",
+   "key_in_environment":False,"native_provider":True,"protocol_standin":False,
+   "limits":{"wall_clock_seconds":600,"budget_usd":2.0,"message_calls":60},
+   "actions":self.actions,"provider":self.provider,
+   "cost_basis":"actual provider token/cache usage multiplied by published Haiku4.5 rates; not an invoice"}
+  (self.out/"evaluation.json").write_text(self.scrub(json.dumps(manifest,indent=2))+"\n")
+ def api(self,path,title):
+  r=self.execute(title,shlex.join(["curl","--silent","--show-error","--fail","--unix-socket",f"/run/user/{self.m.uid}/st3.sock","http://localhost"+path]),timeout=15)
+  if r["exit"]: return None
+  return rig.unwrap(json.loads(r["stdout"]))
+ def status(self):
+  r=self.m.run("curl --silent --show-error --fail http://127.0.0.1:18443/status",timeout=5)
+  if r["exit"]: raise RuntimeError("private broker status unavailable")
+  self.provider=json.loads(self.scrub(r["stdout"])); self.save(); return self.provider
+ def privacy(self,title):
+  r=self.execute(title,"curl -fsS http://127.0.0.1:18443/safety",timeout=20)
+  data=json.loads(r["stdout"]) if r["exit"]==0 else {}
+  return self.check(title,r["exit"]==0 and data.get("credential_environment_processes")==[] and data.get("credential_files")==[],"key absent from all fixture-user process environments and regular home files")
+ def review(self,card,run):
+  if not card.get("review_mode") or not card.get("mission_run_id") or card["mission_run_id"]==run["id"]: return False
+  sample=self.api("/v1/mission-runs/"+urllib.parse.quote(card["mission_run_id"].removeprefix("mission-run/"),safe=""),"Actual sample review run")
+  if not sample or sample["workspace"]!=str(Path(run["workspace"])/"garden-note") or card.get("person_id")!=run["requester"]: return False
+  if not any(action.get("step")=="first-mission" and action.get("answer")=="accept" for action in self.actions): return False
+  spec=self.api("/v1/missions/"+urllib.parse.quote(sample["mission"].removeprefix("mission/"),safe=""),"Sample revision and human gate")
+  if not spec or spec["revision"]!=sample["revision"]: return False
+  targets=[]
+  for step in spec["steps"].values():
+   for gate in step.get("gates",[]):
+    if gate.get("predicate")=="human" and gate.get("reviewer")=="person/ada": targets+=gate.get("review_targets",[])
+  if not targets: return False
+  for target in targets:
+   ref=target if isinstance(target,str) else target.get("document") or target.get("subject")
+   if not ref or not ref.startswith("doc/"): return False
+   r=self.cli("Ada reads actual sample review document","documents","get",ref,"--raw")
+   if r["exit"] or not r["stdout"].strip(): return False
+  r=self.cli("Ada approves actual sample on Home","attention","approve",card["id"],"--as","person/ada","--reason","I read the private garden note; it is ready.")
+  if r["exit"]: raise RuntimeError("person sample review failed")
+  self.actions.append({"type":"sample-review","attention":card["id"],"sample_run":sample["id"],"read_targets":targets})
+  self.save(); return True
+ def observe(self):
+  persona=Persona(self.variant); reviewed=set(); previous=None; until=time.monotonic()+600; run=None
+  while time.monotonic()<until:
+   state=self.status()
+   if state["stopped"]: self.check("provider-stop",False,state["stopped"]); break
+   run=self.api("/v1/mission-runs/st%2Fonboarding","Current onboarding run")
+   if not run: raise RuntimeError("onboarding run unavailable")
+   projection=[(s["step"],s["status"]) for s in run["steps"]]
+   if projection!=previous:
+    print("variant",self.variant,"steps",projection,flush=True); previous=projection
+   if run["status"] in ("completed","cancelled","failed"): break
+   page=self.json_cli("Ada Home questions","attention","ls","--as","person/ada")
+   if page is None: raise RuntimeError("person attention unavailable")
+   for card in page.get("items",[]):
+    decision=persona.answer(card,run)
+    if decision:
+     argv=["work","done",card["source_id"],"--as","person/ada"]
+     argv += ["--answer",decision["answer"]] if "answer" in decision else ["--text",decision["text"]]
+     r=self.cli("Ada answers current "+decision["step"],*argv)
+     if r["exit"]: raise RuntimeError("person Home answer failed")
+     persona.answered(card,decision); self.actions.append({"type":"person-answer","attention":card["id"],"source":card["source_id"],**decision}); self.save()
+    elif card.get("state")=="open" and card["id"] not in reviewed and self.review(card,run): reviewed.add(card["id"])
+   time.sleep(2)
+  completed=run is not None and run["status"]=="completed"
+  self.check("semantic-run-completed",completed,"actual onboarding graph run completed" if completed else "run did not complete within the bounded evaluation")
+  if completed:
+   for step in run["steps"]:
+    r=self.cli("Production gate "+step["step"],"gate","onboarding",step["step"],"--run",run["id"],"--generation",run["generation"],"--attempt",str(step["attempt"]))
+    self.check("gate-"+step["step"],r["exit"]==0,"actual current production gate")
+   self.check("actual-person-review",bool(reviewed),"Ada read and approved the actual sample document")
+   if self.variant==2: self.check("help-decline-order",persona.help_used and persona.decline_used,"help and decline answered before fresh accepted requests")
+  return run
+ def cleanup_seats(self):
+  seats=self.json_cli("Fixture seats before stopping","agents","ls","--limit","200")
+  for seat in (seats or {}).get("items",[]):
+   subject=seat.get("id") or seat.get("subject")
+   if subject: self.cli("Stop fixture provider seat","agents","stop",subject,"--as","person/ada",timeout=15)
+  runs=self.api("/v1/mission-runs?root=mission-run%2Fst%2Fonboarding","Fixture runs before cancellation")
+  for run in runs or []:
+   if run.get("status") not in ("completed","cancelled","failed"):
+    self.cli("Cancel unfinished fixture run","missions","cancel",run["id"],"--reason","Bounded semantic fixture finished","--as","person/ada",timeout=15)
+ def transcripts(self):
+  # Read only transcript/log artifacts into memory, redact before any host write.
+  probe='''import json
+from pathlib import Path
+out={}
+for root,pattern in ((Path.home()/".claude/projects","*.jsonl"),(Path.home()/".local/state/st3","*.log")):
+ for p in root.rglob(pattern):
+  if p.is_file(): out[str(p)]=p.read_text(errors="replace")[-3000000:]
+print(json.dumps(out))
+'''
+  r=self.m.run("python3 -c "+shlex.quote(probe),timeout=30)
+  (self.out/"native-transcripts.json").write_text(self.scrub(r["stdout"]))
+  self.check("native-transcripts",r["exit"]==0,"only native transcript/log text, redacted in memory before publication")
+
+def evaluate(args,archive,metadata,key,variant):
+ machine=rig.Machine(args,"24.04","content-native-"+str(variant))
+ run=Evaluation(machine,args.out/str(variant),archive,metadata,key=key,variant=variant)
+ broker=None; graph_started=False
+ try:
+  machine.start()
+  if not run.install(False): return run
+  machine.send(args.claude.read_bytes(),"/home/ada/smalltalk-install/claude-native")
+  r=run.execute("Install native provider and private fixture directories","mkdir -p ~/.local/bin ~/.local/lib ~/.claude ~/.local/state/onboarding-eval ~/garden-project; install -m755 ~/smalltalk-install/claude-native ~/.local/lib/claude-native; chmod 700 ~/.local/state/onboarding-eval")
+  if r["exit"]: raise RuntimeError("provider installation failed")
+  for name in ("claude_eval_broker.py","claude_welcome.py"):
+   machine.send((HERE/"onboarding-fixtures"/name).read_bytes(),"/home/ada/.local/state/onboarding-eval/"+name)
+  machine.send(KEY_HELPER.encode(),"/home/ada/.local/state/onboarding-eval/key_helper.py")
+  machine.send(WRAPPER.encode(),"/home/ada/.local/bin/claude")
+  settings={"apiKeyHelper":"python3 /home/ada/.local/state/onboarding-eval/key_helper.py","alwaysThinkingEnabled":False}
+  machine.send(json.dumps(settings).encode(),"/home/ada/.claude/settings.json")
+  r=run.execute("Generate guest-only TLS certificate for bounded native provider proxy","umask 077; openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=api.anthropic.com -addext subjectAltName=DNS:api.anthropic.com -keyout ~/.local/state/onboarding-eval/proxy-tls-key.pem -out ~/.local/state/onboarding-eval/proxy-cert.pem >/dev/null 2>&1")
+  if r["exit"]: raise RuntimeError("guest proxy certificate preparation failed")
+  run.execute("Prepare executable wrapper and real native version","chmod 755 ~/.local/bin/claude; ~/.local/bin/claude --version")
+  r=run.cli("Prepare daemon without any provider seat","setup","--person","ada","--node","studio","--yes","--harness","none","--service","true")
+  if r["exit"]: raise RuntimeError("foundation setup failed")
+  graph_started=True; run.st="/home/ada/.local/bin/st"
+  run.execute("Guest operator enables lingering before lesson","loginctl enable-linger ada; loginctl show-user ada --property=Linger --value",root=True)
+  broker=subprocess.Popen(machine.prefix()+["python3","/home/ada/.local/state/onboarding-eval/claude_eval_broker.py"],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  broker.stdin.write(key.encode()+b"\n"); broker.stdin.close()
+  for _ in range(30):
+   probe=machine.run("test -S ~/.local/state/onboarding-eval/key.sock; curl -fsS http://127.0.0.1:18443/status",timeout=3)
+   if probe["exit"]==0: break
+   time.sleep(.1)
+  else: raise RuntimeError("private helper did not become ready")
+  welcome=run.execute("Actual native first-launch welcome; no model prompt","python3 ~/.local/state/onboarding-eval/claude_welcome.py",timeout=100)
+  run.status()
+  if not run.check("native-welcome",welcome["exit"]==0,"real native preference/account/consent actions; no fabricated onboarding marker"): return run
+  if not run.check("no-welcome-model-turn",run.provider["message_calls"]==0,"native welcome completed before semantic model requests"): return run
+  if not run.privacy("credential-isolation-before-eval"): return run
+  run.semantic_started=True; run.save()
+  r=run.cli("Create actual bundled expert and onboarding run","setup","--yes","--harness","claude","--claude-channel","true","--service","true",timeout=90)
+  if r["exit"]: raise RuntimeError("expert setup failed")
+  run.observe()
+ except Exception as error:
+  run.check("runner-error",False,type(error).__name__+": "+run.scrub(str(error)))
+ finally:
+  if graph_started:
+   try: run.cleanup_seats()
+   except Exception as error: run.check("stop-fixture",False,type(error).__name__)
+  if broker:
+   try: run.privacy("credential-isolation-after-eval")
+   except Exception: run.check("credential-isolation-unavailable",False,"guest privacy observation unavailable")
+   try: run.status()
+   except Exception: run.check("provider-usage-unavailable",False,"usage receipt unavailable")
+   try: run.transcripts()
+   except Exception as error: run.check("transcript-export",False,type(error).__name__)
+   broker.terminate()
+   try: broker.wait(timeout=3)
+   except subprocess.TimeoutExpired: broker.kill(); broker.wait()
+  try: machine.close()
+  except Exception as error: run.check("cleanup",False,type(error).__name__)
+  run.save()
+ return run
+
+def main():
+ parser=argparse.ArgumentParser(description=__doc__)
+ parser.add_argument("--archive",required=True); parser.add_argument("--sha256",required=True)
+ parser.add_argument("--claude",type=Path,required=True)
+ parser.add_argument("--key-file",type=Path,default=Path.home()/".config/anthropic/api-key")
+ parser.add_argument("--authorization",required=True,help="immutable authorization message reference, never a key")
+ parser.add_argument("--image",default="onb-sysd2404"); parser.add_argument("--out",type=Path,required=True)
+ args=parser.parse_args(); args.backend="docker"; args.keep=False
+ if args.out.exists(): parser.error("output directory already exists; evaluations must never be silently retried")
+ with args.claude.open("rb") as source:
+  if source.read(4)!=b"\x7fELF": parser.error("native Linux Claude ELF required")
+ with open("/tmp/st-onboarding-container.lock","a") as lock,tempfile.TemporaryDirectory() as tmp:
+  fcntl.flock(lock,fcntl.LOCK_EX); archive,metadata=rig.load_archive(args,tmp)
+  key=guarded_key(args.key_file); args.out.mkdir(parents=True,mode=0o700)
+  results=[]
+  for variant in (1,2):
+   run=evaluate(args,archive,metadata,key,variant)
+   results.append({"variant":variant,"semantic_started":run.semantic_started,"checks":run.checks,"provider":run.provider})
+   if run.provider.get("stopped") in ("authentication-or-rate-limit","credential-helper-mismatch") or not run.semantic_started:
+    break
+  manifest={"authorization":args.authorization,"archive":metadata,"native_claude_sha256":hashlib.sha256(args.claude.read_bytes()).hexdigest(),"results":results,"authorized_semantic_evaluations":2,"no_third_attempt":True,"codex":"pending: no authorized credential source"}
+  (args.out/"summary.json").write_text(json.dumps(manifest,indent=2)+"\n")
+  return int(len(results)!=2 or any(c["status"]=="FAIL" for result in results for c in result["checks"]))
+
+if __name__=="__main__": raise SystemExit(main())

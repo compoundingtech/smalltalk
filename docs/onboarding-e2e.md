@@ -115,6 +115,68 @@ fixtures read and claim steps; they do not complete the onboarding content.
 onboarding run and fails when it does not. Paid content evals belong to the
 mission-content step. Do not report a basic stub pass as wrap-up evidence.
 
+Two separate native-Claude runners cover the actual provider binary. They require
+an immutable local archive and the native Linux ELF; they copy no host login or
+provider preference files. `scripts/onboarding-plain-claude` installs the actual
+bundled plugin, explicitly enables it at user scope and requires unscoped native
+Claude to report its MCP server connected. It also checks the installed server's
+idle initialize, empty tools/list and ping responses, with no model prompt.
+
+`scripts/onboarding-content-eval` requires explicit authorization for its credential
+source and exactly two paid semantic evaluations. It runs two fresh Ubuntu24
+systemd guests sequentially, with the ordinary 2 CPU/3 GiB/no-host-mount limits.
+The guarded loader accepts only a user-owned mode0600 regular file without following
+symlinks. It pipes the key into a disposable guest memory broker; Claude receives it
+only through its private `apiKeyHelper` socket. No key is supplied to the daemon,
+container arguments, environment, image, settings file or report. This route differs
+from the original suggestion to use the host omp wrapper, which has no native-Claude
+bridge. Use it only under authorization for the guarded helper route.
+
+The fixture completes native welcome/theme/account and Bypass Permissions consent before any model prompt;
+it observes preferences written by Claude and never fabricates onboarding markers.
+Each semantic run is capped at ten minutes, sixty message requests and a conservative
+$2 transport budget. The pinned model is Haiku4.5, with short outputs and native
+subagent/web tools disabled. A token-count preflight reserves the worst-case cost
+before each paid message. The first authentication or rate-limit error blocks all
+later upstream calls and stops the pair; no third attempt or silent retry is allowed.
+The HTTPS proxy uses a temporary guest certificate and `NODE_EXTRA_CA_CERTS`, only
+for the provider process, while retaining Claude's normal Anthropic endpoint.
+Setting a loopback `ANTHROPIC_BASE_URL` disabled channels in the retained native
+trial. The proxy forwards real provider responses; it supplies no model stand-in.
+Other native metadata endpoints pass through without being recorded as model calls.
+
+Ada answers only actual current Home questions for this run and attempt, reads the
+actual sample document before its human approval, chooses the private project
+directory and accepts its proposed seat. The second run asks for tour help and
+declines the first garden plan before accepting fresh requests. Optional phone,
+second-machine and GitHub each receive their own current skip answer. Success
+requires the completed graph run and all nine production gates; readiness or an MCP
+handshake cannot satisfy semantic checks. A native welcome that stalls is a failed
+precondition, not a semantic pass. The runner removes each guest on success or failure.
+
+Reports include redacted native transcripts, actual graph/action receipts, model and
+binary/archive pins, upstream request counts and cost calculated from actual provider
+token/cache usage. The [Haiku4.5 rates](https://platform.claude.com/docs/en/models/haiku-4-5/overview) are used for this calculation; it is not an invoice. Transcript text is read
+into memory and redacted before writing on the host; credential/config directories
+are excluded. Codex paid evaluation needs its own authorized credential source and is
+not implied by these Claude runs. Example, after obtaining the required authorization:
+
+```sh
+scripts/onboarding-content-eval --archive /tmp/content-candidate.tar.gz \
+  --sha256 HEX --claude /path/to/native/claude.exe \
+  --authorization message/AUTHORIZATION --out /var/tmp/content-native
+```
+
+The first two authorized paid attempts on content500 each made one successful
+native model request, then failed the fixture's next token-count preflight with
+HTTP400. Their usage-derived total was $0.070646. All semantic gates remain
+untested; neither run reached a person question. The failed receipts are retained.
+The offline correction follows the [official beta `countTokens` implementation](https://github.com/anthropics/anthropic-sdk-typescript/blob/main/src/resources/beta/messages/messages.ts) endpoint/header
+and preserves native tool-result/context fields. Its sanitized native-shape and
+HTTPS first-error guard tests pass, but the correction has not been rerun against
+the provider. Both paid attempts are exhausted: obtain a separate, specific rerun
+authorization before using this runner again for that evaluation.
+
 Each scenario writes `result.json` and `report.md` under OUT/RELEASE-SCENARIO, with
 exact commands, exit codes, separate stdout/stderr and elapsed seconds. Output
 directories must be new. `--keep` retains the uniquely named instance for debugging;
