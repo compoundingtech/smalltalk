@@ -39,12 +39,14 @@ export const stSessionTraceLayer = Layer.effect(SessionTraceProvider,
           const usage = observation.usage
           const field = <TValue>(pick: (value: Native.UsageSummary) => TValue | undefined) => {
             if (usage._tag === 'Unknown') return usage
+            if (usage.value.incarnation_count === 0) return missing
             const value = pick(usage.value)
-            return value === undefined ? missing : known(value)
+            return value === undefined || (typeof value === 'string' && value.length === 0) ? missing : known(value)
           }
           const context = usage._tag === 'Known' ? usage.value.context : undefined
           const contextField = <TValue>(value: TValue | undefined) =>
-            usage._tag === 'Unknown' ? usage : value === undefined ? missing : known(value)
+            usage._tag === 'Unknown' ? usage
+              : value === undefined || (typeof value === 'string' && value.length === 0) ? missing : known(value)
           const row = observation.row
           // A returned row must establish the requested join; never echo an unverified input as Known.
           const nativeSessionId = row._tag === 'Unknown' ? row

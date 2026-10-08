@@ -41,6 +41,32 @@ const consumerLayer = Layer.effect(TraceConsumer, Effect.gen(function* () {
   return { trace: yield* sessionTrace(query) }
 }))
 
+it.effect('context-only native summaries preserve context but do not invent zero spend', () =>
+  Effect.gen(function* () {
+    const contextOnly = { ...summary, incarnation_count: 0, input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0 }
+    const trace = yield* sessionTrace(query).pipe(Effect.provide(nativeLayer({
+      ...facts, usage: { _tag: 'Known', value: contextOnly },
+    })))
+    for (const value of Object.values(trace.meters.tokens)) expect(value).toEqual(unknown)
+    expect(trace.meters.cost).toEqual({ amount: unknown, currency: unknown })
+    expect(trace.meters.context.usedTokens).toEqual({ _tag: 'Known', value: 12 })
+    expect(yield* Schema.decodeUnknownEffect(TraceSeries)(trace)).toEqual(trace)
+  }),
+)
+
+it.effect('valid empty native currency and model remain Unknown in the stricter public schema', () =>
+  Effect.gen(function* () {
+    const trace = yield* sessionTrace(query).pipe(Effect.provide(nativeLayer({
+      ...facts, usage: { _tag: 'Known', value: { ...summary, currency: '', context: {
+        observed_at_unix_ms: summary.context!.observed_at_unix_ms, model: '',
+      } } },
+    })))
+    expect(trace.meters.cost.currency).toEqual(unknown)
+    expect(trace.meters.context.model).toEqual(unknown)
+    expect(yield* Schema.decodeUnknownEffect(TraceSeries)(trace)).toEqual(trace)
+  }),
+)
+
 describe('session trace seam', () => {
   it.effect.prop('round trips the complete response schema', [TraceSeries], ([trace]) =>
     Effect.gen(function* () {

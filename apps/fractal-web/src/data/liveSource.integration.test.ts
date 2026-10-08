@@ -9,7 +9,7 @@ import type {
   TerminalScreen,
 } from '@smalltalk/st3-client'
 import type { AttachmentSendRequest, MessageSendAction } from './source.ts'
-import { Effect } from 'effect'
+import { Effect, Layer } from 'effect'
 import * as Option from 'effect/Option'
 import * as Atom from 'effect/reactivity/Atom'
 import { afterEach, beforeEach, describe, expect, vi } from 'vitest'
@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, vi } from 'vitest'
 /** Cold-selection admission through the real live source and SDK. */
 
 import { liveSource, type LiveSource } from './liveSource.ts'
+import { SessionTraceProvider } from './sessionTrace.ts'
 
 const snapshot: Snapshot = {
   id: 'snapshot/1',
@@ -176,6 +177,8 @@ class Gateway {
       } else {
         throw new Error(`Unexpected action ${action.type}`)
       }
+    } else if (path === '/v1/client/usage') {
+      value = { since_ms: 0, until_ms: 1000, rows: [] }
     } else {
       throw new Error(`Unexpected request ${path}`)
     }
@@ -297,13 +300,17 @@ const settle = Effect.promise(async () => {
 
 const withGateway = (
   test: (live: LiveSource, gateway: Gateway) => Effect.Effect<void>,
-  { maxFollows = 2 }: { readonly maxFollows?: number } = {},
+  { maxFollows = 2, sessionTraceLayer }: {
+    readonly maxFollows?: number
+    readonly sessionTraceLayer?: Layer.Layer<SessionTraceProvider>
+  } = {},
 ) =>
   Effect.gen(function* () {
     const gateway = new Gateway()
     const live = yield* Effect.acquireRelease(
       Effect.sync(() =>
         liveSource({
+          sessionTraceLayer,
           options: {
             baseUrl: 'http://gateway.test',
             maxFollows,
@@ -317,6 +324,26 @@ const withGateway = (
     )
     yield* test(live, gateway)
   }).pipe(Effect.scoped)
+
+it.live('exposes the native default and an injected trace provider through the owned source runtime', () =>
+  withGateway((live) => Effect.gen(function* () {
+    const query = { native_session_id: 'native-example', range: '7d', bucket: '15m' } as const
+    expect(live.source.sessionTrace).toBeDefined()
+    const native = yield* Effect.promise(() => live.source.sessionTrace!(query))
+    expect(native.partial).toBe(true)
+    expect(native.meters.scope).toBe('agent-incarnations')
+    expect(native.buckets).toEqual({ _tag: 'Unknown', reason: 'no-provider' })
+    const full = { ...native, scope: 'including_subagents' as const, partial: false,
+      buckets: { _tag: 'Known' as const, value: [] }, subagents: { _tag: 'Known' as const, value: [] } }
+    yield* withGateway((injected) => Effect.gen(function* () {
+      expect(yield* Effect.promise(() => injected.source.sessionTrace!(query))).toEqual(full)
+    }), {
+      sessionTraceLayer: Layer.succeed(SessionTraceProvider, {
+        load: () => Effect.succeed(full),
+      }),
+    })
+  })),
+)
 
 describe('live feed sync sidecars', () => {
   it.live('records requested only after actual send and retains the last observed value as stale', () =>

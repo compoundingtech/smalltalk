@@ -84,8 +84,11 @@ agent reader: roster meters are labelled `agent-incarnations`, exclude subagents
 are always partial. These cumulative meters are neither the requested range's totals
 nor the selected root's totals. Missing values never become zero, and unavailable
 series/subagent coverage remains `Unknown('no-provider')`, not an empty series.
-Consumers use `sessionTrace(query)`; another Effect layer can provide
-`SessionTraceProvider` via `Layer.provide` without changing consumer code.
+Context-only native summaries leave spend unknown; observed context meters remain
+available. Consumers call the live source's `sessionTrace(query)` port, bound to its
+owned runtime, or use the same-named Effect operation inside a provided context.
+Another Effect layer can provide `SessionTraceProvider` via `Layer.provide`, or be
+passed as `liveSource({ sessionTraceLayer, options })`, without changing consumer code.
 
 ### Web follow budgets and synchronization
 

@@ -53,7 +53,7 @@ import {
 } from './source.ts'
 import { gatewaySubjectReads, SubjectReadPort, subjectReaderFromAtom } from './subjectReadPort.ts'
 import { gatewaySessionTraceLayer } from './stSessionTrace.ts'
-import type { SessionTraceProvider } from './sessionTrace.ts'
+import { sessionTrace, type SessionTraceProvider } from './sessionTrace.ts'
 
 /** The owned source registry and runtime teardown handle. */
 export interface LiveSource {
@@ -826,6 +826,7 @@ export const liveSource = ({
       grants,
       contentSearch: gatewayContentSearch(client),
       attachments: { ...attachments, send: (request) => retainConversation(request.parameters.to).send(request) },
+      sessionTrace: (query) => runtime.runPromise(sessionTrace(query)),
       connection,
       agents,
       missions,
