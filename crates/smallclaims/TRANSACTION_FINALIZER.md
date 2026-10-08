@@ -73,9 +73,16 @@ deadline inputs, bounded initial installation, restore/checkpoint handling, roll
 same-snapshot read certification. Neither callback installation nor a maximum applied
 index makes a projection Ready. Existing runtimes install no callback by default.
 
-The default path has small library overhead: two OnceLock loads per queued batch; a lent
-transaction adds an Arc clone, a OnceLock load and an autocommit check at commit. No
-callback or source SQL runs unless explicitly installed. This is not a zero-cost claim.
+Each managed outer transaction borrows one snapshot of the installed hook pair. Hook
+installation acquires the same exclusive writer loan, so neither a queued batch nor a
+lent transaction can switch hook pairs between prepare and finalize. The lent transaction
+borrows the pair for the existing guard lifetime instead of acquiring shared Arc ownership.
+
+The default path still checks the OnceLock once per outer transaction and branches on
+that snapshot at finalize; a lent commit retains its autocommit check. No callback or
+source SQL runs unless explicitly installed. This removes an Arc clone/drop and the
+second registry lookup; it is a source-level cost reduction, not a measured performance
+result or a zero-cost claim.
 
 For an adapter's persisted gap singleton, explicitly call
 `Views::install_gap_trigger(tx, table, gap_column)`. The ordinary main table must already

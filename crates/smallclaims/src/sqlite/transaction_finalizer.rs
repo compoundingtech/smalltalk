@@ -11,7 +11,7 @@ use rusqlite::{Savepoint, Transaction};
 
 type TransactionCallback = Arc<dyn Fn(&Transaction<'_>) -> Result<()> + Send + Sync>;
 
-struct TransactionHooks {
+pub(super) struct TransactionHooks {
     prepare: TransactionCallback,
     finalize: TransactionCallback,
 }
@@ -39,18 +39,20 @@ impl TransactionFinalizers {
         Ok(())
     }
 
+    /// Installation owns the same writer loan as the transaction, so this pair cannot
+    /// change until the outer transaction and its guard have finished.
+    pub(super) fn snapshot(&self) -> Option<&TransactionHooks> {
+        self.hooks.get()
+    }
+}
+
+impl TransactionHooks {
     pub(super) fn prepare(&self, transaction: &Transaction<'_>) -> Result<()> {
-        if let Some(hooks) = self.hooks.get() {
-            Self::invoke(&hooks.prepare, transaction, "prepare")?;
-        }
-        Ok(())
+        Self::invoke(&self.prepare, transaction, "prepare")
     }
 
     pub(super) fn run(&self, transaction: &Transaction<'_>) -> Result<()> {
-        if let Some(hooks) = self.hooks.get() {
-            Self::invoke(&hooks.finalize, transaction, "finalizer")?;
-        }
-        Ok(())
+        Self::invoke(&self.finalize, transaction, "finalizer")
     }
 
     fn invoke(
@@ -79,18 +81,15 @@ impl TransactionFinalizers {
 /// Explicit raw Connection access and raw SQL transaction control remain outside this API.
 pub struct WriterTransaction<'connection> {
     transaction: Transaction<'connection>,
-    finalizers: Arc<TransactionFinalizers>,
+    hooks: Option<&'connection TransactionHooks>,
 }
 
 impl<'connection> WriterTransaction<'connection> {
     pub(super) fn new(
         transaction: Transaction<'connection>,
-        finalizers: Arc<TransactionFinalizers>,
+        hooks: Option<&'connection TransactionHooks>,
     ) -> Self {
-        Self {
-            transaction,
-            finalizers,
-        }
+        Self { transaction, hooks }
     }
 
     /// Run bounded source maintenance in this transaction, then commit. Errors propagate
@@ -100,7 +99,9 @@ impl<'connection> WriterTransaction<'connection> {
             !self.transaction.is_autocommit(),
             "writer transaction was ended through raw SQL"
         );
-        self.finalizers.run(&self.transaction)?;
+        if let Some(hooks) = self.hooks {
+            hooks.run(&self.transaction)?;
+        }
         self.transaction.commit()?;
         Ok(())
     }
@@ -746,6 +747,96 @@ mod tests {
         assert_eq!(count(&writer, "source"), 2);
         assert_eq!(count(&writer, "delta"), 2);
         assert_eq!(count(&writer, "output"), 0);
+    }
+
+    #[test]
+    fn lent_transactions_borrow_hooks_without_acquiring_shared_ownership() {
+        let writer = writer();
+        for installed in [false, true] {
+            if installed {
+                writer.install_transaction_hooks(|_| Ok(()), drain).unwrap();
+            }
+            let owners = Arc::strong_count(&writer.finalizers);
+            let mut guard = writer.write();
+            let tx = guard.transaction().unwrap();
+            assert_eq!(Arc::strong_count(&writer.finalizers), owners);
+            tx.rollback().unwrap();
+            let tx = guard
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(Arc::strong_count(&writer.finalizers), owners);
+            tx.commit().unwrap();
+            assert_eq!(Arc::strong_count(&writer.finalizers), owners);
+        }
+    }
+
+    #[test]
+    fn hook_installation_waits_for_the_unhooked_outer_transaction_and_loan() {
+        let writer = Arc::new(writer());
+        let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (done, installed) = mpsc::sync_channel(1);
+        let mut guard = writer.write();
+        let tx = guard.transaction().unwrap();
+        let installing = writer.clone();
+        let started = barrier.clone();
+        let prepared = phases.clone();
+        let finalized = phases.clone();
+        let installer = std::thread::spawn(move || {
+            started.wait();
+            let result = installing.install_transaction_hooks(
+                move |_| {
+                    prepared.lock().unwrap().push("prepare");
+                    Ok(())
+                },
+                move |tx| {
+                    finalized.lock().unwrap().push("finalize");
+                    // The previously unhooked source is not retrospectively finalized.
+                    tx.execute(
+                        "INSERT INTO output SELECT id,value FROM source WHERE id=2",
+                        [],
+                    )?;
+                    Ok(())
+                },
+            );
+            done.send(result).unwrap();
+        });
+        barrier.wait();
+        free_write(&tx, 1, "before installation").unwrap();
+        tx.commit().unwrap();
+        assert!(matches!(
+            installed.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(phases.lock().unwrap().is_empty());
+        assert_eq!(tx_count(&guard, "output"), 0);
+        drop(guard);
+        installed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        installer.join().unwrap();
+        writer
+            .batched(|tx| free_write(tx, 2, "after installation"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(*phases.lock().unwrap(), vec!["prepare", "finalize"]);
+        assert_eq!(count(&writer, "source"), 2);
+        assert_eq!(count(&writer, "output"), 1);
+    }
+
+    #[test]
+    fn unhooked_raw_commit_still_reports_the_managed_contract_violation() {
+        let writer = writer();
+        let mut guard = writer.write();
+        let tx = guard.transaction().unwrap();
+        free_write(&tx, 1, "outside managed commit").unwrap();
+        tx.execute_batch("COMMIT").unwrap();
+        let error = tx.commit().unwrap_err();
+        assert!(error.to_string().contains("ended through raw SQL"));
+        assert!(error.downcast_ref::<rusqlite::Error>().is_none());
+        assert_eq!(tx_count(&guard, "source"), 1);
+        assert_eq!(tx_count(&guard, "output"), 0);
     }
 
     #[test]

@@ -618,6 +618,7 @@ fn run_write_batch(
     mutation_observer: Option<&Arc<writer_observer::MutationState>>,
 ) -> Option<WriterJob> {
     let (observers, finalizers) = callbacks;
+    let hooks = finalizers.snapshot();
     let started = std::time::Instant::now();
     let mut answers = Vec::new();
     let mut lend = None;
@@ -626,8 +627,8 @@ fn run_write_batch(
             Ok(transaction) => (Some(transaction), None),
             Err(error) => (None, Some(anyhow::Error::from(error))),
         };
-    if let Some(transaction) = &transaction {
-        failure = finalizers.prepare(transaction).err();
+    if let (Some(transaction), Some(hooks)) = (&transaction, hooks) {
+        failure = hooks.prepare(transaction).err();
     }
     let mut job = Some(first);
     while let Some(current) = job.take() {
@@ -673,9 +674,13 @@ fn run_write_batch(
     batches.0.fetch_add(1, Ordering::Relaxed);
     batches.1.fetch_add(answers.len() as u64, Ordering::Relaxed);
     let committed = match (transaction, failure) {
-        (Some(transaction), None) => finalizers
-            .run(&transaction)
-            .and_then(|()| transaction.commit().map_err(anyhow::Error::from)),
+        (Some(transaction), None) => {
+            let finalized = match hooks {
+                Some(hooks) => hooks.run(&transaction),
+                None => Ok(()),
+            };
+            finalized.and_then(|()| transaction.commit().map_err(anyhow::Error::from))
+        }
         // Dropping the transaction rolls back every write in the batch.
         (_, Some(error)) => Err(error),
         (None, None) => unreachable!("a batch without a transaction failed to begin"),
@@ -701,20 +706,32 @@ impl WriterGuard<'_> {
     /// accepting &Transaction can use the wrapper through dereference; commit finalizes
     /// before COMMIT. Prepare failure rolls back and retains its original error cause.
     pub fn transaction(&mut self) -> Result<WriterTransaction<'_>> {
-        let finalizers = self.finalizers.clone();
-        let transaction = self.deref_mut().transaction()?;
-        finalizers.prepare(&transaction)?;
-        Ok(WriterTransaction::new(transaction, finalizers))
+        let hooks = self.finalizers.snapshot();
+        let connection = self
+            .connection
+            .as_mut()
+            .context("writer guard has no connection")?;
+        let transaction = connection.transaction()?;
+        if let Some(hooks) = hooks {
+            hooks.prepare(&transaction)?;
+        }
+        Ok(WriterTransaction::new(transaction, hooks))
     }
 
     pub fn transaction_with_behavior(
         &mut self,
         behavior: rusqlite::TransactionBehavior,
     ) -> Result<WriterTransaction<'_>> {
-        let finalizers = self.finalizers.clone();
-        let transaction = self.deref_mut().transaction_with_behavior(behavior)?;
-        finalizers.prepare(&transaction)?;
-        Ok(WriterTransaction::new(transaction, finalizers))
+        let hooks = self.finalizers.snapshot();
+        let connection = self
+            .connection
+            .as_mut()
+            .context("writer guard has no connection")?;
+        let transaction = connection.transaction_with_behavior(behavior)?;
+        if let Some(hooks) = hooks {
+            hooks.prepare(&transaction)?;
+        }
+        Ok(WriterTransaction::new(transaction, hooks))
     }
 }
 
