@@ -142,6 +142,7 @@ mod agent_messages;
 pub mod agent_view;
 mod conversation_reads;
 mod runtime;
+pub mod collection_ivm;
 #[cfg(test)]
 mod tombstones_tests;
 pub use runtime::SmalltalkRuntime;
