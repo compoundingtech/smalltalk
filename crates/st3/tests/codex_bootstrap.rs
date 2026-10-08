@@ -757,7 +757,7 @@ async fn bootstrap_waits_for_reconciliation(status: &str, previous: Option<&str>
                 let (parts, body) = response.into_parts();
                 let bytes = to_bytes(body, 1024 * 1024).await.unwrap();
                 let value: Value = serde_json::from_slice(&bytes).unwrap();
-                if !parts.status.is_success() && value["code"] != "mailbox-session-starting" {
+                if !parts.status.is_success() {
                     eprintln!("isolated Codex bootstrap refusal: {} {value}", parts.status);
                 }
                 if value["code"] == "mailbox-session-starting" {
