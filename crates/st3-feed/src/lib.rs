@@ -475,9 +475,17 @@ async fn connected(
                     // under it). Asked at once and again on every resync, that is a loop and, at an
                     // upgrade, a herd; so each is asked after a wait that grows and is jittered, and
                     // one good snapshot resets the wait.
-                    CollectionEvent::Resync { id, .. } => {
+                    CollectionEvent::Resync { id, code, message } => {
                         if let Some(window) = Window::from_id(&id) {
-                            window_retries.failed(window, Instant::now());
+                            // Said once, with st's own reason when it gave one (its source is
+                            // not ready); the retries are quiet until the window loads.
+                            let first = window_retries.failed(window, Instant::now());
+                            if first && let Some(message) = message {
+                                let message = st3_client::plain_message(code.as_ref(), &message);
+                                if updates.send(Update::WindowFailed(window, message)).is_err() {
+                                    return Ended::Closed;
+                                }
+                            }
                         }
                     }
                     CollectionEvent::Conversation { id, session_id, replace, items, has_more } => {
