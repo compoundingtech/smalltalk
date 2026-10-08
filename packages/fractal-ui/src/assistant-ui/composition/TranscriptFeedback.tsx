@@ -8,12 +8,13 @@ import { surfaceVars as surface, textVars as ink, accentVars as accent, statusVa
 export interface TranscriptEmptyState { readonly title: string; readonly body?: string }
 
 /** Failed send: danger reason line; host-supplied detail opens on disclosure. */
-export function SendFailure({ state }: { readonly state: Extract<SendState, { _tag: 'Failed' }> }) {
+export function SendFailure({ state, onRetry }: { readonly state: Extract<SendState, { _tag: 'Failed' }>; readonly onRetry?: () => void }) {
   const [open, setOpen] = React.useState(false)
   const detailId = React.useId()
   return <div role="alert" data-testid="send-failure" {...stylex.props(styles.sendFailure)}>
     <Button aria-expanded={open} aria-controls={state.detail === undefined ? undefined : detailId} onPress={() => setOpen(value => !value)} {...stylex.props(styles.sendFailureLine)}>{state.reason}{state.detail !== undefined && <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} />}</Button>
     {open && state.detail !== undefined ? <div id={detailId} {...stylex.props(styles.sendFailureDetail)}>{state.detail}</div> : null}
+    {onRetry !== undefined && <Button onPress={onRetry} {...stylex.props(styles.sendFailureLine)}>Retry</Button>}
   </div>
 }
 
