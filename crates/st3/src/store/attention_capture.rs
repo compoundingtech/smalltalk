@@ -3,6 +3,8 @@
 //! runs in a native trigger. Images remain until the source owner acknowledges
 //! that every consumer has advanced past them. This helper does not inventory existing
 //! native rows, qualify a source, or enable a production reader.
+//! Ordinary main triggers own unqualified trigger DML; standalone reads/writes
+//! bind main. Broader Installer calls remain unsupported under metadata shadows.
 #![allow(dead_code)]
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -14,11 +16,11 @@ const MAX_IMAGE: usize = 64 * 1024;
 const MAX_IMAGES: usize = 8192;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS local_attention_native_capture(
+CREATE TABLE IF NOT EXISTS main.local_attention_native_capture(
  source TEXT PRIMARY KEY,epoch INTEGER NOT NULL,managed INTEGER NOT NULL CHECK(managed IN(0,1)),
  image_rows INTEGER NOT NULL CHECK(image_rows>=0),image_bytes INTEGER NOT NULL CHECK(image_bytes>=0),
  reclaiming INTEGER NOT NULL DEFAULT 0 CHECK(reclaiming IN(0,1)));
-CREATE TABLE IF NOT EXISTS local_attention_native_images(
+CREATE TABLE IF NOT EXISTS main.local_attention_native_images(
  source TEXT NOT NULL,epoch INTEGER NOT NULL,revision INTEGER NOT NULL,side INTEGER NOT NULL CHECK(side IN(0,1)),
  native_table TEXT NOT NULL,body TEXT NOT NULL,bytes INTEGER NOT NULL,
  PRIMARY KEY(source,epoch,revision,side));";
@@ -188,7 +190,7 @@ mod tests {
         tx.commit()?;
         let position = installer.position(&c, "attention-native")?;
         let references = c
-            .prepare("SELECT payload FROM ivm_install_journal ORDER BY revision")?
+            .prepare("SELECT payload FROM main.ivm_install_journal ORDER BY revision")?
             .query_map([], |r| r.get::<_, String>(0))?
             .map(|row| Ok(serde_json::from_str::<Mutation>(&row?)?))
             .collect::<Result<Vec<_>>>()?;
@@ -224,8 +226,8 @@ mod tests {
     fn raw_retained_image_changes_fence_only_the_owning_source() -> Result<()> {
         for action in [
             "UPDATE local_attention_native_images SET body='{}'",
-            "DELETE FROM local_attention_native_images",
-            "UPDATE local_attention_native_capture SET reclaiming=1; DELETE FROM local_attention_native_images",
+            "DELETE FROM main.local_attention_native_images",
+            "UPDATE local_attention_native_capture SET reclaiming=1; DELETE FROM main.local_attention_native_images",
             "INSERT INTO local_attention_native_images VALUES('attention-native',8,2,1,'native','{}',2)",
         ] {
             let (mut c, installer, capture) = fixture(64)?;
@@ -260,12 +262,98 @@ mod tests {
         assert!(installer.position(&c, "attention-native").is_err());
         Ok(())
     }
+
+    #[test]
+    fn capture_uses_main_native_and_retained_images_despite_temp_shadows() -> Result<()> {
+        let (mut c, installer, capture) = fixture(64)?;
+        c.execute_batch(
+            "CREATE TEMP TABLE native(other TEXT PRIMARY KEY);
+             CREATE TEMP TABLE local_attention_native_capture AS
+               SELECT * FROM main.local_attention_native_capture;
+             CREATE TEMP TABLE local_attention_native_images AS
+               SELECT * FROM main.local_attention_native_images;
+             UPDATE temp.local_attention_native_capture SET managed=1,image_rows=8192;",
+        )?;
+        let tx = c.transaction()?;
+        // Setup must validate main's columns and find the existing main triggers.
+        let position = installer.position(&tx, "attention-native")?;
+        let reopened = NativeCapture::install(&tx, &installer, &position, TABLES)?;
+        reopened.begin(&tx, &installer)?;
+        tx.execute("INSERT INTO main.native VALUES('main',X'00FF',17)", [])?;
+        reopened.commit(&tx)?;
+        tx.commit()?;
+        assert!(capture.compatible(&c)?);
+        assert_eq!(
+            capture.image(&c, 1, 1, "native")?["number"],
+            json!(["integer", 17])
+        );
+        assert_eq!(count(&c, "main.native")?, 1);
+        assert_eq!(count(&c, "temp.native")?, 0);
+        assert_eq!(count(&c, "main.local_attention_native_images")?, 1);
+        assert_eq!(count(&c, "temp.local_attention_native_images")?, 0);
+        let shadow_rows: usize = c.query_row(
+            "SELECT image_rows FROM temp.local_attention_native_capture",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(shadow_rows, MAX_IMAGES);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_shadows_refuse_reclaim_and_main_fence_preserves_native_admission() -> Result<()> {
+        let (mut c, installer, capture) = fixture(64)?;
+        let reclaim = capture.capture_reclaim(&c, &installer, 64)?;
+        let position = installer.position(&c, "attention-native")?;
+        c.execute_batch(
+            "CREATE TEMP TABLE ivm_install_sources AS SELECT * FROM main.ivm_install_sources;
+             CREATE TEMP TABLE ivm_install_jobs AS SELECT * FROM main.ivm_install_jobs;
+             CREATE TEMP TABLE ivm_install_roots AS SELECT * FROM main.ivm_install_roots;
+             CREATE TEMP TABLE ivm_install_journal AS SELECT * FROM main.ivm_install_journal;
+             CREATE TEMP TABLE ivm_install_deferred AS SELECT * FROM main.ivm_install_deferred;",
+        )?;
+        assert!(!capture.compatible(&c)?);
+        assert!(
+            capture
+                .capture_images(&c, &position, &[], 64, 256 * 1024)
+                .is_err()
+        );
+        assert!(capture.capture_reclaim(&c, &installer, 64).is_err());
+        let tx = c.transaction()?;
+        assert!(capture.publish_reclaim(&tx, &installer, &reclaim).is_err());
+        capture.begin(&tx, &installer)?;
+        tx.execute("INSERT INTO main.native VALUES('admitted',X'01',0)", [])?;
+        capture.commit(&tx)?;
+        tx.commit()?;
+        let main_available: bool = c.query_row(
+            "SELECT available FROM main.ivm_install_sources WHERE name='attention-native'",
+            [],
+            |r| r.get(0),
+        )?;
+        let shadow_available: bool = c.query_row(
+            "SELECT available FROM temp.ivm_install_sources WHERE name='attention-native'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(!main_available);
+        assert!(shadow_available);
+        assert_eq!(count(&c, "main.native")?, 1);
+        assert_eq!(count(&c, "main.local_attention_native_images")?, 0);
+        c.execute_batch(
+            "DROP TABLE temp.ivm_install_sources;
+            DROP TABLE temp.ivm_install_jobs; DROP TABLE temp.ivm_install_roots;
+            DROP TABLE temp.ivm_install_journal; DROP TABLE temp.ivm_install_deferred;",
+        )?;
+        assert!(!capture.compatible(&c)?);
+        Ok(())
+    }
 }
 
 pub(crate) struct NativeCapture {
     source: String,
     epoch: u64,
     fingerprint: String,
+    gap_main_sql: String,
     schema: Vec<(String, String)>,
     triggers: Vec<(String, String)>,
 }
@@ -348,6 +436,19 @@ fn literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+// The broader Installer position/reclaim API is still unqualified. Refuse that
+// connection shape before calling it; this does not validate physical schema or
+// bound metadata VM work, and is not a source coverage certificate.
+fn installer_metadata_unshadowed(c: &Connection) -> Result<bool> {
+    Ok(!c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema WHERE type IN ('table','view')
+         AND name IN ('ivm_install_sources','ivm_install_jobs','ivm_install_roots',
+                      'ivm_install_journal','ivm_install_deferred'))",
+        [],
+        |r| r.get::<_, bool>(0),
+    )?)
+}
+
 // Size before hex/JSON allocation; the final encoded size is checked as well.
 fn image(table: &Table, prefix: &str) -> Result<(String, String)> {
     let mut fields = Vec::new();
@@ -382,6 +483,10 @@ impl NativeCapture {
         tables: &[Table],
     ) -> Result<Self> {
         ensure!(
+            installer_metadata_unshadowed(tx)?,
+            "attention capture Installer metadata shadow"
+        );
+        ensure!(
             (1..=MAX_TABLES).contains(&tables.len()),
             "attention capture table bound"
         );
@@ -391,19 +496,20 @@ impl NativeCapture {
         );
         tx.execute_batch(SCHEMA)?;
         tx.execute(
-            "INSERT INTO local_attention_native_capture VALUES(?1,?2,0,0,0,0) ON CONFLICT DO NOTHING",
+            "INSERT INTO main.local_attention_native_capture VALUES(?1,?2,0,0,0,0) ON CONFLICT DO NOTHING",
             params![position.source, position.epoch],
         )?;
         let mut capture = Self {
             source: position.source.clone(),
             epoch: position.epoch,
             fingerprint: position.fingerprint.clone(),
+            gap_main_sql: String::new(),
             schema: vec![],
             triggers: vec![],
         };
         let source = literal(&position.source);
         let scope = format!(
-            "EXISTS(SELECT 1 FROM local_attention_native_capture WHERE source={source} AND epoch={} AND managed=1)",
+            "EXISTS(SELECT 1 FROM main.local_attention_native_capture WHERE source={source} AND epoch={} AND managed=1)",
             position.epoch
         );
         let mut names = std::collections::BTreeSet::new();
@@ -416,9 +522,9 @@ impl NativeCapture {
                 (1..=MAX_COLUMNS).contains(&table.columns.len()),
                 "attention capture column bound"
             );
-            let table_name = quoted(table.name)?;
+            let table_name = format!("main.{}", quoted(table.name)?);
             let columns = tx
-                .prepare("SELECT name FROM pragma_table_xinfo(?1) ORDER BY cid LIMIT 65")?
+                .prepare("SELECT name FROM pragma_table_xinfo(?1,'main') ORDER BY cid LIMIT 65")?
                 .query_map([table.name], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             ensure!(
@@ -429,7 +535,7 @@ impl NativeCapture {
                 "attention capture requires all native columns in schema order"
             );
             let sql: String = tx.query_row(
-                "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+                "SELECT sql FROM main.sqlite_schema WHERE type='table' AND name=?1",
                 [table.name],
                 |r| r.get(0),
             )?;
@@ -438,9 +544,10 @@ impl NativeCapture {
             // Execute the foundation's entire compiled fence body conditionally through
             // an empty view. Never duplicate or rewrite Installer SQL internals.
             if capture.triggers.is_empty() {
-                let view_sql = "CREATE VIEW local_attention_native_gap AS SELECT source,epoch FROM local_attention_native_capture WHERE 0";
+                capture.gap_main_sql = plan.gap_main_sql().to_owned();
+                let view_sql = "CREATE VIEW local_attention_native_gap AS SELECT source,epoch FROM main.local_attention_native_capture WHERE 0";
                 let previous: Option<String> = tx.query_row(
-                    "SELECT sql FROM sqlite_schema WHERE type='view' AND name='local_attention_native_gap'",
+                    "SELECT sql FROM main.sqlite_schema WHERE type='view' AND name='local_attention_native_gap'",
                     [], |r| r.get(0),
                 ).optional()?;
                 if let Some(previous) = previous {
@@ -459,14 +566,14 @@ impl NativeCapture {
                     ]))?[..16]
                 );
                 let sql = format!(
-                    "CREATE TRIGGER {} INSTEAD OF INSERT ON local_attention_native_gap WHEN NEW.source={source} AND NEW.epoch={} BEGIN {} END",
+                    "CREATE TRIGGER {} INSTEAD OF INSERT ON main.local_attention_native_gap WHEN NEW.source={source} AND NEW.epoch={} BEGIN {} END",
                     quoted(&name)?,
                     position.epoch,
                     plan.gap_sql()
                 );
                 let previous: Option<String> = tx
                     .query_row(
-                        "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                        "SELECT sql FROM main.sqlite_schema WHERE type='trigger' AND name=?1",
                         [&name],
                         |r| r.get(0),
                     )
@@ -499,7 +606,7 @@ impl NativeCapture {
                         "image_delete",
                         "DELETE",
                         format!(
-                            "OLD.source={source} AND NOT (OLD.epoch={} AND EXISTS(SELECT 1 FROM local_attention_native_capture WHERE source={source} AND epoch={} AND reclaiming=1) AND OLD.revision<={} AND NOT EXISTS(SELECT 1 FROM ivm_install_journal WHERE source={source} AND revision<=OLD.revision))",
+                            "OLD.source={source} AND NOT (OLD.epoch={} AND EXISTS(SELECT 1 FROM main.local_attention_native_capture WHERE source={source} AND epoch={} AND reclaiming=1) AND OLD.revision<={} AND NOT EXISTS(SELECT 1 FROM main.ivm_install_journal WHERE source={source} AND revision<=OLD.revision))",
                             position.epoch,
                             position.epoch,
                             plan.revision_sql()
@@ -514,13 +621,13 @@ impl NativeCapture {
                         ]))?[..16]
                     );
                     let sql = format!(
-                        "CREATE TRIGGER {} AFTER {action} ON local_attention_native_images WHEN {condition} BEGIN {} END",
+                        "CREATE TRIGGER {} AFTER {action} ON main.local_attention_native_images WHEN {condition} BEGIN {} END",
                         quoted(&name)?,
                         plan.gap_sql()
                     );
                     let previous: Option<String> = tx
                         .query_row(
-                            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                            "SELECT sql FROM main.sqlite_schema WHERE type='trigger' AND name=?1",
                             [&name],
                             |r| r.get(0),
                         )
@@ -537,7 +644,7 @@ impl NativeCapture {
                     "local_attention_native_images",
                 ] {
                     let sql: String = tx.query_row(
-                        "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+                        "SELECT sql FROM main.sqlite_schema WHERE type='table' AND name=?1",
                         [name],
                         |r| r.get(0),
                     )?;
@@ -551,7 +658,7 @@ impl NativeCapture {
             let retain = |prefix: &str, side: usize| -> Result<(String, String)> {
                 let (body, bounded) = image(table, prefix)?;
                 let check = format!(
-                    "({bounded}) AND EXISTS(SELECT 1 FROM local_attention_native_capture WHERE source={source} AND epoch={} AND image_rows<{MAX_IMAGES} AND image_bytes<= {MAX_BYTES}-length(CAST(({body}) AS BLOB)))",
+                    "({bounded}) AND EXISTS(SELECT 1 FROM main.local_attention_native_capture WHERE source={source} AND epoch={} AND image_rows<{MAX_IMAGES} AND image_bytes<= {MAX_BYTES}-length(CAST(({body}) AS BLOB)))",
                     position.epoch
                 );
                 let append = format!(
@@ -575,7 +682,7 @@ impl NativeCapture {
             };
             // Replacement reserves both images before either is inserted.
             let pair_check = format!(
-                "({old_check}) AND ({new_check}) AND EXISTS(SELECT 1 FROM local_attention_native_capture WHERE source={source} AND image_rows<={MAX_IMAGES}-2 AND image_bytes<={MAX_BYTES}-length(CAST(({}) AS BLOB))-length(CAST(({}) AS BLOB)))",
+                "({old_check}) AND ({new_check}) AND EXISTS(SELECT 1 FROM main.local_attention_native_capture WHERE source={source} AND image_rows<={MAX_IMAGES}-2 AND image_bytes<={MAX_BYTES}-length(CAST(({}) AS BLOB))-length(CAST(({}) AS BLOB)))",
                 image(table, "OLD")?.0,
                 image(table, "NEW")?.0
             );
@@ -644,7 +751,7 @@ impl NativeCapture {
                 ensure!(sql.len() <= 1024 * 1024, "attention capture SQL bound");
                 let previous: Option<String> = tx
                     .query_row(
-                        "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                        "SELECT sql FROM main.sqlite_schema WHERE type='trigger' AND name=?1",
                         [&name],
                         |r| r.get(0),
                     )
@@ -666,49 +773,52 @@ impl NativeCapture {
 
     /// Paired writer hooks. A raw write outside this scope permanently fences
     /// the source in that write transaction, preserving native admission.
-    pub(crate) fn begin(&self, tx: &Transaction<'_>, installer: &Installer) -> Result<()> {
+    pub(crate) fn begin(&self, tx: &Transaction<'_>, _installer: &Installer) -> Result<()> {
         let inactive = tx
             .query_row(
-                "SELECT managed=0 FROM local_attention_native_capture WHERE source=?1 AND epoch=?2",
+                "SELECT managed=0 FROM main.local_attention_native_capture WHERE source=?1 AND epoch=?2",
                 params![self.source, self.epoch],
                 |r| r.get::<_, bool>(0),
             )
             .optional()?
             .unwrap_or(false);
         if !inactive || !self.compatible(tx)? {
-            installer.source_gap(
-                tx,
-                &self.source,
-                "attention native capture compatibility gap",
-            )?;
+            // The library compiles this explicitly main-bound standalone fence.
+            // Do not call unqualified Installer::source_gap under TEMP metadata.
+            tx.execute_batch(&self.gap_main_sql)?;
             return Ok(());
         }
         tx.execute(
-            "UPDATE local_attention_native_capture SET managed=1 WHERE source=?1 AND epoch=?2",
+            "UPDATE main.local_attention_native_capture SET managed=1 WHERE source=?1 AND epoch=?2",
             params![self.source, self.epoch],
         )?;
         Ok(())
     }
     pub(crate) fn commit(&self, tx: &Transaction<'_>) -> Result<()> {
         tx.execute(
-            "UPDATE local_attention_native_capture SET managed=0 WHERE source=?1 AND epoch=?2",
+            "UPDATE main.local_attention_native_capture SET managed=0 WHERE source=?1 AND epoch=?2",
             params![self.source, self.epoch],
         )?;
         Ok(())
     }
     pub(crate) fn compatible(&self, c: &Connection) -> Result<bool> {
+        if !installer_metadata_unshadowed(c)? {
+            return Ok(false);
+        }
         if !c.query_row("PRAGMA recursive_triggers", [], |r| r.get::<_, bool>(0))? {
             return Ok(false);
         }
-        let available: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM ivm_install_sources s JOIN local_attention_native_capture c ON c.source=s.name AND c.epoch=s.epoch WHERE s.name=?1 AND s.epoch=?2 AND s.fingerprint=?3 AND s.available=1)",params![self.source,self.epoch,self.fingerprint],|r|r.get(0))?;
+        let available: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM main.ivm_install_sources s JOIN main.local_attention_native_capture c ON c.source=s.name AND c.epoch=s.epoch WHERE s.name=?1 AND s.epoch=?2 AND s.fingerprint=?3 AND s.available=1)",params![self.source,self.epoch,self.fingerprint],|r|r.get(0))?;
         if !available {
             return Ok(false);
         }
         for (name, expected) in self.schema.iter().chain(&self.triggers) {
             let actual: Option<String> = c
-                .query_row("SELECT sql FROM sqlite_schema WHERE name=?1", [name], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT sql FROM main.sqlite_schema WHERE name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
                 .optional()?;
             if actual.as_ref() != Some(expected) {
                 return Ok(false);
@@ -717,6 +827,7 @@ impl NativeCapture {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) fn image(
         &self,
         c: &Connection,
@@ -725,7 +836,7 @@ impl NativeCapture {
         table: &str,
     ) -> Result<serde_json::Value> {
         ensure!(side <= 1, "attention image side");
-        let body: String = c.query_row("SELECT body FROM local_attention_native_images WHERE source=?1 AND epoch=?2 AND revision=?3 AND side=?4 AND native_table=?5",params![self.source,self.epoch,revision,side,table],|r|r.get(0))?;
+        let body: String = c.query_row("SELECT body FROM main.local_attention_native_images WHERE source=?1 AND epoch=?2 AND revision=?3 AND side=?4 AND native_table=?5",params![self.source,self.epoch,revision,side,table],|r|r.get(0))?;
         Ok(serde_json::from_str(&body)?)
     }
 
@@ -742,6 +853,10 @@ impl NativeCapture {
         ensure!(
             (1..=64).contains(&rows) && (1..=256 * 1024).contains(&bytes),
             "attention capture page bound"
+        );
+        ensure!(
+            installer_metadata_unshadowed(c)?,
+            "attention capture Installer metadata shadow"
         );
         ensure!(
             position.source == self.source
@@ -784,7 +899,7 @@ impl NativeCapture {
                 revision = Some(number);
                 ensure!(metadata.len() < rows, "attention image side page bound");
                 let (size, actual): (usize,usize) = c.query_row(
-                    "SELECT bytes,length(CAST(body AS BLOB)) FROM local_attention_native_images WHERE source=?1 AND epoch=?2 AND revision=?3 AND side=?4 AND native_table=?5",
+                    "SELECT bytes,length(CAST(body AS BLOB)) FROM main.local_attention_native_images WHERE source=?1 AND epoch=?2 AND revision=?3 AND side=?4 AND native_table=?5",
                     params![self.source,self.epoch,number,side,table], |r|Ok((r.get(0)?,r.get(1)?)),
                 )?;
                 ensure!(
@@ -804,7 +919,7 @@ impl NativeCapture {
         }
         metadata.into_iter().map(|(revision,side,table)| {
             let body = c.query_row(
-                "SELECT body FROM local_attention_native_images WHERE source=?1 AND epoch=?2 AND revision=?3 AND side=?4 AND native_table=?5",
+                "SELECT body FROM main.local_attention_native_images WHERE source=?1 AND epoch=?2 AND revision=?3 AND side=?4 AND native_table=?5",
                 params![self.source,self.epoch,revision,side,table], |r|r.get(0),
             )?;
             Ok(RetainedImage {revision,side,table,body})
@@ -819,6 +934,10 @@ impl NativeCapture {
         installer: &Installer,
         limit: usize,
     ) -> Result<ReclaimPage> {
+        ensure!(
+            installer_metadata_unshadowed(c)?,
+            "attention reclaim Installer metadata shadow"
+        );
         ensure!((1..=64).contains(&limit), "attention image reclaim bound");
         let position = installer.position(c, &self.source)?;
         ensure!(
@@ -828,15 +947,15 @@ impl NativeCapture {
         // The retained journal is a contiguous suffix; a missing reference in
         // its interior is a source gap, never permission to reclaim that image.
         let first: Option<u64> = c.query_row(
-            "SELECT MIN(revision) FROM ivm_install_journal WHERE source=?1",
+            "SELECT MIN(revision) FROM main.ivm_install_journal WHERE source=?1",
             [&self.source],
             |r| r.get(0),
         )?;
         let through = first
             .map(|r| r.saturating_sub(1))
             .unwrap_or(position.revision);
-        let (image_rows,image_bytes) = c.query_row("SELECT image_rows,image_bytes FROM local_attention_native_capture WHERE source=?1 AND epoch=?2",params![self.source,self.epoch],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        let entries = c.prepare_cached("SELECT revision,side,bytes FROM local_attention_native_images WHERE source=?1 AND epoch=?2 AND revision<=?3 ORDER BY revision,side LIMIT ?4")?
+        let (image_rows,image_bytes) = c.query_row("SELECT image_rows,image_bytes FROM main.local_attention_native_capture WHERE source=?1 AND epoch=?2",params![self.source,self.epoch],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let entries = c.prepare_cached("SELECT revision,side,bytes FROM main.local_attention_native_images WHERE source=?1 AND epoch=?2 AND revision<=?3 ORDER BY revision,side LIMIT ?4")?
             .query_map(params![self.source,self.epoch,through,limit],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(ReclaimPage {
             position,
@@ -854,6 +973,10 @@ impl NativeCapture {
         installer: &Installer,
         page: &ReclaimPage,
     ) -> Result<bool> {
+        ensure!(
+            installer_metadata_unshadowed(tx)?,
+            "attention reclaim Installer metadata shadow"
+        );
         if installer.position(tx, &self.source)? != page.position {
             return Ok(false);
         }
@@ -862,15 +985,15 @@ impl NativeCapture {
             removed_bytes <= page.image_bytes && page.entries.len() <= page.image_rows,
             "attention image reclaim accounting"
         );
-        let changed = tx.execute("UPDATE local_attention_native_capture SET image_rows=?3,image_bytes=?4 WHERE source=?1 AND epoch=?2 AND image_rows=?5 AND image_bytes=?6",params![self.source,self.epoch,page.image_rows-page.entries.len(),page.image_bytes-removed_bytes,page.image_rows,page.image_bytes])?;
+        let changed = tx.execute("UPDATE main.local_attention_native_capture SET image_rows=?3,image_bytes=?4 WHERE source=?1 AND epoch=?2 AND image_rows=?5 AND image_bytes=?6",params![self.source,self.epoch,page.image_rows-page.entries.len(),page.image_bytes-removed_bytes,page.image_rows,page.image_bytes])?;
         if changed != 1 {
             return Ok(false);
         }
-        ensure!(tx.execute("UPDATE local_attention_native_capture SET reclaiming=1 WHERE source=?1 AND epoch=?2 AND reclaiming=0", params![self.source,self.epoch])? == 1, "attention reclaim scope already open");
+        ensure!(tx.execute("UPDATE main.local_attention_native_capture SET reclaiming=1 WHERE source=?1 AND epoch=?2 AND reclaiming=0", params![self.source,self.epoch])? == 1, "attention reclaim scope already open");
         for &(revision, side, size) in &page.entries {
-            ensure!(tx.execute("DELETE FROM local_attention_native_images WHERE source=?1 AND epoch=?2 AND revision=?3 AND side=?4 AND bytes=?5",params![self.source,self.epoch,revision,side,size])? == 1,"attention retained image changed");
+            ensure!(tx.execute("DELETE FROM main.local_attention_native_images WHERE source=?1 AND epoch=?2 AND revision=?3 AND side=?4 AND bytes=?5",params![self.source,self.epoch,revision,side,size])? == 1,"attention retained image changed");
         }
-        ensure!(tx.execute("UPDATE local_attention_native_capture SET reclaiming=0 WHERE source=?1 AND epoch=?2 AND reclaiming=1", params![self.source,self.epoch])? == 1, "attention reclaim scope missing");
+        ensure!(tx.execute("UPDATE main.local_attention_native_capture SET reclaiming=0 WHERE source=?1 AND epoch=?2 AND reclaiming=1", params![self.source,self.epoch])? == 1, "attention reclaim scope missing");
         Ok(true)
     }
 }

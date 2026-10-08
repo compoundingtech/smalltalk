@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Bind inactive attention native capture storage and triggers to main",
+  "replay": {"status": "none", "detail": "No source bootstrap, replay or automatic production registration is added."},
+  "schema": {"status": "changed", "detail": "Explicit inactive setup uses main-qualified tables, native descriptors and trigger targets. Disposable capture trigger/view SQL changes; an existing incompatible definition is refused, never silently replaced. No numeric Store schema transition or default installation."},
+  "rules": {"status": "none", "detail": "Native admission, canonical ordering and projection rules are unchanged."},
+  "compatibility": {"status": "none", "detail": "Public APIs and production attention reads remain unchanged. Broader unqualified Installer calls are refused under metadata shadows; paired capture hooks use the library-compiled standalone main fence."},
+  "downtime": {"status": "none", "detail": "No production source or startup callback is registered."},
+  "manual": {"status": "none", "detail": "Existing installations require no action. Full native capture, physical eligibility, lifecycle and coverage remain prerequisites for future activation."},
+  "recovery": {"status": "none", "detail": "A metadata shadow refuses reads/reclaim and the next paired begin fences the main source while preserving native admission. Dropping the shadow does not restore availability. No read-time repair or retained lifetime proof is added; storage errors require caller rollback and the unresolved managed writer cleanup contract."}
+}
