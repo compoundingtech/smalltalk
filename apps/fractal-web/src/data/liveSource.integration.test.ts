@@ -425,6 +425,28 @@ describe('live feed sync sidecars', () => {
       }),
     ),
   )
+  it.live('reports a rejected socket credential as Failed on mounted and later-opened follows', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        const sync = live.source.sync
+        if (sync === undefined) throw new Error('Live sync sidecars are missing')
+        gateway.rejectedCredential = true
+        const failed = {
+          _tag: 'Failed',
+          cause: { _tag: 'Local', kind: 'connection-rejected', detail: { message: 'Device credential revoked' } },
+        }
+        live.registry.mount(live.source.agents)
+        live.registry.mount(sync.agents)
+        yield* settle
+        expect(live.registry.get(live.source.agents)).toMatchObject({ _tag: 'Unavailable', reason: 'ungranted' })
+        expect(live.registry.get(sync.agents).sync.status).toEqual(failed)
+        expect(Option.isNone(live.registry.get(sync.agents).last)).toBe(true)
+        const later = 'agent/opened-after-rejection'
+        expect(live.registry.get(live.source.conversation(later))).toMatchObject({ _tag: 'Unavailable', reason: 'ungranted' })
+        expect(live.registry.get(sync.conversation(later)).sync.status).toEqual(failed)
+      }),
+    ),
+  )
 })
 
 
