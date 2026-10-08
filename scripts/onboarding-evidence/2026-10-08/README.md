@@ -170,3 +170,45 @@ slot was released. Each used two CPUs, 3 GiB RAM, UID42420 and no host mounts or
 supplied runtime. This proves expert/channel plumbing with native protocol
 stand-ins; it does not prove paid-model semantics, finalized gate content,
 wrap-up, stock22 expert behavior, macOS/TCC or a real VM.
+
+
+## Small-machine cache sizing on native Ubuntu 24.04
+
+Production proof source97190ca64120057138e1b1bc84b0e49bf753f822 composes the
+foundation with setup-memory sourcefac628632ab97226f0d3358d9f4081f1b1fef372
+(PR1893). Archive SHA256:
+05d74c1e350b46b60115fc46e5107d2b877bbecb0f8b665c91cbdb6a62646e00.
+BUILD.json pins the actual 2048 KiB default and128 retained readers. Final native
+receipts total **71 PASS, zero FAIL**:
+
+| Scenario | RAM limit | Selected cache | Persisted override | PASS |
+| --- | --- | --- | --- | ---: |
+| setup | 3 GiB | 2048 KiB | absent | 20 |
+| small-machine | 1 GiB | 2048 KiB | absent | 25 |
+| small-machine-512m | 512 MiB | 1024 KiB | 1024 | 26 |
+
+The rig verifies actual guest cgroup memory.max without changing /proc/meminfo
+or injecting a cache setting. The1 GiB case's compiled default already fits;
+the512 MiB control proves a strict reduction. Main service unit environment,
+actual daemon PID environment and live doctor reader target agree initially,
+after service restart and after repeated setup. Both small daemons serve the
+configured machine API and ordinary doctor has no failed checks. Service restart
+creates a different daemon PID. The3 GiB control persists no override.
+
+The initial source987cb0d26faa6f90e875b039fa14f875c49559a0 recorded two failed
+API assertions because the rig invoked `st machines ls` instead of `st machines`.
+The corrected runner changed only that command; the identical product archive
+passed both affected cases on a single bounded rerun. Initial failures remain in
+cache24-initial.txt and their pinned full receipts. cache24-corrected.txt retains
+the rerun output; cache24-summary.json pins all ten full report/JSON receipts,
+source and packaged binary hashes, resource limits and observed cache settings.
+Immutable summary: doc/fleet/smalltalk/onboarding/2026-10-08d/cache24-summary@f50a7e47a12014a79f5e7b2da3471897050a556da45be5577c2015e5cdcab2e4.
+
+All five initial/corrected containers were verified removed and the shared slot
+released. Each used two CPUs, ada UID42420, stock guest libc/native loader and no
+host mounts. An earlier two-container pilot independently confirmed the real
+Docker and guest1 GiB/512 MiB caps with active systemd user managers; both pilot
+containers were removed. Fifteen local rig checks and eight Tart guard checks
+pass; the public repository and effective-merge impact checks pass. No provider,
+paid model, expert/content, release, stock22, nativeMac/TCC or realVM proof is
+claimed. Page-cache planning targets do not bound total RSS or concurrent bursts.
