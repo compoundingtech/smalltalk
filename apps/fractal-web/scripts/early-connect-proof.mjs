@@ -26,6 +26,16 @@ const page = index.replace('src="/main.tsx"', 'src="/proof-main.js"').replace('<
 
 /** Its import evaluates the actual app entry and all dependencies, not a stand-in main bundle. */
 const proofModule = `
+const reportError = (message, stack) => {
+  void fetch('/browser-error', { method: 'POST', keepalive: true, body: JSON.stringify({ message, stack }) })
+}
+window.addEventListener('error', (event) => reportError(event.message, event.error?.stack))
+window.addEventListener('unhandledrejection', (event) => reportError(String(event.reason), event.reason?.stack))
+const originalConsoleError = console.error.bind(console)
+console.error = (...args) => {
+  originalConsoleError(...args)
+  reportError(args.map(String).join(' '))
+}
 const importStartedAt = performance.now()
 const handle = globalThis.__wfEarlyProofHandle
 const framesAtStart = handle?.frames.length
@@ -46,6 +56,7 @@ const upgraded = new Set()
 const observed = new EventEmitter()
 const lifecycleOrder = []
 const reports = []
+const browserErrors = []
 const nextEvent = (name) => new Promise((resolve) => observed.once(name, resolve))
 let releaseModule
 const subscribed = new Promise((resolve) => { releaseModule = resolve })
@@ -79,11 +90,18 @@ const proofMiddleware = (req, res, next) => {
       finish(report)
       observed.emit(`report:${reports.length}`, report)
     })
+  } else if (url.pathname === '/browser-error' && req.method === 'POST') {
+    let body = ''
+    req.on('data', (chunk) => { body += chunk })
+    req.on('end', () => { browserErrors.push(JSON.parse(body)); res.writeHead(204); res.end() })
   } else if (url.pathname === '/v1/client/capabilities') {
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ api_version: 'st3.client.v0', snapshot: { id: 'snapshot/proof', created_at: '2026-10-08T00:00:00Z', host_id: 'host/proof', projection_version: 'client-projection.v0', store_index: 1 }, value: { capabilities: [] } }))
   } else if (url.pathname === '/otlp/v1/traces') {
     req.resume()
+    res.writeHead(204)
+    res.end()
+  } else if (url.pathname === '/favicon.ico') {
     res.writeHead(204)
     res.end()
   } else {
@@ -229,11 +247,13 @@ expect(result?.earlyTaken === true, 'the real SDK did not take the early socket'
 expect(result?.actualShellRendered === true, 'the real main bundle did not render the shell')
 expect(lifecycleOrder.indexOf('close:0:1005') >= 0 && lifecycleOrder.indexOf('close:0:1005') < lifecycleOrder.indexOf('roster:1'), 'bfcache restore subscribed before old close')
 expect(lifecycleOrder.findIndex((event) => event.startsWith('close:1:')) >= 0 && lifecycleOrder.findIndex((event) => event.startsWith('close:1:')) < lifecycleOrder.indexOf('roster:2'), 'new document subscribed before old close')
+expect(browserErrors.length === 0, 'browser lifecycle raised errors: ' + JSON.stringify(browserErrors))
 
-console.log(JSON.stringify({ events, lifecycleOrder, connections, subscribes, result }, null, 2))
+console.log(JSON.stringify({ events, lifecycleOrder, connections, subscribes, result, browserErrors }, null, 2))
 if (failures.length > 0) {
   for (const failure of failures) console.error(`FAIL ${failure}`)
   process.exit(1)
 }
 console.log('PASS early roster subscribe precedes actual main-module evaluation and SDK adoption')
 console.log('PASS synchronous pagehide close frame precedes restore and next-document roster subscribes (native browser API cannot send reserved code 1001)')
+console.log('PASS initial render, retained restore and real reload have no console errors or unhandled browser errors')

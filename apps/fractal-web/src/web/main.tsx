@@ -5,6 +5,7 @@ import { setTheme } from '../ui-compat/foundations.ts'
 
 import { App } from './App.tsx'
 import { live } from './liveRuntime.ts'
+import { installPageLifecycle } from './pageLifecycle.ts'
 
 setTheme('system')
 
@@ -15,12 +16,14 @@ if (rootElement === null) {
 
 const root = createRoot(rootElement)
 let disposed = false
-window.addEventListener('pagehide', (event) => {
-  if (event.persisted) return
-  disposed = true
-  // Stop registry consumers in the same event before asynchronous source teardown can rerender them.
-  root.unmount()
-}, { capture: true })
+installPageLifecycle({
+  target: window,
+  source: live,
+  beforeDispose: () => {
+    disposed = true
+    root.unmount()
+  },
+})
 
 void live.ready.then(() => {
   if (disposed) return
