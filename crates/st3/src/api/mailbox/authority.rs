@@ -418,6 +418,74 @@ fn bootstrap_witness(
     Ok(witness)
 }
 
+/// A declared argv-only program can consume channel envelopes without a model provider.
+/// This preserves the delivery monitor's protocol, not qualified native custody or repair.
+#[cfg(target_os = "linux")]
+pub(super) fn with_argv_channel<T>(
+    state: &AppState,
+    fence: &Fence,
+    peer: &NativeDeliveryPeer,
+    action: impl FnOnce(&crate::model::MemberSpec, &dyn Fn() -> Result<(), St3Error>) -> Result<T, St3Error>,
+) -> Result<Option<T>, St3Error> {
+    let desired = state.store.desired_subjects_named(std::slice::from_ref(&fence.subject))
+        .map_err(internal)?.into_iter().next()
+        .ok_or_else(|| refused("the seat is no longer declared"))?;
+    let member = desired.member.ok_or_else(|| refused("the seat is intentionally stopped"))?;
+    if member.driver.is_some() { return Ok(None); }
+    if desired.kind == "stop"
+        || member.kind != crate::model::MemberKind::Agent
+        || member.host != state.node
+        || member.terminal_binding.is_some()
+        || !matches!(&member.launch, crate::model::LaunchSpec::Argv(argv) if !argv.is_empty())
+        || fence.component != "delivery"
+        || peer.transport != "omp-channel"
+    {
+        return Err(refused("this is not an explicit local argv channel seat"));
+    }
+    let physical = st_runtime::PtyRuntime::new(state.pty_root.clone())
+        .with_binary(state.pty_binary.to_string_lossy()).snapshot().map_err(internal)?
+        .into_iter().find(|runtime| runtime.name == member.runtime_id
+            && runtime.status == "running"
+            && runtime.pid.zip(runtime.created_at.as_deref())
+                .is_some_and(|(pid, stamp)| format!("{pid}:{stamp}") == fence.incarnation))
+        .ok_or_else(|| unavailable("the exact argv runtime is unavailable"))?;
+    let daemon_pid = physical.pid.ok_or_else(|| refused("missing argv runtime identity"))?;
+    let stamp = physical.created_at.as_deref().ok_or_else(|| refused("missing argv runtime generation"))?;
+    let stats = terminal_stats(state, &physical.name)?;
+    let terminal_pid = terminal_identity(&physical.name, stamp, daemon_pid, &stats)?;
+    let generations = [
+        (daemon_pid, process_birth(daemon_pid)?),
+        (terminal_pid, process_birth(terminal_pid)?),
+        (peer.pid, process_birth(peer.pid)?),
+    ];
+    let validate = || {
+        let stats = terminal_stats(state, &physical.name)?;
+        if terminal_identity(&physical.name, stamp, daemon_pid, &stats)? != terminal_pid {
+            return Err(refused("the argv terminal process was replaced"));
+        }
+        for (pid, birth) in generations {
+            if process_birth(pid)? != birth {
+                return Err(refused("the argv process generation was replaced"));
+            }
+        }
+        if !belongs_to_runtime(terminal_pid, daemon_pid) || !belongs_to_runtime(peer.pid, terminal_pid) {
+            return Err(refused("the channel is outside the exact argv process"));
+        }
+        Ok(())
+    };
+    action(&member, &validate).map(Some)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn with_argv_channel<T>(
+    _state: &AppState,
+    _fence: &Fence,
+    _peer: &NativeDeliveryPeer,
+    _action: impl FnOnce(&crate::model::MemberSpec, &dyn Fn() -> Result<(), St3Error>) -> Result<T, St3Error>,
+) -> Result<Option<T>, St3Error> {
+    Ok(None)
+}
+
 pub(super) fn with_authority<T>(
     state: &AppState,
     fence: &Fence,

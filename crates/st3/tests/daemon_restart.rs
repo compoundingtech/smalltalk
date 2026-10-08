@@ -488,7 +488,7 @@ async fn native_exit_retries_past_stop_budget_without_signal_and_reports_on_reco
         native_exit_finishes(root, &mut driver, Duration::ZERO).await;
         panic!("driver exited before daemon recovery");
     }
-    daemon.start_isolated().await;
+    daemon.start_admitted_protocol().await;
     native_exit_finishes(root, &mut driver, Duration::from_secs(5)).await;
     let claims = daemon
         .store
@@ -613,7 +613,7 @@ async fn a_quiet_idle_seat_reports_current_after_daemon_restart_without_seat_res
     let mut command = seat_command(root, &daemon.socket);
     declare_claude(&daemon, seat);
     daemon.observe_running(seat, incarnation);
-    daemon.start_isolated().await;
+    daemon.start_admitted_protocol().await;
     // A healthy quiet Claude seat includes its initialized delivery channel. The provider
     // emits no further hook events; the wrapper must keep the owned idle evidence current.
     let provider = r#"
@@ -701,7 +701,7 @@ time.sleep(300)
     tokio::time::sleep(Duration::from_secs(95)).await;
     assert_alive(&mut driver, "the quiet driver");
     daemon.store = Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap());
-    daemon.start_isolated().await;
+    daemon.start_admitted_protocol().await;
     let deadline = Instant::now() + Duration::from_secs(40);
     let recovered = loop {
         let view: Value = client.get("/v1/client/agents").await.unwrap();
@@ -1878,7 +1878,7 @@ async fn claude_idle_staged_mail_recovers_startup_binding_and_both_native_receip
         let root = root.path();
         let mut daemon = Daemon::new(root);
         daemon.observe_running("agent/quartz", "first");
-        daemon.start_with_binding(true).await;
+        daemon.start_admitted_protocol().await;
         let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-first");
         let (channel, _input, received) = fixture.open(root, &daemon, "wrapper-first").await;
         daemon.send("message/idle", "agent/quartz", "QUARTZ IDLE SIGNAL");
@@ -2058,7 +2058,7 @@ async fn claude_preboot_mail_is_held_while_live_receipts_survive_outage() {
         })
         .unwrap();
     daemon.observe_running("agent/quartz", "replacement");
-    daemon.start_with_binding(true).await;
+    daemon.start_admitted_protocol().await;
     let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-replacement");
     let (mut channel, _input, received) = fixture.open(root, &daemon, "wrapper-replacement").await;
     assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
@@ -2076,7 +2076,7 @@ async fn claude_preboot_mail_is_held_while_live_receipts_survive_outage() {
     );
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert_alive(&mut channel, "the Claude channel");
-    daemon.start_with_binding(true).await;
+    daemon.start_admitted_protocol().await;
     wait_until(
         "startup receipts after daemon recovery",
         Duration::from_secs(8),
@@ -2137,7 +2137,7 @@ async fn claude_delivered_unread_mail_from_an_old_ledger_is_held_in_a_fresh_sess
             idempotency_key: None,
         })
         .unwrap();
-    daemon.start_with_binding(true).await;
+    daemon.start_admitted_protocol().await;
     let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-replacement");
     fixture.append(
         root,

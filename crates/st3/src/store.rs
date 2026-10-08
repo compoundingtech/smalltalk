@@ -15846,9 +15846,32 @@ impl Store {
         authority: Option<&crate::mailbox::Authority>,
         validate: &dyn Fn() -> Result<(), St3Error>,
     ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_admission_checked(request, authority, None, validate)
+    }
+
+    /// Explicit argv-only transports retain their legacy protocol, never provider custody.
+    pub(crate) fn bind_argv_mailbox_checked(
+        &self,
+        request: &crate::mailbox::Fence,
+        member: &MemberSpec,
+        validate: &dyn Fn() -> Result<(), St3Error>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_admission_checked(request, None, Some(member), validate)
+    }
+
+    fn bind_mailbox_with_admission_checked(
+        &self,
+        request: &crate::mailbox::Fence,
+        authority: Option<&crate::mailbox::Authority>,
+        argv_member: Option<&MemberSpec>,
+        validate: &dyn Fn() -> Result<(), St3Error>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
         let mut connection = self.connection.write();
         let tx = connection.transaction().map_err(internal)?;
         check_mailbox_incarnation(&tx, request)?;
+        if let Some(member) = argv_member {
+            mailbox_lease::check_argv_declaration(&tx, request, member, &self.origin)?;
+        }
         validate()?;
         if let Some(authority) = authority {
             mailbox_lease::check_declaration(&tx, request, authority, &self.origin)?;

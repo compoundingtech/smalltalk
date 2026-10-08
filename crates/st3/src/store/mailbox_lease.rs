@@ -418,6 +418,59 @@ mod tests {
         store.check_mailbox(&new).unwrap();
     }
 
+    fn declare_argv(store: &Store, host: &str) -> MemberSpec {
+        let intent = crate::graph::parse_intent(
+            &format!("version 2\nagent \"eval.worker\" {{ host \"{host}\"; workspace \"/tmp\"; argv \"python3\" \"probe\"; }}"),
+            "node",
+        ).unwrap();
+        store.apply_internal(&intent, "argv-monitor-fixture").unwrap();
+        store.desired_subjects_named(&["agent/eval.worker".into()]).unwrap().remove(0).member.unwrap()
+    }
+
+    #[test]
+    fn argv_channel_binding_retains_runtime_declaration_and_receipt_fences() {
+        let store = fixture();
+        let member = declare_argv(&store, "node");
+        let bound = store.bind_argv_mailbox_checked(&request(), &member, &|| Ok(())).unwrap();
+        assert!(store.mailbox_lease_authority(&bound).unwrap().is_none());
+        let reconnect = store.bind_argv_mailbox_checked(&bound, &member, &|| Ok(())).unwrap();
+        assert_eq!((reconnect.token, reconnect.epoch), (bound.token.clone(), bound.epoch));
+        let mut stale = bound.clone();
+        stale.incarnation = "previous".into();
+        assert!(store.bind_argv_mailbox_checked(&stale, &member, &|| Ok(())).is_err());
+        let moved = declare_argv(&store, "other");
+        assert!(store.bind_argv_mailbox_checked(&bound, &moved, &|| Ok(())).is_err());
+        assert!(store.bind_argv_mailbox_checked(&bound, &member, &|| Ok(())).is_err());
+        let mut undeclared = request();
+        undeclared.subject = "agent/undeclared".into();
+        assert!(store.bind_argv_mailbox_checked(&undeclared, &member, &|| Ok(())).is_err());
+        store.append_claim(&ClaimInput {
+            subject: bound.subject.clone(), kind: "runtime.observed".into(), actor: Some("daemon/runtime".into()),
+            fields: BTreeMap::from([("status".into(), json!("running")), ("incarnation_id".into(), json!("replacement"))]),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        assert!(store.bind_argv_mailbox_checked(&bound, &member, &|| Ok(())).is_err());
+    }
+
+    #[test]
+    fn argv_channel_cannot_discard_qualified_or_revoked_custody() {
+        for revoked in [false, true] {
+            let store = fixture();
+            let owner = authority(1);
+            let held = store.bind_mailbox_with_lease(&request(), Some(&owner)).unwrap();
+            if revoked {
+                store.connection.write().execute("UPDATE local_mailbox_leases SET revoked=1", []).unwrap();
+            }
+            let member = declare_argv(&store, "node");
+            for candidate in [held.clone(), request()] {
+                assert!(store.bind_argv_mailbox_checked(&candidate, &member, &|| Ok(())).is_err());
+            }
+            let retained = lease(&store.readers.get(), &held).unwrap().unwrap();
+            assert_eq!((retained.0.token, retained.0.epoch, retained.1, retained.2),
+                (held.token, held.epoch, owner, revoked));
+        }
+    }
+
     #[test]
     fn same_process_session_reexec_advances_ownership_without_reissuing_capability() {
         let store = fixture();
@@ -629,6 +682,35 @@ pub(super) fn check_declaration(
         return Err(refused(
             "the seat is stopped, moved or belongs to another provider",
         ));
+    }
+    Ok(())
+}
+
+pub(super) fn check_argv_declaration(
+    connection: &Connection,
+    fence: &Fence,
+    captured: &MemberSpec,
+    host: &str,
+) -> Result<(), St3Error> {
+    if lease(connection, fence)?.is_some() {
+        return Err(refused("qualified mailbox history cannot become an argv-only transport"));
+    }
+    let desired = current_desired_row(connection, &fence.subject)
+        .map_err(internal)?
+        .ok_or_else(|| refused("the argv seat is no longer declared"))?;
+    let current: MemberSpec = desired.member.as_deref()
+        .map(serde_json::from_str).transpose().map_err(internal)?
+        .ok_or_else(|| refused("the argv seat is intentionally stopped"))?;
+    if desired.kind == "stop"
+        || current.kind != MemberKind::Agent
+        || current.host != host
+        || current.driver.is_some()
+        || current.terminal_binding.is_some()
+        || !matches!(&current.launch, LaunchSpec::Argv(argv) if !argv.is_empty())
+        || serde_json::to_value(&current).map_err(internal)?
+            != serde_json::to_value(captured).map_err(internal)?
+    {
+        return Err(refused("the explicit argv seat declaration was stopped or replaced"));
     }
     Ok(())
 }

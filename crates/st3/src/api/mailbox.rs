@@ -16,8 +16,14 @@ pub(super) async fn subscribe(
     let binding = fence.clone();
     let peer = peer.expect("authorize checked the native peer").0;
     let checked_peer = peer.clone();
-    blocking_action(move || {
-        if !cfg!(target_os = "linux") { return checked_state.store.check_mailbox(&binding); }
+    let native = blocking_action(move || {
+        if !cfg!(target_os = "linux") { return checked_state.store.check_mailbox(&binding).map(|_| false); }
+        if authority::with_argv_channel(&checked_state, &binding, &checked_peer, |member, validate| {
+            if binding.epoch == 0 {
+                return Err(St3Error::new("stale-mailbox-session", "an argv subscription must already be bound"));
+            }
+            checked_state.store.bind_argv_mailbox_checked(&binding, member, validate)
+        })?.is_some() { return Ok(false); }
         authority::with_authority(&checked_state, &binding, &checked_peer, |owner, validate| {
         if checked_state.store.check_mailbox(&binding).is_ok() {
             // Upgrade a still-current pre-lease binding without changing its capability.
@@ -25,11 +31,11 @@ pub(super) async fn subscribe(
         } else {
             checked_state.store.repair_mailbox_checked(&binding, owner, validate).map(|_| ())
         }
-        })
+        }).map(|_| true)
     }).await?;
     // Wake the predecessor immediately, even when no graph content changed.
     signal_local_change(&state);
-    Ok(websocket.on_upgrade(move |socket| stream(state, fence, socket, peer)))
+    Ok(websocket.on_upgrade(move |socket| stream(state, fence, socket, peer, native)))
 }
 
 pub(super) async fn bind(
@@ -42,6 +48,9 @@ pub(super) async fn bind(
     let peer = peer.expect("authorize checked the native peer").0;
     let bound = blocking_action(move || {
         if !cfg!(target_os = "linux") { return bind_state.store.bind_mailbox(&request); }
+        if let Some(bound) = authority::with_argv_channel(&bind_state, &request, &peer, |member, validate| {
+            bind_state.store.bind_argv_mailbox_checked(&request, member, validate)
+        })? { return Ok(bound); }
         authority::with_authority(&bind_state, &request, &peer, |owner, validate| {
             bind_state.store.bind_mailbox_with_lease_checked(&request, Some(owner), validate)
         })
@@ -450,7 +459,7 @@ where
 /// Maximum gap between durable change checks, including when a notification is missed.
 const MAILBOX_RECHECK: Duration = Duration::from_secs(30);
 
-async fn stream(state: AppState, fence: Fence, socket: WebSocket, peer: NativeDeliveryPeer) {
+async fn stream(state: AppState, fence: Fence, socket: WebSocket, peer: NativeDeliveryPeer, native: bool) {
     #[cfg(feature = "test-support")]
     let mut control = crate::test_support::fixture_mailbox_transport(&state.store, &fence.subject);
     #[cfg(feature = "test-support")]
@@ -467,7 +476,7 @@ async fn stream(state: AppState, fence: Fence, socket: WebSocket, peer: NativeDe
         timer.tick().await;
         Some(((), timer))
     });
-    let stream = stream_with_timers_inner(state.clone(), fence.clone(), socket, raw_snapshot, safety, heartbeat, cfg!(target_os = "linux").then(|| peer.clone()));
+    let stream = stream_with_timers_inner(state.clone(), fence.clone(), socket, raw_snapshot, safety, heartbeat, native.then(|| peer.clone()));
     #[cfg(not(feature = "test-support"))]
     stream.await;
     #[cfg(feature = "test-support")]
@@ -481,9 +490,11 @@ async fn stream(state: AppState, fence: Fence, socket: WebSocket, peer: NativeDe
             std::future::pending::<()>().await;
         } => {},
     }
-    let _ = crate::api::read_deadline::spawn_blocking(move || {
-        authority::loss_if_current(&state, &fence, &peer)
-    }).await;
+    if native {
+        let _ = crate::api::read_deadline::spawn_blocking(move || {
+            authority::loss_if_current(&state, &fence, &peer)
+        }).await;
+    }
 }
 
 fn safety_delay(fence: &Fence) -> Duration {
