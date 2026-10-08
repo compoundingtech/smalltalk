@@ -37,6 +37,17 @@ pub struct SetupArgs {
     /// Merge this config file instead of the default config.toml.
     #[arg(long)]
     pub config: Option<PathBuf>,
+    /// Choose an installed harness, or none to skip it.
+    #[arg(long, value_parser = ["claude", "codex", "opencode", "pi", "omp", "none"])]
+    pub harness: Option<String>,
+    /// Install the user-owned Claude channel (default: true; never installs policy).
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub claude_channel: Option<bool>,
+}
+
+pub struct PreparedSetup {
+    pub config: Config,
+    pub harness: Option<String>,
 }
 
 fn interactive() -> bool {
@@ -89,7 +100,7 @@ pub fn prepare_plain_ui() -> Result<()> {
         })
 }
 
-pub async fn run(args: SetupArgs) -> Result<Config> {
+pub async fn run(args: SetupArgs) -> Result<PreparedSetup> {
     require_person_process()?;
     let path = args.config.clone().unwrap_or_else(Config::default_path);
     let mut config = if path.try_exists()? {
@@ -176,8 +187,129 @@ pub async fn run(args: SetupArgs) -> Result<Config> {
     } else if !daemon_ready(&config).await {
         println!("Configuration saved; the daemon remains stopped.");
     }
+    let harness = prepare_harness(&config, &executable, &args).await?;
     println!("Your agents run without permission prompts inside their own workspaces.");
-    Ok(config)
+    Ok(PreparedSetup { config, harness })
+}
+
+async fn prepare_harness(
+    config: &Config,
+    executable: &Path,
+    args: &SetupArgs,
+) -> Result<Option<String>> {
+    if args.harness.as_deref() == Some("none") {
+        println!("Harness setup skipped; no onboarding seat was created.");
+        return Ok(None);
+    }
+    let found = if daemon_ready(config).await {
+        Client::new(Endpoint::Unix(config.client_socket()))
+            .get::<Vec<String>>("/v1/harnesses")
+            .await?
+    } else {
+        crate::environment::available_harnesses()?
+    };
+    if let Some(requested) = &args.harness {
+        anyhow::ensure!(
+            found.contains(requested),
+            "{requested} is not installed on the daemon's login PATH; install it and open a new login shell, then run st setup"
+        );
+    }
+    if found.is_empty() {
+        println!(
+            "No supported harness is installed on the daemon's login PATH. Install Claude Code, Codex, OpenCode, Pi or Omp, then run st setup. No onboarding seat was created."
+        );
+        return Ok(None);
+    }
+    let chosen = if let Some(requested) = &args.harness {
+        requested.clone()
+    } else if found.len() == 1 || args.yes {
+        found[0].clone()
+    } else {
+        anyhow::ensure!(
+            interactive(),
+            "several harnesses are installed; pass --harness NAME or --yes"
+        );
+        loop {
+            let answer = read_answer(
+                &format!(
+                    "Which harness ({})",
+                    found
+                        .iter()
+                        .enumerate()
+                        .map(|(i, h)| format!("{}: {h}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                &found[0],
+            )?;
+            if let Some(name) = answer
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|i| found.get(i))
+            {
+                break name.clone();
+            }
+            if found.contains(&answer) {
+                break answer;
+            }
+            println!("Choose one of {}.", found.join(", "));
+        }
+    };
+    if chosen == "claude" {
+        let install = ask_bool(
+            "Install the st Claude channel (no admin rights needed)?",
+            "--claude-channel",
+            args.claude_channel,
+            args.yes,
+            true,
+        )?;
+        if !install {
+            return Ok(fallback_harness(&found));
+        }
+        // CLI plugin commands must see the same account login environment as the daemon.
+        let environment = crate::environment::snapshot()?;
+        let status = Command::new(executable)
+            .args(["claude-channel", "status"])
+            .envs(&environment)
+            .stdin(Stdio::null())
+            .output()?;
+        if !status.status.success() {
+            let output = Command::new(executable)
+                .args(["claude-channel", "install", "--no-policy"])
+                .envs(&environment)
+                .stdin(Stdio::null())
+                .output()?;
+            if !output.status.success() {
+                println!(
+                    "Claude channel installation failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                return Ok(fallback_harness(&found));
+            }
+        }
+        if st_drivers::claude_channel::st3_policy_available() {
+            println!(
+                "Claude channel policy is present; seats use --channels plugin:st-channel@st."
+            );
+        } else {
+            println!(
+                "Claude channel uses --dangerously-load-development-channels plugin:st-channel@st. st accepts its local-development dialog when starting a seat. Provider or organization channel restrictions still apply.\nOptional administrator approval policy: sudo st claude-channel install-policy"
+            );
+        }
+    }
+    println!("Selected harness: {chosen}");
+    Ok(Some(chosen))
+}
+
+fn fallback_harness(found: &[String]) -> Option<String> {
+    let next = found.iter().find(|h| h.as_str() != "claude").cloned();
+    if let Some(next) = &next {
+        println!("Selected harness: {next}");
+    } else {
+        println!("No usable harness remains; no onboarding seat was created.");
+    }
+    next
 }
 
 fn slug(value: &str) -> String {

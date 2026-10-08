@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Setup detects harnesses on the daemon login PATH and installs the user-owned Claude channel without requiring policy; missing local harnesses fail before seat publication.",
+  "replay": {
+    "status": "none",
+    "detail": "Existing claim replay and projection recovery are unchanged. The consent attempt is an additive claim keyed by runtime incarnation; a repeated pass cannot send another Return."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or fleet rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Add st setup --harness and --claude-channel, and a local daemon harness discovery read. Packaged Claude channels without machine policy use the measured development admission flag; approved policy retains --channels, missing plugin retains inline fallback. Local st agents new now rejects absent provider executables before publishing a desired seat. Unscoped MCP behavior is reused unchanged from PR1781."
+  },
+  "downtime": {
+    "status": "changed",
+    "detail": "New local discovery requires the updated daemon API; install the updated daemon and restart it through the existing service upgrade lifecycle before using the new setup/creation checks. No restart of already answering seats is requested by setup."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Setup installs only user Claude plugin assets. The optional administrator policy command is printed and never executed by setup. Provider login and organization restrictions still apply. Scripts can choose an installed harness or none and decline Claude installation."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No store transition or backup procedure changes. Existing configured stores and running seats remain readable by prior binaries; changing provider admission requires restarting that seat. Consent attempts are not replayed as terminal input."
+  }
+}

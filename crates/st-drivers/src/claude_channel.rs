@@ -156,6 +156,16 @@ pub fn verify_installed() -> Result<()> {
 }
 
 pub fn verify_st3_installed() -> Result<()> {
+    verify_st3_plugin()?;
+    anyhow::ensure!(
+        st3_policy_available(),
+        "the st Claude channel policy is not installed"
+    );
+    Ok(())
+}
+
+/// User-owned assets are usable with Claude's development channel admission.
+pub fn verify_st3_plugin() -> Result<()> {
     let marketplace = st3_marketplace_root()?;
     verify_st3_marketplace_at(&marketplace)?;
     if !st3_marketplace_is_registered_at(&marketplace)? {
@@ -164,11 +174,11 @@ pub fn verify_st3_installed() -> Result<()> {
     if !st3_plugin_is_installed()? {
         bail!("the st Claude channel plugin is not installed; run `st claude-channel install`");
     }
-    let policy = st3_policy_path()?;
-    if !st3_policy_is_current_at(&policy) {
-        bail!("the st Claude channel policy is not installed; run `st claude-channel install`");
-    }
     Ok(())
+}
+
+pub fn st3_policy_available() -> bool {
+    st3_policy_path().is_ok_and(|path| st3_policy_is_current_at(&path))
 }
 
 /// Install the ST3-owned Claude channel under an ST3 marketplace identity. This is deliberately
@@ -212,7 +222,15 @@ pub fn status_st3() -> Result<()> {
     println!("marketplace\t{}", state(marketplace_ready));
     println!("plugin\t{}", state(plugin_ready));
     println!("policy\t{}", state(policy_ready));
-    if assets && marketplace_ready && plugin_ready && policy_ready {
+    println!(
+        "admission\t{}",
+        if policy_ready {
+            "approved"
+        } else {
+            "development"
+        }
+    );
+    if assets && marketplace_ready && plugin_ready {
         Ok(())
     } else {
         bail!("the st Claude channel installation is incomplete")
