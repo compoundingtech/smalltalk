@@ -704,6 +704,8 @@ pub struct Store {
     pub admission: Mutex<()>,
     /// The membership last folded, and the `fleet_generation` it was folded at.
     pub membership_cache: Mutex<Option<(i64, crate::fleet::Membership)>>,
+    /// The member part of the trust roots, folded at the `fleet_generation` shown.
+    pub roots_cache: Mutex<Option<(i64, BTreeSet<(String, String)>)>>,
     /// Serializes projection passes while they lend the writer back between chunks.
     pub projection: Mutex<()>,
     pub replication_timers: ReplicationTimers,
@@ -959,6 +961,7 @@ impl Store {
             replication_sync: Mutex::new(BTreeMap::new()),
             admission: Mutex::new(()),
             membership_cache: Mutex::new(None),
+            roots_cache: Mutex::new(None),
             projection: Mutex::new(()),
             replication_timers: ReplicationTimers::default(),
             replication_projection_state: AtomicU64::new(0),
