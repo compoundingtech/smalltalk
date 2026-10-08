@@ -33,6 +33,39 @@ const frame = (items: Resource[]): CollectionFrame => ({
 })
 
 describe('bounded ordered collection ingestion', () => {
+  it('bounds rejected-row reporting to the present latest revision and clears departed/recovered rows', () => {
+    const tasks: (() => void)[] = []
+    const reports: string[] = []
+    const row = agents[0]!
+    const ingest = makeWindowIngest({
+      decode: (value) => value.revision === 'recovered' ? value : undefined,
+      onRejected: (value) => reports.push(value.revision),
+      publish: () => {},
+      now: () => 0,
+      schedule: (work) => { tasks.push(work); return () => {} },
+    })
+    const send = (items: Resource[]) => {
+      ingest.accept(frame(items))
+      while (tasks.length > 0) tasks.shift()!()
+    }
+    send([row])
+    send([{ ...row, name: 'Changed contents' }])
+    expect(reports).toEqual(['1'])
+    expect(ingest.rejectedRowCount).toBe(1)
+    send([{ ...row, revision: '2' }])
+    expect(reports).toEqual(['1', '2'])
+    expect(ingest.rejectedRowCount).toBe(1)
+    send([])
+    expect(ingest.rejectedRowCount).toBe(0)
+    send([row])
+    expect(reports).toEqual(['1', '2', '1'])
+    send([{ ...row, revision: 'recovered' }])
+    expect(ingest.rejectedRowCount).toBe(0)
+    send([row])
+    expect(reports).toEqual(['1', '2', '1', '1'])
+    expect(ingest.rejectedRowCount).toBe(1)
+  })
+
   it('processes a >150KB warmed decoded burst below a frame of CPU per task', () => {
     const wire = JSON.stringify(frame(agents))
     expect(wire.length).toBeGreaterThan(150_000)

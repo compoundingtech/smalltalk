@@ -43,6 +43,7 @@ export const makeWindowIngest = <A>({
   decode,
   publish,
   onSlice,
+  onRejected,
   schedule = (work) => {
     const timer = setTimeout(work, 0)
     return () => clearTimeout(timer)
@@ -53,6 +54,7 @@ export const makeWindowIngest = <A>({
   readonly decode: (row: Resource) => A | undefined
   readonly publish: (window: ProcessedWindow<A>) => void
   readonly onSlice?: (elapsedMs: number) => void
+  readonly onRejected?: (row: Resource) => void
   readonly schedule?: (work: () => void) => () => void
   readonly now?: () => number
   readonly sliceMs?: number
@@ -65,6 +67,18 @@ export const makeWindowIngest = <A>({
   let current: Generator<void, void> | undefined
   let cancel: (() => void) | undefined
   let running = false
+  // At most one rejected revision per currently present row, not lifetime history.
+  const rejected = new Map<string, string>()
+  const decodeRow = (raw: Resource): A | undefined => {
+    const value = decode(raw)
+    if (value !== undefined) {
+      rejected.delete(raw.id)
+    } else if (onRejected !== undefined && rejected.get(raw.id) !== raw.revision) {
+      rejected.set(raw.id, raw.revision)
+      onRejected(raw)
+    }
+    return value
+  }
 
   const apply = function* (frame: WindowFrame): Generator<void, void> {
     if (frame.kind === 'changes' && rows === undefined) return
@@ -81,7 +95,7 @@ export const makeWindowIngest = <A>({
         raw.id,
         retained !== undefined && sameWireValue(retained.raw, raw)
           ? retained
-          : { raw, value: decode(raw) },
+          : { raw, value: decodeRow(raw) },
       )
       yield
     }
@@ -96,6 +110,9 @@ export const makeWindowIngest = <A>({
       yield
     }
     rows = next
+    for (const id of rejected.keys()) {
+      if (!next.has(id) || !frame.order.includes(id)) rejected.delete(id)
+    }
     const retainedItems =
       previous !== undefined &&
       previous.items.length === items.length &&
@@ -134,6 +151,8 @@ export const makeWindowIngest = <A>({
   }
 
   return {
+    /** Reporting state is bounded by rejected rows in the current window. */
+    get rejectedRowCount(): number { return rejected.size },
     accept: (frame: CollectionFrame): void => {
       if (frame.kind !== 'snapshot' && frame.kind !== 'changes') return
       frames.push(frame)

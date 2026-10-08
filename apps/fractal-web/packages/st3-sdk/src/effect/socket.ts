@@ -53,7 +53,7 @@ export type St3Diagnostic =
   | { readonly _tag: 'Retry' }
   /** Synchronous protocol decoding/projection of the last routed data frame. */
   | { readonly _tag: 'Decode'; readonly elapsedMs: number }
-  /** A rejected collection row; reported once per identity/revision for each follow lifetime.
+  /** A rejected collection row; reported once while the same bad revision remains in the window.
    * Contains no row contents, exception objects or decoder messages.
    */
   | {
