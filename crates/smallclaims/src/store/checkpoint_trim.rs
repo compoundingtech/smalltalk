@@ -496,8 +496,9 @@ impl Store {
         state: &str,
     ) -> Result<()> {
         self.runtime.checkpoint_preflight()?;
-        let connection = self.connection.write();
-        connection.execute(
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "INSERT INTO checkpoints(id, cut_unix_ms, state, updated_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET state=excluded.state,
@@ -509,6 +510,7 @@ impl Store {
                 i64::try_from(now_ms())?
             ],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
