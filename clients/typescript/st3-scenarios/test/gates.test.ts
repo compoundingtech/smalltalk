@@ -15,7 +15,7 @@ afterEach(() => scratch.splice(0).forEach((dir) => rmSync(dir, { recursive: true
 
 describe('decode gate', () => {
   it('decodes every ordinary-world variant at two instants; huge has bounded coverage separately', () => {
-    // CLI decode still exhausts all huge variants. Avoid duplicating that scale workload in Vitest.
+    // The CLI decode gate covers huge (every variant at the anchor, defaults at a second instant).
     const failures = [ANCHOR_MS, Date.UTC(2101, 6, 4, 3, 2, 1, 7)].flatMap((now) =>
       catalog.filter(({ id }) => id !== 'huge').flatMap(({ id }) =>
         everyVariant(loadWorld(id, { now })).flatMap((slice) => decodeSlice(id, slice))))

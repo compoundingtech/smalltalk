@@ -1,7 +1,8 @@
 /**
  * Decode gate (spec "Gates" 3): every wire value of every world and variant decodes with the real
- * client-v0 codecs in strict mode, at the anchor and rebased to another `now`, and so does every
- * committed slice file that non-TypeScript readers load.
+ * client-v0 codecs in strict mode, at the anchor and rebased to another `now` (`huge`: every variant
+ * at the anchor, default slices at the other `now`), and so does every committed slice file that
+ * non-TypeScript readers load.
  */
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -113,10 +114,21 @@ export const decodeSlice = (world: string, slice: AnySlice): DecodeFailure[] => 
 export const everyVariant = (world: World): AnySlice[] =>
   SLICE_KINDS.flatMap((kind) => world.available[kind].map((variant) => world.with({ [kind]: variant }).slices[kind] as AnySlice))
 
+/**
+ * Scale worlds whose variants are decoded at the first `now` only. Later instants decode their
+ * default slices, so the relative-time path still runs on scale-sized data while the CI lane stays
+ * bounded. Every other world decodes every variant at every instant.
+ */
+export const FIRST_INSTANT_VARIANTS: ReadonlySet<string> = new Set(['huge'])
+
 export const decodeCatalog = (nows: readonly number[]): DecodeFailure[] => {
   const failures: DecodeFailure[] = []
-  for (const now of nows) for (const { id } of catalog) {
+  for (const [index, now] of nows.entries()) for (const { id } of catalog) {
     const world = loadWorld(id, { now })
+    if (index > 0 && FIRST_INSTANT_VARIANTS.has(id)) {
+      for (const kind of SLICE_KINDS) failures.push(...decodeSlice(id, world.slices[kind]))
+      continue
+    }
     // Decode one variant at a time: huge's per-agent variants must not all stay resident.
     for (const kind of SLICE_KINDS) for (const variant of world.available[kind]) {
       const slice = world.with({ [kind]: variant }).slices[kind]

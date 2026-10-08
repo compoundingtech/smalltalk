@@ -776,7 +776,9 @@ The path-filtered `fractal-web-execution` job runs these gates as lanes of `scri
 2. Freshness: `emit --check`, including each file's `times` list.
 3. Decode: every wire value in every committed slice and in every in-process variant is decoded
    with `@smalltalk/st3-client/schema` in strict mode, once at the anchor and once rebased to a
-   random `now`. `unknown-fields` decodes tolerant and fails strict at exactly its declared paths.
+   random `now`. `huge` is the exception: every variant decodes at the anchor, and only its default
+   slices decode at the random `now`, which runs the rebase path on scale-sized data and keeps the
+   lane bounded. `unknown-fields` decodes tolerant and fails strict at exactly its declared paths.
 4. Privacy: `scripts/check-public-repo` covers the committed files and fails the gate when it
    cannot run, is killed, or exits non-zero without a finding in this package or the scenarios.
    `scripts/scan.ts` walks every published file of the package (skipping `node_modules` and
