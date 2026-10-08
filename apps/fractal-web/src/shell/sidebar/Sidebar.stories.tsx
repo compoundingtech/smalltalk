@@ -18,8 +18,6 @@ import { SubjectAddress } from '../../resources/contract.ts'
 import { AgentFolders } from '../AgentFolders.tsx'
 import { WorkbenchContextProvider } from '../context.tsx'
 import { dailyDriver } from '../fixtures/layouts.ts'
-import { StoryWorkbench } from '../Workbench.story.tsx'
-import { recommendedWorkbenchVariant } from '../Workbench.tsx'
 import { createWindow, projectWorkspaces, reduceWindow, type WindowAction } from '../workspaces.ts'
 import { defaultFilters, fixtureSidebarState, type SidebarFilters } from './state.ts'
 import { StatusIcon, statuses, type AgentStatus } from './StatusIcon.tsx'
@@ -142,11 +140,9 @@ const TreeSurface = ({ narrow = false }: { readonly narrow?: boolean }) => {
 }
 const FolderTree = ({
   filters = defaultFilters,
-  fullWorkbench = false,
   narrow = false,
 }: {
   readonly filters?: SidebarFilters
-  readonly fullWorkbench?: boolean
   readonly narrow?: boolean
 }) => {
   const [runtime] = React.useState(() => {
@@ -158,11 +154,7 @@ const FolderTree = ({
   })
   return (
     <DataSourceProvider {...runtime}>
-      {fullWorkbench ? (
-        <StoryWorkbench variant={recommendedWorkbenchVariant} initialState={dailyDriver} />
-      ) : (
-        <TreeSurface narrow={narrow} />
-      )}
+      <TreeSurface narrow={narrow} />
     </DataSourceProvider>
   )
 }
@@ -175,7 +167,6 @@ export default meta
 type Story = StoryObj<typeof meta>
 export const RealFolderTree: Story = {}
 export const NarrowFolderTree: Story = { args: { narrow: true } }
-export const ConversationNavigation: Story = { args: { fullWorkbench: true } }
 export const NeedsMe: Story = { args: { filters: { ...defaultFilters, needsMe: true } } }
 export const FuzzySearch: Story = { args: { filters: { ...defaultFilters, query: 'web' } } }
 export const EmptyResults: Story = {
