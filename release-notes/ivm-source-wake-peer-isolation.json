@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Isolate unavailable named-source wake metadata so valid peers continue producing raw-progress hints.",
+  "replay": {
+    "status": "none",
+    "detail": "No admission, replay, source capture, prepared publication or retained-root certification is supplied or changed."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, index, trigger, journal or persisted counter is created. Explicit attachment reads existing Installer metadata."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No authority, retention, checkpoint, digest or read-coverage rules change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Library-only opt-in named Publisher capture returns valid source identities in SourceCommit and source-specific invalidations for missing, mismatched, malformed or regressing metadata. It never invents a revision for a missing source. Default attachment and publication methods are unchanged. No native production activation is included."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Library-only source change; no deployment or restart behavior is implemented."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Adopting source owners retain native capture, full-cut checks and explicit replacement/restore lifetime guards. Identical metadata DDL and root pages cannot certify table incarnation. No production adopter or recovery procedure is installed."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Configured identities remain fixed. A logical mismatch does not rebind authority or suppress peer raw-progress wakes; common schema/storage failure still invalidates the full scope. Initial state is not broadcast, so subscribers must independently check coverage. Source-owned lifetime/replacement/restore guards remain required and no wake restores Ready."
+  }
+}

@@ -18,7 +18,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 pub use source_progress::{
     SourceCommit, SourceIdentity, SourceInvalidation, SourceProgress, SourceToken, SourceWake,
 };
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::broadcast;
 
 const FORMAT: &str = "smallclaims.ivm.events.v1";
@@ -479,7 +482,10 @@ impl Publisher {
     /// Explicitly observe at most sixteen already-installed named sources on this same bridge.
     /// Setup is read-only and must follow source/capture schema installation. Invalid configured
     /// identities or unsupported metadata schema/storage reject setup; a missing or mismatched
-    /// persisted source initializes an unavailable wake scope without rebinding its identity.
+    /// persisted source initializes its own invalidation without rebinding its identity or
+    /// suppressing valid peers. Common metadata/schema/storage failure affects the whole scope.
+    /// Initial state is retained, not broadcast: subscribers must perform their first independent
+    /// coverage check after subscribing, even when no later commit produces a wake.
     /// Source owners prove complete native capture and lifetime coverage; tuples only wake
     /// consumers. A schema-cookie change revalidates metadata before refreshing the cookie.
     /// Ordinary captures add two metadata statements; schema revalidation adds bounded result
@@ -493,30 +499,17 @@ impl Publisher {
             (1..=256).contains(&capacity),
             "notice capacity outside 1..=256"
         );
-        let (initial, scope, progress) = store.read_snapshot(|_| {
+        let (initial, scope, progress, highwater) = store.read_snapshot(|_| {
             let connection = store.readers.get();
             let initial = frontiers(&connection)?;
             let scope = source_progress::Scope::attach(&connection, &initial.database_id, sources)?;
-            let progress = match scope.capture(&connection, &initial.database_id) {
-                Ok(progress) => SourceWake::Committed(progress),
-                // Structural schema and storage failures remain hard setup failures.
-                // A retained identity/missing-coverage mismatch only disables this wake
-                // scope; it never rebinds identities or repairs the source on startup.
-                Err(error) if error.downcast_ref::<rusqlite::Error>().is_some() => {
-                    return Err(error);
-                }
-                Err(error) => scope.unavailable(&format!("{error:#}")),
-            };
-            Ok((initial, Arc::new(scope), progress))
+            // Structural/storage failures reject setup; each logical identity mismatch is
+            // retained as an individual invalidation without suppressing its valid peers.
+            let captured = scope.capture(&connection, &initial.database_id)?;
+            let mut highwater = BTreeMap::new();
+            let progress = captured.into_wakes(&mut highwater);
+            Ok((initial, Arc::new(scope), progress, highwater))
         })?;
-        let highwater = match &progress {
-            SourceWake::Committed(commit) => commit
-                .sources
-                .iter()
-                .map(|source| source.revision)
-                .collect(),
-            _ => vec![0; sources.len()],
-        };
         let last = Arc::new(Mutex::new((
             Notice::Committed(initial),
             progress,
@@ -533,48 +526,31 @@ impl Publisher {
                     "writer returned with an unfinished transaction"
                 ))
             };
-            let (notice, mut progress) = match captured {
+            let (notice, captured) = match captured {
                 Ok(frontiers) => {
-                    let progress = match capture_scope.capture(connection, &frontiers.database_id) {
-                        Ok(progress) => SourceWake::Committed(progress),
-                        Err(error) => capture_scope.unavailable(&format!("{error:#}")),
-                    };
+                    let progress = capture_scope.capture(connection, &frontiers.database_id);
                     (Notice::Committed(frontiers), progress)
                 }
-                Err(error) => {
-                    let reason = format!("{error:#}");
-                    (
-                        Notice::Unavailable(reason.clone()),
-                        capture_scope.unavailable(&reason),
-                    )
-                }
+                Err(error) => (Notice::Unavailable(format!("{error:#}")), Err(error)),
             };
             // All SQLite work precedes this lock. A returned rollback/no-op emits nothing
             // when its committed metadata is unchanged. Source availability is independent.
             let mut last = last
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let SourceWake::Committed(commit) = &progress {
-                if commit
-                    .sources
-                    .iter()
-                    .zip(&last.2)
-                    .any(|(source, previous)| source.revision < *previous)
-                {
-                    progress = capture_scope.unavailable("named-source revision moved backwards");
-                } else {
-                    for (previous, source) in last.2.iter_mut().zip(&commit.sources) {
-                        *previous = source.revision;
-                    }
-                }
-            }
+            let progress = match captured {
+                Ok(captured) => captured.into_wakes(&mut last.2),
+                Err(error) => vec![capture_scope.unavailable(&format!("{error:#}"))],
+            };
             if last.0 != notice {
                 last.0 = notice.clone();
                 let _ = send.send(notice);
             }
             if last.1 != progress {
                 last.1 = progress.clone();
-                let _ = send.send(Notice::Source(progress));
+                for wake in progress {
+                    let _ = send.send(Notice::Source(wake));
+                }
             }
         });
         Ok(Self {
@@ -630,6 +606,7 @@ mod source_progress {
     use super::super::install::SourcePosition;
     use anyhow::{Context, Result, ensure};
     use rusqlite::{Connection, params_from_iter};
+    use std::collections::BTreeMap;
     use std::sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -657,7 +634,9 @@ mod source_progress {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct SourceCommit {
         pub database_id: String,
-        /// Deterministic source-name order, including unavailable source state.
+        /// Valid attached identities in source-name order, including available=false.
+        /// Missing/replaced/malformed identities instead receive source-specific invalidations;
+        /// no revision is invented for them. This subset never certifies the complete scope.
         pub sources: Vec<SourceProgress>,
     }
 
@@ -690,6 +669,48 @@ mod source_progress {
         schema: Mutex<SchemaStamp>,
         schema_invalidated: AtomicBool,
         query: String,
+    }
+
+    pub(super) struct Captured {
+        commit: SourceCommit,
+        invalidations: Vec<SourceInvalidation>,
+    }
+
+    impl Captured {
+        pub(super) fn into_wakes(self, highwater: &mut BTreeMap<String, u64>) -> Vec<SourceWake> {
+            let Self {
+                mut commit,
+                mut invalidations,
+            } = self;
+            commit.sources.retain(|source| {
+                if highwater
+                    .get(&source.identity.name)
+                    .is_some_and(|previous| source.revision < *previous)
+                {
+                    invalidations.push(SourceInvalidation {
+                        database_id: commit.database_id.clone(),
+                        source: Some(source.identity.clone()),
+                        reason: "named-source revision moved backwards".into(),
+                    });
+                    false
+                } else {
+                    highwater.insert(source.identity.name.clone(), source.revision);
+                    true
+                }
+            });
+            invalidations.sort_by(|a, b| {
+                a.source
+                    .as_ref()
+                    .map(|s| &s.name)
+                    .cmp(&b.source.as_ref().map(|s| &s.name))
+            });
+            let mut wakes = Vec::with_capacity(invalidations.len() + 1);
+            if !commit.sources.is_empty() {
+                wakes.push(SourceWake::Committed(commit));
+            }
+            wakes.extend(invalidations.into_iter().map(SourceWake::Invalidated));
+            wakes
+        }
     }
 
     impl Scope {
@@ -760,7 +781,7 @@ mod source_progress {
             })
         }
 
-        pub(super) fn capture(&self, db: &Connection, database_id: &str) -> Result<SourceCommit> {
+        pub(super) fn capture(&self, db: &Connection, database_id: &str) -> Result<Captured> {
             ensure!(
                 database_id == self.database_id,
                 "publisher database identity replaced"
@@ -817,40 +838,49 @@ mod source_progress {
                     ))
                 },
             )?;
+            let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
             let mut sources = Vec::with_capacity(self.identities.len());
-            for (index, row) in rows.enumerate() {
-                let expected = self
-                    .identities
-                    .get(index)
-                    .context("unexpected named-source metadata")?;
-                let (name, fingerprint, epoch, revision, available) = row?;
-                ensure!(
-                    name == expected.name
-                        && fingerprint.as_deref() == Some(expected.fingerprint.as_str())
-                        && epoch == Some(expected.epoch as i64),
-                    "named-source identity missing or replaced"
-                );
-                let revision = revision
-                    .filter(|r| *r >= 0)
-                    .context("invalid named-source revision")?
-                    as u64;
-                let available = available
-                    .filter(|a| *a == 0 || *a == 1)
-                    .context("invalid named-source availability")?
-                    == 1;
-                sources.push(SourceProgress {
-                    identity: expected.clone(),
-                    revision,
-                    available,
-                });
+            let mut invalidations = Vec::new();
+            for expected in &self.identities {
+                let progress = (|| -> Result<SourceProgress> {
+                    let (_, fingerprint, epoch, revision, available) = rows
+                        .iter()
+                        .find(|row| row.0 == expected.name)
+                        .context("named source missing")?;
+                    ensure!(
+                        fingerprint.as_deref() == Some(expected.fingerprint.as_str())
+                            && *epoch == Some(expected.epoch as i64),
+                        "named-source identity missing or replaced"
+                    );
+                    let revision = (*revision)
+                        .filter(|r| *r >= 0)
+                        .context("invalid named-source revision")?
+                        as u64;
+                    let available = (*available)
+                        .filter(|a| *a == 0 || *a == 1)
+                        .context("invalid named-source availability")?
+                        == 1;
+                    Ok(SourceProgress {
+                        identity: expected.clone(),
+                        revision,
+                        available,
+                    })
+                })();
+                match progress {
+                    Ok(progress) => sources.push(progress),
+                    Err(error) => invalidations.push(SourceInvalidation {
+                        database_id: self.database_id.clone(),
+                        source: Some(expected.clone()),
+                        reason: bounded_reason(&format!("{error:#}")),
+                    }),
+                }
             }
-            ensure!(
-                sources.len() == self.identities.len(),
-                "named source missing"
-            );
-            Ok(SourceCommit {
-                database_id: self.database_id.clone(),
-                sources,
+            Ok(Captured {
+                commit: SourceCommit {
+                    database_id: self.database_id.clone(),
+                    sources,
+                },
+                invalidations,
             })
         }
 
@@ -986,6 +1016,108 @@ mod source_progress {
             root_page,
             declaration,
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn fixture() -> Result<(Connection, Vec<SourceIdentity>)> {
+            let db = Connection::open_in_memory()?;
+            db.execute_batch(
+                "CREATE TABLE ivm_install_sources (
+                name TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, epoch INTEGER NOT NULL,
+                revision INTEGER NOT NULL, available INTEGER NOT NULL,
+                journal_rows INTEGER NOT NULL DEFAULT 0, journal_bytes INTEGER NOT NULL DEFAULT 0);
+                INSERT INTO ivm_install_sources(name,fingerprint,epoch,revision,available)
+                VALUES ('a','a.v1',1,4,1),('b','b.v1',1,9,1);",
+            )?;
+            let identities = ["a", "b"]
+                .into_iter()
+                .map(|name| SourceIdentity {
+                    name: name.into(),
+                    fingerprint: format!("{name}.v1"),
+                    epoch: 1,
+                })
+                .collect();
+            Ok((db, identities))
+        }
+
+        #[test]
+        fn mismatched_source_does_not_suppress_valid_peer_progress() -> Result<()> {
+            let (db, identities) = fixture()?;
+            db.execute(
+                "UPDATE ivm_install_sources SET fingerprint='wrong' WHERE name='a'",
+                [],
+            )?;
+            let scope = Scope::attach(&db, "db", &identities)?;
+            let mut highwater = BTreeMap::new();
+            let wakes = scope.capture(&db, "db")?.into_wakes(&mut highwater);
+            assert!(
+                matches!(&wakes[0], SourceWake::Committed(c) if c.sources.len()==1 && c.sources[0].identity.name=="b" && c.sources[0].revision==9)
+            );
+            assert!(
+                matches!(&wakes[1], SourceWake::Invalidated(i) if i.source.as_ref()==Some(&identities[0]))
+            );
+            assert!(!highwater.contains_key("a"));
+            db.execute(
+                "UPDATE ivm_install_sources SET revision=10 WHERE name='b'",
+                [],
+            )?;
+            let next = scope.capture(&db, "db")?.into_wakes(&mut highwater);
+            assert_ne!(wakes, next);
+            assert!(matches!(&next[0], SourceWake::Committed(c) if c.sources[0].revision==10));
+            assert!(
+                matches!(&next[1], SourceWake::Invalidated(i) if i.source.as_ref()==Some(&identities[0]))
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn missing_and_regressing_sources_do_not_invent_or_reset_revisions() -> Result<()> {
+            let (db, identities) = fixture()?;
+            let scope = Scope::attach(&db, "db", &identities)?;
+            let mut highwater = BTreeMap::new();
+            scope.capture(&db, "db")?.into_wakes(&mut highwater);
+            db.execute_batch(
+                "DELETE FROM ivm_install_sources WHERE name='a';
+                UPDATE ivm_install_sources SET revision=8 WHERE name='b';",
+            )?;
+            let wakes = scope.capture(&db, "db")?.into_wakes(&mut highwater);
+            assert_eq!(wakes.len(), 2);
+            assert!(
+                wakes
+                    .iter()
+                    .all(|w| matches!(w, SourceWake::Invalidated(i) if i.source.is_some()))
+            );
+            assert_eq!(highwater.get("a"), Some(&4));
+            assert_eq!(highwater.get("b"), Some(&9));
+            db.execute(
+                "UPDATE ivm_install_sources SET revision=10 WHERE name='b'",
+                [],
+            )?;
+            let next = scope.capture(&db, "db")?.into_wakes(&mut highwater);
+            assert!(
+                matches!(&next[0], SourceWake::Committed(c) if c.sources.len()==1 && c.sources[0].revision==10)
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn unrelated_namespace_ddl_refreshes_cookie_but_malformed_schema_latches_refusal()
+        -> Result<()> {
+            let (db, identities) = fixture()?;
+            let scope = Scope::attach(&db, "db", &identities)?;
+            let mut highwater = BTreeMap::new();
+            let before = scope.capture(&db, "db")?.into_wakes(&mut highwater);
+            db.execute_batch("CREATE TABLE staged_namespace(key TEXT PRIMARY KEY, value BLOB);")?;
+            assert_eq!(before, scope.capture(&db, "db")?.into_wakes(&mut highwater));
+            db.execute_batch("ALTER TABLE ivm_install_sources ADD COLUMN unsupported INTEGER;")?;
+            assert!(scope.capture(&db, "db").is_err());
+            db.execute_batch("ALTER TABLE ivm_install_sources DROP COLUMN unsupported;")?;
+            assert!(scope.capture(&db, "db").is_err());
+            Ok(())
+        }
     }
 
     fn bounded_reason(reason: &str) -> String {
