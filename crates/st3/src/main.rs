@@ -5570,25 +5570,66 @@ fn raise_open_file_limit() {
     }
 }
 
-fn select_private_gateway(config: &mut Config, private_state: bool, private_socket: bool) {
+#[derive(Debug)]
+struct PrivateGatewayCollision {
+    derived: PathBuf,
+}
+
+impl std::fmt::Display for PrivateGatewayCollision {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            output,
+            "pass --client-gateway-socket; the derived private gateway {} equals the shared default gateway",
+            self.derived.display()
+        )
+    }
+}
+
+impl std::error::Error for PrivateGatewayCollision {}
+
+fn gateway_path_for_comparison(socket: &Path) -> Result<PathBuf> {
+    let socket = std::path::absolute(socket)?;
+    let parent = socket.parent().context("gateway socket has no parent")?;
+    let parent = match fs::canonicalize(parent) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => parent.to_path_buf(),
+        Err(error) => return Err(error).context("resolve gateway socket parent"),
+    };
+    Ok(parent.join(
+        socket
+            .file_name()
+            .context("gateway socket has no file name")?,
+    ))
+}
+
+fn select_private_gateway(
+    config: &mut Config,
+    private_state: bool,
+    private_socket: bool,
+) -> Result<()> {
     if !(private_state || private_socket) {
-        return;
+        return Ok(());
     }
-    let defaults = Config::default();
-    if config.state_dir == defaults.state_dir && config.socket == defaults.socket {
-        return;
-    }
-    let parent = if private_socket {
+    let parent = if private_state {
+        Some(config.state_dir.as_path())
+    } else {
         config
             .socket
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
-    } else {
-        Some(config.state_dir.as_path())
     };
     config.client_gateway_socket = parent
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("st3-client.sock");
+    if gateway_path_for_comparison(&config.client_gateway_socket)?
+        == gateway_path_for_comparison(&Config::default().client_gateway_socket)?
+    {
+        return Err(PrivateGatewayCollision {
+            derived: config.client_gateway_socket.clone(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5600,26 +5641,69 @@ mod private_gateway_tests {
         let mut config = Config::default();
         let default_gateway = config.client_gateway_socket.clone();
         config.state_dir = "/tmp/private-state".into();
-        select_private_gateway(&mut config, true, false);
+        select_private_gateway(&mut config, true, false).unwrap();
         assert_eq!(
             config.client_gateway_socket,
             PathBuf::from("/tmp/private-state/st3-client.sock")
         );
         config.socket = "/tmp/private-socket/api.sock".into();
-        select_private_gateway(&mut config, true, true);
+        select_private_gateway(&mut config, true, true).unwrap();
+        assert_eq!(
+            config.client_gateway_socket,
+            PathBuf::from("/tmp/private-state/st3-client.sock")
+        );
+        assert_ne!(config.client_gateway_socket, default_gateway);
+        select_private_gateway(&mut config, false, true).unwrap();
         assert_eq!(
             config.client_gateway_socket,
             PathBuf::from("/tmp/private-socket/st3-client.sock")
         );
-        assert_ne!(config.client_gateway_socket, default_gateway);
     }
 
     #[test]
     fn default_daemon_keeps_its_default_gateway() {
         let mut config = Config::default();
         let gateway = config.client_gateway_socket.clone();
-        select_private_gateway(&mut config, false, false);
+        select_private_gateway(&mut config, false, false).unwrap();
         assert_eq!(config.client_gateway_socket, gateway);
+    }
+
+    #[test]
+    fn private_socket_in_runtime_dir_refuses_shared_default_gateway() {
+        let mut config = Config::default();
+        config.socket = config.socket.with_file_name("private-st.sock");
+        let error = select_private_gateway(&mut config, false, true).unwrap_err();
+        let collision = error.downcast_ref::<PrivateGatewayCollision>().unwrap();
+        assert_eq!(collision.derived, Config::default().client_gateway_socket);
+        assert!(error.to_string().contains("pass --client-gateway-socket"));
+    }
+
+    #[test]
+    fn private_state_takes_priority_over_runtime_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.state_dir = root.path().join("private-state");
+        config.socket = config.socket.with_file_name("private-st.sock");
+        select_private_gateway(&mut config, true, true).unwrap();
+        assert_eq!(
+            config.client_gateway_socket,
+            config.state_dir.join("st3-client.sock")
+        );
+        assert!(!config.state_dir.exists());
+    }
+
+    #[test]
+    fn gateway_comparison_resolves_symlinked_runtime_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&runtime, &alias).unwrap();
+        assert_eq!(
+            gateway_path_for_comparison(&runtime.join("st3-client.sock")).unwrap(),
+            gateway_path_for_comparison(&alias.join("st3-client.sock")).unwrap()
+        );
+        assert!(!runtime.join("st3-client.sock").exists());
     }
 }
 
@@ -5644,7 +5728,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.client_gateway_socket = socket;
     }
     if !explicit_gateway {
-        select_private_gateway(&mut config, private_state, private_socket);
+        select_private_gateway(&mut config, private_state, private_socket)?;
     }
     if let Some(peer_listen) = args.peer_listen {
         config.peer_listen = Some(peer_listen);

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep private daemon gateways away from the shared default socket.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or projection recovery changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema or index changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or digest rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Private --state-dir takes precedence over --socket when deriving the paired gateway. Socket-only startup refuses if its derived gateway equals the shared default, resolving existing parent-directory symlinks. Explicit --client-gateway-socket and default startup are unchanged."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "For a private socket beside the shared default gateway without --state-dir, pass --client-gateway-socket with a private path."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persisted migration; ordinary binary rollback restores the previous gateway derivation."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal daemon restart; duration not measured for this change."
+  }
+}

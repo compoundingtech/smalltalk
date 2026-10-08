@@ -35,6 +35,38 @@ fn command(root: &Path) -> Command {
 }
 
 #[test]
+fn private_runtime_socket_refuses_shared_gateway_before_creating_state() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("run")).unwrap();
+    let alias = root.path().join("runtime-alias");
+    std::os::unix::fs::symlink(root.path().join("run"), &alias).unwrap();
+    for directory in [root.path().join("run"), alias] {
+        let output = command(root.path())
+            .arg("up")
+            .arg("--socket")
+            .arg(directory.join("private-st.sock"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("pass --client-gateway-socket; the derived private gateway"),
+            "{error}"
+        );
+        assert!(
+            error.contains("equals the shared default gateway"),
+            "{error}"
+        );
+        assert!(!root.path().join("home/.local/state").exists());
+        assert!(!root.path().join("run/private-st.sock").exists());
+        assert!(!root.path().join("run/st3-client.sock").exists());
+    }
+}
+
+#[test]
 fn replay_is_visible_before_the_api_serves_and_stale_files_are_ignored() {
     if st3::test_support::supervise_test() {
         return;
