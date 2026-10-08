@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Avoid legacy graph rescans during modern replication export while retaining exact fallback for older peers.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay, projection rebuild, or recovery frontier changes. The export snapshot continues to seal local batches and use the same inventory and projection digests."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, index, trigger, or schema-version change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule, authority digest, inventory digest, or digest algorithm change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "A modern first peer exchange may leave the existing legacy graph_digest field empty while sending complete projection_digests. A peer with no projection_digests in its authenticated response receives a second summary with the exact legacy digest before its response is accepted or the round completes. The daemon's internal export request adds an optional modern_only flag; omitted means the previous exact legacy behavior. Existing peer exchange fields remain. Older peer version pairs and large mixed-fleet latency have not yet been independently measured."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "A normal daemon restart is needed to run the new export path; restart-to-API and restart-to-health have not been measured on production stores."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No store migration, identity change, configuration, or operator action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persisted format changes. Rolling back the binary restores the prior exact-legacy export behavior; it does not alter stored authority or repair a slow export."
+  }
+}
