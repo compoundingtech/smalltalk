@@ -3,6 +3,7 @@ import {
   decodeUnknownSync,
   type AgentEncoded,
   type ResourceObservationEncoded,
+  type TerminalScreen,
 } from '@smalltalk/st3-client/schema'
 import * as Atom from 'effect/reactivity/Atom'
 import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
@@ -12,8 +13,9 @@ import { describe, expect, it, vi } from 'vitest'
 import { fixtureAttention, fixtureMissions } from '../missions/fixtures.ts'
 import { gatewayResources } from '../resources/agent/source.ts'
 import { fixtureSource, type FixtureProjections } from './fixtureSource.ts'
-import { DataSourceProvider, type SubjectIndex, useSubjectIndex, useSubjectList } from './react.tsx'
-import { type DataSource, observed, unavailable, waiting } from './source.ts'
+import { DataSourceProvider, type SubjectIndex, useSubjectIndex, useSubjectList, useGatewaySync, useAgentsSync, useMissionsSync, useAttentionSync, useConversationSync, useTerminalSync } from './react.tsx'
+import { type ConversationPage, type DataSource, observed, unavailable, waiting } from './source.ts'
+import { initialFeedSync, transitionFeedSync, type FeedSyncObservation } from './feedSync.ts'
 
 const blocked = unavailable({ reason: 'unsupported', detail: 'This family is not served.' })
 const agent = decodeUnknownSync(
@@ -184,6 +186,55 @@ describe('independent subject discovery through the data provider', () => {
       registry.set(missions, observed({ value: world.missions, freshness: 'stale' }))
       expect(renderSubjects(source, registry)).toContain(`<li>${mission.id}</li>`)
       expect(renderSubjects(source, registry)).toContain(`<li>${agent.id}</li>`)
+    } finally {
+      registry.dispose()
+    }
+  })
+})
+
+describe('SDK sync observation hooks', () => {
+  it('passes exact SDK observations through independently of already observed fixture content', () => {
+    const registry = AtomRegistry.make()
+    const base = fixtureSource({ world })
+    const agents = transitionFeedSync(initialFeedSync<typeof world.agents>(100), { _tag: 'Requested', since: 125 }, 125)
+    const gateway: FeedSyncObservation = { status: { _tag: 'Requested', since: 110 }, observedAt: 110 }
+    const source: DataSource = {
+      ...base,
+      sync: {
+        gateway: Atom.make(gateway),
+        agents: Atom.make(agents),
+        missions: Atom.make(initialFeedSync<typeof world.missions>(100)),
+        attention: Atom.make(initialFeedSync<typeof world.attention>(100)),
+        conversation: () => Atom.make(initialFeedSync<ConversationPage>(100)),
+        terminal: () => Atom.make(initialFeedSync<TerminalScreen>(100)),
+      },
+    }
+    let observations: readonly (FeedSyncObservation | undefined)[] = []
+    const Consumer = () => {
+      observations = [useGatewaySync(), useAgentsSync(), useMissionsSync(), useAttentionSync(), useConversationSync(agent.id), useTerminalSync('terminal/example')]
+      return null
+    }
+    try {
+      renderToStaticMarkup(<DataSourceProvider source={source} registry={registry}><Consumer /></DataSourceProvider>)
+      expect(observations[0]).toBe(gateway)
+      expect(observations[1]).toBe(agents.sync)
+      expect(observations.slice(2).map((value) => value?.status)).toEqual(Array.from({ length: 4 }, () => ({ _tag: 'Connecting', attempt: 1, since: 100 })))
+      expect(registry.get(source.agents)._tag).toBe('Observed')
+    } finally {
+      registry.dispose()
+    }
+  })
+
+  it('does not infer Live or unavailable sync facts for a source without SDK observations', () => {
+    const registry = AtomRegistry.make()
+    let observations: readonly (FeedSyncObservation | undefined)[] = []
+    const Consumer = () => {
+      observations = [useGatewaySync(), useAgentsSync(), useMissionsSync(), useAttentionSync(), useConversationSync(agent.id), useTerminalSync('terminal/example')]
+      return null
+    }
+    try {
+      renderToStaticMarkup(<DataSourceProvider source={fixtureSource({ world })} registry={registry}><Consumer /></DataSourceProvider>)
+      expect(observations).toEqual(Array.from({ length: 6 }, () => undefined))
     } finally {
       registry.dispose()
     }

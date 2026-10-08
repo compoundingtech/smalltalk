@@ -33,7 +33,7 @@ const createPageRuntime = () => {
   
   // The page owns one source for its lifetime; Storybook never imports this live root.
   const live = liveSource({
-    options: { baseUrl: window.location.origin, maxFollows: 8 },
+    options: { baseUrl: window.location.origin, maxFollows: 8, conversationSlots: 'advertised' },
     telemetryLayer,
   })
   return { live, telemetry }

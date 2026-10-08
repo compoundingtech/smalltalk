@@ -10,6 +10,7 @@ import type { MissionView } from '../missions/model.ts'
 import type { SubjectSummary } from '../shell/context.tsx'
 import { createProjections } from './projections.ts'
 import { type Agent, type DataSource, type Feed, type Fleet, observed } from './source.ts'
+import type { FeedSync, FeedSyncObservation } from './feedSync.ts'
 
 /** Navigable observations plus the actual availability of each independently followed family. */
 export interface SubjectIndex {
@@ -226,6 +227,27 @@ export const useFeedInterest = ({
 }
 /** Observe the gateway connection lifecycle. */
 export const useConnection = () => useAtomValue(useDataSource().connection)
+const noSyncObservation = Atom.make<FeedSyncObservation | undefined>(undefined)
+/** SDK-owned verdicts, not inferred from retained Feed content or connection state. */
+export const useGatewaySync = (): FeedSyncObservation | undefined =>
+  useAtomValue(useDataSource().sync?.gateway ?? noSyncObservation)
+const useRetainedSync = <TValue,>(sync: Atom.Atom<FeedSync<TValue>> | undefined): FeedSyncObservation | undefined => {
+  const observation = React.useMemo(
+    () => Atom.make((get) => sync === undefined ? undefined : get(sync).sync),
+    [sync],
+  )
+  return useAtomValue(observation)
+}
+export const useAgentsSync = (): FeedSyncObservation | undefined =>
+  useRetainedSync(useDataSource().sync?.agents)
+export const useMissionsSync = (): FeedSyncObservation | undefined =>
+  useRetainedSync(useDataSource().sync?.missions)
+export const useAttentionSync = (): FeedSyncObservation | undefined =>
+  useRetainedSync(useDataSource().sync?.attention)
+export const useConversationSync = (ref: string): FeedSyncObservation | undefined =>
+  useRetainedSync(useDataSource().sync?.conversation(ref))
+export const useTerminalSync = (ref: string): FeedSyncObservation | undefined =>
+  useRetainedSync(useDataSource().sync?.terminal(ref))
 /** Observe current action and terminal grants. */
 export const useGrants = () => useAtomValue(useDataSource().grants)
 /** Observe the fleet projected from agent rows. */
