@@ -2890,7 +2890,7 @@ mod tests {
         let mut state = super::super::tests::state(root.path());
         state.store = Arc::new(Store::open_memory("node").unwrap());
         let store = &state.store;
-        crate::mailbox::tests::ready(&store, "session-1");
+        crate::mailbox::tests::ready(store, "session-1");
         let fence = store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
             .unwrap();
@@ -2932,7 +2932,7 @@ mod tests {
         let mut policies = Default::default();
         let before = store.index().unwrap();
         let (_, view, _, closures) = update_snapshot(
-            &store,
+            store,
             &fence,
             raw_snapshot,
             None,

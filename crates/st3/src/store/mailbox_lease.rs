@@ -1299,7 +1299,7 @@ impl Store {
             let pinned = smallclaims::sqlite::PINNED_READER.with(|slot|
                 slot.borrow().as_ref().is_some_and(|(key, _)| *key == self.readers.key()));
             let result = if pinned { read() } else {
-                self.readers.request_read(read).map_err(anyhow::Error::from).and_then(|result| result)
+                self.readers.request_read(read).and_then(|result| result)
             };
             #[cfg(test)]
             AFTER_FAULT_ACQUISITION.with(|pause| {
