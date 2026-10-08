@@ -335,12 +335,15 @@ fn admission_rechecks_authority_when_a_foreground_change_overtakes_its_preparati
         admitting.validate_replication_backlog().unwrap()
     });
     preparing.recv_timeout(Duration::from_secs(5)).unwrap();
-    // The prepared fold treated birch as legacy. Establish a signed anchor admission for
-    // birch before its loan: the old unsigned page must now wait for that exact member key.
+    // The prepared fold treated birch as legacy. Establish cedar as the signed anchor,
+    // then let it admit birch: the old unsigned page must now wait for that exact member key.
     let (key, _) = MemberKey::generate().unwrap();
     let key = Arc::new(key);
     target.set_member_key(Some(key.clone())).unwrap();
     target.pin_fleet_anchor(key.public()).unwrap();
+    target
+        .admit_fleet_anchor(FLEET, key.public(), "listening")
+        .unwrap();
     target
         .append_claim(&ClaimInput {
             subject: "host/birch".into(),
@@ -349,7 +352,7 @@ fn admission_rechecks_authority_when_a_foreground_change_overtakes_its_preparati
             fields: BTreeMap::from([
                 ("fleet_id".into(), Value::String(FLEET.into())),
                 ("member_key".into(), Value::String(key.public().into())),
-                ("via".into(), Value::String("anchor".into())),
+                ("via".into(), Value::String("invite".into())),
                 ("mode".into(), Value::String("listening".into())),
             ]),
             evidence: Vec::new(),
@@ -358,12 +361,12 @@ fn admission_rechecks_authority_when_a_foreground_change_overtakes_its_preparati
         })
         .unwrap();
     let membership = target.fleet_membership().unwrap();
+    resume.send(()).unwrap();
+    let outcome = admission.join().unwrap();
     assert!(matches!(
         membership.window("birch", exchange.envelopes[0].sequence),
         crate::fleet::Window::Keyed(_)
     ));
-    resume.send(()).unwrap();
-    let outcome = admission.join().unwrap();
     assert_eq!((outcome.valid, outcome.held), (0, 1));
     assert_eq!(
         target
