@@ -17,6 +17,29 @@ loader.exec_module(runner)
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_guardian_socket_root_fits_with_a_long_temp_directory(self):
+        with tempfile.TemporaryDirectory(prefix="mfe-path-control-", dir="/tmp") as directory:
+            long_temp = Path(directory) / ("long-" * 16)
+            long_temp.mkdir()
+            scratch = long_temp / "binary-scratch"
+            with patch.dict(os.environ, {"TMPDIR": str(long_temp)}), \
+                 patch.object(tempfile, "gettempdir", return_value=str(long_temp)):
+                roots = runner.supervised_roots(scratch)
+                name, prefix, parent = roots[0]
+                self.assertEqual(name, "ST3_MESSAGING_ROOT")
+                self.assertEqual(roots[1],
+                                 ("ST3_MESSAGING_SCRATCH", "mfi-owner-", str(scratch)))
+                with tempfile.TemporaryDirectory(prefix=prefix, dir=parent) as owned:
+                    with tempfile.TemporaryDirectory(prefix="mfe-", dir=owned) as case:
+                        pty_root = Path(case) / "cobalt" / "pty"
+                        pty_root.mkdir(parents=True)
+                        socket_path = pty_root / "eval.fault-probe.sock"
+                        # Match pty-core's conservative 104-byte limit as well as
+                        # exercising an actual Unix bind at the complete fixture path.
+                        self.assertLessEqual(len(os.fsencode(socket_path)), 104)
+                        with socket.socket(socket.AF_UNIX) as listener:
+                            listener.bind(str(socket_path))
+
     def test_only_an_existing_user_bus_is_inherited(self):
         for mode in ("unset", "directory", "bus"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
