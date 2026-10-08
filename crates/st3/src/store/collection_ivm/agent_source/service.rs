@@ -21,7 +21,7 @@ use std::{
 
 const PAGE: usize = 128;
 #[cfg(test)]
-pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 type Handles = Arc<Mutex<BTreeMap<String, Namespace>>>;
 
 /// Retains opaque identity only. No SQL, cut, certificate or readiness is produced here.
@@ -892,9 +892,7 @@ mod tests {
 
     #[test]
     fn observation_retention_and_count_trim_keep_managed_capture_bounded() {
-        let _lock = TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = TEST_LOCK.blocking_lock();
         let directory = tempfile::tempdir().unwrap();
         let store =
             Store::open_with_agent_collections(&directory.path().join("trim.sqlite"), "node")
@@ -963,9 +961,7 @@ mod tests {
 
     #[test]
     fn native_source_publication_pending_commit_and_raw_refusal_use_real_store() {
-        let _lock = TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = TEST_LOCK.blocking_lock();
         let directory = tempfile::tempdir().unwrap();
         let store =
             Store::open_with_agent_collections(&directory.path().join("source.sqlite"), "node")
@@ -1160,9 +1156,7 @@ mod tests {
     }
     #[test]
     fn reopen_raw_gap_and_interrupted_scan_publish_fresh_namespace_without_resetting_identity() {
-        let _lock = TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = TEST_LOCK.blocking_lock();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("reopen.sqlite");
         let first = Store::open_with_agent_collections(&path, "node").unwrap();
