@@ -4272,13 +4272,17 @@ fn session_message_body(state: &AppState, claim: &ClaimRecord) -> Value {
     body
 }
 
-fn native_timeline_page(
+fn timeline_order(a: &Value, b: &Value) -> std::cmp::Ordering {
+    a["timestamp"].as_str().cmp(&b["timestamp"].as_str())
+        .then_with(|| a["sequence"].as_u64().cmp(&b["sequence"].as_u64()))
+}
+
+fn native_session_messages(
     state: &AppState,
     snapshot: &ClientSnapshot,
     session_id: &str,
-    query: &ClientListQuery,
-    mut items: Vec<Value>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Vec<Value>, ApiError> {
+    let mut items = Vec::new();
     if let Some((owner, incarnation, _)) =
         super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
@@ -4303,14 +4307,35 @@ fn native_timeline_page(
             items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":session_message_body(state, &claim)}));
             items.push(json!({"id":format!("timeline-entry/{}/{}-content", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base+1, "revision":1, "timestamp":stamp, "role":role, "type":"content", "final":true, "body":{"media_type":"text/plain","text":fields.get("content").and_then(Value::as_str).unwrap_or_default()}}));
         }
-        items.sort_by(|a, b| {
-            a["timestamp"]
-                .as_str()
-                .cmp(&b["timestamp"].as_str())
-                .then_with(|| a["sequence"].as_u64().cmp(&b["sequence"].as_u64()))
-        });
+        items.sort_by(timeline_order);
     }
     items.reverse();
+    Ok(items)
+}
+
+fn native_timeline_page(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session_id: &str,
+    query: &ClientListQuery,
+    mut items: Vec<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let order = native_timeline_order(state, snapshot, session_id)?;
+    let mut keyed: Vec<_> = items.drain(..)
+        .map(|item| {
+            let key = crate::external_sessions::timeline_key(&item, 0);
+            (item, key)
+        })
+        .collect();
+    if order == crate::external_sessions::TimelineOrder::TimestampSequence {
+        keyed.extend(native_session_messages(state, snapshot, session_id)?.into_iter()
+            .map(|item| {
+                let key = crate::external_sessions::timeline_key(&item, 1);
+                (item, key)
+            }));
+    }
+    keyed.sort_by(|(_, a), (_, b)| a.cmp_in(b, order));
+    items = keyed.into_iter().rev().map(|(item, _)| item).collect();
     let mut page = client_page(
         state,
         snapshot,
@@ -4324,6 +4349,212 @@ fn native_timeline_page(
         "session_id": session_id,
         "items": page.items,
         "page": page.page
+    })))
+}
+
+fn native_timeline_order(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session_id: &str,
+) -> Result<crate::external_sessions::TimelineOrder, ApiError> {
+    Ok(if super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
+        .map_err(ApiError::internal)?.is_some()
+    {
+        crate::external_sessions::TimelineOrder::TimestampSequence
+    } else {
+        crate::external_sessions::TimelineOrder::Sequence
+    })
+}
+
+pub(super) const NATIVE_PAGE_CURSOR_PREFIX: &str = "page/native/";
+
+/// All stateless cursor authority is authenticated, including expiry, the source basis, and
+/// the source's content generation. A process restart changes the key, invalidating these
+/// pages just like cached offset pages.
+#[derive(Serialize, Deserialize)]
+struct NativePagePosition {
+    session_id: String,
+    collection: String,
+    order: String,
+    boundary: crate::external_sessions::TimelineKey,
+    limit: usize,
+    filter_digest: String,
+    snapshot: ClientSnapshot,
+    source_basis: String,
+    /// Content generation at the page boundary. An in-place replacement moves it even when
+    /// driver, native id, path and inode are unchanged.
+    source_generation: u64,
+    expires_at_unix_ms: u128,
+}
+
+#[derive(Serialize, Deserialize)]
+struct NativePageCursor {
+    position: NativePagePosition,
+    #[serde(default)]
+    mac: Option<String>,
+}
+
+fn native_page_mac(position: &NativePagePosition) -> Result<hmac::Hmac<Sha256>, ApiError> {
+    use hmac::Mac as _;
+    static KEY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        let mut key = [0_u8; 32];
+        getrandom::fill(&mut key).expect("creating the native page cursor authentication key");
+        key
+    });
+    let mut mac = <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(&*KEY)
+        .expect("HMAC accepts a 32-byte key");
+    // Struct serialization fixes the field order; the position contains no arbitrary JSON.
+    mac.update(&serde_json::to_vec(position).map_err(ApiError::internal)?);
+    Ok(mac)
+}
+
+fn encode_native_page_cursor(position: NativePagePosition) -> Result<String, ApiError> {
+    use hmac::Mac as _;
+    let mac = hex::encode(native_page_mac(&position)?.finalize().into_bytes());
+    let encoded = serde_json::to_vec(&NativePageCursor { position, mac: Some(mac) })
+        .map_err(ApiError::internal)?;
+    Ok(format!("{NATIVE_PAGE_CURSOR_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encoded)))
+}
+
+fn decode_native_page_cursor(encoded: &str) -> Result<NativePagePosition, ApiError> {
+    use hmac::Mac as _;
+    let expired = || client_page_expired("the page snapshot is no longer available; restart pagination");
+    let encoded = encoded.strip_prefix(NATIVE_PAGE_CURSOR_PREFIX).ok_or_else(expired)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)
+        .map_err(|_| expired())?;
+    let cursor: NativePageCursor = serde_json::from_slice(&bytes).map_err(|_| expired())?;
+    let signature = hex::decode(cursor.mac.as_deref().ok_or_else(expired)?)
+        .map_err(|_| expired())?;
+    native_page_mac(&cursor.position)?.verify_slice(&signature).map_err(|_| expired())?;
+    Ok(cursor.position)
+}
+
+pub(super) fn native_page_cursor_snapshot(encoded: &str) -> Result<ClientSnapshot, ApiError> {
+    decode_native_page_cursor(encoded).map(|position| position.snapshot)
+}
+
+fn native_page_filter_digest(query: &ClientListQuery) -> Result<String, ApiError> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&json!([
+        query.history, query.person, query.actor, query.owner_run, query.status,
+        query.native_only, query.owner, query.state
+    ])).map_err(ApiError::internal)?)))
+}
+
+/// Native pages retain no whole-window page cache. Their authenticated boundary names
+/// the entire last-returned key, including source rank, so tied entries survive pagination.
+fn native_slice_page(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    session_id: &str,
+    query: &ClientListQuery,
+    source: &crate::external_sessions::ExternalSession,
+) -> Result<Json<Value>, ApiError> {
+    let cursor = query.cursor.as_deref().map(decode_native_page_cursor).transpose()?;
+    let source_basis = conversation_blocks::basis(source)?;
+    let order = native_timeline_order(state, snapshot, session_id)?;
+    let order_name = match order {
+        crate::external_sessions::TimelineOrder::Sequence => "sequence",
+        crate::external_sessions::TimelineOrder::TimestampSequence => "timestamp-sequence",
+    };
+    let filter_digest = native_page_filter_digest(query)?;
+    let requested_limit = query.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
+        .clamp(1, CLIENT_MAX_PAGE_ITEMS);
+    if let Some(cursor) = &cursor {
+        if cursor.session_id != session_id
+            || cursor.collection != format!("timeline/{session_id}")
+            || cursor.snapshot.id != snapshot.id
+            || cursor.snapshot.store_index != snapshot.store_index
+            || cursor.order != order_name
+            || cursor.filter_digest != filter_digest
+            || cursor.source_basis != source_basis
+            || query.limit.is_some_and(|_| requested_limit != cursor.limit)
+        {
+            return Err(client_page_expired(
+                "the page cursor does not match this collection, snapshot, or filter",
+            ));
+        }
+        if client_now_ms() > cursor.expires_at_unix_ms {
+            return Err(client_page_expired("the page cursor expired"));
+        }
+    }
+    let limit = cursor.as_ref().map_or(requested_limit, |cursor| cursor.limit);
+    let expires_at_unix_ms = cursor.as_ref().map_or_else(
+        || client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
+        |cursor| cursor.expires_at_unix_ms,
+    );
+    let before = cursor.as_ref().map(|cursor| &cursor.boundary);
+    let native = conversation_blocks::read_slice(source, session, session_id, order, before, limit + 1)?;
+    if native.basis != source_basis {
+        return Err(client_page_expired("the transcript changed while reading the page"));
+    }
+    if let Some(cursor) = &cursor
+        && cursor.source_generation != native.generation
+    {
+        return Err(client_page_expired(
+            "the transcript was replaced while paging; restart pagination",
+        ));
+    }
+    let messages = if order == crate::external_sessions::TimelineOrder::TimestampSequence {
+        native_session_messages(state, snapshot, session_id)?
+    } else {
+        Vec::new()
+    };
+    // Message sequences are unique, and native_session_messages already returns them
+    // newest-first by timestamp and sequence. Compute each full key only once.
+    let messages = messages.into_iter().map(|item| {
+        let key = crate::external_sessions::timeline_key(&item, 1);
+        (item, key)
+    }).filter(|(_, key)| before.is_none_or(|before| key.cmp_in(before, order).is_lt()));
+    let mut native_items = native.items.into_iter().map(|item| {
+        let key = crate::external_sessions::timeline_key(&item, 0);
+        (item, key)
+    }).peekable();
+    let mut messages = messages.peekable();
+    let mut items = Vec::with_capacity(limit + 1);
+    while items.len() <= limit {
+        let take_native = match (native_items.peek(), messages.peek()) {
+            (Some((_, native)), Some((_, message))) => native.cmp_in(message, order).is_gt(),
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        items.push(if take_native {
+            native_items.next().expect("peeked native entry")
+        } else {
+            messages.next().expect("peeked message entry")
+        });
+    }
+    let has_more = items.len() > limit || native.has_more;
+    items.truncate(limit);
+    let next_cursor = if has_more {
+        let boundary = items.last()
+            .ok_or_else(|| ApiError::internal("native page has no boundary"))?.1.clone();
+        Some(encode_native_page_cursor(NativePagePosition {
+            session_id: session_id.to_owned(),
+            snapshot: snapshot.clone(),
+            collection: format!("timeline/{session_id}"),
+            order: order_name.to_owned(),
+            boundary,
+            limit,
+            filter_digest,
+            source_basis,
+            source_generation: native.generation,
+            expires_at_unix_ms,
+        })?)
+    } else {
+        None
+    };
+    let items: Vec<_> = items.into_iter().rev().map(|(item, _)| item).collect();
+    Ok(Json(json!({
+        "kind": "timeline-page",
+        "session_id": session_id,
+        "items": items,
+        "page": ClientPageInfo {
+            limit, has_more, next_cursor,
+            cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+        },
     })))
 }
 
@@ -4703,8 +4934,13 @@ pub(super) fn timeline_value(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(session, "read.projections")?;
     let session_id = client_detail_id("session", id);
-    if query.cursor.is_some() {
+    if let Some(cursor) = query.cursor.as_deref() {
         let _span = crate::profile::span("timeline/cached-page");
+        if cursor.starts_with(NATIVE_PAGE_CURSOR_PREFIX) {
+            let source = conversation_blocks::source(state, &session_id)
+                .map_err(|_| client_page_expired("the page snapshot is no longer available; restart pagination"))?;
+            return native_slice_page(state, snapshot, session, &session_id, query, &source);
+        }
         let mut page = client_page(
             state,
             snapshot,
@@ -4748,6 +4984,9 @@ fn timeline_first_page(
         let items = match conversation {
             Some(crate::external_sessions::ExternalConversation::Readable(external)) => {
                 let _span = crate::profile::span("timeline/native-read");
+                if external.driver != crate::external_sessions::ExternalDriver::OpenCode {
+                    return native_slice_page(state, snapshot, session, &session_id, query, &external);
+                }
                 conversation_blocks::read(&external, session, &session_id)?
             }
             other => external_conversation_items(other, &session_id)?,
@@ -4765,8 +5004,13 @@ fn timeline_first_page(
         let read = {
             let _span = crate::profile::span("timeline/native-read");
             match managed.transcript.as_ref() {
-                Ok(external) => match conversation_blocks::read(external, session, &session_id) {
-                    Ok(items) => Ok(items),
+                Ok(external) => match if external.driver != crate::external_sessions::ExternalDriver::OpenCode {
+                    native_slice_page(state, snapshot, session, &session_id, query, external)
+                } else {
+                    conversation_blocks::read(external, session, &session_id)
+                        .and_then(|items| native_timeline_page(state, snapshot, &session_id, query, items))
+                } {
+                    Ok(page) => Ok(page),
                     Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Err(error),
                     Err(error) => Err(format!("the transcript could not be read: {}", error.message)),
                 },
@@ -4774,7 +5018,7 @@ fn timeline_first_page(
             }
         };
         match read {
-            Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items),
+            Ok(page) => return Ok(page),
             Err(reason) => {
                 transcript_notice_entry = Some(transcript_notice(&session_id, &managed, &reason));
             }
@@ -5281,30 +5525,25 @@ fn conversation_read_now_unbounded(
         *rebuilds.entry(session_id.to_owned()).or_default() += 1;
     }
     let snapshot = new_client_snapshot(state);
-    let page = timeline_value(
-        state,
-        &snapshot,
-        session,
-        session_id,
-        &ClientListQuery {
-            limit: Some(200),
-            ..Default::default()
-        },
-    )?
-    .0;
+    let query = ClientListQuery { limit: Some(200), ..Default::default() };
+    let page = match conversation_blocks::source(state, session_id) {
+        // Replay selects only its newest bounded projection, including for OpenCode.
+        Ok(source) => native_slice_page(state, &snapshot, session, session_id, &query, &source),
+        Err(_) => timeline_value(state, &snapshot, session, session_id, &query),
+    }?.0;
     let all = page["items"]
         .as_array()
         .ok_or_else(|| ApiError::internal("the timeline has no items"))?;
-    let native_latest = all
+    let native_sequences = all
         .iter()
         .filter(|item| {
             item["id"]
                 .as_str()
                 .is_some_and(|id| id.starts_with("timeline-entry/native-"))
         })
-        .filter_map(|item| item["sequence"].as_u64())
-        .max()
-        .unwrap_or(0);
+        .filter_map(|item| item["sequence"].as_u64());
+    let native_latest = native_sequences.clone().max().unwrap_or(0);
+    let native_oldest = native_sequences.min();
     let local_latest = state
         .store
         .local_observations_tail(1)
@@ -5451,14 +5690,7 @@ fn conversation_read_now_unbounded(
         .any(|id| !items.iter().any(|item| item["id"].as_str() == Some(id)))
         || (all.len() == 200
             && position.is_some_and(|(_, _, native)| {
-                all.iter()
-                    .find(|item| {
-                        item["id"]
-                            .as_str()
-                            .is_some_and(|id| id.starts_with("timeline-entry/native-"))
-                    })
-                    .and_then(|item| item["sequence"].as_u64())
-                    .is_some_and(|first| first > native)
+                native_oldest.is_some_and(|first| first > native)
             }))
     {
         return Err(ApiError {
@@ -14812,6 +15044,263 @@ mission "example/zero-run" state="ready" {
                 .all(|item| item["body"]["text"].is_null()),
             "{next:#}"
         );
+    }
+
+    fn page_test_source(path: &Path, session_id: &str) -> crate::external_sessions::ExternalSession {
+        crate::external_sessions::ExternalSession {
+            id: session_id.into(),
+            revision: "test-revision".into(),
+            driver: crate::external_sessions::ExternalDriver::Codex,
+            native_id: "paging-test".into(),
+            transcript: path.to_owned(),
+            codex_home: None,
+            cwd: None,
+            title: None,
+            started_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            process: None,
+        }
+    }
+
+    #[test]
+    fn managed_native_limit_one_pages_preserve_cross_source_ties() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "native-ties");
+        let owner = "agent/native-ties";
+        let incarnation = "native-ties-one";
+        let session_id = super::managed_session_id(owner, incarnation);
+        // The fourth claim's two message entries have sequences 16 and 17, exactly
+        // those of a native message beginning at byte zero and its first content part.
+        for number in 0..3 {
+            state.store.append_claim(&ClaimInput {
+                subject: owner.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(owner.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("runtime_id".into(), json!("native-ties-runtime")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("terminal".into(), json!(true)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("native-ties-runtime-{number}")),
+            }).unwrap();
+        }
+        let claim = state.store.append_claim(&ClaimInput {
+            subject: "message/native-ties".into(),
+            kind: "message.sent".into(),
+            actor: Some("person/alex".into()),
+            fields: BTreeMap::from([
+                ("from".into(), json!("person/alex")),
+                ("to".into(), json!(owner)),
+                ("session_id".into(), json!(session_id)),
+                ("content".into(), json!("Small Talk message")),
+                ("status".into(), json!("sent")),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        }).unwrap();
+        assert_eq!(claim.store_index, 4);
+        let path = root.path().join("ties.jsonl");
+        std::fs::write(&path, format!("{}\n", json!({
+            "type":"response_item", "timestamp":client_timestamp(claim.accepted_at_unix_ms),
+            "payload":{"type":"message", "role":"assistant", "id":"native-tie",
+                "content":[{"type":"output_text", "text":"Native message"}]}
+        }))).unwrap();
+        let source = page_test_source(&path, &session_id);
+        let snapshot = new_client_snapshot(&state);
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let native = conversation_blocks::read(&source, &session, &session_id).unwrap();
+        let messages = native_session_messages(&state, &snapshot, &session_id).unwrap();
+        assert_eq!(native[0]["sequence"], messages[1]["sequence"]);
+        assert_eq!(native[0]["timestamp"], messages[1]["timestamp"]);
+        let expected = vec![messages[0].clone(), native[1].clone(),
+            messages[1].clone(), native[0].clone()];
+        let mut query = ClientListQuery { limit: Some(1), ..Default::default() };
+        let mut walked = Vec::new();
+        loop {
+            let page = native_slice_page(&state, &snapshot, &session, &session_id, &query, &source)
+                .unwrap().0;
+            walked.extend(page["items"].as_array().unwrap().iter().cloned());
+            query.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+            if query.cursor.is_none() {
+                break;
+            }
+            assert!(walked.len() < expected.len());
+        }
+        assert_eq!(walked, expected);
+    }
+
+    #[test]
+    fn unmanaged_native_pages_use_sequence_order_and_reject_cursor_tampering() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "native-sequence-pages");
+        let session_id = "session/unmanaged-sequence-pages";
+        let path = root.path().join("sequence.jsonl");
+        // Setup headers are explicitly omitted; blank records instead become visible
+        // native-line-unreadable errors and would add thousands of legitimate pages.
+        let mut transcript = "{\"type\":\"session_meta\"}\n".repeat(4_096 - 3);
+        for (stamp, text) in [
+            ("2099-01-01T00:00:00Z", "first"),
+            ("2020-01-01T00:00:00Z", "second"),
+            ("2030-01-01T00:00:00Z", "third"),
+        ] {
+            transcript.push_str(&format!("{}\n", json!({
+                "type":"response_item", "timestamp":stamp,
+                "payload":{"type":"message", "role":"assistant", "id":text,
+                    "content":[{"type":"output_text", "text":text}]}
+            })));
+        }
+        std::fs::write(&path, transcript).unwrap();
+        let source = page_test_source(&path, session_id);
+        let snapshot = new_client_snapshot(&state);
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let mut query = ClientListQuery { limit: Some(1), ..Default::default() };
+        let first = native_slice_page(&state, &snapshot, &session, session_id, &query, &source)
+            .unwrap().0;
+        let encoded = first["page"]["next_cursor"].as_str().unwrap();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded.strip_prefix(NATIVE_PAGE_CURSOR_PREFIX).unwrap()).unwrap();
+        let original: Value = serde_json::from_slice(&bytes).unwrap();
+        for remove_mac in [false, true] {
+            let mut tampered = original.clone();
+            if remove_mac {
+                tampered.as_object_mut().unwrap().remove("mac");
+            } else {
+                tampered["position"]["expires_at_unix_ms"] =
+                    json!(client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS * 10));
+            }
+            let cursor = format!("{NATIVE_PAGE_CURSOR_PREFIX}{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(serde_json::to_vec(&tampered).unwrap()));
+            let error = native_slice_page(&state, &snapshot, &session, session_id,
+                &ClientListQuery { cursor: Some(cursor), ..Default::default() }, &source)
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::GONE);
+            assert_eq!(error.code, "page-cursor-expired");
+        }
+        let mut walked = first["items"].as_array().unwrap().clone();
+        query.cursor = Some(encoded.to_owned());
+        loop {
+            let page = native_slice_page(&state, &snapshot, &session, session_id, &query, &source)
+                .unwrap().0;
+            walked.extend(page["items"].as_array().unwrap().iter().cloned());
+            query.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+            if query.cursor.is_none() {
+                break;
+            }
+            assert!(walked.len() < 7);
+        }
+        assert!(walked.windows(2).all(|pair|
+            pair[0]["sequence"].as_u64().unwrap() > pair[1]["sequence"].as_u64().unwrap()));
+        let texts: Vec<_> = walked.iter().filter_map(|item| item["body"]["text"].as_str()).collect();
+        assert_eq!(texts, ["third", "second", "first"]);
+        assert_eq!(walked.last().unwrap()["type"], "truncation");
+        assert_eq!(walked.last().unwrap()["sequence"], 0);
+    }
+
+    #[test]
+    fn native_page_cursor_expires_after_in_place_transcript_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "native-replaced-pages");
+        let session_id = "session/external-replaced-pages";
+        let path = root.path().join("replaced.jsonl");
+        let record = |id: &str, text: &str, stamp: &str| json!({
+            "type":"response_item", "timestamp":stamp,
+            "payload":{"type":"message", "role":"assistant", "id":id,
+                "content":[{"type":"output_text", "text":text}]}
+        });
+        std::fs::write(&path, format!(
+            "{}\n{}\n{}\n",
+            record("one", "first", "2099-01-01T00:00:00Z"),
+            record("two", "second", "2030-01-01T00:00:00Z"),
+            record("three", "third", "2020-01-01T00:00:00Z"),
+        )).unwrap();
+        let source = page_test_source(&path, session_id);
+        let snapshot = new_client_snapshot(&state);
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let first = native_slice_page(&state, &snapshot, &session, session_id,
+            &ClientListQuery { limit: Some(1), ..Default::default() }, &source).unwrap().0;
+        let cursor = first["page"]["next_cursor"].as_str().unwrap().to_owned();
+        // Rewrite in place: same driver, native id, path and inode, different content.
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+        std::fs::write(&path, format!(
+            "{}\n", record("replaced", "replaced", "2099-01-01T00:00:00Z"),
+        )).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode_before,
+                "the replacement must keep the same inode");
+        }
+        let error = native_slice_page(&state, &snapshot, &session, session_id,
+            &ClientListQuery { cursor: Some(cursor), ..Default::default() }, &source)
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::GONE);
+        assert_eq!(error.code, "page-cursor-expired");
+        // A fresh page sequence reads the replaced transcript normally.
+        let fresh = native_slice_page(&state, &snapshot, &session, session_id,
+            &ClientListQuery { limit: Some(1), ..Default::default() }, &source).unwrap().0;
+        let texts: Vec<_> = fresh["items"].as_array().unwrap().iter()
+            .filter_map(|item| item["body"]["text"].as_str()).collect();
+        assert_eq!(texts, ["replaced"]);
+    }
+
+    #[test]
+    fn native_keyset_pages_exclude_newer_appends_between_pages() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "native-append-pages");
+        let session_id = "session/external-append-pages";
+        let path = root.path().join("append.jsonl");
+        let large_text = "paged chunk ".repeat(1_000);
+        let record = |number| json!({"type":"response_item","timestamp":"2026-10-06T12:00:00Z",
+            "payload":{"type":"message","role":"assistant","id":format!("entry-{number}"),
+            "content":[{"type":"output_text","text":format!("text-{number} {large_text}")}]}});
+        std::fs::write(&path, (0..5).map(|number| format!("{}\n", record(number))).collect::<String>()).unwrap();
+        let source = page_test_source(&path, session_id);
+        let snapshot = new_client_snapshot(&state);
+        let mut session = ClientSession::local(Some("person/alex")).unwrap();
+        session.conversation_blocks = true;
+        let mut expected = conversation_blocks::read(&source, &session, session_id).unwrap();
+        expected.reverse();
+        let mut query = ClientListQuery { limit: Some(3), ..Default::default() };
+        let mut walked = Vec::new();
+        let mut page_number = 0;
+        loop {
+            let page = native_slice_page(&state, &snapshot, &session, session_id, &query, &source).unwrap().0;
+            page_number += 1;
+            if page_number == 2 {
+                let reference = page["items"].as_array().unwrap().iter().flat_map(|entry|
+                    entry["body"]["blocks"].as_array().into_iter().flatten())
+                    .find_map(|block| block["continuation"]["ref"].as_str())
+                    .expect("the second page contains a large native block");
+                let chunk = tokio::runtime::Runtime::new().unwrap().block_on(
+                    conversation_blocks::chunk_local(&state, &session, session_id, reference, 0)
+                ).unwrap();
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(chunk["data"].as_str().unwrap()).unwrap();
+                let payload: Value = serde_json::from_slice(&decoded).unwrap();
+                assert!(payload.to_string().contains(&large_text));
+            }
+            walked.extend(page["items"].as_array().unwrap().iter().rev().cloned());
+            if walked.len() == 3 {
+                writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}", record(99)).unwrap();
+            }
+            query.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+            if query.cursor.is_none() { break; }
+            assert!(walked.len() < expected.len());
+        }
+        // Encrypted continuation refs use random nonces; compare complete entry identity/order.
+        let identities = |items: &[Value]| items.iter().map(|item|
+            (item["id"].clone(), item["sequence"].clone())).collect::<Vec<_>>();
+        assert_eq!(identities(&walked), identities(&expected));
     }
 
     #[test]
