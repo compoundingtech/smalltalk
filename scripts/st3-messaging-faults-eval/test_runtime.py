@@ -1,10 +1,12 @@
 """A runner without a user bus must not attempt transient systemd scopes."""
+import asyncio
 import importlib.machinery
 import importlib.util
 import os
 from pathlib import Path
 import socket
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -45,6 +47,41 @@ class ChannelReadinessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(result, card)
             else:
                 self.assertIsNone(result)
+
+    async def test_replacement_state_is_checked_after_the_card_await(self):
+        old = {"pid": 10, "start_ticks": 100, "argv": " driver omp-channel "}
+        child = {"pid": 20, "start_ticks": 200, "argv": " driver omp-channel "}
+        baseline = {"subject": "agent/eval/fault-probe", "component": "delivery",
+                    "transport": "omp-channel", "ready": True, "incarnation": "seat",
+                    "pid": 10, "start_ticks": 100, "epoch": 1,
+                    "token_sha256": "old", "sequence": 1}
+        ready = {**baseline, "pid": 20, "start_ticks": 200, "epoch": 2,
+                 "token_sha256": "new", "sequence": 2}
+        for transition in ("unchanged", "not-ready", "dead", "replaced"):
+            with self.subTest(transition=transition):
+                state = {"processes": [child], "reports": [baseline, ready]}
+                node = SimpleNamespace(seats=lambda: state["processes"])
+                entered, release = asyncio.Event(), asyncio.Event()
+                async def delayed_card(_):
+                    entered.set()
+                    await release.wait()
+                    return {"incarnation_id": "seat", "delivery": {"state": "current"}}
+                with patch.object(runner, "current_channel", delayed_card), \
+                     patch.object(runner, "admitted_reports", lambda _: state["reports"]):
+                    task = asyncio.create_task(runner.current_replacement_channel(node, baseline, old, "seat"))
+                    await entered.wait()
+                    if transition == "not-ready":
+                        state["reports"].append({**ready, "sequence": 3, "ready": False})
+                    elif transition == "dead":
+                        state["processes"] = []
+                    elif transition == "replaced":
+                        state["processes"] = [{**child, "pid": 30, "start_ticks": 300}]
+                    release.set()
+                    result = await task
+                if transition == "unchanged":
+                    self.assertEqual(ready, result["report"])
+                else:
+                    self.assertIsNone(result)
 
     async def test_absent_agent_value_is_not_ready(self):
         node = AsyncMock()

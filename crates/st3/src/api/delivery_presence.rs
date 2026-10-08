@@ -101,9 +101,9 @@ pub(crate) fn record(recipient: &str, report: &str) {
 
 /// Title updates cannot establish delivery readiness. They can report the outer driver's
 /// attachment check, including a missing plugin for which no delivery process exists.
-pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) {
+pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) -> bool {
     let Ok(report) = serde_json::from_str::<Report>(raw) else {
-        return;
+        return false;
     };
     let target = if fence.component == "delivery" {
         if report.transport.as_deref() != Some("claude-channel")
@@ -115,7 +115,7 @@ pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) {
     } else if report.transport.as_deref() == Some("claude-channel") {
         &presence().monitors
     } else {
-        return;
+        return false;
     };
     if let Ok(mut beats) = target.lock() {
         beats.insert(
@@ -126,7 +126,9 @@ pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) {
                 fence: Some(fence.clone()),
             },
         );
+        return true;
     }
+    false
 }
 
 pub(super) fn attachment(recipient: &str, incarnation: &str) -> Option<crate::mailbox::Fence> {
@@ -370,6 +372,27 @@ mod tests {
     use super::*;
 
     const DAEMON: Option<&str> = Some("new");
+
+    #[test]
+    fn malformed_report_does_not_replace_a_beat_or_prove_recording() {
+        let recipient = "agent/malformed-report-control";
+        let mut fence = crate::mailbox::Fence::new(recipient, "current", "delivery");
+        fence.epoch = 1;
+        assert!(record_fenced(
+            &fence,
+            &json!({"transport":"omp-channel", "ready":false}).to_string()
+        ));
+        let mut malformed = fence.clone();
+        malformed.epoch = 2;
+        assert!(!record_fenced(
+            &malformed,
+            &json!({"transport":"omp-channel", "ready":true, "image":42}).to_string()
+        ));
+        let beats = presence().beats.lock().unwrap();
+        let beat = beats.get(recipient).unwrap();
+        assert_eq!(beat.report.ready, Some(false));
+        assert_eq!(beat.fence.as_ref().unwrap().epoch, 1);
+    }
 
     #[test]
     fn attachment_requires_current_initialized_delivery_and_not_a_title_report() {
