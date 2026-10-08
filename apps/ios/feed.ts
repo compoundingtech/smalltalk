@@ -83,6 +83,10 @@ export class Feed {
   private glasses: { handlers: GlassesHandlers; window?: CollectionWindow } | undefined;
   /** Windows (and the glasses) st stopped sending: how often they failed, and the timer to ask again. */
   private retries: Partial<Record<FeedWindow | typeof GLASSES, { failures: number; timer?: ReturnType<typeof setTimeout> }>> = {};
+  // A reason st gave for a window it cannot serve yet, said only once it has lasted a moment: a write
+  // briefly revokes a source's readiness, and that blip is not worth a message.
+  private reports: Partial<Record<FeedWindow, ReturnType<typeof setTimeout>>> = {};
+  private readonly reportAfterMs: number;
   private probe: ReturnType<typeof setInterval> | undefined;
   /** When a frame last arrived on the open socket. */
   private lastFrameAt = Date.now();
@@ -93,7 +97,8 @@ export class Feed {
   private readonly newActionId: () => string;
   private readonly retryDelaysMs: readonly number[];
 
-  constructor(client: Client, handlers: FeedHandlers, foreground: Foreground, newActionId: () => string, retryDelaysMs: readonly number[] = RETRY_DELAYS_MS) {
+  constructor(client: Client, handlers: FeedHandlers, foreground: Foreground, newActionId: () => string, retryDelaysMs: readonly number[] = RETRY_DELAYS_MS, reportAfterMs = 1000) {
+    this.reportAfterMs = reportAfterMs;
     this.client = client;
     this.handlers = handlers;
     this.foreground = foreground;
@@ -158,6 +163,8 @@ export class Feed {
     this.stopProbing();
     for (const retry of Object.values(this.retries)) clearTimeout(retry?.timer);
     this.retries = {};
+    for (const report of Object.values(this.reports)) clearTimeout(report);
+    this.reports = {};
     this.terminal?.socketLost();
     open?.close();
   }
@@ -203,6 +210,7 @@ export class Feed {
   private loaded(name: FeedWindow | typeof GLASSES): void {
     clearTimeout(this.retries[name]?.timer);
     delete this.retries[name];
+    if (name !== GLASSES) { clearTimeout(this.reports[name]); delete this.reports[name]; }
   }
 
   private async connect(): Promise<void> {
@@ -274,7 +282,11 @@ export class Feed {
       else if (frame.id === GLASSES && this.glasses) { this.glasses.window = undefined; this.stream?.subscribeGlasses(GLASSES); }
       else if (frame.id in FEED_WINDOWS) {
         const name = frame.id as FeedWindow;
-        if (this.retryLater(name, () => this.subscribeWindow(name)) && frame.message) this.handlers.onWindowError?.(name, `${plainMessage(frame.code, frame.message)} · trying again`);
+        if (this.retryLater(name, () => this.subscribeWindow(name)) && frame.message) {
+          const text = `${plainMessage(frame.code, frame.message)} · trying again`;
+          clearTimeout(this.reports[name]);
+          this.reports[name] = setTimeout(() => { delete this.reports[name]; this.handlers.onWindowError?.(name, text); }, this.reportAfterMs);
+        }
       }
     } else if (frame.kind === 'screen') {
       if (id === TERMINAL) this.terminal?.screen(frame.value);

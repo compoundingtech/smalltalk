@@ -26,7 +26,7 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   // recover on the held subscription, canceling the pending resubscription timer.
   const { client, sockets } = fakeClient();
   const { seen, handlers } = watch();
-  const feed = new Feed(client, handlers, new ForegroundGate('active'), () => 'action/test', [100]);
+  const feed = new Feed(client, handlers, new ForegroundGate('active'), () => 'action/test', [100], 40);
   await settle();
   const socket = sockets[0];
   socket.frame({ kind: 'snapshot', id: 'agents', collection: 'agents', snapshot: snapshot(1), items: [agent('agent/amber'), agent('agent/blue')], order: ['agent/amber', 'agent/blue'], has_more: false });
@@ -35,14 +35,23 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   socket.frame(pending);
   socket.frame(pending);
   assert.deepEqual(seen.windows.agents.ids, ['agent/amber', 'agent/blue'], 'resync preserves the last delivered rows');
-  assert.equal(seen.errors.length, 1, 'one issue per unavailable interval');
+  assert.equal(seen.errors.length, 0, 'a moment of unavailability is not reported yet');
+  await settle(60);
+  assert.equal(seen.errors.length, 1, 'one issue per unavailable interval, once it lasted');
   assert.match(seen.errors[0], /agents: .*held rows are stale/);
   socket.frame({ kind: 'changes', id: 'agents', collection: 'agents', snapshot: snapshot(2), upserts: [agent('agent/coral')], removes: ['agent/amber'], order: ['agent/coral', 'agent/blue'], has_more: false });
   assert.deepEqual(seen.windows.agents.ids, ['agent/coral', 'agent/blue']);
   await settle(170);
   assert.equal(socket.sent.length, before, 'Ready changes cancel resubscription');
   socket.frame(pending);
+  await settle(60);
   assert.equal(seen.errors.length, 2, 'a later unavailable interval is reported again');
+  // A blip a write causes (unavailable, then changes at once) is never reported.
+  socket.frame({ kind: 'changes', id: 'agents', collection: 'agents', snapshot: snapshot(3), upserts: [agent('agent/coral')], removes: [], order: ['agent/coral', 'agent/blue'], has_more: false });
+  socket.frame(pending);
+  socket.frame({ kind: 'changes', id: 'agents', collection: 'agents', snapshot: snapshot(4), upserts: [agent('agent/coral')], removes: [], order: ['agent/coral', 'agent/blue'], has_more: false });
+  await settle(60);
+  assert.equal(seen.errors.length, 2, 'a blip that recovered at once says nothing');
   feed.close();
 }
 

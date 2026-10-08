@@ -37,6 +37,9 @@ const QUIET_BEFORE_PING: Duration = Duration::from_secs(10);
 const PONG_WAIT: Duration = Duration::from_secs(8);
 
 /// The waits between attempts to reach st again, reset once st answers.
+/// How long a window must stay unserved before st's reason for it is reported.
+const REPORT_AFTER: Duration = Duration::from_secs(1);
+
 const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -394,6 +397,9 @@ async fn connected(
     // A window st stopped (its first read failed) is asked for again after a backoff, so a list
     // never stays stale under a live connection.
     let mut window_retries = WindowRetries::default();
+    // Reasons st gave for a window it cannot serve yet, said once they have lasted a moment: a
+    // write briefly revokes a source's readiness, and that blip is not worth a message.
+    let mut pending_reports: Vec<(Window, Instant, String)> = Vec::new();
     if following.is_some() {
         match follow(client, stream, updates, following).await {
             Ok(()) => {}
@@ -407,6 +413,7 @@ async fn connected(
             .filter_map(|current| current.retry_at)
             .min();
         let window_at = window_retries.next();
+        let report_at = pending_reports.iter().map(|(_, at, _)| *at).min();
         tokio::select! {
             _ = probe.tick() => {
                 let quiet = heard.quiet_for();
@@ -444,6 +451,7 @@ async fn connected(
                         let Some(window) = Window::from_id(&id) else { continue };
                         *failures = 0;
                         window_retries.loaded(window);
+                        pending_reports.retain(|(pending, _, _)| *pending != window);
                         let rows = windows.entry(window).or_default();
                         rows.clear();
                         rows.extend(items.into_iter().map(|item| (item.header().id.clone(), item)));
@@ -454,6 +462,7 @@ async fn connected(
                     CollectionEvent::Changes { id, snapshot, upserts, removes, order, has_more } => {
                         let Some(window) = Window::from_id(&id) else { continue };
                         window_retries.loaded(window);
+                        pending_reports.retain(|(pending, _, _)| *pending != window);
                         let rows = windows.entry(window).or_default();
                         for id in removes {
                             rows.remove(&id);
@@ -483,9 +492,7 @@ async fn connected(
                             let first = window_retries.failed(window, Instant::now());
                             if first && let Some(message) = message {
                                 let message = st3_client::plain_message(code.as_ref(), &message);
-                                if updates.send(Update::WindowFailed(window, message)).is_err() {
-                                    return Ended::Closed;
-                                }
+                                pending_reports.push((window, Instant::now() + REPORT_AFTER, message));
                             }
                         }
                     }
@@ -596,6 +603,23 @@ async fn connected(
             () = tokio::time::sleep_until(retry_at.unwrap_or_else(Instant::now)), if retry_at.is_some() => {
                 if let Err(error) = follow(client, stream, updates, following).await {
                     return Ended::Dropped(error.to_string());
+                }
+            }
+            () = tokio::time::sleep_until(report_at.unwrap_or_else(Instant::now)), if report_at.is_some() => {
+                let now = Instant::now();
+                let mut due = Vec::new();
+                pending_reports.retain(|(window, at, message)| {
+                    if *at <= now {
+                        due.push((*window, message.clone()));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for (window, message) in due {
+                    if updates.send(Update::WindowFailed(window, message)).is_err() {
+                        return Ended::Closed;
+                    }
                 }
             }
             () = tokio::time::sleep_until(window_at.unwrap_or_else(Instant::now)), if window_at.is_some() => {
