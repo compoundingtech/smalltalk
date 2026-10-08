@@ -289,7 +289,7 @@
               "cursor": {
                 "blinking": true,
                 "column": 0,
-                "row": 4,
+                "row": 5,
                 "style": "block",
                 "visible": true
               },
@@ -351,11 +351,25 @@
                   ],
                   "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g",
                   "truncated": false,
-                  "wrapped": false
+                  "wrapped": true
                 },
                 {
                   "redacted": false,
                   "row": 4,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 1,
+                      "text": "ot 1."
+                    }
+                  ],
+                  "text": "ot 1.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
                   "runs": [],
                   "text": "",
                   "truncated": false,
@@ -387,7 +401,7 @@
               "cursor": {
                 "blinking": true,
                 "column": 0,
-                "row": 5,
+                "row": 6,
                 "style": "block",
                 "visible": true
               },
@@ -449,11 +463,25 @@
                   ],
                   "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g",
                   "truncated": false,
-                  "wrapped": false
+                  "wrapped": true
                 },
                 {
                   "redacted": false,
                   "row": 4,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 1,
+                      "text": "ot 1."
+                    }
+                  ],
+                  "text": "ot 1.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
                   "runs": [
                     {
                       "cells": 33,
@@ -467,7 +495,7 @@
                 },
                 {
                   "redacted": false,
-                  "row": 5,
+                  "row": 6,
                   "runs": [],
                   "text": "",
                   "truncated": false,
@@ -499,7 +527,7 @@
               "cursor": {
                 "blinking": true,
                 "column": 16,
-                "row": 5,
+                "row": 6,
                 "style": "block",
                 "visible": true
               },
@@ -561,11 +589,25 @@
                   ],
                   "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g",
                   "truncated": false,
-                  "wrapped": false
+                  "wrapped": true
                 },
                 {
                   "redacted": false,
                   "row": 4,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 1,
+                      "text": "ot 1."
+                    }
+                  ],
+                  "text": "ot 1.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
                   "runs": [
                     {
                       "cells": 33,
@@ -579,7 +621,7 @@
                 },
                 {
                   "redacted": false,
-                  "row": 5,
+                  "row": 6,
                   "runs": [
                     {
                       "cells": 5,
