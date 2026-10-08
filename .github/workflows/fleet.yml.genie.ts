@@ -203,6 +203,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       'timeout-minutes': 20,
       steps: [
         ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')),
+        { name: 'Check frozen workspace dependency license coverage', run: 'python3 scripts/ci-fractal-web-licenses-test && python3 scripts/ci-fractal-web-licenses --check-lockfile' },
         nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && python3 scripts/ci-fractal-web-test && genie --check'] }),
         { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
         ...buildSnapshotSave,
