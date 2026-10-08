@@ -11801,6 +11801,99 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The newest eligible local driver receipt after this exact check's request in writer
+    /// sequence/position order. The same statement reads current SystemLocal starts and
+    /// legacy admitted starts. A local row's after_store_index places it after that claim;
+    /// this is local log ordering, not the driver's original writer/deadline proof.
+    /// Multiple launches cannot bind a no-incarnation driver exit to the current process.
+    pub(crate) fn mechanical_gate_exit_receipt(
+        &self,
+        requested: &ClaimRecord,
+    ) -> Result<Option<(ClaimRecord, Option<String>)>> {
+        smallclaims::touched::note_read(|| requested.subject.clone());
+        smallclaims::touched::note_read(|| "kind:record.repaired".into());
+        if requested.origin != self.origin() {
+            return Ok(None);
+        }
+        let request_position = smallclaims::store::canonical::position_sql("request");
+        let launch_position = smallclaims::store::canonical::position_sql("created");
+        let exit_position = smallclaims::store::canonical::position_sql("claims");
+        let connection = self.readers.get();
+        let found = connection
+            .prepare_cached(&canonical_sql(&format!(
+                "WITH current_request AS MATERIALIZED (
+                   SELECT request.subject, request.batch_id, request.store_index,
+                          request_batch.replica_sequence AS sequence,
+                          {request_position} AS position
+                   FROM claims request JOIN batches request_batch ON request_batch.id=request.batch_id
+                   WHERE request.id=?1 AND request.subject=?2 AND request.kind='gate.requested'
+                     AND request.origin=?3 AND request_batch.origin=?3
+                     AND NOT EXISTS (SELECT 1 FROM replica_records repaired
+                       WHERE repaired.claim_id=request.id AND repaired.state='repaired')
+                 ), legacy_launches AS MATERIALIZED (
+                   SELECT json_extract(created.body, '$.fields.incarnation_id') AS incarnation,
+                          json_extract(created.body, '$.fields.runtime_id') AS runtime_id
+                   FROM claims created JOIN batches launch_batch ON launch_batch.id=created.batch_id
+                     JOIN current_request
+                   WHERE created.subject=?2 AND created.kind='runtime.action.succeeded'
+                     AND created.actor IS NULL
+                     AND created.origin=?3 AND launch_batch.origin=?3
+                     AND json_extract(created.body, '$.fields.action')='start'
+                     AND (launch_batch.replica_sequence, {launch_position})
+                         > (current_request.sequence, current_request.position)
+                     AND (launch_batch.replica_sequence<>current_request.sequence
+                          OR created.batch_id=current_request.batch_id)
+                     AND NOT EXISTS (SELECT 1 FROM replica_records repaired
+                       WHERE repaired.claim_id=created.id AND repaired.state='repaired')
+                   ORDER BY CANONICAL_DESC(created) LIMIT 2
+                 ), local_launches AS MATERIALIZED (
+                   SELECT json_extract(local.body, '$.fields.incarnation_id') AS incarnation,
+                          json_extract(local.body, '$.fields.runtime_id') AS runtime_id
+                   FROM local_observations local JOIN current_request
+                   WHERE local.subject=?2 AND local.kind='runtime.action.succeeded'
+                     AND local.actor IS NULL
+                     AND json_extract(local.body, '$.fields.action')='start'
+                     AND local.after_store_index>=current_request.store_index
+                   ORDER BY local.id DESC LIMIT 2
+                 ), launches AS MATERIALIZED (
+                   SELECT incarnation, runtime_id FROM legacy_launches
+                   UNION ALL SELECT incarnation, runtime_id FROM local_launches
+                 )
+                 SELECT {CLAIM_COLUMNS},
+                        (SELECT incarnation FROM launches LIMIT 1),
+                        (SELECT COUNT(*) FROM launches),
+                        (SELECT runtime_id FROM launches LIMIT 1)
+                 FROM claims JOIN batches ON batches.id=claims.batch_id JOIN current_request
+                 WHERE claims.subject=?2 AND claims.kind='runtime.observed' AND claims.actor=?2
+                   AND claims.origin=?3 AND batches.origin=?3
+                   AND (batches.replica_sequence, {exit_position})
+                       > (current_request.sequence, current_request.position)
+                   AND (batches.replica_sequence<>current_request.sequence
+                        OR claims.batch_id=current_request.batch_id)
+                   AND NOT EXISTS (SELECT 1 FROM replica_records repaired
+                     WHERE repaired.claim_id=claims.id AND repaired.state='repaired')
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1"
+            )))?
+            .query_row(
+                params![requested.id, requested.subject, self.origin()],
+                |row| {
+                    Ok((
+                        claim_from_row(row)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, u64>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(found
+            .filter(|(_, _, launches, runtime_id)| {
+                *launches <= 1 && runtime_id.as_deref()
+                    .is_none_or(|runtime_id| runtime_id == requested.subject.replace('/', "."))
+            })
+            .map(|(receipt, incarnation, _, _)| (receipt, incarnation)))
+    }
+
     /// Gate runners are launched directly rather than through desired declarations. Their
     /// owner is durable in the request; older mechanical/LLM requests encode it in the subject.
     pub(crate) fn mission_gate_runners(&self) -> Result<Vec<MissionGateRunner>> {
@@ -27690,70 +27783,117 @@ fn project_replicated_base_claims_with_progress(
     transaction: &Transaction<'_>,
     progress: &mut dyn FnMut(ReplayProgress),
 ) -> Result<(), St3Error> {
-    let mut statement = transaction
-        .prepare(&canonical_sql(
-            "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
-                    claims.origin, claims.actor, claims.body, claims.predecessors,
-                    claims.accepted_at_unix_ms
-             FROM claims JOIN batches ON batches.id=claims.batch_id
-             WHERE NOT EXISTS (
+    const BATCH: usize = 256;
+    // Event positions do not consume bodies or canonical fold order. Preserve the same
+    // admitted/repaired and case-sensitive glass exclusions without decoding unrelated
+    // observation, message or work bodies just to insert their positions.
+    transaction.execute(
+        "INSERT OR IGNORE INTO event_positions(store_index, subject)
+         SELECT claims.store_index, claims.subject FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE substr(claims.subject,1,6) <> 'glass/' COLLATE BINARY
+           AND NOT EXISTS (SELECT 1 FROM replica_records
+               WHERE replica_records.claim_id=claims.id AND replica_records.state='repaired')",
+        [],
+    ).map_err(internal)?;
+    let selection = "FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.kind IN ('intent.desired','doc.bound','mission.published')
+               AND NOT EXISTS (
                  SELECT 1 FROM replica_records
                  WHERE replica_records.claim_id=claims.id
                    AND replica_records.state='repaired'
-             )
-             ORDER BY CANONICAL_ASC(claims)",
-        ))
+             )";
+    // Sort selected IDs once. Re-evaluating the canonical key for every body page
+    // would scan/sort the remaining selected history once per page. This temporary
+    // order contains no bodies and lives only on this serialized writer connection.
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS heal_replay_base_order(
+             ordinal INTEGER PRIMARY KEY, claim_id TEXT NOT NULL);
+         DELETE FROM temp.heal_replay_base_order;",
+        )
         .map_err(internal)?;
-    // Read every claim before projecting any: rolling back one claim's savepoint aborts a
-    // statement that is still stepping, which would fail the whole replay.
-    let claims = statement
-        .query_map([], claim_from_row)
-        .map_err(internal)?
-        .collect::<Result<Vec<_>, _>>()
+    transaction
+        .execute(
+            &canonical_sql(&format!(
+                "INSERT INTO temp.heal_replay_base_order(claim_id)
+             SELECT claims.id {selection} ORDER BY CANONICAL_ASC(claims)"
+            )),
+            [],
+        )
         .map_err(internal)?;
-    drop(statement);
+    let total: u64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(ordinal),0) FROM temp.heal_replay_base_order",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(internal)?;
     clear_quarantined_claims_tx(transaction, "projection:base")?;
-    let total = claims.len() as u64;
     progress(ReplayProgress {
         phase: "full-replay/base-claims",
         processed: Some(0),
         total: Some(total),
     });
-    for (position, claim) in claims.into_iter().enumerate() {
-        insert_event(
-            transaction,
-            claim.store_index,
-            &claim.kind,
-            &claim.subject,
-            &claim.body,
-        )
-        .map_err(internal)?;
-        project_claim_isolated_tx(transaction, "projection:base", &claim, || {
-            match claim.kind.as_str() {
-                "intent.desired" => {
-                    let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
-                        .map_err(internal)?;
-                    select_replicated_desired(transaction, &claim, &desired)?;
-                }
-                "doc.bound" => select_replicated_document(transaction, &claim, claim.store_index)?,
-                "mission.published" => {
-                    select_replicated_mission(transaction, &claim, claim.store_index)?
-                }
-                _ => {}
-            }
-            Ok(())
-        })?;
-        let processed = position as u64 + 1;
-        if processed.is_multiple_of(1000) || processed == total {
-            progress(ReplayProgress {
-                phase: "full-replay/base-claims",
-                processed: Some(processed),
-                total: Some(total),
-            });
+    let mut cursor: u64 = 0;
+    let mut processed = 0;
+    loop {
+        // Finish/drop the read before any per-claim savepoint can roll back. Bound retained
+        // bodies, and use the same total canonical key as the full fold, including ties.
+        let claims = {
+            let mut statement = transaction
+                .prepare_cached(BASE_REPLAY_PAGE_SQL)
+                .map_err(internal)?;
+            statement
+                .query_map(params![cursor, BATCH as i64], |row| {
+                    Ok((claim_from_row(row)?, row.get::<_, u64>(10)?))
+                })
+                .map_err(internal)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(internal)?
+        };
+        if claims.is_empty() {
+            break;
         }
+        cursor = claims.last().expect("nonempty replay page").1;
+        for (claim, _) in claims {
+            project_claim_isolated_tx(transaction, "projection:base", &claim, || {
+                match claim.kind.as_str() {
+                    "intent.desired" => {
+                        let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
+                            .map_err(internal)?;
+                        select_replicated_desired(transaction, &claim, &desired)?;
+                    }
+                    "doc.bound" => {
+                        select_replicated_document(transaction, &claim, claim.store_index)?
+                    }
+                    "mission.published" => {
+                        select_replicated_mission(transaction, &claim, claim.store_index)?
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })?;
+            processed += 1;
+        }
+        progress(ReplayProgress {
+            phase: "full-replay/base-claims",
+            processed: Some(processed),
+            total: Some(total),
+        });
     }
+    transaction
+        .execute("DELETE FROM temp.heal_replay_base_order", [])
+        .map_err(internal)?;
     owned_sets::project_tx(transaction)
 }
+
+const BASE_REPLAY_PAGE_SQL: &str =
+    "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
+            claims.origin, claims.actor, claims.body, claims.predecessors,
+            claims.accepted_at_unix_ms, ordering.ordinal
+     FROM temp.heal_replay_base_order ordering
+     JOIN claims ON claims.id=ordering.claim_id
+     WHERE ordering.ordinal>?1 ORDER BY ordering.ordinal LIMIT ?2";
 
 /// Project one replicated claim on its own. A claim whose projection fails is rolled back alone
 /// and recorded as an unhealthy projection that names it, so one claim a build cannot project
@@ -34307,11 +34447,11 @@ agent "test/empty" { command "true" }
                 .iter()
                 .map(|event| event.processed.unwrap())
                 .collect::<Vec<_>>(),
-            [0, 1000, 2000, 2501]
+            [0]
         );
         assert!(claims.iter().all(|event| event.frontier == 0
             && event.target == target
-            && event.total == Some(2501)));
+            && event.total == Some(0)));
         let committed = events.last().unwrap();
         assert_eq!(committed.phase, "projection-committed");
         assert_eq!(committed.frontier, target);
@@ -34327,6 +34467,261 @@ agent "test/empty" { command "true" }
                 .graph_digest,
             digest
         );
+    }
+
+    #[test]
+    fn heal_invalidation_point_is_read_only_and_stays_at_one_committed_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("graph.db"), "node").unwrap());
+        store.apply_internal(&simple("true"), "heal/point").unwrap();
+        let read = || {
+            let statements = STATEMENTS_RUN.with(std::cell::Cell::get);
+            let point = store.replication_change_point().unwrap();
+            (
+                point,
+                STATEMENTS_RUN.with(std::cell::Cell::get) - statements,
+            )
+        };
+        let (first, small) = read();
+        {
+            let mut connection = store.connection.write();
+            let tx = connection.transaction().unwrap();
+            tx.execute("UPDATE desired SET revision='rolled-back'", [])
+                .unwrap();
+            tx.rollback().unwrap();
+        }
+        assert_eq!(
+            read().0,
+            first,
+            "rolled-back graph changes never invalidate committed answers"
+        );
+        store
+            .read_snapshot(|_| {
+                let before = store.replication_change_point()?;
+                let writer = store.clone();
+                std::thread::spawn(move || {
+                    let mut connection = writer.connection.write();
+                    let tx = connection.transaction().unwrap();
+                    for number in 0..3000 {
+                        append_claim_record_tx(
+                            &tx,
+                            "node",
+                            "agent/growth",
+                            "harness.observed",
+                            None,
+                            &json!({"fields":{"sequence":number}}),
+                            &[],
+                            None,
+                        )
+                        .unwrap();
+                    }
+                    tx.execute("UPDATE desired SET revision='committed-change'", [])
+                        .unwrap();
+                    tx.commit().unwrap();
+                })
+                .join()
+                .unwrap();
+                assert_eq!(
+                    store.replication_change_point()?,
+                    before,
+                    "point cannot mix the live graph generation with a preceding source cut"
+                );
+                Ok(())
+            })
+            .unwrap();
+        let (grown, large) = read();
+        assert!(grown.0 > first.0 && grown.1 > first.1);
+        assert_eq!(
+            small, large,
+            "invalidation does not enumerate peers, claims, envelopes or graphs"
+        );
+        assert_eq!(
+            read().0,
+            grown,
+            "the point read writes no observation or repair"
+        );
+    }
+
+    #[test]
+    fn base_replay_batches_selected_bodies_and_preserves_event_and_quarantine_answers() {
+        let store = Store::open_memory("node").unwrap();
+        let mut connection = store.connection.write();
+        let tx = connection.transaction().unwrap();
+        for number in 0..263 {
+            let subject = format!("exec/base-{number}");
+            append_claim_record_tx(
+                &tx,
+                "node",
+                &subject,
+                "intent.desired",
+                None,
+                &json!({"subject":subject,"kind":"exec","desired":{"number":number}}),
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        let malformed = append_claim_record_tx(
+            &tx,
+            "node",
+            "exec/bad",
+            "intent.desired",
+            None,
+            &json!({}),
+            &[],
+            None,
+        )
+        .unwrap();
+        let repaired = append_claim_record_tx(
+            &tx,
+            "node",
+            "exec/repaired",
+            "intent.desired",
+            None,
+            &json!({"subject":"exec/repaired","kind":"exec","desired":{}}),
+            &[],
+            None,
+        )
+        .unwrap();
+        tx.execute("INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,raw,state,claim_id,updated_at_unix_ms)
+            VALUES ('record/repaired','node',1,'test',0,X'','repaired',?1,'1')", [&repaired.id]).unwrap();
+        for number in 0..1500 {
+            append_claim_record_tx(
+                &tx,
+                "node",
+                "agent/events",
+                "harness.observed",
+                None,
+                &json!({"fields":{"number":number,"padding":"x".repeat(1024)}}),
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        for subject in ["glass/hidden", "Glass/visible", "glass-visible"] {
+            append_claim_record_tx(
+                &tx,
+                "node",
+                subject,
+                "harness.observed",
+                None,
+                &json!({"fields":{}}),
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        // Numeric time and batch/position ties cross more than one decode page.
+        tx.execute("UPDATE claims SET accepted_at_unix_ms='1'", [])
+            .unwrap();
+        let expected = tx.prepare("SELECT claims.store_index, claims.subject FROM claims JOIN batches ON batches.id=claims.batch_id
+            WHERE substr(claims.subject,1,6)<>'glass/' COLLATE BINARY
+            AND claims.id<>?1 ORDER BY claims.store_index").unwrap()
+            .query_map([&repaired.id], |row| Ok((row.get::<_,u64>(0)?,row.get::<_,String>(1)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let mut progress = Vec::new();
+        project_replicated_base_claims_with_progress(&tx, &mut |stage| progress.push(stage)).unwrap();
+        assert_eq!(
+            progress
+                .iter()
+                .map(|stage| stage.processed.unwrap())
+                .collect::<Vec<_>>(),
+            [0, 256, 264]
+        );
+        assert!(progress.iter().all(|stage| stage.total == Some(264)));
+        let actual = tx
+            .prepare("SELECT store_index,subject FROM event_positions ORDER BY store_index")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM desired", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            263
+        );
+        let quarantined = tx
+            .query_row(
+                "SELECT aggregate FROM projection_health WHERE aggregate LIKE 'projection:base:%'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, format!("projection:base:{}", malformed.id));
+        // Repeating the same fold retains the same event positions and quarantine identity.
+        project_replicated_base_claims_with_progress(&tx, &mut |_| {}).unwrap();
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM event_positions", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            expected.len()
+        );
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn base_replay_body_page_work_does_not_grow_with_selected_order_size() {
+        let store = Store::open_memory("node").unwrap();
+        let mut connection = store.connection.write();
+        let tx = connection.transaction().unwrap();
+        tx.execute_batch(
+            "CREATE TEMP TABLE heal_replay_base_order(
+            ordinal INTEGER PRIMARY KEY, claim_id TEXT NOT NULL)",
+        )
+        .unwrap();
+        let mut costs = Vec::new();
+        for (start, end) in [(0, 512), (512, 4096)] {
+            for number in start..end {
+                let subject = format!("exec/page-{number}");
+                let claim = append_claim_record_tx(
+                    &tx,
+                    "node",
+                    &subject,
+                    "intent.desired",
+                    None,
+                    &json!({"subject":subject,"kind":"exec","desired":{}}),
+                    &[],
+                    None,
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO temp.heal_replay_base_order(claim_id) VALUES (?1)",
+                    [&claim.id],
+                )
+                .unwrap();
+            }
+            let mut statement = tx.prepare(BASE_REPLAY_PAGE_SQL).unwrap();
+            let page = statement
+                .query_map(params![0, 256], claim_from_row)
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(page.len(), 256);
+            assert_eq!(page[0].subject, "exec/page-0");
+            assert_eq!(page[255].subject, "exec/page-255");
+            costs.push((
+                statement.get_status(rusqlite::StatementStatus::VmStep),
+                statement.get_status(rusqlite::StatementStatus::FullscanStep),
+                statement.get_status(rusqlite::StatementStatus::Sort),
+            ));
+        }
+        assert_eq!(
+            costs[0], costs[1],
+            "body page work must depend on its selected page, not the remaining canonical order"
+        );
+        assert_eq!(costs[0].1, 0, "ordinal lookup must not scan the order");
+        assert_eq!(
+            costs[0].2, 0,
+            "body pages must not repeat the canonical sort"
+        );
+        // This measures the actual body-page statement, not the once-per-replay canonical
+        // sort, the full runtime fold or writer latency.
+        tx.rollback().unwrap();
     }
 
     #[test]

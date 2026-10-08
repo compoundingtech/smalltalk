@@ -13371,6 +13371,42 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             let elapsed = now_ms().saturating_sub(requested.accepted_at_unix_ms);
             if elapsed >= time_limit_ms as u128 {
+                // A delayed pass is not proof that the check ran late. Only its authenticated
+                // driver receipt can establish timely completion; an exited runtime alone
+                // has no finish timestamp. Same-writer sequence/position also permits a
+                // receipt in the same millisecond as its request, but never an older check.
+                let deadline = requested
+                    .accepted_at_unix_ms
+                    .saturating_add(u128::from(time_limit_ms));
+                if let Some((completed, incarnation)) =
+                    self.store.mechanical_gate_exit_receipt(&requested)?
+                {
+                    let fields = &completed.body["fields"];
+                    if completed.accepted_at_unix_ms >= requested.accepted_at_unix_ms
+                        && completed.accepted_at_unix_ms < deadline
+                        && fields["status"] == "exited"
+                        && fields["exit_signal"].is_null()
+                        && let Some(code) = fields["exit_code"].as_i64()
+                    {
+                        smallclaims::touched::note_read(|| format!("exec:{runtime_id}"));
+                        if let Some(observation) = self.runtime.observe_exec(&runtime_id)?
+                            && observation.runtime_id == runtime_id
+                            && !observation.terminal
+                            && observation.status == "exited"
+                            && observation.exit_code.is_none_or(|actual| actual == code)
+                            && incarnation.as_deref().is_none_or(|started| {
+                                observation.incarnation_id.as_deref() == Some(started)
+                            })
+                        {
+                            // Use this qualifying receipt, never a different code from an
+                            // unfiltered history fallback. Contradictory runtime evidence
+                            // cannot turn an overdue check into a successful result.
+                            let check =
+                                check_result(Some(code), crate::gate_report::read(&report), None);
+                            return self.record_gate_check(stage, check);
+                        }
+                    }
+                }
                 self.stop_gate_runner(&operation, true)?;
                 let mut check = check_result(None, crate::gate_report::read(&report), None);
                 check.start_failure = Some(format!(
