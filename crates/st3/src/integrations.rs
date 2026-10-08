@@ -108,14 +108,14 @@ fn capture(mut command: Command, input: Option<&[u8]>, timeout: Duration) -> Res
         .stdout(output.try_clone()?)
         .stderr(errors.try_clone()?);
     let mut child = command.spawn().context("start integration check")?;
-    if let Some(input) = input {
-        if let Err(error) = child.stdin.take().unwrap().write_all(input) {
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
-            let _ = child.wait();
-            return Err(error.into());
+    if let Some(input) = input
+        && let Err(error) = child.stdin.take().unwrap().write_all(input)
+    {
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
         }
+        let _ = child.wait();
+        return Err(error.into());
     }
     let started = Instant::now();
     loop {
