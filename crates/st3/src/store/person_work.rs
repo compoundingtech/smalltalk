@@ -371,6 +371,106 @@ pub(super) fn current(connection: &Connection, ask: &ClaimRecord, as_of: u128) -
     Ok(true)
 }
 
+/// Owned facts at one certified native cut. Their producer must maintain the exact
+/// canonical STOP head and all run/rollout/origin dependencies independently; this
+/// evaluator supplies no source qualification or public actor visibility.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct CurrencyFacts {
+    pub step: StepRunView,
+    pub ask_run_live: bool,
+    pub requester_live: bool,
+    pub retiring: bool,
+    pub maximum_stop: Option<canonical::ClaimKey>,
+    pub ask_key: Option<canonical::ClaimKey>,
+    pub requester_declaration: Option<String>,
+    pub owner_run_live: bool,
+    pub origin_step: Option<StepRunView>,
+}
+
+/// Shared current-person-ask semantics for off-reader attention and mission preparation.
+/// Callers retain absence before invoking this function when the ask's step is missing.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn current_from_facts(
+    ask: &ClaimRecord,
+    facts: &CurrencyFacts,
+    as_of: u128,
+) -> Result<bool> {
+    if ask.accepted_at_unix_ms > as_of
+        || !matches!(facts.step.status.as_str(), "pending" | "ready")
+        || !facts.ask_run_live
+    {
+        return Ok(false);
+    }
+    let requester = ask.actor.as_deref().unwrap_or_default();
+    let unfenced = requester.starts_with("daemon/") || is_update(ask);
+    if !unfenced && !facts.requester_live && !facts.retiring {
+        return Ok(false);
+    }
+    if unfenced {
+        return Ok(true);
+    }
+    if !facts.retiring {
+        let ask_key = facts
+            .ask_key
+            .as_ref()
+            .context("person ask canonical key absent")?;
+        if facts
+            .maximum_stop
+            .as_ref()
+            .is_some_and(|stop| stop > ask_key)
+        {
+            return Ok(false);
+        }
+    }
+    let fields = &ask.body["fields"];
+    if let Some(declaration) = fields["requester_declaration"].as_str() {
+        if facts.requester_declaration.as_deref() != Some(declaration) {
+            return Ok(false);
+        }
+    }
+    if fields["owner_run"].as_str().is_some() && !facts.owner_run_live {
+        return Ok(false);
+    }
+    if fields["origin_step"].as_str().is_some() {
+        let Some(origin) = facts.origin_step.as_ref() else {
+            return Ok(false);
+        };
+        if origin.attempt as u64 != fields["origin_attempt"].as_u64().unwrap_or(0)
+            || origin.status != "waiting-person"
+            || origin.blocked_reason.as_deref() != Some(ask.subject.as_str())
+            || origin.generation != facts.step.generation
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Native oracle input, selected without decoding every requester declaration. This
+/// query still orders historical STOP candidates; it is not a bounded producer input.
+/// The incremental producer must maintain the same maximum from certified OLD/NEW keys.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn maximum_stop_key(
+    connection: &Connection,
+    requester: &str,
+) -> Result<Option<canonical::ClaimKey>> {
+    let id: Option<String> = connection
+        .query_row(
+            &canonical_sql(
+                "SELECT id FROM claims WHERE subject=?1 AND kind='intent.desired'
+         AND (json_extract(body,'$.kind')='stop' OR
+             (json_array_length(body,'$.desired.children')=1 AND
+              json_extract(body,'$.desired.children[0].name')='stop'))
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+            ),
+            [requester],
+            |row| row.get(0),
+        )
+        .optional()?;
+    id.map(|id| canonical::claim_key(connection, &id))
+        .transpose()
+}
+
 pub(super) fn is_update(ask: &ClaimRecord) -> bool {
     ask.body["fields"]["request"]["type"] == "update"
 }
@@ -724,7 +824,9 @@ impl Store {
         let has_asks: bool = {
             let connection = self.readers.get();
             connection
-                .prepare_cached("SELECT EXISTS(SELECT 1 FROM claims WHERE kind='work.person-asked')")?
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM claims WHERE kind='work.person-asked')",
+                )?
                 .query_row([], |row| row.get(0))?
         };
         if !has_asks {
@@ -1031,7 +1133,9 @@ pub(super) mod tests {
             completed
         });
         assert!(
-            !completed.expect("empty reconciliation submitted a writer job").unwrap(),
+            !completed
+                .expect("empty reconciliation submitted a writer job")
+                .unwrap(),
             "empty reconciliation must not report a change"
         );
     }
@@ -1088,6 +1192,211 @@ mission "person-work" state="ready" {
             request: None,
         };
         (store, origin, input)
+    }
+
+    // Capture complete native inputs in tests only. Production source owners supply
+    // these through their own qualified, bounded capture plans.
+    fn currency_facts(connection: &Connection, ask: &ClaimRecord) -> CurrencyFacts {
+        let view = step(connection, &ask.subject).unwrap().unwrap();
+        let fields = &ask.body["fields"];
+        let requester = ask.actor.as_deref().unwrap_or_default();
+        let requester_live = declaration_live(connection, requester).unwrap();
+        CurrencyFacts {
+            ask_run_live: run_live(connection, &view.run, Some(&view.generation), false).unwrap(),
+            step: view,
+            requester_live,
+            retiring: !requester_live
+                && super::super::rollouts::retiring_ask_live(connection, ask).unwrap(),
+            maximum_stop: maximum_stop_key(connection, requester).unwrap(),
+            ask_key: Some(canonical::claim_key(connection, &ask.id).unwrap()),
+            requester_declaration: current_desired_row(connection, requester)
+                .unwrap()
+                .map(|row| row.claim_id),
+            owner_run_live: fields["owner_run"].as_str().is_none_or(|owner| {
+                run_live(
+                    connection,
+                    owner,
+                    fields["owner_generation"].as_str(),
+                    false,
+                )
+                .unwrap()
+            }),
+            origin_step: fields["origin_step"]
+                .as_str()
+                .and_then(|origin| step(connection, origin).unwrap()),
+        }
+    }
+
+    fn assert_currency_parity(store: &Store, subject: &str, expected: bool) {
+        let connection = store.readers.get();
+        let ask = request(&connection, subject).unwrap().unwrap();
+        let facts = currency_facts(&connection, &ask);
+        let clock = now_ms();
+        assert_eq!(current(&connection, &ask, clock).unwrap(), expected);
+        assert_eq!(current_from_facts(&ask, &facts, clock).unwrap(), expected);
+        assert!(!current_from_facts(&ask, &facts, ask.accepted_at_unix_ms - 1).unwrap());
+    }
+
+    #[test]
+    fn captured_person_currency_matches_native_origin_retry_and_requester_redeclaration() {
+        let (store, origin, input) = fixture();
+        let ask = store.ask_person(&input).unwrap();
+        assert_currency_parity(&store, &ask.subject, true);
+        store
+            .set_step_state(&origin.subject, "failed", Some("try again"))
+            .unwrap();
+        store.retry_step(&origin.subject, "new attempt", 0).unwrap();
+        assert_currency_parity(&store, &ask.subject, false);
+
+        let (store, _, input) = fixture();
+        let ask = store.ask_person(&input).unwrap();
+        let stop =
+            crate::graph::parse_internal_intent("version 2\nstop \"agent/alder.asker\"", "alder")
+                .unwrap();
+        store.apply_internal(&stop, "currency-stop").unwrap();
+        assert_currency_parity(&store, &ask.subject, false);
+        let renewed = crate::graph::parse_internal_intent("version 2\nagent \"alder.asker\" { workspace \"/tmp\"; command \"true\"; restart always; }", "alder").unwrap();
+        store.apply_internal(&renewed, "currency-renew").unwrap();
+        assert_currency_parity(&store, &ask.subject, false);
+        store.replay_replication_graph().unwrap();
+        assert_currency_parity(&store, &ask.subject, false);
+    }
+
+    #[test]
+    fn captured_updates_and_daemon_asks_keep_native_unfenced_rules() {
+        let (store, _, input) = fixture();
+        let ask_view = store.ask_person(&input).unwrap();
+        let connection = store.readers.get();
+        let ask = request(&connection, &ask_view.subject).unwrap().unwrap();
+        let mut facts = currency_facts(&connection, &ask);
+        // These dependencies are deliberately absent: native unfenced asks ignore them.
+        facts.requester_live = false;
+        facts.retiring = false;
+        facts.ask_key = None;
+        facts.requester_declaration = None;
+        facts.owner_run_live = false;
+        facts.origin_step = None;
+        for update in [false, true] {
+            let mut record = ask.clone();
+            if update {
+                record.body["fields"]["request"]["type"] = json!("update");
+            } else {
+                record.actor = Some("daemon/test".into());
+            }
+            assert!(current(&connection, &record, now_ms()).unwrap());
+            assert!(current_from_facts(&record, &facts, now_ms()).unwrap());
+            facts.ask_run_live = false;
+            assert!(!current_from_facts(&record, &facts, now_ms()).unwrap());
+            facts.ask_run_live = true;
+        }
+    }
+
+    #[test]
+    fn native_stop_head_matches_full_fold_after_canonical_corrections_and_rollback() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE batches(id TEXT PRIMARY KEY, origin TEXT, replica_sequence INTEGER);
+             CREATE TABLE claims(id TEXT PRIMARY KEY, subject TEXT, kind TEXT, batch_id TEXT,
+                                 store_index INTEGER, accepted_at_unix_ms TEXT, body TEXT);
+             CREATE TABLE replica_records(claim_id TEXT, position INTEGER);
+             INSERT INTO batches VALUES ('a','writer-a',1),('b','writer-b',1);",
+            )
+            .unwrap();
+        for (id, batch, index, clock, body) in [
+            ("old", "a", 5, "9", json!({"kind":"stop"})),
+            (
+                "legacy",
+                "a",
+                3,
+                "10",
+                json!({"desired":{"children":[{"name":"stop"}]}}),
+            ),
+            ("current", "b", 1, "10", json!({"kind":"stop"})),
+            (
+                "not-stop",
+                "b",
+                2,
+                "10",
+                json!({"desired":{"children":[{"name":"stop"},{"name":"agent"}]}}),
+            ),
+            (
+                "future",
+                "a",
+                4,
+                "340282366920938463463374607431768211455",
+                json!({"kind":"agent"}),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO claims VALUES (?1,'agent/asker','intent.desired',?2,?3,?4,?5)",
+                    params![id, batch, index, clock, body.to_string()],
+                )
+                .unwrap();
+        }
+        fn full_fold(c: &Connection) -> Option<canonical::ClaimKey> {
+            let mut query = c.prepare("SELECT id,body FROM claims WHERE subject='agent/asker' AND kind='intent.desired'").unwrap();
+            let rows = query
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap();
+            rows.filter_map(|row| {
+                let (id, body) = row.unwrap();
+                let body: Value = serde_json::from_str(&body).unwrap();
+                (body["kind"] == "stop"
+                    || body["desired"]
+                        .get("children")
+                        .and_then(Value::as_array)
+                        .is_some_and(|children| {
+                            children.len() == 1 && children[0]["name"] == "stop"
+                        }))
+                .then(|| canonical::claim_key(c, &id).unwrap())
+            })
+            .max()
+        }
+        assert_eq!(
+            maximum_stop_key(&connection, "agent/asker").unwrap(),
+            full_fold(&connection)
+        );
+        assert_eq!(full_fold(&connection).unwrap().5, "current");
+        {
+            let tx = connection.transaction().unwrap();
+            tx.execute("UPDATE batches SET origin='writer-z' WHERE id='a'", [])
+                .unwrap();
+            tx.execute(
+                "INSERT INTO replica_records VALUES ('legacy',7),('legacy',2)",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                maximum_stop_key(&tx, "agent/asker").unwrap(),
+                full_fold(&tx)
+            );
+            assert_eq!(full_fold(&tx).unwrap().5, "legacy");
+            tx.execute(
+                "UPDATE claims SET body='{\"kind\":\"stop\"}' WHERE id='future'",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                maximum_stop_key(&tx, "agent/asker").unwrap(),
+                full_fold(&tx)
+            );
+            assert_eq!(full_fold(&tx).unwrap().0, u128::MAX);
+            // Drop rolls back both a STOP birth and its canonical producer-key correction.
+        }
+        assert_eq!(
+            maximum_stop_key(&connection, "agent/asker").unwrap(),
+            full_fold(&connection)
+        );
+        assert_eq!(full_fold(&connection).unwrap().5, "current");
+        assert!(
+            maximum_stop_key(&connection, "agent/absent")
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn delivery_fixture(kind: &str) -> (Store, StepRunView, PersonAskRequest, MissionRunView) {
