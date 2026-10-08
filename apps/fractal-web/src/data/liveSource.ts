@@ -92,7 +92,7 @@ export const liveSource = ({
   setDebug('Wf.activeFollows', 0)
   setDebug('Wf.followCap', options.maxFollows)
   setDebug('Wf.conversationEntries', 0)
-  if (options.conversationSlots !== undefined)
+  if (typeof options.conversationSlots === 'number')
     setDebug('Wf.conversationSlots', options.conversationSlots)
   // Each sync-status consumer is owned by the corresponding follow fiber.
   let freshnessConsumers = 0
