@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep fixture boundary inspection strict when SQLite removes a transient sidecar",
+  "replay": {
+    "status": "none",
+    "detail": "Only the CI/evaluation filesystem boundary scanner and its regression controls change; claim projection and replay do not change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema, table, index or migration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or fleet coordination requirements change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No product API, peer, client or harness contract changes. A vanished SQLite -wal/-shm is tolerated only after the matching database records and schemas were inspected; generated-path findings, live SQLite semantic checks and all other missing-file or I/O errors retain existing failure behavior."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "The bounded fixture scanner introduces no service interruption or runtime restart requirement."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No existing-installation action, state conversion or budget change is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No state or runtime recovery change; binary swap-back needs no data conversion."
+  }
+}
