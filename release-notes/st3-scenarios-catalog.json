@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "Extend the st3 scenario catalog to 23 worlds with the matching variants, sync-matrix rows and replay fault policies",
+  "summary": "Extend the st3 scenario catalog to all 24 worlds with the matching variants, sync-matrix rows and replay fault policies",
   "replay": {"status": "none", "detail": "Development and test package only; no runtime replay change."},
   "schema": {"status": "none", "detail": "No database schema change."},
   "rules": {"status": "none", "detail": "No checkpoint rules change."},
