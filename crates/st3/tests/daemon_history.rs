@@ -43,7 +43,7 @@ async fn history_does_not_change_what_requests_cost() {
     assert!(long > short, "the long past must be longer than the short one");
     let keep = std::env::var_os("ST_BENCH_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/st-bench"));
+        .unwrap_or_else(|| Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../../target/st-bench"));
     std::fs::create_dir_all(&keep).unwrap();
     let (store, peer) = generated_stores(&keep, scale).await;
     // `measure` copies the store for each run, so the two runs start from the same bytes.
