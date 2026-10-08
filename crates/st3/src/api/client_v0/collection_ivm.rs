@@ -439,6 +439,20 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn non_unix_held_scope_cannot_bypass_current_grant_revalidation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::test_state_named(root.path(), "alder");
+        let mut session = ClientSession::local(None).unwrap();
+        session.transport = "fabric";
+        let request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe", "id":"agents", "collection":"agents"
+        })).unwrap();
+        let error = authorize(&state, &session, &request).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::FORBIDDEN);
+        assert!(error.message.contains("grant is absent"));
+    }
+
     #[tokio::test]
     async fn ivm_socket_upsert_remove_reorder_silence_resync_and_reconnect() {
         let root = tempfile::tempdir().unwrap();

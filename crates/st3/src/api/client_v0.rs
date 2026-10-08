@@ -853,7 +853,11 @@ async fn collection_items_without_source(
     if request.collection == "agents"
         && let Some(error) = source_error
     {
-        return Err(ApiError::internal(error));
+        let mut refusal = ApiError::internal(error);
+        // This constructor failure is cached for the socket lifetime. Drop this subscription
+        // rather than polling every other legacy window for a condition that cannot heal here.
+        refusal.status = StatusCode::CONFLICT;
+        return Err(refusal);
     }
     collection_items_with_windows(state, session, request, permit, windows).await
 }
@@ -948,6 +952,8 @@ async fn collection_stream_socket_with_sources<F, Fut>(
     let mut generation = 0_u64;
     type GrantCheck = std::pin::Pin<Box<dyn Future<Output = Result<ClientSession, ApiError>> + Send>>;
     let mut grant_check: Option<GrantCheck> = None;
+    // Keep a pre-pulled command across select iterations when another ready arm wins.
+    let mut waiting = None;
     loop {
         // The subscriptions to read after this wake-up.
         let mut refresh = Vec::<String>::new();
@@ -958,7 +964,9 @@ async fn collection_stream_socket_with_sources<F, Fut>(
             tokio::time::Instant::now().checked_add(Duration::from_millis(
                 expires.saturating_sub(client_now_ms()).min(u64::MAX as u128) as u64))
         });
-        let waiting = futures_util::FutureExt::now_or_never(socket.recv());
+        if waiting.is_none() {
+            waiting = futures_util::FutureExt::now_or_never(socket.recv());
+        }
         let command_waiting = waiting.is_some();
         tokio::select! {
             () = async {
@@ -995,7 +1003,7 @@ async fn collection_stream_socket_with_sources<F, Fut>(
                 }
                 continue;
             }
-            incoming = async { match waiting { Some(incoming) => incoming, None => socket.recv().await } } => {
+            incoming = async { match waiting.take() { Some(incoming) => incoming, None => socket.recv().await } } => {
                 // Take every command already waiting, so subscriptions sent together are read
                 // together below.
                 let mut next = Some(incoming);
@@ -10578,11 +10586,13 @@ mod tests {
             let (sources, error) = collection_sources(state.store.clone(), adapters).await;
             assert!(sources.is_none());
             assert!(error.is_some());
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = count.clone();
             let (state, error) = (state.clone(), error.clone());
             let app = axum::Router::new().route(
                 "/stream",
                 axum::routing::get(move |upgrade: WebSocketUpgrade| {
-                    let (state, error) = (state.clone(), error.clone());
+                    let (state, error, seen) = (state.clone(), error.clone(), seen.clone());
                     async move {
                         upgrade.on_upgrade(move |socket| {
                             collection_stream_socket_with_reader(
@@ -10591,8 +10601,9 @@ mod tests {
                                 ClientSession::local(None).unwrap(),
                                 None,
                                 move |state, session, request, permit| {
-                                    let error = error.clone();
+                                    let (error, seen) = (error.clone(), seen.clone());
                                     async move {
+                                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                         collection_items_without_source(
                                             &state, &session, &request, permit, None, error,
                                         )
@@ -10632,7 +10643,8 @@ mod tests {
                 let value: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
                 received.insert(value["id"].as_str().unwrap().to_owned(), value);
             }
-            assert_eq!(received["agents"]["kind"], "resync");
+            assert_eq!(received["agents"]["kind"], "error");
+            assert_eq!(received["agents"]["retryable"], false);
             assert_eq!(received["work"]["kind"], "snapshot");
             socket
                 .send(tokio_tungstenite::tungstenite::Message::Ping(
@@ -10648,6 +10660,8 @@ mod tests {
                     .unwrap(),
                 tokio_tungstenite::tungstenite::Message::Pong(vec![4, 7].into())
             );
+            assert!(tokio::time::timeout(Duration::from_millis(1700), socket.next()).await.is_err());
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
             socket.close(None).await.unwrap();
             server.abort();
         }

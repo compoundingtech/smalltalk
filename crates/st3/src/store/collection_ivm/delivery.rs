@@ -11,6 +11,7 @@ use crate::api::delivery_presence::source::{self, CapturedAssessment, Certificat
 use crate::store::Store;
 
 pub(crate) const DRIVERS: [&str; 5] = ["claude", "codex", "opencode", "pi", "omp"];
+#[cfg(test)]
 const PAGE_LIMIT: usize = 128;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS local_agent_delivery_presence (
@@ -154,6 +155,7 @@ pub(crate) fn commit(store: &Store, capture: &CapturedAssessment) -> Result<Cert
 
 /// Indexed finite clock input. Capture/commit each returned key outside this snapshot/writer.
 /// Wall time schedules conservatively; the live helper's monotonic deadline grants coverage.
+#[cfg(test)]
 pub(crate) fn due_page(
     connection: &Connection,
     at_ms: u64,
@@ -207,6 +209,7 @@ pub(crate) fn row(
 
 /// Decode the complete captured namespace physical row. This never reads the live producer
 /// or current SQL, and cannot replace the whole-namespace boundary certificate/guard.
+#[cfg(test)]
 pub(crate) fn decode_sql_row(physical: &Value, at_ms: u64) -> Result<Option<CapturedAssessment>> {
     let state = physical["state"]
         .as_str()

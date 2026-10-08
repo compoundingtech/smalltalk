@@ -288,16 +288,8 @@ fn read_in<T>(
     Ok(result)
 }
 
-/// Explicit durable native/active namespace classifier proof for an irrelevant recipient. No
-/// automatic exclusion exists. The closure commits that proof/removal under the same Store cut;
-/// a stale Change or concurrent replacement cannot clear pending source work.
-pub(crate) fn commit_exclusion(
-    change: &Change,
-    commit: impl FnOnce(&Change) -> Result<()>,
-) -> Result<()> {
-    exclusion_in(presence(), change, commit)
-}
-
+// Fixture-only exclusion control; production uses the complete native classifier.
+#[cfg(test)]
 fn exclusion_in(
     presence: &Presence,
     change: &Change,
