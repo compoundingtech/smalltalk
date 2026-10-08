@@ -649,6 +649,9 @@ so their adapters use no-argument close (an empty close frame, reported as 1005 
 A persisted (back/forward-cache) page retains its scope; persisted `pageshow` reconnects and
 resubscribes its existing interests. These lifecycle handlers add no timers. The early unclaimed
 socket also closes synchronously on pagehide.
+The document entry owns a single lifecycle handler: close the socket, synchronously unmount
+React registry consumers, then dispose the source. This explicit ordering does not rely on
+capture/bubble ordering between separately registered window listeners.
 
 The browser proof commands require `playwright-cli` on `PATH` and the locked workspace
 dependencies installed:

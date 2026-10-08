@@ -2,7 +2,6 @@ import { Effect, Layer } from 'effect'
 import { buildIdentity, deploymentId } from 'virtual:build-identity'
 import { liveSource } from '../data/liveSource.ts'
 import { makeTelemetry } from '../telemetry/browser.ts'
-import { installPageLifecycle } from './pageLifecycle.ts'
 
 /** Page-owned scopes survive React Fast Refresh; a full navigation owns teardown. */
 const createPageRuntime = () => {
@@ -42,5 +41,4 @@ type PageRuntime = ReturnType<typeof createPageRuntime>
 const retained = import.meta.hot?.data.pageRuntime as PageRuntime | undefined
 const runtime = retained ?? createPageRuntime()
 if (import.meta.hot !== undefined) import.meta.hot.data.pageRuntime = runtime
-if (retained === undefined) installPageLifecycle({ target: window, source: runtime.live })
 export const { live, telemetry } = runtime
