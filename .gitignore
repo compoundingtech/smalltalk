@@ -27,6 +27,7 @@ crates/st-drivers/hooks/typecheck/node_modules/
 /node_modules/
 clients/typescript/st3-client/node_modules/
 clients/typescript/st3-views/node_modules/
+clients/typescript/st3-scenarios/node_modules/
 
 # Pinned flake input made available to the CI generators by the devShell.
 /repos/
