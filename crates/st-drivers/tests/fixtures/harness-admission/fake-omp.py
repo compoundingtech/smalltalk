@@ -32,7 +32,15 @@ for _ in range(2):
         response.read()
     messages.append({'role': 'tool', 'tool_call_id': 'admission_call', 'content': 'fixture denied'})
 for name, key in [('ST_ADMISSION_TRACE', 'events'), ('ST_ADMISSION_CHANNEL_TRACE', 'channel')]:
-    pathlib.Path(os.environ[name]).write_text(''.join(json.dumps(value) + '\n' for value in fixture[key]))
+    text = ''.join(json.dumps(value) + '\n' for value in fixture[key])
+    if key == 'events' and (root / 'malformed').exists():
+        text += 'malformed\n'
+    # Publish the whole synthetic capture at once: the negative fixture must
+    # never expose a passing prefix before its malformed record is visible.
+    path = pathlib.Path(os.environ[name])
+    staged = path.with_suffix('.new')
+    staged.write_text(text)
+    staged.replace(path)
 if (root / 'hold-after-publication').exists():
     # The probe kills this child after deciding. Keep it alive at the publication
     # boundary so the malformed control cannot depend on child exit timing.
@@ -42,6 +50,3 @@ if (root / 'hold-after-publication').exists():
         if time.monotonic() >= deadline:
             raise RuntimeError('publication barrier was not released')
         time.sleep(0.01)
-if (root / 'malformed').exists():
-    with pathlib.Path(os.environ['ST_ADMISSION_TRACE']).open('a') as output:
-        output.write('malformed\n')

@@ -920,6 +920,7 @@ pub(crate) mod tests {
     fn unseen_exact_release_passes_and_reuses_measured_cache() {
         let directory = tempfile::tempdir().unwrap();
         fake_omp(directory.path());
+        fs::write(directory.path().join("hold-after-publication"), "").unwrap();
         let first = admit_fake(directory.path());
         assert!(first.passed(), "{first:?}");
         assert_eq!(first.version.as_deref(), Some("99.42.7"));
@@ -1244,6 +1245,12 @@ pub(crate) mod tests {
         let extension = directory.path().join("extension.ts");
         fs::write(&extension, "fixture").unwrap();
         assert!(omp::probe(&binary, &extension, &scratch).is_err());
+        assert!(
+            scratch
+                .capture("events.jsonl")
+                .unwrap()
+                .ends_with("malformed\n")
+        );
         let admission = admit_fake(directory.path());
         assert_eq!(admission.failed, Some(Reason::AdmissionIndeterminate));
         assert_eq!(admit_fake(directory.path()).failed, admission.failed);
