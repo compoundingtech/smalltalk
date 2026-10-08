@@ -276,12 +276,15 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
         &json!({
             "type": "hello",
             "protocol": PROTOCOL,
+            "capabilities": ["durable-turn-receipts-v1"],
             "identity": identity,
             "sessionContext": session_context,
         }),
     )?;
     stdout.flush()?;
+    let mut bound_native_session = None;
     if let Some((state_dir, native_session_id, resume_generation, ownership_seq)) = omp_binding {
+        bound_native_session = Some(native_session_id.clone());
         confirm_omp_channel_session(
             &input_rx,
             &state_dir,
@@ -338,6 +341,7 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
         kind,
         POLL,
         harness_state::HARNESS_STATE_REFRESH,
+        bound_native_session.as_deref(),
     )
 }
 
@@ -398,6 +402,7 @@ fn channel_loop(
     kind: &ChannelKind,
     poll: Duration,
     heartbeat_every: Duration,
+    initial_native_session: Option<&str>,
 ) -> Result<()> {
     let mut delivered = HashSet::new();
     // The extension opens its channel during `session_start`, before a positional boot prompt has
@@ -406,6 +411,7 @@ fn channel_loop(
     // `agent_start` also precedes that write; the first `idle` lifecycle edge proves the boot turn
     // and transcript have both completed. Startup mail then begins a clean provider turn.
     let mut delivery_ready = false;
+    let mut native_session = initial_native_session.map(str::to_owned);
     let label = kind.label;
     let mut next_heartbeat = Instant::now() + heartbeat_every;
     loop {
@@ -420,6 +426,30 @@ fn channel_loop(
                 // must not be able to take the channel down and stall an inbox. A failed record
                 // write degrades the same way — delivery never depends on observability.
                 let frame = serde_json::from_str::<Value>(&line).ok();
+                if let Some(frame)=frame.as_ref() {
+                    if matches!(frame["type"].as_str(),Some("session"|"ready")) {
+                        native_session=frame["sessionId"].as_str().filter(|id| !id.is_empty()).map(str::to_owned);
+                    }
+                    let recorded = match observe_turn_frame(writer,frame,native_session.as_deref()) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            tracing::warn!("st {label} channel: recording turn receipt failed: {error:#}");
+                            false
+                        }
+                    };
+                    if recorded && matches!(frame["type"].as_str(),Some("turn_start"|"turn_tool"|"turn"))
+                        && frame["sessionId"].as_str()==native_session.as_deref()
+                        && let Some(request)=frame["requestId"].as_str()
+                        && let Some(receipt)=if frame["type"]=="turn" {
+                            frame.get("receipt").filter(|receipt| writer.terminal_receipt_recorded(receipt)).cloned()
+                        } else if frame["type"] == "turn_tool" && frame["completed"] == true {
+                            frame.get("receipt").filter(|receipt| writer.late_tool_result_recorded(receipt, frame["toolId"].as_str().unwrap_or_default())
+                                || writer.turn_receipt().as_ref() == Some(*receipt)).cloned()
+                        } else { writer.turn_receipt() } {
+                        write_json(out,&serde_json::json!({"type":"turn_recorded","requestId":request,"receipt":receipt}))?;
+                        out.flush()?;
+                    }
+                }
                 // The typed turn result, decoded once: it feeds two independent records and the
                 // credential edge must not depend on the categorical write landing.
                 let turn = frame.as_ref().and_then(turn_result);
@@ -534,6 +564,8 @@ pub struct EventObserver {
     runtime: String,
     driver: &'static str,
     native_session: Option<String>,
+    // Never acknowledge a previous receipt after this frame's write failed.
+    recorded_boundary: Option<Value>,
 }
 impl EventObserver {
     pub fn new(
@@ -564,6 +596,7 @@ impl EventObserver {
             runtime: runtime_id.into(),
             driver,
             native_session: None,
+            recorded_boundary: None,
         })
     }
     /// The channel resume state already authenticated this binding before re-exec.
@@ -575,6 +608,11 @@ impl EventObserver {
         if matches!(frame["type"].as_str(), Some("session" | "ready")) {
             self.native_session = frame["sessionId"].as_str()
                 .filter(|id| !id.is_empty()).map(str::to_owned);
+        }
+        self.recorded_boundary = None;
+        observe_turn_frame(&mut self.state, frame, self.native_session.as_deref())?;
+        if matches!(frame["type"].as_str(), Some("turn_start" | "turn_tool" | "turn")) {
+            self.recorded_boundary = Some(frame.clone());
         }
         if let Some(fields) = todo_observation(
             frame, self.driver, self.native_session.as_deref(), &self.runtime,
@@ -593,12 +631,52 @@ impl EventObserver {
         }
         crate::harness_timeline::observe_channel_frame(&mut self.timeline, frame)
     }
+    pub fn turn_boundary_ack(&self, frame: &Value) -> Option<Value> {
+        if self.recorded_boundary.as_ref() != Some(frame)
+            || !matches!(frame["type"].as_str(),Some("turn_start"|"turn_tool"|"turn"))
+            || frame["sessionId"].as_str() != self.native_session.as_deref() { return None; }
+        let request=frame["requestId"].as_str().filter(|id| !id.is_empty() && id.len()<=256)?;
+        if frame["type"] == "turn_tool" {
+            frame["toolId"].as_str().filter(|id| !id.is_empty())?;
+            let receipt = frame.get("receipt")?;
+            let current = Some(receipt) == self.state.turn_receipt().as_ref();
+            let late = frame["completed"] == true && self.state.late_tool_result_recorded(receipt, frame["toolId"].as_str()?);
+            if !current && !late { return None; }
+            frame["completed"].as_bool()?;
+        }
+        if frame["type"] == "turn" && !matches!(frame["outcome"].as_str(),Some("completed"|"cancelled"|"failed")) { return None; }
+        Some(serde_json::json!({"type":"turn_recorded","requestId":request,"receipt":if frame["type"]=="turn" {
+            let receipt=frame.get("receipt")?;
+            if !self.state.terminal_receipt_recorded(receipt) { return None; }
+            receipt.clone()
+        } else if frame["type"] == "turn_tool" && frame["completed"] == true
+            && frame.get("receipt").is_some_and(|receipt| self.state.late_tool_result_recorded(receipt, frame["toolId"].as_str().unwrap_or_default())) {
+            frame["receipt"].clone()
+        } else { self.state.turn_receipt()? }}))
+    }
     pub fn heartbeat(&mut self) -> Result<()> {
         if self.last_heartbeat.elapsed() >= harness_state::HARNESS_STATE_REFRESH {
             self.state.heartbeat()?;
             self.last_heartbeat = std::time::Instant::now();
         }
         Ok(())
+    }
+}
+
+fn observe_turn_frame(writer: &mut harness_state::Writer, frame: &Value, bound_session: Option<&str>) -> Result<()> {
+    if bound_session.is_none() || frame["sessionId"].as_str() != bound_session { return Ok(()); }
+    match frame["type"].as_str() {
+        Some("turn_start") => writer.turn_started(bound_session, None),
+        Some("turn") => {
+            let outcome=frame["outcome"].as_str().unwrap_or("unknown");
+            if let Some(receipt)=frame.get("receipt") { writer.turn_terminal_receipt(bound_session,outcome,receipt) }
+            else { writer.turn_terminal(bound_session,None,outcome) }
+        }
+        Some("turn_tool") => {
+            if let Some(receipt)=frame.get("receipt") && !writer.retain_turn_receipt(receipt)? { return Ok(()); }
+            if let Some(id)=frame["toolId"].as_str() { writer.turn_tool(bound_session,None,id,frame["completed"]==true) } else { Ok(()) }
+        }
+        _ => Ok(()),
     }
 }
 
@@ -991,6 +1069,66 @@ fn message_frame(msg: message::Message, identity: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durable_turn_ack_requires_session_receipt_and_current_provider_ownership() {
+        let root=tempfile::tempdir().unwrap();
+        crate::harness_events::enable(root.path(),"runtime-one").unwrap();
+        let seq=harness_state::claim(root.path(),"agent/fixture","omp","provider-one").unwrap();
+        let mut observer=EventObserver::new(root.path(),"agent/fixture","omp","provider-one",seq,"runtime-one").unwrap()
+            .with_native_session(Some("native-one".into()));
+        observer.state=observer.state.with_turn_fence(Some("runtime-one".into()),Some("revision-one".into()));
+        let start=json!({"type":"turn_start","sessionId":"native-one","requestId":"start"});
+        observer.observe(&start).unwrap();
+        let receipt=observer.turn_boundary_ack(&start).unwrap()["receipt"].clone();
+        assert!(receipt["source_sequence"].as_u64().is_some());
+        let mut tool=json!({"type":"turn_tool","sessionId":"native-one","requestId":"tool","toolId":"side-effect","completed":false,"receipt":receipt});
+        observer.observe(&tool).unwrap();
+        assert!(observer.turn_boundary_ack(&tool).is_some());
+        let state=harness_state::read(&harness_state::harness_state_path(root.path()),None).unwrap();
+        assert!(state.turn_obligation.open[0].tool_outcome_unknown);
+        tool["receipt"]["source_sequence"]=json!(999);
+        observer.observe(&tool).unwrap();
+        assert!(observer.turn_boundary_ack(&tool).is_none());
+        let wrong=json!({"type":"turn","sessionId":"native-other","outcome":"completed","requestId":"wrong","receipt":receipt});
+        observer.observe(&wrong).unwrap();
+        assert!(observer.turn_boundary_ack(&wrong).is_none());
+        let terminal=json!({"type":"turn","sessionId":"native-one","outcome":"completed","requestId":"end","receipt":receipt});
+        observer.observe(&terminal).unwrap();
+        assert!(observer.turn_boundary_ack(&terminal).is_some());
+        harness_state::claim(root.path(),"agent/fixture","omp","provider-two").unwrap();
+        observer.observe(&start).unwrap();
+        assert!(observer.turn_boundary_ack(&start).is_none());
+        assert!(observer.turn_boundary_ack(&terminal).is_none());
+    }
+
+    #[test]
+    fn failed_boundary_write_cannot_ack_a_previous_receipt_and_observer_recovers() {
+        let root = tempfile::tempdir().unwrap();
+        let seq = harness_state::claim(root.path(), "agent/fixture", "omp", "provider-one").unwrap();
+        let mut observer = EventObserver::new(root.path(), "agent/fixture", "omp", "provider-one", seq, "runtime-one").unwrap()
+            .with_native_session(Some("native-one".into()));
+        let start = json!({"type":"turn_start", "sessionId":"native-one", "requestId":"start"});
+        observer.observe(&start).unwrap();
+        let receipt = observer.turn_boundary_ack(&start).unwrap()["receipt"].clone();
+        let path = harness_state::harness_state_path(root.path());
+        let backup = path.with_file_name("state-backup");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let tool = json!({"type":"turn_tool", "sessionId":"native-one", "requestId":"tool", "toolId":"side-effect", "completed":false, "receipt":receipt});
+        assert!(observer.observe(&tool).is_err());
+        assert!(observer.turn_boundary_ack(&tool).is_none());
+        assert!(observer.turn_boundary_ack(&start).is_none());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        observer.observe(&tool).unwrap();
+        assert!(observer.turn_boundary_ack(&tool).is_some());
+        let recovered = harness_state::read(&path, None).unwrap().turn_obligation;
+        assert_eq!(recovered.unknown_evidence.unwrap().reason, "native-receipt-write-unavailable");
+        let terminal = json!({"type":"turn", "sessionId":"native-one", "requestId":"end", "outcome":"completed", "receipt":receipt});
+        observer.observe(&terminal).unwrap();
+        assert!(harness_state::read(&path, None).unwrap().turn_obligation.unknown, "later native completion cannot erase the observation gap");
+    }
+
     use super::*;
 
     #[test]
@@ -1224,6 +1362,7 @@ mod tests {
                 &PI_KIND,
                 Duration::from_millis(1),
                 Duration::from_secs(60),
+                None,
             )
             .unwrap();
             String::from_utf8(output).unwrap()
@@ -1313,6 +1452,7 @@ mod tests {
                 &OMP_KIND,
                 Duration::from_millis(1),
                 Duration::from_secs(60),
+                None,
             )
             .unwrap();
         };
@@ -1382,6 +1522,7 @@ mod tests {
             &PI_KIND,
             Duration::from_millis(2),
             Duration::from_millis(5),
+            None,
         )
         .unwrap();
 
@@ -1440,6 +1581,7 @@ mod tests {
             &PI_KIND,
             Duration::from_millis(2),
             Duration::from_millis(5),
+            None,
         )
         .unwrap();
 
@@ -1973,6 +2115,7 @@ mod tests {
                 &OMP_KIND,
                 Duration::from_millis(1),
                 Duration::from_secs(60),
+                None,
             )
             .unwrap();
         };
@@ -2051,6 +2194,7 @@ mod tests {
             &PI_KIND,
             Duration::from_millis(1),
             Duration::from_secs(60),
+            None,
         )
         .unwrap();
 

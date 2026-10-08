@@ -1752,7 +1752,12 @@ mod tests {
         while !socket.exists() {
             tokio::task::yield_now().await;
         }
-        let error = fast_client(Endpoint::Unix(socket))
+        // Leave room for the loopback handler to accept both attempts under a
+        // busy test host; its one-second delay still outlasts each request.
+        let mut client = fast_client(Endpoint::Unix(socket));
+        client.deadlines.connect = Duration::from_millis(200);
+        client.deadlines.request = Duration::from_millis(250);
+        let error = client
             .send_message(&MessageSendRequest {
                 idempotency_key: "retry-this-key".into(),
                 from: "person/ada".into(),

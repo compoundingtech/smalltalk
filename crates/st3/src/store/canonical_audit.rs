@@ -11,6 +11,7 @@ const SHARED_TABLES: &[(&str, &[&str])] = &[
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("glass_heads", &[]),
+    ("agent_turn_obligations", &["first_index", "terminal_index", "acknowledged_index"]),
     ("custom_registrations", &[]),
     ("custom_sources", &[]),
     ("custom_dependencies", &[]),
@@ -73,6 +74,10 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_resource_projection_pending",
         "local_glass_head_pending",
         "local_glass_head_dirty",
+        "agent_turn_obligation_evidence",
+        "local_turn_obligation_versions",
+        "local_turn_obligation_pending",
+        "local_turn_obligation_dirty",
         "local_custom_dirty",
         "graph_generation",
         "fleet_generation",
@@ -745,6 +750,23 @@ message "audit-declared" {
             .append_claim_outcome(&harness_state("agent/alder.worker", state, observed_at))
             .unwrap();
     }
+    // The shared selected-head table must participate in shuffled replay,
+    // column/digest mutation, rollback, reopen and checkpoint controls.
+    source.append_claim(&ClaimInput {
+        subject: "agent/audit/turn".into(), kind: "harness.observed".into(),
+        actor: Some("agent/audit/turn".into()),
+        fields: serde_json::from_value(json!({"state":"idle", "turn_obligation":{
+            "sequence":1, "unknown":false, "unknown_tool_outcome":false,
+            "terminal":[], "tool_results":[], "open":[{
+                "source_sequence":1, "provider_incarnation":"audit-provider",
+                "ownership_sequence":1, "runtime_incarnation":"audit-runtime",
+                "desired_revision":null, "native_session_id":"audit-session",
+                "native_turn_id":null, "started_at_ms":1, "pending_human":false,
+                "tool_outcome_unknown":false, "pending_tool_ids":[]
+            }]
+        }})).unwrap(),
+        evidence:vec![], expected_subject:None, idempotency_key:None,
+    }).unwrap();
     source.replay_replication_graph().unwrap();
     source
         .ask_person(&crate::model::PersonAskRequest {

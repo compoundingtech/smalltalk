@@ -413,6 +413,15 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 
 const PROBES: &[Probe] = &[
     get(
+        "GET /v1/agents/turn-obligation",
+        "/v1/agents/turn-obligation?subject={turn_obligation_subject}",
+    ),
+    post(
+        "POST /v1/agents/turn-obligation/acknowledge",
+        "/v1/agents/turn-obligation/acknowledge",
+        |fixture, attempt| fixture.turn_acknowledgments[attempt].clone(),
+    ),
+    get(
         "GET /v1/client/adapter/deliveries",
         "/v1/client/adapter/deliveries?after={adapter_frontier}&wait_ms=0",
     ),
@@ -1249,6 +1258,8 @@ struct Fixture {
     subjects: Subjects,
     items: BTreeMap<&'static str, String>,
     custom_replies: Vec<Value>,
+    /// Explicit owner acknowledgements of invented native receipt evidence.
+    turn_acknowledgments: Vec<Value>,
     /// A message sent for the lifecycle writes.
     sent: String,
     /// Person asks the done probe answers, one per attempt.
@@ -1839,6 +1850,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     assert_eq!(page["items"], json!([selected]));
 
     prepare_custom_fixture(&store, &mut fixture, scale);
+    prepare_turn_obligations(&store, &client, &mut fixture).await;
     let event_page: Value = client
         .get(&fixture.fill("/v1/events/page?after={event_after}&limit=100", 0))
         .await
@@ -2037,6 +2049,55 @@ fn prepare_custom_fixture(store: &Store, fixture: &mut Fixture, scale: f64) {
     }
 }
 
+/// Each acknowledgement has a distinct complete source and declaration. Seed outside
+/// measurement and use the public snapshot's exact cut/receipt/source contract.
+async fn prepare_turn_obligations(store: &Store, client: &Client, fixture: &mut Fixture) {
+    use st_drivers::turn_obligation::{Ledger, Obligation};
+    let kdl = format!("version 2\n{}", (0..4).map(|attempt| format!(
+        "agent \"bench/cost/debt-{attempt}\" {{ workspace \"/tmp\"; command \"true\" }}\n"
+    )).collect::<String>());
+    let intent = st3::parse_intent(&kdl, NODE).unwrap();
+    let plan = store.mission(&intent, st3::model::IntentInput {
+        kdl, source_name: None,
+    }).unwrap();
+    store.apply(&intent, &plan.subject_tokens, "cost-turn-debt-declarations").unwrap();
+    for attempt in 0..4 {
+        let subject = format!("agent/bench/cost/debt-{attempt}");
+        let ledger = Ledger {
+            sequence: 1,
+            open: vec![Obligation {
+                source_sequence: 1, provider_incarnation: format!("cost-provider-{attempt}"),
+                ownership_sequence: 1, runtime_incarnation: Some(format!("cost-runtime-{attempt}")),
+                desired_revision: None, native_session_id: Some(format!("cost-session-{attempt}")),
+                native_turn_id: None, started_at_ms: 1, pending_human: false,
+                tool_outcome_unknown: false, pending_tool_ids: vec![],
+            }], ..Ledger::default()
+        };
+        store.append_claim(&ClaimInput {
+            subject: subject.clone(), kind: "harness.observed".into(), actor: Some(subject.clone()),
+            fields: serde_json::from_value(json!({"state":"idle", "turn_obligation":ledger})).unwrap(),
+            evidence: vec![], expected_subject: None,
+            idempotency_key: Some(format!("cost-turn-debt-{attempt}")),
+        }).unwrap();
+        let encoded = urlencoding::encode(&subject);
+        let snapshot: Value = client.get(&format!("/v1/agents/turn-obligation?subject={encoded}"))
+            .await.expect("turn cost fixture must capture admitted evidence");
+        let receipts = snapshot["evidence"]["selected_receipts"].as_array().unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(snapshot["evidence"]["owner_action_required"], true);
+        fixture.turn_acknowledgments.push(json!({
+            "subject":subject, "actor":"person/bench-operator",
+            "source_revision":snapshot["source_revision"], "captured_cut":snapshot["captured_cut"],
+            "receipts":[{"receipt":receipts[0]["receipt"], "source_claim":receipts[0]["source_claim"]}],
+            "reason":"Invented benchmark owner acknowledgement; execution remains unknown",
+            "idempotency_key":format!("cost-turn-ack-{attempt}"),
+        }));
+        if attempt == 0 {
+            fixture.items.insert("turn_obligation_subject", encoded.into_owned());
+        }
+    }
+}
+
 /// Ids from the store's own lists, a sent message, and a person ask per attempt.
 async fn fixture(person: &Client, client: &Client, subjects: Subjects) -> Fixture {
     let mut items = BTreeMap::new();
@@ -2170,6 +2231,7 @@ async fn fixture(person: &Client, client: &Client, subjects: Subjects) -> Fixtur
         handoffs: Vec::new(),
         acknowledgments: Vec::new(),
         custom_replies: Vec::new(),
+        turn_acknowledgments: Vec::new(),
         peer_inventory: Value::Null,
         peer_exchange: Value::Null,
     }

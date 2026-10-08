@@ -1535,6 +1535,8 @@ pub struct ClientSyncPeer {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CurrentHarnessView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_recovery: Option<Value>,
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<String>,
@@ -1570,6 +1572,7 @@ mod current_harness_view_tests {
 
     fn harness(reason: Option<&str>) -> CurrentHarnessView {
         CurrentHarnessView {
+            turn_recovery: None,
             state: "idle".into(),
             driver: Some("claude".into()),
             incarnation_id: "worker-one".into(),

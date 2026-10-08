@@ -147,6 +147,8 @@ impl Ask {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Record {
+    #[serde(default)]
+    turn_obligation: crate::turn_obligation::Ledger,
     schema: String,
     agent: String,
     harness: String,
@@ -261,6 +263,10 @@ impl Observation {
 /// The caller's rule for indeterminacy: when evidence is lost (the observer no longer sees its
 /// harness), call nothing — never heartbeat a state you cannot see, and never write `unknown`.
 pub struct Writer {
+    retained_turn_start: Option<u64>,
+    pending_turn_write_failure: bool,
+    runtime_incarnation: Option<String>,
+    desired_revision: Option<String>,
     path: PathBuf,
     lock_path: PathBuf,
     agent: String,
@@ -286,6 +292,10 @@ impl Writer {
         pty_session: Option<String>,
     ) -> Self {
         Self {
+            retained_turn_start: None,
+            pending_turn_write_failure: false,
+            runtime_incarnation: std::env::var("ST3_INCARNATION").ok().filter(|value| !value.is_empty()),
+            desired_revision: std::env::var("ST3_TURN_DESIRED_REVISION").ok().filter(|value| !value.is_empty()),
             path: harness_state_path(agent_dir),
             lock_path: agent_dir.join(LOCK_NAME),
             agent: agent.into(),
@@ -304,6 +314,12 @@ impl Writer {
     /// re-stamp nor terminally fence its siblings' records.
     pub fn with_session(mut self, token: impl Into<String>) -> Self {
         self.session = token.into();
+        self
+    }
+
+    pub fn with_turn_fence(mut self, runtime: Option<String>, revision: Option<String>) -> Self {
+        self.runtime_incarnation = runtime;
+        self.desired_revision = revision;
         self
     }
 
@@ -496,7 +512,20 @@ impl Writer {
                     .map_or(0, |current| current.transitions.saturating_add(1)),
             ),
         };
-        let record = Record {
+        let mut turn_obligation = on_disk
+            .as_ref()
+            .map(|record| record.turn_obligation.clone())
+            .unwrap_or_default();
+        for entry in &mut turn_obligation.open {
+            if entry.provider_incarnation == self.session
+                && entry.ownership_sequence == seq
+                && self.retained_turn_start == Some(entry.source_sequence)
+            {
+                entry.pending_human = observation.blocked_on == BlockedOn::Human;
+            }
+        }
+        let mut record = Record {
+            turn_obligation,
             schema: own_record.map_or_else(|| SCHEMA.to_owned(), |current| current.schema.clone()),
             agent: self.agent.clone(),
             harness: self.harness.to_string(),
@@ -516,7 +545,7 @@ impl Writer {
             written_at_ms,
             transitions,
         };
-        write_record(&self.path, &record)?;
+        self.write_owned_record(&mut record)?;
         self.interrupted = false;
         Ok(true)
     }
@@ -553,7 +582,7 @@ impl Writer {
             // Never inherit an untrusted future stamp — reset to this writer's clock.
             now_ms
         };
-        write_record(&self.path, &current)
+        self.write_owned_record(&mut current)
     }
 
     /// Write the terminal record for this session. Idempotent-shaped: callers on racing teardown
@@ -564,6 +593,281 @@ impl Writer {
                 .with_exit(exit),
         )
     }
+
+    fn write_owned_record(&mut self, record: &mut Record) -> anyhow::Result<()> {
+        if self.pending_turn_write_failure {
+            record.turn_obligation.sequence = record.turn_obligation.sequence.saturating_add(1);
+            record.turn_obligation.note_unknown(Some(&self.session), record.seq,
+                crate::message::now_ms(), "native-receipt-write-unavailable");
+        }
+        let result = write_record(&self.path, record);
+        if result.is_ok() { self.pending_turn_write_failure = false; }
+        result
+    }
+
+    fn turn_source(
+        &self,
+        seq: u64,
+        now_ms: u64,
+        session: Option<&str>,
+        turn: Option<&str>,
+    ) -> crate::turn_obligation::Obligation {
+        crate::turn_obligation::Obligation {
+            source_sequence: 0,
+            provider_incarnation: self.session.clone(),
+            ownership_sequence: seq,
+            runtime_incarnation: self.runtime_incarnation.clone(),
+            desired_revision: self.desired_revision.clone(),
+            native_session_id: session.map(str::to_owned),
+            native_turn_id: turn.map(str::to_owned),
+            started_at_ms: now_ms,
+            pending_human: false,
+            tool_outcome_unknown: false,
+            pending_tool_ids: Vec::new(),
+        }
+    }
+
+    /// A real native start event; source receipts are explicitly separate from native turn IDs.
+    pub fn turn_started(&mut self, session: Option<&str>, turn: Option<&str>) -> anyhow::Result<()> {
+        let result = self.turn_started_inner(session, turn);
+        if result.is_err() { self.pending_turn_write_failure = true; }
+        result
+    }
+
+    fn turn_started_inner(
+        &mut self,
+        session: Option<&str>,
+        turn: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let _lock = self.locked()?;
+        let mut record = read_record(&self.path).context("turn start has no ownership record")?;
+        if record.incarnation != self.session
+            || self.claimed_seq.is_some_and(|seq| record.seq != seq)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(crate::contracts::schema_matches(&record.schema, SCHEMA)
+            && !(record.state == Activity::Ended && record.exit.is_some()), "turn start ownership has ended");
+        let invalid_native = [session, turn]
+            .into_iter()
+            .flatten()
+            .any(|id| id.is_empty() || id.len() > 4096);
+        if invalid_native || self.session.is_empty() || self.session.len() > 4096 {
+            record.turn_obligation.sequence = record.turn_obligation.sequence.saturating_add(1);
+            record.turn_obligation.note_unknown(Some(&self.session), record.seq,
+                crate::message::now_ms(), "native-identity-unavailable");
+            self.retained_turn_start = None;
+            return self.write_owned_record(&mut record);
+        }
+        let previous_sequence = record.turn_obligation.sequence;
+        let retained_start = record.turn_obligation.start(self.turn_source(
+            record.seq,
+            crate::message::now_ms(),
+            session,
+            turn,
+        ));
+        let new_start = retained_start.is_some()
+            && record.turn_obligation.sequence != previous_sequence;
+        if new_start {
+            // The positive boundary and its activity commit together. Publishing an
+            // open receipt with the preceding idle state would invent an interruption.
+            // Replayed starts must preserve an existing human wait or terminal state.
+            let stamp = next_stamp(Some(&record), crate::message::now_ms());
+            if record.state != Activity::Active || record.blocked_on != BlockedOn::None
+                || record.ask != Ask::None || record.input_buffer != InputBuffer::Empty
+                || record.reason.is_some() || record.exit.is_some() {
+                record.since_ms = stamp;
+                record.transitions = record.transitions.saturating_add(1);
+            }
+            record.state = Activity::Active;
+            record.blocked_on = BlockedOn::None;
+            record.ask = Ask::None;
+            record.input_buffer = InputBuffer::Empty;
+            record.reason = None;
+            record.exit = None;
+            record.written_at_ms = stamp;
+        }
+        self.write_owned_record(&mut record)?;
+        if new_start { self.interrupted = false; }
+        self.retained_turn_start = retained_start;
+        Ok(())
+    }
+
+    /// Receipt retained by the native hook across channel replacement. This is st provenance,
+    /// not a provider turn ID or checkpoint.
+    pub fn turn_receipt(&self) -> Option<serde_json::Value> {
+        let record = read_record(&self.path)?;
+        if record.incarnation != self.session || self.claimed_seq.is_some_and(|seq| record.seq != seq) { return None; }
+        let source = self.retained_turn_start?;
+        record.turn_obligation.open.iter().find(|entry| entry.provider_incarnation == self.session && entry.source_sequence == source)
+            .map(|entry| serde_json::json!({"provider_incarnation":self.session,"ownership_sequence":record.seq,"source_sequence":entry.source_sequence}))
+    }
+
+    pub fn terminal_receipt_recorded(&self, receipt: &serde_json::Value) -> bool {
+        let Some(record)=read_record(&self.path) else { return false; };
+        record.incarnation==self.session && self.claimed_seq.is_none_or(|seq| record.seq == seq) && receipt["provider_incarnation"].as_str()==Some(self.session.as_str())
+            && receipt["ownership_sequence"].as_u64()==Some(record.seq)
+            && record.turn_obligation.terminal.iter().chain(record.turn_obligation.tool_results.iter().map(|result| &result.terminal)).any(|proof| proof.obligation.provider_incarnation==self.session
+                && receipt["source_sequence"].as_u64()==Some(proof.obligation.source_sequence))
+    }
+
+    pub fn late_tool_result_recorded(&self, receipt: &serde_json::Value, tool_id: &str) -> bool {
+        read_record(&self.path).is_some_and(|record| record.incarnation == self.session
+            && self.claimed_seq.is_none_or(|seq| seq == record.seq)
+            && receipt["provider_incarnation"].as_str() == Some(self.session.as_str())
+            && receipt["ownership_sequence"].as_u64() == Some(record.seq)
+            && record.turn_obligation.tool_results.iter().any(|result| result.tool_id == tool_id
+                && result.evidence_provider_incarnation == self.session
+                && receipt["source_sequence"].as_u64() == Some(result.terminal.obligation.source_sequence)))
+    }
+
+    pub fn retain_turn_receipt(&mut self, receipt: &serde_json::Value) -> anyhow::Result<bool> {
+        let result = self.retain_turn_receipt_inner(receipt);
+        if result.is_err() { self.pending_turn_write_failure = true; }
+        result
+    }
+
+    fn retain_turn_receipt_inner(&mut self, receipt: &serde_json::Value) -> anyhow::Result<bool> {
+        let record = read_record(&self.path).context("turn receipt has no ownership record")?;
+        if receipt["provider_incarnation"].as_str() != Some(self.session.as_str())
+            || receipt["ownership_sequence"].as_u64() != Some(record.seq)
+            || record.incarnation != self.session || self.claimed_seq.is_some_and(|seq| seq != record.seq) { return Ok(false); }
+        self.retained_turn_start = receipt["source_sequence"].as_u64();
+        Ok(true)
+    }
+
+    pub fn turn_terminal_receipt(&mut self, session: Option<&str>, outcome: &str, receipt: &serde_json::Value) -> anyhow::Result<()> {
+        let record = read_record(&self.path).context("terminal receipt has no ownership record")?;
+        if receipt["provider_incarnation"].as_str() != Some(self.session.as_str())
+            || receipt["ownership_sequence"].as_u64() != Some(record.seq) { return Ok(()); }
+        self.retained_turn_start = receipt["source_sequence"].as_u64();
+        self.turn_terminal(session, None, outcome)
+    }
+
+    pub fn turn_terminal(&mut self, session: Option<&str>, turn: Option<&str>, outcome: &str) -> anyhow::Result<()> {
+        let result = self.turn_terminal_inner(session, turn, outcome);
+        if result.is_err() { self.pending_turn_write_failure = true; }
+        result
+    }
+
+    fn turn_terminal_inner(
+        &mut self,
+        session: Option<&str>,
+        turn: Option<&str>,
+        outcome: &str,
+    ) -> anyhow::Result<()> {
+        let _lock = self.locked()?;
+        let mut record =
+            read_record(&self.path).context("turn terminal has no ownership record")?;
+        if record.incarnation != self.session
+            || self.claimed_seq.is_some_and(|seq| record.seq != seq)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(crate::contracts::schema_matches(&record.schema, SCHEMA), "unknown turn terminal ownership schema");
+        let revision = self.desired_revision.clone();
+        if record.turn_obligation.settle(
+            crate::turn_obligation::TerminalSource {
+                provider: &self.session,
+                revision: revision.as_deref(),
+                session,
+                turn,
+                retained_start: self.retained_turn_start,
+            },
+            outcome,
+            // Receipt provenance follows its own start/heartbeat even for writes
+            // within one clock millisecond. Exact native identity selects settlement.
+            crate::message::now_ms().max(record.written_at_ms),
+        ) {
+            self.write_owned_record(&mut record)?;
+            self.retained_turn_start = None;
+        }
+        Ok(())
+    }
+
+    pub fn turn_tool(&mut self, session: Option<&str>, turn: Option<&str>, tool_id: &str, completed: bool) -> anyhow::Result<()> {
+        let result = self.turn_tool_inner(session, turn, tool_id, completed);
+        if result.is_err() { self.pending_turn_write_failure = true; }
+        result
+    }
+
+    fn turn_tool_inner(&mut self, session: Option<&str>, turn: Option<&str>, tool_id: &str, completed: bool) -> anyhow::Result<()> {
+        let _lock = self.locked()?;
+        let mut record = read_record(&self.path).context("tool event has no ownership record")?;
+        if record.incarnation != self.session || self.claimed_seq.is_some_and(|seq| record.seq != seq) { return Ok(()); }
+        anyhow::ensure!(crate::contracts::schema_matches(&record.schema, SCHEMA), "unknown tool event ownership schema");
+        if completed {
+            let matches = |entry: &crate::turn_obligation::Obligation| {
+                entry.desired_revision == self.desired_revision
+                    && entry.native_session_id.as_deref() == session
+                    && entry.pending_tool_ids.iter().any(|id| id == tool_id)
+                    && if let Some(turn) = turn {
+                        entry.native_turn_id.as_deref() == Some(turn)
+                            && (entry.provider_incarnation == self.session
+                                || (entry.desired_revision.is_some() && entry.native_session_id.is_some()))
+                    } else {
+                        entry.provider_incarnation == self.session
+                            && self.retained_turn_start == Some(entry.source_sequence)
+                            && entry.native_turn_id.is_none()
+                    }
+            };
+            let terminal = if let Some(position) = record.turn_obligation.terminal.iter().position(|proof| matches(&proof.obligation)) {
+                Some(record.turn_obligation.terminal.remove(position))
+            } else { record.turn_obligation.tool_results.iter().position(|result| matches(&result.terminal.obligation))
+                .map(|position| record.turn_obligation.tool_results.remove(position).terminal) };
+            if let Some(mut terminal) = terminal {
+                terminal.obligation.pending_tool_ids.retain(|id| id != tool_id);
+                terminal.obligation.tool_outcome_unknown = !terminal.obligation.pending_tool_ids.is_empty();
+                if record.turn_obligation.tool_results.len() >= crate::turn_obligation::MAX_TERMINALS {
+                    let lost = record.turn_obligation.tool_results.remove(0);
+                    if lost.terminal.obligation.tool_outcome_unknown {
+                        record.turn_obligation.note_unknown(Some(&lost.terminal.obligation.provider_incarnation),
+                            lost.terminal.obligation.ownership_sequence, crate::message::now_ms(), "tool-evidence-window-exhausted");
+                    }
+                }
+                record.turn_obligation.tool_results.push(crate::turn_obligation::ToolResult {
+                    terminal, tool_id: tool_id.into(), evidence_provider_incarnation: self.session.clone(), observed_at_ms: crate::message::now_ms(),
+                });
+                record.turn_obligation.unknown_tool_outcome = record.turn_obligation.terminal.iter().any(|proof| proof.obligation.tool_outcome_unknown)
+                    || record.turn_obligation.tool_results.iter().any(|result| result.terminal.obligation.tool_outcome_unknown)
+                    || record.turn_obligation.unknown_evidence.as_ref().is_some_and(|evidence| evidence.reason.starts_with("tool-"));
+                while serde_json::to_vec(&record.turn_obligation)?.len() > crate::turn_obligation::MAX_LEDGER_BYTES {
+                    if !record.turn_obligation.terminal.is_empty() { record.turn_obligation.terminal.remove(0); }
+                    else if record.turn_obligation.tool_results.len() > 1 {
+                        let lost = record.turn_obligation.tool_results.remove(0);
+                        if lost.terminal.obligation.tool_outcome_unknown {
+                            record.turn_obligation.note_unknown(Some(&lost.terminal.obligation.provider_incarnation), lost.terminal.obligation.ownership_sequence, crate::message::now_ms(), "tool-evidence-byte-bound-exhausted");
+                        }
+                    } else { anyhow::bail!("late tool-result evidence exceeds durable receipt bound"); }
+                }
+                return self.write_owned_record(&mut record);
+            }
+        }
+        let Some(entry) = record.turn_obligation.open.iter_mut().find(|entry| {
+            entry.provider_incarnation == self.session && entry.desired_revision == self.desired_revision
+                && entry.native_session_id.as_deref() == session
+                && if turn.is_some() { entry.native_turn_id.as_deref() == turn }
+                    else { self.retained_turn_start == Some(entry.source_sequence) }
+        }) else { return Ok(()); };
+        let source = entry.source_sequence;
+        if completed { entry.pending_tool_ids.retain(|id| id != tool_id); }
+        else if !entry.pending_tool_ids.iter().any(|id| id == tool_id) {
+            if tool_id.is_empty() || tool_id.len() > 4096 { entry.tool_outcome_unknown = true; record.turn_obligation.unknown_tool_outcome = true; record.turn_obligation.note_unknown(Some(&self.session), record.seq, crate::message::now_ms(), "tool-invocation-untrackable"); return self.write_owned_record(&mut record); }
+            if entry.pending_tool_ids.len() >= 128 { entry.tool_outcome_unknown = true; record.turn_obligation.unknown_tool_outcome = true; record.turn_obligation.note_unknown(Some(&self.session), record.seq, crate::message::now_ms(), "tool-invocation-untrackable"); return self.write_owned_record(&mut record); }
+            entry.pending_tool_ids.push(tool_id.into());
+        }
+        entry.tool_outcome_unknown = !entry.pending_tool_ids.is_empty();
+        if serde_json::to_vec(&record.turn_obligation)?.len() > crate::turn_obligation::START_BUDGET_BYTES {
+            if let Some(entry) = record.turn_obligation.open.iter_mut().find(|entry| entry.provider_incarnation == self.session
+                && source == entry.source_sequence) {
+                entry.pending_tool_ids.retain(|id| id != tool_id);
+                entry.tool_outcome_unknown = true;
+            }
+            record.turn_obligation.note_unknown(Some(&self.session), record.seq, crate::message::now_ms(), "tool-invocation-byte-bound-exhausted");
+            record.turn_obligation.unknown_tool_outcome = true;
+        }
+        self.write_owned_record(&mut record)
+    }
 }
 
 /// The derived view a consumer reads. `state` already folds in staleness, future skew,
@@ -571,6 +875,7 @@ impl Writer {
 /// produced an `unknown`, so no absence is silent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Observed {
+    pub turn_obligation: crate::turn_obligation::Ledger,
     pub state: Activity,
     pub blocked_on: BlockedOn,
     pub input_buffer: InputBuffer,
@@ -597,6 +902,7 @@ impl Observed {
         // The single constructor for an indeterminate observation: every absence routes here, so
         // no path can derive `idle` — or anything else — from missing evidence.
         Self {
+            turn_obligation: crate::turn_obligation::Ledger::default(),
             state: Activity::Unknown,
             blocked_on: BlockedOn::Unknown,
             input_buffer: InputBuffer::Unknown,
@@ -616,6 +922,7 @@ impl Observed {
     }
 
     fn with_record_evidence(mut self, record: &Record) -> Self {
+        self.turn_obligation = record.turn_obligation.clone();
         self.harness = Some(record.harness.clone());
         self.observed_at_ms = Some(record.written_at_ms);
         self.ownership_sequence = Some(record.seq);
@@ -702,6 +1009,7 @@ pub fn read_raw_at(
         }
     }
     Observed {
+        turn_obligation: record.turn_obligation,
         state: record.state,
         blocked_on: record.blocked_on,
         input_buffer: record.input_buffer,
@@ -759,7 +1067,14 @@ fn write_record(path: &Path, record: &Record) -> anyhow::Result<()> {
     // ([`crate::harness_context`]) stages outside the agent subtree because a replicated
     // temporary name becomes a durable key, and moving this one's staging is a separate change.
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    write_json_atomic(path, record, &dir, ".harness-state")
+    write_json_atomic_with_durability(path, record, &dir, ".harness-state", record_durability(path, record))
+}
+
+fn record_durability(path: &Path, record: &Record) -> crate::fsatomic::Durability {
+    if record.turn_obligation != crate::turn_obligation::Ledger::default()
+        && read_record(path).is_none_or(|previous| previous.turn_obligation != record.turn_obligation) {
+        crate::fsatomic::Durability::FsyncFileAndDir
+    } else { crate::fsatomic::Durability::Rename }
 }
 
 /// Take one driver record's exclusive cross-process lock, held for a read→decide→rename cycle.
@@ -784,6 +1099,17 @@ pub(crate) fn write_json_atomic<T: Serialize>(
     staging_dir: &Path,
     tmp_prefix: &str,
 ) -> anyhow::Result<()> {
+    write_json_atomic_with_durability(path, value, staging_dir, tmp_prefix,
+        crate::fsatomic::Durability::Rename)
+}
+
+fn write_json_atomic_with_durability<T: Serialize>(
+    path: &Path,
+    value: &T,
+    staging_dir: &Path,
+    tmp_prefix: &str,
+    durability: crate::fsatomic::Durability,
+) -> anyhow::Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     if let Some(dir) = path.parent()
         && crate::harness_events::enabled(dir)
@@ -803,7 +1129,7 @@ pub(crate) fn write_json_atomic<T: Serialize>(
         path,
         &bytes,
         crate::fsatomic::Staging::new(tmp_prefix).in_dir(staging_dir),
-        crate::fsatomic::Durability::Rename,
+        durability,
     )?;
     Ok(())
 }
@@ -889,7 +1215,34 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     let seq = highest.map_or(1, |seq| seq.saturating_add(1));
     let now_ms = crate::message::now_ms();
     let written_at_ms = next_stamp(on_disk.as_deref(), now_ms);
+    let mut turn_obligation = on_disk
+        .as_ref()
+        .map(|record| record.turn_obligation.clone())
+        .unwrap_or_default();
+    if let Some(previous) = on_disk.as_ref()
+        && matches!(previous.state, Activity::Active | Activity::Child)
+        && turn_obligation.open.is_empty()
+        && !turn_obligation.terminal.iter().chain(turn_obligation.tool_results.iter().map(|result| &result.terminal)).any(|terminal| {
+            terminal.obligation.provider_incarnation == previous.incarnation
+                && terminal.obligation.ownership_sequence == previous.seq
+                && terminal.observed_at_ms >= previous.written_at_ms
+        })
+        && previous.seq > 0
+    {
+        // A categorical active state proves no native turn identity. Unsupported/legacy
+        // adapters expose scoped unavailable evidence instead of minting a fictitious start.
+        turn_obligation.sequence = turn_obligation.sequence.saturating_add(1);
+        turn_obligation.note_unknown(Some(&previous.incarnation), previous.seq,
+            written_at_ms, "native-turn-tracking-unavailable");
+    }
+    if matches!(read_stored(&writer.path), StoredRecord::Unreadable)
+        || on_disk.as_ref().is_some_and(|previous| previous.seq == 0
+            && matches!(previous.state, Activity::Active | Activity::Child)) {
+        turn_obligation.sequence = turn_obligation.sequence.saturating_add(1);
+        turn_obligation.note_unknown(None, seq, written_at_ms, "predecessor-evidence-unavailable");
+    }
     let record = Record {
+        turn_obligation,
         schema: on_disk
             .as_ref()
             .filter(|record| {
@@ -1041,6 +1394,31 @@ mod tests {
     /// are the two records a replication transport's include list names (HC-R05), and no such
     /// transport runs on the fleet today (`DQ-C1`/`DQ-H2`), so nothing reads them as another uid;
     /// the tightening is recorded against HC-T08 for whoever adopts one.
+    #[test]
+    fn receipt_durability_excludes_heartbeat_and_measures_isolated_boundary_latency() {
+        let root = tempfile::tempdir().unwrap();
+        let mut producer = writer(root.path());
+        producer.observe(active()).unwrap();
+        producer.turn_started(Some("session-fixture"), Some("turn-fixture")).unwrap();
+        let path = harness_state_path(root.path());
+        let mut record = read_record(&path).unwrap();
+        record.written_at_ms += 1;
+        assert_eq!(record_durability(&path, &record), crate::fsatomic::Durability::Rename,
+            "ordinary freshness does not add file and directory fsync");
+        record.turn_obligation.open[0].pending_tool_ids.push("tool-fixture".into());
+        assert_eq!(record_durability(&path, &record), crate::fsatomic::Durability::FsyncFileAndDir);
+        let mut timings = Vec::new();
+        for n in 0..16 {
+            let tool = format!("tool-{n}");
+            let started = std::time::Instant::now();
+            producer.turn_tool(Some("session-fixture"), Some("turn-fixture"), &tool, false).unwrap();
+            timings.push(started.elapsed().as_micros());
+            producer.turn_tool(Some("session-fixture"), Some("turn-fixture"), &tool, true).unwrap();
+        }
+        timings.sort();
+        println!("isolated local receipt write latency: median={}us max={}us; 16 samples; storage is fixture-only, no fleet/disk-reboot guarantee", timings[8], timings[15]);
+    }
+
     #[test]
     fn a_record_is_one_json_line_staged_in_the_directory_the_caller_named() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1354,6 +1732,7 @@ mod tests {
         let skew_ms = duration_ms(HARNESS_STATE_FUTURE_SKEW);
         let raw = |written_at_ms: u64| {
             serde_json::to_vec(&Record {
+                turn_obligation: Default::default(),
                 schema: SCHEMA.to_string(),
                 agent: "example-linux.worker".to_string(),
                 harness: "codex".to_string(),
@@ -1563,6 +1942,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
         let predecessor = Record {
+            turn_obligation: Default::default(),
             schema: SCHEMA.to_string(),
             agent: "example-linux.worker".to_string(),
             harness: "codex".to_string(),
@@ -2080,8 +2460,9 @@ mod tests {
     #[test]
     fn wrapperless_claims_are_atomic_and_never_supersede_a_live_wrapper() {
         let tmp = tempfile::tempdir().unwrap();
-        let wl =
-            |token: &str| claim_wrapperless(tmp.path(), "example-linux.worker", "claude", token).unwrap();
+        let wl = |token: &str| {
+            claim_wrapperless(tmp.path(), "example-linux.worker", "claude", token).unwrap()
+        };
         assert!(wl("claude-session-a").is_some(), "virgin dir");
 
         // A wrapper's FRESH claim placeholder is a session mid-startup, not an ended one: the

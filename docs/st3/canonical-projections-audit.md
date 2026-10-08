@@ -31,6 +31,10 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `local_blobs` | Local | Staged upload bytes awaiting a durable claim reference. Promotion into `blobs` commits with the referencing claim. |
 | `documents` | Shared projection | Shared immutable name/hash binding, binding_claim_id and materialized canonical binding_key. created_index is a local arrival cursor; latest selection and history order use the indexed binding_key. |
 | `desired` | Shared projection | Shared selected declaration, ancestry/conflicts, ownership and full canonical body; existing ancestry/revision/id selection is deterministic and must be preserved. |
+| `agent_turn_obligations` | Shared projection | Canonically selected native receipt, source identity, evidence and attributed acknowledgement. `first_index`, `terminal_index` and `acknowledged_index` are local arrival cursors excluded from its digest. |
+| `agent_turn_obligation_evidence` | Local candidate index | Receipt images retained by this node's admitted/checkpoint history. Superseded carriers may compact; shared heads and the checkpoint current-turn reader proof preserve selected authority. |
+| `local_turn_obligation_versions` | Local | Exact selected receipt images at this node's graph cuts for bounded captured reads. |
+| `local_turn_obligation_pending`, `local_turn_obligation_dirty` | Local | Source mutation queues; queued repairs refuse complete captured reads until committed. |
 | `idempotency` | Local | Local opaque HTTP/operation response cache with local indexes; shared operation identity is operations plus checkpoint_claims. |
 | `mission_run_requests` | Local | Local original request-hash cache paired with idempotency; run identities in this legacy API are origin-scoped. |
 | `events` | Local view | Canonical claim payloads joined to local admitted membership by arrival index. |

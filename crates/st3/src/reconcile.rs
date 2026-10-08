@@ -34,6 +34,7 @@ use crate::resource::{
 use crate::store::Store;
 
 mod channel_recovery;
+mod turn_obligation;
 mod placement;
 
 /// The actor of every attention request the reconciler raises.
@@ -414,6 +415,14 @@ fn record_member_commands(
     Ok(())
 }
 
+/// A physical PTY identity needs both a usable PID and its immutable creation stamp.
+/// Missing metadata never manufactures a driver/adoption incarnation.
+pub fn pty_incarnation(observation: &st_runtime::PtyObservation) -> Option<String> {
+    let pid=observation.pid.filter(|pid| *pid>0 && *pid<=i32::MAX as u32)?;
+    let created=observation.created_at.as_deref().filter(|created| !created.trim().is_empty())?;
+    Some(format!("{pid}:{created}"))
+}
+
 fn observed_pty_status(observation: &st_runtime::PtyObservation) -> String {
     if observation.status == "running"
         && observation
@@ -447,10 +456,7 @@ impl RuntimeControl for NativeRuntime {
         observations
             .into_iter()
             .map(|item| {
-                let incarnation_id = match (&item.pid, &item.created_at) {
-                    (Some(pid), Some(created)) => Some(format!("{pid}:{created}")),
-                    _ => None,
-                };
+                let incarnation_id = pty_incarnation(&item);
                 let status = observed_pty_status(&item);
                 Ok(RuntimeObservation {
                     runtime_id: item.name,
@@ -620,8 +626,18 @@ impl NativeRuntime {
         guard: Option<&dyn Fn() -> Result<()>>,
     ) -> Result<()> {
         let executable = launch_executable()?;
-        let environment =
+        let mut environment =
             member_environment(&member.environment, &executable, self.recorder.as_deref())?;
+        // Login-shell capture can carry an enclosing seat's reserved fence. Only the
+        // immutable agent launch overlay may supply it to this child.
+        if member.kind == crate::model::MemberKind::Agent {
+            match member.environment.get("ST3_TURN_DESIRED_REVISION") {
+                Some(revision) => { environment.insert("ST3_TURN_DESIRED_REVISION".into(), revision.clone()); }
+                None => { environment.remove("ST3_TURN_DESIRED_REVISION"); }
+            }
+        } else {
+            environment.remove("ST3_TURN_DESIRED_REVISION");
+        }
         let mut launch = st_runtime::Launch::from(&member.launch);
         match &mut launch {
             st_runtime::Launch::Shell(source) => {
@@ -2422,6 +2438,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                             });
                             self.runtime.observe_exec(&member.runtime_id)?
                         };
+                        if subject.kind == "agent" && member.driver.is_some()
+                            && observed.as_ref().is_some_and(|observation| observation.status == "running"
+                                && observation.incarnation_id.as_deref().is_none_or(|id| id.trim().is_empty())) {
+                            anyhow::bail!("the live native runtime for {} has no usable physical incarnation; successor admission is unavailable until its runtime metadata is repaired",subject.subject);
+                        }
                         if member.lifecycle == MemberLifecycle::TerminalBound {
                             if let Some(incarnation) =
                                 self.reconcile_terminal_binding(subject, member, observed.as_ref())?
@@ -3118,16 +3139,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         observation: &RuntimeObservation,
         now: u128,
     ) -> Result<()> {
-        if subject.kind != "agent" {
+        if subject.kind != "agent" || observation.status != "running" {
             return Ok(());
         }
         let Some(driver) = member.driver.as_deref() else {
             return Ok(());
         };
-        let Some(incarnation) = observation.incarnation_id.as_deref() else {
-            return Ok(());
-        };
+        let incarnation = observation.incarnation_id.as_deref().filter(|id| !id.trim().is_empty())
+            .context("the live native runtime has no usable incarnation; successor readiness cannot be admitted")?;
         let attention_key = format!("harness-readiness:{0}:{incarnation}", subject.subject);
+        self.reconcile_turn_obligation(subject, observation)?;
         let attention_digest = hex::encode(sha2::Sha256::digest(attention_key.as_bytes()));
         let attention_subject = format!("attention/{}", &attention_digest[..32]);
         let harness_ready = self
@@ -5249,7 +5270,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         launch_member
             .environment
             .insert("ST3_SUBJECT".into(), subject.subject.clone());
+        // This immutable receipt fence belongs to this captured launch, not a later
+        // declaration read or the label-preserving launch lineage.
+        launch_member.environment.remove("ST3_TURN_DESIRED_REVISION");
         if subject.kind == "agent" {
+            launch_member.environment.insert("ST3_TURN_DESIRED_REVISION".into(), crate::store::desired_revision(subject));
             launch_member
                 .environment
                 .insert("ST_AGENT".into(), subject.subject.clone());
@@ -15700,11 +15725,13 @@ mod tests {
     mod differential;
     mod first_readiness_tests;
     mod incremental_deadlines;
+    mod no_successor_native;
     mod ownership_guard_tests;
     mod pull_request_run_tests;
     mod ready_idle_wake;
     mod ref_watch_tests;
     mod rollout_tests;
+    mod turn_obligation_attention;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
         use super::{NativeRuntime, RuntimeControl};
@@ -18704,6 +18731,7 @@ mission "feedback-review" state="ready" {
               agent "worker" {{
                 workspace {:?}
                 command "true"
+                env {{ ST3_TURN_DESIRED_REVISION "authored-stale" }}
               }}
 
         "#,
@@ -18712,12 +18740,15 @@ mission "feedback-review" state="ready" {
         apply_source(&store, &source, "member-identity");
         let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
-            store,
+            store.clone(),
             runtime.clone(),
             "node".into(),
             Arc::new(Notify::new()),
         );
 
+        let captured = store.desired_subjects().unwrap().remove(0);
+        let mut reconciler = reconciler;
+        reconciler.runtime_environment.insert("ST3_TURN_DESIRED_REVISION".into(), "inherited-stale".into());
         reconciler.reconcile_once().unwrap();
 
         let members = runtime.started_members.lock().unwrap();
@@ -18731,6 +18762,16 @@ mission "feedback-review" state="ready" {
             Some(std::env::current_exe().unwrap())
         );
         assert!(!members[0].environment.contains_key("PATH"));
+        let first_revision = members[0].environment["ST3_TURN_DESIRED_REVISION"].clone();
+        assert_eq!(first_revision, crate::store::desired_revision(&captured));
+        drop(members);
+        apply_source(&store, &source.replace("command \"true\"", "command \"false\""), "member-later-revision");
+        assert_eq!(runtime.started_members.lock().unwrap()[0].environment["ST3_TURN_DESIRED_REVISION"], first_revision);
+        let later = store.desired_subjects().unwrap().remove(0);
+        reconciler.perform_start(&later, later.member.as_ref().unwrap(), "fixture separate launch").unwrap();
+        let members = runtime.started_members.lock().unwrap();
+        assert_eq!(members[1].environment["ST3_TURN_DESIRED_REVISION"], crate::store::desired_revision(&later));
+        assert_ne!(members[1].environment["ST3_TURN_DESIRED_REVISION"], first_revision);
     }
 
     fn account_source(logins: &Path, workspace: &Path, harness_body: &str) -> String {

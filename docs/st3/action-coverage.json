@@ -416,6 +416,14 @@
       "verification": "real local CLI; environment guard, exact-build record, revoke, and no daemon or producer child"
     },
     {
+      "command": "st agents acknowledge-turn",
+      "description": "Acknowledge exact unknown turn evidence without settling execution",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_turn_evidence_and_acknowledgement_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; evidence and attributed acknowledgement checked after disk-store restart; absent receipt refused without writes"
+    },
+    {
       "command": "st agents apply",
       "description": "Preview and apply one KDL file containing durable agent seats",
       "tests": [
@@ -503,6 +511,14 @@
         "crates/st3/tests/action_coverage.rs::cli_agent_and_shell_declarations_survive_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st agents turn-obligation",
+      "description": "Inspect bounded durable turn evidence and owner action",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_turn_evidence_and_acknowledgement_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; evidence and attributed acknowledgement checked after disk-store restart; absent receipt refused without writes"
     },
     {
       "command": "st agents workspace",

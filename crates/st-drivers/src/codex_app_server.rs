@@ -981,6 +981,54 @@ impl CodexInboxDelivery {
         }
     }
 
+    fn observe_turn_obligation(&mut self, message: &Value, thread_id: &str) -> Result<()> {
+        if message.pointer("/params/threadId").and_then(Value::as_str) != Some(thread_id) {
+            return Ok(());
+        }
+        let turn = message.pointer("/params/turn/id").and_then(Value::as_str);
+        match (message["method"].as_str(), turn) {
+            (Some("turn/started"), Some(turn)) => self.harness_writer.turn_started(Some(thread_id), Some(turn)),
+            (Some("turn/completed"), Some(turn)) => {
+                let outcome = match message.pointer("/params/turn/status").and_then(Value::as_str) {
+                    Some("completed") => "completed", Some("interrupted") => "cancelled", Some("failed") => "failed",
+                    _ => "unknown",
+                };
+                self.harness_writer.turn_terminal(Some(thread_id), Some(turn), outcome)
+            }
+            (Some("item/started" | "item/completed"), _) => {
+                let kind=message.pointer("/params/item/type").and_then(Value::as_str);
+                let id=message.pointer("/params/item/id").and_then(Value::as_str);
+                let turn=message.pointer("/params/turnId").and_then(Value::as_str);
+                if matches!(kind,Some("commandExecution"|"fileChange"|"mcpToolCall"|"dynamicToolCall"))
+                    && let (Some(id),Some(turn))=(id,turn) {
+                    self.harness_writer.turn_tool(Some(thread_id),Some(turn),id,message["method"]=="item/completed")?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// A subscription's native history can settle a missed live terminal frame. No input,
+    /// tool or model action is issued; each proof retains the exact thread and turn identity.
+    fn observe_turn_history(&mut self, message: &Value, thread_id: &str) -> Result<()> {
+        if message.pointer("/result/thread/id").and_then(Value::as_str) != Some(thread_id) { return Ok(()); }
+        if let Some(turns)=message.pointer("/result/thread/turns").and_then(Value::as_array) {
+            // Read-only bounded provider snapshot. Missing/truncated proof settles nothing.
+            for turn in turns.iter().rev().take(128) {
+                let Some(id)=turn["id"].as_str() else { continue; };
+                match turn["status"].as_str() {
+                    Some("inProgress") => self.harness_writer.turn_started(Some(thread_id),Some(id))?,
+                    Some("completed") => self.harness_writer.turn_terminal(Some(thread_id),Some(id),"completed")?,
+                    Some("interrupted") => self.harness_writer.turn_terminal(Some(thread_id),Some(id),"cancelled")?,
+                    Some("failed") => self.harness_writer.turn_terminal(Some(thread_id),Some(id),"failed")?,
+                    _ => {},
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Hand one inbound control frame to the context producer. Best-effort in the same sense as the
     /// presence refresh and the state projection: a record write that fails must not disturb
     /// delivery. Unlike the state record there is nothing to retain and retry — the next model
@@ -5171,6 +5219,7 @@ fn pump_control(
                     {
                         SubscriptionAcceptance::Accepted { .. } => {
                             if let Some(delivery) = delivery.as_mut() {
+                                delivery.observe_turn_history(&message, thread_id)?;
                                 delivery
                                     .reconcile_resume(&message, &bound)
                                     .context("reconciling Codex resume delivery")?;
@@ -5250,6 +5299,7 @@ fn pump_control(
                     } => Some(turn_id.as_str()),
                     _ => None,
                 };
+                delivery.observe_turn_obligation(&message, state.thread_id())?;
                 delivery.observe_context(&message, state.thread_id(), active_turn);
                 // The subagent axis, for the same reason. Fail-open like the context record.
                 if let Err(error) = crate::subagents::observe_codex(
@@ -5302,6 +5352,7 @@ fn pump_control(
                 {
                     SubscriptionAcceptance::Accepted { changed } => {
                         if let Some(delivery) = delivery.as_mut() {
+                            delivery.observe_turn_history(&message, state.thread_id())?;
                             delivery
                                 .reconcile_resume(&message, state)
                                 .context("reconciling Codex subscription delivery")?;
@@ -5465,6 +5516,7 @@ fn recover_transcript_turn_from_frames(
         atomic_json(control_state_path, state)
             .context("persisting transcript-recovered Codex turn")?;
         if let Some(delivery) = delivery.as_mut() {
+            delivery.harness_writer.turn_started(Some(state.thread_id()),Some(&turn_id))?;
             delivery.observe_harness(&state.observed);
         }
         let _ = events.send(ControlEvent::Observed);

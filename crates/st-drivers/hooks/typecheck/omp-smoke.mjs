@@ -15,22 +15,37 @@ const framesPath = path.join(dir, "frames.jsonl");
 const outboxPath = path.join(dir, "outbox.jsonl");
 const pidPath = path.join(dir, "channel-pids");
 const delayedHelloPath = path.join(dir, "delay-hello");
+const heldTurnAckPath = path.join(dir, "hold-turn-ack");
+const legacyReceiptPath = path.join(dir, "legacy-receipts");
 const recorder = path.join(dir, "recorder");
 fs.writeFileSync(
   recorder,
   `#!${process.execPath}
 import fs from "node:fs";
 fs.appendFileSync(${JSON.stringify(pidPath)}, process.pid + "\\n");
-const hello = () => process.stdout.write(JSON.stringify({ type: "hello", protocol: 1, sessionContext: fs.existsSync(${JSON.stringify(delayedHelloPath)}) ? "late seat context" : "" }) + "\\n");
+const hello = () => process.stdout.write(JSON.stringify({ type: "hello", protocol: 1, capabilities: fs.existsSync(${JSON.stringify(legacyReceiptPath)}) ? [] : ["durable-turn-receipts-v1"], sessionContext: fs.existsSync(${JSON.stringify(delayedHelloPath)}) ? "late seat context" : "" }) + "\\n");
 if (fs.existsSync(${JSON.stringify(delayedHelloPath)})) setTimeout(hello, 6000);
 else hello();
 process.stdin.setEncoding("utf8");
 let pending = "";
+let receiptSequence = 0;
 const record = (chunk) => {
   pending += chunk;
   const boundary = pending.lastIndexOf("\\n");
   if (boundary < 0) return;
   fs.appendFileSync(${JSON.stringify(framesPath)}, pending.slice(0, boundary + 1));
+  for (const line of pending.slice(0, boundary + 1).split("\\n").filter(Boolean)) {
+    const frame = JSON.parse(line);
+    if (["turn_start", "turn_tool", "turn"].includes(frame.type) && frame.requestId) {
+      const response = JSON.stringify({ type: "turn_recorded", requestId: frame.requestId,
+        receipt: frame.receipt ?? { provider_incarnation: "smoke-session", ownership_sequence: 1, source_sequence: ++receiptSequence } }) + "\\n";
+      const acknowledge = () => {
+        if (fs.existsSync(${JSON.stringify(heldTurnAckPath)})) setTimeout(acknowledge, 10);
+        else process.stdout.write(response);
+      };
+      acknowledge();
+    }
+  }
   pending = pending.slice(boundary + 1);
 };
 // Pipe chunks can end inside JSON. Exercise that boundary deliberately and publish only
@@ -259,7 +274,7 @@ assert.strictEqual(
 // A retried turn has not ended, so it claims neither credential edge: only the ordinary end
 // before it may emit a turn result.
 assert.deepStrictEqual(
-  readFrames().filter((frame) => frame.type === "turn").slice(beforeTurns),
+  readFrames().filter((frame) => frame.type === "turn").slice(beforeTurns).map(({ type, error }) => ({ type, ...(error ? { error } : {}) })),
   [{ type: "turn" }],
   "willContinue must emit no turn result",
 );
@@ -295,7 +310,7 @@ assert.strictEqual(
   "terminal error must cancel the older poll without asserting a state word",
 );
 assert.deepStrictEqual(
-  readFrames().filter((frame) => frame.type === "turn").slice(beforeTurns),
+  readFrames().filter((frame) => frame.type === "turn").slice(beforeTurns).map(({ type, error }) => ({ type, ...(error ? { error } : {}) })),
   [
     { type: "turn" },
     { type: "turn", error: { reason: "credential expired", errorId: 16781312 } },
@@ -563,10 +578,50 @@ assert.ok(acknowledged().includes("message/after-subagent"));
 // The top-level session names itself `main` on omp 18.3.2 and later; its events still flow.
 const mainCtx = { ...fullCtx, agent: { kind: "main", id: "Main", name: "main", depth: 0 } };
 const framesBeforeMain = readFrames().length;
-await handlers.get("agent_start")({}, mainCtx);
+fs.writeFileSync(heldTurnAckPath, "hold");
+let startReturned = false;
+const recordedStart = handlers.get("agent_start")({}, mainCtx).then(() => { startReturned = true; });
 await pause(50);
-assert.deepStrictEqual(readFrames().slice(framesBeforeMain), [expectedState("active")]);
+assert.strictEqual(startReturned, false, "native start callback awaits receipt acknowledgement");
+const beforeAcknowledgement = readFrames().slice(framesBeforeMain);
+assert.strictEqual(beforeAcknowledgement.length, 1);
+assert.strictEqual(beforeAcknowledgement[0].type, "turn_start");
+assert.strictEqual(beforeAcknowledgement[0].sessionId, "session-smoke");
+fs.rmSync(heldTurnAckPath);
+await recordedStart;
+await pause(50);
+assert.deepStrictEqual(readFrames().slice(framesBeforeMain).filter((frame) => frame.type !== "turn_start"), [expectedState("active")]);
+// A positively observed delayed invocation result keeps its original receipt even
+// after agent_end and a later native start; a clean later turn supplies no such proof.
+await handlers.get("tool_call")({ toolName: "bash", toolCallId: "late-side-effect", input: {} }, mainCtx);
+const originalTool = readFrames().filter((frame) => frame.type === "turn_tool" && frame.toolId === "late-side-effect").at(-1);
 await handlers.get("agent_end")(successfulEnd, mainCtx);
+await handlers.get("agent_start")({}, mainCtx);
+const laterStart = readFrames().filter((frame) => frame.type === "turn_start").at(-1);
+await handlers.get("tool_result")({ toolName: "bash", toolCallId: "late-side-effect" }, mainCtx);
+const lateResult = readFrames().filter((frame) => frame.type === "turn_tool" && frame.completed && frame.toolId === "late-side-effect").at(-1);
+assert.deepStrictEqual(lateResult.receipt, originalTool.receipt, "delayed result preserves the exact original receipt");
+assert.notDeepStrictEqual(lateResult.receipt, globalThis.__stOmpChannel.activeReceipt, "a later turn cannot impersonate the interrupted invocation");
+assert.ok(laterStart);
+await handlers.get("agent_end")(successfulEnd, mainCtx);
+// A channel advertising receipt support but withholding its ACK yields explicit uncertainty.
+fs.writeFileSync(heldTurnAckPath, "hold");
+const timeoutStart = Date.now();
+await assert.rejects(handlers.get("agent_start")({}, mainCtx), /not acknowledged/);
+assert.ok(Date.now() - timeoutStart >= 4900, "capable channel has a bounded acknowledgement deadline");
+assert.strictEqual(globalThis.__stOmpChannel.activeReceipt, undefined, "failed new start never inherits the previous receipt");
+fs.rmSync(heldTurnAckPath);
+await pause(50);
+// The old channel is detected by its hello; it must not impose that deadline on each hook.
+await handlers.get("session_shutdown")({}, mainCtx);
+fs.writeFileSync(legacyReceiptPath, "legacy");
+await handlers.get("session_start")({}, mainCtx);
+const legacyStart = Date.now();
+await assert.rejects(handlers.get("agent_start")({}, mainCtx), /capability is unavailable/);
+assert.ok(Date.now() - legacyStart < 500, "unsupported channel refuses receipt requests immediately");
+await handlers.get("session_shutdown")({}, mainCtx);
+fs.rmSync(legacyReceiptPath);
+await handlers.get("session_start")({}, mainCtx);
 fs.rmSync(outboxPath, { force: true });
 
 // st3's dedicated todo observation is deliberately absent from the legacy st2 asset.

@@ -8112,3 +8112,29 @@ fn native_codex_login_recovery_requires_a_successful_current_thread_turn() {
         None
     );
 }
+
+#[test]
+fn owed_turn_native_codex_history_is_thread_turn_and_revision_fenced() {
+    let root=tempfile::tempdir().unwrap();
+    let config=delivery_config(root.path());
+    let agent_dir=config.agent_dir.clone();
+    let mut producer=inbox_delivery(root.path(),config);
+    producer.harness_writer=producer.harness_writer.with_turn_fence(Some("fixture-runtime".into()),Some("fixture-revision".into()));
+    let observed=|| harness_state::read(&harness_state::harness_state_path(&agent_dir),None).unwrap().turn_obligation;
+    let start=json!({"method":"turn/started","params":{"threadId":"fixture-thread","turn":{"id":"one"}}});
+    producer.observe_turn_obligation(&start,"fixture-thread").unwrap();
+    assert_eq!(observed().open.len(),1);
+    producer.observe_turn_history(&json!({"result":{"thread":{"id":"other-thread","turns":[{"id":"one","status":"completed"}]}}}),"fixture-thread").unwrap();
+    assert_eq!(observed().open.len(),1);
+    producer.observe_turn_obligation(&json!({"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"one","status":"unknown"}}}),"fixture-thread").unwrap();
+    assert_eq!(observed().open.len(),1);
+    producer.observe_turn_obligation(&json!({"method":"turn/started","params":{"threadId":"fixture-thread","turn":{"id":"two"}}}),"fixture-thread").unwrap();
+    producer.observe_turn_history(&json!({"result":{"thread":{"id":"fixture-thread","turns":[{"id":"one","status":"completed"}]}}}),"fixture-thread").unwrap();
+    assert_eq!(observed().open.len(),1);
+    assert_eq!(observed().open[0].native_turn_id.as_deref(),Some("two"));
+    producer.observe_turn_obligation(&json!({"method":"item/started","params":{"threadId":"fixture-thread","turnId":"two","item":{"type":"commandExecution","id":"fixture-side-effect"}}}),"fixture-thread").unwrap();
+    assert!(observed().open[0].tool_outcome_unknown);
+    producer.observe_turn_history(&json!({"result":{"thread":{"id":"fixture-thread","turns":[{"id":"two","status":"completed"}]}}}),"fixture-thread").unwrap();
+    assert!(observed().open.is_empty());
+    assert!(observed().unknown_tool_outcome,"positive turn end cannot erase a missing native tool result");
+}

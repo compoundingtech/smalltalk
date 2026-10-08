@@ -17,6 +17,7 @@ mod rollouts;
 mod seat_status;
 #[cfg(test)]
 mod roster_controls;
+pub(crate) mod turn_obligation;
 pub(crate) mod step_labels;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -333,6 +334,10 @@ WHERE kind='harness.observed'
 
 -- Attachment checks must not walk a quiet seat's accumulated hook and work history.
 -- Only phase transitions publish these diagnostics, so a current-runtime lookup stays small.
+CREATE INDEX IF NOT EXISTS claims_turn_obligation_index
+ON claims(subject, store_index)
+WHERE kind='harness.observed' AND json_type(body,'$.fields.turn_obligation')='object';
+
 CREATE INDEX IF NOT EXISTS claims_claude_attachment_index
 ON claims(
     subject,
@@ -3327,6 +3332,7 @@ impl Store {
         rebuild_planning_tx(&transaction)?;
         resources::rebuild(&transaction)?;
         glass_heads::rebuild(&transaction)?;
+        turn_obligation::rebuild(&transaction)?;
         arrangements::rebuild(&transaction)?;
         transaction.commit()?;
         Ok(())
@@ -18268,7 +18274,7 @@ fn current_desired_row_tx(
         .map_err(Into::into)
 }
 
-fn desired_revision(desired: &DesiredSubject) -> String {
+pub(crate) fn desired_revision(desired: &DesiredSubject) -> String {
     let mut desired = desired.clone();
     desired.desired = canonical_json_value(&desired.desired);
     canonical_hash(&desired).expect("desired subject serializes")
@@ -18788,8 +18794,13 @@ fn insert_local_observation_tx(
     input: &ClaimInput,
     observed_at: u128,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    // Receipt snapshots have their own durable graph projection. A local freshness row
+    // need not duplicate the entire historical ledger; its request digest still checks
+    // retries against the original producer payload.
+    let mut local_fields = input.fields.clone();
+    if input.kind == "harness.observed" { local_fields.remove("turn_obligation"); }
     let mut body = json!({
-        "fields": &input.fields,
+        "fields": local_fields,
         "evidence": input.evidence,
     });
     let dedupe_key = input
@@ -19216,6 +19227,10 @@ fn publish_changed_harness_state_tx(
         input.fields.get("incarnation_id").and_then(Value::as_str),
     )?;
     let mut fields = input.fields.clone();
+    if let Some(raw) = fields.remove("turn_obligation")
+        && let Some(delta) = turn_obligation::publication_delta(transaction, &input.subject, &raw).map_err(internal)? {
+        fields.insert("turn_obligation".into(), delta);
+    }
     if let Some(previous) = latest.as_ref().and_then(|claim| claim.body.get("fields")) {
         for name in ["blocked_on", "ask"] {
             if !fields.contains_key(name)
@@ -20354,6 +20369,9 @@ pub(crate) fn append_claim_tx(
     if matches!(kind, "glass.upserted" | "glass.deleted") {
         glass_heads::flush(transaction)?;
     }
+    if matches!(kind, "harness.observed" | "harness.turn-acknowledged") {
+        turn_obligation::flush(transaction)?;
+    }
     if kind == "message.sent" {
         agent_messages::flush(transaction)?;
     }
@@ -21342,6 +21360,7 @@ fn update_prompt_fence(
     }
     let text = |name: &str| fields[name].as_str().map(str::to_owned);
     Ok(Some(crate::model::CurrentHarnessView {
+        turn_recovery: None,
         state: "blocked".into(),
         driver: text("driver"),
         incarnation_id: incarnation.into(),
@@ -21401,6 +21420,7 @@ fn claude_attachment_fence(
     }
     let starting = body["fields"]["status"] == "starting";
     Ok(Some(crate::model::CurrentHarnessView {
+        turn_recovery: None,
         state: if starting { "starting" } else { "blocked" }.into(),
         driver: Some("claude".into()),
         incarnation_id: incarnation.into(),
@@ -21515,6 +21535,7 @@ fn current_harness_fold_at(
         .optional()?;
     if let Some((claim, observed_at, reason)) = admission {
         return Ok(Some(crate::model::CurrentHarnessView {
+            turn_recovery: None,
             state: "indeterminate".into(),
             driver: None,
             incarnation_id: incarnation_id.into(),
@@ -21554,6 +21575,7 @@ fn current_harness_fold_at(
         auth_restored = fields["provider_auth"] == true;
         if fields["provider_auth"] == false {
             return Ok(Some(crate::model::CurrentHarnessView {
+                turn_recovery: None,
                 state: "needs-login".into(),
                 driver: fields["driver"].as_str().map(str::to_owned),
                 incarnation_id: incarnation_id.into(),
@@ -21610,6 +21632,7 @@ fn current_harness_fold_at(
         let fields = &body["fields"];
         let driver = fields["driver"].as_str().unwrap_or("claude");
         return Ok(Some(crate::model::CurrentHarnessView {
+            turn_recovery: None,
             state: state.into(),
             driver: Some(driver.into()),
             incarnation_id: incarnation_id.to_owned(),
@@ -21770,6 +21793,7 @@ fn current_harness_fold_at(
         && harness_key.as_ref().is_none_or(|harness_key| key > *harness_key)
     {
         return Ok(Some(crate::model::CurrentHarnessView {
+            turn_recovery: None,
             state: "working".into(),
             driver: optional.remove("driver").flatten(),
             incarnation_id: incarnation_id.to_owned(),
@@ -21806,6 +21830,7 @@ fn current_harness_fold_at(
         }
     }
     Ok(Some(crate::model::CurrentHarnessView {
+        turn_recovery: None,
         state,
         driver: optional.remove("driver").flatten(),
         incarnation_id: incarnation_id.to_owned(),
@@ -27555,6 +27580,7 @@ fn replay_graph_from_nothing_with_progress_tx(
     resources::rebuild(transaction).map_err(internal)?;
     stage("full-replay/glass-heads");
     glass_heads::rebuild(transaction).map_err(internal)?;
+    turn_obligation::rebuild(transaction).map_err(internal)?;
     stage("full-replay/custom");
     custom::rebuild(transaction).map_err(internal)?;
     stage("full-replay/arrangements");
@@ -53757,6 +53783,12 @@ fn append_claim_with_subject_fences(
             if let Some((subject, revision, current)) = observer_completion {
                 check_observer_completion(transaction, subject, revision, Some(current))?;
             }
+            if input.kind == "operational.failure"
+                && input.fields.get("condition").and_then(Value::as_str) == Some("turn-obligation")
+                && event_runtime.is_some()
+            {
+                owned_sets::guard_member(transaction, &input.subject)?;
+            }
             let outcome = (|| {
             check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
             let settled_receipt = if let Some(fence) = fence {
@@ -53804,6 +53836,9 @@ fn append_claim_with_subject_fences(
             }
             if let Some((operation_id, request_digest)) = &operation {
                 checkpointed_operation_outcome(transaction, operation_id, request_digest)?;
+            }
+            if input.kind == "harness.turn-acknowledged" {
+                turn_obligation::validate_acknowledgement_tx(transaction, input)?;
             }
             if let Some(expected_subjects) = expected_subjects {
                 for (subject, expected) in expected_subjects {
@@ -54109,6 +54144,15 @@ fn append_latest_observation_publication(
         .connection
         .batched(|transaction| {
             check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
+            let obligation_changed = if input.kind == "harness.observed" {
+                match input.fields.get("turn_obligation") {
+                    Some(raw) => match turn_obligation::publication_delta(transaction, &input.subject, raw).map_err(internal)? {
+                        Some(delta) => turn_obligation::wakes_reconciler(transaction, &input.subject, &delta).map_err(internal)?,
+                        None => false,
+                    },
+                    None => false,
+                }
+            } else { false };
             let (mut local, appended) =
                 insert_local_observation_tx(transaction, &graph.origin, input, now)?;
             if !appended {
@@ -54133,7 +54177,7 @@ fn append_latest_observation_publication(
             };
             let status_transition = published.as_ref().is_some_and(|claim| {
                 input.kind == "harness.observed"
-                    && claim.body["fields"]["status_transition"] == true
+                    && (claim.body["fields"]["status_transition"] == true || obligation_changed)
             });
             if input.kind == "harness.observed" && event_runtime.is_some() {
                 // Native acknowledgements echo the admitted producer event, including on
@@ -54175,6 +54219,9 @@ const PROJECTION_DIGEST_TABLES: &[(&str, &[&str])] = &[
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("glass_heads", &[]),
+    // Candidate receipt images are a local index: checkpoints may replace older
+    // carriers. Selected heads and the checkpoint reader proof retain authority.
+    ("agent_turn_obligations", &["first_index", "terminal_index", "acknowledged_index"]),
     ("custom_registrations", &[]),
     ("custom_sources", &[]),
     ("custom_dependencies", &[]),

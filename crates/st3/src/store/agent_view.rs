@@ -544,6 +544,7 @@ fn observed(
                  transport: Option<String>,
                  reason: Option<String>,
                  blocked_on: Option<&str>| crate::model::CurrentHarnessView {
+        turn_recovery: None,
         state: state.into(),
         driver,
         incarnation_id: incarnation.into(),
@@ -661,6 +662,7 @@ fn observed(
             }
         }
         Some(crate::model::CurrentHarnessView {
+            turn_recovery: None,
             state,
             driver: field("driver"),
             incarnation_id: incarnation.into(),
