@@ -3042,6 +3042,18 @@ impl Store {
     }
 
     #[cfg(test)]
+    fn count_refolded_cards_for_test(&self, cards: usize) {
+        self.smalltalk.agent_resources_refolded_cards.fetch_add(cards, std::sync::atomic::Ordering::Relaxed);
+        self.smalltalk.agent_resources_largest_fold.fetch_max(cards, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The most cards one projection call folded since the store opened.
+    #[cfg(test)]
+    pub(crate) fn agent_resources_largest_fold_for_test(&self) -> usize {
+        self.smalltalk.agent_resources_largest_fold.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     pub(crate) fn agent_resources_refolded_cards_for_test(&self) -> usize {
         self.smalltalk.agent_resources_refolded_cards.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -3071,16 +3083,41 @@ impl Store {
         Some(wake)
     }
 
-    /// Whether a fold at `index` can start from the newest complete roster and refold only the
-    /// cards whose claims changed since, rather than every card.
-    pub(crate) fn agent_roster_delta_known(&self, index: u64, history: bool) -> Result<bool> {
+    /// Whether a complete roster at `index` takes folding at most `bound` cards: the newest
+    /// rows, complete or partial, say which cards changed since, and together with the agents
+    /// they do not cover yet those are no more than `bound`. Read in the snapshot that folds.
+    pub(crate) fn agent_roster_completion_bounded(
+        &self,
+        index: u64,
+        history: bool,
+        bound: usize,
+    ) -> Result<bool> {
         let previous = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
-            .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
+            .filter(|entry| entry.history == history && entry.index <= index)
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
-        let Some(previous) = previous else { return Ok(false) };
-        Ok(previous.index == index
-            || self.changed_agent_resources(previous.index, index, &previous.items)?.is_some())
+        // Without rows to start from, every agent is missing: a small roster, or an empty
+        // one, still completes in one bounded fold.
+        let changed = match &previous {
+            None => 0,
+            Some(previous) if previous.index == index => 0,
+            Some(previous) => match self.changed_agent_resources(previous.index, index, &previous.items)? {
+                Some(delta) => delta.subjects.len(),
+                None => return Ok(false),
+            },
+        };
+        let connection = self.readers.get();
+        let names = connection.prepare_cached(RANGE_SUBJECTS)?
+            .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        let names = if history { names } else {
+            self.current_view_candidates(&connection, names, index, true)?
+        };
+        drop(connection);
+        let folded = previous.iter().flat_map(|previous| previous.items.iter())
+            .filter_map(|item| item["id"].as_str()).collect::<HashSet<_>>();
+        let missing = names.iter().filter(|name| !folded.contains(name.as_str())).count();
+        Ok(changed.saturating_add(missing) <= bound)
     }
 
     /// Whether a refresher keeps the roster published, so readers must never fold it.
@@ -3274,15 +3311,37 @@ impl Store {
         selected: Option<&BTreeSet<String>>,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
+        self.cached_agent_resources_folding(index, history, selected, false, build)
+    }
+
+    /// [`Self::cached_agent_resources_for`] for one chunk of a roster assembled in short folds:
+    /// it refolds only the `selected` agents. Changed cards outside them leave the published
+    /// rows' coverage and fold with their own chunk, so one call folds at most `selected`.
+    pub(crate) fn cached_agent_resources_chunk(
+        &self,
+        index: u64,
+        history: bool,
+        selected: &BTreeSet<String>,
+        build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
+    ) -> Result<Vec<Value>> {
+        self.cached_agent_resources_folding(index, history, Some(selected), true, build)
+    }
+
+    fn cached_agent_resources_folding(
+        &self,
+        index: u64,
+        history: bool,
+        selected: Option<&BTreeSet<String>>,
+        chunk: bool,
+        build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
+    ) -> Result<Vec<Value>> {
         // Cold presentation reads current desired/queue tables even for historical status
         // cuts. Do not reuse rows from an older physical projection for those requests.
         if index < current_index(&self.readers.get())? {
             let mut items = crate::performance::task("roster/card-projection",
                 || build(selected.map(|names| (names, &[][..]))))?;
             #[cfg(test)]
-            self.smalltalk.agent_resources_refolded_cards.fetch_add(
-                items.len(), std::sync::atomic::Ordering::Relaxed,
-            );
+            self.count_refolded_cards_for_test(items.len());
             items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                 .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
             return Ok(items);
@@ -3351,7 +3410,13 @@ impl Store {
                     changed.extend(statement.query_map(params![previous.local, local, index],
                         |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<BTreeSet<_>>>()?);
                 }
-                let covered = match (&previous.covered, selected) {
+                // A chunk treats complete rows as covering exactly the agents they hold.
+                let previous_covered: Option<BTreeSet<String>> = match &previous.covered {
+                    None if chunk => Some(previous.items.iter()
+                        .filter_map(|item| item["id"].as_str().map(str::to_owned)).collect()),
+                    covered => covered.clone(),
+                };
+                let mut covered: Option<BTreeSet<String>> = match (&previous_covered, selected) {
                     (None, _) => None,
                     (Some(covered), Some(names)) => {
                         changed.retain(|name| covered.contains(name));
@@ -3393,10 +3458,17 @@ impl Store {
                 } else {
                     previous.valid_until_unix_ms
                 };
+                // A chunk defers changed cards outside it: they leave the coverage and the rows.
+                let mut deferred = BTreeSet::new();
+                if chunk && let (Some(names), Some(covered)) = (selected, covered.as_mut()) {
+                    deferred = changed.difference(names).cloned().collect::<BTreeSet<_>>();
+                    changed.retain(|name| names.contains(name));
+                    covered.retain(|name| !deferred.contains(name));
+                }
                 // Coverage gaps join `changed`, so an empty set means no card this cut can see
                 // moved at all: the previous rows already are this cut's projection, and the
                 // heartbeat or fleet-only claim between two reads costs no clone, sort or build.
-                if changed.is_empty() {
+                if changed.is_empty() && deferred.is_empty() {
                     return Ok(runtime::AgentResourcesEntry {
                         index, local, history, covered,
                         valid_until_unix_ms,
@@ -3407,14 +3479,15 @@ impl Store {
                 #[cfg(test)]
                 self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut items = previous.items.iter()
-                    .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
+                    .filter(|item| {
+                        let id = item["id"].as_str().unwrap_or_default();
+                        !changed.contains(id) && !deferred.contains(id)
+                    })
                     .cloned().collect::<Vec<_>>();
                 let rebuilt = crate::performance::task("roster/card-projection",
                     || build(Some((&changed, queue_metadata.as_deref().unwrap_or(&previous.items)))))?;
                 #[cfg(test)]
-                self.smalltalk.agent_resources_refolded_cards.fetch_add(
-                    rebuilt.len(), std::sync::atomic::Ordering::Relaxed,
-                );
+                self.count_refolded_cards_for_test(rebuilt.len());
                 items.extend(rebuilt);
                 items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
@@ -3431,9 +3504,7 @@ impl Store {
                 let mut items = crate::performance::task("roster/card-projection",
                     || build(selected.map(|names| (names, &[][..]))))?;
                 #[cfg(test)]
-                self.smalltalk.agent_resources_refolded_cards.fetch_add(
-                    items.len(), std::sync::atomic::Ordering::Relaxed,
-                );
+                self.count_refolded_cards_for_test(items.len());
                 items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
                 Ok(runtime::AgentResourcesEntry {

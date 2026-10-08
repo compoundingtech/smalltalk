@@ -2286,19 +2286,21 @@ fn client_agent_cards_for_page(
         .iter()
         .filter_map(|r| r["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    let cards = client_agent_cards_selected(store, history, index, &selected)
+    let cards = client_agent_cards_selected(store, history, index, &selected, false)
         .map_err(ApiError::internal)?;
     client_agent_cards_from_cached(store, cards, refs, at)
 }
 
 /// The cards of `selected` agents at `index`, folding only those not already cached there.
+/// A `chunk` of a roster assembled in short folds refolds no card outside `selected`.
 fn client_agent_cards_selected(
     store: &Store,
     history: bool,
     index: u64,
     selected: &BTreeSet<String>,
+    chunk: bool,
 ) -> anyhow::Result<Vec<Value>> {
-    store.cached_agent_resources_for(index, history, Some(selected), |changed| {
+    let build = |changed: Option<(&BTreeSet<String>, &[Value])>| {
         let (subjects, previous) = changed.expect("a selected page always names its missing cards");
         // Delta metadata is current and already diffed; only cold pages need shallow refs.
         // Frozen continuation refs remain response metadata, never shared cache inputs.
@@ -2314,7 +2316,12 @@ fn client_agent_cards_selected(
         )?;
         add_agent_todos(store, &mut cards, index)?;
         Ok(cards)
-    })
+    };
+    if chunk {
+        store.cached_agent_resources_chunk(index, history, selected, build)
+    } else {
+        store.cached_agent_resources_for(index, history, Some(selected), build)
+    }
 }
 
 fn client_agent_cards_from_cached(
@@ -4376,13 +4383,27 @@ fn warm_agent_roster(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Publish the complete roster at a new cut. When the newest complete roster tells which cards
-/// changed since, one short snapshot refolds only those. Otherwise the cards fold in short
-/// snapshots of at most [`AGENT_ROSTER_WARM_CHUNK`]: each folds the next agents at its own cut
-/// and refolds the already folded cards whose claims changed, so the last step completes a
-/// roster coherent at its cut. Readers keep the previous complete roster meanwhile.
+/// How many times a refresh folds the roster in chunks before it gives up on a roster that
+/// keeps changing in ways it cannot follow card by card.
+const AGENT_ROSTER_ASSEMBLY_ROUNDS: usize = 3;
+
+/// Publish the complete roster at a new cut, never folding more than
+/// [`AGENT_ROSTER_WARM_CHUNK`] cards in one snapshot. A snapshot completes the roster only once
+/// the newest rows say which cards changed and at most that many are changed or missing.
+/// Otherwise the cards fold in chunks, each at its own cut, refolding the already folded cards
+/// whose claims changed, and completion is tried again. Readers keep the previous complete
+/// roster meanwhile; if it cannot be assembled, they keep it until its requests are overdue.
 fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
-    if !store.read_snapshot(|index| store.agent_roster_delta_known(index, history))? {
+    let complete = |store: &Store| store.read_snapshot(|index| {
+        if !store.agent_roster_completion_bounded(index, history, AGENT_ROSTER_WARM_CHUNK)? {
+            return Ok(false);
+        }
+        client_agent_resources_cached(store, history, index).map(|_| true)
+    });
+    for _ in 0..AGENT_ROSTER_ASSEMBLY_ROUNDS {
+        if complete(store)? {
+            return Ok(());
+        }
         let order = store.read_snapshot(|index| {
             Ok(client_agent_page_refs(store, history, index)?.iter()
                 .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
@@ -4391,11 +4412,14 @@ fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
         for chunk in order.chunks(AGENT_ROSTER_WARM_CHUNK) {
             let chunk = chunk.iter().cloned().collect::<BTreeSet<_>>();
             store.read_snapshot(|index| {
-                client_agent_cards_selected(store, history, index, &chunk).map(drop)
+                client_agent_cards_selected(store, history, index, &chunk, true).map(drop)
             })?;
         }
     }
-    store.read_snapshot(|index| client_agent_resources_cached(store, history, index).map(drop))
+    if complete(store)? {
+        return Ok(());
+    }
+    anyhow::bail!("the agents roster kept changing in ways no short fold can follow; keeping the previous one")
 }
 
 /// Every current agent's refs, and the cards of as many as the largest window or page shows.
@@ -4404,7 +4428,7 @@ fn client_agent_roster_head(store: &Store, index: u64) -> anyhow::Result<()> {
     let head = refs.iter().take(CLIENT_MAX_PAGE_ITEMS + 1)
         .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    client_agent_cards_selected(store, false, index, &head).map(drop)
+    client_agent_cards_selected(store, false, index, &head, false).map(drop)
 }
 
 /// For a read that asked to see what was written before it: wait, briefly, for the refresher
@@ -23118,6 +23142,63 @@ mission "wake" state="ready" {
                 checked_agent_cache(&state.store, false, index);
             }
         }
+    }
+
+    #[test]
+    fn agent_roster_refresh_publishes_an_empty_or_small_roster_at_once() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let _wake = store.start_agent_roster_refresher().unwrap();
+        for history in [false, true] {
+            refresh_agent_roster(store, history).unwrap();
+            let (cut, cards, _) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
+            assert_eq!((cut, cards.len()), (store.index().unwrap(), 0), "history {history}");
+        }
+        store.append_claim(&ClaimInput {
+            subject: "agent/small-roster".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":"small",
+                "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        for history in [false, true] {
+            refresh_agent_roster(store, history).unwrap();
+            let (_, cards, _) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
+            assert_eq!(cards.len(), 1, "history {history}");
+        }
+    }
+
+    #[test]
+    fn agent_roster_refresh_never_folds_more_than_a_chunk_in_one_call() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let add = |agents: std::ops::Range<usize>| for n in agents {
+            store.append_claim(&ClaimInput {
+                subject: format!("agent/bound-{n:04}"), kind: "runtime.observed".into(),
+                actor: None, fields: serde_json::from_value(json!({"status":"running",
+                    "runtime_id":format!("bound-{n}"), "incarnation_id":"one"})).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        let _wake = store.start_agent_roster_refresher().unwrap();
+        // Cold: nothing to start from.
+        add(0..600);
+        refresh_agent_roster(store, false).unwrap();
+        let (_, cards, _) = store.published_agent_roster(store.index().unwrap(), false).unwrap();
+        assert_eq!(cards.len(), 600);
+        // More changed and missing cards than one fold may take.
+        add(600..900);
+        refresh_agent_roster(store, false).unwrap();
+        let (cut, cards, _) = store.published_agent_roster(store.index().unwrap(), false).unwrap();
+        assert_eq!((cut, cards.len()), (store.index().unwrap(), 900));
+        assert!(store.agent_resources_largest_fold_for_test() <= AGENT_ROSTER_WARM_CHUNK,
+            "one call folded {} cards", store.agent_resources_largest_fold_for_test());
+        // A few changes complete in one short fold.
+        add(900..910);
+        refresh_agent_roster(store, false).unwrap();
+        assert_eq!(store.published_agent_roster(store.index().unwrap(), false).unwrap().1.len(), 910);
+        assert!(store.agent_resources_largest_fold_for_test() <= AGENT_ROSTER_WARM_CHUNK);
     }
 
     #[test]
