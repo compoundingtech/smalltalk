@@ -1,8 +1,8 @@
-import { Agent, Revision, decodeUnknownSync, type AgentEncoded } from '@smalltalk/st3-client/schema'
+import { Agent, AgentId, Revision, decodeUnknownSync, type AgentEncoded } from '@smalltalk/st3-client/schema'
 import { expect, test } from 'vitest'
 
 import { fixtureAttention, fixtureMissions } from '../missions/fixtures.ts'
-import { createProjections, fleetFromAgents } from './projections.ts'
+import { createProjections, fleetFromAgents, terminalSubjectForAgent } from './projections.ts'
 
 test.each([
   { state: 'running', harness_state: 'idle', blocked_on: null, fault: null, activity: 'idle' },
@@ -59,6 +59,23 @@ const row = decodeUnknownSync(
   updated_at: '2026-10-04T12:00:00.000Z',
 } satisfies AgentEncoded)
 
+test.each([
+  ['agent/example', 'terminal/example'],
+  ['agent/example-seat', 'terminal/example-seat'],
+  ['agent/team/seat', 'terminal/team/seat'],
+])('projects native agent identity %s through the shared terminal subject contract', (id, terminal) => {
+  const nativeId = decodeUnknownSync(AgentId)(id)
+  expect(terminalSubjectForAgent(nativeId)).toBe(terminal)
+  expect(fleetFromAgents([{ ...row, id: nativeId }]).agents[0]?.terminal).toBe(terminalSubjectForAgent(nativeId))
+})
+
+test.each(['example-seat', 'team/seat', 'terminal/example', '', 'agent/', 'agent/example seat'])(
+  'does not invent a terminal subject for the rejected native identity %s',
+  id => {
+    expect(() => decodeUnknownSync(AgentId)(id)).toThrow()
+    expect(terminalSubjectForAgent(id)).toBeUndefined()
+  },
+)
 test('incremental fleet projection retains unchanged rows, hosts and collection identity', () => {
   const project = createProjections()
   const second: Agent = { ...row, id: 'agent/second', name: 'Second' }

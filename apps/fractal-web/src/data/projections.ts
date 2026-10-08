@@ -15,6 +15,15 @@ import type { MissionView, ProposedMissionFields } from '../missions/model.ts'
 import type { SubjectSummary } from '../shell/context.tsx'
 import type { Agent, Fleet, Host, Known } from './source.ts'
 
+const isAgentId = Schema.is(St3.AgentId)
+
+/** Match the native agent identity boundary before deriving any terminal subject. */
+export function terminalSubjectForAgent(id: St3.AgentId): string
+export function terminalSubjectForAgent(id: string): string | undefined
+export function terminalSubjectForAgent(id: string): string | undefined {
+  return isAgentId(id) ? `terminal/${id.slice('agent/'.length)}` : undefined
+}
+
 const harnesses = ['omp', 'claude', 'codex'] as const
 
 /** `host/<id>` → `<id>`; an agent without a host row runs on the gateway's own host. */
@@ -71,7 +80,7 @@ const agentFromRow = (row: St3.Agent): Agent => {
   const lastActivityAt = Option.getOrUndefined(row.last_activity_at)
   return {
     ref: row.id,
-    terminal: `terminal/${row.id.slice('agent/'.length)}`,
+    terminal: terminalSubjectForAgent(row.id),
     name: row.name,
     host: hostName(row),
     ...(harness === undefined ? {} : { harness }),

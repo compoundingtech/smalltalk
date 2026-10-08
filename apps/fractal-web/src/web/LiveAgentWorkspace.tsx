@@ -1,6 +1,7 @@
 import { sidebarRow } from './sidebarRow.ts'
 import { ConversationPane } from './ConversationPane.tsx'
 import { ConversationHeaderActions } from './ConversationHeaderActions.tsx'
+import { changesNotice, liveChangesState, workspaceView, workspaceViewNotice, type ChangesState, type WorkspaceView } from './workspaceView.ts'
 import { ThreadHeaderSlotContext } from '../shell/threadHeaderSlot.tsx'
 import { liveLegacyTheme } from '../ui-compat/live-theme.stylex.ts'
 import { colorVars as c, typeVars as t, spaceVars as s, geometryVars as g } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
@@ -12,6 +13,7 @@ import { Schema } from 'effect'
 import * as Atom from 'effect/reactivity/Atom'
 import { SidebarAgentRow, ThreadHeader, ResizableSplit, assistantDarkTheme, liveComposerDarkTheme, liveAccentTheme, compositionLightTheme } from '@smalltalk/fractal-ui/assistant-ui/shell'
 import type { WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
+import { terminalSubjectForAgent } from '../data/projections.ts'
 import { useFleet, useSubjectList, useConnection, useNow } from '../data/react.tsx'
 import { persistedAtom } from '../state/persistence.ts'
 import { WorkbenchContextProvider, ResourcePanelProvider, MonitorDetailProvider, type OpenRequest } from '../shell/context.tsx'
@@ -66,6 +68,9 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
   const rosterCommit = React.useCallback((node: HTMLElement | null) => node === null || !rosterObserved ? undefined : ux?.rosterCommitted(), [ux, rosterObserved])
   const current = initialAgentFromUrl() ?? (storedAgent || agents[0]?.ref || '')
   const agent = agents.find((row) => row.ref === current)
+  // Fleet projection assigns every agent this canonical subject address; it is not a
+  // claim that the runtime has a terminal or that terminal input is granted.
+  const terminalRef = agent?.terminal ?? terminalSubjectForAgent(current)
   const [headerSlot, setHeaderSlot] = React.useState<HTMLDivElement | null>(null)
   const [search, setSearch] = React.useState('')
   const [panes, setPanes] = useAtom(workspacePanes(current))
@@ -139,8 +144,8 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                       ))}
                     </nav>
                     {fleet._tag !== 'Observed' ? (
-                      <p role="status" {...stylex.props(styles.notice)}>
-                        {fleet._tag === 'Waiting' ? 'Waiting for the agent roster.' : 'Agent roster unavailable: ' + fleet.detail}
+                      <p role="status" data-wf-roster-reason={fleet._tag === 'Unavailable' ? fleet.reason : undefined} {...stylex.props(styles.notice)}>
+                        {fleet._tag === 'Waiting' ? 'Waiting for the agent roster.' : fleet.reason === 'ungranted' ? 'Read access to the agent roster has not been granted.' : fleet.reason === 'unsupported' ? 'This connection does not support the agent roster.' : 'The agent roster could not be loaded; reconnect and try again.'}
                       </p>
                     ) : stale ? (
                       <p role="status" {...stylex.props(styles.notice)}>
@@ -161,7 +166,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
               </aside>
               <ResizableSplit id="live-agent-sidebar" value={width} min={208} max={maxSidebar} collapsed={collapsed} label="Agent sidebar width" onChange={(value) => { setCollapsed(false); setDragWidth(value) }} onCommit={(value) => { setRatio(value / viewport); setDragWidth(undefined) }} onToggle={() => setCollapsed(!collapsed)} onReset={() => { setCollapsed(false); setRatio(256 / viewport) }} />
               <section aria-label="Agent workspace" {...stylex.props(styles.workspace)}>
-                <ThreadHeader terminalAvailable={Boolean(agent?.terminal)} nativeActions={current === '' || selectedPane !== 'thread' ? undefined : <ConversationHeaderActions key={current} agentRef={current} />} actionPortalRef={setHeaderSlot} folder={agent?.host} title={agent?.name ?? (current || 'Select an agent')} status={headerRow?.status} statusLabel={headerRow?.statusLabel} statusSince={headerRow?.statusSince} freshness={stale ? 'stale' : agent === undefined ? 'unobserved' : 'live'} now={now} panelOpen={diffOpen} drawerOpen={selectedPane.includes('terminal/')} onTogglePanel={() => setDiffOpen((value) => !value)} onToggleDrawer={() => { if (agent?.terminal) open({ ref: agent.terminal }) }} />
+                <ThreadHeader terminalAvailable={terminalRef !== undefined} nativeActions={current === '' || selectedPane !== 'thread' ? undefined : <ConversationHeaderActions key={current} agentRef={current} />} actionPortalRef={setHeaderSlot} folder={agent?.host} title={agent?.name ?? (current || 'Select an agent')} status={headerRow?.status} statusLabel={headerRow?.statusLabel} statusSince={headerRow?.statusSince} freshness={stale ? 'stale' : agent === undefined ? 'unobserved' : 'live'} now={now} panelOpen={diffOpen} drawerOpen={selectedPane.includes('terminal/')} onTogglePanel={() => setDiffOpen((value) => !value)} onToggleDrawer={() => { if (selectedPane.startsWith('terminal/')) navigate(current); else if (terminalRef !== undefined) open({ ref: terminalRef }) }} />
                 {visiblePanes.length > 0 ? (
                   <div role="toolbar" aria-label="Workspace views" {...stylex.props(styles.tabs)}>
                     <Aria.Button aria-pressed={selectedPane === 'thread'} onPress={() => navigate(current)} {...stylex.props(styles.textButton)}>
@@ -178,20 +183,14 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                   </div>
                 ) : null}
                 <div {...stylex.props(styles.body)}>
-                  {current === '' ? (
-                    <div {...stylex.props(styles.empty)}>Choose an agent to open its live thread.</div>
-                  ) : (
-                    <ConversationPane key={current} agentRef={current} agentName={agentName} onOpenTool={setOpenedTool} />
-                  )}
+                  <WorkspaceBody current={current} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} />
                 </div>
               </section>
               {diffOpen && openedTool === undefined && current !== '' ? (
                 <>
                   <ResizableSplit id="live-change-panel" reverse value={panelSize} min={240} max={maxPanel} collapsed={false} label="Change panel width" onChange={setDragPanel} onCommit={(value) => { setPanelFraction(value / viewport); setDragPanel(undefined) }} onToggle={() => setDiffOpen(false)} onReset={() => setPanelFraction(380 / viewport)} />
                   <aside aria-label="Changes" style={{ width: panelSize }} {...stylex.props(styles.changesPanel)}>
-                    <p role="status" {...stylex.props(styles.notice)}>
-                      Changes appear only after verified transcript observations.
-                    </p>
+                    <ChangesPanelNotice state={liveChangesState} />
                   </aside>
                 </>
               ) : null}
@@ -213,6 +212,17 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
       </ResourcePanelProvider>
     </WorkbenchContextProvider>
   )
+}
+
+/** The selected tab decides the body; a non-thread pane never falls back to the transcript. */
+export function WorkspaceBody({ current, view, agentName, onOpenTool }: { readonly current: string; readonly view: WorkspaceView; readonly agentName: string; readonly onOpenTool: (call: WorkLogCall) => void }) {
+  if (current === '') return <div {...stylex.props(styles.empty)}>Choose an agent to open its live thread.</div>
+  if (view._tag === 'Thread') return <ConversationPane key={current} agentRef={current} agentName={agentName} onOpenTool={onOpenTool} />
+  return <p role="status" {...stylex.props(styles.empty)}>{workspaceViewNotice(view)}</p>
+}
+
+export function ChangesPanelNotice({ state }: { readonly state: ChangesState }) {
+  return <p role="status" {...stylex.props(styles.notice)}>{changesNotice(state)}</p>
 }
 const styles = stylex.create({
   legacyBridge: { '--canvas': c.canvas, '--panel': c.raised, '--recess': c.message, '--ink': c.fg, '--muted': c.fgMuted, '--line': c.borderStrong, '--accent': c.primary, '--on-accent': c.onPrimary, '--selection': c.rowActive, '--good': c.done, '--warning': c.attention, '--danger': c.dangerFg, '--sans': t.fontSans, '--mono': t.fontMono },
