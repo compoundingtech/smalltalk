@@ -1042,9 +1042,11 @@ async fn dial_peer<B: Backend>(
     let mut moving = false;
     let mut route = 0_usize;
     let mut last_http_success = None;
+    let mut recovery = TransportRecoveryCredit::default();
     let mut refused = Vec::<(Route, tokio::time::Instant)>::new();
     let mut last_attempt_unix_ms = crate::store::now_ms();
     loop {
+        recovery.validate(&routes, &auth, &fleet, &name);
         // A removed node stops dialing; `st3 doctor` says what to do next.
         if fleet.is_removed() {
             tokio::time::sleep(worker_interval(Duration::from_secs(60))).await;
@@ -1104,7 +1106,7 @@ async fn dial_peer<B: Backend>(
                 tokio::select! {
                     _ = tokio::time::sleep_until(at + window) => {}
                     _ = notify.changed() => { must_send = true; }
-                    _ = routes.changed() => { must_send = true; }
+                    _ = routes.changed() => { recovery.invalidate(); must_send = true; }
                     _ = inbound_changes.changed() => {}
                     _ = connectivity.changed() => { backoff = PeerBackoff::default(); must_send = true; }
                 }
@@ -1207,88 +1209,159 @@ async fn dial_peer<B: Backend>(
             name: name.clone(),
             url,
         };
-        match exchange(&http, &backend, &node, &peer, &auth, &fleet).await {
-            Ok((moved, heal_now)) => {
-                if is_http {
-                    last_http_success = Some((peer.url.clone(), tokio::time::Instant::now()));
-                }
-                backoff = PeerBackoff::default();
-                must_send = false;
-                if heal_now {
-                    record_worker(&backend, &name, "heal", attempt_unix_ms, None).await;
-                    heal(&backend, &node, &peer, &auth, &fleet).await;
-                }
-                record_worker(&backend, &name, "idle", attempt_unix_ms, None).await;
-                if moved {
-                    // One exchange carries a bounded batch. Keep going at once while envelopes
-                    // still move instead of leaving the rest of a backlog to the timer, or to
-                    // the quiet window after the peer's last inbound exchange.
-                    notify.borrow_and_update();
-                    moving = true;
-                } else {
-                    // A busy harness can write several observations while one exchange is in
-                    // flight. Keep the first exchange immediate, then coalesce the resulting
-                    // wake burst without disabling the 30-second retry path. The window stays
-                    // short so a publish is startable on every peer within seconds.
-                    let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
-                    tokio::select! {
-                        _ = notify.changed() => { must_send = true; }
-                        _ = routes.changed() => { must_send = true; }
-                        _ = inbound_changes.changed() => {}
-                        _ = connectivity.changed() => { backoff = PeerBackoff::default(); must_send = true; }
-                        _ = tokio::time::sleep(worker_interval(Duration::from_secs(30))) => {}
+        let mut offered = None;
+        // A signing/membership change while the request is suspended must not
+        // become the authenticated epoch of that earlier request.
+        let attempt_auth = TransportRecoveryCredit::auth_epoch(&auth, &fleet, &name);
+        let mut answer =
+            exchange_recorded(&http, &backend, &node, &peer, &auth, &fleet, &mut offered).await;
+        let mut recovery_wait = None;
+        loop {
+            match answer {
+                Ok((moved, heal_now)) => {
+                    if is_http {
+                        last_http_success = Some((peer.url.clone(), tokio::time::Instant::now()));
+                        let armed =
+                            recovery.grant_epoch(&peer.url, offered.take(), attempt_auth.clone());
+                        recovery.validate(&routes, &auth, &fleet, &name);
+                        if armed && recovery.epoch.is_some() {
+                            record_worker(
+                                &backend,
+                                &name,
+                                "recovery-granted",
+                                attempt_unix_ms,
+                                None,
+                            )
+                            .await;
+                        }
                     }
-                    tokio::time::sleep_until(not_before).await;
-                }
-            }
-            Err(error) => {
-                if let Some(removed) = error.downcast_ref::<RemovedFromFleet>() {
-                    fleet.mark_removed(&peer.name, removed);
-                    continue;
-                }
-                // A peer can leave an HTTP stream open without making progress. Once that
-                // exchange times out, discard the pooled connection so the next attempt opens
-                // a fresh stream, and try the next route.
-                http = replication_http_client();
-                route = route.wrapping_add(1);
-                let overloaded = error.is::<PeerOverloaded>();
-                let status = if overloaded {
-                    "overloaded"
-                } else if error.to_string().contains("signature")
-                    || error.to_string().contains("fleet")
-                {
-                    "auth-failed"
-                } else {
-                    "down"
-                };
-                let _ = backend
-                    .record_failure(&peer.name, status, &error.to_string())
-                    .await;
-                let delay = retry_delay(backoff.next(), &fleet, &name);
-                record_worker(&backend, &name, "backoff", attempt_unix_ms, Some(delay)).await;
-                if wait_peer_retry(
-                    &backend,
-                    attempt_unix_ms,
-                    delay,
-                    &mut routes,
-                    &mut inbound_changes,
-                    &mut activity_changes,
-                    &mut connectivity,
-                    &fleet,
-                    &name,
-                    if overloaded {
-                        tokio::time::Instant::now()
-                    } else {
-                        attempt_started
-                    },
-                    last_http_success.as_ref(),
-                    &http,
-                )
-                .await
-                {
                     backoff = PeerBackoff::default();
+                    must_send = false;
+                    if heal_now {
+                        record_worker(&backend, &name, "heal", attempt_unix_ms, None).await;
+                        heal(&backend, &node, &peer, &auth, &fleet).await;
+                    }
+                    record_worker(&backend, &name, "idle", attempt_unix_ms, None).await;
+                    if moved {
+                        // One exchange carries a bounded batch. Keep going at once while envelopes
+                        // still move instead of leaving the rest of a backlog to the timer, or to
+                        // the quiet window after the peer's last inbound exchange.
+                        notify.borrow_and_update();
+                        moving = true;
+                    } else {
+                        // A busy harness can write several observations while one exchange is in
+                        // flight. Keep the first exchange immediate, then coalesce the resulting
+                        // wake burst without disabling the 30-second retry path. The window stays
+                        // short so a publish is startable on every peer within seconds.
+                        let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
+                        tokio::select! {
+                            _ = notify.changed() => { must_send = true; }
+                            _ = routes.changed() => { recovery.invalidate(); must_send = true; }
+                            _ = inbound_changes.changed() => {}
+                            _ = connectivity.changed() => { backoff = PeerBackoff::default(); must_send = true; }
+                            _ = tokio::time::sleep(worker_interval(Duration::from_secs(30))) => {}
+                        }
+                        tokio::time::sleep_until(not_before).await;
+                    }
+                }
+                Err(error) => {
+                    if let Some(removed) = error.downcast_ref::<RemovedFromFleet>() {
+                        fleet.mark_removed(&peer.name, removed);
+                        recovery.invalidate();
+                        break;
+                    }
+                    // A peer can leave an HTTP stream open without making progress. Once that
+                    // exchange times out, discard the pooled connection so the next attempt opens
+                    // a fresh stream, and try the next route.
+                    http = replication_http_client();
+                    route = route.wrapping_add(1);
+                    let overloaded = error.is::<PeerOverloaded>();
+                    let status = if overloaded {
+                        "overloaded"
+                    } else if error.to_string().contains("signature")
+                        || error.to_string().contains("fleet")
+                    {
+                        "auth-failed"
+                    } else {
+                        "down"
+                    };
+                    let _ = backend
+                        .record_failure(&peer.name, status, &error.to_string())
+                        .await;
+                    // An early attempt shares the failed attempt's counter and absolute wait.
+                    // Neither a failed send nor its timeout starts a fresh backoff window.
+                    let resumed = recovery_wait.is_some();
+                    let mut window = backoff.window(recovery_wait.take(), &fleet, &name);
+                    record_worker(
+                        &backend,
+                        &name,
+                        "backoff",
+                        attempt_unix_ms,
+                        Some(window.remaining()),
+                    )
+                    .await;
+                    let eligible = is_transport_recovery_failure(&error) && is_http;
+                    let pending = eligible
+                        && recovery.refusal(&peer.url, true, true).is_none()
+                        && pending_peer_authority(&backend, &auth, &fleet, &name, &recovery).await;
+                    let outcome = wait_peer_retry_inner(
+                        &backend,
+                        attempt_unix_ms,
+                        &mut window,
+                        &mut routes,
+                        &mut inbound_changes,
+                        &mut activity_changes,
+                        &mut connectivity,
+                        &fleet,
+                        &name,
+                        if overloaded || resumed {
+                            tokio::time::Instant::now()
+                        } else {
+                            attempt_started
+                        },
+                        last_http_success.as_ref(),
+                        &http,
+                        Some(RecoveryOpportunity {
+                            credit: &mut recovery,
+                            auth: &auth,
+                            failed_url: &peer.url,
+                            eligible,
+                            pending,
+                        }),
+                    )
+                    .await;
+                    match outcome {
+                        PeerRetryOutcome::TransportRecovery => {
+                            // Credit was spent before this future is created. Dropping or timing
+                            // out the send cannot refund it; a send failure may mean the remote
+                            // already admitted our envelopes. Receive remains idempotent.
+                            must_send = true;
+                            answer = match tokio::time::timeout_at(
+                                window.deadline,
+                                exchange_recorded(
+                                    &http,
+                                    &backend,
+                                    &node,
+                                    &peer,
+                                    &auth,
+                                    &fleet,
+                                    &mut offered,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(answer) => answer,
+                                Err(_) => Err(RecoveryAttemptInterrupted.into()),
+                            };
+                            recovery_wait = Some(window);
+                            continue;
+                        }
+                        PeerRetryOutcome::Activity => backoff = PeerBackoff::default(),
+                        PeerRetryOutcome::Deadline => {}
+                    }
                 }
             }
+            break;
         }
     }
 }
@@ -1350,6 +1423,15 @@ struct PeerBackoff {
 }
 
 impl PeerBackoff {
+    fn window(
+        &mut self,
+        previous: Option<PeerRetryWindow>,
+        fleet: &FleetContext,
+        name: &str,
+    ) -> PeerRetryWindow {
+        previous.unwrap_or_else(|| PeerRetryWindow::new(retry_delay(self.next(), fleet, name)))
+    }
+
     fn delay(failures: u32, jitter: u16) -> Duration {
         // The first retries cover brief interruptions; long absences grow to an hour.
         let seconds = (1_u64 << failures.min(12)).min(3600);
@@ -1363,6 +1445,260 @@ impl PeerBackoff {
         self.failures = self.failures.saturating_add(1);
         delay
     }
+}
+
+/// A send error is not proof the remote did not admit the request. In particular a
+/// timeout may lose only the response; a recovery attempt must use normal replay-safe sync.
+#[derive(Debug)]
+struct PreHeadersTransportFailure {
+    peer: String,
+    endpoint: String,
+    source: reqwest::Error,
+}
+impl std::fmt::Display for PreHeadersTransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "replication request to peer {} failed before headers within {} seconds at `{}`",
+            self.peer,
+            REPLICATION_EXCHANGE_TIMEOUT.as_secs(),
+            self.endpoint
+        )
+    }
+}
+fn is_transport_recovery_failure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<PreHeadersTransportFailure>()
+        .is_some_and(|failure| {
+            !failure.source.is_builder()
+                && !failure.source.is_redirect()
+                && !failure.source.is_decode()
+                && !failure.source.is_status()
+        })
+}
+impl std::error::Error for PreHeadersTransportFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+#[derive(Debug)]
+struct RecoveryAttemptInterrupted;
+impl std::fmt::Display for RecoveryAttemptInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("early replication attempt reached the original retry deadline; remote admission is unknown")
+    }
+}
+impl std::error::Error for RecoveryAttemptInterrupted {}
+
+#[derive(Default)]
+struct TransportRecoveryCredit {
+    epoch: Option<RecoveryEpoch>,
+}
+struct RecoveryEpoch {
+    url: String,
+    authenticated_at: tokio::time::Instant,
+    auth: RecoveryAuthEpoch,
+    authority: String,
+    spent: bool,
+}
+#[derive(Clone, PartialEq)]
+struct RecoveryAuthEpoch {
+    member_key: Option<String>,
+    secret: Arc<Vec<u8>>,
+    members: Vec<(String, u64, String)>,
+    view_generation: u64,
+}
+impl TransportRecoveryCredit {
+    fn auth_epoch(auth: &FleetAuth, fleet: &FleetContext, name: &str) -> RecoveryAuthEpoch {
+        let view = fleet.view.read().expect("fleet view lock poisoned");
+        RecoveryAuthEpoch {
+            member_key: auth.member_key().map(str::to_owned),
+            secret: auth.secret.clone(),
+            members: view
+                .current(name)
+                .iter()
+                .map(|member| {
+                    (
+                        member.member_key.clone(),
+                        member.start,
+                        member.state.clone(),
+                    )
+                })
+                .collect(),
+            view_generation: *fleet.view_changed.borrow(),
+        }
+    }
+    #[cfg(test)]
+    fn grant(
+        &mut self,
+        url: &str,
+        authority: Option<String>,
+        auth: &FleetAuth,
+        fleet: &FleetContext,
+        name: &str,
+    ) {
+        self.grant_epoch(url, authority, Self::auth_epoch(auth, fleet, name));
+    }
+    fn grant_epoch(
+        &mut self,
+        url: &str,
+        authority: Option<String>,
+        auth: RecoveryAuthEpoch,
+    ) -> bool {
+        let already_armed = self
+            .epoch
+            .as_ref()
+            .is_some_and(|epoch| !epoch.spent && epoch.url == url && epoch.auth == auth);
+        self.epoch = authority.map(|authority| RecoveryEpoch {
+            url: url.into(),
+            authenticated_at: tokio::time::Instant::now(),
+            auth,
+            authority,
+            spent: false,
+        });
+        !already_armed && self.epoch.is_some()
+    }
+    fn invalidate(&mut self) {
+        self.epoch = None;
+    }
+    fn validate(
+        &mut self,
+        routes: &watch::Receiver<Vec<Route>>,
+        auth: &FleetAuth,
+        fleet: &FleetContext,
+        name: &str,
+    ) {
+        if fleet.is_removed()
+            || routes.has_changed().unwrap_or(true)
+            || self.epoch.as_ref().is_some_and(|epoch| {
+                epoch.authenticated_at.elapsed() >= PEER_PROBE_WINDOW
+                    || epoch.auth != Self::auth_epoch(auth, fleet, name)
+                    || !routes
+                        .borrow()
+                        .iter()
+                        .any(|route| matches!(route, Route::Http(url) if url == &epoch.url))
+            })
+        {
+            self.invalidate();
+        }
+    }
+    fn refusal(&self, failed_url: &str, eligible: bool, pending: bool) -> Option<&'static str> {
+        if !eligible {
+            return Some("recovery-refused-cause");
+        }
+        match &self.epoch {
+            None => Some("recovery-refused-epoch"),
+            Some(epoch) if epoch.url != failed_url => Some("recovery-refused-route"),
+            Some(epoch) if epoch.spent => Some("recovery-refused-spent"),
+            Some(_) if !pending => Some("recovery-refused-no-pending"),
+            Some(_) => None,
+        }
+    }
+    fn spend(&mut self) {
+        self.epoch.as_mut().expect("validated recovery epoch").spent = true;
+    }
+}
+
+async fn pending_peer_authority<B: Backend>(
+    backend: &B,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    name: &str,
+    credit: &TransportRecoveryCredit,
+) -> bool {
+    // Either authenticated direction may have acknowledged the current digest.
+    // An older inbound observation must not override a newer outbound success.
+    let mut known = Vec::new();
+    if let Some(authority) = fleet
+        .inbound_authority
+        .read()
+        .expect("inbound inventory lock poisoned")
+        .get(name)
+    {
+        known.push(authority.clone());
+    }
+    if let Some(epoch) = &credit.epoch {
+        known.push(epoch.authority.clone());
+    }
+    if known.is_empty() {
+        return false;
+    }
+
+    // Fail closed; a notification alone does not prove genuinely newer authority.
+    tokio::time::timeout(
+        PEER_PROBE_TIMEOUT,
+        backend.export(auth.fleet_id(), &ReplicationInventory::default(), true, &[]),
+    )
+    .await
+    .is_ok_and(|answer| {
+        answer.is_ok_and(|current| {
+            known
+                .iter()
+                .all(|digest| &current.exchange.authority_digest != digest)
+        })
+    })
+}
+
+struct PeerRetryWindow {
+    started: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    next_probe: tokio::time::Instant,
+}
+impl PeerRetryWindow {
+    fn new(delay: Duration) -> Self {
+        let started = tokio::time::Instant::now();
+        Self {
+            started,
+            deadline: started + delay,
+            next_probe: started + PEER_PROBE_INTERVAL,
+        }
+    }
+    fn remaining(&self) -> Duration {
+        self.deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+}
+#[derive(Debug, PartialEq)]
+enum PeerRetryOutcome {
+    Deadline,
+    Activity,
+    TransportRecovery,
+}
+struct RecoveryOpportunity<'a> {
+    credit: &'a mut TransportRecoveryCredit,
+    auth: &'a FleetAuth,
+    failed_url: &'a str,
+    eligible: bool,
+    pending: bool,
+}
+fn recovery_jitter(jitter: u16) -> Duration {
+    Duration::from_millis(100 + u64::from(jitter) % 401)
+}
+
+async fn consume_recovery_credit<B: Backend>(
+    credit: &mut TransportRecoveryCredit,
+    backend: &B,
+    name: &str,
+    last_attempt: u128,
+    window: &PeerRetryWindow,
+) {
+    // Spend before the first await and before dispatch. Cancellation cannot refund it.
+    credit.spend();
+    record_worker(
+        backend,
+        name,
+        "recovery-consumed",
+        last_attempt,
+        Some(window.remaining()),
+    )
+    .await;
+    let mut random = [0; 2];
+    let _ = getrandom::fill(&mut random);
+    tokio::time::sleep_until(
+        (tokio::time::Instant::now() + recovery_jitter(u16::from_le_bytes(random)))
+            .min(window.deadline),
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1380,10 +1716,66 @@ async fn wait_peer_retry<B: Backend>(
     last_http_success: Option<&(String, tokio::time::Instant)>,
     http: &reqwest::Client,
 ) -> bool {
-    let started = tokio::time::Instant::now();
-    let mut deadline = started + delay;
-    let mut next_probe = started + PEER_PROBE_INTERVAL;
+    wait_peer_retry_inner(
+        backend,
+        last_attempt_unix_ms,
+        &mut PeerRetryWindow::new(delay),
+        routes,
+        inbound_changes,
+        activity_changes,
+        connectivity,
+        fleet,
+        name,
+        attempt_started,
+        last_http_success,
+        http,
+        None,
+    )
+    .await
+        == PeerRetryOutcome::Activity
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_peer_retry_inner<B: Backend>(
+    backend: &B,
+    last_attempt_unix_ms: u128,
+    window: &mut PeerRetryWindow,
+    routes: &mut watch::Receiver<Vec<Route>>,
+    inbound_changes: &mut watch::Receiver<u64>,
+    activity_changes: &mut watch::Receiver<u64>,
+    connectivity: &mut watch::Receiver<u64>,
+    fleet: &FleetContext,
+    name: &str,
+    attempt_started: tokio::time::Instant,
+    last_http_success: Option<&(String, tokio::time::Instant)>,
+    http: &reqwest::Client,
+    mut recovery: Option<RecoveryOpportunity<'_>>,
+) -> PeerRetryOutcome {
+    let mut refusal_recorded = false;
     loop {
+        if let Some(opportunity) = &mut recovery {
+            opportunity
+                .credit
+                .validate(routes, opportunity.auth, fleet, name);
+            if !refusal_recorded
+                && opportunity.credit.epoch.is_some()
+                && let Some(reason) = opportunity.credit.refusal(
+                    opportunity.failed_url,
+                    opportunity.eligible,
+                    opportunity.pending,
+                )
+            {
+                record_worker(
+                    backend,
+                    name,
+                    reason,
+                    last_attempt_unix_ms,
+                    Some(window.remaining()),
+                )
+                .await;
+                refusal_recorded = true;
+            }
+        }
         // Check before sleeping as well as after notification: watch channels coalesce
         // events, and an accepted request can predate entry to this retry wait.
         if fleet
@@ -1405,7 +1797,7 @@ async fn wait_peer_retry<B: Backend>(
                 .get(name)
                 .is_some_and(|at| *at >= attempt_started)
         {
-            return true;
+            return PeerRetryOutcome::Activity;
         }
         let probe_url = last_http_success
             .filter(|(_, at)| {
@@ -1424,35 +1816,66 @@ async fn wait_peer_retry<B: Backend>(
                     .any(|route| matches!(route, Route::Http(current) if current == url))
             })
             .map(|(url, _)| url);
+        let probe_at = window.next_probe;
+        let probe_allowed = probe_url.is_some();
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => return false,
-            changed = routes.changed() => return changed.is_ok(),
-            changed = connectivity.changed() => return changed.is_ok(),
+            _ = tokio::time::sleep_until(window.deadline) => return PeerRetryOutcome::Deadline,
+            changed = routes.changed() => {
+                if let Some(opportunity) = &mut recovery { opportunity.credit.invalidate(); }
+                return if changed.is_ok() { PeerRetryOutcome::Activity } else { PeerRetryOutcome::Deadline };
+            },
+            changed = connectivity.changed() => return if changed.is_ok() { PeerRetryOutcome::Activity } else { PeerRetryOutcome::Deadline },
             changed = inbound_changes.changed() => {
-                if changed.is_err() { return false; }
+                if changed.is_err() { return PeerRetryOutcome::Deadline; }
             }
             changed = activity_changes.changed() => {
-                if changed.is_err() { return false; }
+                if changed.is_err() { return PeerRetryOutcome::Deadline; }
             }
             alive = async {
-                tokio::time::sleep_until(next_probe).await;
+                tokio::time::sleep_until(probe_at).await;
+                // Reserve the rate interval before awaiting: a coalesced activity
+                // wake may cancel HEAD, but cannot immediately repeat it.
+                window.next_probe = tokio::time::Instant::now() + PEER_PROBE_INTERVAL;
                 // HEAD is answered by the existing router without accessing the graph.
                 // Any HTTP response proves transport life, including an older peer's 405.
                 // Only the ensuing signed exchange can authenticate or import peer data.
                 http.head(format!("{}{}", probe_url.unwrap().trim_end_matches('/'), EXCHANGE_PATH))
                     .timeout(PEER_PROBE_TIMEOUT).send().await.is_ok()
-            }, if probe_url.is_some() => {
-                next_probe = tokio::time::Instant::now() + PEER_PROBE_INTERVAL;
+            }, if probe_allowed => {
+                window.next_probe = tokio::time::Instant::now() + PEER_PROBE_INTERVAL;
                 if alive {
                     // Transport is alive, but another expensive exchange has just failed.
                     // Retain backoff and allow at most one attempt every 30 seconds at the cap.
                     // A cheap probe is not authenticated activity. It must not refresh
                     // its own eligibility window and keep a failing peer hot indefinitely.
-                    let capped = started + Duration::from_secs(30);
-                    if capped < deadline {
-                        deadline = capped;
+                    let capped = window.started + Duration::from_secs(30);
+                    if capped < window.deadline {
+                        window.deadline = capped;
                         record_worker(backend, name, "backoff", last_attempt_unix_ms,
-                            Some(deadline.saturating_duration_since(tokio::time::Instant::now()))).await;
+                            Some(window.remaining())).await;
+                    }
+                    if let Some(opportunity) = &mut recovery {
+                        opportunity.credit.validate(routes, opportunity.auth, fleet, name);
+                        // While the allowance is still eligible, recheck pending authority
+                        // at the decision rather than relying on the wait-entry snapshot.
+                        if opportunity.credit.refusal(opportunity.failed_url, opportunity.eligible, opportunity.pending).is_none() {
+                            opportunity.pending = pending_peer_authority(
+                                backend, opportunity.auth, fleet, name, opportunity.credit).await;
+                        }
+                        if opportunity.credit.refusal(opportunity.failed_url, opportunity.eligible, opportunity.pending).is_none()
+                            && probe_url.is_some_and(|url| url == opportunity.failed_url)
+                            && window.remaining() > PEER_PROBE_TIMEOUT + Duration::from_millis(500) {
+                            consume_recovery_credit(opportunity.credit, backend, name,
+                                last_attempt_unix_ms, window).await;
+                            opportunity.credit.validate(routes, opportunity.auth, fleet, name);
+                            if opportunity.credit.epoch.is_some() && !fleet.is_removed()
+                                && tokio::time::Instant::now() < window.deadline {
+                                return PeerRetryOutcome::TransportRecovery;
+                            }
+                            if tokio::time::Instant::now() >= window.deadline {
+                                return PeerRetryOutcome::Deadline;
+                            }
+                        }
                     }
                 }
             }
@@ -2133,6 +2556,19 @@ pub async fn exchange<B: Backend>(
     auth: &FleetAuth,
     fleet: &FleetContext,
 ) -> Result<(bool, bool)> {
+    exchange_recorded(http, backend, node, peer, auth, fleet, &mut None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn exchange_recorded<B: Backend>(
+    http: &reqwest::Client,
+    backend: &B,
+    node: &str,
+    peer: &PeerConfig,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    offered: &mut Option<String>,
+) -> Result<(bool, bool)> {
     let mut heal_now = false;
     // One compact round, then at most one full-inventory round if the compact prefix
     // cannot make progress. Payloadless checkpoint identities can differ indefinitely.
@@ -2141,6 +2577,7 @@ pub async fn exchange<B: Backend>(
             .export(auth.fleet_id(), &ReplicationInventory::default(), true, &[])
             .await?
             .exchange;
+        *offered = Some(first.authority_digest.clone());
         let own_checkpoint = first.inventory.checkpoint.clone();
         let mut query = ReplicationExchange {
             envelopes: Vec::new(),
@@ -2180,6 +2617,7 @@ pub async fn exchange<B: Backend>(
                 )
                 .await?
                 .exchange;
+            *offered = Some(push.authority_digest.clone());
             let started = std::time::Instant::now();
             // A peer that says it takes compressed requests gets a large push compressed.
             let (response, _) =
@@ -2457,12 +2895,10 @@ async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
     let response = request
         .send()
         .await
-        .with_context(|| {
-            format!(
-                "replication request to peer {} failed before headers within {} seconds at `{endpoint}`",
-                peer.name,
-                REPLICATION_EXCHANGE_TIMEOUT.as_secs()
-            )
+        .map_err(|source| PreHeadersTransportFailure {
+            peer: peer.name.clone(),
+            endpoint,
+            source,
         })?;
     let status = response.status();
     let headers = response.headers().clone();
