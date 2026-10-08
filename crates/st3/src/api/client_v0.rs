@@ -11,6 +11,7 @@ pub(super) mod conversation_blocks;
 mod collection_windows;
 mod collection_patches;
 mod collection_ivm;
+mod summary;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -79,6 +80,17 @@ const COLLECTION_SEND_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
+    // Summary overlays include transport reachability and agent activity as well as
+    // graph membership. Its tiny public row is compared after each current read.
+    if collection == "summary" {
+        return false;
+    }
+    if collection == "summary-missions"
+        && matches!(kind, "runtime.observed" | "harness.observed" | "harness.diagnostic"
+            | "harness.activity" | "harness.usage" | "work.progress" | "work.submitted")
+    {
+        return true;
+    }
     // A held window must be rechecked when its exact grant or delegated scopes change,
     // including otherwise graph-only glasses and arrangements.
     if matches!(kind, "custom.client.pairing-completed" | "custom.client.pairing-revoked") {
@@ -140,9 +152,14 @@ async fn collection_items_with_windows(
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     if !matches!(
         request.collection.as_str(),
-        "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements"
+        "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements" | "summary"
     ) {
         return Err(validation("unknown collection subscription"));
+    }
+    if request.collection == "summary"
+        && (request.actor.is_some() || request.status.is_some() || request.subject.is_some())
+    {
+        return Err(validation("summary does not accept list filters"));
     }
     if request.status.is_some() && request.collection != "agents" {
         return Err(validation("status filters are supported for agents only"));
@@ -177,7 +194,7 @@ async fn collection_items_with_windows(
             }
         }
         Some(person)
-    } else if request.collection == "attention" {
+    } else if matches!(request.collection.as_str(), "attention" | "summary") {
         person_filter(session, request.person.as_deref())?
     } else {
         None
@@ -219,7 +236,7 @@ async fn collection_items_with_windows(
     let arrangement_window = collection == "arrangements";
     let mut admitted = collection != "agents";
     let (snapshot, mut items, mut has_more) = loop {
-        let roster_admission = if collection == "agents" && admitted {
+        let roster_admission = if matches!(collection.as_str(), "agents" | "summary") && admitted {
             Some(state.store.admit_agent_resources().await)
         } else {
             None
@@ -260,7 +277,7 @@ async fn collection_items_with_windows(
                             request.person.as_deref(),
                             false,
                         )?),
-                        "attention" => person_filter(&current, request.person.as_deref())?,
+                        "attention" | "summary" => person_filter(&current, request.person.as_deref())?,
                         _ => person.clone(),
                     };
                     Ok::<_, ApiError>((current, person))
@@ -280,6 +297,10 @@ async fn collection_items_with_windows(
                 };
                 let compute = || {
                     let mut items = match collection.as_str() {
+                        "summary" => {
+                            return Ok((summary::native(&state, &current, &request, &snapshot,
+                                now, windows.as_deref(), commits)?, false));
+                        }
                         "missions" => {
                             let mut ids =
                                 store.mission_collection_ids(false, 0, limit.saturating_add(1))?;
@@ -383,6 +404,7 @@ fn collection_window_label(collection: &str) -> &'static str {
         "work" => "stream collection/work",
         "glasses" => "stream collection/glasses",
         "arrangements" => "stream collection/arrangements",
+        "summary" => "stream collection/summary",
         _ => "stream collection/invalid",
     }
 }
@@ -423,7 +445,7 @@ async fn deliver_collection(
     read: Result<(ClientSnapshot, Vec<Value>, bool), ApiError>,
 ) -> Refreshed {
     let request = &subscription.request;
-    let (snapshot, items, has_more) = match read {
+    let (snapshot, mut items, has_more) = match read {
         Ok(read) => read,
         Err(error) => {
             let retryable = client_error_retryable(error.status, Some(&error.code));
@@ -444,6 +466,9 @@ async fn deliver_collection(
             };
         }
     };
+    if request.collection == "summary" {
+        summary::retain_timestamp(&mut items, &subscription.previous);
+    }
     let order = items
         .iter()
         .filter_map(|item| item["id"].as_str().map(str::to_owned))
@@ -910,7 +935,7 @@ async fn collection_stream_socket_with_sources<F, Fut>(
     let mut ivm_notices = sources.as_ref().map(|sources| sources.subscribe());
     let mut changed = state.event_notify.subscribe();
     let windows = collection_windows::Windows::attach(&state.store);
-    let mut window_revisions = [0; 6];
+    let mut window_revisions = [0; 8];
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
     let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
     let mut conversations = ConversationFollowers::default();
@@ -1760,6 +1785,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    capabilities.push(json!({"id":"summary", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"collections", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
@@ -2903,6 +2929,24 @@ fn machine_resources(
     snapshot: &ClientSnapshot,
     session: &ClientSession,
 ) -> anyhow::Result<Vec<Value>> {
+    machine_resources_with_work(state, history, snapshot, session, true)
+}
+
+fn machine_summary_resources(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+) -> anyhow::Result<Vec<Value>> {
+    machine_resources_with_work(state, false, snapshot, session, false)
+}
+
+fn machine_resources_with_work(
+    state: &AppState,
+    history: bool,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    include_work: bool,
+) -> anyhow::Result<Vec<Value>> {
     let runtimes = runtime_resources(state, history, snapshot, session)?;
     let mut host_runtime_ids = BTreeMap::<String, BTreeSet<String>>::new();
     let mut host_running_runtimes = BTreeMap::<String, usize>::new();
@@ -2949,9 +2993,11 @@ fn machine_resources(
     // Building full client work resources also reduces usage history, wake history and mission
     // annotations for every step, which makes this small host list expensive during the
     // startup burst when many seats connect at once.
-    let work = state
-        .store
-        .client_work_claims_at_snapshot(history, client_snapshot_time(snapshot))?;
+    let work = if include_work {
+        state.store.client_work_claims_at_snapshot(history, client_snapshot_time(snapshot))?
+    } else {
+        Vec::new()
+    };
     let mut host_work = BTreeMap::<String, BTreeSet<String>>::new();
     for item in work {
         let Some(claimant) = item.claimant.as_deref() else {

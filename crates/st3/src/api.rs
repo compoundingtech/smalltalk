@@ -1941,7 +1941,7 @@ fn client_work_item(
 }
 
 /// Translate internal step states once for every client projection.
-fn client_work_state(status: &str) -> &str {
+pub(crate) fn client_work_state(status: &str) -> &str {
     match status {
         "pending" => "waiting",
         "working" => "claimed",
