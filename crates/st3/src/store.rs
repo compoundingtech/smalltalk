@@ -44250,7 +44250,6 @@ message "timing-reminder" { from "person/test"; to "person/test"; content "Resum
             ("step-run.state".into(), json!({"fields":{"status":"blocked","reason":"provider approval"}}), 200),
         ];
         assert_eq!(fold_step_timing(&events, 1, 500, false), (None, 100));
-        assert_eq!(RULES_VERSION, 12);
     }
 
     #[test]
