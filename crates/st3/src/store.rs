@@ -31967,6 +31967,9 @@ mod tests {
             )
             .unwrap();
         store.apply(&intent, &plan.subject_tokens, "roster-cache").unwrap();
+        store.append_claim(&local_observation_for_test("harness.observed", json!({
+            "state":"idle", "driver":"codex", "incarnation_id":"amber-1", "observed_at_ms":1,
+        }))).unwrap();
         store
     }
 
@@ -32006,11 +32009,12 @@ mod tests {
             .unwrap()
             .unwrap();
         for n in 0..8 {
-            store.append_local_observations_for_test(&[local_observation_for_test(
+            let response = store.append_claim(&local_observation_for_test(
                 "harness.observed",
                 json!({"state":"idle", "driver":"codex", "incarnation_id":"amber-1",
                     "observed_at_ms":300_001 + n}),
-            )]);
+            )).unwrap();
+            assert!(local_observation_position(&response).is_some());
             assert_eq!(
                 store.index().unwrap(),
                 index,

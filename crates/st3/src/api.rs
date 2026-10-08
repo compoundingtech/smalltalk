@@ -21945,11 +21945,12 @@ mission "wake" state="ready" {
         let started = Instant::now();
         let mut hits = 0;
         for n in 0..APPENDS {
-            store.append_local_observations_for_test(&[roster_local_observation(
+            let response = store.append_claim(&roster_local_observation(
                 "harness.observed",
                 json!({"state":"idle", "driver":"codex", "incarnation_id":"amber-1",
                     "observed_at_ms":300_001 + n as u64}),
-            )]);
+            )).unwrap();
+            assert!(crate::store::local_observation_position(&response).is_some());
             assert_eq!(store.index().unwrap(), index);
             for (history, original) in [false, true].into_iter().zip(&pinned) {
                 store.read_snapshot(|_| {
@@ -22010,7 +22011,7 @@ mission "wake" state="ready" {
             assert!(appended);
             assert!(crate::store::local_observation_position(&response).is_some());
             assert_eq!(state.store.index().unwrap(), index);
-            finish_claim_publication(&state, &request.kind, response, appended)
+            let _ = finish_claim_publication(&state, &request.kind, response, appended)
                 .await.unwrap();
             for subscriber in &mut subscribers {
                 tokio::time::timeout(Duration::from_secs(1), subscriber.changed())
