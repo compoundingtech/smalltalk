@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Sending a message takes one round trip fewer in stui and the phone, and a read receipt st refuses for good is no longer retried",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, columns, indexes or triggers."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No wire change: a message send already needed only a snapshot of this host not ahead of its store; the clients now use the newest one a window brought, and read a fresh one only when st calls it stale."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to recover."
+  }
+}
