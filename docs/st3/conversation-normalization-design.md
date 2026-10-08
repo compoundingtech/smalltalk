@@ -384,7 +384,10 @@ record, including `pendingToolCalls`, arguments/intent and unknown fields. Only
 transport size and paging limits apply, with visible truncation markers and
 owner continuations for exact full values. Outcomes are read from the owner
 machine per request, not stored in the database; presentation filters remain
-in shared renderers. Recognized exits use `status: stopped`, not turn completion.
+in shared renderers. Recognized exits use the existing `cancelled` status value — the
+process stopped before the turn finished; the recorded kind, reason and exit code stay in
+`detail` — so a planned stop is neither a completed turn nor an error, with no new
+client-visible vocabulary.
 #1458's native tool-result timing uses open block metadata; arbitrary native
 result details remain available in `source_record`, without copying its numeric
 whitelist into this normalizer.

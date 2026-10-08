@@ -2084,8 +2084,8 @@ export const TimelineRedactionBody = /*#__PURE__*/ (() => Schema.Struct({
 export type TimelineRedactionBody = typeof TimelineRedactionBody.Type
 export type TimelineRedactionBodyEncoded = typeof TimelineRedactionBody.Encoded
 
-/** Run or process status reported in a timeline `status` entry. `stopped` describes process lifecycle, not successful turn completion. */
-export const TimelineStatus = /*#__PURE__*/ (() => openEnum(["queued","running","waiting","completed","stopped","failed","cancelled"]).annotate({ identifier: "TimelineStatus", description: "Run or process status reported in a timeline `status` entry. `stopped` describes process lifecycle, not successful turn completion." }))()
+/** Run status reported in a timeline `status` entry. */
+export const TimelineStatus = /*#__PURE__*/ (() => openEnum(["queued","running","waiting","completed","failed","cancelled"]).annotate({ identifier: "TimelineStatus", description: "Run status reported in a timeline `status` entry." }))()
 export type TimelineStatus = typeof TimelineStatus.Type
 export type TimelineStatusEncoded = typeof TimelineStatus.Encoded
 

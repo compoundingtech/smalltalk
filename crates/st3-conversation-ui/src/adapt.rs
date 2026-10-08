@@ -387,7 +387,6 @@ pub fn conversation_with_filters(
                     st3_client::TimelineStatus::Running => "running",
                     st3_client::TimelineStatus::Waiting => "waiting",
                     st3_client::TimelineStatus::Completed => "completed",
-                    st3_client::TimelineStatus::Stopped => "stopped",
                     st3_client::TimelineStatus::Failed => "failed",
                     st3_client::TimelineStatus::Cancelled => "cancelled",
                     st3_client::TimelineStatus::Unknown => "unknown",

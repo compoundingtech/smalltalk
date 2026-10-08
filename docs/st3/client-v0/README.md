@@ -604,7 +604,7 @@ timestamp, `role` (`system`, `user`, `assistant`, or `tool`), and one typed body
 - `content`: text or an attachment reference with a media type;
 - `tool_call`: stable call ID, tool name, and JSON arguments;
 - `tool_result`: the matching call ID, JSON/text content, and success status;
-- `status`: queued, running, waiting, completed, stopped, failed, or cancelled;
+- `status`: queued, running, waiting, completed, failed, or cancelled;
 - `error`: versioned safe code, message, retryability, and details;
 - `usage`: input, output, cached, and total tokens plus optional cost data;
 - `redaction`: reason and the byte or item count withheld;

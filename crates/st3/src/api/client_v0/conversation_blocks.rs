@@ -1111,7 +1111,7 @@ mod tests {
                     }
                     assert_eq!(body["details"]["errorStatus"], 429);
                 } else {
-                    assert_eq!(body["status"], "stopped");
+                    assert_eq!(body["status"], "cancelled");
                     let detail = &body["detail"];
                     assert!(detail.as_str().unwrap().contains("size limit"));
                     assert!(detail.as_str().unwrap().contains("[st truncated"));
@@ -1138,7 +1138,7 @@ mod tests {
                     _ => None,
                 })
                 .unwrap();
-            assert_eq!(status.status, st3_client::TimelineStatus::Stopped);
+            assert_eq!(status.status, st3_client::TimelineStatus::Cancelled);
             outcomes
         }
 

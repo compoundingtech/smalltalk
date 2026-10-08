@@ -3321,7 +3321,7 @@ fn push_omp_exit(items: &mut Vec<Value>, sequence: u64, timestamp: &str, data: &
         (
             "status",
             json!({
-                "status":"stopped",
+                "status":"cancelled",
                 "detail":serde_json::to_string(data).expect("native exit metadata serializes"),
             }),
         )
@@ -4201,7 +4201,7 @@ mod tests {
                 .any(|item| item["body"]["code"] == "native_process_exit")
         );
         let status = items.iter().find(|item| item["type"] == "status").unwrap();
-        assert_eq!(status["body"]["status"], "stopped");
+        assert_eq!(status["body"]["status"], "cancelled");
         let details: Value =
             serde_json::from_str(status["body"]["detail"].as_str().unwrap()).unwrap();
         assert_eq!(details, checkpoint);
@@ -4293,7 +4293,7 @@ mod tests {
                 assert_eq!(block["kind"], "error", "{data}");
             } else {
                 assert_eq!(entry["type"], "status", "{data}");
-                assert_eq!(entry["body"]["status"], "stopped", "{data}");
+                assert_eq!(entry["body"]["status"], "cancelled", "{data}");
                 let detail: Value =
                     serde_json::from_str(entry["body"]["detail"].as_str().unwrap()).unwrap();
                 assert_eq!(detail, data);

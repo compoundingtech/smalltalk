@@ -80,8 +80,8 @@ Native `custom/session_exit` checkpoints are classified from their `data.kind` a
 
 | Native exit | Timeline entry |
 | --- | --- |
-| `normal` (including `dispose` and `manual`); `signal` with `sigterm`, `sigint` or `sighup` | `status: stopped` |
-| `process_exit` or `exit` with explicit numeric `exitCode` (or `code`) zero | `status: stopped` |
+| `normal` (including `dispose` and `manual`); `signal` with `sigterm`, `sigint` or `sighup` | `status: cancelled` |
+| `process_exit` or `exit` with explicit numeric `exitCode` (or `code`) zero | `status: cancelled` |
 | `fatal`, `crash`, `uncaughtException` / `uncaught_exception`, or `unhandledRejection` / `unhandled_rejection` | `error`, code `native_session_exit_fatal` |
 | Recognized normal/signal/process-exit kinds with a fatal reason or a nonzero exit code | `error`, code `native_session_exit_fatal` |
 | Unknown/missing kinds, unfamiliar signals, or process exits without a known exit code | `error`, code `native_session_exit_unknown` |
@@ -93,8 +93,11 @@ outcome stays unknown unless a numeric code is supplied. Unknown kinds remain un
 even if their reason looks like a normal signal.
 
 Recognized stops use the existing status entry and `status` block with `{body_ref:true}`;
-the body has `status: stopped` and `detail` containing the complete native `data` serialized
-as JSON. Fatal and unknown stops use a system error entry and `error` block with
+the body has `status: cancelled` and `detail` containing the complete native `data` serialized
+as JSON — including the recorded kind, reason (the signal) and exit code. `cancelled` is the
+existing timeline vocabulary: the process stopped before the turn finished. It is neither a
+successfully completed turn nor an error, and it does not infer who or what stopped the
+process. Fatal and unknown stops use a system error entry and `error` block with
 `{body_ref:true}`, `retryable: false` and the complete native `data` in `details`.
 Both retain exact kind, reason, pending-tool arguments/intent and future fields.
 A process exit proves neither user cancellation, tool completion nor the outcome of
@@ -107,7 +110,8 @@ original bytes as `raw_text`. Only transport size and paging limits bound respon
 truncation is visibly marked, and owner continuations recover the exact full values.
 These outcomes are read from the owner machine per request, not stored in the database.
 Presentation filters belong to shared renderers; show-everything mode exposes the unchanged
-normalized data. A `stopped` status describes process lifecycle, not a successfully finished turn.
+normalized data. A `cancelled` exit status describes process lifecycle, not a successfully
+finished turn.
 
 ## Interrupted ask bridge
 
