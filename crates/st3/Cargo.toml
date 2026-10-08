@@ -49,6 +49,7 @@ sha2 = "0.10"
 smallclaims = { path = "../smallclaims" }
 st-runtime = { path = "../st-runtime" }
 st3-client = { path = "../st3-client" }
+stui = { path = "../stui" }
 st3-conversation-ui = { path = "../st3-conversation-ui", features = ["ratatui"] }
 st3-schema = { path = "../st3-schema" }
 st-drivers = { path = "../st-drivers" }
@@ -65,6 +66,7 @@ uuid = { version = "1", features = ["v7"] }
 walkdir = "2"
 
 [dev-dependencies]
+alacritty_terminal = { version = "0.26", default-features = false }
 st3 = { path = ".", features = ["test-support"] }
 smallclaims = { path = "../smallclaims", features = ["test-support"] }
 tokio = { version = "1", features = ["test-util"] }
