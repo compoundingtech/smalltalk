@@ -2826,17 +2826,19 @@ fn managed_session_owner_for_subject_at(
     session_id: &str,
     owner: &str,
 ) -> anyhow::Result<Option<ManagedSessionOwner>> {
-    let owners = store.conversation_owners_at(snapshot_index)?;
-    let Some(owner) = owners.get(owner) else {
-        return Ok(None);
-    };
-    let Some(identity) = owner.incarnation.as_deref().or(owner.runtime.as_deref()) else {
-        return Ok(None);
-    };
-    if managed_session_id(&owner.subject, identity) != session_id {
-        return Ok(None);
-    }
-    Ok(Some((owner.subject.clone(), owner.incarnation.clone(), owner.origin.clone())))
+    crate::performance::task("conversation/owner", || {
+        let owners = store.conversation_owners_at(snapshot_index)?;
+        let Some(owner) = owners.get(owner) else {
+            return Ok(None);
+        };
+        let Some(identity) = owner.incarnation.as_deref().or(owner.runtime.as_deref()) else {
+            return Ok(None);
+        };
+        if managed_session_id(&owner.subject, identity) != session_id {
+            return Ok(None);
+        }
+        Ok(Some((owner.subject.clone(), owner.incarnation.clone(), owner.origin.clone())))
+    })
 }
 
 /// How many of a subject's claims, oldest first, date its session in the session list.

@@ -631,12 +631,14 @@ async fn open_conversation_subscription(
 ) -> Result<(String, Option<String>), ApiError> {
     tokio::task::spawn_blocking(move || {
         let _permits = permits;
-        let target = request.conversation.as_deref().unwrap_or_default();
-        let session_id = conversation_session_id(&state, target)?;
-        let remote = conversation_owner_host(
-            &state, &session, &session_id, target.starts_with("agent/").then_some(target),
-        )?;
-        Ok((session_id, remote))
+        crate::performance::task("conversation/admission", || {
+            let target = request.conversation.as_deref().unwrap_or_default();
+            let session_id = conversation_session_id(&state, target)?;
+            let remote = conversation_owner_host(
+                &state, &session, &session_id, target.starts_with("agent/").then_some(target),
+            )?;
+            Ok((session_id, remote))
+        })
     })
     .await
     .map_err(ApiError::internal)?
@@ -1033,6 +1035,8 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         subscriptions.remove(&request.id);
                         terminals.remove(&request.id);
                         conversations.stop(&request.id);
+                        // Allocate a fresh token for every accepted subscribe, including terminal
+                        // replacements, so queued collection/conversation results cannot reuse it.
                         generation += 1;
                         if request.collection == "conversation" {
                             let (state, session, outbox, admit) =

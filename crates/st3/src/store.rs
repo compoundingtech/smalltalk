@@ -10432,14 +10432,15 @@ impl Store {
         at_index: Option<u64>,
         include_history: bool,
     ) -> Result<StatusResponse> {
-        // Keep cached snapshots, but never hold the cache mutex while reducing a roster.
-        // Concurrent misses may compute independently; neither blocks exact-subject reads.
+        // Agent listings are expensive on large graphs. Hold this lock while building the
+        // snapshot so concurrent callers share one reduction, then serve clones at the same
+        // store index. A later index always rebuilds, preserving snapshot semantics.
         if prefix == "agent/" {
             // What this thread's reads can see, as every snapshot read checks: a read pinned to
             // a snapshot can see a commit a moment before the writer publishes its index.
             let current = current_index(&self.readers.get())?;
             let index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
-            let cache = self
+            let mut cache = self
                 .smalltalk
                 .agent_status_cache
                 .lock()
@@ -10451,13 +10452,7 @@ impl Store {
                 result.store_index = index;
                 return Ok(result);
             }
-            drop(cache);
             let projection_index = self.agent_status_index(index)?;
-            let mut cache = self
-                .smalltalk
-                .agent_status_cache
-                .lock()
-                .expect("agent status cache poisoned");
             if let Some((cached_index, _, _, status)) =
                 cache.iter_mut().find(|(_, cached_projection, history, _)| {
                     *cached_projection == projection_index && *history == include_history
@@ -10468,14 +10463,8 @@ impl Store {
                 result.store_index = index;
                 return Ok(result);
             }
-            drop(cache);
             let status =
                 self.status_for_subject_prefix_uncached(prefix, Some(index), include_history)?;
-            let mut cache = self
-                .smalltalk
-                .agent_status_cache
-                .lock()
-                .expect("agent status cache poisoned");
             cache.push_back((
                 index,
                 projection_index,
