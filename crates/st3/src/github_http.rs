@@ -17,21 +17,38 @@ use tokio::sync::Mutex;
 /// An acquired credential retains its identity so a late 401 cannot evict a newer acquisition.
 /// Deliberately has no Debug implementation: credentials never belong in diagnostics.
 #[derive(Clone)]
-pub(crate) struct GithubAuth {
-    token: Arc<String>,
-    cache: Option<Arc<TokenCache>>,
+pub(crate) enum GithubAuth {
+    Local {
+        token: Arc<String>,
+        cache: Option<Arc<TokenCache>>,
+    },
+    Authorized {
+        config: Arc<crate::config::Config>,
+        profile: String,
+    },
 }
 
 impl GithubAuth {
     pub(crate) fn is_valid(&self) -> bool {
-        !self.token.trim().is_empty()
+        match self {
+            Self::Local { token, .. } => !token.trim().is_empty(),
+            Self::Authorized { profile, .. } => !profile.trim().is_empty(),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn test(token: &str) -> Self {
-        Self {
+        Self::Local {
             token: Arc::new(token.into()),
             cache: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn local_token(&self) -> &Arc<String> {
+        match self {
+            Self::Local { token, .. } => token,
+            Self::Authorized { .. } => panic!("profile auth has no local token"),
         }
     }
 }
@@ -145,7 +162,7 @@ fn read_token_file(file: File) -> Result<String> {
 }
 
 #[derive(Default)]
-struct TokenCache(Mutex<TokenState>);
+pub(crate) struct TokenCache(Mutex<TokenState>);
 
 // Failed logins or a permanently rejected exported token must not spawn one process per caller.
 const AUTH_REFRESH_BACKOFF: Duration = Duration::from_secs(30);
@@ -191,7 +208,7 @@ impl TokenCache {
         Fut: Future<Output = Result<String>>,
     {
         if let Some(token) = &state.token {
-            return Ok(GithubAuth {
+            return Ok(GithubAuth::Local {
                 token: token.clone(),
                 cache: Some(self.clone()),
             });
@@ -210,7 +227,7 @@ impl TokenCache {
         };
         state.token = Some(token.clone());
         state.retry_at = None;
-        Ok(GithubAuth {
+        Ok(GithubAuth::Local {
             token,
             cache: Some(self.clone()),
         })
@@ -245,11 +262,14 @@ impl TokenCache {
     }
 
     async fn invalidate(&self, auth: &GithubAuth) {
+        let GithubAuth::Local { token, .. } = auth else {
+            return;
+        };
         let mut state = self.0.lock().await;
         if state
             .token
             .as_ref()
-            .is_some_and(|known| Arc::ptr_eq(known, &auth.token))
+            .is_some_and(|known| Arc::ptr_eq(known, token))
         {
             state.token = None;
             state.retry_at = Some(Instant::now() + AUTH_REFRESH_BACKOFF);
@@ -262,24 +282,46 @@ fn token_cache() -> &'static Arc<TokenCache> {
     CACHE.get_or_init(Default::default)
 }
 
-static SOURCE: OnceLock<crate::config::GithubConfig> = OnceLock::new();
+static SOURCE: OnceLock<Arc<crate::config::Config>> = OnceLock::new();
 
-pub(crate) fn configure(config: &crate::config::GithubConfig) -> Result<()> {
-    config.validate()?;
-    anyhow::ensure!(
-        config.sekrets_profile.is_none(),
-        "unsupported GitHub configuration: github.sekrets_profile requires the pending authorized-request gateway client; no fallback credentials were used"
-    );
+pub(crate) fn configure(config: &crate::config::Config) -> Result<()> {
+    config.github.validate()?;
     if let Some(known) = SOURCE.get() {
         anyhow::ensure!(
-            known == config,
+            known.as_ref() == config,
             "GitHub source was already configured for this process"
         );
         return Ok(());
     }
     SOURCE
-        .set(config.clone())
+        .set(Arc::new(config.clone()))
         .map_err(|_| anyhow::anyhow!("GitHub source was already configured"))
+}
+
+async fn auth_for_config<F, Fut>(
+    config: Arc<crate::config::Config>,
+    cache: &Arc<TokenCache>,
+    lookup: F,
+) -> Result<GithubAuth>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<BTreeMap<String, String>>>,
+{
+    anyhow::ensure!(
+        config.github.token_file.is_none() || config.github.sekrets_profile.is_none(),
+        "github.token_file and github.sekrets_profile are mutually exclusive"
+    );
+    if let Some(profile) = &config.github.sekrets_profile {
+        anyhow::ensure!(
+            !profile.trim().is_empty() && profile.trim() == profile,
+            "github.sekrets_profile must name a non-empty profile without surrounding whitespace"
+        );
+        return Ok(GithubAuth::Authorized {
+            profile: profile.clone(),
+            config,
+        });
+    }
+    auth_for(&config.github, cache, lookup).await
 }
 
 async fn auth_for<F, Fut>(
@@ -297,7 +339,7 @@ where
     );
     anyhow::ensure!(
         config.sekrets_profile.is_none(),
-        "unsupported GitHub configuration: github.sekrets_profile requires the pending authorized-request gateway client; no fallback credentials were used"
+        "profile authentication must use the authorized-request path; no fallback credentials were used"
     );
     if let Some(path) = &config.token_file {
         return cache.acquire_file(path).await;
@@ -310,15 +352,15 @@ where
 
 pub(crate) async fn github_auth() -> Result<GithubAuth> {
     let config = configured_source(&SOURCE)?;
-    auth_for(config, token_cache(), || async {
+    auth_for_config(config.clone(), token_cache(), || async {
         tokio::task::spawn_blocking(crate::environment::snapshot).await?
     })
     .await
 }
 
 fn configured_source(
-    source: &OnceLock<crate::config::GithubConfig>,
-) -> Result<&crate::config::GithubConfig> {
+    source: &OnceLock<Arc<crate::config::Config>>,
+) -> Result<&Arc<crate::config::Config>> {
     source
         .get()
         .context("GitHub credential source was not configured for this process")
@@ -353,19 +395,412 @@ pub(crate) async fn send(
     request: reqwest::RequestBuilder,
     auth: &GithubAuth,
 ) -> Result<reqwest::Response> {
-    let response = request.bearer_auth(auth.token.as_str()).send().await?;
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED
-        && let Some(cache) = &auth.cache
-    {
-        cache.invalidate(auth).await;
+    match auth {
+        GithubAuth::Authorized { config, profile } => {
+            send_authorized_with(
+                config.clone(),
+                profile,
+                request,
+                crate::sekrets::authorized::authorized_request,
+            )
+            .await
+        }
+        GithubAuth::Local { token, cache } => {
+            let response = request.bearer_auth(token.as_str()).send().await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && let Some(cache) = cache
+            {
+                cache.invalidate(auth).await;
+            }
+            Ok(response)
+        }
     }
-    Ok(response)
+}
+
+async fn send_authorized_with<F>(
+    config: Arc<crate::config::Config>,
+    profile: &str,
+    builder: reqwest::RequestBuilder,
+    transport: F,
+) -> Result<reqwest::Response>
+where
+    F: FnOnce(
+            &crate::config::Config,
+            &str,
+            &crate::sekrets::authorized::AuthorizedRequest,
+        ) -> std::result::Result<
+            crate::sekrets::authorized::AuthorizedResponse,
+            crate::sekrets::authorized::AuthorizedError,
+        > + Send
+        + 'static,
+{
+    use crate::sekrets::authorized::{AuthorizedRequest, MAX_REQUEST_BODY, MAX_RESPONSE_BODY};
+    use reqwest::ResponseBuilderExt as _;
+    // Client defaults are applied by reqwest only when sending; this path builds for the RPC.
+    let mut request = builder.build()?;
+    request
+        .headers_mut()
+        .entry(reqwest::header::USER_AGENT)
+        .or_insert(reqwest::header::HeaderValue::from_static(
+            "st3-resource-observer/0.1",
+        ));
+    let url = request.url().clone();
+    anyhow::ensure!(
+        url.scheme() == "https"
+            && url.host_str() == Some("api.github.com")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port_or_known_default() == Some(443),
+        "GitHub authorized requests require https://api.github.com with no userinfo or non-default port"
+    );
+    anyhow::ensure!(
+        !request
+            .headers()
+            .contains_key(reqwest::header::AUTHORIZATION),
+        "GitHub authorized requests must not carry their own Authorization header"
+    );
+    let headers = request
+        .headers()
+        .iter()
+        .map(|(name, value)| Ok((name.as_str().to_owned(), value.to_str()?.to_owned())))
+        .collect::<Result<Vec<_>>>()?;
+    let body = request
+        .body()
+        .map(|body| {
+            let bytes = body.as_bytes().context(
+                "GitHub authorized request requires a buffered body; streamed bodies are refused",
+            )?;
+            anyhow::ensure!(
+                bytes.len() <= MAX_REQUEST_BODY,
+                "GitHub authorized request body exceeds 16 MiB"
+            );
+            Ok::<_, anyhow::Error>(bytes.to_vec())
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let wire = AuthorizedRequest {
+        method: request.method().as_str().to_owned(),
+        url: url.as_str().to_owned(),
+        headers,
+        body,
+    };
+    let profile = profile.to_owned();
+    let response =
+        tokio::task::spawn_blocking(move || transport(&config, &profile, &wire)).await??;
+    anyhow::ensure!(
+        response.body.len() <= MAX_RESPONSE_BODY,
+        "GitHub authorized response body exceeds 64 MiB"
+    );
+    let mut raw = axum::http::Response::builder()
+        .status(response.status)
+        .url(url);
+    for (name, value) in response.headers {
+        raw.headers_mut()
+            .context("invalid authorized response status")?
+            .append(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes())?,
+                reqwest::header::HeaderValue::from_str(&value)?,
+            );
+    }
+    Ok(reqwest::Response::from(raw.body(response.body)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn authorized_destination_body_and_header_validation_refuses_before_the_rpc() {
+        let client = reqwest::Client::new();
+        for url in [
+            "http://api.github.com/repos",
+            "https://github.com/repos",
+            "https://api.github.com.evil.example/repos",
+            "https://api.github.com:8443/repos",
+            "https://user@api.github.com/repos",
+            "https://user:password@api.github.com/repos",
+            "https://api.github.com./repos",
+            "https://127.0.0.1/repos",
+        ] {
+            let error = send_authorized_with(
+                Arc::new(crate::config::Config::default()),
+                "owner/daemon-gh",
+                client.get(url),
+                |_, _, _| panic!("foreign destination reached RPC"),
+            )
+            .await
+            .err()
+            .unwrap();
+            let message = error.to_string();
+            // reqwest moves URL userinfo into an Authorization header before build.
+            assert!(
+                message.contains("require https://api.github.com")
+                    || message.contains("must not carry"),
+                "{url}: {message}"
+            );
+        }
+        let error = send_authorized_with(
+            Arc::new(crate::config::Config::default()),
+            "owner/daemon-gh",
+            client
+                .get("https://api.github.com/user")
+                .header("authorization", "fixture-local"),
+            |_, _, _| panic!("own authorization reached RPC"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("must not carry"));
+        let stream =
+            futures_util::stream::iter([Ok::<_, std::io::Error>(b"fixture-stream".to_vec())]);
+        let error = send_authorized_with(
+            Arc::new(crate::config::Config::default()),
+            "owner/daemon-gh",
+            client
+                .post("https://api.github.com/graphql")
+                .body(reqwest::Body::wrap_stream(stream)),
+            |_, _, _| panic!("streamed request reached RPC"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("streamed bodies are refused"));
+        let error = send_authorized_with(
+            Arc::new(crate::config::Config::default()),
+            "owner/daemon-gh",
+            client.post("https://api.github.com/graphql").body(vec![
+                0;
+                crate::sekrets::authorized::MAX_REQUEST_BODY
+                    + 1
+            ]),
+            |_, _, _| panic!("oversized request reached RPC"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("exceeds 16 MiB"));
+    }
+
+    #[tokio::test]
+    async fn authorized_response_body_is_capped_before_becoming_a_response() {
+        use crate::sekrets::authorized::{AuthorizedResponse, MAX_RESPONSE_BODY};
+        for length in [MAX_RESPONSE_BODY, MAX_RESPONSE_BODY + 1] {
+            let result = send_authorized_with(
+                Arc::new(crate::config::Config::default()),
+                "owner/daemon-gh",
+                reqwest::Client::new().get("https://api.github.com:443/repos/acme/garden"),
+                move |_, _, _| {
+                    Ok(AuthorizedResponse {
+                        status: 200,
+                        headers: vec![],
+                        body: vec![0; length],
+                    })
+                },
+            )
+            .await;
+            if length == MAX_RESPONSE_BODY {
+                assert_eq!(
+                    result.unwrap().bytes().await.unwrap().len(),
+                    MAX_RESPONSE_BODY
+                );
+            } else {
+                assert!(result.err().unwrap().to_string().contains("exceeds 64 MiB"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_requests_preserve_method_body_status_and_all_response_headers() {
+        use crate::sekrets::authorized::AuthorizedResponse;
+        let config = Arc::new(crate::config::Config {
+            node: "fixture-node".into(),
+            ..Default::default()
+        });
+        for (method, path, status) in [
+            ("GET", "/repos/acme/garden/issues?page=2", 304),
+            ("POST", "/graphql", 200),
+            ("POST", "/repos/acme/garden/issues/1/comments", 401),
+            ("POST", "/repos/acme/garden/pulls/1/reviews", 403),
+            ("GET", "/redirect", 302),
+            ("GET", "/error", 503),
+        ] {
+            let url = format!("https://api.github.com{path}");
+            let expected_url = url.clone();
+            let payload = br#"{"body":"fixture-comment"}"#;
+            let response = send_authorized_with(config.clone(), "owner/daemon-gh",
+                reqwest::Client::new().request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), &url)
+                    .header("if-none-match", "\"fixture-etag\"")
+                    .header("accept", "application/vnd.github+json")
+                    .header("x-github-api-version", "2022-11-28")
+                    .body(payload.to_vec()), move |config, profile, request| {
+                assert_eq!(config.node, "fixture-node");
+                assert_eq!(profile, "owner/daemon-gh");
+                assert_eq!(request.method, method);
+                assert_eq!(request.url, expected_url);
+                assert_eq!(request.body, payload);
+                let headers = request.headers.iter().cloned().collect::<BTreeMap<_,_>>();
+                assert_eq!(headers["if-none-match"], "\"fixture-etag\"");
+                assert_eq!(headers["accept"], "application/vnd.github+json");
+                assert_eq!(headers["x-github-api-version"], "2022-11-28");
+                assert!(headers.contains_key("user-agent"));
+                assert!(!headers.contains_key("authorization"));
+                Ok(AuthorizedResponse { status, headers: vec![
+                    ("etag".into(), "\"next-etag\"".into()),
+                    ("link".into(), "<https://api.github.com/repos/acme/garden/issues?page=3>; rel=\"next\"".into()),
+                    ("x-ratelimit-remaining".into(), "37".into()),
+                    ("x-ratelimit-reset".into(), "1234567890".into()),
+                    ("retry-after".into(), "30".into()),
+                    ("location".into(), "https://github.com/login".into()),
+                    ("x-fixture".into(), "first".into()), ("x-fixture".into(), "second".into()),
+                ], body: br#"{"message":"fixture response"}"#.to_vec() })
+            }).await.unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.url().as_str(), url);
+            assert_eq!(response.headers()["etag"], "\"next-etag\"");
+            assert!(
+                response.headers()["link"]
+                    .to_str()
+                    .unwrap()
+                    .contains("page=3")
+            );
+            assert_eq!(response.headers()["x-ratelimit-remaining"], "37");
+            assert_eq!(response.headers()["x-ratelimit-reset"], "1234567890");
+            assert_eq!(response.headers()["retry-after"], "30");
+            assert_eq!(response.headers().get_all("x-fixture").iter().count(), 2);
+            assert_eq!(
+                response.bytes().await.unwrap().as_ref(),
+                br#"{"message":"fixture response"}"#
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_errors_and_unavailable_socket_never_fall_back_or_retry() {
+        use crate::sekrets::authorized::{AuthorizedError, authorized_request_at};
+        for error in [
+            AuthorizedError::Unavailable("fixture absent".into()),
+            AuthorizedError::Refused("fixture grant".into()),
+            AuthorizedError::Transport("fixture TLS".into()),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = calls.clone();
+            let expected = error.to_string();
+            let result = send_authorized_with(
+                Arc::new(crate::config::Config::default()),
+                "owner/daemon-gh",
+                reqwest::Client::new().post("https://api.github.com/graphql"),
+                move |_, _, _| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Err(error)
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+            assert!(format!("{result:#}").contains(&expected));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("missing.sock");
+        let result = send_authorized_with(
+            Arc::new(crate::config::Config::default()),
+            "owner/daemon-gh",
+            reqwest::Client::new().get("https://api.github.com/user"),
+            move |config, profile, request| {
+                authorized_request_at(&socket, config, profile, request)
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            result
+                .downcast_ref::<AuthorizedError>()
+                .is_some_and(|e| matches!(e, AuthorizedError::Unavailable(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_adapter_uses_the_real_client_wire_once_for_a_rejected_mutation() {
+        use crate::sekrets::{
+            authorized::authorized_request_at,
+            protocol::{self, CallerView, Reply, Request},
+        };
+        use base64::Engine as _;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("gateway.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let gateway = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let (hello, _) = protocol::recv::<Request>(&stream).unwrap().unwrap();
+            assert!(matches!(hello, Request::Hello { attestation: None }));
+            protocol::send(
+                &stream,
+                &Reply::Hello {
+                    caller: CallerView::Person {
+                        person: "person/fixture".into(),
+                    },
+                    nonce: "fixture nonce".into(),
+                    gateway: "fixture".into(),
+                },
+                &[],
+            )
+            .unwrap();
+            let (request, _) = protocol::recv::<Request>(&stream).unwrap().unwrap();
+            let Request::Authorized(call) = request else {
+                panic!("wrong gateway request");
+            };
+            assert_eq!(call.profile, "owner/daemon-gh");
+            assert_eq!(call.method, "POST");
+            assert_eq!(
+                call.url,
+                "https://api.github.com/repos/acme/garden/issues/1/comments"
+            );
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(call.body)
+                    .unwrap(),
+                br#"{"body":"fixture"}"#
+            );
+            assert!(
+                !call
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            );
+            protocol::send(
+                &stream,
+                &Reply::Response {
+                    status: 401,
+                    headers: vec![("x-ratelimit-remaining".into(), "37".into())],
+                    body: base64::engine::general_purpose::STANDARD.encode(b"original 401"),
+                },
+                &[],
+            )
+            .unwrap();
+            assert!(
+                protocol::recv::<Request>(&stream).unwrap().is_none(),
+                "mutation was replayed"
+            );
+        });
+        let response = send_authorized_with(
+            Arc::new(crate::config::Config::default()),
+            "owner/daemon-gh",
+            reqwest::Client::new()
+                .post("https://api.github.com/repos/acme/garden/issues/1/comments")
+                .json(&serde_json::json!({"body":"fixture"})),
+            move |config, profile, request| {
+                authorized_request_at(&socket, config, profile, request)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["x-ratelimit-remaining"], "37");
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"original 401");
+        gateway.join().unwrap();
+    }
 
     fn gh_fixture() -> (tempfile::TempDir, BTreeMap<String, String>) {
         let root = tempfile::tempdir().unwrap();
@@ -405,7 +840,7 @@ mod tests {
         let first = tasks.remove(0).await.unwrap();
         for task in tasks {
             let auth = task.await.unwrap();
-            assert!(Arc::ptr_eq(&first.token, &auth.token));
+            assert!(Arc::ptr_eq(first.local_token(), auth.local_token()));
         }
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(3_600)).await;
@@ -441,7 +876,10 @@ mod tests {
             .acquire(|| async { panic!("late 401 evicted the refresh") })
             .await
             .unwrap();
-        assert!(Arc::ptr_eq(&second.token, &still_second.token));
+        assert!(Arc::ptr_eq(
+            second.local_token(),
+            still_second.local_token()
+        ));
     }
 
     #[tokio::test]
@@ -483,7 +921,7 @@ mod tests {
             .acquire(|| async { Ok("fixture-next".into()) })
             .await
             .unwrap();
-        assert!(auth.token.as_str() == "fixture-next");
+        assert!(auth.local_token().as_str() == "fixture-next");
     }
 
     #[test]
@@ -495,7 +933,9 @@ mod tests {
                 .to_string()
                 .contains("not configured")
         );
-        source.set(crate::config::GithubConfig::default()).unwrap();
+        source
+            .set(Arc::new(crate::config::Config::default()))
+            .unwrap();
         assert!(configured_source(&source).is_ok());
     }
 
@@ -583,13 +1023,13 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(first.token.as_str() == "fixture-first");
+        assert!(first.local_token().as_str() == "fixture-first");
         let unchanged = auth_for(&config, &cache, || async {
             panic!("file source touched default credentials")
         })
         .await
         .unwrap();
-        assert!(Arc::ptr_eq(&first.token, &unchanged.token));
+        assert!(Arc::ptr_eq(first.local_token(), unchanged.local_token()));
         let path = config.token_file.as_ref().unwrap();
         let prior_mtime = std::fs::metadata(path).unwrap().modified().unwrap();
         std::fs::write(path, b"fixture-next!\r\n").unwrap();
@@ -604,11 +1044,14 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(rotated.token.as_str() == "fixture-next!");
-        assert!(!Arc::ptr_eq(&first.token, &rotated.token));
+        assert!(rotated.local_token().as_str() == "fixture-next!");
+        assert!(!Arc::ptr_eq(first.local_token(), rotated.local_token()));
         cache.invalidate(&first).await;
         let still_rotated = cache.acquire_file(path).await.unwrap();
-        assert!(Arc::ptr_eq(&rotated.token, &still_rotated.token));
+        assert!(Arc::ptr_eq(
+            rotated.local_token(),
+            still_rotated.local_token()
+        ));
     }
 
     #[tokio::test]
@@ -629,8 +1072,8 @@ mod tests {
             .unwrap();
         std::fs::rename(replacement, path).unwrap();
         let rotated = cache.acquire_file(path).await.unwrap();
-        assert!(rotated.token.as_str() == "fixture-next!");
-        assert!(!Arc::ptr_eq(&first.token, &rotated.token));
+        assert!(rotated.local_token().as_str() == "fixture-next!");
+        assert!(!Arc::ptr_eq(first.local_token(), rotated.local_token()));
     }
 
     #[tokio::test]
@@ -690,37 +1133,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserved_profile_fails_closed_without_file_env_gh_or_cached_token() {
+    async fn profile_selection_never_reads_local_credentials_or_cached_token() {
         let cache = Arc::new(TokenCache::default());
         cache
             .acquire(|| async { Ok("fixture-cached".into()) })
             .await
             .unwrap();
-        let mut config = crate::config::GithubConfig {
-            sekrets_profile: Some("owner/daemon-gh".into()),
-            ..Default::default()
-        };
-        let error = auth_for(&config, &cache, || async {
-            panic!("profile touched default credentials")
+        let mut config = crate::config::Config::default();
+        config.github.sekrets_profile = Some("owner/daemon-gh".into());
+        config.state_dir = "/definitely/missing/node-state".into();
+        let auth = auth_for_config(Arc::new(config.clone()), &cache, || async {
+            panic!("profile touched environment or gh credentials")
         })
         .await
-        .err()
         .unwrap();
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported GitHub configuration")
-        );
-        assert!(configure(&config).is_err());
-        config.token_file = Some("/definitely/missing/credential".into());
-        let error = auth_for(&config, &cache, || async {
-            panic!("conflicting profile touched credentials")
+        assert!(auth.is_valid());
+        assert!(matches!(auth, GithubAuth::Authorized { .. }));
+        config.github.token_file = Some("/definitely/missing/credential".into());
+        let error = auth_for_config(Arc::new(config.clone()), &cache, || async {
+            panic!("conflicting profile touched local credentials")
         })
         .await
         .err()
         .unwrap();
         assert!(error.to_string().contains("mutually exclusive"));
-        assert!(config.validate().is_err());
+        assert!(config.github.validate().is_err());
     }
     #[tokio::test]
     async fn default_environment_changes_rotate_with_existing_precedence() {
@@ -732,22 +1169,25 @@ mod tests {
         let primary = auth_for(&config, &cache, || async { Ok(environment.clone()) })
             .await
             .unwrap();
-        assert!(primary.token.as_str() == "fixture-primary");
+        assert!(primary.local_token().as_str() == "fixture-primary");
         environment.insert("GITHUB_TOKEN".into(), "fixture-rotated-secondary".into());
         let unchanged = auth_for(&config, &cache, || async { Ok(environment.clone()) })
             .await
             .unwrap();
-        assert!(Arc::ptr_eq(&primary.token, &unchanged.token));
+        assert!(Arc::ptr_eq(primary.local_token(), unchanged.local_token()));
         environment.remove("GH_TOKEN");
         let secondary = auth_for(&config, &cache, || async { Ok(environment.clone()) })
             .await
             .unwrap();
-        assert!(secondary.token.as_str() == "fixture-rotated-secondary");
+        assert!(secondary.local_token().as_str() == "fixture-rotated-secondary");
         cache.invalidate(&primary).await;
         let unchanged = auth_for(&config, &cache, || async { Ok(environment.clone()) })
             .await
             .unwrap();
-        assert!(Arc::ptr_eq(&secondary.token, &unchanged.token));
+        assert!(Arc::ptr_eq(
+            secondary.local_token(),
+            unchanged.local_token()
+        ));
         assert!(!root.path().join("calls").exists());
         environment.remove("GITHUB_TOKEN");
         auth_for(&config, &cache, || async { Ok(environment.clone()) })
@@ -770,7 +1210,7 @@ mod tests {
         let unchanged = auth_for(&config, &cache, || async { Ok(environment.clone()) })
             .await
             .unwrap();
-        assert!(Arc::ptr_eq(&first.token, &unchanged.token));
+        assert!(Arc::ptr_eq(first.local_token(), unchanged.local_token()));
         let modified = std::fs::metadata(&hosts).unwrap().modified().unwrap();
         File::options()
             .write(true)
@@ -782,17 +1222,18 @@ mod tests {
             (0..8).map(|_| auth_for(&config, &cache, || async { Ok(environment.clone()) }));
         let refreshed = futures_util::future::join_all(refreshes).await;
         let newest = refreshed[0].as_ref().unwrap();
-        assert!(!Arc::ptr_eq(&first.token, &newest.token));
+        assert!(!Arc::ptr_eq(first.local_token(), newest.local_token()));
         assert!(
-            refreshed
-                .iter()
-                .all(|auth| Arc::ptr_eq(&auth.as_ref().unwrap().token, &newest.token))
+            refreshed.iter().all(|auth| Arc::ptr_eq(
+                auth.as_ref().unwrap().local_token(),
+                newest.local_token()
+            ))
         );
         cache.invalidate(&first).await;
         let unchanged = auth_for(&config, &cache, || async { Ok(environment.clone()) })
             .await
             .unwrap();
-        assert!(Arc::ptr_eq(&newest.token, &unchanged.token));
+        assert!(Arc::ptr_eq(newest.local_token(), unchanged.local_token()));
         assert_eq!(std::fs::read(root.path().join("calls")).unwrap().len(), 2);
     }
 }

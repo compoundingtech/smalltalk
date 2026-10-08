@@ -489,6 +489,40 @@ pub fn plain(line: &Line<'_>) -> String {
         .collect()
 }
 
+/// One styled line as terminal text: 24-bit colors, bold, italic, underline and dim, reset at the
+/// end. For a program with no screen of its own, such as `st documents get`.
+pub fn ansi(line: &Line<'_>) -> String {
+    let mut out = String::new();
+    for span in &line.spans {
+        let style = line.style.patch(span.style);
+        let mut codes: Vec<String> = Vec::new();
+        for (add, code) in [
+            (Modifier::BOLD, "1"),
+            (Modifier::DIM, "2"),
+            (Modifier::ITALIC, "3"),
+            (Modifier::UNDERLINED, "4"),
+            (Modifier::REVERSED, "7"),
+            (Modifier::CROSSED_OUT, "9"),
+        ] {
+            if style.add_modifier.contains(add) {
+                codes.push(code.to_owned());
+            }
+        }
+        if let Some(Color::Rgb(r, g, b)) = style.fg {
+            codes.push(format!("38;2;{r};{g};{b}"));
+        }
+        if let Some(Color::Rgb(r, g, b)) = style.bg {
+            codes.push(format!("48;2;{r};{g};{b}"));
+        }
+        if codes.is_empty() {
+            out.push_str(&span.content);
+        } else {
+            out.push_str(&format!("\x1b[{}m{}\x1b[0m", codes.join(";"), span.content));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +574,14 @@ mod tests {
         assert_eq!(text[0], "Head");
         assert_eq!(text[2], "• a b");
         assert!(text.iter().any(|line| line.starts_with("k │ v")));
+    }
+
+    #[test]
+    fn ansi_writes_colors_and_modifiers_and_resets() {
+        let line = Line::from(vec![
+            Span::styled("hi", Style::default().fg(Color::Rgb(1, 2, 3)).add_modifier(Modifier::BOLD)),
+            Span::raw(" plain"),
+        ]);
+        assert_eq!(ansi(&line), "\x1b[1;38;2;1;2;3mhi\x1b[0m plain");
     }
 }

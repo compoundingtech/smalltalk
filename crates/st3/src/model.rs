@@ -74,6 +74,22 @@ pub enum MemberLifecycle {
     #[default]
     Service,
     AdoptOnly,
+    /// Borrow a caller-owned shell's PTY; never launch or terminate that PTY.
+    TerminalBound,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TerminalBinding {
+    pub subject: String,
+    pub incarnation: String,
+    /// Unique per invocation, even when another harness uses the same shell.
+    pub id: String,
+}
+
+impl TerminalBinding {
+    pub fn agent_incarnation(&self) -> String {
+        format!("{}:bound:{}", self.incarnation, self.id)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -126,6 +142,8 @@ pub struct MemberSpec {
     pub tags: BTreeMap<String, String>,
     pub display_name: Option<String>,
     pub lifecycle: MemberLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_binding: Option<TerminalBinding>,
     /// Retire this seat when its process finishes, independently of its restart policy.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub one_shot: bool,
@@ -755,6 +773,10 @@ fn default_human_gate_mode() -> String {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct NormalizedIntent {
+    /// Local parser provenance for the public existing-observer registration route.
+    /// Never trusted from a serialized client intent; APIs reparse authored KDL.
+    #[serde(skip)]
+    pub(crate) direct_message_registrations: BTreeSet<String>,
     pub schema: String,
     pub source_hash: String,
     pub subjects: BTreeMap<String, DesiredSubject>,

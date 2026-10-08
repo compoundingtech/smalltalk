@@ -203,11 +203,12 @@ fn projection_failure_log_line(
         "error": bounded(message, 4096), "error_truncated": message.chars().take(4097).count()>4096,
         "stage": field("projection_stage"), "claim_id": field("projection_claim_id"),
         "subject": field("projection_subject"), "operation_id": field("projection_operation_id"),
+        "claim_kind": field("projection_claim_kind"),
         "frontier": if details.get("projection_frontier_unknown").and_then(Value::as_bool).unwrap_or(false) { None } else { Some(frontier) }, "target": target,
         "suppressed_errors": emission.suppressed, "rate_bucket_overflow": emission.overflow,
         "context_truncated": details.get("projection_context_truncated").and_then(Value::as_bool).unwrap_or(false)
             || phase.chars().take(129).count()>128 || code.chars().take(129).count()>128
-            || ["projection_stage", "projection_claim_id", "projection_subject", "projection_operation_id"].iter()
+            || ["projection_stage", "projection_claim_id", "projection_subject", "projection_operation_id", "projection_claim_kind"].iter()
                 .any(|name| details.get(*name).and_then(Value::as_str).is_some_and(|value| value.chars().take(257).count()>256)),
     });
     format!("st: projection failure detail {diagnostic}")
@@ -362,6 +363,7 @@ mod projection_failure_diagnostic_tests {
         let details = serde_json::Map::from_iter([
             ("projection_claim_id".into(), json!("claim")),
             ("projection_subject".into(), json!("subject\nnext")),
+            ("projection_claim_kind".into(), json!(format!("work.\"\n{}", "é".repeat(300)))),
             ("secret-payload".into(), json!("never copy")),
         ]);
         let line = projection_failure_log_line(
@@ -381,6 +383,9 @@ mod projection_failure_diagnostic_tests {
         assert_eq!(value["error_truncated"], true);
         assert_eq!(value["claim_id"], "claim");
         assert_eq!(value["subject"], "subject\nnext");
+        assert_eq!(value["claim_kind"].as_str().unwrap().chars().count(), 256);
+        assert!(value["claim_kind"].as_str().unwrap().starts_with("work.\"\n"));
+        assert_eq!(value["context_truncated"], true);
         assert_eq!(value["operation_id"], Value::Null);
         assert!(!line.contains("never copy"));
         let short = projection_failure_log_line(

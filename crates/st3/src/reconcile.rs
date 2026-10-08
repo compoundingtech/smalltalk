@@ -2379,6 +2379,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                             });
                             self.runtime.observe_exec(&member.runtime_id)?
                         };
+                        if member.lifecycle == MemberLifecycle::TerminalBound {
+                            if let Some(incarnation) =
+                                self.reconcile_terminal_binding(subject, member, observed.as_ref())?
+                            {
+                                work_message_agents.push((
+                                    (**subject).clone(),
+                                    incarnation,
+                                    member.clone(),
+                                ));
+                            }
+                            return Ok(());
+                        }
                         if self.reconcile_rollout(subject, observed.as_ref(), blocked.as_ref())? {
                             if subject.kind == "agent"
                                 && let Some(observation) =
@@ -4502,6 +4514,18 @@ impl<R: RuntimeControl> Reconciler<R> {
             // not evidence that the owner's process stopped.
             return Ok(());
         }
+        if let Some(member) = member.filter(|m| m.lifecycle == MemberLifecycle::TerminalBound) {
+            let incarnation = member
+                .terminal_binding
+                .as_ref()
+                .context("bound seat has no binding")?
+                .agent_incarnation();
+            return self.record_once(
+                &subject.subject,
+                "runtime.observed",
+                member_fields(member, "stopped", Some(&incarnation), true),
+            );
+        }
         let Some(runtime_id) = member.map(|m| m.runtime_id.as_str())
             .or_else(|| fields.get("runtime_id").and_then(Value::as_str)) else {
             return Ok(());
@@ -5010,6 +5034,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         reason: &str,
         request: Option<&crate::model::ClaimRecord>,
     ) -> Result<bool> {
+        anyhow::ensure!(
+            member.lifecycle != MemberLifecycle::TerminalBound,
+            "a bound terminal seat cannot be spawned"
+        );
         self.store.owned_desired_guard(subject)?;
         let explicit_person = request.is_some_and(|request| {
             request
@@ -6608,6 +6636,53 @@ impl<R: RuntimeControl> Reconciler<R> {
             crate::performance::record_wake("timer restart", Some(restart_wake_kind(&subject)));
             notify.notify_one();
         });
+    }
+
+    /// Observe only the invocation, never the borrowed shell's lifecycle as an agent exit.
+    fn reconcile_terminal_binding(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observed: Option<&RuntimeObservation>,
+    ) -> Result<Option<String>> {
+        let binding = member
+            .terminal_binding
+            .as_ref()
+            .context("bound seat has no binding")?;
+        let incarnation = binding.agent_incarnation();
+        let prior = self.store.latest_actual_value(&subject.subject)?;
+        if let Some(prior) = prior.as_ref().filter(|actual| {
+            actual_field(actual, "incarnation_id").and_then(Value::as_str)
+                == Some(incarnation.as_str())
+                && matches!(
+                    actual_field(actual, "status").and_then(Value::as_str),
+                    Some("exited" | "vanished" | "stopped")
+                )
+        }) {
+            let status = actual_field(prior, "status")
+                .and_then(Value::as_str)
+                .expect("exit status");
+            let mut fields = member_fields(member, status, Some(&incarnation), true);
+            for key in ["exit_code", "exit_signal"] {
+                if let Some(value) = actual_field(prior, key) {
+                    fields.insert(key.into(), value.clone());
+                }
+            }
+            self.record_once(&subject.subject, "runtime.observed", fields)?;
+            return Ok(None);
+        }
+        // Refuse a replacement PTY with the same runtime ID, including after daemon restart.
+        let running = observed.is_some_and(|o| {
+            o.status == "running"
+                && o.incarnation_id.as_deref() == Some(binding.incarnation.as_str())
+        });
+        let status = if running { "running" } else { "vanished" };
+        self.record_once(
+            &subject.subject,
+            "runtime.observed",
+            member_fields(member, status, Some(&incarnation), true),
+        )?;
+        Ok(running.then_some(incarnation))
     }
 
     fn record_member(
@@ -8607,6 +8682,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             tags: BTreeMap::new(),
             display_name: Some(format!("loop metric {}", metric.name)),
             lifecycle: MemberLifecycle::Service,
+            terminal_binding: None,
             one_shot: false,
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),
@@ -13265,6 +13341,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             tags: BTreeMap::new(),
             display_name: None,
             lifecycle: MemberLifecycle::Service,
+            terminal_binding: None,
             one_shot: false,
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),
@@ -13800,6 +13877,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             tags: BTreeMap::new(),
             display_name: None,
             lifecycle: MemberLifecycle::Service,
+            terminal_binding: None,
             one_shot: false,
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),
@@ -28500,6 +28578,45 @@ observer "repo" {
         .expect("the observation finished");
     }
 
+    #[tokio::test]
+    async fn main_performance_failures_subscription_extends_the_existing_observer_request() {
+        struct Capture {
+            calls: Arc<AtomicUsize>,
+            fields: Arc<Mutex<Vec<BTreeSet<String>>>>,
+        }
+        impl ResourceProvider for Capture {
+            fn observe(&self, request: ObservationRequest) -> std::pin::Pin<Box<
+                dyn std::future::Future<Output = Result<crate::resource::ProviderObservation>> + Send + '_
+            >> {
+                self.fields.lock().unwrap().push(request.fields);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(crate::resource::ProviderObservation {
+                    facts: serde_json::json!({"repository_id": 7, "issues": [], "main_performance_failures": []}),
+                    cursor: Some("workflow-baseline".into()),
+                    next_check_unix_ms: now_ms().saturating_add(60_000),
+                }) })
+            }
+        }
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, &format!(r#"{SCRIPTED_OBSERVER}
+agent "target" {{ workspace "."; command "true" }}
+subscription "performance" {{ observer "observer/repo"; to "agent/node.target"; on "main_performance_failures"; delivery "message" }}
+"#), "subscribe-workflow");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fields = Arc::new(Mutex::new(Vec::new()));
+        let reconciler = Reconciler::new(store.clone(), Arc::new(FakeRuntime::default()),
+            "node".into(), Arc::new(Notify::new()))
+            .with_resource_provider(Arc::new(Capture { calls: calls.clone(), fields: fields.clone() }));
+        observe_now(&reconciler, &calls).await;
+        assert!(fields.lock().unwrap().iter().any(|fields|
+            fields.contains("issues") && fields.contains("main_performance_failures")));
+        let observers = store.desired_subjects().unwrap().into_iter()
+            .filter(|item| item.kind == "observer").collect::<Vec<_>>();
+        assert_eq!(observers.len(), 1);
+        assert_eq!(crate::graph::observer_spec(&observers[0].desired).unwrap().fields, ["issues"]);
+        assert!(store.messages(None, true).unwrap().is_empty());
+    }
+
     fn failure_for_item(
         store: &Store,
         item: &crate::model::AttentionItemView,
@@ -33823,6 +33940,251 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
             expected_subject: None,
             idempotency_key: Some(format!("{subject}:{state}:{incarnation}")),
         }
+    }
+
+    #[test]
+    fn same_state_name_change_recovers_two_live_seats_without_touching_a_remote_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("claims.sqlite3");
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let source = format!(
+            "version 2\nagent \"example/one\" {{ host \"orchid\"; workspace {:?}; harness \"claude\" {{}} }}\nagent \"example/two\" {{ host \"orchid\"; workspace {:?}; harness \"claude\" {{}} }}\nagent \"example/remote\" {{ host \"fern\"; workspace {:?}; harness \"claude\" {{}} }}\n",
+            workspace.path().display().to_string(),
+            workspace.path().display().to_string(),
+            workspace.path().display().to_string()
+        );
+        let before;
+        {
+            let store = Arc::new(Store::open(&database, "orchid").unwrap());
+            store
+                .append_claim(&ClaimInput {
+                    subject: "daemon/orchid".into(),
+                    kind: "daemon.started".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), Value::String("running".into()))]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            apply_source(&store, &source, "rename-source");
+            for name in ["one", "two"] {
+                let seat = format!("agent/example/{name}");
+                let member = store
+                    .desired_subject_with_writer(&seat)
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .member
+                    .unwrap();
+                runtime.ptys.lock().unwrap().push(RuntimeObservation {
+                    runtime_id: member.runtime_id,
+                    terminal: true,
+                    status: "running".into(),
+                    exit_code: None,
+                    incarnation_id: Some(format!("native-{name}")),
+                });
+                store
+                    .append_claim(&ClaimInput {
+                        subject: seat.clone(),
+                        kind: "runtime.action.succeeded".into(),
+                        actor: None,
+                        fields: BTreeMap::from([
+                            ("action".into(), Value::String("start".into())),
+                            (
+                                "desired_token".into(),
+                                Value::String(
+                                    store.selected_desired_token(&seat).unwrap().unwrap(),
+                                ),
+                            ),
+                            (
+                                "runtime_id".into(),
+                                Value::String(
+                                    store
+                                        .desired_subject_with_writer(&seat)
+                                        .unwrap()
+                                        .unwrap()
+                                        .0
+                                        .member
+                                        .unwrap()
+                                        .runtime_id,
+                                ),
+                            ),
+                            (
+                                "incarnation_id".into(),
+                                Value::String(format!("native-{name}")),
+                            ),
+                        ]),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+                let mut harness = harness_claim(&seat, "idle", &format!("native-{name}"));
+                harness
+                    .fields
+                    .insert("driver".into(), serde_json::json!("claude"));
+                store.append_claim(&harness).unwrap();
+                store
+                    .append_claim(&ClaimInput {
+                        subject: seat.clone(),
+                        kind: "harness.session-file".into(),
+                        actor: Some(seat),
+                        fields: BTreeMap::from([
+                            ("harness".into(), serde_json::json!("claude")),
+                            (
+                                "session_id".into(),
+                                serde_json::json!(format!("provider-{name}")),
+                            ),
+                            (
+                                "path".into(),
+                                serde_json::json!(
+                                    workspace
+                                        .path()
+                                        .join(format!("provider-{name}.jsonl"))
+                                        .display()
+                                        .to_string()
+                                ),
+                            ),
+                        ]),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            }
+            let reconciler = Reconciler::new(
+                store.clone(),
+                runtime.clone(),
+                "orchid".into(),
+                Arc::new(Notify::new()),
+            );
+            reconciler.reconcile_once().unwrap();
+            before = store
+                .desired_subjects()
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.subject.clone(), s.member.unwrap().host))
+                .collect::<BTreeMap<_, _>>();
+        }
+        // Peer records replicate into this graph, but there is no local start receipt for
+        // its runtime. They must neither select our node identity nor be moved or stopped.
+        {
+            let peer = Store::open(&database, "fern").unwrap();
+            let member = peer
+                .desired_subject_with_writer("agent/example/remote")
+                .unwrap()
+                .unwrap()
+                .0
+                .member
+                .unwrap();
+            peer.append_claim(&ClaimInput {
+                subject: "agent/example/remote".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    ("host".into(), Value::String("fern".into())),
+                    ("runtime_id".into(), Value::String(member.runtime_id)),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("remote-native".into()),
+                    ),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        }
+        // Reproduce the old binary restarting this same directory under another writer name.
+        {
+            let renamed = Store::open(&database, "orchid-laptop").unwrap();
+            renamed
+                .append_claim(&ClaimInput {
+                    subject: "daemon/orchid-laptop".into(),
+                    kind: "daemon.started".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), Value::String("running".into()))]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        for name in ["orchid-laptop", "orchid"] {
+            let mut config = crate::config::Config {
+                node: name.into(),
+                state_dir: directory.path().into(),
+                ..crate::config::Config::default()
+            };
+            let lock = crate::node_identity::acquire(&mut config).unwrap();
+            assert_eq!(config.node, "orchid");
+            let store = Arc::new(Store::open(&database, &config.node).unwrap());
+            let reconciler = Reconciler::new(
+                store.clone(),
+                runtime.clone(),
+                config.node.clone(),
+                Arc::new(Notify::new()),
+            );
+            reconciler.reconcile_once().unwrap();
+            assert_eq!(
+                before,
+                store
+                    .desired_subjects()
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| (s.subject.clone(), s.member.unwrap().host))
+                    .collect()
+            );
+            for name in ["one", "two"] {
+                let seat = format!("agent/example/{name}");
+                let actual = store.latest_actual_value(&seat).unwrap().unwrap();
+                assert_eq!(
+                    actual_field(&actual, "incarnation_id"),
+                    Some(&Value::String(format!("native-{name}")))
+                );
+                assert_eq!(
+                    actual_field(&actual, "status"),
+                    Some(&Value::String("running".into()))
+                );
+                assert_eq!(
+                    store
+                        .latest_observation(&seat, "harness.observed")
+                        .unwrap()
+                        .unwrap()
+                        .body["fields"]["incarnation_id"],
+                    format!("native-{name}")
+                );
+                assert_eq!(
+                    store
+                        .latest_observation(&seat, "harness.session-file")
+                        .unwrap()
+                        .unwrap()
+                        .body["fields"]["session_id"],
+                    format!("provider-{name}")
+                );
+            }
+            let remote = store
+                .latest_actual_value("agent/example/remote")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                actual_field(&remote, "incarnation_id"),
+                Some(&Value::String("remote-native".into()))
+            );
+            assert_eq!(
+                actual_field(&remote, "status"),
+                Some(&Value::String("running".into()))
+            );
+            drop(reconciler);
+            drop(store);
+            drop(lock);
+        }
+        assert!(runtime.starts.lock().unwrap().is_empty());
+        assert!(runtime.stops.lock().unwrap().is_empty());
+        assert!(runtime.kills.lock().unwrap().is_empty());
     }
 
     #[test]
