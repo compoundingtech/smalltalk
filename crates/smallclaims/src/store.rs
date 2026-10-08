@@ -5469,19 +5469,39 @@ impl Store {
         &self,
         connection: &Connection,
     ) -> Result<Arc<ReplicationSnapshot>> {
-        let previous = self
-            .replication_snapshot
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let store_index = current_index(connection)?;
+        let graph_generation = graph_generation(connection)?;
+        let projection_generation = projection_digest::generation(connection)?;
+        let inventory_generation = inventory_generation::current(connection)?;
+        let pinned_tail = max_envelope_rowid(connection)?;
+        // A builder on an older WAL cut must neither extend a newer cached inventory nor
+        // replace that cache with its older result. Tail appends leave inventory_generation
+        // unchanged, so the tail itself is part of this comparison.
+        let cache_ahead = |cached: &ReplicationSnapshot| {
+            cached.store_index > store_index
+                || cached.graph_generation > graph_generation
+                || cached.projection_generation > projection_generation
+                || cached.inventory_generation > inventory_generation
+                || (cached.inventory_generation == inventory_generation
+                    && cached.max_envelope_rowid > pinned_tail)
+        };
+        let previous = {
+            let mut cache = self
+                .replication_snapshot
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if cache.as_ref().is_some_and(|cached| cache_ahead(cached)) {
+                None
+            } else {
+                cache.take()
+            }
+        };
         // The six-table digest stays on the legacy peer wire format. Its generation lets us
         // retain compatibility without rescanning those tables for unrelated source changes.
-        let graph_generation = graph_generation(connection)?;
         let reusable_graph_digest = previous
             .as_ref()
             .filter(|previous| previous.graph_generation == graph_generation)
             .map(|previous| previous.legacy_graph_digest.clone());
-        let inventory_generation = inventory_generation::current(connection)?;
         let full = |connection: &Connection| -> Result<_> {
             let (inventory, max_rowid, envelope_rows) =
                 load_compact_replication_inventory(connection)?;
@@ -5512,7 +5532,9 @@ impl Store {
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
-            if inventory_generation == previous.inventory_generation {
+            if inventory_generation == previous.inventory_generation
+                && previous.max_envelope_rowid <= pinned_tail
+            {
                 let envelope_rows = previous.envelope_rows + additions.len();
                 let mut max_rowid = previous.max_envelope_rowid;
                 // Most snapshots are owned only by this cache. Move their inventory
@@ -5585,11 +5607,10 @@ impl Store {
             Some(digest) => digest,
             None => legacy_graph_digest(connection, self.runtime.legacy_digest_tables())?,
         };
-        let projection_generation = projection_digest::generation(connection)?;
         let projection_digests = projection_digest::tables(connection)?;
         let graph_digest = projection_digest::root(&projection_digests);
         let snapshot = Arc::new(ReplicationSnapshot {
-            store_index: current_index(connection)?,
+            store_index,
             replica_generation: self.replica_generation.load(Ordering::Acquire),
             max_envelope_rowid,
             envelope_rows: envelope_count,
@@ -5605,17 +5626,21 @@ impl Store {
             projection_digests,
             unsealed: connection
                 .prepare_cached(
-                    "SELECT EXISTS(SELECT 1 FROM batches WHERE rowid>?1 AND NOT EXISTS(
+                    "SELECT EXISTS(SELECT 1 FROM batches WHERE rowid>
+                         COALESCE((SELECT CAST(value AS INTEGER) FROM meta
+                                   WHERE key='seeded_batch_rowid'),0)
+                       AND NOT EXISTS(
                          SELECT 1 FROM replica_envelopes WHERE replica_envelopes.batch_id=batches.id))",
                 )?
-                .query_row([self.seeded_batch_rowid.load(Ordering::Acquire)], |row| {
-                    row.get(0)
-                })?,
+                .query_row([], |row| row.get(0))?,
         });
-        *self
+        let mut cache = self
             .replication_snapshot
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(snapshot.clone());
+            .unwrap_or_else(PoisonError::into_inner);
+        if !cache.as_ref().is_some_and(|cached| cache_ahead(cached)) {
+            *cache = Some(snapshot.clone());
+        }
         Ok(snapshot)
     }
 

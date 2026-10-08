@@ -1326,18 +1326,27 @@ fn sealed_status_keeps_the_pending_guard_at_the_readers_cut() {
     let writer = target.clone();
     let sealer = std::thread::spawn(move || {
         if started.recv().is_ok() {
-            let result = writer.seal_local_batches().map(|_| {
-                writer
-                    .seeded_batch_rowid
-                    .load(std::sync::atomic::Ordering::Acquire)
+            let result = writer.seal_local_batches().and_then(|_| {
+                // Publish the successor cache before the older reader asks for status.
+                let snapshot = writer.sealed_replication_snapshot()?;
+                Ok((
+                    writer
+                        .seeded_batch_rowid
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    snapshot.inventory.digest.clone(),
+                    snapshot.envelope_rows,
+                    snapshot.unsealed,
+                ))
             });
             let _ = done.send(result);
         }
     });
+    let mut newer_digest_for_fresh = None;
     target
         .read_snapshot(|_| {
             let snapshot = target.sealed_replication_snapshot()?;
             assert_eq!(snapshot.inventory.digest, exchange.inventory.digest);
+            assert!(snapshot.unsealed);
             assert_ne!(snapshot.projection_digests, exchange.projection_digests);
             let before =
                 target.replication_status_sealed(true, Some(TEST_FLEET), &["alder".into()])?;
@@ -1350,13 +1359,17 @@ fn sealed_status_keeps_the_pending_guard_at_the_readers_cut() {
             // Seal on another thread after this reader has pinned the pre-seal cut.
             // The writer's live cursor advances, but this reader still sees pending input.
             start.send(()).unwrap();
-            let cursor_after = finished
+            let (cursor_after, newer_digest, newer_rows, newer_unsealed) = finished
                 .recv_timeout(std::time::Duration::from_secs(60))
                 .expect("sealing must complete while a WAL reader holds its earlier cut")?;
             assert!(
                 cursor_after > cursor_before,
                 "the sealer must advance its live cursor"
             );
+            assert_ne!(newer_digest, snapshot.inventory.digest);
+            assert!(newer_rows > snapshot.envelope_rows);
+            assert!(!newer_unsealed);
+            newer_digest_for_fresh = Some(newer_digest);
             eprintln!("pinned pending cut: live sealing cursor {cursor_before} -> {cursor_after}");
             let pending: bool = target.readers.get().query_row(
                 "SELECT EXISTS(SELECT 1 FROM batches WHERE origin=?1 AND rowid>COALESCE(\
@@ -1365,8 +1378,19 @@ fn sealed_status_keeps_the_pending_guard_at_the_readers_cut() {
                 |row| row.get(0),
             )?;
             assert!(pending, "the pinned database cut still has unsealed input");
+            let pinned_after = target.sealed_replication_snapshot()?;
+            assert_eq!(pinned_after.inventory.digest, snapshot.inventory.digest);
+            assert_eq!(pinned_after.envelope_rows, snapshot.envelope_rows);
+            assert_eq!(
+                pinned_after.inventory.public().envelopes,
+                snapshot.inventory.public().envelopes
+            );
+            assert!(pinned_after.unsealed);
             let status =
                 target.replication_status_sealed(true, Some(TEST_FLEET), &["alder".into()])?;
+            assert_eq!(status.authority_digest, snapshot.authority_digest);
+            assert_eq!(status.received_envelopes, snapshot.envelope_rows as u64);
+            assert_eq!(status.projection_digests, snapshot.projection_digests);
             assert!(
                 status.peers[0].differing_tables.is_empty(),
                 "a later writer cursor cannot certify this older reader's projections: {:?}",
@@ -1377,15 +1401,9 @@ fn sealed_status_keeps_the_pending_guard_at_the_readers_cut() {
         })
         .unwrap();
     sealer.join().unwrap();
-    assert_ne!(
-        target
-            .sealed_replication_snapshot()
-            .unwrap()
-            .inventory
-            .digest,
-        exchange.inventory.digest,
-        "the post-commit cut has a newer sealed inventory than the measured peer"
-    );
+    let fresh = target.sealed_replication_snapshot().unwrap();
+    assert_eq!(fresh.inventory.digest, newer_digest_for_fresh.unwrap());
+    assert_ne!(fresh.inventory.digest, exchange.inventory.digest);
 }
 
 #[test]
