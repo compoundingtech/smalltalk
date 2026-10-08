@@ -20,6 +20,8 @@ use std::{
 };
 
 const PAGE: usize = 128;
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 type Handles = Arc<Mutex<BTreeMap<String, Namespace>>>;
 
 /// Retains opaque identity only. No SQL, cut, certificate or readiness is produced here.
@@ -76,14 +78,21 @@ pub(crate) struct Service {
     job: Mutex<Option<String>>,
     producer_after: Mutex<String>,
     waiting: Mutex<Option<SourcePosition>>,
+    recovery: Mutex<bool>,
+    stopped: Mutex<Option<String>>,
 }
 
 pub(crate) fn open(path: &Path, receiver: &str) -> Result<Arc<Store>> {
+    let preflight = preflight_reopen(path, receiver);
     let views = Arc::new(Views::new(cards::definitions())?);
     let store = Arc::new(Store::open_with_ivm_views(path, receiver, views.clone())?);
     // This is actual bounded native projection, not an invented frontier update. It precedes
     // source registration, so a preexisting legacy dependency cannot be silently adopted stale.
-    store.project_replication_backlog()?;
+    let startup = match preflight {
+        Ok(true) => store.replay_replication_graph(),
+        Ok(false) => store.project_replication_backlog().map(|_| ()),
+        Err(error) => Err(error),
+    };
     let handles = Arc::new(Mutex::new(BTreeMap::new()));
     let installer = Arc::new(Installer::new(vec![Box::new(Observed {
         inner: kernel::Kernel::new(receiver),
@@ -99,12 +108,59 @@ pub(crate) fn open(path: &Path, receiver: &str) -> Result<Arc<Store>> {
         job: Mutex::new(None),
         producer_after: Mutex::new(String::new()),
         waiting: Mutex::new(None),
+        recovery: Mutex::new(false),
+        stopped: Mutex::new(None),
     });
-    service.install(&store)?;
+    let installed = startup.and_then(|_| service.install(&store));
+    if let Err(error) = installed {
+        service.stop(&store, &error.to_string())?;
+    }
     Ok(store)
 }
 
 impl Service {
+    // A source-only refusal fences agent reads while native daemon operations remain usable.
+    // It installs no fallback reader and never fabricates source/producer coverage.
+    fn stop(self: &Arc<Self>, store: &Arc<Store>, reason: &str) -> Result<()> {
+        *self
+            .stopped
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source stop lock poisoned"))? = Some(reason.into());
+        store
+            .connection
+            .batched(|tx| self.fence_stopped(tx, reason))
+            .map_err(anyhow::Error::msg)??;
+        if store.smalltalk.ivm_installer.get().is_none() {
+            store
+                .smalltalk
+                .ivm_installer
+                .set(self.installer.clone())
+                .map_err(|_| anyhow::anyhow!("stopped Installer attachment raced"))?;
+        }
+        if store.smalltalk.ivm_agent_service.get().is_none() {
+            store
+                .smalltalk
+                .ivm_agent_service
+                .set(self.clone())
+                .map_err(|_| anyhow::anyhow!("stopped source attachment raced"))?;
+        }
+        tracing::warn!(%reason,"native agent collection source is unavailable");
+        Ok(())
+    }
+
+    fn fence_stopped(&self, tx: &Transaction<'_>, reason: &str) -> Result<()> {
+        self.views.fence_all(tx, reason)?;
+        let capture:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='st3_ivm_capture_state' AND type='table')",[],|r|r.get(0))?;
+        if capture {
+            super::super::gap(tx, reason)?;
+        }
+        let sources:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='ivm_install_sources' AND type='table')",[],|r|r.get(0))?;
+        if sources {
+            self.installer.source_gap(tx, SOURCE, reason)?;
+        }
+        Ok(())
+    }
+
     fn install(self: &Arc<Self>, store: &Arc<Store>) -> Result<()> {
         let epoch = smallclaims::ivm::source_cut(&store.readers.get())?
             .context("collection graph identity missing")?
@@ -138,32 +194,27 @@ impl Service {
         let job = store
             .connection
             .batched(|tx| {
-                // A retained lifetime, raw gap or changed binding requires a separately qualified
-                // recovery schedule. Never clear it merely because the process has reopened.
-                super::super::scope::begin_install(
-                    tx,
-                    &self.views,
-                    &self.installer,
-                    SOURCE,
-                    &self.fingerprint,
-                    epoch,
+                let retained: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM ivm_install_sources WHERE name=?1)",
+                    [SOURCE],
+                    |r| r.get(0),
                 )?;
-                self.views
-                    .register_installed(tx, &self.installer, cards::VIEW)?;
-                let job = self.installer.start(
-                    tx,
-                    cards::VIEW,
-                    Limits {
-                        page_rows: PAGE,
-                        page_bytes: 1024 * 1024,
-                        pending_rows: 16384,
-                        pending_bytes: 16 * 1024 * 1024,
-                        total_rows: 1_000_000,
-                        callback_ms: 1000,
-                        lifetime_ms: 60 * 60 * 1000,
-                    },
-                    now_ms_u64()?,
-                )?;
+                let job = if retained {
+                    self.begin_recovery(tx, epoch)?;
+                    None
+                } else {
+                    super::super::scope::begin_install(
+                        tx,
+                        &self.views,
+                        &self.installer,
+                        SOURCE,
+                        &self.fingerprint,
+                        epoch,
+                    )?;
+                    self.views
+                        .register_installed(tx, &self.installer, cards::VIEW)?;
+                    Some(self.start(tx)?)
+                };
                 let version: u64 = tx.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
                 tx.execute(
                     "UPDATE st3_agent_source_service SET schema_version=?1 WHERE singleton=1",
@@ -175,7 +226,11 @@ impl Service {
         *self
             .job
             .lock()
-            .map_err(|_| anyhow::anyhow!("source job lock poisoned"))? = Some(job);
+            .map_err(|_| anyhow::anyhow!("source job lock poisoned"))? = job.clone();
+        *self
+            .recovery
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source recovery lock poisoned"))? = job.is_none();
         self.tick(store, clock::Reason::Kernel)?;
         let registration = super::super::delivery::install_sink(store)?;
         store.retain_collection_runtime(self.installer.clone(), registration)?;
@@ -187,10 +242,136 @@ impl Service {
         Ok(())
     }
 
+    fn start(&self, tx: &Transaction<'_>) -> Result<String> {
+        self.installer.start(
+            tx,
+            cards::VIEW,
+            Limits {
+                page_rows: PAGE,
+                page_bytes: 1024 * 1024,
+                pending_rows: 16384,
+                pending_bytes: 16 * 1024 * 1024,
+                total_rows: 1_000_000,
+                callback_ms: 1000,
+                lifetime_ms: 60 * 60 * 1000,
+            },
+            now_ms_u64()?,
+        )
+    }
+
+    fn begin_recovery(&self, tx: &Transaction<'_>, epoch: u64) -> Result<()> {
+        let capture = super::super::status(tx)?;
+        let retained = self.installer.status(tx, cards::VIEW)?;
+        ensure!(
+            retained.compatible
+                && retained.source.fingerprint == self.fingerprint
+                && retained.source.epoch == epoch
+                && capture.epoch == epoch
+                && capture.fingerprint == self.fingerprint,
+            "source recovery identity/epoch/operator mismatch"
+        );
+        ensure!(
+            capture.gap.as_deref()
+                != Some(
+                    "capture identity or source descriptor changed; explicit replacement required"
+                ),
+            "source recovery descriptor changed"
+        );
+        ensure!(
+            capture.pending_rows <= 256 && capture.pending_bytes <= 1024 * 1024,
+            "source recovery staging range exceeds fixed bound"
+        );
+        self.views.fence_all(
+            tx,
+            "fresh source baseline and namespace publication pending",
+        )?;
+        self.installer
+            .restore_source(tx, &retained.source, &self.fingerprint, epoch)?;
+        // The writer is exclusive: this fixed pre-recovery range precedes all future paired
+        // capture. A new full PK scan covers its current source, never replays it as managed.
+        let through: u64 = tx.query_row(
+            "SELECT COALESCE(max(sequence),0) FROM st3_ivm_capture",
+            [],
+            |r| r.get(0),
+        )?;
+        tx.execute("DELETE FROM st3_ivm_capture WHERE sequence IN (SELECT sequence FROM st3_ivm_capture WHERE sequence<=?1 ORDER BY sequence LIMIT 256)",[through])?;
+        ensure!(
+            tx.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM st3_ivm_capture)",
+                [],
+                |r| r.get::<_, bool>(0)
+            )?,
+            "source recovery staging range incomplete"
+        );
+        tx.execute("DELETE FROM st3_ivm_insert_before", [])?;
+        tx.execute("DELETE FROM st3_ivm_update_before", [])?;
+        tx.execute(
+            "UPDATE st3_ivm_capture_state SET gap=NULL,guarded=1 WHERE singleton=1",
+            [],
+        )?;
+        self.views
+            .install_gap_trigger(tx, "st3_ivm_capture_state", "gap")?;
+        self.views
+            .register_installed(tx, &self.installer, cards::VIEW)?;
+        Ok(())
+    }
+
+    fn reclaim_page(&self, store: &Store) -> Result<bool> {
+        let job: Option<String> = store.readers.get().query_row(
+            "SELECT j.id FROM ivm_install_jobs j WHERE view=?1 AND phase IN ('stopped','published') AND NOT EXISTS(SELECT 1 FROM ivm_install_roots r WHERE r.namespace=j.id) ORDER BY j.id LIMIT 1",
+            [cards::VIEW],|r|r.get(0)).optional()?;
+        let Some(job) = job else { return Ok(false) };
+        let done = store
+            .connection
+            .batched(|tx| self.installer.reclaim(tx, &job, PAGE))
+            .map_err(anyhow::Error::msg)??;
+        if done {
+            self.handles
+                .lock()
+                .map_err(|_| anyhow::anyhow!("namespace identity lock poisoned"))?
+                .remove(&job);
+        }
+        Ok(true)
+    }
+
+    fn recovery_page(&self, store: &Store) -> Result<bool> {
+        if self.reclaim_page(store)? {
+            return Ok(true);
+        }
+        let removed = store
+            .connection
+            .batched(|tx| self.installer.prune_journal(tx, SOURCE, PAGE))
+            .map_err(anyhow::Error::msg)??;
+        if removed > 0 {
+            return Ok(true);
+        }
+        let job = store
+            .connection
+            .batched(|tx| self.start(tx))
+            .map_err(anyhow::Error::msg)??;
+        *self
+            .job
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source job lock poisoned"))? = Some(job);
+        *self
+            .recovery
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source recovery lock poisoned"))? = false;
+        Ok(true)
+    }
+
     fn prepare(&self, tx: &Transaction<'_>) -> Result<()> {
         super::super::scope::prepare(tx)
     }
     fn finalize(&self, tx: &Transaction<'_>) -> Result<()> {
+        let stopped = self
+            .stopped
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source stop lock poisoned"))?
+            .clone();
+        if let Some(reason) = stopped {
+            return self.fence_stopped(tx, &reason);
+        }
         let state = super::super::status(tx)?;
         if !self.schema_current(tx)? || state.fingerprint != self.fingerprint {
             super::super::gap(tx, "agent source schema or receiver binding changed")?;
@@ -250,12 +431,27 @@ impl Service {
     /// One finite page/tick per call. The daemon runs this on a blocking maintenance worker.
     pub(crate) fn pump(&self) -> Result<bool> {
         let store = self.store.upgrade().context("agent Store closed")?;
+        if let Some(reason) = self
+            .stopped
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source stop lock poisoned"))?
+            .as_ref()
+        {
+            anyhow::bail!("agent collection source unavailable: {reason}");
+        }
         ensure!(
             super::super::status(&store.readers.get())?.gap.is_none(),
             "source gap requires explicit fresh namespace recovery"
         );
         if store.replication_projection_deferred() {
             return Ok(false);
+        }
+        let recovering = *self
+            .recovery
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source recovery lock poisoned"))?;
+        if recovering {
+            return self.recovery_page(&store);
         }
         if !store.replication_projection_deferred() {
             let behind=store.read_snapshot(|_| {
@@ -327,7 +523,7 @@ impl Service {
                 return Ok(true);
             }
             if self.current_boundary(&store)? {
-                return Ok(false);
+                return self.reclaim_page(&store);
             }
             if !self.try_publish(&store, &root.namespace, None)? {
                 return self.tick_work(&store, &root.namespace);
@@ -631,6 +827,43 @@ impl Service {
         Ok(true)
     }
 }
+// Inspect the persisted physical schema before native open-time helpers can write. A
+// changed schema/receiver/graph epoch requires another binding lifecycle, never auto-adoption.
+fn preflight_reopen(path: &Path, receiver: &str) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let exists:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='st3_agent_source_service')",[],|r|r.get(0))?;
+    if !exists {
+        return Ok(false);
+    }
+    let (version, bound): (u64, String) = c.query_row(
+        "SELECT schema_version,receiver FROM st3_agent_source_service WHERE singleton=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let actual: u64 = c.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+    let capture = super::super::status(&c)?;
+    let cut = smallclaims::ivm::source_cut(&c)?.context("retained graph identity missing")?;
+    ensure!(
+        version == actual
+            && bound == receiver
+            && capture.fingerprint == super::capture_fingerprint_for(receiver)?
+            && capture.epoch == cut.epoch,
+        "retained agent capture schema/receiver/epoch requires explicit binding replacement"
+    );
+    // A same-index canonical correction can leave consumed projected desired/mission/step
+    // tables stale. Only the actual native replay closes that dependency after a raw/fenced
+    // lifetime; a healthy scalar frontier or no-op backlog check cannot do so.
+    let fenced: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ivm_views WHERE name=?1 AND ready=0)",
+        [cards::VIEW],
+        |r| r.get(0),
+    )?;
+    Ok(capture.gap.is_some() || fenced)
+}
+
 fn now_ms_u64() -> Result<u64> {
     u64::try_from(crate::store::now_ms()).context("native clock exceeds producer range")
 }
@@ -660,6 +893,9 @@ mod tests {
 
     #[test]
     fn native_source_publication_pending_commit_and_raw_refusal_use_real_store() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let directory = tempfile::tempdir().unwrap();
         let store =
             Store::open_with_agent_collections(&directory.path().join("source.sqlite"), "node")
@@ -849,6 +1085,187 @@ mod tests {
                 .get()
                 .unwrap()
                 .current_boundary(&store)
+                .unwrap()
+        );
+    }
+    #[test]
+    fn reopen_raw_gap_and_interrupted_scan_publish_fresh_namespace_without_resetting_identity() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reopen.sqlite");
+        let first = Store::open_with_agent_collections(&path, "node").unwrap();
+        first
+            .append_claim(&crate::model::ClaimInput {
+                subject: "agent/node.reopen".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), serde_json::json!("running")),
+                    ("runtime_id".into(), serde_json::json!("node.reopen")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        settle(&first);
+        let service = first.smalltalk.ivm_agent_service.get().unwrap();
+        let before = service
+            .views
+            .installed_root(&first.readers.get(), &service.installer, cards::VIEW)
+            .unwrap();
+        let cut = smallclaims::ivm::source_cut(&first.readers.get())
+            .unwrap()
+            .unwrap();
+        let position = service
+            .installer
+            .position(&first.readers.get(), SOURCE)
+            .unwrap();
+        // A raw, same-value source replacement still loses managed capture coverage.
+        first
+            .connection
+            .write()
+            .execute(
+                "UPDATE claims SET predecessors=predecessors WHERE subject='agent/node.reopen'",
+                [],
+            )
+            .unwrap();
+        assert!(!super::super::receiver_readable(&first.readers.get(), "node").unwrap());
+        drop(first);
+        let interrupted = Store::open_with_agent_collections(&path, "node").unwrap();
+        assert!(
+            !interrupted
+                .smalltalk
+                .ivm_agent_service
+                .get()
+                .unwrap()
+                .current_boundary(&interrupted)
+                .unwrap()
+        );
+        // Reach a new active scan, then close without completing it. Restart must reclaim
+        // that stopped unattached namespace with bounded pages before another scan starts.
+        for _ in 0..128 {
+            interrupted.maintain_agent_collections().unwrap();
+            if interrupted
+                .smalltalk
+                .ivm_agent_service
+                .get()
+                .unwrap()
+                .job
+                .lock()
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+        }
+        assert!(
+            interrupted
+                .smalltalk
+                .ivm_agent_service
+                .get()
+                .unwrap()
+                .job
+                .lock()
+                .unwrap()
+                .is_some()
+        );
+        interrupted.maintain_agent_collections().unwrap();
+        drop(interrupted);
+        let recovered = Store::open_with_agent_collections(&path, "node").unwrap();
+        assert!(
+            !recovered
+                .smalltalk
+                .ivm_agent_service
+                .get()
+                .unwrap()
+                .current_boundary(&recovered)
+                .unwrap()
+        );
+        settle(&recovered);
+        let service = recovered.smalltalk.ivm_agent_service.get().unwrap();
+        let after = service
+            .views
+            .installed_root(&recovered.readers.get(), &service.installer, cards::VIEW)
+            .unwrap();
+        assert_ne!(after.namespace, before.namespace);
+        assert!(after.generation >= before.generation);
+        let after_cut = smallclaims::ivm::source_cut(&recovered.readers.get())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_cut.epoch, cut.epoch);
+        assert!(
+            after_cut.admitted >= cut.admitted
+                && after_cut.projected >= cut.projected
+                && after_cut.local_generation >= cut.local_generation
+        );
+        let after_position = service
+            .installer
+            .position(&recovered.readers.get(), SOURCE)
+            .unwrap();
+        assert_eq!(after_position.epoch, position.epoch);
+        assert_eq!(after_position.fingerprint, position.fingerprint);
+        assert!(after_position.revision >= position.revision);
+        // Drain the now-unattached formerly published namespace; its journal/state rows
+        // must vanish without touching the current namespace or its certified boundary.
+        for _ in 0..128 {
+            if !recovered.maintain_agent_collections().unwrap() {
+                break;
+            }
+        }
+        assert!(
+            !recovered
+                .readers
+                .get()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM ivm_install_jobs WHERE id=?1)",
+                    [before.namespace.as_str()],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        assert!(service.current_boundary(&recovered).unwrap());
+        drop(recovered);
+        let unavailable = Store::open_with_agent_collections(&path, "other-node").unwrap();
+        assert!(unavailable.has_agent_collection_source());
+        assert!(unavailable.maintain_agent_collections().is_err());
+        assert!(
+            !unavailable
+                .smalltalk
+                .ivm_agent_service
+                .get()
+                .unwrap()
+                .current_boundary(&unavailable)
+                .unwrap()
+        );
+        // Source refusal must not abort native daemon admission.
+        unavailable
+            .append_claim(&crate::model::ClaimInput {
+                subject: "agent/other-node.safe".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), serde_json::json!("running"))]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        drop(unavailable);
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch("CREATE TABLE unrecognized_schema_change(value TEXT)")
+            .unwrap();
+        drop(raw);
+        let unavailable = Store::open_with_agent_collections(&path, "node").unwrap();
+        assert!(unavailable.maintain_agent_collections().is_err());
+        assert!(
+            !unavailable
+                .smalltalk
+                .ivm_agent_service
+                .get()
+                .unwrap()
+                .current_boundary(&unavailable)
                 .unwrap()
         );
     }

@@ -43,6 +43,15 @@ current boundary performs no maintenance write.
 This constructor pin is for composition controls. Initial publication and a real
 managed write have passed local Service controls; actual provider/socket,
 reconnect, paired consumer authority and deployed callback profiling remain
-activation gates. Existing guarded source lifetimes currently require an explicit
-fresh namespace recovery schedule; reopening must not adopt pre-hook capture or
-clear a retained fence by synchronizing an old root.
+activation gates. The isolated daemon's initial namespace published, then a normal
+checkpoint autocommit fenced the source. Managed checkpoint writer fixes and a
+successful real daemon rerun remain required before activation.
+
+Compatible reopening preserves the source fingerprint, epoch and revision. A
+capture gap or fenced view requires actual native projection replay followed by
+bounded extraction into a fresh namespace; synchronizing the retained root cannot
+clear that fence. Recovery discards only the fixed, bounded pre-recovery capture
+range that the new baseline covers. Interrupted installations reclaim unattached
+namespaces and prune journal pages before restarting. A changed receiver, schema,
+fingerprint or epoch keeps the agent source unavailable while the native Store
+continues to serve. These recovery controls are separate from initial publication.
