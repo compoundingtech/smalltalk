@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Yield the replication admission writer between short atomic chunks and verify envelope signatures before queueing receipt",
+  "replay": {
+    "status": "none",
+    "detail": "No new startup or heal replay. Existing pending envelopes use the same admission checks, per-envelope savepoints and durable admitted frontier, in smaller transactions."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema version or persisted format changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules, tombstone exclusions, membership authority and admission semantics remain unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Wire and client shapes are unchanged. Whole-page receipt remains atomic and retry-idempotent. Aligned modern projection digests can be compared without a legacy graph digest; legacy comparison still requires its digest. This does not change the outbound legacy-peer negotiation."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Only the normal binary restart is needed. No additional migration or recovery phase is introduced; production latency and restart timing have not yet been measured for this change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing stores need no manual repair or coordinated fleet upgrade."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "There is no migration to undo. Older binaries can read the unchanged store; an interrupted admission resumes from existing pending envelopes and committed frontiers."
+  }
+}
