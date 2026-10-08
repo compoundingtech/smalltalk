@@ -55,7 +55,7 @@ jobs:
     name: perf-load
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 30

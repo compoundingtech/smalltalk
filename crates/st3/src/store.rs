@@ -7964,15 +7964,41 @@ impl Store {
                         ));
                     }
                 };
+                // Most renewals only extend the local operational lease. Publish an
+                // anchor before the last replicated expiry is within five minutes, so
+                // another replica never sees a normally renewed lease as expired.
+                let quiet_renewal = action == "renew"
+                    && request.summary.is_none()
+                    && request.reason.is_none()
+                    && request.evidence.is_empty();
+                let last_replicated_expiry = if quiet_renewal {
+                    transaction
+                        .query_row(
+                            &canonical_sql("SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
+                             FROM claims WHERE subject=?1
+                               AND kind IN ('work.claimed','work.renewed','work.progress')
+                             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                            [&subject],
+                            |row| row.get::<_, Option<u64>>(0),
+                        )
+                        .optional()
+                        .map_err(internal)?
+                        .flatten()
+                        .map(u128::from)
+                } else {
+                    None
+                };
+                let publish = !quiet_renewal
+                    || last_replicated_expiry.is_none_or(|expiry| expiry <= now.saturating_add(300_000));
                 let readiness_epoch = current
                     .readiness_epoch
                     .saturating_add(u32::from(status == "ready" && current.status != "ready"));
                 transaction
                     .execute(
                         "UPDATE step_runs SET status=?2, worker_reported=?3, lease_owner=?4, lease_incarnation=?5,
-                                lease_expires_at_unix_ms=?6, blocked_reason=?7, readiness_epoch=?8,
+                                lease_expires_at_unix_ms=?6, blocked_reason=CASE WHEN ?10 THEN ?7 ELSE blocked_reason END, readiness_epoch=?8,
                                 updated_at_unix_ms=?9 WHERE subject=?1",
-                        params![subject, status, worker_reported, claimant, claim_incarnation, claim_expiry.map(|value| value.to_string()), request.reason, readiness_epoch, now.to_string()],
+                        params![subject, status, worker_reported, claimant, claim_incarnation, claim_expiry.map(|value| value.to_string()), request.reason, readiness_epoch, now.to_string(), publish],
                     )
                     .map_err(internal)?;
                 renew_nested_ancestor_leases_tx(
@@ -8010,32 +8036,6 @@ impl Store {
                     "extend" => "work.extended",
                     _ => unreachable!("the work action was validated above"),
                 };
-                // Most renewals only extend the local operational lease. Publish an
-                // anchor before the last replicated expiry is within five minutes, so
-                // another replica never sees a normally renewed lease as expired.
-                let quiet_renewal = action == "renew"
-                    && request.summary.is_none()
-                    && request.reason.is_none()
-                    && request.evidence.is_empty();
-                let last_replicated_expiry = if quiet_renewal {
-                    transaction
-                        .query_row(
-                            &canonical_sql("SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
-                             FROM claims WHERE subject=?1
-                               AND kind IN ('work.claimed','work.renewed','work.progress')
-                             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
-                            [&subject],
-                            |row| row.get::<_, Option<u64>>(0),
-                        )
-                        .optional()
-                        .map_err(internal)?
-                        .flatten()
-                        .map(u128::from)
-                } else {
-                    None
-                };
-                let publish = !quiet_renewal
-                    || last_replicated_expiry.is_none_or(|expiry| expiry <= now.saturating_add(300_000));
                 if publish {
                     append_receipt_claim_tx(
                         transaction,
@@ -39990,6 +39990,50 @@ version 2
                 .unwrap()
                 .authority_digest
         );
+    }
+
+    #[test]
+    fn quiet_renewals_preserve_the_shared_step_reason_and_projection_digest() {
+        for working in [false, true] {
+            let (controller, worker, step) = replicated_step_pair();
+            let request = |reason: Option<&str>, key: &str| WorkRequest {
+                actor: Some("agent/worker.one".into()),
+                incarnation: Some("worker-generation".into()),
+                summary: None, reason: reason.map(str::to_owned), evidence: Vec::new(),
+                idempotency_key: key.into(),
+            };
+            worker.work_action(&step, "claim", &request(Some("durable claim reason"), "reason-claim")).unwrap();
+            if working {
+                worker.work_action(&step, "progress", &request(Some("durable progress reason"), "reason-progress")).unwrap();
+            }
+            receive_and_project(&controller, "worker", &exchange_from(&worker, &controller.replication_inventory().unwrap()));
+            let before = worker.step_run(&step).unwrap().unwrap();
+            let snapshot = worker.replication_snapshot().unwrap();
+            let claims_before = worker.claims_for(&step, Some("work.renewed")).unwrap().len();
+            // Use the ordinary clock and the existing renewal cadence: this stays inside
+            // the five-minute replicated anchor margin and changes no production deadline.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let renewed = worker.work_action(&step, "renew", &request(None, "reason-quiet-renew")).unwrap();
+            assert!(renewed.claim_expires_at_unix_ms > before.claim_expires_at_unix_ms);
+            assert_eq!(renewed.blocked_reason, before.blocked_reason);
+            assert_eq!(worker.claims_for(&step, Some("work.renewed")).unwrap().len(), claims_before);
+            let after = worker.replication_snapshot().unwrap();
+            assert_eq!(after.authority_digest, snapshot.authority_digest);
+            assert_eq!(after.projection_digests, snapshot.projection_digests);
+            assert_eq!(after.projection_digests, controller.replication_snapshot().unwrap().projection_digests);
+            worker.replay_replication_graph().unwrap();
+            let replayed = worker.step_run(&step).unwrap().unwrap();
+            assert_eq!(replayed.blocked_reason, before.blocked_reason);
+            assert_eq!(replayed.claim_expires_at_unix_ms, renewed.claim_expires_at_unix_ms);
+            assert_eq!(worker.replication_snapshot().unwrap().projection_digests, after.projection_digests);
+            // A published renewal still updates the shared reason through its durable claim.
+            let published = worker.work_action(&step, "renew", &request(Some("new durable reason"), "reason-published-renew")).unwrap();
+            assert_eq!(published.blocked_reason.as_deref(), Some("new durable reason"));
+            assert_eq!(worker.claims_for(&step, Some("work.renewed")).unwrap().len(), claims_before + 1);
+            receive_and_project(&controller, "worker", &exchange_from(&worker, &controller.replication_inventory().unwrap()));
+            assert_eq!(controller.step_run(&step).unwrap().unwrap().blocked_reason, published.blocked_reason);
+            assert_eq!(worker.replication_snapshot().unwrap().projection_digests, controller.replication_snapshot().unwrap().projection_digests);
+        }
     }
 
     /// A seat's own lease renewals, and the lane, runtime-action and intake claims its node writes,
