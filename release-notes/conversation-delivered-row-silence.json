@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Avoid repeating unchanged recently delivered conversation rows on collection sockets.",
+  "replay": {"status": "none", "detail": "No claim projection, replay or timeline identity changes."},
+  "schema": {"status": "none", "detail": "No database or client JSON schema changes."},
+  "rules": {"status": "none", "detail": "No checkpoint or fleet rule changes."},
+  "compatibility": {"status": "changed", "detail": "The existing conversation collection follower suppresses exact copies of recently delivered rows. New and revised rows still arrive, and cursor gaps, replacement pages and reconnects retain authoritative snapshot behavior. Remembered rows are bounded to 200 entries and the response byte limit; rows without identities or above the cache bound remain deliverable. Authorization and long-poll reads are unchanged. Separate paged HTTP and conversation stream endpoints are unchanged."},
+  "downtime": {"status": "none", "detail": "No additional interruption beyond the normal daemon replacement restart."},
+  "manual": {"status": "none", "detail": "No client option or installation steps are required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes. Reconnecting clears delivery memory and returns a complete page; replacing the binary restores prior repeat behavior."}
+}
