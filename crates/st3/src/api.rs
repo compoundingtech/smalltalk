@@ -8252,7 +8252,39 @@ async fn replication_receive(
         // with or without new data, projects what it admitted meanwhile.
         let was_deferred = store.replication_projection_deferred();
         let projection = if new_data || was_deferred {
-            admitted_projection_result(store.project_replication_backlog_unless_catching_up())?
+            use opentelemetry::trace::{Span as _, TraceContextExt as _};
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            let receive = crate::otel::export_enabled().then(|| {
+                tracing::Span::current().context().span().span_context().clone()
+            });
+            let mut span = crate::otel::stage_root(
+                "st.replication.projection", "receive", receive,
+            );
+            let result = admitted_projection_result(
+                store.project_replication_backlog_unless_catching_up(),
+            );
+            if let Some(span) = span.as_mut() {
+                span.set_attribute(opentelemetry::KeyValue::new(
+                    "st.replication.peer", request.peer.clone(),
+                ));
+                span.set_attribute(opentelemetry::KeyValue::new(
+                    "st.replication.moved_envelopes", receipt.received as i64,
+                ));
+                span.set_attribute(opentelemetry::KeyValue::new(
+                    "st.replication.outcome",
+                    match &result {
+                        Ok(Some(true)) => "projected",
+                        Ok(Some(false)) => "unchanged",
+                        Ok(None) => "deferred",
+                        Err(_) => "error",
+                    },
+                ));
+                if result.is_err() {
+                    span.set_status(opentelemetry::trace::Status::error("projection failed"));
+                }
+                span.end();
+            }
+            result?
         } else {
             Some(true)
         };

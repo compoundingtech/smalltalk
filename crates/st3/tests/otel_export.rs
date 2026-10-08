@@ -905,45 +905,25 @@ async fn daemon_request_id_and_roster_stages_match_response() {
     const STARTUP_BARRIER: &str = "00-21af7651916cd43dd8448eb211c80319-b7ad6b7169203330-01";
     daemon.health(Some(STARTUP_BARRIER));
     daemon.await_span(root.path(), |span| span["traceId"] == "21af7651916cd43dd8448eb211c80319");
-    // The stopped fixture is visible only to history reads. Background current-roster
-    // rebuilds have zero cards and are unrelated detached roots.
-    let startup_rebuilds = daemon.captured_spans(root.path()).iter()
-        .filter(|span| span["name"] == "st.roster.rebuild"
-            && int_attribute(span, "st.roster.cards") == Some(1)).count();
-    // Independent daemon maintenance can invalidate even adjacent roster reads.
-    // Retry a bounded hit/incremental pair without sleeps, then prove every observed
-    // cold read owns one rebuild and that hit/incremental reads own none.
+    // History rosters are published on demand; await that publication before measuring hits.
+    daemon.request("GET", "/v1/client/agents?history=true&fresh=true&status=stopped",
+        None, STARTUP_BARRIER, None).await;
+    // The refresher publishes rosters independently. HTTP reads serve a published
+    // cut, including after a new claim, and never rebuild on the request's behalf.
     let mut responses = Vec::new();
-    let mut matched_pair = false;
-    for attempt in 0..16 {
-        let first = responses.len();
-        for advance in [false, true] {
-            if advance {
-                daemon.request("POST", "/v1/diagnostics/harness", Some(serde_json::json!({
-                    "actor":actor, "code":"otel-roster-advance", "reason":"stage fixture",
-                    "severity":"warning", "status":"healthy", "incarnation_id":"otel-session",
-                    "idempotency_key":format!("otel-roster-advance-{attempt}"),
-                })), TRACEPARENT, None).await;
-            }
-            // Historical reads exercise the complete cache, not selected-page coverage.
-            let (body, bytes) = daemon.request("GET",
-                "/v1/client/agents?history=true&status=stopped", None, TRACEPARENT, None).await;
-            responses.push((body, bytes));
+    for attempt in 0..3 {
+        if attempt != 0 {
+            daemon.request("POST", "/v1/diagnostics/harness", Some(serde_json::json!({
+                "actor":actor, "code":"otel-roster-advance", "reason":"stage fixture",
+                "severity":"warning", "status":"healthy", "incarnation_id":"otel-session",
+                "idempotency_key":format!("otel-roster-advance-{attempt}"),
+            })), TRACEPARENT, None).await;
         }
-        matched_pair = responses[first..].iter().zip(["hit", "incremental"]).all(|((body, _), mode)| {
-            let request_id = body["request_id"].as_str().expect("response request_id");
-            let span = daemon.await_span(root.path(), |span| {
-                string_attribute(span, "st.request.id") == Some(request_id)
-            });
-            string_attribute(&span, "st.roster.mode") == Some(mode)
-        });
-        if matched_pair {
-            break;
-        }
+        let (body, bytes) = daemon.request("GET",
+            "/v1/client/agents?history=true&status=stopped", None, TRACEPARENT, None).await;
+        responses.push((body, bytes));
     }
-    assert!(matched_pair, "maintenance prevented a hit/incremental pair in 16 attempts");
-    let mut cold_reads = 0;
-    for (index, (body, bytes)) in responses.into_iter().enumerate() {
+    for (body, bytes) in responses {
         let request_id = body["request_id"].as_str().expect("response request_id");
         assert!(request_id.starts_with("request/"), "{body}");
         let rows = body["value"]["items"].as_array().expect("roster page").len();
@@ -955,33 +935,17 @@ async fn daemon_request_id_and_roster_stages_match_response() {
         assert_eq!(span["traceId"], TRACE);
         assert_eq!(span["parentSpanId"], PARENT);
         let mode = string_attribute(&span, "st.roster.mode").expect("roster mode");
-        assert!(matches!(mode, "cold" | "hit" | "incremental"), "{span}");
-        if index == 0 {
-            assert_eq!(mode, "cold", "first historical read must rebuild: {span}");
-        }
+        assert_eq!(mode, "hit", "HTTP reads serve the published roster: {span}");
+        assert!(body["snapshot"]["published_at"].is_string(), "{body}");
         assert_eq!(int_attribute(&span, "st.roster.cards"), Some(1), "{span}");
         assert_eq!(int_attribute(&span, "st.page.rows"), Some(i64::try_from(rows).unwrap()));
         assert_eq!(int_attribute(&span, "st.page.bytes"), Some(i64::try_from(bytes).unwrap()));
-        if mode == "cold" {
-            cold_reads += 1;
-            let request_start = span["startTimeUnixNano"].as_str().unwrap().parse::<u64>().unwrap();
-            let request_end = span["endTimeUnixNano"].as_str().unwrap().parse::<u64>().unwrap();
-            let rebuild = daemon.await_span(root.path(), |stage| {
-                stage["name"] == "st.roster.rebuild"
-                    && stage["startTimeUnixNano"].as_str().unwrap().parse::<u64>().unwrap() >= request_start
-                    && stage["endTimeUnixNano"].as_str().unwrap().parse::<u64>().unwrap() <= request_end
-                    && int_attribute(stage, "st.roster.cards") == Some(1)
-            });
-            assert_internal_root(&rebuild);
-            assert!(rebuild["links"].as_array().is_none_or(Vec::is_empty), "{rebuild}");
-            assert_ne!(rebuild["traceId"], span["traceId"]);
-            assert_eq!(string_attribute(&rebuild, "st.roster.mode"), Some("cold"));
-            assert_eq!(int_attribute(&rebuild, "st.roster.cards"), Some(1));
-        }
     }
     let spans = daemon.captured_spans(root.path());
-    assert_eq!(spans.iter().filter(|span| span["name"] == "st.roster.rebuild"
-        && int_attribute(span, "st.roster.cards") == Some(1)).count(), startup_rebuilds + cold_reads);
+    for rebuild in spans.iter().filter(|span| span["name"] == "st.roster.rebuild") {
+        assert_internal_root(rebuild);
+        assert_ne!(rebuild["traceId"], TRACE);
+    }
     assert!(spans.iter().all(|span| span["parentSpanId"].as_str()
         .is_none_or(|parent| !spans.iter().any(|server| server["traceId"] == TRACE
             && server["spanId"].as_str() == Some(parent)))), "request stage children leaked: {spans:?}");
@@ -1110,3 +1074,63 @@ async fn conversation_first_frames_link_collection_and_dedicated_upgrades() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn replication_projection_is_linked_root_only_for_new_data() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    const TRACE: &str = "81af7651916cd43dd8448eb211c80319";
+    const NEW: &str = "00-81af7651916cd43dd8448eb211c80319-b7ad6b7169203336-01";
+    const DUPLICATE: &str = "00-91af7651916cd43dd8448eb211c80319-b7ad6b7169203337-01";
+    const HEARTBEAT: &str = "00-a1af7651916cd43dd8448eb211c80319-b7ad6b7169203338-01";
+    let Some(collector) = otelite("replication_projection_is_linked_root_only_for_new_data") else { return };
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("daemon-state");
+    std::fs::create_dir_all(&state).unwrap();
+    let target = st3::store::Store::open(&state.join("claims.sqlite3"), "otel-test").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    target.project_replication_backlog().unwrap();
+    let source = st3::store::Store::open_memory("otel-source").unwrap();
+    source.bind_fleet(FLEET).unwrap();
+    source.append_claim(&st3::model::ClaimInput {
+        subject: "resource/otel-stage-projection".into(),
+        kind: "resource.observed".into(),
+        actor: None,
+        fields: serde_json::from_value(serde_json::json!({
+            "kind":"vcs.pull-request", "facts":{"state":"open"}
+        })).unwrap(),
+        evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    let exchange = source.export_replication_exchange(FLEET, &target.replication_inventory().unwrap()).unwrap();
+    assert!(!exchange.envelopes.is_empty(), "the real exchange must carry new data");
+    let heartbeat = source.export_replication_summary(FLEET).unwrap();
+    assert!(heartbeat.envelopes.is_empty());
+    drop(target);
+    let mut daemon = ExportDaemon::start(&collector, root.path());
+    let payload = serde_json::json!({"peer":"otel-source", "fleet_id":FLEET, "exchange":exchange});
+    let (received, _) = daemon.request("POST", "/v1/internal/replication/receive",
+        Some(payload.clone()), NEW, None).await;
+    assert!(received["value"]["receipt"]["received"].as_u64().is_some_and(|count| count > 0), "{received}");
+    let receive = daemon.await_span(root.path(), |span| {
+        span["traceId"] == TRACE && span["name"] == "POST /v1/internal/replication/receive"
+    });
+    let projection = daemon.await_span(root.path(), |span| span["name"] == "st.replication.projection");
+    assert_upgrade_link(&projection, &receive);
+    assert_eq!(string_attribute(&projection, "st.replication.peer"), Some("otel-source"));
+    assert!(int_attribute(&projection, "st.replication.moved_envelopes").is_some_and(|count| count > 0), "{projection}");
+    for (body, traceparent, trace) in [
+        (payload, DUPLICATE, "91af7651916cd43dd8448eb211c80319"),
+        (serde_json::json!({"peer":"otel-source", "fleet_id":FLEET, "exchange":heartbeat}),
+            HEARTBEAT, "a1af7651916cd43dd8448eb211c80319"),
+    ] {
+        let (response, _) = daemon.request("POST", "/v1/internal/replication/receive",
+            Some(body), traceparent, None).await;
+        assert_eq!(response["value"]["receipt"]["received"], 0, "{response}");
+        assert_eq!(response["value"]["receipt"]["signatures"], 0, "{response}");
+        daemon.await_span(root.path(), |span| span["traceId"] == trace
+            && span["name"] == "POST /v1/internal/replication/receive");
+    }
+    let spans = daemon.captured_spans(root.path());
+    let projections: Vec<_> = spans.iter().filter(|span| span["name"] == "st.replication.projection").collect();
+    assert_eq!(projections.len(), 1, "no projection root for duplicate/heartbeat: {projections:?}");
+    assert_upgrade_link(projections[0], &receive);
+}

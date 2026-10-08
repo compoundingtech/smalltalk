@@ -358,6 +358,9 @@ The performance report exposes each roster stage under bounded task labels:
 `roster/admission-wait` (waiting for the shared admission or an in-flight build),
 `roster/frontier-read`, `roster/cache-hit`, `roster/build` (incremental advance or cold build),
 `roster/card-projection` (refolding changed cards) and `agent_work_queues`.
+With trace export enabled, HTTP reads of a published complete roster or startup head report
+`st.roster.mode=hit` and the served publication's card count on their request span. Rebuilds
+remain independent roots of the background refresher, not children of the reading request.
 
 The focused 70-agent, 20-session fixture reports card-status, usage, repeated-projection and
 incremental-update costs with `cargo test -p st3 --lib agent_roster_snapshot_fixture_timing --

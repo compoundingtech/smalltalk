@@ -3621,7 +3621,10 @@ impl Store {
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
             .max_by_key(|entry| (entry.index, entry.local))
-            .map(|entry| (entry.index, Arc::clone(&entry.items), entry.published_at_unix_ms))
+            .map(|entry| {
+                crate::otel::record_roster("hit", entry.items.len());
+                (entry.index, Arc::clone(&entry.items), entry.published_at_unix_ms)
+            })
     }
 
     /// The complete roster published at exactly `cut`, for a page continuing from a first page
@@ -3636,7 +3639,10 @@ impl Store {
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index == cut)
             .max_by_key(|entry| entry.local)
-            .map(|entry| (Arc::clone(&entry.items), entry.published_at_unix_ms))
+            .map(|entry| {
+                crate::otel::record_roster("hit", entry.items.len());
+                (Arc::clone(&entry.items), entry.published_at_unix_ms)
+            })
     }
 
     /// When no complete roster is published yet: the newest current refs at or before `index`
@@ -3667,6 +3673,7 @@ impl Store {
                     .collect::<Option<Vec<_>>>()
                     .map(|head| (head, entry.published_at_unix_ms))
             })?;
+        crate::otel::record_roster("hit", head.0.len());
         Some((cut, refs, head.0, head.1))
     }
 
@@ -4028,7 +4035,7 @@ impl Store {
             .map(|entry| (Arc::clone(&entry.items), entry.published_at_unix_ms));
         drop(cache);
         Ok(hit.map(|hit| crate::performance::task("roster/cache-hit", || {
-            crate::otel::record_roster("hit", hit.len());
+            crate::otel::record_roster("hit", hit.0.len());
             hit
         })))
     }
