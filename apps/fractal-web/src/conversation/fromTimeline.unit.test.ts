@@ -225,21 +225,43 @@ The person reads replies in st, not in the agent's session.`,
     expect(kept?._tag === 'Text' ? kept.text : '').toBe(quote)
   })
 
-  it('orders merged entries by (timestamp, sequence) even when sequences disagree', () => {
+  it('keeps a stored-fallback page in its sequence order when observed timestamps disagree', () => {
+    // The stored fallback sorts by sequence alone and may stamp entries from
+    // `observed_at_unix_ms`: a result can carry an earlier timestamp than its call.
     const timeline = new LiveTimeline()
     timeline.apply({
       replace: true, hasMore: false,
       entries: [
-        entry('timeline-entry/later-turn', 2, 'content', {
-          media_type: 'text/plain', text: 'later turn',
+        entry('timeline-entry/call', 4, 'tool_call', {
+          call_id: 'call/1', name: 'shell', arguments: { command: 'true' },
         }, 'assistant', '2026-10-03T00:02:00Z'),
-        entry('timeline-entry/earlier-mail', 40, 'content', {
-          media_type: 'text/plain', text: 'earlier mail',
-        }, 'user', '2026-10-03T00:00:00Z'),
+        entry('timeline-entry/result', 7, 'tool_result', {
+          call_id: 'call/1', status: 'success', media_type: 'text/plain', content: 'ok',
+        }, 'tool', '2026-10-03T00:01:00Z'),
       ],
     })
-    expect(timeline.project().items.map((item) => item.id))
-      .toEqual(['timeline-entry/earlier-mail', 'timeline-entry/later-turn'])
+    const items = timeline.project().items
+    expect(items.map((item) => item.id)).toEqual(['timeline-entry/call'])
+    expect(items[0]).toMatchObject({ _tag: 'ToolCall', status: 'success' })
+  })
+
+  it('joins a delta result to its call when the result is stamped before it', () => {
+    const timeline = new LiveTimeline()
+    timeline.apply({
+      replace: true, hasMore: false,
+      entries: [entry('timeline-entry/call', 4, 'tool_call', {
+        call_id: 'call/1', name: 'shell', arguments: { command: 'true' },
+      }, 'assistant', '2026-10-03T00:02:00Z')],
+    })
+    timeline.apply({
+      replace: false, hasMore: false,
+      entries: [entry('timeline-entry/result', 7, 'tool_result', {
+        call_id: 'call/1', status: 'success', media_type: 'text/plain', content: 'ok',
+      }, 'tool', '2026-10-03T00:01:00Z')],
+    })
+    const items = timeline.project().items
+    expect(items.map((item) => item.id)).toEqual(['timeline-entry/call'])
+    expect(items[0]).toMatchObject({ _tag: 'ToolCall', status: 'success' })
   })
 
   it('strips a shown delivery from a native turn and keeps the turn\'s own text', () => {
