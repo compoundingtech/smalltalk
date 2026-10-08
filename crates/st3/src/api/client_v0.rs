@@ -82,6 +82,18 @@ fn collection_ignores(collection: &str, kind: &str) -> bool {
         return !kind.starts_with("arrangement.")
             && !matches!(kind, "custom.client.pairing-completed" | "custom.client.pairing-revoked");
     }
+    // Mission cards read run/step/gate state, definitions and person attention, never
+    // harness telemetry. Attention additionally reads harness login state and diagnostics,
+    // but not transcripts, token totals, todos or session-file metadata.
+    if collection == "missions" && matches!(kind,
+        "harness.observed" | "harness.diagnostic" | "harness.timeline" | "harness.usage"
+            | "harness.todo.observed" | "harness.session-file") {
+        return true;
+    }
+    if collection == "attention" && matches!(kind,
+        "harness.timeline" | "harness.usage" | "harness.todo.observed" | "harness.session-file") {
+        return true;
+    }
     matches!(kind, "daemon.diagnostic" | "transport.observed" | "workspace.observed")
         || (kind == "harness.usage" && collection != "agents")
 }
@@ -249,16 +261,18 @@ async fn collection_items_with_windows(
                 };
                 let snapshot = client_snapshot_at(&state, index);
                 let at = snapshot.created_at.clone();
+                // Share one bounded fleet projection across subscriber window sizes.
+                // Uncached reads retain the same bounded cut as the shared projection.
+                let projection_limit = if matches!(collection.as_str(), "missions" | "attention") {
+                    CLIENT_MAX_PAGE_ITEMS
+                } else {
+                    limit
+                };
                 let compute = || {
+                    let mut valid_until = None;
                     let mut items = match collection.as_str() {
                         "missions" => {
-                            let mut ids =
-                                store.mission_collection_ids(false, 0, limit.saturating_add(1))?;
-                            let mut has_more = ids.len() > limit;
-                            ids.truncate(limit);
-                            let mut items = mission_list_cards_at(&store, &ids, now)?;
-                            has_more |= bound_mission_cards(&mut items)?;
-                            return Ok((items, has_more));
+                            return mission_collection_projection_at(&store, projection_limit, now);
                         }
                         "glasses" => store.glasses(
                             person.as_deref().expect("authenticated glass owner"),
@@ -275,7 +289,11 @@ async fn collection_items_with_windows(
                             }
                         }
                         "attention" => {
-                            client_attention_resources_at(&store, person.as_deref(), false, now)?
+                            let (items, until) = crate::performance::task("attention_collection/resources", || {
+                                client_attention_resources_fenced_at(&store, person.as_deref(), now)
+                            })?;
+                            valid_until = until;
+                            items
                         }
                         "agents" => client_agent_resources_cached(&store, false, index)?,
                         "work" => client_work_resources(
@@ -291,14 +309,14 @@ async fn collection_items_with_windows(
                     // Agent status/availability depends on live local delivery presence; overlay and
                     // filter it on every read, after reusing the immutable graph-derived rows.
                     if collection == "agents" {
-                        return Ok((items, false));
+                        return Ok((items, false, None));
                     }
                     if let Some(status) = &status {
                         items.retain(|item| item["state"].as_str() == Some(status.as_str()));
                     }
-                    let has_more = items.len() > limit;
-                    items.truncate(limit);
-                    Ok((items, has_more))
+                    let has_more = items.len() > projection_limit;
+                    items.truncate(projection_limit);
+                    Ok((items, has_more, valid_until))
                 };
                 let (mut items, mut has_more) = match &windows {
                     Some(windows) => windows.read(
@@ -313,8 +331,15 @@ async fn collection_items_with_windows(
                         },
                         compute,
                     )?,
-                    None => compute()?,
+                    None => {
+                        let (items, has_more, _) = compute()?;
+                        (items, has_more)
+                    }
                 };
+                if matches!(collection.as_str(), "missions" | "attention") {
+                    has_more |= items.len() > limit;
+                    items.truncate(limit);
+                }
                 if collection == "agents" {
                     overlay_agent_resources(&store, &mut items, &at)?;
                     if let Some(status) = &status {
@@ -1887,6 +1912,24 @@ pub(super) fn mission_resources(
     })
 }
 
+fn mission_collection_projection_at(
+    store: &Store,
+    limit: usize,
+    at_unix_ms: u128,
+) -> anyhow::Result<(Vec<Value>, bool, Option<u128>)> {
+    let mut ids = store.mission_collection_ids_at(false, 0, limit.saturating_add(1), at_unix_ms)?;
+    let mut has_more = ids.len() > limit;
+    // The lookahead also determines has_more, so its membership deadline belongs to
+    // this window even though its card is not rendered.
+    let valid_until = store.mission_collection_valid_until(&ids, at_unix_ms)?;
+    ids.truncate(limit);
+    let mut items = crate::performance::task("mission_collection/cards", || {
+        mission_list_cards_at(store, &ids, at_unix_ms)
+    })?;
+    has_more |= bound_mission_cards(&mut items)?;
+    Ok((items, has_more, valid_until))
+}
+
 /// Collection cards keep only three run headers, regardless of a mission's history size.
 /// Full run and step detail stays on the detail endpoint.
 fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value>> {
@@ -1898,14 +1941,14 @@ fn mission_list_cards_at(
     ids: &[String],
     at_unix_ms: u128,
 ) -> anyhow::Result<Vec<Value>> {
-    let attention = store.human_attention_runs()?;
-    let definitions = store
-        .mission_definitions_for_ids(ids)?
+    let attention = crate::performance::task("mission_collection/attention_runs", || store.human_attention_runs_at(at_unix_ms))?;
+    let definitions = crate::performance::task("mission_collection/definitions", || store
+        .mission_definitions_for_ids(ids))?
         .into_iter()
         .map(|d| (d.mission.subject.clone(), d))
         .collect::<BTreeMap<_, _>>();
     ids.iter().map(|id| {
-        let overview = store.mission_overview(id, 3)?;
+        let overview = crate::performance::task("mission_collection/overview", || store.mission_overview(id, 3))?;
         let newest = overview["newest"].as_array().expect("overview previews");
         let latest = newest.first();
         let definition = definitions.get(id);
@@ -1925,7 +1968,7 @@ fn mission_list_cards_at(
             .map(|(_,count)| count.as_u64().unwrap_or(0)).sum::<u64>();
         let details = newest.iter().rev().map(|run| {
             let run_id=run["id"].as_str().expect("run header id");
-            let (total,done,steps)=store.mission_step_preview_at(run_id, at_unix_ms)?;
+            let (total,done,steps)=crate::performance::task("mission_collection/steps", || store.mission_step_preview_at(run_id, at_unix_ms))?;
             let terminal=matches!(run["status"].as_str(),Some("completed"|"failed"|"cancelled"));
             let scheduler_fault=store.reconcile_fault(run_id, crate::reconcile::FIRST_READINESS_FAULT_SCOPE)?;
             let must_act=if terminal {"nobody"} else if attention.contains(run_id) {"you"}
