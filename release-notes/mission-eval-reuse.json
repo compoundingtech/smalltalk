@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Reuse pinned mission definitions during run evaluation and read only child state needed by scheduling",
+  "replay": { "status": "none", "detail": "Only read-side query hydration changes; claim replay and canonical ordering are unchanged." },
+  "schema": { "status": "none", "detail": "No tables, indexes, triggers, schema versions or migrations change." },
+  "rules": { "status": "none", "detail": "Mission scheduling, timeout, loop and child-run decisions retain their existing semantics." },
+  "compatibility": { "status": "none", "detail": "Presentation views, client contracts and protocol formats are unchanged." },
+  "downtime": { "status": "none", "detail": "No additional service interruption is required." },
+  "manual": { "status": "none", "detail": "No installation steps or starting-state transitions are required." },
+  "recovery": { "status": "none", "detail": "No recovery or database swap-back behavior changes." }
+}

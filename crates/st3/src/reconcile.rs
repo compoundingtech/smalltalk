@@ -6881,13 +6881,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             let ((evaluated, armed), reads) = smallclaims::touched::record(|| {
                 smallclaims::touched::record_due(|| {
                     self.isolate("mission-run", &subject, || {
-                        let run = self.store.mission_run_for_reconcile(id)?;
+                        let (run, mission) = self.store.mission_run_for_evaluation(id)?;
                         active_generations.insert(run.generation.clone());
                         active_steps.extend(run.steps.iter().map(|step| step.subject.clone()));
                         // From the view the evaluation started with: a write it makes changes subjects
                         // it read, so the next pass evaluates it again and takes the new times.
                         due = crate::incremental::run_due(&run, now_ms());
-                        let evaluated = self.evaluate_active_mission_run(&run);
+                        let evaluated = self.evaluate_active_mission_run(&run, mission);
                         // Recovery is diagnostic too: admission and execution writes come first.
                         if (!first_readiness_pending(&run)
                             || now_ms().saturating_sub(first_readiness_since(&run))
@@ -6990,7 +6990,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         );
     }
 
-    fn evaluate_active_mission_run(&self, run: &MissionRunView) -> Result<bool> {
+    fn evaluate_active_mission_run(
+        &self,
+        run: &MissionRunView,
+        mission: Option<MissionSpec>,
+    ) -> Result<bool> {
         if run.phase == "normal"
             && let Some(reason) = self.store.stale_subscription_pull_request_run(run)?
         {
@@ -7044,7 +7048,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             return self.reconcile_mission_run_cleanup(run);
         }
         let mission_id = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
-        let Some(mission) = self.store.mission_spec(mission_id, Some(&run.revision))? else {
+        smallclaims::touched::note_read(|| format!("mission/{mission_id}"));
+        let mission = if run.steps.is_empty() {
+            self.store.mission_spec(mission_id, Some(&run.revision))?
+        } else {
+            mission
+        };
+        let Some(mission) = mission else {
             return self.store.set_mission_run_state(
                 &run.id,
                 "blocked",
@@ -8207,7 +8217,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             format!("{base_key}:dispatch-{dispatch}")
         };
         let expected = self.store.mission_run_subject_for_idempotency_key(&key);
-        let existed = self.store.mission_run(&expected)?.is_some();
+        let existed = self.store.mission_run_status(&expected)?.is_some();
         let mut inputs: BTreeMap<String, String> = run
             .inputs
             .iter()
@@ -8228,7 +8238,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         inputs.insert(CANDIDATE_INDEX_INPUT.into(), String::new());
         let child = if existed {
             self.store
-                .mission_run(&expected)?
+                .mission_run_steps(&expected, false)?
                 .context("the existing loop round disappeared")?
         } else {
             match self.store.create_child_mission_run(
@@ -8813,12 +8823,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             candidate.map_or_else(|| "round".into(), |value| format!("candidate-{value}"))
         );
         let subject = self.store.mission_run_subject_for_idempotency_key(&key);
-        if let Some(child) = self.store.mission_run(&subject)? {
-            return Ok(match child.status.as_str() {
+        if let Some(status) = self.store.mission_run_status(&subject)? {
+            return Ok(match status.as_str() {
                 "completed" => LoopBranchOutcome::Completed,
                 "failed" | "cancelled" => LoopBranchOutcome::Failed(format!(
-                    "the loop {label} branch failed in `{}`",
-                    child.subject
+                    "the loop {label} branch failed in `{subject}`"
                 )),
                 _ => LoopBranchOutcome::Pending,
             });
@@ -8885,10 +8894,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         feedback: &str,
         item: Option<&Value>,
         candidate: Option<u32>,
-    ) -> Result<(MissionRunView, bool)> {
+    ) -> Result<()> {
         let subject = self.store.mission_run_subject_for_idempotency_key(&key);
-        if let Some(child) = self.store.mission_run(&subject)? {
-            return Ok((child, false));
+        if self.store.mission_run_status(&subject)?.is_some() {
+            return Ok(());
         }
         let mut inputs = self.child_loop_inputs(run);
         inputs.insert(LOOP_ROUND_INPUT.into(), round.to_string());
@@ -8901,7 +8910,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             CANDIDATE_INDEX_INPUT.into(),
             candidate.map_or_else(String::new, |value| value.to_string()),
         );
-        let child = self.store.create_child_mission_run(
+        self.store.create_child_mission_run(
             &MissionRunRequest {
                 mission: mission.id.clone(),
                 revision: Some(mission.revision.clone()),
@@ -8915,7 +8924,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             &view.subject,
             None,
         )?;
-        Ok((child, true))
+        Ok(())
     }
 
     fn loop_result_claim(
@@ -9032,7 +9041,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 format!("{base_key}:dispatch-{dispatch}")
             };
             let subject = self.store.mission_run_subject_for_idempotency_key(&key);
-            if let Some(child) = self.store.mission_run(&subject)? {
+            if let Some(child) = self.store.mission_run_steps(&subject, false)? {
                 match child.status.as_str() {
                     "running" | "standing" | "blocked" => active += 1,
                     "failed" | "cancelled" => {
@@ -9211,7 +9220,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 format!("{base_key}:dispatch-{dispatch}")
             };
             let subject = self.store.mission_run_subject_for_idempotency_key(&key);
-            if let Some(child) = self.store.mission_run(&subject)? {
+            if let Some(child) = self.store.mission_run_steps(&subject, false)? {
                 match child.status.as_str() {
                     "running" | "standing" | "blocked" => active += 1,
                     "failed" | "cancelled" => {
@@ -15627,11 +15636,12 @@ fn now_ms() -> u128 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     mod channel_recovery;
     mod differential;
     mod first_readiness_tests;
     mod incremental_deadlines;
+    pub(crate) mod mission_eval_reuse;
     mod ownership_guard_tests;
     mod pull_request_run_tests;
     mod ref_watch_tests;
