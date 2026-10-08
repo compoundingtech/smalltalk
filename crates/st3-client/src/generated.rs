@@ -1138,6 +1138,8 @@ pub enum AgentLifecycle {
     Standing,
     Owner,
     Bounded,
+    #[serde(other)]
+    Unknown,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentHandoff {

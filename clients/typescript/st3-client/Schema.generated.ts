@@ -528,6 +528,11 @@ export const AgentId = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:agent)/[^
 export type AgentId = typeof AgentId.Type
 export type AgentIdEncoded = typeof AgentId.Encoded
 
+/** Declared agent lifecycle. Publication accepts standing, owner, or bounded; clients retain future values as Unknown. */
+export const AgentLifecycle = /*#__PURE__*/ (() => openEnum(["standing","owner","bounded"]).annotate({ identifier: "AgentLifecycle", description: "Declared agent lifecycle. Publication accepts standing, owner, or bounded; clients retain future values as Unknown." }))()
+export type AgentLifecycle = typeof AgentLifecycle.Type
+export type AgentLifecycleEncoded = typeof AgentLifecycle.Encoded
+
 /** Whether the daemon can currently reach the agent runtime. */
 export const AgentReachability = /*#__PURE__*/ (() => openEnum(["local","remote","unreachable","unknown","reachable","indeterminate"]).annotate({ identifier: "AgentReachability", description: "Whether the daemon can currently reach the agent runtime." }))()
 export type AgentReachability = typeof AgentReachability.Type
@@ -737,8 +742,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "incarnation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "kind": Schema.Literal("agent"),
   "last_activity_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
-  /** The selected agent declaration's optional KDL `lifecycle` child. Declared intent, not observed activity, runtime state, restart policy, or inferred ownership; omitted rather than null when undeclared, and absence means unknown. */
-  "lifecycle": optionalKey(Schema.Literals(["standing","owner","bounded"])).annotate({ description: "The selected agent declaration's optional KDL `lifecycle` child. Declared intent, not observed activity, runtime state, restart policy, or inferred ownership; omitted rather than null when undeclared, and absence means unknown." }),
+  /** The selected agent declaration's optional KDL `lifecycle` child. Declared intent, not observed activity, runtime state, restart policy, or inferred ownership; omitted rather than null when undeclared. Absence means undeclared; a future string decodes as Unknown without discarding the row. */
+  "lifecycle": optionalKey(AgentLifecycle),
   "name": Schema.String,
   "next_work": Schema.OptionFromOptionalNullOr(WorkLabel, NULL_NONE),
   "next_work_id": Schema.OptionFromOptionalNullOr(Id, NULL_NONE),

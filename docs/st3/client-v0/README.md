@@ -60,8 +60,8 @@ Clients can render `round N/M · wakes in …` without reading claim envelopes.
 
 ### Agent lifecycle metadata
 
-An agent roster row has an optional `lifecycle` field with the exact enum `"standing"`,
-`"owner"`, or `"bounded"`. It reports the selected agent declaration's optional KDL
+An agent roster row has an optional `lifecycle` field. The declaration currently accepts
+`"standing"`, `"owner"`, or `"bounded"`. It reports the selected agent declaration's optional KDL
 `lifecycle` child, not observed activity, runtime state, restart policy, or inferred ownership.
 Declaration replacements are reflected in subsequent roster reads and collection updates,
 including removal of the field when the replacement omits the child.
@@ -69,6 +69,9 @@ including removal of the field when the replacement omits the child.
 When the declaration has no lifecycle, the server omits the field rather than supplying null
 or a default. A client treats an absent field as unknown, including when reading an older
 server; it must not infer `"standing"`, `"owner"`, or `"bounded"` from other fields.
+Like the other forward-compatible response enums, the wire schema accepts future strings.
+Generated clients decode an unfamiliar value as `Unknown` without dropping the roster row;
+this differs from an absent field, which means no lifecycle was declared.
 See [agent declarations](../kdl-lifecycle.md#definitions-do-not-start-work).
 
 ### Agent activity and human blocking
