@@ -162,8 +162,6 @@ hook = subprocess.run([os.environ['ST3_BIN'], 'driver-hook', 'claude-observe', '
 Path(os.environ['FIXTURE_NATIVE_IDLE'] + '.hook-result').write_text(json.dumps({
     'exit': hook.returncode, 'stderr': hook.stderr, 'stdout': hook.stdout}))
 hook.check_returncode()
-while not Path(os.environ['FIXTURE_NATIVE_IDLE']).exists():
-    time.sleep(0.005)
 channel = subprocess.Popen([os.environ['ST3_BIN'], 'driver', 'claude-mcp', '--subject', os.environ['ST_AGENT']],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 try:
@@ -180,6 +178,8 @@ try:
 finally:
     channel.stdin.close()
     channel.wait(timeout=10)
+while not Path(os.environ['FIXTURE_NATIVE_IDLE']).exists():
+    time.sleep(0.005)
 if os.environ.get('FIXTURE_EXIT_GATE'):
     while not Path(os.environ['FIXTURE_EXIT_GATE']).exists():
         time.sleep(0.005)
@@ -272,8 +272,25 @@ read -r _
         .write_all(b"launch\n")
         .await
         .unwrap();
+    let sent: MessageView = client
+        .post(
+            "/v1/messages",
+            &MessageSendRequest {
+                idempotency_key: "mail".into(),
+                from: "person/avery".into(),
+                to: SEAT.into(),
+                content: "hello from the terminal owner".into(),
+                title: None,
+                in_reply_to: None,
+                tags: vec![],
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
     // Admit the real SessionStart observation before releasing the provider to
-    // consume mail or finish. This does not grant readiness from channel presence.
+    // finish or forcing a foreign fence. The initialized channel must be live
+    // before the channel fence permits the native idle view. This does not grant readiness from channel presence.
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if store.current_harness(SEAT).unwrap().is_some_and(|h| {
@@ -293,22 +310,6 @@ read -r _
         )
     });
     std::fs::write(&native_idle, b"go").unwrap();
-    let sent: MessageView = client
-        .post(
-            "/v1/messages",
-            &MessageSendRequest {
-                idempotency_key: "mail".into(),
-                from: "person/avery".into(),
-                to: SEAT.into(),
-                content: "hello from the terminal owner".into(),
-                title: None,
-                in_reply_to: None,
-                tags: vec![],
-                attachments: vec![],
-            },
-        )
-        .await
-        .unwrap();
     let mut rejection_fence = if let Some(rejection) = rejection.filter(|_| order.is_none()) {
         wait_file(&received).await;
         // Reject an established stream, rather than racing its initial HTTP admission.
