@@ -18,6 +18,27 @@ interfaces and edge cases.
 8. Every repair adds a replacement fact and retains the invalid source for inspection.
 9. Host placement is explicit. Cross-host replication is optional.
 10. The st2 and st control loops remain separate during migration.
+11. Reads never write. A request does not initialize, rebuild, or backfill derived state.
+
+## Daemon query rules
+
+A read uses prepared state and a bounded read snapshot. It never acquires the database writer
+or performs lazy initialization, a cache rebuild, or a backfill on the request path. A background
+reactor prepares derived state in short batches and returns the writer between batches. Until
+the required state is ready at the requested cut, the read reports not ready; it does not build
+the state inline or present an incomplete result as current.
+
+Queries and transactions must be short. Bound the work each batch reads or changes, rather than
+only limiting the response size. Do not keep a database snapshot open across network waits.
+Count queries per request and reduce their number as well as their duration; replacing one long
+scan with an unbounded sequence of small queries does not satisfy this rule.
+
+After the performance outage, add a CI check that exercises cold, warm, missing, stale, and
+historical read paths with a request-scoped write refusal and writer-admission accounting. It
+must detect writes through helpers and additional connections without attributing independent
+background reactor work to a read. Include a seeded lazy-initialization violation and a prepared
+read control, verify truthful not-ready responses, and track statements and SQLite work across
+growing stores. This check is planned, not implemented or a new merge gate during the outage.
 
 ## Durable graph
 
