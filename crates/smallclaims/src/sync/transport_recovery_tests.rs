@@ -15,6 +15,47 @@ fn append(store: &Store, subject: &str) {
         .unwrap();
 }
 
+#[test]
+fn healthy_recovery_auth_snapshot_is_reused_but_changed_membership_is_not() {
+    let fleet = FleetContext::legacy(BTreeSet::from(["cedar".into()]));
+    let auth = FleetAuth::test("invented-fleet", &[7; 32]);
+    fleet.view.write().unwrap().members.push(
+        serde_json::from_value(serde_json::json!({
+            "name":"cedar", "member_key":"key-one", "state":"current", "mode":"listen", "start":1
+        }))
+        .unwrap(),
+    );
+    let (route_tx, routes) = watch::channel(vec![Route::Http("http://cedar".into())]);
+    let mut credit = TransportRecoveryCredit::default();
+    credit.grant("http://cedar", Some("known".into()), &auth, &fleet, "cedar");
+    let captured = credit.capture_auth(&auth, &fleet, "cedar");
+    for _ in 0..3 {
+        credit.validate(&routes, &auth, &fleet, "cedar");
+        let next = credit.capture_auth(&auth, &fleet, "cedar");
+        assert!(
+            Arc::ptr_eq(&captured, &next),
+            "unchanged auth shares the pre-dispatch snapshot"
+        );
+        assert!(!credit.grant_epoch("http://cedar", Some("known".into()), next));
+    }
+    // Do not trust the generation alone: view content can change before a
+    // notification is published. The old in-flight snapshot must stay invalid.
+    fleet.view.write().unwrap().members[0].member_key = "key-two".into();
+    let changed = credit.capture_auth(&auth, &fleet, "cedar");
+    assert!(!Arc::ptr_eq(&captured, &changed));
+    assert!(!captured.matches(&auth, &fleet, "cedar"));
+    credit.grant_epoch("http://cedar", Some("known".into()), captured);
+    credit.validate(&routes, &auth, &fleet, "cedar");
+    assert!(
+        credit.epoch.is_none(),
+        "old request success cannot arm the new membership"
+    );
+    credit.grant_epoch("http://cedar", Some("known".into()), changed);
+    credit.validate(&routes, &auth, &fleet, "cedar");
+    assert!(credit.epoch.is_some());
+    drop(route_tx);
+}
+
 #[tokio::test(start_paused = true)]
 async fn credit_rearms_only_on_signed_success_and_invalidates_route_or_auth_epochs() {
     let fleet = FleetContext::legacy(BTreeSet::from(["cedar".into()]));

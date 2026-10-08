@@ -1212,14 +1212,14 @@ async fn dial_peer<B: Backend>(
         let mut offered = None;
         // A signing/membership change while the request is suspended must not
         // become the authenticated epoch of that earlier request.
-        let attempt_auth = TransportRecoveryCredit::auth_epoch(&auth, &fleet, &name);
+        let attempt_auth = is_http.then(|| recovery.capture_auth(&auth, &fleet, &name));
         let mut answer =
             exchange_recorded(&http, &backend, &node, &peer, &auth, &fleet, &mut offered).await;
         let mut recovery_wait = None;
         loop {
             match answer {
                 Ok((moved, heal_now)) => {
-                    if is_http {
+                    if let Some(attempt_auth) = &attempt_auth {
                         last_http_success = Some((peer.url.clone(), tokio::time::Instant::now()));
                         let armed =
                             recovery.grant_epoch(&peer.url, offered.take(), attempt_auth.clone());
@@ -1497,26 +1497,50 @@ struct TransportRecoveryCredit {
 struct RecoveryEpoch {
     url: String,
     authenticated_at: tokio::time::Instant,
-    auth: RecoveryAuthEpoch,
+    auth: Arc<RecoveryAuthEpoch>,
     authority: String,
     spent: bool,
 }
-#[derive(Clone, PartialEq)]
+#[derive(PartialEq)]
 struct RecoveryAuthEpoch {
     member_key: Option<String>,
     secret: Arc<Vec<u8>>,
     members: Vec<(String, u64, String)>,
     view_generation: u64,
 }
-impl TransportRecoveryCredit {
-    fn auth_epoch(auth: &FleetAuth, fleet: &FleetContext, name: &str) -> RecoveryAuthEpoch {
+impl RecoveryAuthEpoch {
+    fn matches(&self, auth: &FleetAuth, fleet: &FleetContext, name: &str) -> bool {
         let view = fleet.view.read().expect("fleet view lock poisoned");
-        RecoveryAuthEpoch {
+        self.member_key.as_deref() == auth.member_key()
+            && self.secret == auth.secret
+            && self.view_generation == *fleet.view_changed.borrow()
+            && self
+                .members
+                .iter()
+                .map(|(key, start, state)| (key.as_str(), *start, state.as_str()))
+                .eq(view
+                    .members
+                    .iter()
+                    .filter(|member| member.name == name && member.state != "ended")
+                    .map(|member| {
+                        (
+                            member.member_key.as_str(),
+                            member.start,
+                            member.state.as_str(),
+                        )
+                    }))
+    }
+}
+impl TransportRecoveryCredit {
+    fn auth_epoch(auth: &FleetAuth, fleet: &FleetContext, name: &str) -> Arc<RecoveryAuthEpoch> {
+        let view = fleet.view.read().expect("fleet view lock poisoned");
+        Arc::new(RecoveryAuthEpoch {
             member_key: auth.member_key().map(str::to_owned),
             secret: auth.secret.clone(),
             members: view
-                .current(name)
+                .members
                 .iter()
+                .filter(|member| member.name == name && member.state != "ended")
                 .map(|member| {
                     (
                         member.member_key.clone(),
@@ -1526,7 +1550,21 @@ impl TransportRecoveryCredit {
                 })
                 .collect(),
             view_generation: *fleet.view_changed.borrow(),
-        }
+        })
+    }
+    fn capture_auth(
+        &self,
+        auth: &FleetAuth,
+        fleet: &FleetContext,
+        name: &str,
+    ) -> Arc<RecoveryAuthEpoch> {
+        // Retain the exact pre-dispatch snapshot across awaits, without rebuilding
+        // strings and membership vectors on every healthy HTTP exchange.
+        self.epoch
+            .as_ref()
+            .filter(|epoch| epoch.auth.matches(auth, fleet, name))
+            .map(|epoch| Arc::clone(&epoch.auth))
+            .unwrap_or_else(|| Self::auth_epoch(auth, fleet, name))
     }
     #[cfg(test)]
     fn grant(
@@ -1543,7 +1581,7 @@ impl TransportRecoveryCredit {
         &mut self,
         url: &str,
         authority: Option<String>,
-        auth: RecoveryAuthEpoch,
+        auth: Arc<RecoveryAuthEpoch>,
     ) -> bool {
         let already_armed = self
             .epoch
@@ -1572,7 +1610,7 @@ impl TransportRecoveryCredit {
             || routes.has_changed().unwrap_or(true)
             || self.epoch.as_ref().is_some_and(|epoch| {
                 epoch.authenticated_at.elapsed() >= PEER_PROBE_WINDOW
-                    || epoch.auth != Self::auth_epoch(auth, fleet, name)
+                    || !epoch.auth.matches(auth, fleet, name)
                     || !routes
                         .borrow()
                         .iter()
