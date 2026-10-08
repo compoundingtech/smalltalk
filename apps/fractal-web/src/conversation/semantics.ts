@@ -55,6 +55,41 @@ export const proseItem = (item: TextItem): TextItem => {
   return { ...item, text: envelope[2]!, sender, role: sender.kind === 'human' ? 'user' : 'system' }
 }
 
+/**
+ * Mirrors st3-views' shown/delivered semantics for envelope, channel and PING delivery links.
+ * That package is not a dependency here. Only explicit graph links suppress mail, never prose.
+ * Keep unrelated text in a native turn; the two driver delivery notes are not user prose.
+ */
+export const withoutShownDeliveries = (raw: string, shown: ReadonlySet<string>): string => {
+  let delivered = false
+  let text = raw.replace(/\r\n/g, '\n')
+  text = text.replace(/<channel\b([^>]*)>[\s\S]*?<\/channel>/g, (block: string, head: string) => {
+    const id = /\bmessageId="([^"]+)"/.exec(head)?.[1] ??
+      /^\s*\[PING from st3\] (message\/\S+) from /m.exec(block)?.[1] ??
+      /<smalltalk-message\b[^>]*\bgraph="([^"]+)"/.exec(block)?.[1]
+    if (id === undefined || !shown.has(id)) return block
+    delivered = true
+    return ''
+  })
+  text = text.replace(/<smalltalk-message\b([^>]*)>[\s\S]*?<\/smalltalk-message>/g, (block: string, head: string) => {
+    const id = /\bgraph="([^"]+)"/.exec(head)?.[1]
+    if (id === undefined || !shown.has(id)) return block
+    delivered = true
+    return ''
+  })
+  text = text.split('\n').filter((line) => {
+    const id = /^\s*\[PING from st3\] (message\/\S+) from /.exec(line)?.[1]
+    if (id === undefined || !shown.has(id)) return true
+    delivered = true
+    return false
+  }).join('\n')
+  if (!delivered) return raw
+  return text.split('\n').filter((line) =>
+    line.trim() !== "The person reads replies in st, not in the agent's session." &&
+    line.trim() !== '(dictated by voice; it may contain transcription mistakes)',
+  ).join('\n').trim()
+}
+
 /** Deliberately decode an event envelope; arbitrary prose and JSON remain prose. */
 export const structuredEvent = ({
   id,

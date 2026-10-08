@@ -6,7 +6,7 @@ import type { ConversationChunk, UnrecognizedEntry } from '@st3/sdk/effect'
 import { DateTime, Option, Schema } from 'effect'
 
 import type { ConversationItem, ToolCallItem, ToolResult } from './model.ts'
-import { contentEvent, proseItem } from './semantics.ts'
+import { contentEvent, proseItem, withoutShownDeliveries } from './semantics.ts'
 
 /**
  * Fixture-only D08 proposal, not part of the st3 wire contract.
@@ -338,6 +338,8 @@ export class LiveTimeline {
       if (previous !== undefined && previous.revision >= entry.revision) continue
       this.entries.set(entry.id, entry)
       changed = true
+      // Mail may arrive after its native delivery; visibility depends on the whole shown set.
+      if (entry.type === 'message' || previous?.type === 'message') this.dirtyFrom = 0
       const last = this.ordered.at(-1)
       let at: number
       if (
@@ -413,10 +415,23 @@ export class LiveTimeline {
     const changedFrom = this.itemsBefore[from] ?? this.items.length
     const items = this.items.slice(0, changedFrom)
     this.itemsBefore.length = from
+    const shown = new Set(
+      this.ordered.flatMap((entry) =>
+        entry.type === 'message' && !isTurnHeader(entry) ? [entry.body.message_id] : [],
+      ),
+    )
     for (let at = from; at < this.ordered.length; at += 1) {
       const entry = this.ordered[at]!
       this.itemsBefore.push(items.length)
       if (isTurnHeader(entry)) continue
+      if (entry.type === 'content' && (entry.role === 'user' || entry.role === 'system')) {
+        const text = withoutShownDeliveries(entry.body.text ?? '', shown)
+        if (text !== entry.body.text) {
+          if (text.length > 0)
+            items.push(itemOf({ entry: { ...entry, body: { ...entry.body, text } }, sessionActive: true }))
+          continue
+        }
+      }
       if (entry.type === 'tool_result') {
         // A result after any same-id call folds into a call (the newest one wins there).
         const first = this.calls.get(entry.body.call_id)?.[0]
