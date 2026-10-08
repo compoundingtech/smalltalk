@@ -284,7 +284,7 @@ describe('ConversationPane conversation demand', () => {
     const workspace = container.querySelector('section[aria-label="Agent workspace"]')!
     expect(workspace.querySelector('[data-testid="transcript-turn"]')).not.toBeNull()
     expect(container.querySelector('aside[aria-label="Tool detail"]')).toBeNull()
-    const button = container.querySelector('button[aria-label="Open read tool detail"]') as HTMLButtonElement
+    const button = container.querySelector('button[aria-label="Open Reading information tool detail"]') as HTMLButtonElement
     expect(button).not.toBeNull()
     flushSync(() => button.click())
     const panel = container.querySelector('aside[aria-label="Tool detail"]')!

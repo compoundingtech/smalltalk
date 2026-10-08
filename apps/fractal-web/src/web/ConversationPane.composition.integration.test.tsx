@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ConversationItem } from '../conversation/model.ts'
 import type { ConversationPage, Feed } from '../data/source.ts'
 import type { FeedSyncObservation } from '../data/feedSync.ts'
-import type { WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
+import { Markdown, type WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
 
 // The kit compiles StyleX at build time; node tests stub only the CSS runtime, never data hooks.
 vi.mock('@stylexjs/stylex', () => ({
@@ -46,8 +46,7 @@ const scenario: readonly ConversationItem[] = [
   { _tag: 'Reasoning', id: 'reasoning', text: 'Compare the observed selection with the projected rows.', streaming: false, durationMs: 1200, at: at(4) },
   { _tag: 'Text', id: 'answer', role: 'assistant', text: 'The projection keeps **visible rows** together and preserves selection.', attachments: [], streaming: false, at: at(6) },
   { _tag: 'Status', id: 'status', status: 'completed', detail: 'Finished', at: at(7) },
-  { _tag: 'UnknownEvent', id: 'custom', eventType: 'custom', data: { kind: 'custom' }, at: at(8) },
-  { _tag: 'Notice', id: 'truncated', kind: 'truncation', text: 'Older history unavailable in this transcript window', detail: 'retained · sequences 0–40 omitted', at: at(9) },
+  { _tag: 'UnknownEvent', id: 'custom', eventType: 'custom', data: { raw: { type: 'custom', customType: 'tool_execution_start' } }, at: at(8) },
 ]
 
 let root: Root | undefined
@@ -104,12 +103,12 @@ describe('ConversationPane composition activation', () => {
     expect(answer.querySelector('strong')?.textContent).toBe('visible rows')
     expect(answer.textContent).not.toContain('**')
 
-    // Unsupported event kinds are omitted by structural kind; no card per unknown event.
+    // Only known internal event kinds are omitted; unlisted kinds retain the kit Unknown row.
     expect(text()).not.toContain('custom')
     expect(text()).not.toContain('credential_pin')
     expect(text()).not.toContain('title_change')
 
-    // Truncation collapses into the single quiet in-lane history row.
+    // Native HasOlder owns the single quiet in-lane history row.
     const boundary = container.querySelector('[data-testid="history-boundary"]')!
     expect(boundary.textContent).toContain('Earlier messages not loaded')
     expect(text()).not.toContain('sequences')
@@ -126,13 +125,13 @@ describe('ConversationPane composition activation', () => {
     expect(fold?.textContent).toContain('Worked for 7s')
     await act(async () => { fold!.click() })
     const open = await act(async () => {
-      const button = container.querySelector('button[aria-label="Open read tool detail"]') as HTMLButtonElement | null
+      const button = container.querySelector<HTMLButtonElement>('button[aria-label="Open Reading information tool detail"]')
       button?.click()
       return button
     })
     expect(open).not.toBeNull()
     expect(opened).toHaveLength(1)
-    expect(opened[0]).toMatchObject({ id: 'read', kind: 'read', title: 'read', argsSummary: 'src/rows.ts' })
+    expect(opened[0]).toMatchObject({ id: 'read', kind: 'read', title: 'Reading information', argsSummary: undefined })
   })
 
   it('shows native text-block tool output on the expanded row instead of No output', async () => {
@@ -161,6 +160,24 @@ describe('ConversationPane composition activation', () => {
     expect(prompts[1]!.getAttribute('data-send-state')).toBe('pending')
   })
 
+  it('renders unfamiliar protocol neutrally and hides known internal accounting', async () => {
+    source.feed = { _tag: 'Observed', freshness: 'live', value: {
+      items: [
+        scenario[0]!,
+        { _tag: 'UnknownEvent', id: 'accounting', eventType: 'custom/model_usage', data: { raw: { tokens: 42 } } },
+        { _tag: 'UnknownEvent', id: 'unfamiliar', eventType: 'unfamiliar_kind', data: { raw: { payload: 'synthetic-payload-sentinel' } } },
+      ],
+      hasOlder: false, observation: { empty: false },
+    } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    expect(text()).toContain('An event this view cannot show yet.')
+    expect(text()).not.toContain('Unsupported event')
+    expect(text()).not.toContain('custom/model_usage')
+    expect(text()).not.toContain('unfamiliar_kind')
+    expect(text()).not.toContain('synthetic-payload-sentinel')
+    expect(container.querySelectorAll('[data-testid="transcript-message"]')).toHaveLength(1)
+  })
   it('waits for the first observation inside the lane with the kit skeleton', async () => {
     source.feed = { _tag: 'Waiting' }
     source.sync = { status: { _tag: 'Requested', since: 990 }, observedAt: 990 }
@@ -169,14 +186,45 @@ describe('ConversationPane composition activation', () => {
     expect(text()).not.toContain('Waiting for the first conversation observation')
   })
 
-  // Kit gap: TranscriptTurn.prompt is required (packages/fractal-ui/src/assistant-ui/composition/Transcript.tsx),
-  // so an assistant-only page — a leading prompt-less tail — cannot be rendered yet. The mapping
-  // omits that tail rather than synthesising a fake prompt; flip this on once the kit makes
-  // prompt optional.
-  it.skip('renders an assistant-only page once the kit accepts prompt-less turns', async () => {
+  it('hands remote image consent to a new-tab opener without rendering a remote image', async () => {
+    const image = 'https://images.example.invalid/preview.png'
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    try {
+      source.feed = { _tag: 'Observed', freshness: 'live', value: {
+        items: [{ _tag: 'Text', id: 'image-answer', role: 'assistant', text: `![Preview](${image})`, attachments: [], streaming: false, at: at(6) }],
+        hasOlder: false, observation: { empty: false },
+      } }
+      source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+      await mount()
+      const placeholder = container.querySelector('[data-testid="deferred-image"]')
+      expect(placeholder?.textContent).toContain('images.example.invalid')
+      expect(container.querySelector(`img[src="${image}"]`)).toBeNull()
+      expect(open).not.toHaveBeenCalled()
+      const button = placeholder?.querySelector<HTMLButtonElement>('button')
+      expect(button?.textContent).toBe('Open image · images.example.invalid')
+      await act(async () => { button!.click() })
+      expect(open).toHaveBeenCalledExactlyOnceWith(image, '_blank', 'noopener,noreferrer')
+      expect(container.querySelector(`img[src="${image}"]`)).toBeNull()
+    } finally {
+      open.mockRestore()
+    }
+  })
+
+  it('negative control: without the host opener, kit consent loads the image inline', async () => {
+    const image = 'https://images.example.invalid/control.png'
+    await act(async () => { root!.render(<Markdown text={`![Control](${image})`} />) })
+    expect(container.querySelector(`img[src="${image}"]`)).toBeNull()
+    const button = container.querySelector<HTMLButtonElement>('[data-testid="deferred-image"] button')
+    expect(button?.textContent).toBe('Load image')
+    await act(async () => { button!.click() })
+    expect(container.querySelector(`img[src="${image}"]`)).not.toBeNull()
+  })
+
+  it('renders an assistant-only page without a synthetic user bubble', async () => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [scenario[3]!, scenario[4]!], hasOlder: false, observation: { empty: false } } }
     source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
     await mount()
     expect(container.querySelector('[data-testid="agent-message"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="user-message"]')).toBeNull()
   })
 })

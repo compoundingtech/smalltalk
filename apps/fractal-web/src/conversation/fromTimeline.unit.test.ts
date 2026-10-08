@@ -26,6 +26,48 @@ describe('native conversation page boundaries', () => {
   })
 })
 
+describe('native reasoning convention', () => {
+  it.each([
+    ['[reasoning]\nCompare the options.', 'assistant', 'Reasoning', 'Compare the options.'],
+    ['[reasoning]\n', 'assistant', 'Reasoning', ''],
+    ['[reasoning]', 'assistant', 'Text', '[reasoning]'],
+    ['Answer contains [reasoning]\ninside it.', 'assistant', 'Text', 'Answer contains [reasoning]\ninside it.'],
+    ['[reasoning]\nHuman quotation.', 'user', 'Text', '[reasoning]\nHuman quotation.'],
+    ['[reasoning]\nSystem quotation.', 'system', 'Text', '[reasoning]\nSystem quotation.'],
+  ])('projects %j (%s) as %s', (text, role, tag, expected) => {
+    const timeline = new LiveTimeline()
+    timeline.apply({
+      replace: true, hasMore: false,
+      entries: [Schema.decodeUnknownSync(TimelineEntry)({
+        id: 'timeline-entry/thought', sequence: 1, revision: 1, final: false,
+        timestamp: '2026-10-03T00:00:00Z', type: 'content', role,
+        body: { media_type: 'text/plain', text },
+      })],
+    })
+    const item = timeline.project().items[0]!
+    expect(item).toMatchObject({ _tag: tag, text: expected, streaming: true })
+    expect(item).not.toHaveProperty('durationMs')
+  })
+})
+
+describe('native truncation boundary', () => {
+  it('retains HasOlder but never fabricates a transcript notice', () => {
+    const timeline = new LiveTimeline()
+    timeline.apply({
+      replace: true, hasMore: false,
+      entries: [Schema.decodeUnknownSync(TimelineEntry)({
+        id: 'timeline-entry/boundary', sequence: 1, revision: 1, final: true,
+        timestamp: '2026-10-03T00:00:00Z', type: 'truncation', role: 'system',
+        body: { reason: 'response-limit', omitted_from_sequence: 0, omitted_to_sequence: 20 },
+      })],
+    })
+    expect(timeline.hasOlder).toBe(true)
+    expect(timeline.project().items).toEqual([])
+    timeline.apply({ replace: true, hasMore: false, entries: [] })
+    expect(timeline.hasOlder).toBe(false)
+  })
+})
+
 describe('mailbox deliveries', () => {
   const entry = (
     id: string,

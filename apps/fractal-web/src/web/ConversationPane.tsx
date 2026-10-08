@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { EmbraceRuntimeProvider, Transcript, type WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
 import { useConversation, useConversationSync, useDataSource, useFeedInterest, useNow } from '../data/react.tsx'
-import { mapConversationFeed, transcriptObservedAt, transcriptRuntimeOptions, transcriptSyncStatus } from './conversationTranscript.ts'
+import { mapConversationFeed, openableImageUrl, transcriptObservedAt, transcriptRuntimeOptions, transcriptSyncStatus } from './conversationTranscript.ts'
 
 /** The selected follow owns content; the gated kit composition owns every rendered element,
  * including the first-observation skeleton, the availability state and the older-history row. */
@@ -42,6 +42,7 @@ export const ConversationPane = ({
       observedAt={transcriptObservedAt(observation, now)}
       onOpenTool={onOpenTool}
       onRetrySync={retryConversation === undefined ? undefined : () => retryConversation(agentRef)}
+      onLoadImage={(src) => { const url = openableImageUrl(src); if (url !== undefined) window.open(url, '_blank', 'noopener,noreferrer') }}
       {...(state._tag === 'Unavailable' ? { availability: state.availability } : {})}
       {...(state._tag === 'Observed' && state.history._tag === 'HasOlder' ? { history: state.history } : {})}
       {...(state._tag === 'Observed' && state.emptyState !== undefined ? { emptyState: state.emptyState } : {})}
