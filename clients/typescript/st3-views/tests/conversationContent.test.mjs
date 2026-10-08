@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { contentReferences, loadConversationContent, contentJsonText, contentImageUri, conversationEntries } from '../index.ts';
+import { contentReferences, loadConversationContent, contentJsonText, contentImageUri, conversationEntries, fetchedConversationEntries } from '../index.ts';
 
 const reference = { ref: 'opaque/ref', media_type: 'application/json', reason: 'size-limit' };
 const chunk = (data, offset, size, next_offset = null) => ({ kind: 'conversation-content-chunk', ref: reference.ref, media_type: reference.media_type, offset, size, data: btoa(data), next_offset });
@@ -62,4 +62,26 @@ test('keeps result continuation on merged tool row and image-only content visibl
   assert.equal(rows[0].id, 'call');
   assert.equal(rows[0].content[0].ref, reference.ref);
   assert.equal(rows[1].content[0].ref, 'image');
+});
+
+test('full tool body and clipped payload use the typed output projection beyond 400 lines', () => {
+  const output = Array.from({ length: 600 }, (_, index) => `line-${index}`).join('\n');
+  const source = { id: 'result', role: 'assistant', timestamp: '2026-10-08T12:00:00Z', type: 'tool_result',
+    body: { call_id: 'c', status: 'success', media_type: 'text/plain', content: 'clipped',
+      blocks: [{ kind: 'tool_output', payload: '[st truncated this native timeline value: size limit; 20000 bytes]', continuation: reference, view: { type: 'bash', exit_code: 0 } }] } };
+  const [entry] = conversationEntries([source], new Map());
+  for (const value of [output, { call_id: 'c', status: 'success', media_type: 'text/plain', content: output }]) {
+    const [shown] = fetchedConversationEntries(entry, reference, value);
+    assert.equal(shown.body.kind, 'tool');
+    assert.ok(shown.body.output.includes('line-599'));
+    assert.ok(!shown.body.output.some(line => line.includes('"content"')));
+  }
+});
+
+test('metadata and view subtrees do not get guessed into a tool payload', () => {
+  const source = { id: 'result', role: 'assistant', timestamp: '2026-10-08T12:00:00Z', type: 'tool_result',
+    body: { call_id: 'c', status: 'success', media_type: 'text/plain', content: 'normal output',
+      blocks: [{ kind: 'tool_output', payload: { body_ref: true }, metadata: { large: '[st truncated this native timeline value: size limit; 20000 bytes]' }, continuation: reference }] } };
+  const [entry] = conversationEntries([source], new Map());
+  assert.equal(fetchedConversationEntries(entry, reference, { fullMetadata: 'complete' }), undefined);
 });

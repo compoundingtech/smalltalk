@@ -38,6 +38,7 @@ pub enum Hit {
     Escape,
     ToggleTool(String),
     ContentImage(super::content::Key),
+    ContentOutput(super::content::Key),
     InlineImage(super::content::Key),
     Pane(st3_conversation_ui::PaneIntent),
     JumpLatest,

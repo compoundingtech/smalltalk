@@ -4198,11 +4198,6 @@ impl Ui {
             }
         } else {
             self.conversation_state.expanded.extend(tools);
-            for tool in self.conversation_state.expanded.clone() {
-                for key in self.content.request_tool(&id, &tool) {
-                    self.effects.push(Effect::LoadContent(key));
-                }
-            }
         }
     }
 
@@ -5632,6 +5627,13 @@ impl Ui {
                     self.conversation_state.expanded.insert(st3_conversation_ui::bundle_id(&entry));
                 }
                 if self.content.toggle_image(&key) { self.effects.push(Effect::LoadContent(key)); }
+            }
+            Hit::ContentOutput(key) => {
+                if let Some((conversation, entry)) = self.content.image_owner(&key) {
+                    self.conversation_state.expanded.insert(entry);
+                    self.reveal_tool_bundles(&conversation);
+                }
+                if self.content.request(&key) { self.effects.push(Effect::LoadContent(key)); }
             }
             Hit::InlineImage(_) => {}
             Hit::Pane(PaneIntent::Open(id)) => self.open(&id),

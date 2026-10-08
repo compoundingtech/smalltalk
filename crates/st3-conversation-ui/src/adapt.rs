@@ -78,6 +78,21 @@ pub fn conversation_with_filters(
     names: &BTreeMap<String, String>,
     filters: &[crate::DisplayFilter],
 ) -> Vec<Entry> {
+    conversation_with_output_mode(timeline, names, filters, false)
+}
+
+/// Explicitly fetched native content uses the normal typed projections without
+/// the timeline preview's line limit.
+pub fn conversation_full(timeline: &[TimelineEntry], names: &BTreeMap<String, String>) -> Vec<Entry> {
+    conversation_with_output_mode(timeline, names, crate::DEFAULT_FILTERS, true)
+}
+
+fn conversation_with_output_mode(
+    timeline: &[TimelineEntry],
+    names: &BTreeMap<String, String>,
+    filters: &[crate::DisplayFilter],
+    full_output: bool,
+) -> Vec<Entry> {
     if filters.is_empty() {
         // JSON escapes terminal controls reversibly; the data itself remains unchanged.
         return timeline
@@ -372,7 +387,7 @@ pub fn conversation_with_filters(
                     }
                     continue;
                 }
-                let (mut output, command_failed) = tool_output(&result.content);
+                let (mut output, command_failed) = tool_output(&result.content, full_output);
                 let forced;
                 if let Some(view) = view {
                     let rows = typed_result(view, output);
@@ -1735,7 +1750,7 @@ fn script_commands(script: &str) -> Vec<String> {
 /// What a tool printed, and whether a command in it failed. Codex's code mode reports each
 /// command as JSON (`{"exit_code":…,"output":…}`, inside `{"status":…,"value":…}` when the
 /// script awaited several); those become the command's own output.
-fn tool_output(content: &Value) -> (Vec<String>, bool) {
+fn tool_output(content: &Value, full: bool) -> (Vec<String>, bool) {
     if is_redacted(content) {
         return (vec!["output not recorded".into()], false);
     }
@@ -1747,7 +1762,7 @@ fn tool_output(content: &Value) -> (Vec<String>, bool) {
             cut = whole.is_some();
             let text = whole.unwrap_or(text);
             match serde_json::from_str::<Value>(text) {
-                Ok(inner @ Value::Array(_)) if !cut => return tool_output(&inner),
+                Ok(inner @ Value::Array(_)) if !cut => return tool_output(&inner, full),
                 _ if text.trim_start().starts_with("[{") => {
                     let mut texts = string_fields(text, "text");
                     texts.extend(std::iter::repeat_n(
@@ -1818,7 +1833,9 @@ fn tool_output(content: &Value) -> (Vec<String>, bool) {
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
     }
-    lines.truncate(400);
+    if !full {
+        lines.truncate(400);
+    }
     if cut {
         lines.push("… st kept only the start of this output".into());
     }

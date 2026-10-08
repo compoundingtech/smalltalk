@@ -65,4 +65,5 @@ export const contentImageUri = ({ bytes, mediaType }: LoadedContent): string => 
   return `data:${detected};base64,${btoa(binary)}`;
 };
 
-export const contentJsonText = (content: LoadedContent): string => JSON.stringify(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(content.bytes)), null, 2);
+export const contentJsonValue = (content: LoadedContent): unknown => JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(content.bytes));
+export const contentJsonText = (content: LoadedContent): string => JSON.stringify(contentJsonValue(content), null, 2);

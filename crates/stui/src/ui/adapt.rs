@@ -864,6 +864,16 @@ pub fn conversation(timeline: &[st3_client::TimelineEntry], names: &BTreeMap<Str
     for (index, source) in timeline.iter().enumerate() {
         let st3_client::TimelineBody::Content(content) = &source.body else { continue };
         if !super::content::has_images(&content.blocks) { continue; }
+        if content.blocks.iter().all(|block| matches!(block.kind.as_str(), "image" | "source_record"))
+            && content.text.as_deref().is_none_or(|text| {
+                text.is_empty() || matches!(text, "[image]" | "[image · load from owner]")
+            })
+        {
+            // Replace the shared text adapter's image-only placeholder instead
+            // of adding a second row for the same image.
+            let prefix = format!("{}#", source.id);
+            entries.retain(|entry| entry.id != source.id && !entry.id.starts_with(&prefix));
+        }
         let at = entries.iter().rposition(|entry| entry.id == source.id || entry.id.starts_with(&format!("{}#", source.id)))
             .map(|at| at + 1)
             .or_else(|| timeline[index + 1..].iter().find_map(|next| {
