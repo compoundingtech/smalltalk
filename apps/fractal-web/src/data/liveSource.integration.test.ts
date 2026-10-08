@@ -45,6 +45,7 @@ class Gateway {
   transportFailure = false
   capabilityGate: Promise<void> | undefined
   rejectedCredential = false
+  runtimeRefusalStatus: number | undefined
 
   readonly fetch: typeof fetch = async (input, init) => {
     const path = new URL(String(input)).pathname
@@ -83,6 +84,12 @@ class Gateway {
         transport: 'fabric-loopback',
       }
     } else if (path.startsWith('/v1/client/runtimes/')) {
+      if (this.runtimeRefusalStatus !== undefined)
+        return new Response(JSON.stringify({
+          api_version: 'st3.client.v0', error_version: 'st3.client.error.v0',
+          code: this.runtimeRefusalStatus === 503 ? 'unavailable' : 'forbidden',
+          message: 'Runtime read refused', retryable: false, request_id: 'request/runtime', details: {},
+        }), { status: this.runtimeRefusalStatus, headers: { 'content-type': 'application/json' } })
       const name = decodeURIComponent(path.slice('/v1/client/runtimes/'.length)).slice(
         'runtime/'.length,
       )
@@ -406,3 +413,56 @@ describe('cold conversation admission', () => {
   )
 })
 
+
+describe('terminal dependent-read authority', () => {
+  for (const status of [401, 403, 503]) {
+    it.live(`handles replacement runtime refusal ${status} without disclosing revoked content`, () =>
+      withGateway((live, gateway) =>
+        Effect.gen(function* () {
+          live.registry.mount(live.source.agents)
+          yield* settle
+          gateway.fleet([agent])
+          yield* settle
+          const ref = 'terminal/example'
+          live.registry.mount(live.source.terminalInterest!(ref))
+          yield* settle
+          gateway.screen(gateway.subscription('terminal').id, 'old', 'Trusted previous screen')
+          yield* settle
+          expect(live.registry.get(live.source.terminal(ref))._tag).toBe('Observed')
+          gateway.runtimeRefusalStatus = status
+          gateway.fleet([{ ...agent, revision: '2', runtime_ids: ['runtime/new'] }])
+          yield* settle
+          const feed = live.registry.get(live.source.terminal(ref))
+          if (status === 503)
+            expect(feed).toMatchObject({ _tag: 'Observed', freshness: 'stale', error: { reason: 'failed' } })
+          else
+            expect(feed).toMatchObject({ _tag: 'Unavailable', reason: 'ungranted' })
+          expect(live.registry.get(live.source.sync!.terminal(ref)).sync.status).toEqual({
+            _tag: 'Failed', cause: { _tag: 'Server', code: status === 503 ? 'unavailable' : 'forbidden', message: 'Runtime read refused' },
+          })
+        }),
+      ),
+    )
+  }
+
+  it.live('clears a terminal when its dependent roster read is revoked on an open socket', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.agents)
+        yield* settle
+        gateway.fleet([agent])
+        yield* settle
+        const ref = 'terminal/example'
+        live.registry.mount(live.source.terminalInterest!(ref))
+        yield* settle
+        gateway.screen(gateway.subscription('terminal').id, 'old', 'Previously authorized screen')
+        yield* settle
+        expect(live.registry.get(live.source.terminal(ref))._tag).toBe('Observed')
+        gateway.send({ kind: 'error', id: gateway.subscription('agents').id, collection: 'agents', code: 'forbidden', message: 'Roster read revoked', retryable: false })
+        yield* settle
+        expect(live.registry.get(live.source.terminal(ref))).toMatchObject({ _tag: 'Unavailable', reason: 'ungranted' })
+        expect(live.registry.get(live.source.sync!.terminal(ref)).sync.status).toEqual({ _tag: 'Failed', cause: { _tag: 'Unknown' } })
+      }),
+    ),
+  )
+})

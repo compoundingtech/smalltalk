@@ -77,6 +77,9 @@ The SDK publishes `SyncStatus` v2 for each follow and the gateway. `Requested` m
 subscribe was sent, and `Live` requires decoded protocol data, not merely an open socket.
 Reconnect, resync, eviction and failure carry only observed evidence. The data layer
 retains trusted content through failed reads but removes authorization-revoked rows.
+Terminal screens also lose display authority when their dependent roster or replacement
+runtime lookup is refused. A Live window status refreshes its native snapshot evidence
+for every observed change while preserving the original Live transition clock.
 Status consumers share their follow's lifetime, and last content never manufactures Live.
 
 ## Header
