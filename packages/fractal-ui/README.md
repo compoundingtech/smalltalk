@@ -5,7 +5,7 @@ A small, independent UI kit for the Fractal web client, built on React Aria Comp
 It has two layers:
 
 - `.` (`kit.tsx`, `tokens.css`): token-driven component families. The workshop renders them in three switchable visual directions (**Folio**, **Relay**, **Orbit**), each with light and dark palettes and two densities.
-- `./assistant-ui` and its subpaths: the dark-first application surfaces the web app composes, built on assistant-ui 0.15.25. They cover the transcript, composer, tool calls and previews, the sidebar agent row and status glyph, the thread header, resizable splits, resource cards, the work log, the sync line and the workbench layout model. Every surface is controlled: the host supplies data, clock and transport, and unknown values render as unknown.
+- `./assistant-ui` and its subpaths: the dark-first application surfaces the web app composes, built on assistant-ui 0.15.25. They cover the transcript, composer, tool calls and previews, the sidebar agent row and status glyph, the thread header, resizable splits, resource cards, the work log, the sync line and the workbench layout model, plus rich markdown with highlighted code, the thinking disclosure and the dismissible failure layer. Every surface is controlled: the host supplies data, clock and transport, and unknown values render as unknown.
 
 ## Run
 
@@ -26,6 +26,10 @@ Stories:
 
 - **Fractal UI / Visual language**: one working context rendered in the chosen direction. It contains a thread list, a conversation with a tool call and a diff, a terminal pane, a command palette and component specimens. `Explore` exposes direction, scheme and density as canvas controls and Storybook args. The `FolioLight` … `OrbitDark` and `Compact` stories are fixed comparison entries.
 - **Fractal UI / Component families**: every family on one canvas (`AllFamilies`, `FamiliesDark`), under the same three switches.
+- **Fractal UI / Markdown**: CommonMark + GFM coverage with streamed fences and inline markup; language fences assert lazy grammar loading and stable wrap/copy state.
+- **Fractal UI / Thinking Entry**: the muted reasoning disclosure, settled and streaming.
+- **Fractal UI / Sync Line**: every observation across both schemes; `TransitionSequence` asserts fixed-height slots and CLS 0 across all transitions.
+- **Fractal UI / Sidebar/Agent Row**: compact hover-card facts, omitted unreported fields, the known-vs-none time cohort and the quick Open hover action.
 
 ## Families
 
@@ -64,6 +68,28 @@ Stories:
 - Density: spacing, control height, chrome size. Each direction applies its own pixel bias.
 
 Every foreground/background pair used for text meets WCAG AA (≥ 4.5:1) in all six palettes. The minimum, 4.59:1, is in Relay dark. Under `prefers-reduced-motion`, durations are zero and spinner and pulse animations stop. Fonts come from system stacks only; no font or image assets are distributed.
+
+## Assistant-ui surfaces
+
+### Portable sync seam
+
+`src/assistant-ui/st3-views/sync-status.ts` defines the decoded observation contract with no Effect import: `SyncStatus`, `SyncStage`, `StaleReason` and `SyncFailureCause`; timestamps are epoch milliseconds supplied by the host. `sync-line.ts` exports `syncLine(input): SyncLineValue | undefined` — the shared status vocabulary — and `observeSyncStatus(previous, status, now)`, the client transition clock. `SyncLine.tsx` exports `<SyncLine>`, requiring explicit `now`/`observedAt` numbers and never reading a clock. Hosts decode their own transport into the plain union.
+
+`Stale.reason` is explicit: an observation without a reason binds `{ _tag: 'Unknown' }`, shown immediately as **Stale** with its observed age or known last-live age, never an invented cause. Only known `Resync`/`Reconnecting` reasons receive their 400 ms/2 s delay. `Failed.cause` is `{ _tag: 'Server'; code; message } | { _tag: 'Local'; kind; detail?: { cap?: number; message?: string } } | { _tag: 'Unknown' }`. Local and server subscription-limit failures share one plain vocabulary; a missing cap is never invented and a reported cap of zero is displayed. Usage surfaces are HTTP reads and never present subscription-slot failures. Retry appears only for retryable causes; Details shows the decoded cause facts.
+
+Hosts must not invent `Progress` or `Quiet` observations to fill gaps in the wire contract. `observeSyncStatus` retains its timestamp only in memory for the same status/stage/reason; do not persist or hydrate it.
+
+### Sidebar agent row
+
+Rows render reported facts only; unreported fields are omitted — never shown as placeholders — and remain in the accessible details. Line-one metric and trailing-signal tracks share the widest intrinsic content width in their row cohort, so rows without a reported since-time keep the same title start as their cohort; tree nesting supplies hierarchy without a second indentation. Hovering a row swaps the time slot for a quick Open action. The hover card stays compact — status, host, current work, spend, duration, Last turn/Last activity, model, PR, branch and subagents — and never shows raw timestamps.
+
+### Markdown and the thinking disclosure
+
+The Markdown boundary renders CommonMark and GFM prose — emphasis, nested lists, tables, linked headings — while preserving resource-chip and inline-reference seams. Fenced code uses the pinned `refractor@5.0.0` dependency with lazily loaded grammars for the explicit set (TypeScript, TSX, JavaScript, JSON, Bash, diff, Rust, Nix, Python, YAML, Markdown, CSS), loaded through `refractor/core` only when a fence appears; unknown language labels stay visible above plain source. Wrap and copy are local to the stable code-block identity, so streaming text updates do not reset them. Unfinished streaming link tails complete through a linear backward scan of the current line, including escape-run handling, before label brackets are matched. Settled reasoning uses a muted `Thinking` disclosure whose expanded content renders through the same Markdown seam.
+
+### Floating failure layer
+
+`ErrorOverlayHost` owns one dismissible floating layer per surface; failures portal into the nearest host so banners from deep turns never clip, never scroll away with the timeline, and never reflow it. Escape inside the host dismisses the newest banner without moving focus, and a new failure id reappears after a dismissal. The work log routes run failures through the layer when a host wraps it and keeps the inline banner otherwise.
 
 ## Clean-room note
 

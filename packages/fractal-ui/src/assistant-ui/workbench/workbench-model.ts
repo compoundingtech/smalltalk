@@ -52,7 +52,7 @@ export type PaneKind = 'thread' | 'diff' | 'terminal' | 'placeholder'
 
 /** Resource kind derived from the uri scheme; unknown schemes render as placeholders. */
 export const paneKind = (pane: WorkbenchPane): PaneKind => {
-  if (pane.uri.startsWith('agent:')) return 'thread'
+  if (pane.uri.startsWith('agent:') || pane.uri.startsWith('agent/')) return 'thread'
   if (pane.uri.startsWith('diff:')) return 'diff'
   if (pane.uri.startsWith('terminal:')) return 'terminal'
   return 'placeholder'

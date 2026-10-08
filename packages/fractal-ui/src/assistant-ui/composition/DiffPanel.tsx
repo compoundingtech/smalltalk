@@ -60,7 +60,7 @@ export function DiffPanel({ open, width, diff, path, added, removed, onOpenSurfa
         <span {...stylex.props(styles.fileRemoved)}>−{removed}</span>
         <button type="button" aria-label="Copy file path" title="Copy file path" onClick={() => void navigator.clipboard.writeText(path)} {...stylex.props(styles.copy)}>⧉</button>
       </div>
-      <div {...stylex.props(styles.code)} data-testid="diff-code">
+      <div role="region" aria-label="Diff lines" tabIndex={0} {...stylex.props(styles.code)} data-testid="diff-code">
         {rows.map((row, index) => row.kind === 'hunk'
           ? <div key={index} {...stylex.props(styles.hunkRow)}>{row.text}</div>
           : <div key={index} {...stylex.props(styles.codeRow, row.kind === 'added' && styles.codeAdded, row.kind === 'removed' && styles.codeRemoved)}>
