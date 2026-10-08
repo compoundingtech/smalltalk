@@ -44180,6 +44180,98 @@ version 2
         );
     }
 
+    #[test]
+    fn replica_record_lookup_and_seek_pages_survive_prior_record_removal() {
+        let store = Store::open_memory("example-linux").unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            for (record_ref, writer, sequence, state) in [
+                ("record/one", "alpha", 1, "invalid"),
+                ("record/two", "alpha", 2, "valid"),
+                ("record/three", "beta", 1, "unknown"),
+                ("record/four", "beta", 2, "invalid"),
+            ] {
+                connection.execute(
+                    "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,
+                         position,raw,state,updated_at_unix_ms)
+                     VALUES (?1,?2,?3,'hash',0,X'',?4,'1')",
+                    params![record_ref, writer, sequence, state],
+                ).unwrap();
+            }
+        }
+        let first = store.replica_records_page(true, None, 2).unwrap();
+        let status = store.replication_status_sealed(false, None, &[]).unwrap();
+        assert_eq!((status.invalid_records, status.unknown_records, status.valid_records), (2, 1, 1));
+        let plan = store.connection.lock().unwrap().query_row(
+            "EXPLAIN QUERY PLAN SELECT record_ref FROM replica_records INDEXED BY replica_records_unresolved_page
+             WHERE (writer,sequence,envelope_hash,position) > ('',-1,'',-1)
+               AND state IN ('invalid','unknown')
+             ORDER BY writer,sequence,envelope_hash,position LIMIT 2",
+            [], |row| row.get::<_, String>(3),
+        ).unwrap();
+        assert!(plan.contains("replica_records_unresolved_page"), "{plan}");
+        assert_eq!(first.iter().map(|record| record.record_ref.as_str()).collect::<Vec<_>>(),
+            ["record/one", "record/three"]);
+        assert_eq!(store.replica_record("record/two").unwrap().unwrap().state, "valid");
+        assert!(store.replica_record("record/missing").unwrap().is_none());
+        let last = first.last().unwrap();
+        let cursor = replica_record_cursor(last).unwrap();
+        store.connection.lock().unwrap().execute(
+            "DELETE FROM replica_records WHERE record_ref='record/three'", [],
+        ).unwrap();
+        let second = store.replica_records_page(true, Some(&cursor), 2).unwrap();
+        assert_eq!(second.iter().map(|record| record.record_ref.as_str()).collect::<Vec<_>>(),
+            ["record/four"]);
+        let status = store.replication_status_sealed(false, None, &[]).unwrap();
+        assert_eq!((status.invalid_records, status.unknown_records), (2, 0));
+        store.connection.lock().unwrap().execute_batch(
+            "UPDATE replica_records SET state='unknown' WHERE record_ref='record/two';
+             UPDATE replica_records SET state='valid' WHERE record_ref='record/four';",
+        ).unwrap();
+        let restarted = store.replica_records_page(true, None, 2).unwrap();
+        assert_eq!(restarted.iter().map(|record| record.record_ref.as_str()).collect::<Vec<_>>(),
+            ["record/one", "record/two"]);
+        assert!(store.replica_records_page(true, Some(&cursor), 2).unwrap().is_empty());
+        let status = store.replication_status_sealed(false, None, &[]).unwrap();
+        assert_eq!((status.invalid_records, status.unknown_records, status.valid_records), (1, 1, 1));
+    }
+
+    #[test]
+    fn unresolved_record_page_skips_a_large_valid_prefix() {
+        let store = Store::open_memory("example-linux").unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            for sequence in 0..1_000 {
+                connection.execute(
+                    "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,
+                         position,raw,state,updated_at_unix_ms)
+                     VALUES (?1,'invented-node',?2,'hash',0,X'','valid','1')",
+                    params![format!("record/valid-{sequence}"), sequence],
+                ).unwrap();
+            }
+            connection.execute(
+                "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,
+                     position,raw,state,updated_at_unix_ms)
+                 VALUES ('record/late','invented-node',1000,'hash',0,X'','invalid','1')",
+                [],
+            ).unwrap();
+        }
+        let page = store.replica_records_page(true, None, 1).unwrap();
+        assert_eq!(page[0].record_ref, "record/late");
+        assert!(store.replica_records_page(true, Some(&replica_record_cursor(&page[0]).unwrap()), 1)
+            .unwrap().is_empty());
+        let connection = store.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT record_ref FROM replica_records INDEXED BY replica_records_unresolved_page
+             WHERE (writer,sequence,envelope_hash,position)>('',-1,'',-1)
+               AND state IN ('invalid','unknown')
+             ORDER BY writer,sequence,envelope_hash,position LIMIT 1",
+        ).unwrap();
+        assert_eq!(statement.query_row([], |row| row.get::<_, String>(0)).unwrap(), "record/late");
+        assert_eq!(statement.get_status(rusqlite::StatementStatus::FullscanStep), 0);
+        assert!(statement.get_status(rusqlite::StatementStatus::VmStep) < 100);
+    }
+
     /// A replicated harness observation. Each one is a new transition: a repeat that changed
     /// only `observed_at_ms` would stay in the local observation log.
     fn observe_harness(store: &Store, observed_at_ms: u64) {

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
+use base64::Engine as _;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -44,6 +45,7 @@ mod binary_payloads;
 pub mod events;
 pub mod idempotency;
 mod inventory_generation;
+mod replica_state_counts;
 pub use binary_payloads::PayloadConversion;
 pub mod canonical;
 pub mod checkpoint;
@@ -566,6 +568,9 @@ CREATE TABLE IF NOT EXISTS replica_records (
 );
 CREATE INDEX IF NOT EXISTS replica_records_state
 ON replica_records(state, writer, sequence);
+CREATE INDEX IF NOT EXISTS replica_records_unresolved_page
+ON replica_records(writer, sequence, envelope_hash, position)
+WHERE state IN ('invalid','unknown');
 CREATE INDEX IF NOT EXISTS replica_records_claim
 ON replica_records(claim_id, position);
 -- Any repaired copy excludes the original claim. This partial identity index answers that
@@ -883,6 +888,7 @@ impl Store {
         idempotency::initialize(connection)?;
         events::initialize(connection)?;
         inventory_generation::initialize(connection)?;
+        replica_state_counts::initialize(connection)?;
         connection.execute_batch(principals::PRINCIPAL_SCHEMA)?;
         runtime.create_schema(connection)?;
         // Reassigning user_version dirties the database header even when it is unchanged.
@@ -3598,6 +3604,23 @@ pub fn replication_bucket_digest<'a>(
 
 pub fn replication_bucket_start(sequence: u64) -> u64 {
     sequence - sequence % REPLICATION_BUCKET_WIDTH
+}
+
+/// A stable page boundary even when the preceding record is deleted or changes state.
+pub fn replica_record_cursor(record: &ReplicaRecordView) -> Result<String> {
+    let tuple = (
+        &record.writer,
+        i64::try_from(record.sequence)?,
+        &record.envelope_hash,
+        i64::try_from(record.position)?,
+    );
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&tuple)?))
+}
+
+pub fn decode_replica_record_cursor(cursor: &str) -> Result<(String, i64, String, i64)> {
+    anyhow::ensure!(cursor.len() <= 4096, "replica record cursor is too long");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(cursor)?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 /// Compare a local inventory with a peer's compact inventory. Returns the local envelopes the
@@ -6824,7 +6847,7 @@ impl Store {
         } else {
             ""
         };
-        let mut statement = connection.prepare(&format!(
+        let mut statement = connection.prepare_cached(&format!(
             "SELECT record_ref, writer, sequence, envelope_hash, position, state, claim_id,
                     subject_hint, kind_hint, error_code, error_message, replacement_claim_id
              FROM replica_records{filter} ORDER BY writer, sequence, envelope_hash, position"
@@ -6849,11 +6872,85 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Return one bounded page in the same order as `replica_records`. The cursor encodes the
+    /// ordering tuple, so deleting the preceding record cannot break paging.
+    pub fn replica_records_page(
+        &self,
+        unresolved_only: bool,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ReplicaRecordView>> {
+        let connection = self.readers.get();
+        let cursor: (String, i64, String, i64) = match after {
+            Some(cursor) => decode_replica_record_cursor(cursor)?,
+            None => (String::new(), -1, String::new(), -1),
+        };
+        let filter = if unresolved_only {
+            " AND state IN ('invalid','unknown')"
+        } else {
+            ""
+        };
+        let seek_index = if unresolved_only {
+            " INDEXED BY replica_records_unresolved_page"
+        } else {
+            ""
+        };
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT record_ref, writer, sequence, envelope_hash, position, state, claim_id,
+                    subject_hint, kind_hint, error_code, error_message, replacement_claim_id
+             FROM replica_records{seek_index}
+             WHERE (writer, sequence, envelope_hash, position) > (?1, ?2, ?3, ?4){filter}
+             ORDER BY writer, sequence, envelope_hash, position LIMIT ?5"
+        ))?;
+        Ok(statement
+            .query_map(
+                params![cursor.0, cursor.1, cursor.2, cursor.3, limit.clamp(1, 512) as i64],
+                |row| {
+                    Ok(ReplicaRecordView {
+                        record_ref: row.get(0)?,
+                        writer: row.get(1)?,
+                        sequence: row.get(2)?,
+                        envelope_hash: row.get(3)?,
+                        position: row.get(4)?,
+                        state: row.get(5)?,
+                        claim_id: row.get(6)?,
+                        subject: row.get(7)?,
+                        kind: row.get(8)?,
+                        error_code: row.get(9)?,
+                        error_message: row.get(10)?,
+                        replacement_claim_id: row.get(11)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn replica_record(&self, record_ref: &str) -> Result<Option<ReplicaRecordView>> {
-        Ok(self
-            .replica_records(false)?
-            .into_iter()
-            .find(|record| record.record_ref == record_ref))
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT record_ref, writer, sequence, envelope_hash, position, state, claim_id,
+                        subject_hint, kind_hint, error_code, error_message, replacement_claim_id
+                 FROM replica_records WHERE record_ref=?1",
+        )?;
+        statement
+            .query_row([record_ref], |row| {
+                    Ok(ReplicaRecordView {
+                        record_ref: row.get(0)?,
+                        writer: row.get(1)?,
+                        sequence: row.get(2)?,
+                        envelope_hash: row.get(3)?,
+                        position: row.get(4)?,
+                        state: row.get(5)?,
+                        claim_id: row.get(6)?,
+                        subject: row.get(7)?,
+                        kind: row.get(8)?,
+                        error_code: row.get(9)?,
+                        error_message: row.get(10)?,
+                        replacement_claim_id: row.get(11)?,
+                    })
+                })
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<bool> {
@@ -7246,11 +7343,7 @@ impl Store {
             |row| row.get(0),
         )?;
         let count = |state: &str| -> Result<u64> {
-            Ok(connection.query_row(
-                "SELECT COUNT(*) FROM replica_records WHERE state=?1",
-                [state],
-                |row| row.get(0),
-            )?)
+            replica_state_counts::count(&connection, state)
         };
         let waiting_claims = count("unknown")?;
         let registry_digest = self.runtime.schema_digest();
