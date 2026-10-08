@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Test frozen lock coverage, manifest normalization and verified optional archives."""
+
+import base64
+import hashlib
+import io
+import json
+from pathlib import Path
+import runpy
+import tarfile
+import tempfile
+import unittest
+
+api = runpy.run_path(str(Path(__file__).with_name("ci-fractal-web-licenses")))
+lock_packages = api["lock_packages"]
+manifest_license = api["manifest_license"]
+check_package_set = api["check_package_set"]
+installed_manifests = api["installed_manifests"]
+archive_manifest = api["archive_manifest"]
+INTEGRITY = "sha512-" + base64.b64encode(bytes(64)).decode()
+LOCK = f"""lockfileVersion: '9.0'
+importers:
+  .: {{}}
+  apps/ios: {{}}
+packages:
+  '@fixture/font@1.0.0':
+    resolution: {{integrity: {INTEGRITY}}}
+  binary@2.0.0:
+    resolution: {{integrity: {INTEGRITY}}}
+    cpu: [arm64]
+    os: [darwin]
+snapshots:
+  binary@2.0.0: {{}}
+"""
+
+
+class LicenseTests(unittest.TestCase):
+    def test_complete_lock_package_set_not_snapshots_or_importers(self):
+        self.assertEqual(lock_packages(LOCK), {("@fixture/font", "1.0.0"): INTEGRITY, ("binary", "2.0.0"): INTEGRITY})
+
+    def test_fail_closed_lock_formats(self):
+        for text in (
+            LOCK.replace("'9.0'", "'8.0'"),
+            LOCK.replace(f"{{integrity: {INTEGRITY}}}", "{tarball: https://example.invalid/archive.tgz}"),
+            LOCK.replace("binary@2.0.0", "binary@https://example.invalid/binary"),
+            LOCK.replace("  binary@2.0.0:", "  '@fixture/font@1.0.0':"),
+            LOCK.replace(f"    resolution: {{integrity: {INTEGRITY}}}\n", ""),
+        ):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                lock_packages(text)
+
+    def test_license_strings_and_legacy_fields(self):
+        self.assertEqual(manifest_license({"license": "MIT AND OFL-1.1"}), "MIT AND OFL-1.1")
+        self.assertEqual(manifest_license({"license": "MIT", "licenses": [{"type": "BSD-2-Clause"}]}), "MIT")
+        self.assertEqual(manifest_license({"license": {"type": "MIT", "url": "https://example.invalid"}}), "MIT")
+        self.assertEqual(manifest_license({"licenses": [{"type": "MIT"}, {"type": "BSD-2-Clause"}]}), "(MIT OR BSD-2-Clause)")
+        self.assertEqual(manifest_license({"licenses": [{"type": "MIT"}]}), "MIT")
+        for manifest in ({}, {"license": "UNKNOWN"}, {"licenses": []}, {"license": {"url": "missing-type"}}):
+            with self.subTest(manifest=manifest), self.assertRaises(ValueError):
+                manifest_license(manifest)
+
+    def test_inventory_drift_and_duplicates(self):
+        packages = lock_packages(LOCK)
+        entries = [{"name": name, "version": version, "license": "MIT"} for name, version in sorted(packages)]
+        check_package_set({"packages": entries}, packages)
+        for bad in (entries[:1], entries + [entries[0]], list(reversed(entries)), entries + [{"name": "extra", "version": "1.0.0", "license": "MIT"}]):
+            with self.subTest(entries=bad), self.assertRaises(ValueError):
+                check_package_set({"packages": bad}, packages)
+
+    def test_hoisted_nested_versions_and_conflicting_manifests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [("@fixture/font", "1.0.0", "MIT AND OFL-1.1"), ("other/node_modules/@fixture/font", "2.0.0", "MIT")]
+            for path, version, license in paths:
+                target = root / path / "package.json"
+                target.parent.mkdir(parents=True)
+                target.write_text(json.dumps({"name": "@fixture/font", "version": version, "license": license}))
+            keys = {("@fixture/font", "1.0.0"), ("@fixture/font", "2.0.0"), ("binary", "2.0.0")}
+            self.assertEqual(installed_manifests(root, keys), {("@fixture/font", "1.0.0"): "MIT AND OFL-1.1", ("@fixture/font", "2.0.0"): "MIT"})
+            target.write_text(json.dumps({"name": "@fixture/font", "version": "1.0.0", "license": "MIT"}))
+            with self.assertRaises(ValueError):
+                installed_manifests(root, keys)
+        with self.assertRaises(ValueError):
+            installed_manifests(Path(directory), keys)
+
+    def test_archive_integrity_and_identity(self):
+        manifest = {"name": "binary", "version": "2.0.0", "license": "MPL-2.0"}
+        body = json.dumps(manifest).encode()
+        data = io.BytesIO()
+        with tarfile.open(fileobj=data, mode="w:gz") as archive:
+            member = tarfile.TarInfo("package/package.json")
+            member.size = len(body)
+            archive.addfile(member, io.BytesIO(body))
+        data = data.getvalue()
+        integrity = "sha512-" + base64.b64encode(hashlib.sha512(data).digest()).decode()
+        self.assertEqual(archive_manifest(data, integrity, ("binary", "2.0.0")), manifest)
+        with self.assertRaises(ValueError):
+            archive_manifest(data, INTEGRITY, ("binary", "2.0.0"))
+        with self.assertRaises(ValueError):
+            archive_manifest(data, integrity, ("binary", "1.0.0"))
+
+
+if __name__ == "__main__":
+    unittest.main()

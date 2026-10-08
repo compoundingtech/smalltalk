@@ -132,3 +132,10 @@ assert "fractal-web" not in blocks["linux-gate"], "Rust-only gates never wait fo
 settings = (root / ".github/repo-settings.json").read_text()
 assert '"fractal-web"' not in settings, "fractal-web becomes required only after PR and queue runs emit it"
 print("passed: generated jobs are unfiltered, hosted, bounded and fail closed")
+
+freshness = blocks["genie-freshness"]
+assert "python3 scripts/ci-fractal-web-licenses --check-lockfile" in freshness
+assert "python3 scripts/ci-fractal-web-licenses-test" in freshness
+lanes = (root / "scripts/ci-fractal-web").read_text()
+assert lanes.index("pnpm install --frozen-lockfile") < lanes.index("python3 scripts/ci-fractal-web-licenses --check") < lanes.index("buck2 build //:typecheck")
+print("passed: license coverage and manifest guards are wired into the generated CI lanes")
