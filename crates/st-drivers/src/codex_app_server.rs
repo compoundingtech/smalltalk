@@ -1904,7 +1904,8 @@ fn should_track_timeline_usage(message: &Value, active_turn_id: Option<&str>) ->
         .is_some_and(|turn_id| active_turn_id == Some(turn_id))
 }
 
-fn stable_client_user_message_id(recipient: &str, thread_id: &str, filename: &str) -> String {
+/// The same native client identity used for delivery receipts and conversation echo correlation.
+pub fn stable_client_user_message_id(recipient: &str, thread_id: &str, filename: &str) -> String {
     let mut hash = Sha256::new();
     let graph_message = filename.starts_with("message/");
     hash.update(if graph_message {

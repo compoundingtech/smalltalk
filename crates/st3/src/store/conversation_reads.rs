@@ -157,18 +157,43 @@ impl Store {
         before: Option<u64>,
         after: u64,
     ) -> Result<Vec<ClaimRecord>> {
+        self.conversation_messages_window(owner, before, after, None)
+    }
+
+    /// Bounded indexed post-snapshot sends for native/graph read reconciliation.
+    pub(crate) fn conversation_message_delta_at(
+        &self,
+        owner: &str,
+        before: Option<u64>,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<ClaimRecord>> {
+        self.conversation_messages_window(owner, before, after, Some(limit))
+    }
+
+    fn conversation_messages_window(
+        &self,
+        owner: &str,
+        before: Option<u64>,
+        after: u64,
+        limit: Option<usize>,
+    ) -> Result<Vec<ClaimRecord>> {
         let before = before.unwrap_or(i64::MAX as u64);
         let ids = {
             let connection = self.readers.get();
-            let floor = connection
-                .prepare_cached(
-                    "SELECT store_index FROM claims WHERE kind='message.sent' AND store_index<?1
-                 ORDER BY store_index DESC LIMIT 1 OFFSET 9999",
-                )?
-                .query_row([before], |row| row.get::<_, u64>(0))
-                .optional()?
-                .unwrap_or(0)
-                .max(after.saturating_add(1));
+            let floor = if limit.is_some() {
+                after.saturating_add(1)
+            } else {
+                connection
+                    .prepare_cached(
+                        "SELECT store_index FROM claims WHERE kind='message.sent' AND store_index<?1
+                     ORDER BY store_index DESC LIMIT 1 OFFSET 9999",
+                    )?
+                    .query_row([before], |row| row.get::<_, u64>(0))
+                    .optional()?
+                    .unwrap_or(0)
+                    .max(after.saturating_add(1))
+            };
             connection
                 .prepare_cached(
                     "WITH selected AS (
@@ -188,9 +213,9 @@ impl Store {
                     WHERE kind='message.sent' AND json_type(body,'$.fields') IS NULL
                       AND json_extract(body,'$.from')=?1 AND store_index>=?2 AND store_index<?3
                  ) SELECT claims.id FROM claims JOIN selected USING(store_index)
-                   ORDER BY claims.store_index DESC",
+                   ORDER BY claims.store_index DESC LIMIT ?4",
                 )?
-                .query_map(params![owner, floor, before], |row| row.get::<_, String>(0))?
+                .query_map(params![owner, floor, before, limit.map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX))], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         // Copy at most 64 rows, stopping after 1 MiB plus one complete row, as raw strings.
