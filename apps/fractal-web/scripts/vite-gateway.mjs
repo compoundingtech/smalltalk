@@ -1,6 +1,7 @@
 import { Tracer } from 'effect'
 
 import { createFractalWebMiddleware } from '../server/core.mts'
+import { devAdmission } from '../server/devAdmission.mts'
 
 /** Enable live data only when explicitly configured; Storybook remains credential-free. */
 export function webfractalGateway() {
@@ -21,14 +22,14 @@ export function webfractalGateway() {
       if (authorization === undefined || authorization === '') {
         throw new Error('WF_ST_GATEWAY requires WF_ST_AUTHORIZATION to carry the paired gateway bearer token')
       }
-      const loopback = new Set(['127.0.0.1', 'localhost'])
+      const server = vite.httpServer
       const boundary = createFractalWebMiddleware({
-        server: vite.httpServer,
-        // Dev admission: an exact loopback Host header only; no deployment identity is assumed.
-        admit: (request) => {
-          const match = /^([a-z0-9.-]+)(?::([0-9]+))?$/.exec(request.headers.host ?? '')
-          return match !== null && loopback.has(match[1]!)
-        },
+        server,
+        // Dev admission: loopback Host plus the exact Vite Origin; no deployment identity is assumed.
+        admit: devAdmission(() => {
+          const address = server.address()
+          return typeof address === 'object' && address !== null ? address.port : undefined
+        }),
         gateway: {
           socketPath: socket.replace(/^unix:/, ''),
           host: process.env.WF_ST_GATEWAY_HOST ?? '127.0.0.1',

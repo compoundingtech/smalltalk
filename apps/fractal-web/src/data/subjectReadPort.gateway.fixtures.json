@@ -1,9 +1,9 @@
 {
   "provenance": {
-    "capturedAt": "2026-10-04T22:54:16.747Z",
-    "transport": "Existing authenticated wf same-origin read-only client proxy; GET only",
+    "generatedAt": "2030-01-03T22:54:16.747Z",
+    "transport": "Synthetic contract cases for the st3.client.v0 read projections; GET only",
     "contractSha256": "135849d425c51a95fbe522a2f9be7753bb3be7a9ebc59cd32f9b4cf9beced18f",
-    "redactions": "Identifiers hashed consistently; free-text replaced; optional operational fields removed. Native enum/state/time/numeric shapes preserved. Empty families cover real absence, not synthetic success."
+    "redactions": "Synthetic identifiers, dates, counts, versions and topology. Native enum/state/time/numeric shapes preserved. Empty families cover absence, not synthetic success."
   },
   "capabilities": {
     "api_version": "st3.client.v0",
@@ -13,11 +13,11 @@
       "host_id": "host/37eda7d15d948865",
       "store_index": 50201,
       "projection_version": "client-projection.v0",
-      "created_at": "2026-10-04T22:31:50.380Z"
+      "created_at": "2030-01-03T22:31:50.380Z"
     },
     "value": {
       "kind": "capabilities",
-      "machine_version": "0.1.0+8298c70",
+      "machine_version": "0.1.0+synthetic",
       "session_actor": "person/e8c45d2cc74acc91",
       "transport": "fabric-loopback",
       "capabilities": [
@@ -386,13 +386,13 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50413,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:25.021Z"
+          "created_at": "2030-01-03T22:40:25.021Z"
         },
         "value": {
           "id": "mission/a3bbc810d73c508e",
           "kind": "mission",
           "revision": "fe20339b3fb855c55ee79bb8876952e4448f554b9eb86d0aa4bbe34e3bc1feab",
-          "updated_at": "2026-10-04T22:05:17.459Z",
+          "updated_at": "2030-01-03T22:05:17.459Z",
           "title": "Recorded gateway value",
           "state": "running",
           "mission_revision": "recorded-11f00c677fff2372",
@@ -417,11 +417,11 @@
                   "assignee": null,
                   "claimant": null,
                   "state": "claimed",
-                  "since": "2026-10-04T22:05:18.176Z"
+                  "since": "2030-01-03T22:05:18.176Z"
                 }
               ],
               "must_act": "you",
-              "state_since": "2026-10-04T22:05:17.459Z",
+              "state_since": "2030-01-03T22:05:17.459Z",
               "outcome": null,
               "last_progress": null,
               "blocker": null,
@@ -437,7 +437,7 @@
                   "assignee": null,
                   "claimant": null,
                   "agentless": true,
-                  "since": "2026-10-04T22:05:18.176Z",
+                  "since": "2030-01-03T22:05:18.176Z",
                   "last_progress": null,
                   "blocked_reason": null,
                   "blockers": [],
@@ -465,13 +465,13 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50413,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:25.021Z"
+          "created_at": "2030-01-03T22:40:25.021Z"
         },
         "value": {
           "id": "step-run/bae275d95dcecaed",
           "kind": "work",
           "revision": "4219b50e411fbd42c047ab1f14023224acc7e29261d4f95702f3a6834ed8cd3a",
-          "updated_at": "2026-10-02T17:10:43.487Z",
+          "updated_at": "2030-01-01T17:10:43.487Z",
           "mission_id": "mission/cc94272e0bfef192",
           "mission_run_id": "mission-run/2ba9ae7211fc3aa6",
           "generation_id": "run-generation/8c0c1ad8001c6eaf",
@@ -509,13 +509,13 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50413,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:25.021Z"
+          "created_at": "2030-01-03T22:40:25.021Z"
         },
         "value": {
           "id": "agent/1d34acd36c9a4c89",
           "kind": "agent",
           "revision": "ae66038c5a09606826bbccb958c24021de6e4110c07d740c2a4d6579848ac701",
-          "updated_at": "2026-10-04T22:35:47.176Z",
+          "updated_at": "2030-01-03T22:35:47.176Z",
           "name": "Recorded gateway value",
           "state": "running",
           "reachability": "reachable",
@@ -529,8 +529,8 @@
           "ask": null,
           "reason": null,
           "host_id": "host/ad8787c4cc9d991e",
-          "last_activity_at": "2026-10-04T22:39:01.254Z",
-          "silent_since": "2026-10-04T22:39:01.254Z",
+          "last_activity_at": "2030-01-03T22:39:01.254Z",
+          "silent_since": "2030-01-03T22:39:01.254Z",
           "fault": null,
           "incarnation_id": "recorded-1d7c0ce548c462e7",
           "current_session_id": "session/3c0b2415ce17e080",
@@ -556,13 +556,13 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50427,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:41.165Z"
+          "created_at": "2030-01-03T22:40:41.165Z"
         },
         "value": {
           "id": "message/27753b69bd8968c2",
           "kind": "message",
           "revision": "a217d19b359170ca991893069c8c116d1bec81e88afee2560eaabadb8b5ceee8",
-          "updated_at": "2026-10-04T17:23:23.809Z",
+          "updated_at": "2030-01-03T17:23:23.809Z",
           "from": "agent/c3cb4b974b57062e",
           "to": "person/d152066f67e1eb1f",
           "title": null,
@@ -575,7 +575,7 @@
             "age_ms": 19048628,
             "recipient_delivery": null
           },
-          "sent_at": "2026-10-04T17:23:23.809Z",
+          "sent_at": "2030-01-03T17:23:23.809Z",
           "session_id": null,
           "in_reply_to": "message/3c0db569fc217587",
           "tags": [],
@@ -593,13 +593,13 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50428,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:42.624Z"
+          "created_at": "2030-01-03T22:40:42.624Z"
         },
         "value": {
           "id": "runtime/901dee053163764b",
           "kind": "runtime",
           "revision": "48c59b5f8e6604ffd08e3b9045ac99b7217be7ebcb8dc1704a5c4e977b34247e",
-          "updated_at": "2026-10-03T08:02:30.217Z",
+          "updated_at": "2030-01-02T08:02:30.217Z",
           "runtime_kind": "terminal",
           "owner_id": "agent/99d626d796265330",
           "owner_host_id": "host/ad8787c4cc9d991e",
@@ -628,13 +628,13 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50431,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:51.193Z"
+          "created_at": "2030-01-03T22:40:51.193Z"
         },
         "value": {
           "id": "observer/2a64b6ec6b525862",
           "kind": "observer",
           "revision": "0a7df48bf8fe5f1b3a33db39f951ae3d9ec1ebbc644d49496a122c3022f1adad",
-          "updated_at": "2026-10-02T17:20:30.654Z",
+          "updated_at": "2030-01-01T17:20:30.654Z",
           "state": "healthy",
           "spec": {
             "resource": "resource/270de19d4eb8a082",
@@ -663,13 +663,13 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50431,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:51.193Z"
+          "created_at": "2030-01-03T22:40:51.193Z"
         },
         "value": {
           "id": "subscription/3b27561019ac7de",
           "kind": "subscription",
           "revision": "4b1e2cdbe9d785a0b935588902fb347d081f7b7f9fef913f5d60e42faa0740ee",
-          "updated_at": "2026-10-02T17:20:30.960Z",
+          "updated_at": "2030-01-01T17:20:30.960Z",
           "state": "active",
           "spec": {
             "observer": "observer/2a64b6ec6b525862",
@@ -696,13 +696,13 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50431,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:51.193Z"
+          "created_at": "2030-01-03T22:40:51.193Z"
         },
         "value": {
           "id": "operation/dbd3d524dd9caefe",
           "kind": "operation",
           "revision": "terminal-exec-gates:pass",
-          "updated_at": "2026-10-04T22:40:51.193Z",
+          "updated_at": "2030-01-03T22:40:51.193Z",
           "component": "daemon",
           "severity": "info",
           "state": "healthy",
@@ -721,15 +721,15 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50431,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:51.193Z"
+          "created_at": "2030-01-03T22:40:51.193Z"
         },
         "value": {
           "id": "history/1f9c562965839d",
           "kind": "history",
           "revision": "7aec757a7ea95e665be08f6b45aed79a113b5231c006132146b2b5afcc4d505e",
-          "updated_at": "2026-10-04T22:32:52.694Z",
+          "updated_at": "2030-01-03T22:32:52.694Z",
           "event_type": "recorded-9f9d081cb274639",
-          "occurred_at": "2026-10-04T22:32:52.694Z",
+          "occurred_at": "2030-01-03T22:32:52.694Z",
           "store_index": 50205,
           "summary": "Recorded gateway value",
           "targets": [
@@ -748,16 +748,16 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50431,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:51.193Z"
+          "created_at": "2030-01-03T22:40:51.193Z"
         },
         "value": {
           "id": "session/a516d6442dfe378d",
           "kind": "session",
-          "revision": "7018:2026-10-04T13:11:17.057Z",
-          "updated_at": "2026-10-04T22:40:25.874Z",
+          "revision": "7018:2030-01-03T13:11:17.057Z",
+          "updated_at": "2030-01-03T22:40:25.874Z",
           "owner_id": "agent/710581912fe4f12",
           "state": "running",
-          "started_at": "2026-10-04T13:11:17.089Z",
+          "started_at": "2030-01-03T13:11:17.089Z",
           "ended_at": null,
           "timeline_cursor": "recorded-c1b8d04f8a596554",
           "runtime_incarnation": "recorded-d63f6d11b644662"
@@ -774,7 +774,7 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50433,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:57.696Z"
+          "created_at": "2030-01-03T22:40:57.696Z"
         },
         "value": {
           "id": "glass/5a2ab6fd199587e7",
@@ -796,7 +796,7 @@
           "deleted": false,
           "base_revision": "43798cb1ce92175dd9d968fd770c2e7167f3594d125d3fc6876eaeea4eb20a9f",
           "replaced_revision": "43798cb1ce92175dd9d968fd770c2e7167f3594d125d3fc6876eaeea4eb20a9f",
-          "updated_at": "2026-10-03T14:30:25.866Z"
+          "updated_at": "2030-01-02T14:30:25.866Z"
         }
       }
     },
@@ -810,7 +810,7 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50433,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:57.696Z"
+          "created_at": "2030-01-03T22:40:57.696Z"
         },
         "value": {
           "kind": "page",
@@ -823,7 +823,7 @@
               "id": "device/21ef1f816c533e96",
               "kind": "device",
               "revision": "4958a0be1a694b8d53207da101c811f68438a80d5745f481c5416b58677cb3e6",
-              "updated_at": "2026-10-03T21:38:27.475Z",
+              "updated_at": "2030-01-02T21:38:27.475Z",
               "person_id": "person/d152066f67e1eb1f",
               "name": "Recorded gateway value",
               "session_actor": "person/e8c45d2cc74acc91",
@@ -843,7 +843,7 @@
                 "control.runtimes",
                 "control.pairing"
               ],
-              "expires_at": "2026-11-02T21:38:27.471Z"
+              "expires_at": "2030-02-01T21:38:27.471Z"
             }
           ],
           "page": {
@@ -863,7 +863,7 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50433,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:57.696Z"
+          "created_at": "2030-01-03T22:40:57.696Z"
         },
         "value": {
           "kind": "page",
@@ -874,13 +874,13 @@
               "host_id": "host/37eda7d15d948865",
               "name": "Recorded gateway value",
               "state": "local",
-              "fleet_id": "261abdf9-936a-4af5-84df-f62ea97af58c",
+              "fleet_id": "00000000-0000-4000-8000-00000000f1ee",
               "capacity": {
                 "state": "unknown",
                 "reason": "Recorded gateway value"
               },
               "occupancy": {
-                "running_runtimes": 16
+                "running_runtimes": 2
               },
               "projects": [],
               "work": [
@@ -914,19 +914,19 @@
               "id": "machine/bf7c7ed767b08e86",
               "kind": "machine",
               "revision": "machine:07521e71c748f15bbfda2134397b517c2ab6fc28fd595813f398d4ec456b40c7",
-              "updated_at": "2026-10-04T22:41:00.504Z"
+              "updated_at": "2030-01-03T22:41:00.504Z"
             },
             {
               "host_id": "host/ad8787c4cc9d991e",
               "name": "Recorded gateway value",
               "state": "reachable",
-              "fleet_id": "261abdf9-936a-4af5-84df-f62ea97af58c",
+              "fleet_id": "00000000-0000-4000-8000-00000000f1ee",
               "capacity": {
                 "state": "unknown",
                 "reason": "Recorded gateway value"
               },
               "occupancy": {
-                "running_runtimes": 79
+                "running_runtimes": 3
               },
               "projects": [],
               "work": [
@@ -936,7 +936,7 @@
                 {
                   "protocol": "replication",
                   "status": "up",
-                  "last_success_at": "2026-10-04T22:41:02.651Z"
+                  "last_success_at": "2030-01-03T22:41:02.651Z"
                 }
               ],
               "runtime_ids": [
@@ -1025,19 +1025,19 @@
               "id": "machine/743add6f155e634e",
               "kind": "machine",
               "revision": "machine:52f8d33a394e2fe3e39e55728d3a588cd7b300f92decfb61b5650f8b4e0f5eb7",
-              "updated_at": "2026-10-04T22:35:44.684Z"
+              "updated_at": "2030-01-03T22:35:44.684Z"
             },
             {
               "host_id": "host/5204a206c2f886ce",
               "name": "Recorded gateway value",
               "state": "last-seen",
-              "fleet_id": "261abdf9-936a-4af5-84df-f62ea97af58c",
+              "fleet_id": "00000000-0000-4000-8000-00000000f1ee",
               "capacity": {
                 "state": "unknown",
                 "reason": "Recorded gateway value"
               },
               "occupancy": {
-                "running_runtimes": 2
+                "running_runtimes": 1
               },
               "projects": [],
               "work": [],
@@ -1045,7 +1045,7 @@
                 {
                   "protocol": "replication",
                   "status": "last-seen",
-                  "last_success_at": "2026-10-04T06:21:40.199Z"
+                  "last_success_at": "2030-01-03T06:21:40.199Z"
                 }
               ],
               "runtime_ids": [
@@ -1055,7 +1055,7 @@
               "id": "machine/70810221c14f821c",
               "kind": "machine",
               "revision": "machine:d84e766c95c23704f015eda8a4ac71e04595de70047faff8907eab093b7d1eba",
-              "updated_at": "2026-10-03T13:54:21.458Z"
+              "updated_at": "2030-01-02T13:54:21.458Z"
             }
           ],
           "page": {
@@ -1075,7 +1075,7 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50433,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:57.696Z"
+          "created_at": "2030-01-03T22:40:57.696Z"
         },
         "value": {
           "kind": "agent-queue",
@@ -1177,7 +1177,7 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50202,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:32:00.548Z"
+          "created_at": "2030-01-03T22:32:00.548Z"
         },
         "value": {
           "kind": "page",
@@ -1202,7 +1202,7 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50202,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:32:00.548Z"
+          "created_at": "2030-01-03T22:32:00.548Z"
         },
         "value": {
           "kind": "page",
@@ -1227,7 +1227,7 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50202,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:32:00.548Z"
+          "created_at": "2030-01-03T22:32:00.548Z"
         },
         "value": {
           "kind": "page",
@@ -1252,7 +1252,7 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 51375,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T23:22:34.130Z"
+          "created_at": "2030-01-03T23:22:34.130Z"
         },
         "value": {
           "kind": "page",
@@ -1269,7 +1269,7 @@
                 "path": "Recorded resource fact",
                 "status": "Recorded resource fact"
               },
-              "observed_at": "2026-10-03T11:12:43.088Z",
+              "observed_at": "2030-01-02T11:12:43.088Z",
               "opened_by": null,
               "opened_by_run": null
             }
@@ -1291,13 +1291,13 @@
           "host_id": "host/37eda7d15d948865",
           "store_index": 50413,
           "projection_version": "client-projection.v0",
-          "created_at": "2026-10-04T22:40:25.021Z"
+          "created_at": "2030-01-03T22:40:25.021Z"
         },
         "value": {
           "id": "mission/a3bbc810d73c508e",
           "kind": "mission",
           "revision": "fe20339b3fb855c55ee79bb8876952e4448f554b9eb86d0aa4bbe34e3bc1feab",
-          "updated_at": "2026-10-04T22:05:17.459Z",
+          "updated_at": "2030-01-03T22:05:17.459Z",
           "title": "Recorded gateway value",
           "state": "running",
           "mission_revision": "recorded-11f00c677fff2372",
@@ -1322,11 +1322,11 @@
                   "assignee": null,
                   "claimant": null,
                   "state": "claimed",
-                  "since": "2026-10-04T22:05:18.176Z"
+                  "since": "2030-01-03T22:05:18.176Z"
                 }
               ],
               "must_act": "you",
-              "state_since": "2026-10-04T22:05:17.459Z",
+              "state_since": "2030-01-03T22:05:17.459Z",
               "outcome": null,
               "last_progress": null,
               "blocker": null,
@@ -1342,7 +1342,7 @@
                   "assignee": null,
                   "claimant": null,
                   "agentless": true,
-                  "since": "2026-10-04T22:05:18.176Z",
+                  "since": "2030-01-03T22:05:18.176Z",
                   "last_progress": null,
                   "blocked_reason": null,
                   "blockers": [],

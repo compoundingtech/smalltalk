@@ -24,7 +24,7 @@ const contract = <T>(
   fixture: Recording,
   select: (reads: SubjectReads) => SubjectReader<T>,
 ) => {
-  it(`${family}: decodes the recorded response or preserves its real refusal`, async () => {
+  it(`${family}: decodes the synthetic response or preserves its refusal`, async () => {
     let corrupt = false
     const client: ClientOptions = {
       baseUrl: 'http://recorded-gateway.invalid',
@@ -69,7 +69,7 @@ const contract = <T>(
   })
 }
 
-describe('recorded native gateway contracts', () => {
+describe('synthetic native gateway contracts', () => {
   contract('launch', recording.cases.launch, (reads) => reads.launch)
   contract('launch-variant', recording.cases.launchVariant, (reads) => reads.launchVariant)
   contract('launch-decision', recording.cases.launchDecision, (reads) => reads.launchDecision)
