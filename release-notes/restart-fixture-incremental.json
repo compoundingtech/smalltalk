@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Run live restart integration fixtures through the daemon incremental path",
+  "replay": {
+    "status": "none",
+    "detail": "Only test fixture scheduling and test-cause documentation change; no production replay impact."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Only test fixture scheduling and test-cause documentation change; no production schema impact."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Only test fixture scheduling and test-cause documentation change; no production rules impact."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only test fixture scheduling and test-cause documentation change; no production compatibility impact."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Only test fixture scheduling and test-cause documentation change; no production downtime impact."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Only test fixture scheduling and test-cause documentation change; no production manual impact."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Only test fixture scheduling and test-cause documentation change; no production recovery impact."
+  }
+}
