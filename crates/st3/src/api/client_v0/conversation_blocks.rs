@@ -1092,32 +1092,6 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_tool_output_http_chunks_return_complete_native_body_without_writes() {
-        // The real HTTP route uses the process-wide READ_SLOTS admission budget.
-        // A unique temp transcript already isolates LINE_FOLDS, but not those four
-        // permits. Run this multi-chunk proof in its own test process so its owner
-        // reads cannot consume permits from parallel read/chunk tests (or vice versa).
-        // Do not retry away rate-limit responses or change the production globals.
-        const ISOLATED: &str = "ST3_TEST_TRUNCATED_TOOL_OUTPUT_ISOLATED";
-        if std::env::var_os(ISOLATED).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "api::client_v0::conversation_blocks::tests::truncated_tool_output_http_chunks_return_complete_native_body_without_writes",
-                    "--test-threads=1",
-                    "--nocapture",
-                ])
-                .env(ISOLATED, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
-                "isolated tool-output chunk proof failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
         let root = tempfile::tempdir().unwrap();
         // More than two owner chunks, including UTF-8 split across byte boundaries.
         let output = format!("{}\nlast native output line", "é".repeat(CHUNK_BYTES + 37));
