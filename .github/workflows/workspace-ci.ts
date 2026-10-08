@@ -434,7 +434,7 @@ export const fractalWebJobs = {
       ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
       { name: 'Restore the pnpm store', id: 'pnpm-store', uses: 'actions/cache/restore@v4', with: fractalWebStoreCache },
       {
-        ...nixDevelopStep({ name: 'Run the fractal-web lanes', flake: '.#web', command: ['bash', 'scripts/ci-fractal-web'] }),
+        ...nixDevelopStep({ name: 'Run the fractal-web lanes and dependency license check', flake: '.#web', command: ['bash', 'scripts/ci-fractal-web'] }),
         env: pnpmStoreEnv,
       },
     ],
