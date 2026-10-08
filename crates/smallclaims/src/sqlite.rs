@@ -1368,6 +1368,79 @@ pub mod work {
         }
     }
 
+    /// Everything counted so far, in every connection of this process.
+    pub fn total() -> SqliteWork {
+        SqliteWork {
+            statements: STATEMENTS.load(Ordering::Relaxed),
+            vm_steps: VM_STEPS.load(Ordering::Relaxed),
+            fullscan_steps: FULLSCAN_STEPS.load(Ordering::Relaxed),
+            sorts: SORTS.load(Ordering::Relaxed),
+            autoindex_rows: AUTOINDEX_ROWS.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Count `connection`'s statements. SQLite reports each one when it starts and when it
+    /// finishes, also when a trigger or a foreign-key check did the work inside it.
+    pub(super) fn count(connection: &Connection) {
+        // SAFETY: the callback only reads the statement's counters, and the handle stays valid
+        // for the connection's life, which ends the registration with it.
+        unsafe {
+            ffi::sqlite3_trace_v2(
+                connection.handle(),
+                (ffi::SQLITE_TRACE_STMT | ffi::SQLITE_TRACE_PROFILE) as c_uint,
+                Some(traced),
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    const COUNTERS: [c_int; 4] = [
+        ffi::SQLITE_STMTSTATUS_VM_STEP,
+        ffi::SQLITE_STMTSTATUS_FULLSCAN_STEP,
+        ffi::SQLITE_STMTSTATUS_SORT,
+        ffi::SQLITE_STMTSTATUS_AUTOINDEX,
+    ];
+
+    /// Each running statement's counters when it started. A statement's counters add up over
+    /// its runs until someone resets them, and tests read them too, so this never resets them.
+    static STARTED: Mutex<BTreeMap<usize, [u64; 4]>> = Mutex::new(BTreeMap::new());
+
+    unsafe extern "C" fn traced(
+        event: c_uint,
+        _context: *mut c_void,
+        statement: *mut c_void,
+        _detail: *mut c_void,
+    ) -> c_int {
+        let key = statement as usize;
+        let statement = statement.cast::<ffi::sqlite3_stmt>();
+        // SAFETY: SQLite passes the statement that started or finished.
+        let read = |counter: c_int| unsafe { ffi::sqlite3_stmt_status(statement, counter, 0) };
+        let now = COUNTERS.map(|counter| u64::try_from(read(counter)).unwrap_or(0));
+        let mut started = STARTED.lock().unwrap_or_else(PoisonError::into_inner);
+        if event == ffi::SQLITE_TRACE_STMT as c_uint {
+            // A trigger's start reports the statement again; the first start counts.
+            started.entry(key).or_insert(now);
+            return 0;
+        }
+        let before = started.remove(&key).unwrap_or([0; 4]);
+        let spent = |index: usize| now[index].saturating_sub(before[index]);
+        STATEMENTS.fetch_add(1, Ordering::Relaxed);
+        VM_STEPS.fetch_add(spent(0), Ordering::Relaxed);
+        FULLSCAN_STEPS.fetch_add(spent(1), Ordering::Relaxed);
+        SORTS.fetch_add(spent(2), Ordering::Relaxed);
+        AUTOINDEX_ROWS.fetch_add(spent(3), Ordering::Relaxed);
+        THREAD_WORK.with(|total| {
+            let mut next = total.get();
+            next.statements = next.statements.saturating_add(1);
+            next.vm_steps = next.vm_steps.saturating_add(spent(0));
+            next.fullscan_steps = next.fullscan_steps.saturating_add(spent(1));
+            next.sorts = next.sorts.saturating_add(spent(2));
+            next.autoindex_rows = next.autoindex_rows.saturating_add(spent(3));
+            total.set(next);
+        });
+        0
+    }
+
     #[cfg(test)]
     mod scope_tests {
         use super::*;
@@ -1444,78 +1517,6 @@ pub mod work {
         }
     }
 
-    /// Everything counted so far, in every connection of this process.
-    pub fn total() -> SqliteWork {
-        SqliteWork {
-            statements: STATEMENTS.load(Ordering::Relaxed),
-            vm_steps: VM_STEPS.load(Ordering::Relaxed),
-            fullscan_steps: FULLSCAN_STEPS.load(Ordering::Relaxed),
-            sorts: SORTS.load(Ordering::Relaxed),
-            autoindex_rows: AUTOINDEX_ROWS.load(Ordering::Relaxed),
-        }
-    }
-
-    /// Count `connection`'s statements. SQLite reports each one when it starts and when it
-    /// finishes, also when a trigger or a foreign-key check did the work inside it.
-    pub(super) fn count(connection: &Connection) {
-        // SAFETY: the callback only reads the statement's counters, and the handle stays valid
-        // for the connection's life, which ends the registration with it.
-        unsafe {
-            ffi::sqlite3_trace_v2(
-                connection.handle(),
-                (ffi::SQLITE_TRACE_STMT | ffi::SQLITE_TRACE_PROFILE) as c_uint,
-                Some(traced),
-                std::ptr::null_mut(),
-            );
-        }
-    }
-
-    const COUNTERS: [c_int; 4] = [
-        ffi::SQLITE_STMTSTATUS_VM_STEP,
-        ffi::SQLITE_STMTSTATUS_FULLSCAN_STEP,
-        ffi::SQLITE_STMTSTATUS_SORT,
-        ffi::SQLITE_STMTSTATUS_AUTOINDEX,
-    ];
-
-    /// Each running statement's counters when it started. A statement's counters add up over
-    /// its runs until someone resets them, and tests read them too, so this never resets them.
-    static STARTED: Mutex<BTreeMap<usize, [u64; 4]>> = Mutex::new(BTreeMap::new());
-
-    unsafe extern "C" fn traced(
-        event: c_uint,
-        _context: *mut c_void,
-        statement: *mut c_void,
-        _detail: *mut c_void,
-    ) -> c_int {
-        let key = statement as usize;
-        let statement = statement.cast::<ffi::sqlite3_stmt>();
-        // SAFETY: SQLite passes the statement that started or finished.
-        let read = |counter: c_int| unsafe { ffi::sqlite3_stmt_status(statement, counter, 0) };
-        let now = COUNTERS.map(|counter| u64::try_from(read(counter)).unwrap_or(0));
-        let mut started = STARTED.lock().unwrap_or_else(PoisonError::into_inner);
-        if event == ffi::SQLITE_TRACE_STMT as c_uint {
-            // A trigger's start reports the statement again; the first start counts.
-            started.entry(key).or_insert(now);
-            return 0;
-        }
-        let before = started.remove(&key).unwrap_or([0; 4]);
-        let spent = |index: usize| now[index].saturating_sub(before[index]);
-        STATEMENTS.fetch_add(1, Ordering::Relaxed);
-        VM_STEPS.fetch_add(spent(0), Ordering::Relaxed);
-        FULLSCAN_STEPS.fetch_add(spent(1), Ordering::Relaxed);
-        SORTS.fetch_add(spent(2), Ordering::Relaxed);
-        AUTOINDEX_ROWS.fetch_add(spent(3), Ordering::Relaxed);
-        THREAD_WORK.with(|total| {
-            let mut next = total.get();
-            next.statements = next.statements.saturating_add(1);
-            next.vm_steps = next.vm_steps.saturating_add(spent(0));
-            next.fullscan_steps = next.fullscan_steps.saturating_add(spent(1));
-            next.sorts = next.sorts.saturating_add(spent(2));
-            next.autoindex_rows = next.autoindex_rows.saturating_add(spent(3));
-            total.set(next);
-        });
-        0
-    }
 }
 
 pub fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connection> {
