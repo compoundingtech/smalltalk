@@ -409,8 +409,9 @@ impl PtyRuntime {
             if let Some(environment) = &self.command_environment {
                 command.env_clear().envs(environment);
             }
-            command.env("PTY_ROOT", &self.root);
             command.envs(&terminal_env);
+            // The launcher registry is runtime-owned, even when the seat names PTY_ROOT.
+            command.env("PTY_ROOT", &self.root);
             let output = match output_within(command, self.command_timeout) {
                 Ok(output) => output,
                 Err(error) => {
@@ -1523,6 +1524,50 @@ exit 0
         // The launcher still resolved the name from its inherited environment.
         let inherited = fs::read_to_string(binary.with_extension("env")).unwrap();
         assert!(inherited.contains(&format!("SEAT_TOKEN={SECRET}")));
+    }
+
+    #[test]
+    fn spawn_keeps_the_runtime_registry_when_the_seat_declares_pty_root() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        let declared = root.path().join("seat-registry");
+        let binary = fake_pty(
+            root.path(),
+            "fake-pty-root",
+            "  printenv > \"$0.env\"\n  publish new",
+        );
+        let environment: BTreeMap<String, String> = BTreeMap::from([
+            ("PTY_ROOT".into(), declared.to_string_lossy().into_owned()),
+            ("ST_AGENT".into(), "synthetic-agent".into()),
+            ("ST3_BIN".into(), "/synthetic/runtime-bin".into()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("ST3_ROLLOUT_OPERATION".into(), "synthetic-operation".into()),
+            ("ST3_ROLLOUT_PREDECESSOR".into(), "synthetic-predecessor".into()),
+            ("TERM".into(), "screen-256color".into()),
+        ]);
+        // The resolved member overlay must still beat the CLI's own environment.
+        let ambient = environment
+            .keys()
+            .map(|key| (key.clone(), "synthetic-ambient-conflict".into()))
+            .collect();
+        let runtime = PtyRuntime::new(registry.clone())
+            .with_binary(binary.to_string_lossy())
+            .with_environment(ambient);
+        spawn_work(&runtime, root.path(), &environment).unwrap();
+        assert!(registry.join("work.json").exists());
+        assert!(!declared.exists());
+        let inherited = fs::read_to_string(binary.with_extension("env")).unwrap();
+        assert!(
+            inherited
+                .lines()
+                .any(|line| line == format!("PTY_ROOT={}", registry.display()))
+        );
+        for (key, value) in environment.iter().filter(|(key, _)| key.as_str() != "PTY_ROOT") {
+            assert!(inherited.lines().any(|line| line == format!("{key}={value}")));
+        }
+        let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
+        assert!(env_flag_names(&arguments).contains(&"PTY_ROOT"));
+        assert!(!arguments.contains(declared.to_str().unwrap()));
     }
 
     #[test]

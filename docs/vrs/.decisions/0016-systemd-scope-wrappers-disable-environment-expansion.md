@@ -47,14 +47,11 @@ st2-maintained encoding and would no longer be opaque launch argv.
 Linux scope launches use this exact outer argument order:
 
 ```text
-systemd-run --user --scope --collect --quiet --unit=<unit> --description=<unit> --expand-environment=no -- <program> <arg>...
+systemd-run --user --scope --collect --quiet --unit=<unit> --expand-environment=no -- <program> <arg>...
 ```
 
 `--expand-environment=no` is passed as a `systemd-run` option before the `--`
-separator. `--description=` pins the unit description to the unit name:
-without it the manager records the complete command line as the description,
-and a description must never be a place a launch environment value can reach.
-st2 appends the program and each argument after the separator as the
+separator. st2 appends the program and each argument after the separator as the
 original OS strings. It does not quote, escape, expand, or render those values
 through a shell. Detached and degraded-detached modes remain direct
 pass-throughs.
@@ -63,10 +60,35 @@ pass-throughs.
 
 - Dollar-bearing literals, including `$HOME`, `${UNSET}`, and `$$`, reach PTY
   and exec tasks byte-for-byte in scope mode.
-- The systemd option sequence is part of the tested wrapper contract; its only
-  additions to the prior shape are the expansion-disable option and the fixed
-  description, both before the separator.
+- The systemd option sequence is part of the tested wrapper contract; the only
+  addition to the prior shape is the expansion-disable option before the
+  separator.
 - macOS and Linux hosts without usable user scopes keep the existing direct
   program-and-argv path.
 - Scope lifetime and I/O behavior are unchanged. The supporting live evidence
   is recorded in the [systemd scope argv experiment](../.experiments/2026-09-05-systemd-scope-argv-transparency.md).
+
+## Amendment 1 — 2026-10-08
+
+Launch environment values were passed on process command lines, where service
+managers and process listings can record them. The launchers now export the
+resolved environment to the PTY process and pass only `--env NAME`. PTY resolves
+each name from that inherited environment and persists the resolved overlay
+for restart. The runtime-selected `PTY_ROOT` wins over a seat declaration;
+the other resolved environment precedence remains unchanged.
+
+Both scope wrappers also pin the description to the unit name instead of
+systemd's default full command line. The amended outer argument order is:
+
+```text
+systemd-run --user --scope --collect --quiet --unit=<unit> --description=<unit> --expand-environment=no -- <program> <arg>...
+```
+
+This removes environment values from generated environment arguments and unit
+descriptions, not from explicitly authored argv or tag expansions. Seat-declared
+environment values stored in replicated graph claims remain a known exposure
+outside this amendment's fix.
+
+Evidence: launcher environment/argv regression tests, runtime-selected registry
+precedence with a seat-declared `PTY_ROOT`, and fixed-description wrapper tests.
+R42's ratified requirements text is unchanged.
