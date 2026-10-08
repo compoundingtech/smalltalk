@@ -876,10 +876,12 @@ if __name__ == "__main__":
     if "ST3_MESSAGING_ROOT" not in os.environ:
         # Use a dedicated guardian even inside a supervised Rust test: its roots
         # must be removed after this controller dies, before the Rust test ends.
+        # Keep PTY sockets under a short root: CI's TMPDIR can exceed their kernel
+        # path limit. Large executable copies still use the separate scratch root.
         scratch_parent = args.scratch if args.scratch != args.out.resolve() else args.out.resolve().parent
         scratch_parent.mkdir(parents=True, exist_ok=True)
         raise SystemExit(run_supervised([sys.executable, *sys.orig_argv[1:]],
-            temporary_roots=[("ST3_MESSAGING_ROOT", "mfe-owner-", tempfile.gettempdir()),
+            temporary_roots=[("ST3_MESSAGING_ROOT", "mfe-owner-", "/tmp"),
                              ("ST3_MESSAGING_SCRATCH", "mfi-owner-", str(scratch_parent))],
             keep=args.keep))
     args.scratch = Path(os.environ["ST3_MESSAGING_SCRATCH"])
