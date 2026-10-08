@@ -2974,7 +2974,7 @@ impl Store {
             Some(previous) if self.agent_page_refs_unchanged(previous.index, index, &previous.items)? => {
                 (previous.items, previous.valid_until_unix_ms)
             }
-            _ => (Arc::new(build()?), self.agent_queue_valid_until(now)?),
+            _ => (Arc::new(build()?), self.agent_queue_valid_until(now, None)?),
         };
         let mut cache = self.smalltalk.agent_page_refs_cache.lock()
             .expect("agent page refs cache poisoned");
