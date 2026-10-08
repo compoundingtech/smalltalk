@@ -21600,7 +21600,7 @@ fn unix_minute() -> Result<u64> {
 /// Seconds into each minute at which this seat renews its work leases, 0 to 49, fixed per seat.
 /// Every driver once renewed the moment the minute changed, so every running seat reached the
 /// daemon's single writer in the same second and the renewals queued behind one another there
-/// (about 45 of them, 2 to 70 ms each, an average wait of 800 ms and a tail of 2 s on hetz). A
+/// (about 45 of them, 2 to 70 ms each, an average wait of 800 ms and a tail of 2 s on the production host). A
 /// lease lasts ten minutes and is renewed every minute, so an offset inside the minute costs it
 /// nothing.
 fn renewal_offset_secs(subject: &str) -> u64 {
@@ -24261,7 +24261,7 @@ mod tests {
 
     #[test]
     fn seats_renew_once_a_minute_each_at_its_own_second_not_all_on_the_minute_boundary() {
-        let seats: Vec<String> = (0..120).map(|n| format!("agent/fleet/example/seat-{n}")).collect();
+        let seats: Vec<String> = (0..120).map(|n| format!("agent/example/seat-{n}")).collect();
         let mut renewals_per_second = [0usize; 60];
         for seat in &seats {
             let offset = renewal_offset_secs(seat);
