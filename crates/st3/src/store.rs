@@ -1028,7 +1028,7 @@ fn subject_status_at_with_mode(
             let claims = if desired.is_some() {
                 Vec::new()
             } else {
-                connection.prepare_cached(&canonical_sql(
+                connection.prepare_cached(&current_canonical_sql(
                     "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2
                      ORDER BY CANONICAL_DESC(claims) LIMIT 1",
                 ))?.query_row(params![subject, at_index.unwrap_or(i64::MAX as u64)], |row| row.get::<_, String>(0))
@@ -10438,9 +10438,18 @@ impl Store {
         let index = selected_index(current_index(&connection)?, Some(index)).map_err(anyhow::Error::new)?;
         let names = match names {
             Some(names) => names.clone(),
-            None => connection.prepare_cached(RANGE_SUBJECTS)?
-                .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<BTreeSet<_>>>()?,
+            None => {
+                let mut subjects = connection.prepare_cached(RANGE_SUBJECTS)?
+                    .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+                // Registers have no graph claim: preserve the full status reader's discovery
+                // of undeclared seats whose only evidence is their current observation.
+                subjects.extend(connection.prepare_cached(
+                    "SELECT subject FROM latest_values WHERE subject>=?1 AND subject<?2",
+                )?.query_map(["agent/", "agent0"], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?);
+                subjects
+            },
         };
         let names = if history { names } else {
             self.current_view_candidates(&connection, names, index, true)?

@@ -1560,6 +1560,9 @@ Activity uses the observed-harness reducer (not work-progress inference), includ
 authentication, trust, update, and channel diagnostic fences and read-time 90-second
 freshness check. Header-only changes and empty-header retractions are also forwarded on
 the conversation collection socket.
+Agent-card discovery also includes undeclared seats observed only through a current
+register in history. Sparse activity after an ended or indeterminate observation does
+not revive its former permission ask; a new explicit permission observation may block again.
 Todo phases map `name`/`tasks` to the header's `phase`/`items`; the existing todo projection's
 session/incarnation `stale` fence prevents an old binding from overriding transcript data.
 Each field retains its source observation time (falling back to acceptance time), with

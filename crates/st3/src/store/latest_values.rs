@@ -356,6 +356,15 @@ pub(super) fn append(
                     "input_buffer",
                     "exit",
                 ] {
+                    // The graph reducer clears these axes at ended/indeterminate edges.
+                    // A sparse successor of such a register must not revive the prior ask.
+                    if matches!(old["fields"]["state"].as_str(), Some("ended" | "indeterminate"))
+                        && matches!(name, "blocked_on" | "ask")
+                        && !input.fields.contains_key(name)
+                    {
+                        input.fields.insert(name.into(), Value::Null);
+                        continue;
+                    }
                     if (!input.fields.contains_key(name)
                         || (name == "provider_auth" && input.fields[name].is_null()))
                         && let Some(value) = old["fields"].get(name)
@@ -806,6 +815,25 @@ mod tests {
             evidence: vec![],
             expected_subject: None,
             idempotency_key: None,
+        }
+    }
+
+    #[test]
+    fn sparse_activity_after_terminal_or_indeterminate_does_not_revive_permission() {
+        for edge in ["ended", "indeterminate"] {
+            let store = Store::open_memory("owner").unwrap();
+            let mut permission = state("working", "one", 10);
+            permission.fields.insert("blocked_on".into(), json!("human"));
+            permission.fields.insert("ask".into(), json!("permission"));
+            store.append_claim(&permission).unwrap();
+            store.append_claim(&state(edge, "one", 20)).unwrap();
+            let successor = store.append_claim(&state("working", "one", 30)).unwrap();
+            assert!(successor.body["fields"]["blocked_on"].is_null(), "{edge}");
+            assert!(successor.body["fields"]["ask"].is_null(), "{edge}");
+            permission.fields.insert("observed_at_ms".into(), json!(40));
+            let fresh = store.append_claim(&permission).unwrap();
+            assert_eq!(fresh.body["fields"]["blocked_on"], "human");
+            assert_eq!(fresh.body["fields"]["ask"], "permission");
         }
     }
 
