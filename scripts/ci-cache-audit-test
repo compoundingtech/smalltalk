@@ -65,6 +65,85 @@ for ref, event in [('refs/pull/1/merge', 'pull_request'), ('refs/heads/example',
 # Generated jobs must have a reporter or an existing custom cache proof. This catches
 # new jobs/workflows which accidentally bypass the policy wrapper without a YAML dependency.
 import re
+# Execute the generated reporter exactly as Actions does, including its failure paths.
+fleet = (root / '.github/workflows/fleet.yml').read_text()
+reporters = re.findall(r'(?ms)^      - name: Report job cache coverage\n(.*?)(?=^      - |^  [A-Za-z]|\Z)', fleet)
+commands = []
+for reporter in reporters:
+    run = re.search(r'(?m)^        run: \|[-+]?\n((?:          .*\n|\n)+)', reporter)
+    if run:
+        commands.append(''.join(line[10:] for line in run[1].splitlines(keepends=True)))
+assert commands and len(set(commands)) == 1, 'generated cache reporters must share one shell guard'
+command = commands[0]
+with tempfile.TemporaryDirectory() as tmp:
+    directory = Path(tmp)
+    summary = directory / 'summary'
+    env = dict(os.environ, GITHUB_STEP_SUMMARY=str(summary),
+               CACHE_ENTRIES=json.dumps([dict(name='Cargo', outcome='skipped', hit='')]))
+    for key in ('CI_CACHE_AUDIT_SCRIPT', 'CI_LOCAL_CACHES', 'CI_BUILD_SNAPSHOT_HIT'):
+        env.pop(key, None)
+    def report(outcome, script=None):
+        summary.write_text('')
+        current = dict(env, CI_CACHE_CHECKOUT_OUTCOME=outcome)
+        if script is not None:
+            current['CI_CACHE_AUDIT_SCRIPT'] = str(script)
+        return subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', command],
+                              cwd=directory, env=current, capture_output=True, text=True)
+    for outcome in ('skipped', 'failure', ''):
+        result = report(outcome)
+        assert result.returncode == 0, result.stderr
+        assert 'UNAVAILABLE (checkout/setup incomplete)' in summary.read_text()
+        assert '**HIT**' not in summary.read_text() and '::warning::P0:' not in result.stdout
+    assert report('success').returncode != 0, 'missing script after checkout must fail'
+    failed = directory / 'failed-audit.py'
+    failed.write_text('raise SystemExit(7)\n')
+    assert report('success', failed).returncode == 7, 'ordinary audit failures must propagate'
+    real_script = root / 'scripts/ci-cache-audit'
+    result = report('success', real_script)
+    assert result.returncode == 0 and '| Cargo | SKIPPED (step condition) |' in summary.read_text()
+    result = report('skipped', real_script)
+    assert result.returncode == 0 and '| Cargo | SKIPPED (step condition) |' in summary.read_text(), 'copied audit tools remain usable without checkout'
+    env['CACHE_ENTRIES'] = json.dumps([dict(name='Cargo', outcome='success', hit='false')])
+    result = report('success', real_script)
+    assert result.returncode == 0 and '| Cargo | MISS |' in summary.read_text()
+    assert '::warning::P0:' in result.stdout, 'a genuine miss must remain visible'
+
+# The noncancelled snapshot finalizer also runs after the producer blocks checkout.
+snapshot_steps = re.findall(r'(?ms)^      - id: build-snapshot-save\n(.*?)(?=^      - |^  [A-Za-z]|\Z)', fleet)
+snapshot_commands = []
+for step in snapshot_steps:
+    assert 'if: "!cancelled()"' in step and 'CI_CACHE_CHECKOUT_OUTCOME:' in step
+    run = re.search(r'(?m)^        run: \|[-+]?\n((?:          .*\n|\n)+)', step)
+    assert run, 'snapshot finalizers must guard unavailable setup'
+    snapshot_commands.append(''.join(line[10:] for line in run[1].splitlines(keepends=True)))
+assert snapshot_commands and len(set(snapshot_commands)) == 1
+with tempfile.TemporaryDirectory() as tmp:
+    directory = Path(tmp)
+    summary, output = directory / 'summary', directory / 'output'
+    def pack(outcome, script=None):
+        summary.write_text(''); output.write_text('')
+        current = dict(os.environ, CI_CACHE_CHECKOUT_OUTCOME=outcome,
+                       GITHUB_STEP_SUMMARY=str(summary), GITHUB_OUTPUT=str(output))
+        current.pop('CI_BUILD_SNAPSHOT_SCRIPT', None)
+        if script is not None:
+            current['CI_BUILD_SNAPSHOT_SCRIPT'] = str(script)
+        return subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', snapshot_commands[0]],
+                              cwd=directory, env=current, capture_output=True, text=True)
+    for outcome in ('skipped', 'failure', ''):
+        result = pack(outcome)
+        assert result.returncode == 0 and output.read_text() == 'publish=false\n'
+        assert 'no snapshot was created' in summary.read_text()
+        assert not (directory / 'build.tar.zst').exists()
+    assert pack('success').returncode != 0, 'missing pack helper after checkout must fail'
+    failed = directory / 'failed-pack.py'
+    failed.write_text('raise SystemExit(7)\n')
+    assert pack('success', failed).returncode == 7, 'available pack helper failures propagate'
+    copied = directory / 'copied-pack.py'
+    copied.write_text('import sys\nassert sys.argv[1:] == ["pack"]\nprint("copied helper invoked")\n')
+    result = pack('skipped', copied)
+    assert result.returncode == 0 and 'copied helper invoked' in result.stdout
+    assert 'publish=false' not in output.read_text(), 'available helper owns publication decision'
+
 count = 0
 dependency_restores = 0
 main_dependency_saves = 0
@@ -82,7 +161,19 @@ for workflow in sorted((root / '.github/workflows').glob('*.yml')):
         else:
             assert 'name: Report job cache coverage' in block, workflow
             assert 'if: always()' in block, workflow
+        if 'Require the shared test producer to succeed' in block:
+            assert block.index('Require the shared test producer to succeed') < block.index('uses: actions/checkout@')
+            assert 'CI_CACHE_CHECKOUT_OUTCOME: ${{ steps.cache-audit-checkout-' in block
+            guard = re.search(r"(?m)^        run: '([^\n]+)'$", block)
+            assert guard and 'PRODUCER_RESULT' in guard[1]
+            result = subprocess.run(['bash', '-e', '-c', guard[1].replace("''", "'")],
+                                    env=dict(os.environ, PRODUCER_RESULT='failure'), capture_output=True)
+            assert result.returncode == 1, 'primary producer failure must remain a failing step'
         for step in re.split(r'(?m)^      - ', block):
+            if step.startswith('id: build-snapshot-save\n'):
+                assert 'CI_CACHE_CHECKOUT_OUTCOME:' in step, 'snapshot finalizers must bind checkout outcome'
+            if step.startswith('id: build-snapshot-upload\n'):
+                assert "steps.build-snapshot-save.outputs.publish == 'true'" in step, 'unavailable setup must never upload a snapshot'
             if re.search(r'(?m)^        id: (cargo|nix)-cache$', step):
                 dependency_restores += 1
                 assert 'uses: actions/cache/restore@v4' in step, 'PR/queue dependency archives must not auto-save branch copies'

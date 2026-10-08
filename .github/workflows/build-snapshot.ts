@@ -11,8 +11,16 @@ export const buildSnapshotPrepare = {
 export const buildSnapshotSave = [
   {
     id: 'build-snapshot-save', name: 'Keep valid same-source build outputs', if: '!cancelled()',
+    shell: 'bash',
     env: { CI_SNAPSHOT_PIPELINE: '${{ github.workflow_sha }}' },
-    run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack',
+    run: `snapshot_script="\${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}"
+if [ ! -f "$snapshot_script" ] && [ "$CI_CACHE_CHECKOUT_OUTCOME" != success ]; then
+  printf '%s\\n' 'Build snapshot: **UNAVAILABLE (checkout/setup incomplete)** — no snapshot was created.' >> "$GITHUB_STEP_SUMMARY"
+  echo '::notice::Build snapshot unavailable: checkout/setup did not provide the pack helper'
+  echo 'publish=false' >> "$GITHUB_OUTPUT"
+  exit 0
+fi
+python3 "$snapshot_script" pack`,
   },
   {
     id: 'build-snapshot-upload',

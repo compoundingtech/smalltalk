@@ -81,6 +81,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+        id: cache-audit-checkout-0
       - uses: dtolnay/rust-toolchain@stable
       - name: Name the pinned compiler cache
         run: printf 'CI_ZIG_CACHE_DIR=%s/zig/0.15.2\n' "$RUNNER_TOOL_CACHE" >> "$GITHUB_ENV"
@@ -122,9 +123,19 @@ jobs:
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
         if: "!cancelled()"
+        shell: bash
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
-        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
+          CI_CACHE_CHECKOUT_OUTCOME: ${{ steps.cache-audit-checkout-0.outcome }}
+        run: |
+          snapshot_script="${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}"
+          if [ ! -f "$snapshot_script" ] && [ "$CI_CACHE_CHECKOUT_OUTCOME" != success ]; then
+            printf '%s\n' 'Build snapshot: **UNAVAILABLE (checkout/setup incomplete)** — no snapshot was created.' >> "$GITHUB_STEP_SUMMARY"
+            echo '::notice::Build snapshot unavailable: checkout/setup did not provide the pack helper'
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 "$snapshot_script" pack
       - id: build-snapshot-upload
         name: Retain the same-source build snapshot
         if: "!cancelled() && steps.build-snapshot-save.outputs.publish == 'true'"
@@ -165,7 +176,15 @@ jobs:
         shell: bash
         env:
           CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Cargo release","outcome":"${{ steps.cache-4.outcome }}","hit":"${{ steps.cache-4.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the pinned Zig compiler","outcome":"${{ steps.cache-5.outcome }}","hit":"${{ steps.cache-5.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
-        run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
+          CI_CACHE_CHECKOUT_OUTCOME: ${{ steps.cache-audit-checkout-0.outcome }}
+        run: |
+          audit_script="${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"
+          if [ ! -f "$audit_script" ] && [ "$CI_CACHE_CHECKOUT_OUTCOME" != success ]; then
+            printf '%s\n' 'Cache coverage: **UNAVAILABLE (checkout/setup incomplete)** — audit script is absent; no cache hit/miss verdict.' >> "$GITHUB_STEP_SUMMARY"
+            echo '::notice::Cache coverage unavailable: checkout/setup did not provide the audit script'
+            exit 0
+          fi
+          python3 "$audit_script"
   assemble:
     name: release-assemble
     needs: [build, installer]
