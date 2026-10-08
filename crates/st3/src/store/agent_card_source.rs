@@ -45,12 +45,16 @@ pub(crate) struct Kernel {
 /// must spend the remainder in the same transaction; rollback discards all derived changes.
 #[derive(Debug)]
 pub(crate) struct Applied {
+    #[cfg(test)]
     pub namespace: Namespace,
     pub changed: bool,
+    #[cfg(test)]
     pub used: usize,
+    #[cfg(test)]
     pub clock: Option<CapturedWorkClock>,
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CapturedWorkClock {
     pub revision: u64,
@@ -1220,11 +1224,12 @@ impl Kernel {
             [ns.as_str()],
             |r| r.get(0),
         )?;
-        let (changed, used) = if ready && !captured_clock {
+        let (changed, _used) = if ready && !captured_clock {
             (false, 0)
         } else {
             self.maintain(tx, ns)?
         };
+        #[cfg(test)]
         let clock = if captured_clock {
             let (revision, at, snapshot_index): (u64, String, u64) = tx.query_row(
                 "SELECT revision,at,snapshot_index FROM local_agent_card_source_clock WHERE namespace=?1",
@@ -1240,9 +1245,12 @@ impl Kernel {
             None
         };
         Ok(Applied {
+            #[cfg(test)]
             namespace: ns.clone(),
             changed,
-            used,
+            #[cfg(test)]
+            used: _used,
+            #[cfg(test)]
             clock,
         })
     }

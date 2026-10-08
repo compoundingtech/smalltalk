@@ -6,6 +6,7 @@
 use super::*;
 use smallclaims::ivm::install::Namespace;
 
+#[cfg(test)]
 pub(crate) const FINGERPRINT: &str = "agent-authority.v2;namespace.v1;captured-parent-identity.v1;actual-patch.v1;schema-reset.v1;canonical-rank.v1;live-runtime-ancestry.v1;bounds128-256.v1";
 
 // Namespace is an opaque Installer context. Escape its value as a SQL literal; all

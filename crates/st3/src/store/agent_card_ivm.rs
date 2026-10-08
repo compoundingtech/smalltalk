@@ -205,6 +205,7 @@ fn window(
 
 /// Generation is checked even when no key invalidation reached this socket.
 /// Return None for a removed row; the caller must refresh its ranked window.
+#[cfg(test)]
 pub(crate) fn row(
     connection: &Connection,
     namespace: &Namespace,

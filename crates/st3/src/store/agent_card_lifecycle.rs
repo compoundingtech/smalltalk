@@ -10,7 +10,9 @@ use crate::suspension::Suspension;
 use serde::{Deserialize, Serialize};
 use smallclaims::ivm::install::Namespace;
 
+#[cfg(test)]
 pub(crate) const FINGERPRINT: &str = "agent-lifecycle.v1;namespace.v1;live-placement.v1;ordered-presentation-lineage.v1;active-operation-selection.v1;bounds256-v1";
+
 const BOUND: usize = 256;
 fn sql(ns: &Namespace, query: &str) -> String {
     query.replace("@NS@", &format!("'{}'", ns.as_str().replace('\'', "''")))

@@ -13,8 +13,7 @@ use anyhow::ensure;
 use serde::Deserialize;
 use smallclaims::ivm::install::Namespace;
 
-/// Include this dependency/exhaustion contract in the owning operator/source fingerprints.
-pub(super) const FINGERPRINT: &str = "owned-membership.v2;relevant-domain;receipt-sequence-revision-claim;canonical-stops;repair-eligibility;historical-counted-dependencies;members128;sets64;lineage64;claim256k;claims100k;captured64m";
+// Include these dependency/exhaustion limits in the owning operator/source fingerprints.
 
 const MAX_MEMBERS: usize = 128;
 const MAX_SETS: usize = 64;

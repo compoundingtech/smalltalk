@@ -391,16 +391,6 @@ fn annotation(
     })
 }
 
-pub(super) fn projection(
-    connection: &Connection,
-    namespace: &Namespace,
-    agent: &str,
-    desired: Option<&DesiredSubject>,
-    actual: Option<&Value>,
-) -> Result<OperationalAnnotation> {
-    annotation(connection, namespace.as_str(), agent, desired, actual)
-}
-
 pub(super) fn clean(connection: &Connection, namespace: &Namespace) -> Result<bool> {
     Ok(!connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM local_agent_card_owner_dirty WHERE namespace=?1)",

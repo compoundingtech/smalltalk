@@ -6,7 +6,9 @@ use super::*;
 use crate::model::MemberSpec;
 use smallclaims::ivm::install::Namespace;
 
+#[cfg(test)]
 pub(crate) const FINGERPRINT: &str = "agent-launch.v1;namespace.v1;claim-log-order.v1;stable-physical-ties.v1;live-token-member.v1;bounds128.v1";
+
 const BOUND: usize = 128;
 fn sql(ns: &Namespace, q: &str) -> String {
     q.replace("@NS@", &format!("'{}'", ns.as_str().replace('\'', "''")))

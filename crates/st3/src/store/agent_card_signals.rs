@@ -188,22 +188,6 @@ fn local(
     Ok(agents)
 }
 
-pub(super) fn activity(
-    connection: &Connection,
-    namespace: &Namespace,
-    agent: &str,
-    incarnation: Option<&str>,
-    projected: u64,
-) -> Result<Option<u128>> {
-    read_activity(
-        connection,
-        namespace.as_str(),
-        agent,
-        incarnation,
-        projected,
-    )
-}
-
 pub(super) fn set_captured_cut(
     tx: &Transaction<'_>,
     ns: &Namespace,
@@ -222,7 +206,7 @@ pub(super) fn repair_local_cut(
     Ok(())
 }
 /// Current-state namespace head, only after the owner's indexed local cut repair closes.
-/// Historical readers retain `activity`'s explicit filter; this current head never serves them.
+/// Historical oracle tests retain an explicit cut filter; this head serves current state only.
 pub(super) fn current_activity(
     c: &Connection,
     ns: &Namespace,
@@ -289,6 +273,7 @@ pub(super) fn local_cut_page(
     Ok((rows, more))
 }
 
+#[cfg(test)]
 fn read_activity(
     connection: &Connection,
     namespace: &str,

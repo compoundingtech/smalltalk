@@ -252,13 +252,6 @@ fn available(connection: &Connection, namespace: &str, agent: &str) -> Result<bo
     }))
 }
 
-pub(crate) fn coverage(
-    connection: &Connection,
-    namespace: &Namespace,
-    agent: &str,
-) -> Result<bool> {
-    available(connection, namespace.as_str(), agent)
-}
 fn require(connection: &Connection, namespace: &str, agent: &str) -> Result<()> {
     ensure!(
         available(connection, namespace, agent)?,
