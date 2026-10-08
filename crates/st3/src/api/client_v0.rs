@@ -302,7 +302,12 @@ async fn collection_items_with_windows(
                 let cached_agents = if collection == "agents" {
                     match store.agent_resources_cached_at(index, false, None)? {
                         Some(cards) => Some(cards),
-                        None => match store.published_agent_roster(index) {
+                        // Before the first complete roster, an unfiltered window can come
+                        // from the head the refresher publishes first.
+                        None => match store.published_agent_roster(index).or_else(|| {
+                            status.is_none().then(|| store.published_agent_roster_head(index, limit + 1))
+                                .flatten().map(|(cut, _, head)| (cut, Arc::new(head)))
+                        }) {
                             Some((cut, cards)) => {
                                 store.request_agent_roster_refresh();
                                 published = Some(cut);
@@ -10949,8 +10954,20 @@ mission "queue-parity" state="ready" {
             move |upgrade: WebSocketUpgrade| {
                 let state = state.clone();
                 async move {
-                    upgrade.on_upgrade(move |socket| collection_stream_socket(
-                        socket, state, ClientSession::local(None).unwrap(), None))
+                    upgrade.on_upgrade(move |socket| {
+                        let windows = collection_windows::Windows::attach(&state.store);
+                        collection_stream_socket_with_reader(
+                            socket, state, ClientSession::local(None).unwrap(), None,
+                            move |state, session, request, permit| {
+                                let windows = windows.clone();
+                                async move {
+                                    collection_items_with_windows(
+                                        &state, &session, &request, permit, windows,
+                                    ).await
+                                }
+                            },
+                        )
+                    })
                 }
             }
         }));
@@ -10992,6 +11009,51 @@ mission "queue-parity" state="ready" {
         assert_eq!(page.items, changes["upserts"].as_array().unwrap().clone());
         socket.close(None).await.unwrap();
         server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_roster_head_answers_windows_and_first_pages_before_every_card() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        for agent in ["head-a", "head-b", "head-c"] {
+            state.store.append_claim(&ClaimInput {
+                subject: format!("agent/{agent}"), kind: "runtime.observed".into(), actor: None,
+                fields: serde_json::from_value(json!({"status":"running", "runtime_id":agent,
+                    "incarnation_id":"one"})).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let index = state.store.index().unwrap();
+        let request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe", "id":"head", "collection":"agents", "limit":2,
+        })).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let query = ClientListQuery { limit: Some(2), ..ClientListQuery::default() };
+        // What every card folded at this cut answers.
+        let window = collection_items_with_windows(&state, &session, &request,
+            semaphore.clone().acquire_owned().await.unwrap(),
+            collection_windows::Windows::attach(&state.store)).await.unwrap();
+        let (_, Json(page)) = client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(query.clone())).await.unwrap();
+        assert!(window.2 && page.page.has_more);
+
+        // A daemon whose refresher has so far published only the head.
+        state.store.forget_current_views();
+        let _wake = state.store.start_agent_roster_refresher().unwrap();
+        state.store.read_snapshot(|index| crate::api::client_agent_roster_head(&state.store, index))
+            .unwrap();
+        assert!(state.store.published_agent_roster(index).is_none());
+        let builds = state.store.agent_resources_builds_for_test();
+        let from_head = collection_items_with_windows(&state, &session, &request,
+            semaphore.acquire_owned().await.unwrap(), None).await.unwrap();
+        assert_eq!(from_head.0.store_index, index);
+        assert_eq!((&from_head.1, from_head.2), (&window.1, window.2));
+        let (_, Json(head_page)) = client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(query)).await.unwrap();
+        assert_eq!(head_page.items, page.items);
+        assert!(head_page.page.has_more && head_page.page.next_cursor.is_some());
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds, "no card folded");
     }
 
     #[tokio::test]

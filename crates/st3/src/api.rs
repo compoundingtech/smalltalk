@@ -2266,7 +2266,19 @@ fn client_agent_cards_for_page(
         .iter()
         .filter_map(|r| r["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    let cards = store.cached_agent_resources_for(index, history, Some(&selected), |changed| {
+    let cards = client_agent_cards_selected(store, history, index, &selected)
+        .map_err(ApiError::internal)?;
+    client_agent_cards_from_cached(store, cards, refs, at)
+}
+
+/// The cards of `selected` agents at `index`, folding only those not already cached there.
+fn client_agent_cards_selected(
+    store: &Store,
+    history: bool,
+    index: u64,
+    selected: &BTreeSet<String>,
+) -> anyhow::Result<Vec<Value>> {
+    store.cached_agent_resources_for(index, history, Some(selected), |changed| {
         let (subjects, previous) = changed.expect("a selected page always names its missing cards");
         // Delta metadata is current and already diffed; only cold pages need shallow refs.
         // Frozen continuation refs remain response metadata, never shared cache inputs.
@@ -2282,8 +2294,7 @@ fn client_agent_cards_for_page(
         )?;
         add_agent_todos(store, &mut cards, index)?;
         Ok(cards)
-    }).map_err(ApiError::internal)?;
-    client_agent_cards_from_cached(store, cards, refs, at)
+    })
 }
 
 fn client_agent_cards_from_cached(
@@ -4273,6 +4284,15 @@ async fn client_agents(
     unreachable!("an admitted roster read always builds missing cards")
 }
 
+/// Every current agent's refs, and the cards of as many as the largest window or page shows.
+fn client_agent_roster_head(store: &Store, index: u64) -> anyhow::Result<()> {
+    let refs = client_agent_page_refs(store, false, index)?;
+    let head = refs.iter().take(CLIENT_MAX_PAGE_ITEMS + 1)
+        .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    client_agent_cards_selected(store, false, index, &head).map(drop)
+}
+
 /// A first page of the newest published roster, under the snapshot it was folded at, for a
 /// current read that missed its own cut while a refresher keeps the roster published.
 fn client_agents_published_page(
@@ -4282,7 +4302,22 @@ fn client_agents_published_page(
     let store = &state.store;
     let index = store.index().map_err(ApiError::internal)?;
     let Some((index, cards)) = store.published_agent_roster(index) else {
-        return Ok(None);
+        // Before the first complete roster, an unfiltered first page can come from its head.
+        if query.status.is_some() {
+            return Ok(None);
+        }
+        let Some((index, refs, head)) =
+            store.published_agent_roster_head(index, CLIENT_MAX_PAGE_ITEMS + 1)
+        else {
+            return Ok(None);
+        };
+        store.request_agent_roster_refresh();
+        let snapshot = client_snapshot_at(state, index);
+        let mut page = client_page_read(state, &snapshot, "agents", (*refs).clone(), query, true)?;
+        page.items = client_agent_cards_from_cached(
+            store, page_cards(&head, &page.items), &page.items, &snapshot.created_at,
+        )?;
+        return Ok(Some((Extension(snapshot), Json(page))));
     };
     store.request_agent_roster_refresh();
     let snapshot = client_snapshot_at(state, index);
@@ -4304,13 +4339,18 @@ fn client_agents_published_page(
         Value::Object(reference)
     }).collect();
     let mut page = client_page_read(state, &snapshot, "agents", refs, query, true)?;
-    let selected = page.items.iter().filter_map(|item| item["id"].as_str())
-        .collect::<BTreeSet<_>>();
-    let cards = cards.iter()
-        .filter(|card| card["id"].as_str().is_some_and(|id| selected.contains(id)))
-        .cloned().collect();
-    page.items = client_agent_cards_from_cached(store, cards, &page.items, &snapshot.created_at)?;
+    page.items = client_agent_cards_from_cached(
+        store, page_cards(&cards, &page.items), &page.items, &snapshot.created_at,
+    )?;
     Ok(Some((Extension(snapshot), Json(page))))
+}
+
+/// The cards a page's refs name, from published cards.
+fn page_cards(cards: &[Value], refs: &[Value]) -> Vec<Value> {
+    let selected = refs.iter().filter_map(|item| item["id"].as_str()).collect::<BTreeSet<_>>();
+    cards.iter()
+        .filter(|card| card["id"].as_str().is_some_and(|id| selected.contains(id)))
+        .cloned().collect()
 }
 
 fn client_agents_page_at(
@@ -5194,8 +5234,9 @@ pub fn start_native_session_discovery(state: &AppState) {
 /// so refreshing never takes more than about half a core however often readers ask.
 const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_millis(250);
 
-/// Keep the complete agents roster published off the request path, starting with a fold as the
-/// daemon starts. A roster read that misses its exact cut serves the newest publication under
+/// Keep the complete agents roster published off the request path. As the daemon starts it
+/// folds every agent's refs and the cards the largest window shows, then the rest of the cards.
+/// A roster read that misses its exact cut serves the newest publication under
 /// that publication's own snapshot and wakes this one task, so readers neither fold the fleet's
 /// cards nor wait behind a fold once the first has published. Each refresh reuses the previous
 /// publication and refolds only the cards whose claims changed, when it can tell which.
@@ -5205,15 +5246,23 @@ pub fn start_agent_roster(state: &AppState) {
     };
     let store = state.store.clone();
     tokio::spawn(async move {
+        let mut head = true;
         loop {
             let started = tokio::time::Instant::now();
             let admission = store.admit_agent_resources().await;
             let reader = store.clone();
+            let first = std::mem::take(&mut head);
             let refreshed = tokio::task::spawn_blocking(move || {
                 let _admission = admission;
                 crate::performance::task("roster/refresh", || {
                     reader.read_snapshot(|index| {
-                        client_agent_resources_cached(&reader, false, index).map(drop)
+                        // The first fold publishes only what windows and first pages show,
+                        // and releases admission to their readers before the rest follows.
+                        if first {
+                            client_agent_roster_head(&reader, index)
+                        } else {
+                            client_agent_resources_cached(&reader, false, index).map(drop)
+                        }
                     })
                 })
             })
@@ -5222,6 +5271,9 @@ pub fn start_agent_roster(state: &AppState) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => eprintln!("st3: agents roster refresh failed: {error:#}"),
                 Err(error) => eprintln!("st3: agents roster refresh stopped: {error}"),
+            }
+            if first {
+                continue;
             }
             tokio::time::sleep(started.elapsed().max(AGENT_ROSTER_REFRESH_PAUSE)).await;
             wake.notified().await;

@@ -2957,6 +2957,35 @@ impl Store {
             .map(|entry| (entry.index, Arc::clone(&entry.items)))
     }
 
+    /// When no complete roster is published yet: the newest current refs at or before `index`
+    /// (membership, order and queue metadata of every agent) and the cards of their first
+    /// `count` agents, all at that one cut. The refresher publishes this head first as the
+    /// daemon starts, so a window or first page need not wait for every card to fold.
+    pub(crate) fn published_agent_roster_head(
+        &self,
+        index: u64,
+        count: usize,
+    ) -> Option<(u64, Arc<Vec<Value>>, Vec<Value>)> {
+        self.smalltalk.agent_roster_refresh.get()?;
+        let (cut, refs) = self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned").iter()
+            .filter(|entry| !entry.history && entry.index <= index)
+            .max_by_key(|entry| entry.index)
+            .map(|entry| (entry.index, Arc::clone(&entry.items)))?;
+        let cache = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned");
+        let head = cache.iter().filter(|entry| entry.index == cut && !entry.history)
+            .find_map(|entry| {
+                let cards = entry.items.iter()
+                    .filter_map(|card| Some((card["id"].as_str()?, card)))
+                    .collect::<HashMap<_, _>>();
+                refs.iter().take(count)
+                    .map(|reference| cards.get(reference["id"].as_str()?).map(|card| (*card).clone()))
+                    .collect::<Option<Vec<_>>>()
+            })?;
+        Some((cut, refs, head))
+    }
+
     /// Follows the graph index of the newest complete current roster.
     pub(crate) fn subscribe_agent_roster(&self) -> tokio::sync::watch::Receiver<u64> {
         self.smalltalk.agent_roster_published.subscribe()
