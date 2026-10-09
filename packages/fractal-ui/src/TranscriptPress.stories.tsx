@@ -228,7 +228,7 @@ export const ScrollDuringPressLight: Story = { ...ScrollDuringPress, args: { sch
 type InsertSnapshot = 'retained' | 'fresh' | 'shifted'
 const actionRows = Array.from({ length: 40 }, (_, index) => ({ id: `action-${index}`, version: `Row ${index}` }))
 /** App-shaped clickable rows: keys are host ids, never array indexes or decoded object identities. */
-function HostRowsPressStory({ scheme, snapshot }: { scheme: Scheme; snapshot: InsertSnapshot }) {
+function HostRowsPressStory({ scheme, snapshot, scrollOwner = 'lane' }: { scheme: Scheme; snapshot: InsertSnapshot; scrollOwner?: 'lane' | 'ancestor' | 'document' }) {
   const [rows, setRows] = React.useState(actionRows)
   const [activated, setActivated] = React.useState('')
   const insert = () => setRows(previous => {
@@ -238,16 +238,18 @@ function HostRowsPressStory({ scheme, snapshot }: { scheme: Scheme; snapshot: In
     const at = current.length - 1
     return [...current.slice(0, at), ...inserted, ...current.slice(at)]
   })
-  return <main {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}>
+  const content = <EmbraceScrollViewport items={rows} data-testid="host-row-scroll" {...stylex.props(styles.hostViewport, scrollOwner !== 'lane' && styles.unboundedViewport)}>
+    {rows.map((row, index) => <div key={row.id} data-item-id={row.id} data-row-index={index} {...stylex.props(styles.hostRow)}><Button onPress={() => setActivated(row.id)} {...stylex.props(styles.button)}>Activate {row.id}</Button></div>)}
+  </EmbraceScrollViewport>
+  return <main data-scroll-owner={scrollOwner} {...stylex.props(styles.root, scrollOwner === 'document' && styles.growingRoot, ...baselineTheme, scheme === 'light' && lightTheme)}>
     <div {...stylex.props(styles.toolbar)}><Button onPress={insert} {...stylex.props(styles.button)}>Insert host rows above</Button><output data-testid="activated-row">{activated}</output></div>
-    <EmbraceScrollViewport items={rows} data-testid="host-row-scroll" {...stylex.props(styles.hostViewport)}>
-      {rows.map((row, index) => <div key={row.id} data-item-id={row.id} data-row-index={index} {...stylex.props(styles.hostRow)}><Button onPress={() => setActivated(row.id)} {...stylex.props(styles.button)}>Activate {row.id}</Button></div>)}
-    </EmbraceScrollViewport>
+    {scrollOwner === 'ancestor' ? <div data-testid="scroll-owner" {...stylex.props(styles.hostViewport)}>{content}</div> : content}
   </main>
 }
 const hostInsertPlay: NonNullable<Story['play']> = async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   const viewport = canvas.getByTestId('host-row-scroll')
+  const external = canvasElement.querySelector('[data-scroll-owner="lane"]') === null
   await document.fonts.ready
   await settleFrames()
   viewport.dispatchEvent(new WheelEvent('wheel', { deltaY: -viewport.scrollHeight }))
@@ -256,7 +258,10 @@ const hostInsertPlay: NonNullable<Story['play']> = async ({ canvasElement }) => 
   const action = canvas.getByRole('button', { name: `Activate ${id}`, exact: true })
   const row = action.closest<HTMLElement>('[data-item-id]')!
   // The failed outbox/action row is last; incoming server rows insert immediately above it.
-  viewport.scrollTop = viewport.scrollHeight
+  if (external) {
+    action.scrollIntoView({ block: 'center' })
+    await expect(viewport.scrollHeight - viewport.clientHeight, 'unbounded lane must have no scroll range').toBeLessThanOrEqual(1)
+  } else viewport.scrollTop = viewport.scrollHeight
   await settleFrames()
   const before = row.getBoundingClientRect().top
   await expect(row).toHaveAttribute('data-row-index', String(index))
@@ -270,7 +275,7 @@ const hostInsertPlay: NonNullable<Story['play']> = async ({ canvasElement }) => 
     await expect(canvas.getByRole('button', { name: `Activate ${id}`, exact: true }), 'host key must preserve the action DOM node').toBe(action)
     await expect(Number(row.dataset.rowIndex), 'same key must shift index').toBeGreaterThan(index)
     await expect(viewport.scrollHeight, 'incoming rows must grow the scrollable content').toBeGreaterThan(contentHeight)
-    await expect(Math.abs(viewport.getBoundingClientRect().bottom - laneBottom), 'bounded lane must remain the scroll owner during the press').toBeLessThanOrEqual(1)
+    if (!external) await expect(Math.abs(viewport.getBoundingClientRect().bottom - laneBottom), 'bounded lane must remain the scroll owner during the press').toBeLessThanOrEqual(1)
     await expect(Math.abs(row.getBoundingClientRect().top - before), 'original action moved under the held pointer').toBeLessThanOrEqual(1)
   })
   await waitFor(() => expect(canvas.getByTestId('activated-row')).toHaveTextContent(id))
@@ -281,6 +286,23 @@ export const HostInsertShiftedIndex: Story = { render: args => <HostRowsPressSto
 export const HostInsertRetainedRowsLight: Story = { ...HostInsertRetainedRows, args: { scheme: 'light' } }
 export const HostInsertFreshObjectsLight: Story = { ...HostInsertFreshObjects, args: { scheme: 'light' } }
 export const HostInsertShiftedIndexLight: Story = { ...HostInsertShiftedIndex, args: { scheme: 'light' } }
+const externalOwnerPlay: NonNullable<Story['play']> = async context => {
+  const original = console.warn
+  const warnings: string[] = []
+  console.warn = (...args: unknown[]) => { warnings.push(String(args[0])); original(...args) }
+  try {
+    await hostInsertPlay(context)
+    const action = within(context.canvasElement).getByRole('button', { name: 'Activate action-39', exact: true })
+    pointer(action, 'pointerdown', 1, 'mouse')
+    pointer(action, 'pointerup', 1, 'mouse')
+    await expect(warnings.filter(text => text.startsWith('EmbraceScrollViewport:')), 'warn once per lane, not per press').toHaveLength(1)
+  } finally { console.warn = original }
+}
+/** Defense in depth for a misconfigured host: the document, not the lane, scrolls. */
+export const HostInsertDocumentScroll: Story = { render: args => <HostRowsPressStory scheme={args.scheme} snapshot="fresh" scrollOwner="document" />, play: externalOwnerPlay }
+export const HostInsertDocumentScrollLight: Story = { ...HostInsertDocumentScroll, args: { scheme: 'light' } }
+export const HostInsertAncestorScroll: Story = { render: args => <HostRowsPressStory scheme={args.scheme} snapshot="fresh" scrollOwner="ancestor" />, play: externalOwnerPlay }
+export const HostInsertAncestorScrollLight: Story = { ...HostInsertAncestorScroll, args: { scheme: 'light' } }
 
 const styles = stylex.create({
   root: { height: '100vh', width: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans },
@@ -289,4 +311,6 @@ const styles = stylex.create({
   button: { minHeight: g.controlMd, paddingInline: s.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.controlFill, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
   hostViewport: { flex: '1 1 0', minHeight: 0, overflowY: 'auto' },
   hostRow: { minHeight: 72, display: 'flex', alignItems: 'center', paddingInline: s.md },
+  growingRoot: { height: 'auto', display: 'block' },
+  unboundedViewport: { flex: '0 0 auto', overflowY: 'visible' },
 })

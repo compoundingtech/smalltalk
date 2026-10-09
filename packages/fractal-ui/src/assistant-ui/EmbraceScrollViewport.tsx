@@ -6,6 +6,16 @@ import { surfaceVars, textVars, borderVars, radiusVars, spaceVars, typeVars, geo
 const rowSelector = '[data-item-id], [data-embrace-entry-id]'
 const navigationKeys: Readonly<Record<string, true>> = { PageUp: true, PageDown: true, Home: true, End: true, ArrowUp: true, ArrowDown: true, ' ': true }
 
+/** A bounded lane owns scrolling; a misconfigured host may leave it to an ancestor or the page. */
+function pressScrollOwner(lane: HTMLElement): HTMLElement {
+  const view = lane.ownerDocument.defaultView
+  for (let candidate: HTMLElement | null = lane; candidate !== null; candidate = candidate.parentElement) {
+    if (candidate.scrollHeight > candidate.clientHeight && /^(auto|scroll|overlay)$/.test(view?.getComputedStyle(candidate).overflowY ?? '')) return candidate
+  }
+  const documentOwner = lane.ownerDocument.scrollingElement
+  return documentOwner instanceof HTMLElement && documentOwner.scrollHeight > documentOwner.clientHeight ? documentOwner : lane
+}
+
 /** Scroll state a conversation keeps while it stays on a surface. */
 export interface ViewportState { readonly top: number; readonly following: boolean; readonly unread: boolean }
 
@@ -42,7 +52,8 @@ class ViewportController {
   private pendingTop: number | undefined
   /** Pointers down somewhere on the page; the dock keeps its layout until all are released. */
   private readonly pressed = new Set<number>()
-  private pressedAnchor: { pointerId: number; element: HTMLElement; offset: number } | undefined
+  private pressedAnchor: { pointerId: number; element: HTMLElement; scrollOwner: HTMLElement; top: number } | undefined
+  private warnedScrollOwner = false
 
   constructor(saved?: ViewportState) {
     if (saved !== undefined && !saved.following) {
@@ -124,7 +135,9 @@ class ViewportController {
     const viewport = this.element
     const anchor = this.pressedAnchor
     if (viewport === null || anchor === undefined || !anchor.element.isConnected) return false
-    this.writeTop(viewport.scrollTop + anchor.element.getBoundingClientRect().top - viewport.getBoundingClientRect().top - anchor.offset)
+    const delta = anchor.element.getBoundingClientRect().top - anchor.top
+    if (anchor.scrollOwner === viewport) this.writeTop(viewport.scrollTop + delta)
+    else anchor.scrollOwner.scrollTop += delta
     // Hand history back in the compensated coordinate system; a stale offset would undo the press scroll.
     if (this.anchor?.element.isConnected) this.anchor.offset = this.anchor.element.getBoundingClientRect().top - viewport.getBoundingClientRect().top
     return true
@@ -212,7 +225,14 @@ class ViewportController {
       this.pressed.add(event.pointerId)
       if (this.pressedAnchor !== undefined || !(event.target instanceof Element)) return
       const row = event.target.closest<HTMLElement>(rowSelector)
-      if (row !== null && element.contains(row)) this.pressedAnchor = { pointerId: event.pointerId, element: row, offset: row.getBoundingClientRect().top - element.getBoundingClientRect().top }
+      if (row !== null && element.contains(row)) {
+        const scrollOwner = pressScrollOwner(element)
+        if (scrollOwner !== element && !this.warnedScrollOwner && process.env.NODE_ENV !== 'production') {
+          this.warnedScrollOwner = true
+          console.warn('EmbraceScrollViewport: the lane is not its own scroll container. Bound its height so following and history anchoring stay lane-local; held row actions use the actual scroll owner.')
+        }
+        this.pressedAnchor = { pointerId: event.pointerId, element: row, scrollOwner, top: row.getBoundingClientRect().top }
+      }
     }
     const release = (event: PointerEvent) => {
       this.pressed.delete(event.pointerId)
