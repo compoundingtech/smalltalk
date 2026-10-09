@@ -445,6 +445,15 @@ with its own `/tmp`, and nothing the job started outlives it. The runner names a
 cache, use that Cargo home, and Cargo keeps its intermediate build files in a per-runner build
 directory, while sccache shares compiled crates between all runners and the Nix store is the
 machine's own. The machine's configuration lives in the private network repository.
+In GitHub Actions, both Rust dev shells use `scripts/ci-rustc-wrapper`: sccache's response-I/O
+fallback is enabled. A separate read-only `sccache --dist-status` preflight is bounded
+to 15 seconds (five seconds to finish terminating it). A recognized preflight startup
+error or timeout disables caching for the rest of that job with a warning, before any
+compiler request is submitted. Signal statuses are preserved. Once compilation starts,
+the wrapper executes sccache directly and never retries based on its stderr; the actual
+cache/compiler result is authoritative, and cache statistics are optional.
+The boundary guard's dependency-free synthetic workspace uses
+a fresh Cargo home and no compiler wrappers, stays offline, and prints Cargo stderr on failure.
 Cargo builds use the host's four-job limit. Workspace test shards explicitly use eight test
 threads, with the host's 14 GiB per-job memory limit. The repository variable `CI1_MIN_IDLE`
 can override admission; keep it at four when preserving CPU capacity for reserved lanes.
