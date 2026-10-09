@@ -155,7 +155,7 @@ export const Geometry: StoryObj<ComposerArgs & { compareLayout?: boolean; compar
 const settle = () => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
 const textbox = (canvasElement: HTMLElement) => within(canvasElement).getByRole('textbox')
 const receiptLog = (canvasElement: HTMLElement) => within(canvasElement).getByRole('log', { name: 'Accepted fixture messages' })
-const clearDrafts = () => { for (const key of Object.keys(localStorage)) if (key.startsWith('kit-composer.')) localStorage.removeItem(key) }
+function clearDrafts() { for (const key of Object.keys(localStorage)) if (key.startsWith('kit-composer.')) localStorage.removeItem(key) }
 /** RAC shows focus tooltips only in keyboard modality, so reach the control with real Tab presses. */
 const tabTo = async (element: HTMLElement) => {
   for (let step = 0; step < 12 && element.ownerDocument.activeElement !== element; step++) await userEvent.tab()
