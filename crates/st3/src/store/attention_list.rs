@@ -7,7 +7,22 @@
 //! at the newer cut. Everything here is volatile cache state, cleared by `forget_views`.
 
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+
+/// The views the refresher publishes, in the order it refreshes them.
+pub(crate) const PUBLISHED_VIEWS: [&str; 4] = ["attention", "glasses", "arrangements", "summary"];
+
+/// A view whose refresh has failed this long is withdrawn: its windows read for themselves, as
+/// before, until it publishes again. Once published, a window rereads only on publication, so
+/// a view that stopped publishing must not stay served.
+const WITHDRAW_AFTER_MS: u64 = 30_000;
+
+#[derive(Default)]
+struct ViewHealth {
+    /// When its refreshes began failing, in Unix ms; 0 while they succeed.
+    failing_since: AtomicU64,
+    withdrawn: AtomicBool,
+}
 
 /// More claims than this between two publications fold again rather than read them all.
 const DELTA_LIMIT: usize = 10_000;
@@ -61,6 +76,9 @@ pub(crate) struct AttentionList {
     forgotten: AtomicU64,
     /// Counts publications, same cut or not, so streams that read an earlier one reread.
     revision: tokio::sync::watch::Sender<u64>,
+    /// Set when the refresher task ends: no view is served after that.
+    stopped: AtomicBool,
+    health: [ViewHealth; PUBLISHED_VIEWS.len()],
     /// Folds by cause: the first claim kind that could change attention, `clock`, `projection`,
     /// `first` or `many`. Republishing the same rows at a newer cut is not a fold.
     folds: Mutex<BTreeMap<String, u64>>,
@@ -100,9 +118,64 @@ impl Store {
         Some(wake)
     }
 
-    /// Whether a refresher keeps the attention list published, so windows never fold it.
+    /// Whether a refresher was started for the attention list and its sibling views.
     pub(crate) fn attention_list_refresher_running(&self) -> bool {
-        self.smalltalk.attention_list.refresher.get().is_some()
+        let list = &self.smalltalk.attention_list;
+        list.refresher.get().is_some() && !list.stopped.load(AtomicOrdering::Acquire)
+    }
+
+    /// Whether windows of `view` serve its publication rather than reading for themselves: its
+    /// refresher runs and has not withdrawn it.
+    pub(crate) fn published_view_serving(&self, view: &str) -> bool {
+        let Some(position) = PUBLISHED_VIEWS.iter().position(|name| *name == view) else {
+            return false;
+        };
+        self.attention_list_refresher_running()
+            && !self.smalltalk.attention_list.health[position]
+                .withdrawn
+                .load(AtomicOrdering::Acquire)
+    }
+
+    /// Record one refresh of `view`. A view failing for [`WITHDRAW_AFTER_MS`] is withdrawn, so
+    /// its windows follow commits again; its next good refresh serves it again.
+    pub(crate) fn note_view_refreshed(&self, view: &str, succeeded: bool) {
+        let Some(position) = PUBLISHED_VIEWS.iter().position(|name| *name == view) else {
+            return;
+        };
+        let health = &self.smalltalk.attention_list.health[position];
+        let now = now_ms() as u64;
+        if succeeded {
+            health.failing_since.store(0, AtomicOrdering::Release);
+            if health.withdrawn.swap(false, AtomicOrdering::AcqRel) {
+                eprintln!("st3: the {view} view publishes again; its windows serve it");
+                self.publish_collection_view(view);
+            }
+            return;
+        }
+        let since = match health.failing_since.compare_exchange(
+            0, now, AtomicOrdering::AcqRel, AtomicOrdering::Acquire,
+        ) {
+            Ok(_) => now,
+            Err(since) => since,
+        };
+        if now.saturating_sub(since) >= WITHDRAW_AFTER_MS
+            && !health.withdrawn.swap(true, AtomicOrdering::AcqRel)
+        {
+            eprintln!("st3: WARN the {view} view has failed to refresh for {} s; its windows read for themselves until it publishes again", now.saturating_sub(since) / 1000);
+            self.withdraw_collection_view(view);
+        }
+    }
+
+    /// The refresher task ended: windows of every view read for themselves from now on.
+    pub(crate) fn stop_attention_list_refresher(&self) {
+        let list = &self.smalltalk.attention_list;
+        if list.refresher.get().is_none() || list.stopped.swap(true, AtomicOrdering::AcqRel) {
+            return;
+        }
+        eprintln!("st3: WARN the attention, glasses, arrangements and summary refresher stopped; their windows read for themselves");
+        for view in PUBLISHED_VIEWS {
+            self.withdraw_collection_view(view);
+        }
     }
 
     /// Ask the refresher, if one runs, to publish the list at the newest cut. Requests made
