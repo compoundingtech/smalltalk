@@ -13,6 +13,7 @@ mod context;
 mod contract;
 pub mod conversation;
 pub mod demo;
+mod direct;
 pub mod doc;
 mod edit;
 mod glass;

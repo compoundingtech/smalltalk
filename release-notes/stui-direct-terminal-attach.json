@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "stui attaches a terminal on its own host to the local PTY session and one on another fleet host over Fabric, never through a daemon; a lost live stream is offline only when st also fails a fresh request",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill, stored data or transcript change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Published schema, operations and contract digest are unchanged. The client reads the daemon's existing local-terminal and fleet-membership routes and accepts the core API error shape on them."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, retention or authority rule change. The person's terminal.read and terminal.control grants are checked before any Fabric dial, as st terminals attach checks them."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "stui on a machine with its own daemon no longer falls back to the client gateway for a terminal on another host: the owner must run st terminals expose-fabric and grant this machine st3/pty/FLEET_ID, or stui says Fabric did not reach it. Paired devices without a daemon keep the gateway. The feed gains a Degraded update; Swift and TypeScript clients are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment; no data conversion or extra startup work."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Before stui with this change attaches a remote terminal, each fleet host runs st terminals expose-fabric and allows st3/pty/FLEET_ID for the other fleet hosts' Fabric peers, then fabric reload-peers."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery, durable payload or initialization changes. stui writes a bounded connection.log under its state directory."
+  }
+}

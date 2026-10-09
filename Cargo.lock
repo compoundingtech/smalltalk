@@ -4457,6 +4457,7 @@ dependencies = [
  "st3-client",
  "st3-conversation-ui",
  "st3-schema",
+ "st3-terminal-direct",
  "st3-ui-model",
  "tar",
  "tempfile",
@@ -4585,6 +4586,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "st3-terminal-direct"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pty-core",
+ "serde",
+ "serde_json",
+ "smallclaims",
+ "tokio",
+]
+
+[[package]]
 name = "st3-ui-model"
 version = "0.1.0"
 dependencies = [
@@ -4661,6 +4674,7 @@ dependencies = [
  "st3-client",
  "st3-conversation-ui",
  "st3-feed",
+ "st3-terminal-direct",
  "st3-ui-model",
  "tempfile",
  "tokio",

@@ -7,6 +7,7 @@
 //! data in place: it never empties a list or a conversation while the fresh copy is on its way.
 
 use super::adapt::{self, Extras};
+use super::direct;
 use super::glass::GlassWrite;
 use super::view::{Load, MissionPreview};
 use super::{AgentControl, Effect, Guard, Ui};
@@ -368,6 +369,8 @@ pub fn run(context: Context) -> Result<()> {
     // The runtimes of the agent whose terminal view is open, to follow it again after a pause.
     let mut terminal_runtimes: Option<Vec<String>> = None;
     let mut terminal_runtimes_by_agent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // The fleet host that owns each opened terminal, so a dropped stream attaches again directly.
+    let mut terminal_owners: BTreeMap<String, String> = BTreeMap::new();
     // Attaching a dropped terminal again: whether a try is out, and how many failed.
     let mut reattaching = false;
     // When a terminal was asked for, while it connects: the wait is shown, and a long one named.
@@ -1033,9 +1036,14 @@ pub fn run(context: Context) -> Result<()> {
                             agent.clone()
                         }
                     });
+                    let owner = terminal_owner(&model, &agent, found, &runtime_ids);
                     attached = None;
                     terminal_runtimes = Some(runtime_ids.clone());
                     terminal_runtimes_by_agent.insert(agent.clone(), runtime_ids.clone());
+                    match &owner {
+                        Some(owner) => terminal_owners.insert(agent.clone(), owner.clone()),
+                        None => terminal_owners.remove(&agent),
+                    };
                     attach_started = Some(Instant::now());
                     let _ = commands.send(Command::Unfollow);
                     {
@@ -1043,9 +1051,14 @@ pub fn run(context: Context) -> Result<()> {
                         let tx = fetched_tx.clone();
                         let agent = agent.clone();
                         runtime.spawn(async move {
-                            let attached =
-                                attach_known_then_direct(&client, &agent, known, &runtime_ids)
-                                    .await;
+                            let attached = attach_known_then_direct(
+                                &client,
+                                &agent,
+                                known,
+                                &runtime_ids,
+                                owner.as_deref(),
+                            )
+                            .await;
                             let _ = tx.send(match attached {
                                 Ok(direct) => Fetched::Native { agent, direct },
                                 Err(reason) => Fetched::NativeFailed {
@@ -1375,8 +1388,16 @@ pub fn run(context: Context) -> Result<()> {
                 .get(&agent)
                 .cloned()
                 .unwrap_or_default();
+            let owner = terminal_owners.get(&agent).cloned();
             runtime.spawn(async move {
-                let outcome = attach_direct(&client, &agent, &runtime_ids, Some(&expected)).await;
+                let outcome = attach_direct(
+                    &client,
+                    &agent,
+                    &runtime_ids,
+                    Some(&expected),
+                    owner.as_deref(),
+                )
+                .await;
                 let _ = tx.send(Fetched::Reattached { agent, outcome });
             });
         }
@@ -3201,14 +3222,16 @@ async fn attach_known_then_direct(
     agent: &str,
     known: Option<(String, String, String)>,
     runtime_ids: &[String],
+    owner: Option<&str>,
 ) -> Result<Direct, String> {
     if let Some((name, terminal, incarnation)) = known
         && !agent.starts_with("terminal/")
-        && let Ok(direct) = attach_terminal(client, name, &terminal, incarnation).await
+        && let Ok(direct) =
+            attach_terminal(client, agent, name, &terminal, incarnation, owner, None).await
     {
         return Ok(direct);
     }
-    attach_direct(client, agent, runtime_ids, None).await
+    attach_direct(client, agent, runtime_ids, None, owner).await
 }
 
 async fn attach_direct(
@@ -3216,6 +3239,7 @@ async fn attach_direct(
     subject: &str,
     runtime_ids: &[String],
     expected: Option<&str>,
+    owner: Option<&str>,
 ) -> Result<Direct, String> {
     let mut found = Vec::new();
     if subject.starts_with("terminal/") {
@@ -3235,6 +3259,7 @@ async fn attach_direct(
             subject.trim_start_matches("terminal/").replace('/', "."),
             subject.to_owned(),
             screen.value.runtime_incarnation,
+            owner.map(str::to_owned),
         ));
     } else {
         for id in runtime_ids {
@@ -3247,17 +3272,33 @@ async fn attach_direct(
             if let (Some(terminal), Some(incarnation)) =
                 (runtime.terminal_id, runtime.incarnation_id)
             {
-                found.push((runtime.runtime_id, terminal, incarnation));
+                found.push((
+                    runtime.runtime_id,
+                    terminal,
+                    incarnation,
+                    Some(runtime.owner_host_id).filter(|host| !host.is_empty()),
+                ));
             }
         }
     }
     let mut reason = "the agent has no terminal right now".to_owned();
-    for (name, terminal, incarnation) in found {
+    for (name, terminal, incarnation, runtime_owner) in found {
         if expected.is_some_and(|expected| expected != incarnation) {
-            reason = "the terminal restarted; Ctrl+] attaches the new one".into();
+            reason = direct::RESTARTED.into();
             continue;
         }
-        match attach_terminal(client, name, &terminal, incarnation).await {
+        let owner = owner.map(str::to_owned).or(runtime_owner);
+        match attach_terminal(
+            client,
+            subject,
+            name,
+            &terminal,
+            incarnation,
+            owner.as_deref(),
+            expected,
+        )
+        .await
+        {
             Ok(direct) => return Ok(direct),
             Err(error) => reason = error,
         }
@@ -3265,13 +3306,41 @@ async fn attach_direct(
     Err(reason)
 }
 
-/// A raw attachment to one terminal's PTY session at one incarnation, and its stream.
+/// One terminal's PTY session at one incarnation, and its stream: the local socket for a terminal
+/// on this host, Fabric for one another fleet host owns. The paired-device gateway carries the
+/// bytes only for a device with no daemon of its own.
 async fn attach_terminal(
     client: &Client,
+    subject: &str,
     name: String,
     terminal: &str,
     incarnation: String,
+    owner: Option<&str>,
+    expected: Option<&str>,
 ) -> Result<Direct, String> {
+    let opened = direct::open(
+        client,
+        &direct::Terminal {
+            subject,
+            name: &name,
+            incarnation: &incarnation,
+            owner,
+            expected,
+        },
+    )
+    .await?;
+    if let direct::Opened::Stream {
+        stream,
+        name,
+        incarnation,
+    } = opened
+    {
+        return Ok(Direct {
+            name,
+            incarnation,
+            stream,
+        });
+    }
     let attachment = client
         .raw_terminal_attachment(terminal, &incarnation, st3_client::RawTerminalMode::Attach)
         .await
@@ -3288,4 +3357,28 @@ async fn attach_terminal(
             stream,
         })
         .map_err(|error| error.to_string())
+}
+
+/// The fleet host that owns `agent`'s terminal, as st already says it: the agent's host, or else
+/// the host of the runtime that holds the terminal.
+fn terminal_owner(
+    model: &Model,
+    agent: &str,
+    found: Option<&st3_client::Agent>,
+    runtime_ids: &[String],
+) -> Option<String> {
+    found
+        .and_then(|agent| agent.host_id.clone())
+        .filter(|host| !host.is_empty())
+        .or_else(|| {
+            model.runtimes.items.iter().find_map(|item| match item {
+                Resource::Runtime(runtime)
+                    if runtime.terminal_id.as_deref() == Some(agent)
+                        || runtime_ids.contains(&runtime.header.id) =>
+                {
+                    Some(runtime.owner_host_id.clone()).filter(|host| !host.is_empty())
+                }
+                _ => None,
+            })
+        })
 }

@@ -11,7 +11,9 @@ build = "../../build.rs"
 anyhow = "1"
 crossterm = "0.29"
 ratatui = { workspace = true }
+smallclaims = { path = "../smallclaims" }
 st3-client = { path = "../st3-client" }
+st3-terminal-direct = { path = "../st3-terminal-direct" }
 st3-feed = { path = "../st3-feed" }
 st3-conversation-ui = { path = "../st3-conversation-ui", features = ["ratatui"] }
 st3-ui-model = { path = "../st3-ui-model" }
@@ -47,7 +49,6 @@ name = "phone_client"
 test = true
 
 [dev-dependencies]
-smallclaims = { path = "../smallclaims" }
 st3 = { path = "../st3" }
 tempfile = "3"
 axum = { version = "0.8", features = ["ws"] }
