@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Reject legacy full-request digests when replaying client actions",
+  "replay": {
+    "status": "changed",
+    "detail": "Client action receipts and terminal attachments accept only the current fence-independent request digest. A legacy-only digest returns HTTP 409 idempotency-conflict without executing again; current-digest retries still return the saved result."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or receipt bytes change. Existing receipts remain durable."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digests change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Exact replays against legacy-only receipts no longer return their saved result; they fail closed with the existing typed idempotency conflict."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "The normal binary update requires no coordinated restart."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "After a legacy receipt conflict, inspect the committed outcome before deliberately submitting a new action with a fresh key. Do not retry automatically with a new key."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No receipt deletion, rewriting, or graph repair is required."
+  }
+}
