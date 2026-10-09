@@ -6779,9 +6779,14 @@ fn current_doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiErro
         message: "evidence incomplete; a read does not test opening the command log for append"
             .into(),
     });
+    let status = if checks.iter().any(|check| check.status == "fail") {
+        "fail"
+    } else {
+        "warn"
+    };
     Ok(Json(DoctorReport {
         machine_version: Some(st_drivers::version::machine_version()),
-        status: "warn".into(),
+        status: status.into(),
         checks,
         performance: crate::performance::snapshot(),
     }))
@@ -19289,6 +19294,7 @@ agent "good" {{ workspace {:?}; command "true" }}
                 retained_removal::check(&state.state_dir, &state.node, state.fleet_id.as_deref());
             assert_eq!(crate::store::STATEMENTS_RUN.with(std::cell::Cell::get), 0);
             assert_eq!(check.status, "fail");
+            assert_eq!(current_doctor_report(&state).unwrap().0.status, "fail");
             let started = Instant::now();
             let (status, response) =
                 runtime.block_on(get_request(router(state.clone()), "/v1/doctor"));
@@ -19320,6 +19326,7 @@ agent "good" {{ workspace {:?}; command "true" }}
             assert_eq!(fs::read(&settings_path).unwrap(), settings_before);
         }
         crate::fleet::FleetFile::remove(root.path()).unwrap();
+        assert_eq!(current_doctor_report(&state).unwrap().0.status, "warn");
         let (_, response) = runtime.block_on(get_request(router(state.clone()), "/v1/doctor"));
         assert_eq!(
             response["checks"]

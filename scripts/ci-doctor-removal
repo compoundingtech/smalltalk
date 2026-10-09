@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Run eight retained-removal controls from the existing verified hosted archive."""
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+
+TESTS = (
+    "api::retained_removal::tests::removed_and_left_markers_fail_without_certifying_the_graph_or_age",
+    "api::retained_removal::tests::absent_unsupported_or_mismatched_evidence_stays_unknown",
+    "api::retained_removal::tests::byte_syntax_utf8_and_decode_limits_refuse_before_healthy_results",
+    "api::retained_removal::tests::symlinks_directories_and_fifos_do_not_become_evidence",
+    "api::retained_removal::tests::replacement_after_decode_or_in_place_mutation_invalidates_capture",
+    "api::retained_removal::tests::replacing_the_parent_after_decode_requires_path_validation",
+    "api::retained_removal::tests::reopening_after_leave_and_same_name_rejoin_never_reuses_an_old_marker",
+    "api::tests::doctor_retained_removal_fails_without_sql_or_read_mutation",
+)
+FILTER = "package(=st3) and kind(lib) and (" + " or ".join(
+    "test(=" + name + ")" for name in TESTS) + ")"
+
+
+def verify_inventory(document):
+    selected = []
+    for suite in document["rust-suites"].values():
+        for name, test in suite["testcases"].items():
+            if test["filter-match"]["status"] == "matches":
+                if test["ignored"]:
+                    raise ValueError("removal control is ignored: " + name)
+                selected.append(name)
+    if len(selected) != 8 or set(selected) != set(TESTS):
+        raise ValueError("expected exactly eight named removal controls, got " + repr(selected))
+    return selected
+
+
+def terminal_statuses(output):
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    # Final-status failure recaps are not a second execution.
+    initial = plain.split("Summary", 1)[0]
+    return [{"status": status, "name": name} for status, name in re.findall(
+        r"^\s*(PASS|FAIL|TIMEOUT|EXECFAIL|LEAK|ABORT) \[[^\n]*?\]\s+\(\s*[0-9]+/\s*8\) st3 (\S+)\s*$",
+        initial, re.MULTILINE)]
+
+
+def verify_result(output, code):
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    summaries = re.findall(r"Summary[^\n]*?([0-9]+) tests run: ([0-9]+) passed", plain)
+    statuses = terminal_statuses(output)
+    passed = [row["name"] for row in statuses if row["status"] == "PASS"]
+    if code != 0 or summaries != [("8", "8")] or len(statuses) != 8 or len(passed) != 8 or set(passed) != set(TESTS):
+        raise ValueError(f"eight individually passed removal controls required: exit={code}, summaries={summaries}, statuses={statuses}")
+    return passed
+
+
+def main():
+    # There is no compilation fallback: the preceding archive verification/setup owns source
+    # and artifact provenance. These arguments execute its binaries without a shard filter.
+    target = Path(os.environ["CI_TEST_EXTRACTED"]) / "workspace" / "target"
+    workspace = os.environ["CI_TEST_WORKSPACE"]
+    source = ["--binaries-metadata", str(target / "nextest/binaries-metadata.json"),
+              "--cargo-metadata", str(target / "nextest/cargo-metadata.json"),
+              "--target-dir-remap", str(target), "--workspace-remap", workspace]
+    common = source + ["--profile", "ci", "-E", FILTER]
+    logs = Path(os.environ["RUNNER_TEMP"]) / "ci-logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    inventory = subprocess.run(["cargo", "nextest", "list", *common, "--message-format", "json"],
+                               text=True, capture_output=True)
+    (logs / "doctor-removal-eight-inventory.json").write_text(inventory.stdout)
+    (logs / "doctor-removal-eight-inventory.stderr").write_text(inventory.stderr)
+    inventory.check_returncode()
+    selected = verify_inventory(json.loads(inventory.stdout))
+    command = ["cargo", "nextest", "run", *common, "--retries", "0", "--test-threads", "1",
+               "--status-level", "pass", "--final-status-level", "fail", "--no-tests", "fail"]
+    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    (logs / "doctor-removal-eight.log").write_text(result.stdout)
+    print(result.stdout, end="", flush=True)
+    proof = {"revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+             "command": command, "selected": selected, "selected_count": len(selected),
+             "exit_code": result.returncode, "terminal_statuses": terminal_statuses(result.stdout),
+             "executed": [], "executed_count": None, "success": False}
+    try:
+        proof["executed"] = verify_result(result.stdout, result.returncode)
+        proof["executed_count"] = len(proof["executed"])
+        proof["success"] = True
+    finally:
+        (logs / "doctor-removal-eight-result.json").write_text(json.dumps(proof, indent=2) + "\n")
+    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
+        stream.write("Retained removal: exactly 8 named controls selected/executed/passed; no retries.\n")
+
+
+if __name__ == "__main__":
+    main()
