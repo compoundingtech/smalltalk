@@ -367,7 +367,8 @@ const styles = stylex.create({
   brand: { height: g.band, paddingInline: s.lg, display: 'flex', alignItems: 'center', gap: s.md, flexShrink: 0 },
   iconButton: { width: 28, height: 28, display: 'inline-flex', justifyContent: 'center', alignItems: 'center', backgroundColor: 'transparent', color: c.fgMuted, borderWidth: 0, borderRadius: 6, cursor: 'pointer' },
   textButton: { padding: '4px 8px', backgroundColor: 'transparent', color: c.fgMuted, borderWidth: 0, borderRadius: 6, cursor: 'pointer', fontSize: t.metaSize },
-  search: { marginInline: s.md, padding: s.md, borderRadius: 8, backgroundColor: c.raised, flexShrink: 0 },
+  // Message fill plus a hairline: raised equals the sidebar surface in light mode.
+  search: { marginInline: s.md, padding: `calc(${s.md} - ${g.hairline})`, borderRadius: 8, borderWidth: g.hairline, borderStyle: 'solid', borderColor: c.border, backgroundColor: c.message, flexShrink: 0 },
   searchInput: { width: '100%', minWidth: 0, borderWidth: 0, outline: 'none', backgroundColor: 'transparent', color: c.fg, fontSize: t.metaSize },
   roster: { display: 'flex', flexDirection: 'column', overflowY: 'auto', padding: s.md, minHeight: 0, flexGrow: 1, gap: 2 },
   footer: { height: 40, display: 'flex', alignItems: 'center', gap: s.md, paddingInline: s.lg, flexShrink: 0 },
