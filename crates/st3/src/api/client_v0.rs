@@ -25,7 +25,10 @@ pub(super) async fn request_latency(
     Extension(session): Extension<ClientSession>,
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
-    Ok(Json(json!({ "routes": super::request_latency_snapshot() })))
+    Ok(Json(json!({
+        "routes": super::request_latency_snapshot(),
+        "cost_counters": crate::profile::cost_snapshot(),
+    })))
 }
 
 // A client holds one socket for all its current collection views. A subscription
@@ -10556,6 +10559,21 @@ pub(super) async fn action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_latency_keeps_scope_and_routes_with_a_memory_only_cost_snapshot() {
+        let mut session = ClientSession::for_tests("person/ada", "person/ada", "local");
+        assert_eq!(request_latency(Extension(session.clone())).await.unwrap_err().status, StatusCode::FORBIDDEN);
+        session.scopes.insert("read.projections".into());
+        let work = smallclaims::sqlite::work::SqliteWorkScope::start();
+        let Json(value) = request_latency(Extension(session)).await.unwrap();
+        assert_eq!(work.finish(), smallclaims::sqlite::work::SqliteWork::default(), "the counter handler must not execute SQLite statements");
+        assert!(value["routes"].is_array());
+        assert!(value["cost_counters"]["state"].is_string());
+        assert!(value["cost_counters"]["as_of_unix_ms"].is_number());
+        assert!(value["cost_counters"].get("window").is_some());
+    }
+
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
 

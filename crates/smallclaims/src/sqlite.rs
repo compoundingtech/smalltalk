@@ -17,6 +17,8 @@ use crate::read_budget::ReadBudget;
 mod read_lifetime;
 pub mod writer_budget;
 mod transaction_finalizer;
+#[cfg(test)]
+mod managed_commit_counter_tests;
 mod writer_queue;
 
 #[cfg(test)]
@@ -819,6 +821,10 @@ fn run_write_batch(
         (None, None) => unreachable!("a batch without a transaction failed to begin"),
     };
     drop(transaction_timer);
+    // Observe COMMIT before post-commit callbacks can unwind; no changed-row or ACK claim.
+    if committed.is_ok() {
+        crate::profile::managed_commit_succeeded();
+    }
     if let Ok(index) = current_index(connection) {
         committed_index.store(index, Ordering::Release);
     }
