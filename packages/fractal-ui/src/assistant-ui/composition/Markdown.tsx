@@ -159,7 +159,7 @@ const CodeBlock = React.memo(function CodeBlock({ code, language }: { code: stri
       <Button aria-label="Wrap code" aria-pressed={wrap} onPress={() => setWrap(value => !value)} {...stylex.props(styles.codeButton, wrap && styles.codeButtonSelected)}>Wrap</Button>
       <Button aria-label="Copy code" isDisabled={copy.tag === 'copying'} onPress={copyCode} {...stylex.props(styles.codeButton)}>{copy.tag === 'copying' ? 'Copying…' : copiedCurrentCode ? 'Copied' : 'Copy'}</Button>
     </div>
-    <pre data-testid="markdown-code" {...stylex.props(styles.codePre, wrap && styles.codeWrapped)}><code {...stylex.props(styles.codeText)}><HighlightedSource code={code} language={language} /></code></pre>
+    <pre data-testid="markdown-code" role="group" aria-label={`Code, ${language || 'text'}`} tabIndex={0} {...stylex.props(styles.codePre, wrap && styles.codeWrapped)}><code {...stylex.props(styles.codeText)}><HighlightedSource code={code} language={language} /></code></pre>
     <span role="status" {...stylex.props(copy.tag === 'failed' && styles.copyStatus)}>{copy.tag === 'failed' ? 'Could not copy code. Check clipboard permissions and try again.' : <VisuallyHidden><span>{copiedCurrentCode ? 'Code copied.' : copy.tag === 'copied' ? 'Code has changed since the last copy.' : ''}</span></VisuallyHidden>}</span>
   </div>
 })
@@ -318,7 +318,7 @@ const styles = stylex.create({
   codeLanguage: { flexGrow: 1, minWidth: 0, overflowWrap: 'anywhere', fontFamily: t.fontMono, fontSize: t.metaSize, color: textColor.fgMuted },
   codeButton: { flexShrink: 0, minHeight: g.controlSm, paddingInline: s.sm, borderWidth: g.hairline, borderStyle: 'solid', borderColor: surface.transparent, borderRadius: r.sm, backgroundColor: surface.transparent, color: textColor.fgSoft, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':hover': { backgroundColor: surface.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: g.focusOffset }, ':disabled': { cursor: 'default', color: textColor.fgMuted } },
   codeButtonSelected: { backgroundColor: surface.rowActive, borderColor: border.borderStrong, color: textColor.fg },
-  codePre: { margin: 0, padding: s.md, overflowX: 'auto', whiteSpace: 'pre' },
+  codePre: { margin: 0, padding: s.md, overflowX: 'auto', whiteSpace: 'pre', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: `calc(-1 * ${g.focusRing})` } },
   codeWrapped: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' },
   copyStatus: { display: 'block', paddingInline: s.md, paddingBlock: s.xs, color: status.dangerFg, fontSize: t.metaSize, lineHeight: t.metaLeading },
   codeBlock: { minWidth: 0, maxWidth: '100%', margin: 0, marginBlockEnd: s.proseGap, backgroundColor: surface.codeBg, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.border, borderRadius: r.md, overflow: 'hidden' },
