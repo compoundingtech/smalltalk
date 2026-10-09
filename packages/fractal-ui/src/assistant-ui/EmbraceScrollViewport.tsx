@@ -5,28 +5,75 @@ import { FollowController } from './embrace-virtual/FollowController'
 import { FollowAffordance } from './embrace-virtual/FollowAffordance'
 import { returnAffordanceFocus } from './embrace-virtual/AffordancePosition'
 import { captureReadingAnchor, resolveReadingAnchor, type ReadingAnchor, type SavedReadingAnchor } from './embrace-virtual/ReadingAnchor'
+import { nextViewportStamp, observeViewportStamp } from './embrace-virtual/ViewportStamp'
+import { ViewportPublisher } from './embrace-virtual/ViewportPublisher'
 
 const rowSelector = '[data-item-id], [data-embrace-entry-id]'
 
-/** In-memory conversation position; reloads create a fresh store and open at the live edge. */
-export interface ViewportState { readonly top: number; readonly following: boolean; readonly unread: boolean; readonly anchor?: SavedReadingAnchor }
+/** Geometry and follow ownership, before the kit adds its position clock. */
+export interface ViewportPosition { readonly top: number; readonly following: boolean; readonly unread: boolean; readonly anchor?: SavedReadingAnchor }
+/** Portable browser-local position. The kit owns the monotonic wall-clock stamp. */
+export interface ViewportState extends ViewportPosition { readonly updatedAt: number }
 
 /** Per-surface memory, bounded to the last 100 conversations; owners drop closed keys. */
 export class ViewportStore {
   private readonly states = new Map<string, ViewportState>()
   private disposed = false
+  private readonly listeners = new Set<() => void>()
+  private readonly viewports = new Map<() => ViewportState, string>()
   get size(): number { return this.states.size }
   get(key: string): ViewportState | undefined { return this.states.get(key) }
-  save(key: string, state: ViewportState): void {
+  save(key: string, position: ViewportPosition | ViewportState): void {
     if (this.disposed) return
+    const state = 'updatedAt' in position ? position : { ...position, updatedAt: nextViewportStamp() }
+    this.merge(key, state, true)
+    this.notify()
+  }
+
+  /** Includes current mounted positions, even between throttled scroll notifications. */
+  snapshot(): ReadonlyArray<{ readonly key: string; readonly state: ViewportState }> {
+    if (this.disposed) return []
+    for (const [read, key] of this.viewports) this.merge(key, read(), true)
+    return Array.from(this.states, ([key, state]) => ({ key, state }))
+  }
+
+  /** Newer entries win. Mounted viewports only consume memory on a subsequent mount/activation. */
+  hydrate(entries: ReadonlyArray<{ readonly key: string; readonly state: ViewportState }>): void {
+    if (this.disposed) return
+    let changed = false
+    for (const entry of entries) changed = this.merge(entry.key, entry.state, false) || changed
+    if (changed) this.notify()
+  }
+
+  subscribe = (listener: () => void) => {
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+
+  /** @internal Active adapters supply geometry without subscribing the message subtree to memory. */
+  trackViewport(key: string, read: () => ViewportState) {
+    this.viewports.set(read, key)
+    return () => { this.viewports.delete(read) }
+  }
+
+  private merge(key: string, state: ViewportState, replaceEqual: boolean) {
+    const current = this.states.get(key)
+    if (current !== undefined && (current.updatedAt > state.updatedAt || !replaceEqual && current.updatedAt === state.updatedAt)) return false
+    observeViewportStamp(state.updatedAt)
     this.states.delete(key)
     this.states.set(key, state)
     if (this.states.size > 100) this.states.delete(this.states.keys().next().value!)
+    return true
   }
-  retain(keys: ReadonlySet<string>): void { for (const key of this.states.keys()) if (!keys.has(key)) this.states.delete(key) }
+  private notify() { for (const listener of this.listeners) listener() }
+  retain(keys: ReadonlySet<string>): void {
+    for (const key of this.states.keys()) if (!keys.has(key)) this.states.delete(key)
+    for (const [read, key] of this.viewports) if (!keys.has(key)) this.viewports.delete(read)
+    this.notify()
+  }
   open(): void { this.disposed = false }
   /** Parent-first teardown must ignore late saves from unmounting viewports. */
-  dispose(): void { this.disposed = true; this.states.clear() }
+  dispose(): void { this.disposed = true; this.states.clear(); this.viewports.clear(); this.listeners.clear() }
 }
 
 /** Viewports outside a store-owning surface keep memory only for their own mount. */
@@ -36,11 +83,13 @@ export const ViewportStoreContext = React.createContext<ViewportStore | undefine
 class ViewportController {
   private element: HTMLDivElement | null = null
   private jumpButton: HTMLButtonElement | null = null
+  private readonly publisher: ViewportPublisher
   private readonly follow = new FollowController({
     onStateChange: () => { this.dock() },
     onVisibilityChange: () => { this.dock() },
     onUserIntent: () => {
       this.pressedAnchor = undefined
+      this.publisher.readerIntent()
       this.pendingState = undefined
       if (this.frame !== undefined) cancelAnimationFrame(this.frame)
       this.frame = undefined
@@ -51,6 +100,7 @@ class ViewportController {
       this.lastTop = this.element.scrollTop
       if (this.follow.attached) this.anchor = undefined
       else this.capture()
+      this.publisher.readerScroll()
     },
     schedule: () => this.schedule(),
   })
@@ -66,16 +116,19 @@ class ViewportController {
   private pressedAnchor: { pointerId: number; element: HTMLElement; offset: number } | undefined
 
   constructor(saved?: ViewportState) {
+    this.publisher = new ViewportPublisher(() => this.released(true), saved)
     if (saved !== undefined && !saved.following) { this.pendingState = saved; this.follow.read() }
   }
 
+  readonly bindStore = (store?: ViewportStore, key?: string) => { this.publisher.bind(store, key) }
   readonly setRunning = this.follow.setRunning
-  readonly released = (): ViewportState => ({
-    top: this.lastTop, following: this.following, unread: this.follow.showJump,
+  readonly released = (active = false): ViewportState => ({
+    top: active ? this.element?.scrollTop ?? this.lastTop : this.lastTop, following: this.following, unread: this.follow.showJump, updatedAt: this.publisher.updatedAt,
     anchor: this.anchor === undefined ? undefined : { rowId: this.anchor.rowId, text: this.anchor.text, offset: this.anchor.offset },
   })
 
   readonly resume = (saved?: ViewportState) => {
+    this.publisher.restore(saved)
     this.anchor = undefined
     this.pressedAnchor = undefined
     this.pendingState = saved !== undefined && !saved.following ? saved : undefined
@@ -170,6 +223,7 @@ class ViewportController {
     this.pressedAnchor = undefined
     this.follow.jump(animate)
     this.dock()
+    this.publisher.reattach()
   }
   readonly activate = () => { this.jump(true) }
 
@@ -228,6 +282,7 @@ class ViewportController {
       page.removeEventListener('visibilitychange', hidden)
       view?.removeEventListener('blur', abandon)
       this.pressed.clear()
+      this.publisher.detach()
       this.pressedAnchor = undefined
       this.element = null
     }
@@ -257,13 +312,16 @@ export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({
   React.useLayoutEffect(() => {
     controller.setRunning(isRunning)
     if (stateKey !== previousKey.current) {
+      controller.bindStore()
       if (previousKey.current !== undefined) store?.save(previousKey.current, controller.released())
+      controller.bindStore(store, stateKey)
       previousKey.current = stateKey
       controller.resume(stateKey === undefined ? undefined : store?.get(stateKey))
-    } else if (scrollToBottomKey !== undefined && scrollToBottomKey !== previousCommand.current) {
-      // Following persists, so rows that commit after the command (the pending send) stay in view.
-      controller.jump()
-    } else if (previousItems.current !== items) controller.schedule()
+    } else {
+      controller.bindStore(store, stateKey)
+      if (scrollToBottomKey !== undefined && scrollToBottomKey !== previousCommand.current) controller.jump()
+      else if (previousItems.current !== items) controller.schedule()
+    }
     // A switch adopts its own command key; returning to a reading thread is not an own send.
     previousCommand.current = scrollToBottomKey
     previousItems.current = items

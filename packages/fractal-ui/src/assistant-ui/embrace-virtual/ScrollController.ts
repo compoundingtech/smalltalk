@@ -1,7 +1,8 @@
 import type { ListLayout } from 'react-aria-components'
-import type { ViewportState } from '../EmbraceScrollViewport'
+import type { ViewportState, ViewportStore } from '../EmbraceScrollViewport'
 import { FollowController } from './FollowController'
 import { captureReadingAnchor, resolveReadingAnchor, type ReadingAnchor } from './ReadingAnchor'
+import { ViewportPublisher } from './ViewportPublisher'
 
 type Row = { readonly id: string }
 
@@ -14,12 +15,14 @@ export class ScrollController {
   private frame: number | undefined
   private rowKeys = new Set<string>()
   private readonly follow: FollowController
+  private readonly publisher: ViewportPublisher
 
   constructor(private readonly options: {
     readonly layout: ListLayout<unknown>
     readonly saved?: ViewportState
     readonly onVisibilityChange: (visible: boolean) => void
   }) {
+    this.publisher = new ViewportPublisher(() => this.released(true), options.saved)
     this.follow = new FollowController({
       onStateChange: () => {
         if (this.follow.attached) this.anchor = undefined
@@ -27,6 +30,7 @@ export class ScrollController {
       },
       onVisibilityChange: () => this.options.onVisibilityChange(this.follow.showJump),
       onUserIntent: () => {
+        this.publisher.readerIntent()
         if (this.frame !== undefined) cancelAnimationFrame(this.frame)
         this.frame = undefined
         this.pending = undefined
@@ -36,26 +40,30 @@ export class ScrollController {
         if (this.element === null) return
         this.lastTop = this.element.scrollTop
         if (!this.follow.attached) this.anchor = captureReadingAnchor(this.element)
+        this.publisher.readerScroll()
       },
       schedule: () => this.schedule(),
     })
     if (options.saved !== undefined && !options.saved.following) { this.pending = options.saved; this.follow.read() }
   }
 
+  readonly bindStore = (store?: ViewportStore, key?: string) => { this.publisher.bind(store, key) }
   readonly setRunning = (running: boolean) => this.follow.setRunning(running)
-  readonly released = (): ViewportState => ({
-    top: this.element?.scrollTop ?? this.lastTop, following: this.follow.attached, unread: this.follow.showJump,
+  readonly released = (active = false): ViewportState => ({
+    top: active ? this.element?.scrollTop ?? this.lastTop : this.lastTop, following: this.follow.attached, unread: this.follow.showJump, updatedAt: this.publisher.updatedAt,
     anchor: this.anchor === undefined ? undefined : { rowId: this.anchor.rowId, text: this.anchor.text, offset: this.anchor.offset },
   })
   readonly jump = () => {
     this.anchor = undefined
     this.pending = undefined
     this.follow.jump()
+    this.publisher.reattach()
   }
   readonly activate = () => {
     this.anchor = undefined
     this.pending = undefined
     this.follow.jump(true)
+    this.publisher.reattach()
   }
 
   /** React 19 cleans up the ref when the actual RAC scroll element unmounts. */
@@ -72,6 +80,7 @@ export class ScrollController {
       this.lastTop = element.scrollTop
       detach()
       observer.disconnect()
+      this.publisher.detach()
       if (this.frame !== undefined) cancelAnimationFrame(this.frame)
       this.frame = undefined
       this.element = null

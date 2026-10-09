@@ -58,10 +58,11 @@ function VirtualConversationBody<T extends { readonly id: string }>({
   const [scroll] = React.useState(() => new ScrollController({ layout, saved: anchorKey === undefined ? undefined : store?.get(anchorKey), onVisibilityChange: setJumpVisible }))
   const previousCommand = React.useRef(scrollToBottomKey)
   React.useLayoutEffect(() => {
+    scroll.bindStore(store, anchorKey)
     scroll.setRunning(isRunning)
     if (scrollToBottomKey !== undefined && scrollToBottomKey !== previousCommand.current) scroll.jump()
     previousCommand.current = scrollToBottomKey
-  }, [scroll, scrollToBottomKey, isRunning])
+  }, [scroll, scrollToBottomKey, isRunning, store, anchorKey])
   React.useLayoutEffect(() => scroll.afterRowsChange(items), [scroll, items])
   React.useLayoutEffect(() => () => {
     if (anchorKey !== undefined) store?.save(anchorKey, scroll.released())
