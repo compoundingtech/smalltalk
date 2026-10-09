@@ -381,6 +381,102 @@ async fn refuses(state: &AppState, path: &str, code: &str) -> Value {
 }
 
 #[tokio::test]
+async fn detail_normal_admission_can_exceed_the_cumulative_source_budget() {
+    let _serial = SERIAL.acquire().await.unwrap();
+    use crate::store::observer_subscription_detail::MAX_DETAIL_SOURCE_BYTES;
+
+    fn source(kind: &str, padding: usize) -> String {
+        let locator = if kind == "observer" {
+            format!("/tmp/{}", "x".repeat(padding))
+        } else {
+            "/tmp/source".into()
+        };
+        let field = if kind == "subscription" {
+            format!("status-{}", "x".repeat(padding))
+        } else {
+            "status".into()
+        };
+        format!(
+            r#"version 2
+resource "watch/source" {{ kind "filesystem.file" }}
+observer "watch/source" {{
+ resource "resource/watch/source"; provider "local.file"; locator "{locator}"; field "status"
+}}
+subscription "watch/source" {{
+ observer "observer/watch/source"; to "agent/detail/worker"; on "{field}"; delivery "message"
+}}
+"#
+        )
+    }
+
+    for (collection, kind, subject) in [
+        ("observers", "observer", OBSERVER),
+        ("subscriptions", "subscription", SUBSCRIPTION),
+    ] {
+        let baseline =
+            crate::graph::parse_execution_intent(&source(kind, 0), "detail-test", "detail")
+                .unwrap();
+        let overhead = serde_json::to_vec(&baseline.subjects[subject].desired)
+            .unwrap()
+            .len();
+        for body_bytes in [
+            MAX_DETAIL_SOURCE_BYTES - 16 * 1024,
+            MAX_DETAIL_SOURCE_BYTES,
+            MAX_DETAIL_SOURCE_BYTES + 1,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let state = tests::test_state_named(root.path(), "detail-test");
+            let kdl = source(kind, body_bytes - overhead);
+            assert!(kdl.len() < 16 * 1024 * 1024);
+            let intent =
+                crate::graph::parse_execution_intent(&kdl, "detail-test", "detail").unwrap();
+            assert_eq!(
+                serde_json::to_vec(&intent.subjects[subject].desired)
+                    .unwrap()
+                    .len(),
+                body_bytes
+            );
+            // Use the normal parser and admission writer, with no projection SQL
+            // mutations or disabled triggers. Admission has no per-body 256 KiB cap.
+            state
+                .store
+                .apply_internal(&intent, "detail-normal-size-boundary")
+                .unwrap();
+            let connection = Connection::open(root.path().join("graph.db")).unwrap();
+            let stored_bytes: usize = connection
+                .query_row(
+                    "SELECT octet_length(body) FROM desired WHERE subject=?1",
+                    [subject],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored_bytes, body_bytes);
+            let expected = state
+                .store
+                .read_snapshot(|index| {
+                    // The old reader can render this normally admitted declaration.
+                    let snapshot = client_snapshot_at(&state, index);
+                    Ok(oracle(&state, kind, subject, &snapshot))
+                })
+                .unwrap();
+            assert_eq!(expected["id"], subject);
+            assert_eq!(expected["state"], "pending");
+            let path = format!("/v1/client/{collection}/{subject}");
+            if body_bytes < MAX_DETAIL_SOURCE_BYTES {
+                let (status, value) = get(&state, &path).await;
+                assert_eq!(status, StatusCode::OK, "{kind}: {status}");
+                assert_eq!(value["value"], expected);
+            } else {
+                // At exactly 256 KiB the body alone fits, but kind/revision/owner
+                // and snapshot bytes also consume the cumulative source budget.
+                let error = refuses(&state, &path, "projection-detail-too-large").await;
+                assert!(error["message"].as_str().unwrap().contains("source"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn detail_router_admits_timestamp_and_host_before_any_snapshot_construction() {
     let _serial = SERIAL.acquire().await.unwrap();
     let root = tempfile::tempdir().unwrap();
