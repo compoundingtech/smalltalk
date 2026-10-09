@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "A followed conversation finds its owner and transcript once per open rather than again on its first wait",
+  "replay": {"status": "none", "detail": "No claim admission or replay changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes or persistent state. The follower keeps its conversation mark in memory."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged; no coordinated member upgrade is required."},
+  "compatibility": {"status": "none", "detail": "Conversation frames, cursors, replay and relay are unchanged. A follower reuses the owner and transcript it found for one follow wait (10 seconds), as long as a single wait already reused them, then finds them again, so a harness that moves to a new transcript is still followed within the same bound."},
+  "downtime": {"status": "none", "detail": "No additional startup work or interruption beyond a normal daemon restart."},
+  "manual": {"status": "none", "detail": "No operator action or client configuration change is needed."},
+  "recovery": {"status": "none", "detail": "No persistent changes or new binary swap-back restrictions."}
+}
