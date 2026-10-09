@@ -89,7 +89,7 @@ export function CommandsProvider({ commands, platform = commandPlatform(), child
   }, [])
   return <Registry.Provider value={registry}><div ref={setPortalContainer} data-command-scope onCompositionStartCapture={() => { composing.current = true }} onCompositionEndCapture={() => { composing.current = false }} {...stylex.props(styles.scope)}>{children}
     <ModalOverlay UNSTABLE_portalContainer={portalContainer ?? undefined} isOpen={overlay !== null} onOpenChange={open => { if (!open) setOverlay(null) }} isDismissable {...stylex.props(styles.scrim)}><Modal {...stylex.props(styles.modal)}><Dialog aria-label={overlay === 'palette' ? 'Command palette' : 'Keyboard shortcuts'} {...stylex.props(styles.dialog)}>
-      <div {...stylex.props(styles.heading)}><Heading slot="title" {...stylex.props(styles.title)}>{overlay === 'palette' ? 'Command palette' : 'Keyboard shortcuts'}</Heading><Button aria-label="Close (Esc)" onPress={() => setOverlay(null)} {...stylex.props(styles.close)}>Esc</Button></div>
+      <div {...stylex.props(styles.heading)}><Heading slot="title" {...stylex.props(styles.title)}>{overlay === 'palette' ? 'Command palette' : 'Keyboard shortcuts'}</Heading><Button onPress={() => setOverlay(null)} {...stylex.props(styles.close)}>Close · Esc</Button></div>
       {overlay === 'palette' ? <CommandPalette registry={registry} /> : <ShortcutList registry={registry} />}
     </Dialog></Modal></ModalOverlay>
   </div></Registry.Provider>
@@ -106,8 +106,7 @@ function CommandPalette({ registry }: { readonly registry: CommandRegistry }) {
       {groups(registry.commands).map(([group, commands]) => <MenuSection key={group}><Header {...stylex.props(styles.group)}>{group}</Header>{commands.map(command => {
         const reason = commandDisabledReason(command)
         return <MenuItem key={command.id} id={command.id} textValue={command.label} className={state => stylex.props(styles.row, styles.menuRow, state.isFocused && styles.focused, state.isDisabled && styles.disabled).className ?? ''}>
-          <Text slot="label" {...stylex.props(styles.rowLabel)}><span>{command.label}</span>{' '}<Shortcut shortcut={command.shortcut} platform={registry.platform} /></Text>
-          {reason !== undefined && <Text slot="description" {...stylex.props(styles.reason)}>{reason}</Text>}
+          <Text slot="label"><span {...stylex.props(styles.rowLabel)}><span>{command.label}</span>{' '}<Shortcut shortcut={command.shortcut} platform={registry.platform} /></span>{reason !== undefined && <Text slot="description" {...stylex.props(styles.reason)}>{reason}</Text>}</Text>
         </MenuItem>
       })}</MenuSection>)}
     </Menu>
