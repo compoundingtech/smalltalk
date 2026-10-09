@@ -43,12 +43,16 @@ function PressStory({ scheme }: { scheme: Scheme }) {
     const index = next.current++
     setTurns(previous => [...previous, turn(index, undefined, answers[index % answers.length])])
   }, [])
+  const insertReply = React.useCallback(() => {
+    const index = next.current++
+    setTurns(previous => [...previous.slice(0, -1), turn(index, undefined, 'The visible rows are grouped and ready for review.  \nThe failed send keeps its original place.'), previous[previous.length - 1]!])
+  }, [])
   const retry = React.useCallback(() => setRetries(count => count + 1), [])
   // Same length, different words: a length-only revision would miss it.
   const reviseAnswer = React.useCallback(() => setTurns(replacing(historyTurn(23, { answer: [...answers[23 % answers.length]!].reverse().join('') }))), [])
   const attachResult = React.useCallback(() => setTurns(replacing(historyTurn(22, { tool: toolCall(22, 'export const rows = groupVisible(filter(rows))') }))), [])
   return <main data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><EmbraceRuntimeProvider options={options}>
-    <div {...stylex.props(styles.toolbar)}><Button onPress={republish} {...stylex.props(styles.button)}>Republish snapshot</Button><Button onPress={appendReply} {...stylex.props(styles.button)}>Append agent reply</Button><Button onPress={reviseAnswer} {...stylex.props(styles.button)}>Revise answer</Button><Button onPress={attachResult} {...stylex.props(styles.button)}>Attach tool result</Button><span>Retries <output data-testid="retry-count">{retries}</output></span></div>
+    <div {...stylex.props(styles.toolbar)}><Button onPress={republish} {...stylex.props(styles.button)}>Republish snapshot</Button><Button onPress={appendReply} {...stylex.props(styles.button)}>Append agent reply</Button><Button onPress={insertReply} {...stylex.props(styles.button)}>Insert reply above failed send</Button><Button onPress={reviseAnswer} {...stylex.props(styles.button)}>Revise answer</Button><Button onPress={attachResult} {...stylex.props(styles.button)}>Attach tool result</Button><span>Retries <output data-testid="retry-count">{retries}</output></span></div>
     <div {...stylex.props(styles.transcript)}><Transcript title="Row projection" turns={turns} sync={sync} now={now} observedAt={now - 8000} onRetrySend={retry} /></div>
   </EmbraceRuntimeProvider></main>
 }
@@ -175,6 +179,45 @@ export const ToolResultArrives: Story = { play: async ({ canvasElement }) => {
   await waitFor(() => expect(jump, 'tool result not marked unread').toBeVisible())
 } }
 export const ToolResultArrivesLight: Story = { ...ToolResultArrives, args: { scheme: 'light' } }
+
+/** A reply inserted above the last failed send must not move Retry away from the pointer. */
+export const InsertAbovePressedRow: Story = { play: async ({ canvasElement }) => {
+  const { viewport, canvas, jump, retries } = await ready(canvasElement)
+  const retry = canvas.getByRole('button', { name: 'Retry' })
+  const row = retry.closest<HTMLElement>('[data-testid="user-message"]')!
+  const top = row.getBoundingClientRect().top
+  const height = viewport.scrollHeight
+  await expect(viewport.scrollTop).toBeGreaterThan(viewport.clientHeight * 3)
+  await pressAcross(retry, async () => {
+    canvas.getByRole('button', { name: 'Insert reply above failed send' }).click()
+    await waitFor(() => expect(viewport.scrollHeight - height).toBeGreaterThan(80))
+    await settleFrames()
+    await expect(viewport.scrollHeight - height, 'reply should reproduce the roughly 107px insertion').toBeLessThan(140)
+    await expect(Math.abs(row.getBoundingClientRect().top - top), 'pressed row moved under the pointer').toBeLessThanOrEqual(1)
+    await expect(jump).not.toBeVisible()
+  })
+  await waitFor(() => expect(retries).toHaveTextContent('1'))
+  await settleFrames()
+  await expect(retries).toHaveTextContent('1')
+} }
+export const InsertAbovePressedRowLight: Story = { ...InsertAbovePressedRow, args: { scheme: 'light' } }
+
+/** Wheel scrolling during a press gives the reader ownership; compensation stays off. */
+export const ScrollDuringPress: Story = { play: async ({ canvasElement }) => {
+  const { viewport, canvas } = await ready(canvasElement)
+  const retry = canvas.getByRole('button', { name: 'Retry' })
+  pointer(retry, 'pointerdown', 1, 'mouse')
+  viewport.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }))
+  viewport.scrollTop -= 100
+  await settleFrames()
+  const row = retry.closest<HTMLElement>('[data-testid="user-message"]')!
+  const top = row.getBoundingClientRect().top
+  canvas.getByRole('button', { name: 'Insert reply above failed send' }).click()
+  await settleFrames()
+  await expect(row.getBoundingClientRect().top - top, 'press anchoring fought manual scrolling').toBeGreaterThan(80)
+  pointer(viewport, 'pointerup', 1, 'mouse')
+} }
+export const ScrollDuringPressLight: Story = { ...ScrollDuringPress, args: { scheme: 'light' } }
 
 const styles = stylex.create({
   root: { height: '100vh', width: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans },
