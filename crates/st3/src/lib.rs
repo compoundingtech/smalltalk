@@ -55,6 +55,7 @@ pub mod omp_ask_resume;
 // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 pub mod otlp;
 pub mod peer;
+pub mod permission_mode;
 pub mod placement;
 pub mod person_request;
 pub mod pricing;

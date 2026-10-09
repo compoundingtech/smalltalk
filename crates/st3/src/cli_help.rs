@@ -160,6 +160,14 @@ pub(super) fn agent_state(
     }
 }
 
+/// What to tell a person when a Claude seat is not in the permission mode it asked for, or `None`
+/// when the harness reason says nothing of the kind.
+pub(super) fn permission_mode_notice(reason: Option<&str>) -> Option<&'static str> {
+    (reason == Some(st_drivers::claude_session::PERMISSION_MODE_MISMATCH_REASON)).then_some(
+        "Claude is not in the permission mode this seat asked for. It started in Manual mode, so it will stop and ask before it acts. Claude falls back to Manual when its version, the model or an organisation policy rules the asked mode out (auto mode needs Claude Code 2.1.283 or newer and a supported model). Attach and press shift+tab to change mode, or create the seat again with --claude-permission-mode bypass.",
+    )
+}
+
 pub(super) fn agent_next_steps(subject: &str, actor: &str, state: &str) -> String {
     let subject = shell_argument(subject);
     let attach_actor = if actor.starts_with("person/") {

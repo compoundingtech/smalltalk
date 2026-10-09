@@ -5752,6 +5752,13 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         client_now_ms(),
     ));
     report.checks.push(reader_store.mailbox_wake_health());
+    // The mode new Claude seats get and where it came from. It is the daemon's own setting, read
+    // from memory, so this read starts no probe.
+    report.checks.push(DoctorCheck {
+        name: "claude-permission-mode".into(),
+        status: "pass".into(),
+        message: crate::permission_mode::effective_here().describe(),
+    });
     report.checks.push(descriptor_check());
     report.checks.push(reader_memory_check(
         reader_store.readers.usage(),

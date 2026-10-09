@@ -30,7 +30,7 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
                     && text
                         .strip_prefix(phrase)
                         .is_some_and(|tail| tail.is_empty() || tail.starts_with(" ·"))
-                    || ["? for shortcuts", "⏵⏵ bypass permissions on"]
+                    || ["? for shortcuts", "⏵⏵ bypass permissions on", "⏵⏵ auto mode on"]
                         .iter()
                         .any(|prefix| {
                             text.starts_with(prefix)

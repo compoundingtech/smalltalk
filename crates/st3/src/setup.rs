@@ -127,6 +127,10 @@ pub async fn run(args: SetupArgs) -> Result<PreparedSetup> {
     let existing_store = config.state_dir.join("node-identity.json").exists()
         || config.state_dir.join("claims.sqlite3").exists()
         || config.fleet.is_some();
+    // Only a brand new install gets the Claude permission mode written, and only into the new
+    // file. A config that exists, or state without a config, is never given the key: a missing
+    // key reads as bypass, which is what every existing install already runs.
+    let fresh_install = !path.try_exists()? && !existing_store;
 
     println!("Welcome to Smalltalk.");
     let default_person = config
@@ -185,7 +189,7 @@ pub async fn run(args: SetupArgs) -> Result<PreparedSetup> {
         )?
     };
     // Validate every answer before writing, including the persisted machine identity.
-    merge_config(&path, &config)?;
+    merge_config(&path, &config, fresh_install)?;
     println!("Saved {}", path.display());
     if let Some(kib) = crate::read_cache::override_kib() {
         println!("Read cache: {kib} KiB per reader.");
@@ -221,12 +225,39 @@ pub async fn run(args: SetupArgs) -> Result<PreparedSetup> {
         );
         None
     };
-    println!("Your agents run without permission prompts inside their own workspaces.");
+    println!(
+        "{}",
+        permission_notice(
+            harness.as_deref(),
+            crate::permission_mode::Effective::resolve(
+                config.claude_permission_mode.or(fresh_install.then_some(crate::permission_mode::PermissionMode::Auto)),
+            ),
+        )
+    );
     Ok(PreparedSetup {
         config,
         harness,
         initial_subject,
     })
+}
+
+/// What setup tells the person about how the seats it creates are allowed to act.
+fn permission_notice(
+    harness: Option<&str>,
+    permission: crate::permission_mode::Effective,
+) -> String {
+    use crate::permission_mode::{KEY, PermissionMode, Source};
+    match harness {
+        Some("codex") => "Codex seats run in a workspace sandbox, and Codex reviews anything the sandbox blocks before it asks you.".into(),
+        Some("pi" | "omp" | "opencode") => {
+            "Your agents run without permission prompts inside their own workspaces.".into()
+        }
+        _ => match (permission.mode, permission.source) {
+            (PermissionMode::Auto, _) => format!("Claude seats run in auto mode: Claude's own classifier reviews each action, and a seat stops to ask after repeated blocks. To run them without permission prompts instead, set {KEY} = \"bypass\" in config.toml."),
+            (PermissionMode::Bypass, Source::Missing) => format!("Claude seats run without permission prompts inside their own workspaces, as before: {KEY} is missing in config.toml and st does not add it. To use auto mode, set {KEY} = \"auto\"."),
+            (PermissionMode::Bypass, Source::Config) => format!("Claude seats run without permission prompts inside their own workspaces ({KEY} = \"bypass\"). To use auto mode, set {KEY} = \"auto\" in config.toml."),
+        },
+    }
 }
 
 async fn prepare_harness(
@@ -480,12 +511,17 @@ fn ask_bool(
     }
 }
 
-fn merge_config(path: &Path, config: &Config) -> Result<()> {
+/// Save the person and node setup chose. `fresh_install` is true only when this call creates the
+/// config of an install with no state, and only then does the new file get
+/// `claude_permission_mode = "auto"`: an existing config is never given the key, and one that
+/// setup would not change is left byte for byte as it was.
+fn merge_config(path: &Path, config: &Config, fresh_install: bool) -> Result<()> {
     let mut table = match fs::read_to_string(path) {
         Ok(text) => toml::from_str::<toml::Table>(&text).context("parse existing setup config")?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
         Err(error) => return Err(error).context("read existing setup config"),
     };
+    let original = table.clone();
     table.insert(
         "person".into(),
         config
@@ -495,6 +531,15 @@ fn merge_config(path: &Path, config: &Config) -> Result<()> {
             .into(),
     );
     table.insert("node".into(), config.node.clone().into());
+    if fresh_install {
+        table.insert(
+            crate::permission_mode::KEY.into(),
+            crate::permission_mode::PermissionMode::Auto.as_str().into(),
+        );
+    }
+    if table == original && path.try_exists()? {
+        return Ok(());
+    }
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -816,7 +861,7 @@ mod tests {
             node: "studio".into(),
             ..Config::default()
         };
-        merge_config(&path, &config)?;
+        merge_config(&path, &config, false)?;
         let merged: toml::Table = toml::from_str(&fs::read_to_string(&path)?)?;
         assert_eq!(merged["person"].as_str(), Some("person/ada"));
         assert_eq!(merged["node"].as_str(), Some("studio"));
@@ -824,7 +869,7 @@ mod tests {
         assert_eq!(merged["planner"]["model"].as_str(), Some("example-model"));
         assert_eq!(merged["observations"]["retention"].as_str(), Some("2d"));
         let bytes = fs::read(&path)?;
-        merge_config(&path, &config)?;
+        merge_config(&path, &config, false)?;
         assert_eq!(fs::read(&path)?, bytes);
         Ok(())
     }

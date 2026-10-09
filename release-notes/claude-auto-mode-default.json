@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A new install's setup writes claude_permission_mode = \"auto\" into its new config.toml. Existing installs are unchanged.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay. The setting is read from config.toml when the daemon starts and when a Claude seat is created."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and fleet coordination are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Nothing changed for you if you run bypass today: a config.toml without claude_permission_mode reads as bypass, so new Claude seats still start with --dangerously-skip-permissions, and seats that already exist keep the arguments they were declared with. st never adds or rewrites the key in a config that exists, on upgrade, setup re-run, doctor, repair or service install and uninstall. A seat created with auto passes --permission-mode auto, needs Claude Code 2.1.283 or newer and a supported model, and is shown as not in the mode it asked for when Claude falls back to Manual."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No restart is needed to keep the current behavior."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "To move to auto on purpose, add claude_permission_mode = \"auto\" to your own config.toml and restart the daemon; st doctor then prints \"auto: set in config.toml\". One seat can differ with st agents new --claude-permission-mode auto|bypass."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Remove the key, or set it to bypass, to return to the previous behavior; no stored data changes."
+  }
+}

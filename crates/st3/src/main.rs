@@ -3477,6 +3477,11 @@ struct AgentNewArgs {
     /// What the agent is for.
     #[arg(long)]
     description: Option<String>,
+    /// Permission mode of a Claude seat: `auto` (Claude's classifier reviews each action) or
+    /// `bypass` (no permission prompts). Without it `claude_permission_mode` in config.toml
+    /// decides, and a missing key means bypass; `st doctor` says which.
+    #[arg(long, value_enum)]
+    claude_permission_mode: Option<st3::permission_mode::PermissionMode>,
     /// Attach this terminal to the agent once it is ready. Detach with Ctrl+\.
     #[arg(long, conflicts_with = "print_kdl")]
     attach: bool,
@@ -5881,6 +5886,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     validate_unix_socket_path(&config.socket, "--socket")?;
     validate_unix_socket_path(&config.client_gateway_socket, "--client-gateway-socket")?;
     fs::create_dir_all(&config.state_dir)?;
+    st3::permission_mode::configure(config.claude_permission_mode);
     let startup = Arc::new(st3::startup::Startup::begin(&config.socket)?);
     startup.phase("install-hooks");
     st3::hooks::ensure_installed(&st3::hooks::root(&config.state_dir)).context(
@@ -13060,7 +13066,12 @@ fn agent_start_document(
 #[cfg(test)]
 use st3::creation::CLAUDE_SEAT_SETTINGS;
 
-fn agent_new_document(args: &AgentNewArgs, workspace: &str, create_workspace: bool) -> String {
+fn agent_new_document(
+    args: &AgentNewArgs,
+    workspace: &str,
+    create_workspace: bool,
+    claude_mode: st3::permission_mode::PermissionMode,
+) -> String {
     let parameters = st3_client::AgentCreateParameters {
         name: args.name.clone(),
         harness: args.harness.clone(),
@@ -13079,7 +13090,26 @@ fn agent_new_document(args: &AgentNewArgs, workspace: &str, create_workspace: bo
         .message
         .as_ref()
         .map(|_| uuid::Uuid::now_v7().to_string());
-    st3::creation::agent_document(&parameters, workspace, create_workspace, key.as_deref())
+    st3::creation::agent_document(
+        &parameters,
+        workspace,
+        create_workspace,
+        key.as_deref(),
+        claude_mode,
+    )
+}
+
+/// The mode a new Claude seat gets: `--claude-permission-mode`, else `claude_permission_mode` in
+/// config.toml, else bypass. A seat of another harness has no Claude mode.
+fn agent_new_permission_mode(args: &AgentNewArgs) -> Result<st3::permission_mode::PermissionMode> {
+    if let Some(mode) = args.claude_permission_mode {
+        return Ok(mode);
+    }
+    if args.harness != "claude" {
+        return Ok(st3::permission_mode::Effective::MISSING);
+    }
+    let config = Config::load_unvalidated(None)?;
+    Ok(st3::permission_mode::Effective::resolve(config.claude_permission_mode).mode)
 }
 
 async fn run_agent_new(
@@ -13120,7 +13150,8 @@ async fn run_agent_new(
     let timeout = parse_timeout(&args.timeout)?;
     let (workspace, create_workspace) =
         agent_new_workspace(&client, endpoint, &args, person).await?;
-    let kdl = agent_new_document(&args, &workspace, create_workspace);
+    let claude_mode = agent_new_permission_mode(&args)?;
+    let kdl = agent_new_document(&args, &workspace, create_workspace, claude_mode);
     if args.print_kdl {
         print!("{kdl}");
         return Ok(());
@@ -13181,7 +13212,9 @@ async fn run_agent_new(
         Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => {}
         Err(error) => return Err(error.into()),
     }
-    if actor.starts_with("person/") {
+    // The client create action takes no permission mode: the daemon applies its own default. A
+    // seat that names its mode is published as the declaration printed above instead.
+    if actor.starts_with("person/") && args.claude_permission_mode.is_none() {
         let generated = generated_client(endpoint, Some(&actor))?;
         let capabilities = generated.capabilities().await?;
         let nonce = uuid::Uuid::now_v7().simple().to_string();
@@ -13382,7 +13415,14 @@ async fn wait_for_agent_harness(
             *latest = Some(agent.clone());
             let harness = agent.harness_state.as_deref().unwrap_or("not ready");
             match agent.state.as_str() {
-                "running" => return Ok(agent),
+                "running" => {
+                    if !json_output
+                        && let Some(notice) = cli_help::permission_mode_notice(agent.reason.as_deref())
+                    {
+                        eprintln!("{subject}: {notice}");
+                    }
+                    return Ok(agent);
+                }
                 "waiting" if attach && agent.reachability == "reachable" => return Ok(agent),
                 "waiting" if agent.reachability == "reachable" => anyhow::bail!(
                     "`{subject}` started and is waiting for your input; attach with `st terminals attach {subject}`"
@@ -14297,6 +14337,9 @@ fn render_client_agent(
 
     if let Some(fault) = &agent.fault {
         let _ = writeln!(output, "FAULT        {fault}");
+    }
+    if let Some(notice) = cli_help::permission_mode_notice(agent.reason.as_deref()) {
+        let _ = writeln!(output, "MODE         {notice}");
     }
     if let Some(handoff) = &agent.handoff {
         let pending = if handoff.pending_sources.is_empty() { String::new() }
@@ -28722,7 +28765,7 @@ mod tests {
             "example/parser",
             "--remove-at-run-end",
         ]);
-        let source = agent_new_document(&args, "/work/parser", true);
+        let source = agent_new_document(&args, "/work/parser", true, st3::permission_mode::PermissionMode::Bypass);
         let document: KdlDocument = source.parse().unwrap();
         let body = document.get("agent").unwrap().children().unwrap();
         let checkout = body.get("checkout").unwrap();
@@ -28736,7 +28779,7 @@ mod tests {
         );
         assert!(body.get("workspace").unwrap().get("create").is_none());
         let args = agent_new_args(&["parser", "--workspace", "/work/plain"]);
-        let source = agent_new_document(&args, "/work/plain", true);
+        let source = agent_new_document(&args, "/work/plain", true, st3::permission_mode::PermissionMode::Bypass);
         let intent = st3::graph::parse_intent(&source, "example").unwrap();
         assert_eq!(
             intent
@@ -28783,7 +28826,7 @@ mod tests {
             normalize_member_subject("terminal/agent/test.worker", "pty"),
             "agent/test.worker"
         );
-        let source = agent_new_document(&args, "/tmp", false);
+        let source = agent_new_document(&args, "/tmp", false, st3::permission_mode::PermissionMode::Bypass);
         let intent = st3::graph::parse_intent(&source, "test").unwrap();
         assert!(intent.subjects.values().next().unwrap().member.is_some());
         let cli = Cli::try_parse_from([
@@ -28825,6 +28868,17 @@ mod tests {
     }
 
     #[test]
+    fn agents_new_names_its_claude_mode_per_seat_and_defaults_to_bypass_without_the_key() {
+        use st3::permission_mode::PermissionMode::{Auto, Bypass};
+        let args = agent_new_args(&["site", "--claude-permission-mode", "auto"]);
+        assert_eq!(agent_new_permission_mode(&args).unwrap(), Auto);
+        assert!(agent_new_document(&args, "/srv/site", true, Auto).contains("auto"));
+        let args = agent_new_args(&["site", "--claude-permission-mode", "bypass"]);
+        assert_eq!(agent_new_permission_mode(&args).unwrap(), Bypass);
+        assert!(Cli::try_parse_from(["st3", "agents", "new", "site", "--claude-permission-mode", "plan"]).is_err());
+    }
+
+    #[test]
     fn a_new_claude_agent_is_the_fleet_claude_seat() {
         let args = agent_new_args(&[
             "site",
@@ -28839,7 +28893,7 @@ mod tests {
             "--attach",
         ]);
         assert!(args.attach && args.actor.is_none() && args.workspace.is_none());
-        let kdl = agent_new_document(&args, "/home/example/st/agents/site", true);
+        let kdl = agent_new_document(&args, "/home/example/st/agents/site", true, st3::permission_mode::PermissionMode::Bypass);
         assert!(kdl.contains(r#"workspace "/home/example/st/agents/site" create=#true"#));
         let intent = st3::parse_intent(&kdl, "laptop").unwrap();
         let seat = &intent.subjects["agent/builder.site"];
@@ -28897,7 +28951,7 @@ mod tests {
             "person/avery",
         ]);
         assert_eq!(args.actor.as_deref(), Some("person/avery"));
-        let kdl = agent_new_document(&args, "/srv/example", false);
+        let kdl = agent_new_document(&args, "/srv/example", false, st3::permission_mode::PermissionMode::Bypass);
         assert!(!kdl.contains("create="));
         assert!(!kdl.contains("host "));
         let intent = st3::parse_intent(&kdl, "laptop").unwrap();

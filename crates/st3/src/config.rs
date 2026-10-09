@@ -44,6 +44,11 @@ pub struct Config {
     /// What this node does when an account nears its weekly limit. Off unless enabled.
     #[serde(skip_serializing_if = "LimitsConfig::is_default")]
     pub limits: LimitsConfig,
+    /// The permission mode of the Claude seats st creates: `auto` or `bypass`. A brand new
+    /// install's setup writes `auto`; a config without the key reads as `bypass`, and st never
+    /// adds the key to a config that exists. A seat declared with its own `args` is never changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_permission_mode: Option<crate::permission_mode::PermissionMode>,
     /// `STATE/fleet/fleet.toml`, merged by `apply_fleet_file` after command-line overrides.
     #[serde(skip)]
     pub fleet: Option<FleetFile>,
@@ -216,6 +221,7 @@ impl Default for Config {
             github: GithubConfig::default(),
             checkpoint: CheckpointConfig::default(),
             limits: LimitsConfig::default(),
+            claude_permission_mode: None,
             fleet: None,
         }
     }

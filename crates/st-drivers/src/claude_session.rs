@@ -160,6 +160,9 @@ pub fn run_controlled_paths(
         (SESSION_SEQ_ENV.to_string(), observer.seq().to_string()),
         ("ST_CLAUDE_IDENTITY".to_string(), identity.clone()),
     ];
+    if let Some(asked) = asked_permission_mode(&claude_argv) {
+        env.push((PERMISSION_MODE_ASKED_ENV.to_string(), asked.to_string()));
+    }
     env.extend(paths.environment(&identity));
     // An st3 seat never carries an st2 residency fence, so an inherited one must not reach hooks.
     run_provider_with_env_removals(
@@ -544,6 +547,49 @@ pub const SESSION_SEQ_ENV: &str = "ST_CLAUDE_SESSION_SEQ";
 pub const EXPECTED_NATIVE_SESSION_ENV: &str = "ST_CLAUDE_EXPECTED_NATIVE_SESSION";
 /// The cold residency generation whose SessionStart must prove the exact native session.
 pub const RESUME_GENERATION_ENV: &str = "ST_CLAUDE_RESUME_GENERATION";
+/// The permission mode this seat's launch arguments asked for (`auto` or `bypass`), exported so a
+/// hook can say when Claude started in another one. Absent for a seat that asked for neither.
+pub const PERMISSION_MODE_ASKED_ENV: &str = "ST_CLAUDE_PERMISSION_MODE_ASKED";
+/// The harness reason of a seat running in a mode other than the one it asked for.
+pub const PERMISSION_MODE_MISMATCH_REASON: &str = "permissionModeMismatch";
+
+/// The permission mode a Claude launch argv asks for: `auto` for `--permission-mode auto`,
+/// `bypass` for `--dangerously-skip-permissions` or `--permission-mode bypassPermissions`.
+pub fn asked_permission_mode(argv: &[String]) -> Option<&'static str> {
+    let mut asked = None;
+    let mut iter = argv.iter().map(String::as_str);
+    while let Some(argument) = iter.next() {
+        match argument {
+            "--dangerously-skip-permissions" => asked = Some("bypass"),
+            "--permission-mode" => {
+                asked = match iter.next() {
+                    Some("auto") => Some("auto"),
+                    Some("bypassPermissions") => Some("bypass"),
+                    _ => None,
+                }
+            }
+            _ => {}
+        }
+    }
+    asked
+}
+
+/// Whether a hook payload shows Claude in a different permission mode than the seat asked for.
+/// Claude starts in Manual (`default`) without a word when its version, the model or an
+/// organisation policy rules the asked mode out. A payload that names no mode proves nothing.
+pub fn permission_mode_mismatch(asked: Option<&str>, payload: &serde_json::Value) -> bool {
+    let Some(actual) = payload
+        .get("permission_mode")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    match asked {
+        Some("auto") => actual != "auto",
+        Some("bypass") => actual != "bypassPermissions",
+        _ => false,
+    }
+}
 
 const BINDING_SCHEMA: &str = "st.claude-session-binding.v1";
 const CHECKPOINT_SCHEMA: &str = "st.claude-residency-checkpoint.v1";
@@ -1429,6 +1475,14 @@ fn observe_payload(
     if let Some(edge) = provider_auth_edge(event, &payload) {
         observation.provider_auth = Some(edge == ProviderAuthEdge::Accepted);
     }
+    // A seat that asked for a permission mode and is in another one says so in its reason instead
+    // of reading as an ordinary ready seat. The reason clears with the next event in the right
+    // mode. A reason that already names something more urgent stays.
+    if permission_mode_mismatch(var(PERMISSION_MODE_ASKED_ENV).as_deref(), &payload)
+        && matches!(observation.reason.as_deref(), None | Some("sessionStart"))
+    {
+        observation.reason = Some(PERMISSION_MODE_MISMATCH_REASON.to_string());
+    }
     let mut writer = observe_writer(
         agent_dir,
         identity,
@@ -2044,6 +2098,63 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn a_launch_names_the_permission_mode_it_asks_for() {
+        let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert_eq!(asked_permission_mode(&argv(&["claude", "--permission-mode", "auto"])), Some("auto"));
+        assert_eq!(asked_permission_mode(&argv(&["claude", "--dangerously-skip-permissions"])), Some("bypass"));
+        assert_eq!(
+            asked_permission_mode(&argv(&["claude", "--permission-mode", "bypassPermissions"])),
+            Some("bypass")
+        );
+        assert_eq!(asked_permission_mode(&argv(&["claude", "--permission-mode", "plan"])), None);
+        assert_eq!(asked_permission_mode(&argv(&["claude", "--model", "opus"])), None);
+    }
+
+    #[test]
+    fn claude_in_manual_mode_is_a_mismatch_for_a_seat_that_asked_for_auto() {
+        let mode = |mode: &str| serde_json::json!({"hook_event_name": "UserPromptSubmit", "permission_mode": mode});
+        assert!(permission_mode_mismatch(Some("auto"), &mode("default")));
+        assert!(!permission_mode_mismatch(Some("auto"), &mode("auto")));
+        assert!(permission_mode_mismatch(Some("bypass"), &mode("default")));
+        assert!(!permission_mode_mismatch(Some("bypass"), &mode("bypassPermissions")));
+        // No ask, or a payload that names no mode, proves nothing.
+        assert!(!permission_mode_mismatch(None, &mode("default")));
+        assert!(!permission_mode_mismatch(Some("auto"), &serde_json::json!({})));
+    }
+
+    #[test]
+    fn a_seat_that_fell_back_to_manual_records_why_in_its_harness_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hook = |event: &str, mode: &str, asked: &str| {
+            let var = |name: &str| match name {
+                SESSION_ENV => Some("wrapper-1".to_string()),
+                SESSION_SEQ_ENV => Some("1".to_string()),
+                PERMISSION_MODE_ASKED_ENV => Some(asked.to_string()),
+                _ => None,
+            };
+            observe_payload(
+                tmp.path(),
+                tmp.path(),
+                false,
+                "worker",
+                Some("worker"),
+                event,
+                &serde_json::json!({"session_id": "s1", "permission_mode": mode}).to_string(),
+                &var,
+            )
+            .unwrap();
+            harness_state::read(&harness_state::harness_state_path(tmp.path()), None).unwrap().reason
+        };
+        // Asked for auto, Claude is in Manual: the reason says so.
+        assert_eq!(
+            hook("UserPromptSubmit", "default", "auto").as_deref(),
+            Some(PERMISSION_MODE_MISMATCH_REASON)
+        );
+        // The next event in the asked mode clears it.
+        assert_eq!(hook("Stop", "auto", "auto"), None);
+    }
     use crate::harness_state::harness_state_path;
     use crate::provider_session::run_provider;
 

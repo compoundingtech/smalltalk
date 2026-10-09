@@ -8454,11 +8454,14 @@ async fn create_agent(
             "workspace must be absolute on the selected host",
         ));
     }
+    // Only a Claude seat has a mode; a missing `claude_permission_mode` reads as bypass.
+    let claude_mode = crate::permission_mode::effective_here().mode;
     let kdl = crate::creation::agent_document(
         &parameters,
         &workspace,
         true,
         Some(&creation_key(session, request)),
+        claude_mode,
     );
     Ok(vec![
         publish_creation(state, snapshot, session, request, kdl, "agent").await?,

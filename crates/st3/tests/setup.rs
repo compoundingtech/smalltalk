@@ -350,6 +350,95 @@ esac
     }
 }
 
+const CLAUDE_MODE_KEY: &str = "claude_permission_mode";
+
+#[test]
+fn a_brand_new_install_gets_auto_written_into_its_new_config() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let config = fixture.path("home/.config/st3/config.toml");
+    assert!(!config.exists());
+    let text = success(&fixture.setup_config_only(&[]));
+    let table: toml::Table = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(table[CLAUDE_MODE_KEY].as_str(), Some("auto"));
+    assert!(text.contains("Claude seats run in auto mode"), "{text}");
+    // Running setup again leaves the file as it is.
+    let bytes = fs::read(&config).unwrap();
+    success(&fixture.setup_config_only(&[]));
+    assert_eq!(fs::read(&config).unwrap(), bytes);
+}
+
+#[test]
+fn state_without_a_config_never_gets_the_key_and_reads_as_bypass() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let state = fixture.path("home/.local/state/st3");
+    fs::create_dir_all(&state).unwrap();
+    // Setup keeps the machine name an existing store already has; with no config that is the host's.
+    let host = st3::config::Config::default().node;
+    drop(st3::store::Store::open(&state.join("claims.sqlite3"), &host).unwrap());
+    let text = success(
+        &fixture
+            .cli()
+            .args(["setup", "--person", "ada", "--node", &host, "--yes"])
+            .args(["--install", "false", "--service", "false", "--start", "false"])
+            .output()
+            .unwrap(),
+    );
+    let table: toml::Table =
+        toml::from_str(&fs::read_to_string(fixture.path("home/.config/st3/config.toml")).unwrap())
+            .unwrap();
+    assert!(!table.contains_key(CLAUDE_MODE_KEY), "{table:?}");
+    assert!(text.contains("claude_permission_mode is missing in config.toml"), "{text}");
+}
+
+#[test]
+fn an_existing_config_without_the_key_is_left_byte_for_byte_by_every_command() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let config = fixture.path("home/.config/st3/config.toml");
+    // Comments, ordering and spacing that a re-serialisation would change.
+    let original = "# my st config\nnode   = 'studio'\nperson = 'person/ada'\n\n[observations]\n# keep a week\nretention = '7d'\n";
+    fs::write(&config, original).unwrap();
+    // Setup re-runs, with and without a store already in the state directory.
+    success(&fixture.setup_config_only(&[]));
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    let state = fixture.path("home/.local/state/st3");
+    fs::create_dir_all(&state).unwrap();
+    drop(st3::store::Store::open(&state.join("claims.sqlite3"), "studio").unwrap());
+    let text = success(&fixture.setup_config_only(&[]));
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    assert!(text.contains("claude_permission_mode is missing in config.toml"), "{text}");
+    // Service uninstall is another command that must not touch it.
+    let _ = fixture.cli().args(["service", "uninstall"]).output().unwrap();
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    // Nor do offline reads such as help and version.
+    for args in [&["--version"][..], &["agents", "new", "--help"][..]] {
+        let _ = fixture.cli().args(args).output().unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    }
+}
+
+#[test]
+fn an_existing_config_that_sets_the_key_keeps_it_and_names_it() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let config = fixture.path("home/.config/st3/config.toml");
+    let original = "node = 'studio'\nperson = 'person/ada'\nclaude_permission_mode = 'bypass'\n";
+    fs::write(&config, original).unwrap();
+    let text = success(&fixture.setup_config_only(&[]));
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    assert!(text.contains("claude_permission_mode = \"bypass\""), "{text}");
+}
+
 #[test]
 fn flags_merge_config_without_prompting_and_invalid_names_do_not_write() {
     let fixture = Fixture::new();
@@ -360,7 +449,8 @@ fn flags_merge_config_without_prompting_and_invalid_names_do_not_write() {
     )
     .unwrap();
     let text = success(&fixture.setup_config_only(&[]));
-    assert!(text.contains("without permission prompts"));
+    // A config that exists without the key is not given it, and the notice says what that means.
+    assert!(text.contains("claude_permission_mode is missing in config.toml"), "{text}");
     let bytes = fs::read_to_string(&config).unwrap();
     let table: toml::Table = toml::from_str(&bytes).unwrap();
     assert_eq!(table["person"].as_str(), Some("person/ada"));

@@ -34,7 +34,7 @@ impl Harness for Claude {
         let exact = logical_inputs.iter().any(|input| input == expected);
         let placeholder = logical_inputs.len() == 1
             && (logical_inputs[0].is_empty() || is_claude_idle_placeholder(&logical_inputs[0]));
-        let idle_footer = footer.contains("⏵⏵") && footer.contains("permissions on");
+        let idle_footer = idle_mode_footer(&footer);
         let blocked = interaction_blocked(screen.plain);
         if exact && idle_footer && !blocked {
             ReceiptState::RetainedSafe
@@ -46,6 +46,13 @@ impl Harness for Claude {
             ReceiptState::NotRetained
         }
     }
+}
+
+/// The mode marker of a composer that can take input: `⏵⏵ bypass permissions on`, or
+/// `⏵⏵ auto mode on` for a seat started with `--permission-mode auto`. Manual, accept-edits and
+/// plan footers are deliberately not idle: those modes may be waiting on a prompt.
+fn idle_mode_footer(footer: &str) -> bool {
+    footer.contains("⏵⏵") && (footer.contains("permissions on") || footer.contains("auto mode on"))
 }
 
 fn classify_claude_composer(
@@ -63,7 +70,7 @@ fn classify_claude_composer(
         && (logical_inputs[0].is_empty() || is_claude_idle_placeholder(&logical_inputs[0]));
     // The keybinding hint is runtime-composed and may be absent or remapped. The mode marker and
     // permission state are the stable safety signals; active/modal/changed states remain fail-closed.
-    let idle_footer = footer.contains("⏵⏵") && footer.contains("permissions on");
+    let idle_footer = idle_mode_footer(&footer);
     let blocked = interaction_blocked(plain);
     if exact {
         if idle_footer && !blocked {

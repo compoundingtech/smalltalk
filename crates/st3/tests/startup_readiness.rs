@@ -198,6 +198,21 @@ fn replay_is_visible_before_the_api_serves_and_stale_files_are_ignored() {
     let doctor = command(root).args(["doctor", "--json"]).output().unwrap();
     let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
     assert_eq!(report["startup"]["status"], "serving");
+    // The config names no `claude_permission_mode`, so new Claude seats read as bypass and doctor
+    // says that the key is missing rather than that anything was decided for this install.
+    let mode = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "claude-permission-mode")
+        .unwrap_or_else(|| panic!("doctor reports the Claude permission mode: {report}"));
+    assert!(
+        mode["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("bypass: the key is missing in config.toml"),
+        "{mode}"
+    );
     let log = std::fs::read_to_string(&log_path).unwrap();
     let fallbacks = log
         .lines()

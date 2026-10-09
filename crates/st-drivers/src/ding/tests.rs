@@ -776,10 +776,15 @@ fn mature_idle_claude_screen_with_hint() -> String {
     )
 }
 
-/// The same used pane in accept-edits mode. `permissions on` is specific to the bypass footer,
-/// so no accept-edits or auto pane is positively idle to this classifier.
+/// The same used pane in accept-edits mode. Only the bypass and auto footers are positively idle
+/// to this classifier; an accept-edits pane may be waiting on a prompt.
 fn mature_idle_accept_edits_claude_screen() -> String {
     mature_idle_claude_screen().replace("⏵⏵ bypass permissions on", "⏵⏵ accept edits on")
+}
+
+/// A seat started with `--permission-mode auto` (Claude Code 2.1.295 prints `auto mode on`).
+fn mature_idle_auto_claude_screen() -> String {
+    mature_idle_claude_screen().replace("⏵⏵ bypass permissions on", "⏵⏵ auto mode on")
 }
 
 fn mature_staged_claude_screen(text: &str) -> String {
@@ -1280,11 +1285,23 @@ fn maintained_composer_classifiers_require_exact_idle_state() {
         classify_composer(&mature_idle_claude_screen_with_hint(), expected),
         ComposerState::EmptySafe
     );
-    // Only the bypass footer carries `permissions on`, so an otherwise identical accept-edits
-    // pane is never positively idle. It stays unsubmitted rather than being proven safe.
+    // An otherwise identical accept-edits pane is never positively idle. It stays unsubmitted
+    // rather than being proven safe.
     assert_eq!(
         classify_composer(&mature_idle_accept_edits_claude_screen(), expected),
         ComposerState::Changed
+    );
+    // An auto-mode seat is the default seat now: its footer is as idle as the bypass one.
+    assert_eq!(
+        classify_composer(&mature_idle_auto_claude_screen(), expected),
+        ComposerState::EmptySafe
+    );
+    assert_eq!(
+        classify_composer(
+            &mature_idle_auto_claude_screen().replace("❯\u{00a0}", &format!("❯\u{00a0}{expected}")),
+            expected
+        ),
+        ComposerState::ExactSafe
     );
     assert_eq!(
         classify_composer(&mature_staged_claude_screen(expected), expected),

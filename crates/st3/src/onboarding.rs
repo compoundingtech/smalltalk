@@ -109,12 +109,15 @@ pub async fn start(config: &Config, harness: &str, rerun: bool) -> Result<Option
     } else {
         MISSION.into()
     };
+    let claude_mode =
+        crate::permission_mode::Effective::resolve(config.claude_permission_mode).mode;
     let source = declarations(
         harness,
         &workspace,
         &run_id,
         revision,
         config.person.as_deref().unwrap(),
+        claude_mode,
     )?;
     // A mission needs its eligible seat, and a run needs a published mission revision.
     // Publish the definitions together, then the deterministically named initial run.
@@ -252,6 +255,7 @@ fn declarations(
     run_id: &str,
     revision: &str,
     person: &str,
+    claude_mode: crate::permission_mode::PermissionMode,
 ) -> Result<String> {
     let template: KdlDocument = EXPERT.parse()?;
     let description = template
@@ -275,9 +279,14 @@ fn declarations(
         branch: None,
         remove_at_run_end: None,
     };
-    let mut document: KdlDocument =
-        crate::creation::agent_document(&args, &workspace.to_string_lossy(), false, None)
-            .parse()?;
+    let mut document: KdlDocument = crate::creation::agent_document(
+        &args,
+        &workspace.to_string_lossy(),
+        false,
+        None,
+        claude_mode,
+    )
+    .parse()?;
     let mut run = KdlNode::new("mission-run");
     run.entries_mut().push(KdlEntry::new(run_id));
     let mut body = KdlDocument::new();
@@ -365,6 +374,7 @@ mod tests {
                 super::MISSION,
                 revision,
                 "person/ada",
+                crate::permission_mode::PermissionMode::Auto,
             )
             .unwrap();
             let intent = crate::parse_intent(&source, "studio").unwrap();
@@ -378,7 +388,10 @@ mod tests {
                     .any(|text| text.contains(&guide))
             );
             match *harness {
-                "claude" => assert!(source.contains("--dangerously-skip-permissions")),
+                "claude" => {
+                    assert!(source.contains("--permission-mode"));
+                    assert!(!source.contains("--dangerously-skip-permissions"));
+                }
                 "codex" => {
                     assert!(source.contains("--approve-for-me"));
                     assert!(!source.contains("--dangerously-bypass"));

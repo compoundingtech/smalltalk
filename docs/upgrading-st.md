@@ -141,6 +141,10 @@ full replay trigger. Backups and restart windows must accommodate the release's 
 
 Check that local delivery becomes `current`, and read an `outdated` or `stale` reason before deciding a seat needs a restart.
 
+`st doctor` also prints `claude-permission-mode`: the mode new Claude seats get and why. An upgrade never
+adds `claude_permission_mode` to your `config.toml`; without the key it reads as `bypass`, as before.
+To move to auto mode on purpose, add `claude_permission_mode = "auto"` yourself and restart the daemon.
+
 After all members are upgraded and caught up, compare replication digests as [two machines](two-machines.md#check-what-arrived) describes. Mixed builds can exchange signed history while an older member has claims waiting for an upgrade; that does not prove equal projections. Check a real conversation and its message receipt too:
 
 ```sh

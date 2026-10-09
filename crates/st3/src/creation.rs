@@ -22,13 +22,39 @@ pub fn validate_agent_checkout(args: &st3_client::AgentCreateParameters) -> anyh
 /// plugins st2's marketplace shipped off.
 pub const CLAUDE_SEAT_SETTINGS: &str = r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":false,"st3-channel@st3":false,"st-channel@st":true}}"#;
 
+/// What auto mode's classifier is told about st, so it does not treat the seat's own daemon as an
+/// outside destination. These go in the `--settings` JSON because the classifier reads `autoMode`
+/// from user, managed and `--settings` sources only, never from a workspace's
+/// `.claude/settings.local.json`. `$defaults` keeps Claude's built-in rules in every list.
+const AUTO_MODE_ENVIRONMENT: &str = "Key internal services: the local `st` daemon (Smalltalk), reached only through the `st` command over a unix socket on this machine. The daemon, its socket and the other agents it connects this seat to are trusted infrastructure of this fleet, not an external destination.";
+const AUTO_MODE_ALLOW: &str = "St Commands: Running the `st` command against the local st daemon is ordinary control-plane traffic for this seat's work: reading and answering messages, listing, claiming and completing mission steps, recording progress, and reading or storing st documents. It is not an external data flow.";
+
+/// The `--settings` JSON for a Claude seat started in `mode`. Bypass seats keep exactly the JSON
+/// they always had; an auto-mode seat also tells the classifier that st is trusted infrastructure.
+pub fn claude_seat_settings(mode: crate::permission_mode::PermissionMode) -> String {
+    match mode {
+        crate::permission_mode::PermissionMode::Bypass => CLAUDE_SEAT_SETTINGS.to_owned(),
+        crate::permission_mode::PermissionMode::Auto => {
+            let mut settings: serde_json::Value = serde_json::from_str(CLAUDE_SEAT_SETTINGS)
+                .expect("the seat settings are JSON");
+            settings["autoMode"] = serde_json::json!({
+                "environment": ["$defaults", AUTO_MODE_ENVIRONMENT],
+                "allow": ["$defaults", AUTO_MODE_ALLOW],
+            });
+            settings.to_string()
+        }
+    }
+}
+
 /// The declaration `st agents new` publishes: what a person writes by hand for a fleet seat.
-/// Claude and Codex seats get the harness defaults the fleet's existing seats run with.
+/// Claude and Codex seats get the harness defaults the fleet's existing seats run with; a Claude
+/// seat starts in `claude_mode`.
 pub fn agent_document(
     args: &st3_client::AgentCreateParameters,
     workspace: &str,
     create_workspace: bool,
     creation_key: Option<&str>,
+    claude_mode: crate::permission_mode::PermissionMode,
 ) -> String {
     let mut body = KdlDocument::new();
     if let Some(description) = &args.description {
@@ -62,7 +88,8 @@ pub fn agent_document(
         }
         body.nodes_mut().push(checkout);
     }
-    let arguments: &[&str] = match args.harness.as_str() {
+    let claude_settings = claude_seat_settings(claude_mode);
+    let arguments: Vec<&str> = match args.harness.as_str() {
         "claude" => {
             let mut environment = KdlNode::new("env");
             let mut variables = KdlDocument::new();
@@ -78,17 +105,15 @@ pub fn agent_document(
                     [".claude/settings.local.json", CLAUDE_SEAT_SETTINGS],
                 ),
             ]));
-            &[
-                "--dangerously-skip-permissions",
-                "--settings",
-                CLAUDE_SEAT_SETTINGS,
-            ]
+            let mut arguments = claude_mode.claude_flags().to_vec();
+            arguments.extend(["--settings", claude_settings.as_str()]);
+            arguments
         }
         // The workspace-write sandbox with automatic review of anything it blocks, plus the st
         // tool bridge the driver adds at launch. A Codex older than 0.147 does not have the flag;
         // its driver launches such a seat with the full-access flags instead.
-        "codex" => &["--approve-for-me"],
-        _ => &[],
+        "codex" => vec!["--approve-for-me"],
+        _ => Vec::new(),
     };
     let mut harness = kdl_node("harness", [args.harness.as_str()]);
     let mut harness_body = KdlDocument::new();
@@ -258,6 +283,7 @@ pub async fn claim_initial_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permission_mode::PermissionMode::{Auto, Bypass};
 
     #[test]
     fn a_shell_with_no_directory_starts_in_home_and_one_with_a_directory_keeps_it() {
@@ -308,7 +334,7 @@ mod tests {
             ..Default::default()
         };
         let workspace = root.path().join("parser");
-        let source = agent_document(&parameters, &workspace.display().to_string(), true, None);
+        let source = agent_document(&parameters, &workspace.display().to_string(), true, None, Bypass);
         let intent = crate::graph::parse_intent(&source, "example").unwrap();
         let desired = intent.subjects.values().next().unwrap();
         let checkout = Checkout::from_desired(&desired.desired).unwrap();
@@ -334,7 +360,7 @@ mod tests {
             repo: Some(root.path().join("missing").display().to_string()),
             ..parameters.clone()
         };
-        let source = agent_document(&missing, &workspace.display().to_string(), true, None);
+        let source = agent_document(&missing, &workspace.display().to_string(), true, None, Bypass);
         let intent = crate::graph::parse_intent(&source, "example").unwrap();
         let checkout =
             Checkout::from_desired(&intent.subjects.values().next().unwrap().desired).unwrap();
@@ -351,7 +377,7 @@ mod tests {
             remove_at_run_end: None,
             ..parameters
         };
-        let source = agent_document(&plain, &workspace.display().to_string(), true, None);
+        let source = agent_document(&plain, &workspace.display().to_string(), true, None, Bypass);
         let intent = crate::graph::parse_intent(&source, "example").unwrap();
         let desired = intent.subjects.values().next().unwrap();
         assert!(Checkout::from_desired(&desired.desired).is_none());
@@ -399,7 +425,7 @@ mod tests {
                 model: Some("model".into()),
                 ..Default::default()
             };
-            let idle = agent_document(&parameters, "/tmp", true, None);
+            let idle = agent_document(&parameters, "/tmp", true, None, Bypass);
             let idle = crate::graph::parse_intent(&idle, "test").unwrap();
             let member = idle
                 .subjects
@@ -417,7 +443,7 @@ mod tests {
                 message: Some("--literal\ntext".into()),
                 ..parameters
             };
-            let source = agent_document(&parameters, "/tmp", true, Some("first-launch"));
+            let source = agent_document(&parameters, "/tmp", true, Some("first-launch"), Bypass);
             let intent = crate::graph::parse_intent(&source, "test").unwrap();
             let member = intent
                 .subjects
@@ -455,7 +481,7 @@ mod tests {
             harness: "codex".into(),
             ..Default::default()
         };
-        let source = agent_document(&args, "/srv/work", true, None);
+        let source = agent_document(&args, "/srv/work", true, None, Bypass);
         let intent = crate::graph::parse_intent(&source, "example").unwrap();
         let member = intent.subjects.values().next().unwrap().member.as_ref().unwrap();
         let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
@@ -466,5 +492,76 @@ mod tests {
             !argv.iter().any(|argument| argument.starts_with("--dangerously-bypass")),
             "{argv:?}"
         );
+    }
+    fn claude_seat(mode: crate::permission_mode::PermissionMode) -> Vec<String> {
+        let args = st3_client::AgentCreateParameters {
+            name: "worker".into(),
+            harness: "claude".into(),
+            ..Default::default()
+        };
+        let source = agent_document(&args, "/srv/work", true, None, mode);
+        let intent = crate::graph::parse_intent(&source, "example").unwrap();
+        let member = intent.subjects.values().next().unwrap().member.as_ref().unwrap();
+        let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
+            panic!()
+        };
+        argv.clone()
+    }
+
+    #[test]
+    fn a_bypass_claude_seat_is_declared_exactly_as_it_always_was() {
+        let argv = claude_seat(Bypass);
+        let joined = argv.join(" ");
+        assert!(joined.contains("--dangerously-skip-permissions"), "{joined}");
+        assert!(!joined.contains("--permission-mode"), "{joined}");
+        assert!(argv.iter().any(|argument| argument == CLAUDE_SEAT_SETTINGS), "{joined}");
+        assert_eq!(claude_seat_settings(Bypass), CLAUDE_SEAT_SETTINGS);
+    }
+
+    #[test]
+    fn an_auto_claude_seat_asks_for_auto_and_tells_the_classifier_st_is_trusted() {
+        let argv = claude_seat(Auto);
+        let position = argv.iter().position(|argument| argument == "--permission-mode").unwrap();
+        assert_eq!(argv[position + 1], "auto");
+        assert!(!argv.iter().any(|argument| argument == "--dangerously-skip-permissions"));
+        // The launch may add settings of its own; the seat's is the one that carries autoMode.
+        let settings: serde_json::Value = argv
+            .iter()
+            .filter_map(|argument| serde_json::from_str::<serde_json::Value>(argument).ok())
+            .find(|value| value.get("autoMode").is_some())
+            .unwrap_or_else(|| panic!("no --settings JSON carries autoMode: {argv:?}"));
+        // The plugin switches stay, and every list keeps Claude's own rules.
+        assert_eq!(settings["enabledPlugins"]["st-channel@st"], true);
+        for list in ["environment", "allow"] {
+            assert_eq!(settings["autoMode"][list][0], "$defaults", "{list}");
+            assert!(settings["autoMode"][list][1].as_str().unwrap().contains("`st`"));
+        }
+        assert!(settings["autoMode"].get("soft_deny").is_none());
+        assert!(settings["autoMode"].get("hard_deny").is_none());
+    }
+
+    /// The classifier must read the st entries from the `--settings` JSON. Claude can print the
+    /// effective auto mode config without a model call, so this proves the JSON is honoured on the
+    /// installed Claude Code. Without `claude` on PATH there is nothing to check.
+    #[test]
+    fn claude_reads_the_st_entries_from_the_settings_json_it_is_given() {
+        let Ok(output) = std::process::Command::new("claude")
+            .args(["--settings", &claude_seat_settings(Auto), "auto-mode", "config"])
+            .output()
+        else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+        let config: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let has = |list: &str, text: &str| {
+            config[list].as_array().unwrap().iter().any(|entry| entry.as_str() == Some(text))
+        };
+        assert!(has("environment", AUTO_MODE_ENVIRONMENT), "{config}");
+        assert!(has("allow", AUTO_MODE_ALLOW), "{config}");
+        // `$defaults` kept the built-in rules.
+        assert!(config["soft_deny"].as_array().unwrap().len() > 10);
+        assert!(config["environment"].as_array().unwrap().len() > 2);
     }
 }

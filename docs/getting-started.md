@@ -69,8 +69,13 @@ the development-channel flag and st handles its admission dialog. Provider or
 organization restrictions can still block the channel. Smalltalk never asks for or
 types a password; optional machine policy, GitHub login and `gh` do not block setup.
 
-Your agents run without permission prompts inside their own workspaces. Choose the
-projects and tasks you give them accordingly.
+A new install's `config.toml` gets `claude_permission_mode = "auto"`: Claude seats start in
+auto mode, where Claude's own classifier reviews each action and the seat stops to ask after
+repeated blocks. Set it to `"bypass"` for seats that run without permission prompts. A
+config without the key reads as `bypass`, and st never adds the key to a config that exists.
+`st agents new --claude-permission-mode auto|bypass` chooses for one seat, and `st doctor`
+prints the mode new Claude seats get and why. Codex seats run in a workspace sandbox with
+automatic review. Choose the projects and tasks you give your agents accordingly.
 
 ## 3. Work with the expert
 
