@@ -1,0 +1,81 @@
+# What the st daemon aims for. Every daemon builds this file in, shows each target's live
+# 1-minute, 5-minute and 1-hour windows on `GET /v1/client/request-latency` and in `st doctor`,
+# and CI's daemon_load reads it too. A latency is a 99th percentile unless it says max.
+#
+# A target describes; it gates nothing by itself. daemon_load's budgets stay its gates.
+#
+# A path is `METHOD /route` as the daemon routes it, or `stream COLLECTION` for the time from a
+# subscription on the client collections socket to its first snapshot or screen. A request that
+# asks to wait (`wait_ms` above zero, or `wait=true`) is a long poll and counts toward no target.
+
+[[latency]]
+name = "person-read"
+about = "Reads a person waits on: agents list, open a conversation, conversation changes, work list, Now, documents"
+p99_ms = 100
+# The same reads through this daemon from another machine that owns them.
+remote_p99_ms = 300
+paths = [
+  # Agents list
+  "GET /v1/client/agents",
+  "GET /v1/client/agents/{*id}",
+  "stream agents",
+  # Open a conversation, and its changes
+  "GET /v1/client/sessions/{*id}",
+  "stream conversation",
+  "GET /v1/client/conversations/{id}/changes",
+  # Work list
+  "GET /v1/client/work",
+  "GET /v1/client/work/{*id}",
+  "GET /v1/work",
+  "stream work",
+  # Now
+  "GET /v1/client/now",
+  "GET /v1/client/attention",
+  "stream attention",
+  # Documents
+  "GET /v1/client/documents/content",
+  "GET /v1/documents",
+  "GET /v1/documents/content",
+]
+
+[[latency]]
+name = "write-ack"
+about = "Writes and acks: send, work actions, harness events"
+p99_ms = 100
+paths = [
+  "POST /v1/messages",
+  "POST /v1/client/actions",
+  "POST /v1/work/{action}/{*subject}",
+  "POST /v1/work/extend/{*subject}",
+  "POST /v1/work/done",
+  "POST /v1/work/ask",
+  "POST /v1/work/cancel-ask",
+  "POST /v1/work/start",
+  "POST /v1/work/handoff/{*subject}",
+  "POST /v1/work/acknowledge/{*subject}",
+  "POST /v1/harness-events",
+  "POST /v1/mailbox/receipts",
+  "POST /v1/messages/read/{*subject}",
+]
+
+[[latency]]
+name = "terminal-attach"
+about = "Terminal attach to first screen"
+p99_ms = 200
+paths = [
+  "GET /v1/client/terminals/{id}/screen",
+  "stream terminal",
+]
+
+[statement]
+about = "One SQL statement"
+p99_ms = 10
+max_ms = 100
+
+[transaction]
+about = "Any transaction, read or write, and any hold of the store's writer"
+max_ms = 100
+
+[cpu]
+about = "Daemon CPU: near zero when idle, at most 2 cores under daemon_load"
+max_cores = 2.0

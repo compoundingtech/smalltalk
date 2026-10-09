@@ -25,10 +25,10 @@ pub(super) async fn request_latency(
     Extension(session): Extension<ClientSession>,
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
-    Ok(Json(json!({
-        "routes": super::request_latency_snapshot(),
-        "cost_counters": crate::profile::cost_snapshot(),
-    })))
+    let mut latency = super::request_latency_windows();
+    latency["routes"] = json!(super::request_latency_snapshot());
+    latency["cost_counters"] = crate::profile::cost_snapshot();
+    Ok(Json(latency))
 }
 
 // A client holds one socket for all its current collection views. A subscription
@@ -70,6 +70,8 @@ struct CollectionSubscription {
     /// The roster publication revision when this window's last read began. An agents window
     /// rereads once a later roster is published, even at the same graph index.
     roster_revision: u64,
+    /// When the client subscribed, until its first snapshot is sent.
+    opened: Option<std::time::Instant>,
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
@@ -653,6 +655,9 @@ async fn deliver_collection(
     if !sent {
         return Refreshed::Closed;
     }
+    if let Some(opened) = subscription.opened.take() {
+        super::record_stream_latency(&request.collection, opened.elapsed(), false);
+    }
     subscription.delivered = true;
     subscription.previous = Arc::new(current);
     subscription.order = order;
@@ -972,6 +977,9 @@ fn conversation_stream_error(id: &str, error: &ApiError) -> Value {
         "retryable":client_error_retryable(error.status, Some(&error.code))})
 }
 
+/// Follow a conversation with no subscription time. The collections socket calls
+/// [`follow_conversation_since`]; this form is for the tests that exercise the follower itself.
+#[cfg(test)]
 async fn follow_conversation(
     state: AppState,
     session: ClientSession,
@@ -980,6 +988,23 @@ async fn follow_conversation(
     session_id: String,
     remote: Option<String>,
     outbox: tokio::sync::mpsc::UnboundedSender<(String, u64, Value)>,
+) {
+    follow_conversation_since(state, session, id, generation, session_id, remote, outbox, None)
+        .await;
+}
+
+/// [`follow_conversation`] for a subscription made at `subscribed`, so its first page counts
+/// as opening the conversation.
+#[allow(clippy::too_many_arguments)]
+async fn follow_conversation_since(
+    state: AppState,
+    session: ClientSession,
+    id: String,
+    generation: u64,
+    session_id: String,
+    remote: Option<String>,
+    outbox: tokio::sync::mpsc::UnboundedSender<(String, u64, Value)>,
+    mut subscribed: Option<std::time::Instant>,
 ) {
     let remote = remote.as_deref();
     let failed = |error: &ApiError| conversation_stream_error(&id, error);
@@ -1029,6 +1054,9 @@ async fn follow_conversation(
         }
         if outbox.send((id.clone(), generation, frame)).is_err() {
             return;
+        }
+        if let Some(subscribed) = subscribed.take() {
+            super::record_stream_latency("conversation", subscribed.elapsed(), remote.is_some());
         }
         let mut after = start["next_cursor"].as_str().map(str::to_owned);
         loop {
@@ -1199,6 +1227,8 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     let mut window_revisions = [0; 8];
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
     let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
+    // When each terminal subscription began, until its first screen is sent.
+    let mut terminals_opened = BTreeMap::<String, std::time::Instant>::new();
     let mut conversations = ConversationFollowers::default();
     let (conversation_outbox, mut conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, u64, Value)>();
@@ -1251,6 +1281,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                             if let Some(presence) = &presence { presence.unfollow(&request.id); }
                             subscriptions.remove(&request.id);
                             terminals.remove(&request.id);
+                            terminals_opened.remove(&request.id);
                             conversations.stop(&request.id);
                             break 'command;
                         }
@@ -1270,6 +1301,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         // A subscription with a held ID replaces it.
                         subscriptions.remove(&request.id);
                         terminals.remove(&request.id);
+                        terminals_opened.remove(&request.id);
                         conversations.stop(&request.id);
                         // Allocate a fresh token for every accepted subscribe, including terminal
                         // replacements, so queued collection/conversation results cannot reuse it.
@@ -1280,6 +1312,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                             let subscription_id = request.id.clone();
                             let id = subscription_id.clone();
                             let admission_slots = admission_slots.clone();
+                            let opened = std::time::Instant::now();
                             let follower = tokio::spawn(async move {
                                 let permits = ConversationAdmissionPermits {
                                     _socket: admission_slots.acquire_owned().await.expect("socket admission slots stay open"),
@@ -1287,7 +1320,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                                 };
                                 match admit(state.clone(), session.clone(), request, permits).await {
                                     Ok((session_id, remote)) => {
-                                        follow_conversation(state, session, id, generation, session_id, remote, outbox).await;
+                                        follow_conversation_since(state, session, id, generation, session_id, remote, outbox, Some(opened)).await;
                                     }
                                     Err(error) => {
                                         let frame = json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message});
@@ -1299,9 +1332,11 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                             break 'command;
                         }
                         if request.collection == "terminal" {
+                            let opened = std::time::Instant::now();
                             match open_terminal_subscription(&state, &session, &request).await {
                                 Ok(receiver) => {
                                     terminals.insert(request.id.clone(), receiver);
+                                    terminals_opened.insert(request.id.clone(), opened);
                                 }
                                 Err(error) => {
                                     if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "collection":"terminal", "code":error.code, "message":error.message})).await { return; }
@@ -1311,7 +1346,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         }
                         refresh.push(request.id.clone());
                         // Collection results and conversation frames share the same generation fence.
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, request });
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, opened: Some(std::time::Instant::now()), request });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
@@ -1422,6 +1457,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 continue;
             }
             (id, frame) = next_terminal_frame(&mut terminals), if !command_waiting && !terminals.is_empty() => {
+                let message_is_screen = matches!(frame, Some(TerminalFrame::Screen(_)));
                 let message = match frame {
                     Some(TerminalFrame::Waiting) => continue,
                     Some(TerminalFrame::Screen(envelope)) => json!({"kind":"screen", "id":id, "collection":"terminal", "snapshot":envelope["snapshot"], "value":envelope["value"]}),
@@ -1435,6 +1471,9 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                     }
                 };
                 if !send_collection(&mut socket, message).await { return; }
+                if message_is_screen && let Some(opened) = terminals_opened.remove(&id) {
+                    super::record_stream_latency("terminal", opened.elapsed(), false);
+                }
                 continue;
             }
         }

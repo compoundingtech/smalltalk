@@ -81,6 +81,7 @@ pub mod sekrets;
 pub mod service;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
+pub mod slo;
 pub mod startup;
 pub mod store;
 pub mod subagents;

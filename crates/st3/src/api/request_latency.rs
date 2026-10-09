@@ -1,7 +1,10 @@
 //! Completed response-envelope timings. Action buckets are subsets of route totals.
+//!
+//! Each path also keeps rolling 1-minute, 5-minute and 1-hour windows, and each target in
+//! `slo/targets.toml` keeps the same windows over all its paths.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::http::Method;
 use serde_json::{Value, json};
@@ -119,6 +122,40 @@ pub(super) struct Meter {
     // Independent of the general route cap: all seven known actions retain a
     // complete denominator even if the route table has already filled.
     work_actions: BTreeMap<WorkAction, Sample>,
+    /// Windows by path: `GET /route`, `stream COLLECTION`, or a long poll's route.
+    paths: BTreeMap<String, smallclaims::windows::Series>,
+    /// Windows by target position in `slo/targets.toml`: served here, then from another machine.
+    targets: Vec<[smallclaims::windows::Series; 2]>,
+    cpu: smallclaims::windows::Cpu,
+}
+
+/// How a completed sample is counted in the windows. Build it with [`Timed::resolve`] before
+/// taking the meter's lock: the key and the target lookup allocate and scan.
+pub(super) struct Timed {
+    key: String,
+    target: Option<usize>,
+    remote: bool,
+}
+
+impl Timed {
+    /// `path` is `GET /v1/client/now`, or `stream agents` for a socket subscription's first
+    /// snapshot. `remote` says it read from another machine that owns it, through this daemon.
+    /// A `long_poll` asked to wait for a change, so its time is mostly the wait it asked for:
+    /// it is kept under its own key and counts toward no target.
+    pub(super) fn resolve(path: &str, remote: bool, long_poll: bool) -> Self {
+        if long_poll {
+            return Self {
+                key: format!("{path} (long poll)"),
+                target: None,
+                remote,
+            };
+        }
+        Self {
+            key: path.to_owned(),
+            target: crate::slo::targets().index_of(path),
+            remote,
+        }
+    }
 }
 
 impl Meter {
@@ -132,6 +169,77 @@ impl Meter {
         if let Some(action) = WorkAction::classify(method, route, path) {
             self.work_actions.entry(action).or_default().record(elapsed);
         }
+    }
+
+    /// Count one sample in its path's windows and its target's.
+    pub(super) fn time(&mut self, now: Instant, timed: Timed, elapsed: Duration) {
+        self.cpu.note(now);
+        let targets = crate::slo::targets();
+        let Timed {
+            key,
+            target,
+            remote,
+        } = timed;
+        let over = target.is_some_and(|target| elapsed > targets.latency[target].target(remote));
+        if let Some(series) = self.paths.get_mut(key.as_str()) {
+            series.record(now, elapsed, over);
+        } else if self.paths.len() < ROUTES {
+            self.paths
+                .entry(key)
+                .or_default()
+                .record(now, elapsed, over);
+        }
+        if let Some(target) = target {
+            if self.targets.is_empty() {
+                self.targets
+                    .resize_with(targets.latency.len(), Default::default);
+            }
+            self.targets[target][usize::from(remote)].record(now, elapsed, over);
+        }
+    }
+
+    /// Every target's windows, then every path's that has a sample in its last hour.
+    pub(super) fn windows(&mut self, now: Instant) -> Value {
+        let targets = crate::slo::targets();
+        let empty = smallclaims::windows::Series::default();
+        let mut rows = targets
+            .latency
+            .iter()
+            .enumerate()
+            .map(|(index, latency)| {
+                let windows = |remote: bool| {
+                    self.targets
+                        .get(index)
+                        .map_or(&empty, |pair| &pair[usize::from(remote)])
+                        .snapshot(now)
+                };
+                let mut row = json!({
+                    "name": latency.name,
+                    "about": latency.about,
+                    "p99_ms": latency.p99_ms,
+                    "windows": windows(false),
+                });
+                if let Some(remote) = latency.remote_p99_ms {
+                    row["remote_p99_ms"] = json!(remote);
+                    row["remote_windows"] = windows(true);
+                }
+                row
+            })
+            .collect::<Vec<_>>();
+        rows.extend(crate::slo::store_report(self.cpu.snapshot(now)));
+        let paths = self
+            .paths
+            .iter()
+            .filter(|(_, series)| !series.is_empty(now))
+            .map(|(path, series)| {
+                json!({
+                    "path": path,
+                    "target": targets.for_path(path).map(|target| target.name.as_str()),
+                    "windows": series.snapshot(now),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({"targets": rows, "paths": paths})
     }
 
     pub(super) fn snapshot(&self) -> Vec<Value> {
@@ -246,6 +354,52 @@ mod tests {
         assert!(!json.contains("secret"));
         assert!(!json.contains("unknown-"));
         assert!(!json.contains("%72"));
+    }
+
+    #[test]
+    fn paths_count_toward_their_target_with_the_remote_target_for_remote_reads() {
+        let mut meter = Meter::default();
+        let now = Instant::now();
+        let time = |meter: &mut Meter, path, remote, long_poll, ms| {
+            meter.time(
+                now,
+                Timed::resolve(path, remote, long_poll),
+                Duration::from_millis(ms),
+            );
+        };
+        time(&mut meter, "GET /v1/client/now", false, false, 50);
+        time(&mut meter, "GET /v1/client/now", false, false, 150);
+        time(&mut meter, "stream agents", true, false, 250);
+        time(&mut meter, "stream conversation", true, false, 350);
+        time(&mut meter, "GET /v1/client/conversations/{id}/changes", false, true, 30_000);
+        time(&mut meter, "GET /v1/health", false, false, 1);
+        let report = meter.windows(now);
+        let target = |name: &str| {
+            report["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        let read = target("person-read");
+        assert_eq!(read["windows"]["1m"]["count"], 2);
+        assert_eq!(read["windows"]["1m"]["over_target"], 1);
+        assert_eq!(read["remote_windows"]["5m"]["count"], 2);
+        assert_eq!(read["remote_windows"]["5m"]["over_target"], 1);
+        assert_eq!(target("write-ack")["windows"]["1h"]["count"], 0);
+        for name in ["sql-statement", "transaction", "cpu"] {
+            target(name);
+        }
+        let paths = report["paths"].as_array().unwrap();
+        let path = |name: &str| paths.iter().find(|row| row["path"] == name).unwrap();
+        assert_eq!(path("GET /v1/client/now")["target"], "person-read");
+        assert_eq!(path("GET /v1/health")["target"], Value::Null);
+        let poll = path("GET /v1/client/conversations/{id}/changes (long poll)");
+        assert_eq!(poll["target"], Value::Null);
+        assert_eq!(poll["windows"]["1m"]["over_target"], 0);
+        assert_eq!(paths.len(), 5);
     }
 
     #[test]
