@@ -16,10 +16,10 @@ vi.mock('@stylexjs/stylex', () => ({ create: (styles: unknown) => styles, define
 
 const agent = decodeUnknownSync(Agent)({ kind: 'agent', id: 'agent/example', name: 'Example Agent', host_id: 'host/example', runtime_ids: [], reachability: 'reachable', state: 'running', harness_state: 'idle', blocked_on: null, fault: null, revision: '1', updated_at: '2026-10-04T12:00:00.000Z' })
 const queue = decodeUnknownSync(AgentQueue)({ agent_id: agent.id, current_work_ids: ['work/current'], kind: 'agent-queue', move_count: 0, moves: [], next_work_id: null, runs: [{ claimed_work_ids: [], joined_at: '2026-10-04T12:00:00.000Z', mission_run_id: 'mission-run/example', position: 1, ready_work_ids: ['work/ready'], run_state: 'running', state: 'ready', waiting_work_ids: [] }] })
-const resource = decodeUnknownSync(ResourceObservation)({ id: 'resource/example', kind: 'filesystem.file', facts: { title: 'Observed project notes' }, observed_at: '2026-10-04T12:00:00.000Z', opened_by: agent.id, opened_by_run: null })
+const resource = decodeUnknownSync(ResourceObservation)({ id: 'resource/example', kind: 'filesystem.file', facts: { title: 'Observed project notes', state: 'open' }, observed_at: '2026-10-04T12:00:00.000Z', opened_by: agent.id, opened_by_run: null })
 const resources = Atom.make<Feed<ResourcePage>>(observed({ value: { items: [resource], nextCursor: null } }))
 const source = {
-  ...fixtureSource({ world: { now: 0, agents: [agent], missions: [], attention: [], events: [], conversations: { [agent.id]: { items: [
+  ...fixtureSource({ world: { now: Date.parse('2026-10-06T12:00:00.000Z'), agents: [agent], missions: [], attention: [], events: [], conversations: { [agent.id]: { items: [
     { _tag: 'UnknownEvent', id: 'internal', eventType: 'credential_pin', data: { pin_hint: 'not-for-display' } },
     { _tag: 'UnknownEvent', id: 'future', eventType: 'future_kind', data: {} },
   ], hasOlder: false, observation: { empty: false } } }, terminals: {}, envelopes: {}, usage: { _tag: 'undeclared' }, subjectReads: { agentQueue: { [agent.id]: observed({ value: queue }) } } } }),
@@ -72,6 +72,11 @@ describe('live header parity', () => {
     await click('Resources')
     const dialog = document.querySelector('[role="dialog"][aria-label="Agent resources"]')
     expect(dialog?.textContent).toContain('Observed project notes')
+    const row = dialog?.querySelector('[aria-label="Observed resources"] li')
+    expect(row?.textContent).toContain('filesystem.file')
+    expect(row?.textContent).toContain('open')
+    expect(row?.textContent).toContain('2d ago')
+    expect(row?.querySelector('time')?.getAttribute('datetime')).toBe('2026-10-04T12:00:00.000Z')
     expect(dialog?.textContent).toContain('1 current work item')
     expect(dialog?.textContent).toContain('mission-run/example')
     await click('Close resources')
