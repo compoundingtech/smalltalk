@@ -12,14 +12,16 @@ const MAX_SOURCE_BYTES: i64 = 16 * 1024;
 // Returning no parent for a wide or unsupported body is only safe when the future installer
 // marks that source cut incomplete in the same transaction. These statements alone do not do so.
 const CLAIM_PARENT: &str = r#"
-SELECT length(CAST(?1 AS BLOB))<=?2 AND json_valid(?1),
-       CASE WHEN length(CAST(?1 AS BLOB))<=?2 AND json_valid(?1) THEN
-         CASE WHEN json_type(?1,'$.fields') IS NOT NULL THEN
-           CASE WHEN json_type(?1,'$.fields.in_reply_to')='text'
-                THEN json_extract(?1,'$.fields.in_reply_to') END
-         ELSE
-           CASE WHEN json_type(?1,'$.in_reply_to')='text'
-                THEN json_extract(?1,'$.in_reply_to') END
+SELECT CASE WHEN length(CAST(?1 AS BLOB))<=?2 THEN json_valid(?1) ELSE 0 END,
+       CASE WHEN length(CAST(?1 AS BLOB))<=?2 THEN
+         CASE WHEN json_valid(?1) THEN
+           CASE WHEN json_type(?1,'$.fields') IS NOT NULL THEN
+             CASE WHEN json_type(?1,'$.fields.in_reply_to')='text'
+                  THEN json_extract(?1,'$.fields.in_reply_to') END
+           ELSE
+             CASE WHEN json_type(?1,'$.in_reply_to')='text'
+                  THEN json_extract(?1,'$.in_reply_to') END
+           END
          END
        END
 "#;
@@ -27,21 +29,28 @@ SELECT length(CAST(?1 AS BLOB))<=?2 AND json_valid(?1),
 // Match canonical_child_string: the FIRST named child wins even when its first argument is
 // absent or not a string. A later valid child must not replace that first child's null result.
 const DESIRED_PARENT: &str = r#"
-SELECT length(CAST(?1 AS BLOB))<=?2 AND json_valid(?1),
-       CASE WHEN length(CAST(?1 AS BLOB))<=?2 AND json_valid(?1)
-                  AND json_type(?1,'$.children')='array' THEN
-         (SELECT CASE WHEN json_type(child.value,'$.arguments[0]')='text'
-                      THEN json_extract(child.value,'$.arguments[0]') END
-          FROM json_each(?1,'$.children') AS child
-          WHERE CASE WHEN child.type='object'
-                     THEN json_extract(child.value,'$.name')='in-reply-to'
-                     ELSE 0 END
-          ORDER BY CAST(child.key AS INTEGER) LIMIT 1)
+SELECT CASE WHEN length(CAST(?1 AS BLOB))<=?2 THEN json_valid(?1) ELSE 0 END,
+       CASE WHEN length(CAST(?1 AS BLOB))<=?2 THEN
+         CASE WHEN json_valid(?1) THEN
+           CASE WHEN json_type(?1,'$.children')='array' THEN
+             (SELECT CASE WHEN json_type(child.value,'$.arguments[0]')='text'
+                          THEN json_extract(child.value,'$.arguments[0]') END
+              FROM json_each(?1,'$.children') AS child
+              WHERE CASE WHEN child.type='object'
+                         THEN json_extract(child.value,'$.name')='in-reply-to'
+                         ELSE 0 END
+              ORDER BY CAST(child.key AS INTEGER) LIMIT 1)
+           END
+         END
        END
 "#;
 
 fn source_parent(connection: &Connection, sql: &str, value: &Value) -> (bool, Option<String>) {
     let body = serde_json::to_string(value).unwrap();
+    raw_source_parent(connection, sql, &body)
+}
+
+fn raw_source_parent(connection: &Connection, sql: &str, body: &str) -> (bool, Option<String>) {
     connection
         .query_row(sql, params![body, MAX_SOURCE_BYTES], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -127,4 +136,19 @@ fn oversized_source_requires_an_incomplete_cut_before_any_parent_is_used() {
         source_parent(&connection, DESIRED_PARENT, &desired),
         (false, None)
     );
+    let prefix = r#"{"padding":""#;
+    let suffix = r#""}"#;
+    let exact = format!(
+        "{prefix}{}{suffix}",
+        "x".repeat(MAX_SOURCE_BYTES as usize - prefix.len() - suffix.len())
+    );
+    assert_eq!(exact.len(), MAX_SOURCE_BYTES as usize);
+    for sql in [CLAIM_PARENT, DESIRED_PARENT] {
+        assert_eq!(raw_source_parent(&connection, sql, &exact), (true, None));
+        assert_eq!(
+            raw_source_parent(&connection, sql, &format!("{exact} ")),
+            (false, None)
+        );
+        assert_eq!(raw_source_parent(&connection, sql, "{"), (false, None));
+    }
 }
