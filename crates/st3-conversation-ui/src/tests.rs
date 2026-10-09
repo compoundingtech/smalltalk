@@ -1335,3 +1335,33 @@ fn the_filter_hides_a_view_only_and_every_record_stays_available() {
         assert!(text.contains(back), "{back} should return: {text}");
     }
 }
+
+#[test]
+fn a_waiting_or_running_status_with_a_real_reason_is_never_hidden() {
+    let status = |kind: &str, detail: Option<&str>| {
+        let mut body = serde_json::json!({"status": kind});
+        if let Some(detail) = detail {
+            body["detail"] = serde_json::json!(detail);
+        }
+        review_entry("status", "system", body)
+    };
+    let shown = |entry: st3_client::TimelineEntry| adapt::conversation(&[entry], &Default::default()).len();
+    // The plain heartbeats are hidden.
+    for routine in [
+        status("waiting", None),
+        status("waiting", Some("idle")),
+        status("running", None),
+        status("running", Some("working")),
+        status("queued", None),
+        status("completed", None),
+    ] {
+        assert_eq!(shown(routine.clone()), 0, "{routine:?}");
+    }
+    // A harness state st has no word for arrives as `waiting` plus a detail: it is a reason.
+    for reason in ["rate limited", "waiting on approval", "blocked", "needs login"] {
+        assert_eq!(shown(status("waiting", Some(reason))), 1, "{reason}");
+    }
+    assert_eq!(shown(status("running", Some("compacting"))), 1);
+    assert_eq!(shown(status("failed", None)), 1);
+    assert_eq!(shown(status("cancelled", None)), 1);
+}

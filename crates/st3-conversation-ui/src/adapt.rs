@@ -608,20 +608,25 @@ fn claude_context_record(text: &str) -> bool {
 }
 
 /// Status, usage and withheld-content records that repeat every turn and say nothing to read.
-/// A failure, a cancellation, a status st does not know, and any withholding reason other than
-/// the routine `sensitive-content` are still shown.
+/// A failure, a cancellation, a status with any detail beyond the plain `working` and `idle`, and
+/// any withholding reason other than the routine `sensitive-content` are still shown.
 fn is_routine_record(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> bool {
     use st3_client::TimelineStatus;
     filters.contains(&crate::DisplayFilter::Telemetry)
         && match &entry.body {
             TimelineBody::Usage(_) => true,
-            TimelineBody::Status(status) => matches!(
-                status.status,
-                TimelineStatus::Queued
-                    | TimelineStatus::Running
-                    | TimelineStatus::Waiting
-                    | TimelineStatus::Completed
-            ),
+            // A harness status st does not name becomes `waiting` with only its detail kept, so
+            // blocked, rate limited and waiting on approval arrive as `waiting` plus a detail:
+            // only the plain heartbeats are routine.
+            TimelineBody::Status(status) => {
+                let detail = status.detail.as_deref().map(str::trim).filter(|d| !d.is_empty());
+                match status.status {
+                    TimelineStatus::Queued | TimelineStatus::Completed => true,
+                    TimelineStatus::Running => matches!(detail, None | Some("working")),
+                    TimelineStatus::Waiting => matches!(detail, None | Some("idle")),
+                    _ => false,
+                }
+            }
             TimelineBody::Redaction(redaction) => redaction.reason == "sensitive-content",
             _ => false,
         }
