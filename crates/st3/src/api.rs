@@ -2273,7 +2273,7 @@ fn client_agent_page_refs_uncached(store: &Store, history: bool, index: u64) -> 
         let declaration = desired.get(&id);
         let name = crate::model::effective_agent_name(&id, declaration.map(|d| &d.desired));
         let queue = queues.get(&id).cloned().unwrap_or_default();
-        json!({
+        let mut reference = json!({
             "id":id, "name":name,
             "host_id":declaration.and_then(|d| d.member.as_ref()).map(|m| client_host_id(&m.host)),
             "current_work_ids":queue.current_work_ids, "active_work_count":queue.active_work_count,
@@ -2282,7 +2282,11 @@ fn client_agent_page_refs_uncached(store: &Store, history: bool, index: u64) -> 
             "current_work":queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
             "next_work":queue.next_work_id.as_ref().and_then(label),
             "upcoming_work":queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
-        })
+        });
+        if let Some(lifecycle) = crate::model::declared_agent_lifecycle(declaration.map(|d| &d.desired)) {
+            reference["lifecycle"] = json!(lifecycle);
+        }
+        reference
     }).collect::<Vec<_>>();
     refs.sort_by(|a, b| {
         a["name"]
@@ -2873,6 +2877,9 @@ fn client_agent_resources_from_status(
                     None
                 },
             });
+            if let Some(lifecycle) = crate::model::declared_agent_lifecycle(subject.desired.as_ref()) {
+                value["lifecycle"] = json!(lifecycle);
+            }
             if let Some((_, previous)) = changed.filter(|_| retain_queues)
                 && let Some(old) = previous.iter().find(|item| item["id"] == value["id"]) {
                 for field in AGENT_QUEUE_FIELDS {
@@ -16327,6 +16334,33 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         let removed = client_agent_page_refs(&state.store, false, index).unwrap();
         assert_eq!(removed.len(), 1, "a stopped undeclared runtime moves to history");
         assert_eq!(removed, client_agent_page_refs_uncached(&state.store, false, index).unwrap());
+    }
+
+    #[test]
+    fn agent_lifecycle_roster_tracks_current_declaration_without_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        for (version, lifecycle) in [None, Some("standing"), Some("owner"), Some("bounded"), None]
+            .into_iter().enumerate()
+        {
+            let field = lifecycle.map(|value| format!("lifecycle \"{value}\";")).unwrap_or_default();
+            let source = format!("version 2\nagent \"example/purpose\" {{ {field} command \"true\" }}");
+            let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+            let plan = store.mission(&intent, crate::model::IntentInput {
+                kdl: source, source_name: None,
+            }).unwrap();
+            store.apply(&intent, &plan.subject_tokens, &format!("lifecycle-{version}")).unwrap();
+            let index = store.index().unwrap();
+            for history in [false, true] {
+                let refs = client_agent_page_refs(store, history, index).unwrap();
+                let rows = checked_agent_cache(store, history, index);
+                let cards = client_agent_cards_for_page(store, history, index, &refs, "0").unwrap();
+                for row in refs.iter().chain(rows.iter()).chain(cards.iter()) {
+                    assert_eq!(row.get("lifecycle"), lifecycle.map(|value| json!(value)).as_ref());
+                }
+            }
+        }
     }
 
     #[test]
