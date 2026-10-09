@@ -27,7 +27,7 @@ function toolCall(index: number, output?: string): ToolCallItem {
   return { _tag: 'ToolCall', id: `turn/${index}/tool`, callId: `call-${index}`, name: 'read_file', input: { path: 'src/rows.ts' }, status: 'success', callSeen: true, at: minute(index), ...(output === undefined ? {} : { result: { content: output, isError: false, at: minute(index) } }) }
 }
 const historyTurn = (index: number, revise: { answer?: string; tool?: ToolCallItem } = {}) => turn(index, prompts[index % prompts.length], revise.answer ?? answers[index % answers.length], { tool: revise.tool ?? (index === 22 ? toolCall(22) : undefined) })
-const initialTurns = [...Array.from({ length: 24 }, (_, index) => historyTurn(index)), turn(24, 'Ship the grouped rows.', undefined, { failed: true })]
+const initialTurns = [...Array.from({ length: 40 }, (_, index) => historyTurn(index)), turn(40, 'Ship the grouped rows.', undefined, { failed: true })]
 const sync = { _tag: 'Live', since: now - 5000 } as const
 const replacing = (next: TranscriptTurn) => (previous: readonly TranscriptTurn[]) => previous.map(entry => entry.id === next.id ? next : entry)
 
