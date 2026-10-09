@@ -11,13 +11,27 @@ export function useConversationRuntime(options: ConversationRuntimeOptions) {
 /**
  * Message ids the runtime holds after adopting the latest snapshot, or undefined before the first
  * adoption. `Transcript` uses it to tell ids the runtime adopted (its store is still publishing them)
- * from ids it never adopted.
+ * from ids it never adopted. It is a store rather than state, so readers re-render only when the
+ * ids they are waiting for change, never merely because an adoption happened.
  */
-export const RuntimeAdoptedIds = React.createContext<ReadonlySet<string> | undefined>(undefined)
+export interface RuntimeAdoption {
+  readonly get: () => ReadonlySet<string> | undefined
+  readonly subscribe: (listener: () => void) => () => void
+}
+export const RuntimeAdoptedIds = React.createContext<RuntimeAdoption | undefined>(undefined)
+function createRuntimeAdoption() {
+  let ids: ReadonlySet<string> | undefined
+  const listeners = new Set<() => void>()
+  return {
+    get: () => ids,
+    subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener) } },
+    publish: (next: ReadonlySet<string>) => { ids = next; for (const listener of listeners) listener() },
+  }
+}
 export function EmbraceRuntimeProvider({ options, children }: { readonly options: ConversationRuntimeOptions; readonly children: React.ReactNode }) {
   const runtime = useConversationRuntime(options)
-  const [adopted, setAdopted] = React.useState<ReadonlySet<string>>()
+  const [adoption] = React.useState(createRuntimeAdoption)
   // Declared after the runtime hook, so it reads the runtime after that hook's adoption effect for the same snapshot.
-  React.useEffect(() => setAdopted(new Set(runtime.thread.getState().messages.map(message => message.id))), [runtime, options])
-  return <AssistantRuntimeProvider runtime={runtime}><RuntimeAdoptedIds.Provider value={adopted}>{children}</RuntimeAdoptedIds.Provider></AssistantRuntimeProvider>
+  React.useEffect(() => adoption.publish(new Set(runtime.thread.getState().messages.map(message => message.id))), [runtime, options, adoption])
+  return <AssistantRuntimeProvider runtime={runtime}><RuntimeAdoptedIds.Provider value={adoption}>{children}</RuntimeAdoptedIds.Provider></AssistantRuntimeProvider>
 }
