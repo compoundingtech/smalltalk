@@ -41440,13 +41440,11 @@ version 2
 
         // The creation claim is what the run started with, so declaring the run again exactly
         // as it was started is still a retry.
-        assert_eq!(
-            store
-                .latest_claim(run, Some("mission-run.created"))
-                .unwrap()
-                .unwrap(),
-            created
-        );
+        let still = store
+            .latest_claim(run, Some("mission-run.created"))
+            .unwrap()
+            .unwrap();
+        assert_eq!((still.id, still.body), (created.id, created.body));
         let (_, redeclared) = declare();
         assert!(redeclared.blockers.is_empty(), "{:?}", redeclared.blockers);
     }

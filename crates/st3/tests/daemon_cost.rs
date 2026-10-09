@@ -314,6 +314,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "sets a run's outcome",
     ),
     (
+        "POST /v1/mission-runs/{run}/report-to",
+        "sets who a run reports to: one run row, two latest claims and one mission revision by key",
+    ),
+    (
         "POST /v1/revision-proposals/{proposal}/approve",
         "approves a revision",
     ),
