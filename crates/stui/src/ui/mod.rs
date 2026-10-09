@@ -327,6 +327,8 @@ pub struct Ui {
     replies: HashMap<String, String>,
     /// A menu owns its press through release, even after an action closes it.
     context_button: Option<MouseButton>,
+    /// The tab owning a middle-button press until release.
+    middle_tab: Option<(usize, usize)>,
     dragging: bool,
     demo: Option<Demo>,
     quit: bool,
@@ -532,6 +534,7 @@ impl Ui {
             hover: hover::Hover::default(),
             replies: HashMap::new(),
             context_button: None,
+            middle_tab: None,
             dragging: false,
             demo: None,
             quit: false,
@@ -3441,6 +3444,7 @@ impl Ui {
             self.hover.clear();
             self.hover.pressed.set(false);
             self.dragging = false;
+            self.middle_tab = None;
             self.terminal_selecting = false;
             self.cancel_drag();
         }
@@ -5045,6 +5049,42 @@ impl Ui {
                 _ => {}
             }
             return;
+        }
+        // Tabs own a middle press through release, even when released outside the strip.
+        if mouse.kind == MouseEventKind::Drag(MouseButton::Middle) && self.middle_tab.is_some() {
+            return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            self.middle_tab = None;
+        }
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Middle) | MouseEventKind::Up(MouseButton::Middle)
+        ) {
+            let tab = self
+                .frame
+                .borrow()
+                .hits
+                .iter()
+                .rev()
+                .find(|(rect, _)| contains(*rect, mouse.column, mouse.row))
+                .and_then(|(_, hit)| match hit {
+                    Hit::GlassTab(group, tab) => Some((*group, *tab)),
+                    _ => None,
+                });
+            if mouse.kind == MouseEventKind::Down(MouseButton::Middle) {
+                if self.popover.is_none() && !self.home_open() && !self.palette_open() {
+                    self.middle_tab = tab;
+                    if tab.is_some() {
+                        return;
+                    }
+                }
+            } else if let Some(pressed) = self.middle_tab.take() {
+                if tab == Some(pressed) {
+                    self.run_menu_action(glass::MenuAction::CloseTab(pressed.0, pressed.1));
+                }
+                return;
+            }
         }
         if self.terminal_mouse(mouse) {
             return;
