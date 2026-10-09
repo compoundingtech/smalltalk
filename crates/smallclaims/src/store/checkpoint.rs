@@ -24,8 +24,21 @@ pub const DAY_MS: u128 = 86_400_000;
 
 /// Envelopes and records a sealed-set read takes per page. Each page is a read of its own, so no
 /// read holds a snapshot, and with it the WAL, for the length of the whole set.
-pub(crate) const SEALED_ENVELOPE_PAGE: i64 = 5_000;
-pub(crate) const SEALED_RECORD_PAGE: i64 = 20_000;
+pub(crate) const SEALED_ENVELOPE_PAGE: i64 = 64;
+pub(crate) const SEALED_RECORD_PAGE: i64 = 64;
+
+fn checkpoint_accepted_time(raw: &str, id: &str, column: usize) -> rusqlite::Result<u128> {
+    raw.parse::<u128>().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid accepted time for checkpoint claim {id}: {error}"),
+            )),
+        )
+    })
+}
 
 /// The name of the checkpoint whose cut is `cut_unix_ms`, for example `checkpoint/2026-09-27`.
 pub fn checkpoint_name(cut_unix_ms: u128) -> String {
@@ -758,6 +771,12 @@ impl std::fmt::Display for CheckpointCaptureChanged {
 
 impl std::error::Error for CheckpointCaptureChanged {}
 
+struct CheckpointCaptureQuery<'a> {
+    table: &'a str,
+    columns: &'a str,
+    filter: &'a str,
+}
+
 impl Store {
     /// The envelopes this node holds from before `cut_unix_ms`, and their admitted claims in
     /// canonical order. An envelope with any claim dated at or after the cut is not before it.
@@ -780,10 +799,11 @@ impl Store {
         )
     }
 
-    /// Capture metadata and bodies in short, bounded page snapshots. Every page checks a
-    /// persistent invalidation epoch in its own snapshot. Destructive, repair, protection and
-    /// tombstone changes restart capture; after three invalidations it fails closed.
-    /// New envelopes above the sealed rowid do not invalidate the captured set.
+    /// Capture metadata and bodies in bounded page snapshots with an epoch guard. The seal
+    /// and cut are registered once, only advancing durable guard bounds when needed. Retries
+    /// keep that seal and reread the epoch: three conflicting captured-history changes fail
+    /// closed. New above-cut admission, identical re-offers and unrelated projection writes
+    /// do not invalidate the captured prefix.
     pub fn checkpoint_sealed_set_paged(
         &self,
         cut_unix_ms: u128,
@@ -793,14 +813,40 @@ impl Store {
     ) -> Result<SealedSet> {
         self.runtime.checkpoint_preflight()?;
         anyhow::ensure!(envelope_page > 0 && record_page > 0, "checkpoint page sizes must be positive");
-        let envelope_page = envelope_page.min(64);
-        let record_page = record_page.min(64);
+        let envelope_page = envelope_page.min(SEALED_ENVELOPE_PAGE);
+        let record_page = record_page.min(SEALED_RECORD_PAGE);
         // Seal only new batches. A full history scan under the writer stalls live requests
         // every time a checkpoint is reconsidered, even when no new envelope is needed.
         self.seal_local_batches()?;
+        let cut = i64::try_from(cut_unix_ms)?;
+        let (high, frontier, registered_cut): (i64, i64, i64) = self.read_snapshot(|_| {
+            Ok(self.readers.get().query_row(
+                "SELECT (SELECT COALESCE(MAX(rowid), 0) FROM replica_envelopes),
+                        envelope_frontier, cut_unix_ms
+                 FROM checkpoint_capture_epoch WHERE id=1",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?)
+        })?;
+        let seal_rowid = through_rowid.map_or(high, |through| through.min(high));
+        if frontier < seal_rowid || registered_cut < cut {
+            // One atomic autocommit statement. Already covered bounds take no writer loan;
+            // another capture can cover them before this loan, in which case no row changes.
+            self.connection.write().execute(
+                "UPDATE checkpoint_capture_epoch
+                 SET envelope_frontier=MAX(envelope_frontier, ?1),
+                     cut_unix_ms=MAX(cut_unix_ms, ?2)
+                 WHERE id=1 AND (envelope_frontier<?1 OR cut_unix_ms<?2)",
+                params![seal_rowid, cut],
+            )?;
+        }
         for _ in 0..3 {
-            match self.checkpoint_sealed_set_snapshot(
-                cut_unix_ms, through_rowid, envelope_page, record_page,
+            let epoch: i64 = self.read_snapshot(|_| {
+                Ok(self.readers.get().query_row(
+                    "SELECT value FROM checkpoint_capture_epoch WHERE id=1", [], |row| row.get(0),
+                )?)
+            })?;
+            match self.checkpoint_sealed_set_attempt(
+                cut_unix_ms, seal_rowid, epoch, envelope_page, record_page,
             ) {
                 Err(error) if error.downcast_ref::<CheckpointCaptureChanged>().is_some() => continue,
                 result => return result,
@@ -809,32 +855,14 @@ impl Store {
         anyhow::bail!("checkpoint capture invalidated by concurrent store changes after 3 attempts")
     }
 
-    fn checkpoint_sealed_set_snapshot(
+    fn checkpoint_sealed_set_attempt(
         &self,
         cut_unix_ms: u128,
-        through_rowid: Option<i64>,
+        seal_rowid: i64,
+        epoch: i64,
         envelope_page: i64,
         record_page: i64,
     ) -> Result<SealedSet> {
-        let (epoch, seal_rowid): (i64, i64) = {
-            let mut connection = self.connection.write();
-            let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let high: i64 = transaction.query_row(
-                "SELECT COALESCE(MAX(rowid), 0) FROM replica_envelopes",
-                [], |row| row.get(0),
-            )?;
-            let seal_rowid = through_rowid.map_or(high, |through| through.min(high));
-            transaction.execute(
-                "UPDATE checkpoint_capture_epoch
-                 SET envelope_frontier=MAX(envelope_frontier, ?1) WHERE id=1",
-                [seal_rowid],
-            )?;
-            let epoch = transaction.query_row(
-                "SELECT value FROM checkpoint_capture_epoch WHERE id=1", [], |row| row.get(0),
-            )?;
-            transaction.commit()?;
-            (epoch, seal_rowid)
-        };
         let mut envelopes = Vec::new();
         let mut after = 0_i64;
         while after < seal_rowid {
@@ -861,9 +889,7 @@ impl Store {
                         accepted_at_unix_ms: row
                             .get::<_, String>(3)?
                             .parse()
-                            .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
-                                3, rusqlite::types::Type::Text, Box::new(error),
-                            ))?,
+                            .unwrap_or(u128::MAX),
                         records: row.get(4)?,
                     })
                 })?
@@ -931,9 +957,7 @@ impl Store {
         keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         let mut late = BTreeSet::new();
         for (key, _) in &keyed {
-            let accepted_at_unix_ms = key.1.parse::<u128>()
-                .with_context(|| format!("invalid accepted time for checkpoint claim {}", key.6))?;
-            if accepted_at_unix_ms >= cut_unix_ms {
+            if checkpoint_accepted_time(&key.1, &key.6, 1)? >= cut_unix_ms {
                 late.insert(EnvelopeKey {
                     writer: key.7.clone(),
                     sequence: key.8,
@@ -986,7 +1010,7 @@ impl Store {
             ("replica_records", "replacement_claim_id", "replacement_claim_id IS NOT NULL AND ?3 IS NOT NULL"),
         ] {
             let page = self.checkpoint_capture_rows(
-                epoch, table, columns, filter, cut, record_page,
+                epoch, CheckpointCaptureQuery { table, columns, filter }, cut, record_page,
                 |row| row.get::<_, Option<String>>(0),
             )?;
             protected.extend(page.into_iter().flatten());
@@ -996,8 +1020,13 @@ impl Store {
         }
         // Envelopes an earlier checkpoint dropped are still part of what this node seals.
         let envelope_tombstones = self.checkpoint_capture_rows(
-            epoch, "checkpoint_envelopes", "writer, sequence, envelope_hash, accepted_at_unix_ms",
-            "accepted_at_unix_ms < ?3", cut, record_page, |row| {
+            epoch,
+            CheckpointCaptureQuery {
+                table: "checkpoint_envelopes",
+                columns: "writer, sequence, envelope_hash, accepted_at_unix_ms",
+                filter: "accepted_at_unix_ms < ?3",
+            },
+            cut, record_page, |row| {
                 Ok(EnvelopeTombstone {
                     writer: row.get(0)?,
                     sequence: row.get(1)?,
@@ -1007,10 +1036,14 @@ impl Store {
             },
         )?;
         let claim_tombstones = self.checkpoint_capture_rows(
-            epoch, "checkpoint_claims",
-            "id, writer, sequence, envelope_hash, subject, kind, actor, predecessors,
-             operation_id, request_digest, accepted_at_unix_ms",
-            "accepted_at_unix_ms < ?3", cut, record_page, |row| {
+            epoch,
+            CheckpointCaptureQuery {
+                table: "checkpoint_claims",
+                columns: "id, writer, sequence, envelope_hash, subject, kind, actor, predecessors,
+                          operation_id, request_digest, accepted_at_unix_ms",
+                filter: "accepted_at_unix_ms < ?3",
+            },
+            cut, record_page, |row| {
                 Ok(ClaimTombstone {
                     id: row.get(0)?,
                     writer: row.get(1)?,
@@ -1068,13 +1101,12 @@ impl Store {
     fn checkpoint_capture_rows<T>(
         &self,
         epoch: i64,
-        table: &str,
-        columns: &str,
-        filter: &str,
+        query: CheckpointCaptureQuery<'_>,
         cut: i64,
         page_size: i64,
         mut decode: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     ) -> Result<Vec<T>> {
+        let CheckpointCaptureQuery { table, columns, filter } = query;
         let high: i64 = self.checkpoint_capture_page(epoch, || {
             Ok(self.readers.get().query_row(
                 &format!("SELECT COALESCE(MAX(rowid), 0) FROM {table}"), [], |row| row.get(0),

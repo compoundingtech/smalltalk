@@ -19,33 +19,39 @@ pub const SCHEMA_NAME: &str = "st3.v1";
 pub const STORAGE_VERSION: u32 = 18;
 pub const LOCAL_STORAGE_SCHEMA: &str = r#"## Local checkpoint capture storage
 
-SQLite `user_version` is 18. This additive upgrade creates one persistent mutation fence and idempotent triggers; it does not rewrite claim bodies, rebuild projections, or force replay. The local storage digest is separate from the claim/wire registry digest, which remains unchanged.
+SQLite `user_version` is 18. The local checkpoint guard uses trigger version 2, independently of the unchanged claim/wire registry digest. Initialization adds the singleton, any missing guard columns, and its mutation triggers; it does not scan history, rewrite claim bodies, rebuild projections, or force replay.
 
 ```sql
 CREATE TABLE IF NOT EXISTS checkpoint_capture_epoch (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     value INTEGER NOT NULL,
-    envelope_frontier INTEGER NOT NULL DEFAULT 0
+    envelope_frontier INTEGER NOT NULL DEFAULT 0,
+    cut_unix_ms INTEGER NOT NULL DEFAULT 0,
+    trigger_version INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO checkpoint_capture_epoch(id, value, envelope_frontier) VALUES (1, 0, 0);
 ```
 
-At the start of each capture attempt, one short writer transaction chooses the sealed envelope rowid, advances `envelope_frontier` with `MAX(envelope_frontier, seal_rowid)`, and reads `SELECT value FROM checkpoint_capture_epoch WHERE id=1`. Every metadata, body, protection, and tombstone page reads and checks that value in its own short snapshot. A mismatch discards the entire attempt rather than returning a mixed set. The frontier only grows, including across reconnects and concurrent captures; advancing it does not itself increment the epoch.
+Before the first page, a short read snapshot chooses the sealed envelope rowid and checks the persisted guard bounds. If either bound needs to grow, one atomic autocommit writer statement registers `MAX(envelope_frontier, seal_rowid)` and `MAX(cut_unix_ms, requested_cut)`. Already-covered bounds require no writer loan or durable update. Each attempt reads `SELECT value FROM checkpoint_capture_epoch WHERE id=1`; all retries retain the original seal and cut without registering them again. Every metadata, body, protection, and tombstone page checks that value in its own short snapshot. A mismatch discards the whole attempt; three invalidations fail closed. The registered bounds only grow across concurrent captures and reconnects; registering them does not increment the epoch. A zero cut is inactive.
+
+An envelope is relevant when its rowid is at/below the registered frontier and its accepted time is below the registered cut. A protected or canonical-order target additionally requires the claim's own accepted time below the cut. Mutations audit both OLD and NEW identities and references. These retained highwaters can conservatively invalidate a smaller later capture, but ordinary above-cut history does not invalidate it merely because that history is already within the row frontier.
 
 | Captured source | Mutations that increment the epoch |
 |---|---|
-| `claims`, `batches`, `replica_records`, `replica_envelopes` | Every UPDATE and DELETE, including canonical-key, admission, repair-state, body, and rowid changes. |
-| `desired`, `mission_definitions`, `mission_revisions`, `documents` | Every INSERT, UPDATE, and DELETE; these tables protect claims independently of the sealed envelope prefix. Projection rebuilds and direct desired deletion are included. |
-| `checkpoint_claims`, `checkpoint_envelopes` | Every INSERT, UPDATE, and DELETE; trims, manifest adoption, and exact tombstone replacement are included. |
-| `claims` INSERT | Repair receipts (`record.repaired`, `repair.applied`), bodies belonging to an envelope at/below the frontier, and bodies backfilled for an already captured record. |
-| `replica_records` INSERT | Records in an envelope at/below the frontier, repaired/replacement records, and copies naming a claim already present in the captured envelope prefix (which may change its canonical wire position). Pending-envelope admission is included. |
-| `replica_envelopes` INSERT | Rows at/below the frontier, including explicit rowid backfill. |
-| `batches` INSERT | Backfill of a batch already named by a claim, which can change captured canonical keys. |
-| Core identity collisions on INSERT | BEFORE INSERT fences on all four core tables cover REPLACE even when SQLite recursive triggers are disabled; ignored duplicate inserts may conservatively invalidate. |
+| `claims` | Relevant envelope-associated body, identity, canonical-key and membership changes, body backfills, and deletions. Late claims in a relevant envelope remain exclusion witnesses: changing their accepted time, identity or batch, or deleting them, can change whether that envelope qualifies. |
+| `batches` | Backfills, canonical writer/sequence changes, identity/rowid changes and deletions for claims associated with a relevant envelope. Hash and batch-time bookkeeping alone is not captured. |
+| `replica_records` | Backfills and captured identity, position, admission-state, claim-reference or replacement-reference changes in a relevant envelope. A newer duplicate naming a captured below-cut claim is also fenced on INSERT, UPDATE and DELETE: canonical `MIN(position)` reads every copy, not only the sealed envelope prefix. |
+| `replica_envelopes` | Relevant identity, accepted-time or rowid changes and deletions. Any successful below-cut INSERT conservatively invalidates, including explicit rowid backfill and identical REPLACE relocating an old identity beyond the frontier. Receipt state, relay, validation errors and received-time bookkeeping alone is not captured. |
+| `desired`, `mission_definitions`, `mission_revisions`, `documents` | INSERT/DELETE referencing a captured below-cut claim, and UPDATE moving either OLD or NEW reference to/from such a claim (or moving its scan rowid). Unchanged references and references confined to above-cut claims are ignored. Captured projection rebuilds and direct desired deletion remain fenced. |
+| Repair references | `record.repaired` receipt changes referencing a captured replacement or a record in a relevant envelope; `repair.applied` receipt changes referencing captured predecessor claims; record replacement references into captured below-cut claims. Repairs only concerning newer history are ignored. |
+| `checkpoint_claims`, `checkpoint_envelopes` | Below-cut tombstone INSERT/DELETE and captured metadata, identity, accepted-time or rowid changes; both sides of a cut crossing are checked. The checkpoint-label field alone is not captured. |
+| Identity collisions on INSERT | BEFORE INSERT compares the colliding existing row's capture-relevant content, covering REPLACE with recursive triggers disabled, including removal of captured protection or tombstones. Identical ignored duplicates do not invalidate. Successful relevant inserts still run their AFTER fence. |
 
-Ordinary new batches, claims, envelopes, and records strictly beyond the frontier do not invalidate capture when they neither change protection nor name a captured claim. Capture does not read envelope signatures/holds, projection-health rows, peer/cursor state, blob bytes, operation caches, or checkpoint status as metadata, so mutations confined to those tables need no capture fence. Blob-backed document bindings and operation identity in claim bodies/tombstones are covered by their captured tables. Any future captured source must extend the trigger audit before pages may read it.
+Capture does not read envelope signatures/holds, projection-health rows, peer/cursor state, blob bytes, operation caches, or checkpoint status as metadata, so mutations confined to those tables need no capture fence. Blob-backed document bindings and operation identity in claim bodies/tombstones are covered by their captured tables. Any future captured source must extend the trigger audit before pages may read it. Accepted-time parsing remains a prerequisite owned by #2106, not a separate compatibility change here.
 
-Triggers persist in the database and increment the epoch in the mutation's own transaction on every connection, without connection-local hooks or SQL functions. Rollback rolls back the increment too. Reopening initializes neither value again and does not reset a prior frontier. Upgrade requires the normal process restart, not a history migration; its restart duration has not been measured. Older binaries reject storage version 18. Binary rollback requires restoring a pre-upgrade database snapshot; otherwise roll forward. No replicated claim, checkpoint rule, wire protocol, or response shape changes.
+Triggers persist and increment the epoch in the mutation's own transaction on every connection, without connection-local hooks or SQL functions. Rollback rolls back the increment too. A trigger-version migration atomically drops/recreates the old predicates, increments `value`, and stores `trigger_version=2`; captures using the old guard must restart. Earlier version-18 PR-head stores receive `cut_unix_ms` and `trigger_version` columns with default zero while preserving their epoch and frontier. Ordinary reopens preserve all bounds and do not repeat the migration.
+
+Upgrade requires the normal process restart, not a history migration; its restart duration has not been measured. Stable older binaries reject storage version 18. Earlier version-18 PR-head binaries using guard version 1 cannot safely operate the cut-aware version-2 schema and must not run concurrently or be used for binary rollback. Their copied stores can migrate forward only. Binary rollback requires restoring a pre-upgrade database snapshot; otherwise roll forward. No replicated claim, checkpoint rule, wire protocol, or response shape changes.
 "#;
 
 pub fn storage_digest() -> String {

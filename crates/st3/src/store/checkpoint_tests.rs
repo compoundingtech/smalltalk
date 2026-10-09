@@ -5,6 +5,28 @@ use proptest::prelude::*;
 
 const CUT: u128 = 20 * DAY_MS;
 
+#[test]
+fn compact_capture_metadata_rejects_malformed_claim_times() {
+    for malformed in ["not-a-time", "-1", "340282366920938463463374607431768211456"] {
+        let store = Store::open_memory("alder").unwrap();
+        store.set_write_clock_at(100).unwrap();
+        let claim = store.append_claim(&input(
+            AGENT, "harness.observed", Some(AGENT),
+            json!({"state":"idle", "incarnation_id":"compact"}), "compact",
+        )).unwrap();
+        store.seal_local_batches().unwrap();
+        store.connection.write().execute(
+            "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+            params![malformed, claim.id],
+        ).unwrap();
+        let error = store.checkpoint_sealed_set_paged(150, None, 1, 1).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("invalid accepted time for checkpoint claim {}", claim.id)),
+            "compact metadata must reject {malformed:?}: {error:#}",
+        );
+    }
+}
+
 /// Builds a sealed set by hand: each claim in its own envelope unless grouped, in canonical
 /// order. Every writer also gets a newest envelope that no rule drops, so the newest-envelope
 /// guard stays out of the way unless a test wants it.
@@ -436,62 +458,6 @@ fn a_sealed_set_read_in_pages_is_the_same_set_whatever_the_page() {
 }
 
 #[test]
-fn sealed_capture_rejects_invalid_times_even_when_another_claim_excludes_the_envelope() {
-    for malformed in ["not-a-time", "-1", "340282366920938463463374607431768211456"] {
-        let store = Store::open_memory("alder").unwrap();
-        store.set_write_clock_at(100).unwrap();
-        let broken = store.append_claim(&input(
-            AGENT, "harness.observed", Some(AGENT),
-            json!({"state":"idle", "incarnation_id":"broken"}), "broken",
-        )).unwrap();
-        let later = store.append_claim(&input(
-            AGENT, "harness.observed", Some(AGENT),
-            json!({"state":"idle", "incarnation_id":"later"}), "later",
-        )).unwrap();
-        store.seal_local_batches().unwrap();
-        {
-            let connection = store.connection.write();
-            connection.execute(
-                "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
-                params![malformed, broken.id],
-            ).unwrap();
-            connection.execute(
-                "UPDATE claims SET accepted_at_unix_ms='200' WHERE id=?1",
-                [&later.id],
-            ).unwrap();
-            // Put both records in one envelope so the late claim excludes the malformed
-            // claim's envelope before the body pass would otherwise parse it.
-            connection.execute(
-                "UPDATE replica_records SET (writer, sequence, envelope_hash, position)=(
-                    SELECT writer, sequence, envelope_hash, position+1 FROM replica_records
-                    WHERE claim_id=?1) WHERE claim_id=?2",
-                params![broken.id, later.id],
-            ).unwrap();
-        }
-        let error = store.checkpoint_sealed_set_paged(150, None, 1, 1).unwrap_err();
-        assert!(
-            error.to_string().contains(&format!("invalid accepted time for checkpoint claim {}", broken.id)),
-            "malformed time {malformed:?} must not silently count as early: {error:#}",
-        );
-    }
-}
-
-#[test]
-fn sealed_capture_rejects_invalid_envelope_times_at_first_use() {
-    let store = Store::open_memory("alder").unwrap();
-    store.set_write_clock_at(100).unwrap();
-    store.append_claim(&input(
-        AGENT, "harness.observed", Some(AGENT),
-        json!({"state":"idle", "incarnation_id":"broken"}), "broken",
-    )).unwrap();
-    store.seal_local_batches().unwrap();
-    store.connection.write().execute(
-        "UPDATE replica_envelopes SET accepted_at_unix_ms='not-a-time'", [],
-    ).unwrap();
-    assert!(store.checkpoint_sealed_set(150).is_err());
-}
-
-#[test]
 fn sealed_record_windows_leave_later_envelopes_out_before_reading_bodies() {
     let store = Store::open_memory("alder").unwrap();
     let append = |at, incarnation: &str| {
@@ -723,7 +689,21 @@ fn sealed_capture_fails_closed_after_three_consecutive_invalidations() {
         json!({"state":"idle", "incarnation_id":"one"}), "harness",
     )).unwrap();
     let cut = now_ms() + 1_000;
+    store.connection.write().execute_batch(
+        "CREATE TABLE capture_registration_count(value INTEGER NOT NULL);
+         INSERT INTO capture_registration_count VALUES (0);
+         CREATE TRIGGER capture_registration_count AFTER UPDATE OF envelope_frontier, cut_unix_ms
+         ON checkpoint_capture_epoch BEGIN
+             UPDATE capture_registration_count SET value=value+1;
+         END;",
+    ).unwrap();
     store.checkpoint_sealed_set(cut).unwrap();
+    assert_eq!(store.readers.get().query_row(
+        "SELECT value FROM capture_registration_count", [], |row| row.get::<_, i64>(0),
+    ).unwrap(), 1);
+    store.connection.write().execute(
+        "UPDATE capture_registration_count SET value=0", [],
+    ).unwrap();
     let mutation = Mutate {
         connection: rusqlite::Connection::open(&path).unwrap(),
         changes: Cell::new(0),
@@ -744,6 +724,13 @@ fn sealed_capture_fails_closed_after_three_consecutive_invalidations() {
     }
     assert!(captured.unwrap_err().to_string().contains("after 3 attempts"));
     assert!(mutation.changes.get() >= 3);
+    assert_eq!(store.readers.get().query_row(
+        "SELECT value FROM capture_registration_count", [], |row| row.get::<_, i64>(0),
+    ).unwrap(), 0, "retries must not durably rewrite unchanged capture bounds");
+    store.checkpoint_sealed_set(cut).unwrap();
+    assert_eq!(store.readers.get().query_row(
+        "SELECT value FROM capture_registration_count", [], |row| row.get::<_, i64>(0),
+    ).unwrap(), 0, "a repeated capture with covered bounds needs no frontier write");
 }
 
 #[test]

@@ -612,13 +612,15 @@ CREATE TABLE IF NOT EXISTS graph_generation (
 );
 INSERT OR IGNORE INTO graph_generation(id, value) VALUES (1, 0);
 
--- A checkpoint capture fences mutation across independently released read pages. The frontier
--- only grows, so inserting into an envelope an earlier capture sealed can never look like an
--- ordinary append. Both values survive reconnects; triggers update the epoch with each mutation.
+-- A checkpoint capture fences relevant mutations across independently released read pages.
+-- The registered envelope frontier and accepted-time cut only grow, including across reopens.
+-- Trigger versions migrate atomically with an epoch bump; no history rewrite is needed.
 CREATE TABLE IF NOT EXISTS checkpoint_capture_epoch (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     value INTEGER NOT NULL,
-    envelope_frontier INTEGER NOT NULL DEFAULT 0
+    envelope_frontier INTEGER NOT NULL DEFAULT 0,
+    cut_unix_ms INTEGER NOT NULL DEFAULT 0,
+    trigger_version INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO checkpoint_capture_epoch(id, value, envelope_frontier) VALUES (1, 0, 0);
 

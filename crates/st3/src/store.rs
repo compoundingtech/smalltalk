@@ -143,6 +143,8 @@ mod checkpoint_tests;
 #[cfg(test)]
 mod checkpoint_capture_epoch_tests;
 #[cfg(test)]
+mod checkpoint_replication_capture_tests;
+#[cfg(test)]
 mod convergence;
 #[cfg(test)]
 mod document_index_tests;
@@ -46821,6 +46823,9 @@ version 2
                 child_step,
             ))
             .unwrap();
+        // This repair touches run-state projections and appends new history, not any
+        // captured body, canonical key or protection reference.
+        store.checkpoint_sealed_set(now_ms() + 1_000).unwrap();
         let before_dry_run = store.index().unwrap();
         let capture_epoch =
             smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap();
@@ -46843,9 +46848,10 @@ version 2
         assert!(!applied.already_applied);
         let repaired_epoch =
             smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap();
-        assert!(
-            repaired_epoch > capture_epoch,
-            "committing an operational repair must invalidate checkpoint capture"
+        assert_eq!(
+            repaired_epoch,
+            capture_epoch,
+            "unrelated operational-state repair must not invalidate captured history"
         );
         let duplicate = store.apply_operational_repair(&repair.token).unwrap();
         assert_eq!(duplicate.applied, 0);

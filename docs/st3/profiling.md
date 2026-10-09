@@ -129,12 +129,18 @@ session, person, and mode binding, expiry, and owner/incarnation checks remain u
 
 Checkpoint capture filters envelope cuts in SQLite and sorts only claim identities and canonical
 keys, then decodes retained bodies in bounded pages. Each metadata, body, protection and tombstone
-page has its own read snapshot and checks the persistent capture invalidation epoch. Changes to
-captured rows, repairs, protection or tombstones restart capture; three invalidated attempts fail
-with a clear error rather than returning mixed state. A brief initial writer transaction advances
-the monotonic envelope frontier, so delayed admission into an already captured envelope also
-invalidates capture while ordinary new envelopes above the frontier do not. The WAL is released
-between pages instead of being pinned across sorting and the full body pass.
+page has its own read snapshot and checks the persistent capture invalidation epoch. Mutations
+that affect the registered below-cut envelope prefix, canonical ordering, its protection references
+or below-cut tombstones restart capture; three invalidated attempts fail closed with a clear error.
+The seal rowid is fixed once per capture. A short atomic writer statement advances the monotonic
+frontier and accepted-time cut only when their persisted bounds need to grow; retries and repeated
+captures within covered bounds do not rewrite them. Admission of newer above-cut envelopes,
+identical duplicate re-offers and projection writes referring only to newer history do not
+invalidate capture. Delayed admission into the captured prefix and repairs that protect captured
+claims still invalidate it. The WAL is released between pages rather than pinned across sorting
+and the full body pass. The default and maximum capture page sizes are 64 envelopes/records.
+The compact metadata pass strictly decodes claim acceptance timestamps before envelope exclusion;
+malformed, negative or overflowing values return an error rather than silently counting as early.
 Mission-run and planning replay retain the canonical list of IDs and load one claim body at a
 time. Base replay uses a temporary ID order and bounded body pages. Both close their ordering
 or body statements before projection savepoints.
