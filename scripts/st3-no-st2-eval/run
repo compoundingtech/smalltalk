@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import signal
 import sqlite3
 import sys
@@ -28,7 +29,7 @@ import urllib.parse
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.dont_write_bytecode = True
-from st_boundary import fresh_seat_findings
+from st_boundary import fresh_seat_findings, isolated_path
 
 SUBJECT = "agent/eval/native-seat"
 
@@ -45,14 +46,18 @@ class Node:
             raise SystemExit("pty must be on PATH")
         (root / "bin/pty").symlink_to(pty)
         stub = root / "bin/claude"
-        shutil.copy2(HERE / "claude", stub)
+        source = (HERE / "claude").read_text()
+        stub.write_text(f"#!{sys.executable}\n" + source.split("\n", 1)[1])
         stub.chmod(0o755)
-        self.path = f"{root / 'bin'}:/usr/bin:/bin"
+        self.path = isolated_path(root / "bin")
+        shell = shutil.which("bash", path=self.path)
+        if not shell:
+            raise SystemExit("bash must be on the isolated PATH")
         found = shutil.which("st2", path=self.path)
         if found:
             raise SystemExit(f"the isolated PATH must not hold st2, but {found} is on it")
         self.endpoint = root / "run/st.sock"
-        self.env = {"PATH": self.path, "HOME": str(root / "home"), "SHELL": "/bin/bash",
+        self.env = {"PATH": self.path, "HOME": str(root / "home"), "SHELL": shell,
                     "USER": os.environ.get("USER", "eval"), "LOGNAME": os.environ.get("USER", "eval"),
                     "LANG": "C.UTF-8", "XDG_STATE_HOME": str(root / "home/.local/state"),
                     "XDG_CONFIG_HOME": str(root / "home/.config"),
@@ -60,7 +65,7 @@ class Node:
                     "XDG_RUNTIME_DIR": str(root / "run"), "ST3_ENDPOINT": str(self.endpoint),
                     "ST3_DAEMON_WAIT": "0"}
         # The daemon rebuilds PATH from a login shell; pin it to the isolated one.
-        profile = f"export PATH='{self.path}'\n"
+        profile = f"export PATH={shlex.quote(self.path)}\n"
         for name in (".profile", ".bash_profile", ".bashrc", ".zprofile", ".zshenv"):
             (root / "home" / name).write_text(profile)
         (root / "config.toml").write_text(f'''node = "native"

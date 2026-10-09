@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Fix tests/CI seat fixtures in hermetic environments by retaining inherited tools without exposing st2 and resolving shell/interpreter paths",
+  "replay": {"status": "none", "detail": "Tests/CI only; no runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "No client, wire or provider contract change."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No installation or operator steps change; fixture tooling is supplied by the test environment."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

@@ -1,15 +1,64 @@
 #!/usr/bin/env python3
 """Mutation proofs: each forbidden surface must fail the same guard used by CI/evals."""
+import os
 from pathlib import Path
+import runpy
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 sys.dont_write_bytecode = True
-from st_boundary import fresh_seat_findings, launch_findings
+from st_boundary import fresh_seat_findings, isolated_path, launch_findings
 
 HERE = Path(__file__).resolve().parent
+
+
+class FixturePathCheck(unittest.TestCase):
+    def test_inherited_tools_stay_after_private_bin_without_st2(self):
+        with tempfile.TemporaryDirectory(prefix="fixture-path-") as temporary:
+            root = Path(temporary)
+            private, tools, legacy, named = [root / name for name in
+                                             ("private", "tools'quoted", "legacy", "ST2-tools")]
+            for directory in (private, tools, legacy, named):
+                directory.mkdir()
+            (legacy / "st2").write_text("#!/bin/sh\n")
+            (legacy / "st2").chmod(0o755)
+            inherited = os.pathsep.join(["", str(legacy), str(tools), str(named), ""])
+            with patch.dict(os.environ, {"PATH": inherited}):
+                actual = isolated_path(private)
+            self.assertEqual(actual, os.pathsep.join([str(private), str(tools)]))
+            self.assertFalse(list(launch_findings("provider", ["PATH=" + actual])))
+
+    def test_fixture_profiles_preserve_apostrophes_in_inherited_path(self):
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash, "the fixture profile regression needs Bash")
+        with tempfile.TemporaryDirectory(prefix="fixture-profile-") as temporary:
+            root = Path(temporary)
+            tools = root / "tools'quoted"
+            tools.mkdir()
+            for tool, executable in (("bash", bash), ("python3", sys.executable),
+                                     ("pty", sys.executable), ("git", sys.executable)):
+                (tools / tool).symlink_to(executable)
+            for fixture in ("st3-boot-canaries", "st3-no-st2-eval", "st3-subagents-eval"):
+                with self.subTest(fixture=fixture):
+                    node_class = runpy.run_path(str(HERE / fixture / "run"))["Node"]
+                    arguments = [root / fixture, Path(sys.executable)]
+                    if fixture == "st3-boot-canaries":
+                        arguments.append("claude")
+                    with patch.dict(os.environ, {"PATH": str(tools)}):
+                        node = node_class(*arguments)
+                    try:
+                        profile = node.root / "home/.bash_profile"
+                        result = subprocess.run(
+                            [bash, "--noprofile", "--norc", "-c",
+                             'source "$1"; printf "%s" "$PATH"', "profile-test", str(profile)],
+                            check=True, capture_output=True, text=True)
+                        self.assertEqual(result.stdout, node.path)
+                    finally:
+                        node.log.close()
 
 
 class BoundaryCheck(unittest.TestCase):
