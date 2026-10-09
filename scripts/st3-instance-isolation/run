@@ -20,7 +20,7 @@ out="${3:-$(mktemp -d)}"
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 home="$(mktemp -d "${TMPDIR:-/var/tmp}/st-instance-home.XXXXXX")"
-tools="$home/../$(basename "$home").tools"
+tools="$(dirname "$home")/$(basename "$home").tools"
 mkdir -p "$tools"
 # setup finds pty beside the st3 it runs, so use a copy of st3 that has one beside it.
 cp --reflink=auto "$pty" "$tools/pty"
