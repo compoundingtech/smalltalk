@@ -402,8 +402,11 @@ workflow-level path filters. `linux-gate` does not depend on them.
   identity, run `pnpm install --frozen-lockfile`, then `buck2 build //:typecheck`.
   It restores the pnpm store with key
   `fractal-web-pnpm-<os>-pnpm12.7.0-node24.20.0-<hashFiles pnpm-lock.yaml>`;
-  only Main upkeep's `warm-fractal-web` saves this cache. App, UI kit, Storybook,
-  browser and performance lanes join the script with the packages that add them.
+  only Main upkeep's `warm-fractal-web` saves this cache. The app production build
+  lane runs Vite with `apps/fractal-web/vite.config.ts` and `--configLoader runner`
+  into a fresh temporary output directory, removed on exit. Build errors fail the
+  execution job; build output is not cached. App, UI kit, Storybook, browser and
+  performance lanes join the script with the packages that add them.
 - `fractal-web` is always emitted (`if: always()`), with a one-minute timeout. Its
   embedded `scripts/ci-fractal-web-gate` passes only when detection succeeded and
   either no relevant paths changed and execution was skipped, or execution succeeded.
