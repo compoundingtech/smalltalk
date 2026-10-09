@@ -875,7 +875,9 @@ async fn conversation_page(
     .map_err(ApiError::internal)?
 }
 
-/// What changed in a conversation after `after`, waiting up to `wait_ms` for something to.
+/// What changed in a conversation after `after`, waiting up to `wait_ms` for something to. A
+/// local follower keeps the conversation's `mark` between calls, so its owner and transcript are
+/// found once rather than on every wait.
 async fn conversation_changes_value(
     state: &AppState,
     session: &ClientSession,
@@ -883,6 +885,7 @@ async fn conversation_changes_value(
     remote: Option<&str>,
     after: Option<&str>,
     wait_ms: u64,
+    mark: &mut Option<ConversationMark>,
 ) -> Result<Value, ApiError> {
     if let Some(owner) = remote {
         let relay = state
@@ -909,7 +912,10 @@ async fn conversation_changes_value(
             })
             .map_err(|error| conversation_blocks::availability(remote_read_error(owner, error)));
     }
-    conversation_changes_local(state, session, session_id, after, wait_ms).await
+    let (value, kept) =
+        conversation_changes_local_marked(state, session, session_id, after, wait_ms, mark.take()).await?;
+    *mark = Some(kept);
+    Ok(value)
 }
 
 /// Capture the first page and its replay boundary with one timeline read. The graph and local
@@ -919,17 +925,18 @@ async fn conversation_open_value(
     session: &ClientSession,
     session_id: &str,
     remote: Option<&str>,
-) -> Result<(Value, Value), ApiError> {
+) -> Result<(Value, Value, Option<ConversationMark>), ApiError> {
     if remote.is_some() {
         // Existing owners relay the two public reads. Keep mixed-build relay compatibility.
-        let start = conversation_changes_value(state, session, session_id, remote, None, 0).await?;
+        let start = conversation_changes_value(state, session, session_id, remote, None, 0, &mut None).await?;
         let page = conversation_page(state, session, session_id, remote).await?;
-        return Ok((start, page));
+        return Ok((start, page, None));
     }
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
     let admission_store = state.store.clone();
     super::read_deadline::store_read(&admission_store, move || {
-        conversation_open_local(&state, &session, &session_id)
+        conversation_open_local_marked(&state, &session, &session_id)
+            .map(|(start, page, mark)| (start, page, Some(mark)))
     }).await.map_err(ApiError::internal)?
 }
 
@@ -939,9 +946,17 @@ thread_local! {
     static BEFORE_CONVERSATION_PAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
 fn conversation_open_local(
     state: &AppState, session: &ClientSession, session_id: &str,
 ) -> Result<(Value, Value), ApiError> {
+    conversation_open_local_marked(state, session, session_id).map(|(start, page, _)| (start, page))
+}
+
+/// The first page and its replay cursor, with the mark a follower keeps for its later waits.
+fn conversation_open_local_marked(
+    state: &AppState, session: &ClientSession, session_id: &str,
+) -> Result<(Value, Value, ConversationMark), ApiError> {
     // Local rows follow a graph position. Capture their high-water first: a row newer than
     // the graph cut must never be excluded from both this page and its replay cursor.
     let local_position = local_latest_position(state)?;
@@ -964,7 +979,7 @@ fn conversation_open_local(
         state, session_id, snapshot.store_index, local_position, native,
     );
     remember_cursor(&cursor, mark.transcript_seen);
-    Ok((json!({"next_cursor":cursor}), page))
+    Ok((json!({"next_cursor":cursor}), page, mark))
 }
 
 fn native_latest_sequence(page: &Value) -> u64 {
@@ -1011,7 +1026,7 @@ async fn follow_conversation(
                 opened = conversation_open_value(&state, &session, &session_id, remote).await;
             }
         }
-        let (start, page) = match opened {
+        let (start, page, mut mark) = match opened {
             Ok(opened) => opened,
             Err(error) => {
                 if client_error_retryable(error.status, Some(&error.code)) {
@@ -1049,6 +1064,7 @@ async fn follow_conversation(
                 remote,
                 after.as_deref(),
                 10_000,
+                &mut mark,
             )
             .await
             {
@@ -6141,6 +6157,9 @@ fn conversation_read_now_unbounded(
 struct ConversationMark {
     owner: Option<String>,
     transcript: Option<std::path::PathBuf>,
+    /// When the owner and transcript were found. A harness can move to a new transcript within
+    /// one incarnation, so a kept mark finds them again after [`CONVERSATION_MARK_REUSE`].
+    resolved_at: std::time::Instant,
     store_index: u64,
     local_position: u64,
     transcript_seen: Option<(u64, std::time::SystemTime)>,
@@ -6151,6 +6170,9 @@ struct ConversationMark {
 /// rebuilding the timeline, that nothing concerning the conversation changed since: idle polls
 /// rebuilt a 200-entry timeline every time, 275–620 ms of daemon CPU each (idle-cpu findings).
 type TranscriptSeen = Option<(u64, std::time::SystemTime)>;
+/// How long a follower reuses the owner and transcript it found: one follow wait, as long as a
+/// wait-long changes read always reused them.
+const CONVERSATION_MARK_REUSE: Duration = Duration::from_secs(10);
 type HashMap<K, V> = std::collections::HashMap<K, V>;
 const ISSUED_CURSORS: usize = 4096;
 
@@ -6181,6 +6203,14 @@ fn issued_transcript(cursor: &str) -> Option<TranscriptSeen> {
     issued_cursors().lock().ok()?.1.get(cursor).copied()
 }
 
+/// Conversation owners and transcripts found, by session, counted by the work-budget tests.
+#[cfg(test)]
+fn conversation_marks_resolved() -> &'static std::sync::Mutex<HashMap<String, u64>> {
+    static RESOLVED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    RESOLVED.get_or_init(Default::default)
+}
+
 /// First-page builds for initial OPEN and reactive changes, counted by the work-budget tests.
 #[cfg(test)]
 fn timeline_rebuilds() -> &'static std::sync::Mutex<HashMap<String, u64>> {
@@ -6202,6 +6232,10 @@ impl ConversationMark {
     }
 
     fn new_unbounded(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
+        #[cfg(test)]
+        if let Ok(mut resolved) = conversation_marks_resolved().lock() {
+            *resolved.entry(session_id.to_owned()).or_default() += 1;
+        }
         let index = state.store.index().map_err(ApiError::internal)?;
         let managed = super::managed_session_owner_at(&state.store, index, session_id)
             .map_err(ApiError::internal)?;
@@ -6219,10 +6253,26 @@ impl ConversationMark {
         Ok(Self {
             transcript_seen: transcript_seen(transcript.as_deref()),
             transcript,
+            resolved_at: std::time::Instant::now(),
             owner,
             store_index: index,
             local_position: local_latest_position(state)?,
         })
+    }
+
+    /// Bring a kept mark up to now without finding its owner or transcript again: the same as a
+    /// new mark while they are known and recently found. Otherwise find them again.
+    fn refresh(mut self, state: &AppState, session_id: &str) -> Result<Self, ApiError> {
+        if self.transcript.is_none() || self.resolved_at.elapsed() >= CONVERSATION_MARK_REUSE {
+            return Self::new(state, session_id);
+        }
+        super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+            self.store_index = state.store.index().map_err(ApiError::internal)?;
+            self.local_position = local_latest_position(state)?;
+            Ok(())
+        })?;
+        self.transcript_seen = transcript_seen(self.transcript.as_deref());
+        Ok(self)
     }
 
     /// Whether anything that concerns the conversation changed since the last look.
@@ -6262,9 +6312,27 @@ async fn conversation_changes_local(
     after: Option<&str>,
     wait_ms: u64,
 ) -> Result<Value, ApiError> {
+    conversation_changes_local_marked(state, session, session_id, after, wait_ms, None)
+        .await
+        .map(|(value, _)| value)
+}
+
+/// [`conversation_changes_local`], starting from a mark kept from an earlier read of the same
+/// conversation, and returning the mark to keep for the next.
+async fn conversation_changes_local_marked(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    after: Option<&str>,
+    wait_ms: u64,
+    kept: Option<ConversationMark>,
+) -> Result<(Value, ConversationMark), ApiError> {
     let mut changed = state.event_notify.subscribe();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms.min(30_000));
-    let mut mark = ConversationMark::new(state, session_id)?;
+    let mut mark = match kept {
+        Some(mark) => mark.refresh(state, session_id)?,
+        None => ConversationMark::new(state, session_id)?,
+    };
     // A cursor this member gave out, with nothing that concerns the conversation changed since:
     // there is nothing to read yet, so wait without rebuilding the timeline.
     let mut quiet = None;
@@ -6300,7 +6368,7 @@ async fn conversation_changes_local(
             || after.is_none()
             || tokio::time::Instant::now() >= deadline
         {
-            return Ok(value);
+            return Ok((value, mark));
         }
         // Read again only when something that concerns this conversation changed: a full read
         // parses the whole transcript, and the fleet commits many times a second.
@@ -6326,7 +6394,7 @@ async fn conversation_changes_local(
                     remember_cursor(&next, mark.transcript_seen);
                     value["next_cursor"] = Value::String(next);
                 }
-                return Ok(value);
+                return Ok((value, mark));
             }
         }
     }
@@ -16196,7 +16264,11 @@ mission "example/zero-run" state="ready" {
             assert_eq!(frame["has_more"], lines * 2 > 200);
             assert!(frame_bytes(&frame) <= CLIENT_MAX_RESPONSE_BYTES);
             let rebuilds = || timeline_rebuilds().lock().unwrap().get(&session_id).copied().unwrap_or(0);
+            let resolved = || conversation_marks_resolved().lock().unwrap().get(&session_id).copied().unwrap_or(0);
             assert_eq!(rebuilds(), 1, "OPEN must not fold an empty baseline before its page");
+            // Let the follower start its first wait: it keeps the owner and transcript OPEN found.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(resolved(), 1, "OPEN and its first wait find the transcript once");
             // Change the source after the first frame. The next frame is a delta, not a reload.
             use std::io::Write as _;
             let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -16209,6 +16281,8 @@ mission "example/zero-run" state="ready" {
             assert!(delta["items"].as_array().unwrap().iter().any(|item|
                 item["body"]["text"].as_str().is_some_and(|text| text.starts_with(&format!("answer {lines} ")))));
             assert_eq!(rebuilds(), 2);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(resolved(), 1, "a delta and the wait after it reuse the kept mark");
             assert_collection_frame_conforms(&delta);
             follower.abort();
             let _ = follower.await;
