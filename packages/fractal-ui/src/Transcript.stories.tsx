@@ -114,7 +114,8 @@ export const Interrupted: Story = { args: { state: 'interrupted' } }
 export const InterruptedLight: Story = { args: { state: 'interrupted', scheme: 'light' } }
 export const CompletionUnknown: Story = { args: { state: 'unknown' } }
 export const Loading: Story = { args: { state: 'loading' }, play: async ({ canvasElement }) => {
-  await expect(await within(canvasElement).findByText('Loading conversation…')).toBeVisible()
+  await expect(await within(canvasElement).findByText(/^(Loading conversation|Connecting)/)).toBeVisible()
+  await expect(within(canvasElement).getAllByText(/^(Loading conversation|Connecting)/)).toHaveLength(1)
 } }
 export const LoadingLight: Story = { ...Loading, args: { state: 'loading', scheme: 'light' } }
 export const CatchingUp: Story = { args: { state: 'catching-up' }, play: async ({ canvasElement }) => {

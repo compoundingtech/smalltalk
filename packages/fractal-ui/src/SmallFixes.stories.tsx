@@ -56,7 +56,7 @@ export const WorkLogRovingFocusLight: Story = { ...WorkLogRovingFocus, args: { s
 
 const loadingNow = Date.parse('2026-01-15T12:00:08Z')
 function LoadingConversation({ scheme = 'dark' }: { scheme?: Scheme }) {
-  return <section {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><EmbraceRuntimeProvider options={{ messages: [], isRunning: false, onNew: async () => {} }}><Transcript title="Synthetic conversation" turns={[]} sync={{ _tag: 'Connecting', attempt: 1, since: loadingNow - 8000 }} now={loadingNow} observedAt={loadingNow - 8000} /></EmbraceRuntimeProvider></section>
+  return <section {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><EmbraceRuntimeProvider options={{ messages: [], isRunning: false, onNew: async () => {} }}><Transcript title="Synthetic conversation" turns={[]} sync={{ _tag: 'Requested', since: loadingNow - 8000 }} now={loadingNow} observedAt={loadingNow - 8000} /></EmbraceRuntimeProvider></section>
 }
 export const SingleLoadingLabel: Story = { render: args => <LoadingConversation {...args} />, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
