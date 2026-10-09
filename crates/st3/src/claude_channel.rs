@@ -492,7 +492,9 @@ fn user_text(record: &Value) -> Vec<&str> {
     }
 }
 async fn body(client: &Client, message: &MessageView) -> Result<String> {
-    if message.content.starts_with("doc/") {
+    if message.body_ref.is_some() {
+        crate::message_body::full_text(client, message).await
+    } else if message.content.starts_with("doc/") {
         let value: Value = client
             .get(&format!(
                 "/v1/documents/content?reference={}",
@@ -692,6 +694,9 @@ mod tests {
                 title: None,
                 in_reply_to: None,
                 tags: Vec::new(),
+                body_ref: None,
+                body_bytes: None,
+                body_origin: None,
                 created_index: 1,
                 attachments: Vec::new(),
             };

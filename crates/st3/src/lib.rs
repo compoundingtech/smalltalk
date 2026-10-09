@@ -40,6 +40,7 @@ pub mod hooks;
 pub mod incremental;
 pub mod lane;
 pub mod mailbox;
+pub mod message_body;
 /// Bounded local maintenance workers shared by daemon startup and lifecycle fixtures.
 pub mod maintenance;
 pub(crate) mod memory;

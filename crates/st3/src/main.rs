@@ -16016,6 +16016,10 @@ async fn run_message(
                 let mut shown = Vec::with_capacity(messages.len());
                 for message in &messages {
                     let mut value = serde_json::to_value(message)?;
+                    if message.body_ref.is_some() {
+                        // `content` is only the preview; `text` is the whole message.
+                        value["text"] = st3::message_body::full_text(client, message).await?.into();
+                    }
                     if let Some(provenance) = message_provenance(client, &message.subject).await {
                         value["provenance"] = provenance;
                     }
@@ -16031,9 +16035,10 @@ async fn run_message(
                     if index > 0 && !args.raw {
                         println!("\n---\n");
                     }
+                    let text = st3::message_body::full_text(client, message).await?;
                     if args.raw {
-                        print!("{}", message.content);
-                        if index + 1 < messages.len() && !message.content.ends_with('\n') {
+                        print!("{text}");
+                        if index + 1 < messages.len() && !text.ends_with('\n') {
                             println!();
                         }
                     } else {
@@ -16047,7 +16052,7 @@ async fn run_message(
                             println!("Subject: {title}");
                         }
                         println!();
-                        println!("{}", message.content);
+                        println!("{text}");
                         for attachment in &message.attachments {
                             println!(
                                 "Attachment: blob/{} ({}, {} bytes{}); read it with `st blobs get blob/{} --message {} -o FILE`",
@@ -20591,7 +20596,9 @@ async fn latest_document_text(client: &Client, name: &str) -> Result<Option<Stri
 }
 
 async fn message_content(client: &Client, message: &MessageView) -> Result<String> {
-    if message.content.starts_with("doc/") {
+    if message.body_ref.is_some() {
+        st3::message_body::full_text(client, message).await
+    } else if message.content.starts_with("doc/") {
         let value: Value = client
             .get(&format!(
                 "/v1/documents/content?reference={}",
@@ -22822,7 +22829,9 @@ async fn forward_projected_messages_reporting(
                 let filename = if let Some(filename) = present.get(&message.subject) {
                     filename.clone()
                 } else {
-                    let content = if message.content.starts_with("doc/") {
+                    let content = if message.body_ref.is_some() {
+                        st3::message_body::full_text(client, &message).await?
+                    } else if message.content.starts_with("doc/") {
                         let value: Value = client
                             .get(&format!(
                                 "/v1/documents/content?reference={}",
@@ -25112,6 +25121,9 @@ mod tests {
             title: Some("Cross-harness consensus: idle".into()),
             in_reply_to: None,
             tags: vec![],
+            body_ref: None,
+            body_bytes: None,
+            body_origin: None,
             created_index: 1,
             attachments: Vec::new(),
         };
@@ -25377,6 +25389,9 @@ mod tests {
                 title: None,
                 in_reply_to: None,
                 tags: Vec::new(),
+                body_ref: None,
+                body_bytes: None,
+                body_origin: None,
                 created_index: 1,
                 attachments: Vec::new(),
             };
@@ -28318,6 +28333,9 @@ mod tests {
             title: Some("Greeting".into()),
             in_reply_to: None,
             tags: Vec::new(),
+            body_ref: None,
+            body_bytes: None,
+            body_origin: None,
             created_index: 1,
             attachments: Vec::new(),
         };

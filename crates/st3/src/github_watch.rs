@@ -1024,6 +1024,9 @@ mod tests {
             in_reply_to: None,
             tags: comment.tags.clone(),
             attachments: Vec::new(),
+            body_ref: None,
+            body_bytes: None,
+            body_origin: None,
             created_index: 1,
         };
         assert_eq!(
@@ -1105,6 +1108,9 @@ mod tests {
                 format!("{COMMENT_TAG}{thread}:comment:5:12"),
             ],
             attachments: Vec::new(),
+            body_ref: None,
+            body_bytes: None,
+            body_origin: None,
             created_index: 1,
         };
         let post = PostInFlight::begin("agent/example.planner", &thread);

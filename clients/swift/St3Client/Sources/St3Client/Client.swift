@@ -181,6 +181,7 @@ public actor St3Client {
     public func attentionGet(id: String) async throws -> Envelope<Resource> { try await resource("attention", id: id) }
     public func messagesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("messages", cursor: cursor, limit: limit, history: history) }
     public func messagesGet(id: String) async throws -> Envelope<Resource> { try await resource("messages", id: id) }
+    public func messageBodyGet(id: String) async throws -> Envelope<MessageBody> { try await get("v1/client/message-bodies/\(id)") }
     public func launchesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("launches", cursor: cursor, limit: limit, history: history) }
     public func launchesGet(id: String) async throws -> Envelope<Resource> { try await resource("launches", id: id) }
     public func launchVariantsList(launchID: String, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ResourcePage> { var query: [URLQueryItem] = []; if let cursor { query.append(.init(name: "cursor", value: cursor)) }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/launches/\(launchID.replacingOccurrences(of: "launch/", with: ""))/variants", query: query) }

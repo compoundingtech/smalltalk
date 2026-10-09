@@ -84,6 +84,7 @@ pub enum ErrorCode {
     BlobQuotaExceeded,
     BlobNotFound,
     BlobExpired,
+    MessageTooLarge,
     Internal,
     #[serde(other)]
     Unknown,
@@ -113,6 +114,10 @@ pub struct Limits {
     pub max_event_items: usize,
     pub max_response_bytes: usize,
     pub max_wait_ms: u64,
+    /// The longest message body, in UTF-8 bytes, this daemon takes now. Absent on older daemons,
+    /// which take 4096.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_message_bytes: Option<usize>,
     pub max_glass_body_bytes: Option<usize>,
     pub max_glasses: Option<usize>,
     pub max_glass_depth: Option<usize>,
@@ -367,6 +372,22 @@ pub struct DocumentContent {
     pub bytes: Vec<u8>,
 }
 
+/// The whole text of a message, of which a long message's `content` is only the start. It is
+/// asked of the machine that sent the message; see `complete`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MessageBody {
+    pub message: String,
+    pub bytes: u64,
+    pub text: String,
+    /// False when the owner could not be reached: `text` is then the preview and a note.
+    #[serde(default = "complete_default")]
+    pub complete: bool,
+}
+
+fn complete_default() -> bool {
+    true
+}
+
 /// The clients connected to one member now and those seen in the last few minutes, newest first.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ClientConnections {
@@ -617,6 +638,12 @@ pub struct Message {
     pub tags: Vec<String>,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    /// With `body_bytes`: `content` is only the start of a longer message, kept as a blob.
+    /// Read the whole text with `Client::message_body_get`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_bytes: Option<u64>,
 }
 
 /// A file a message carries. The bytes stay on `origin`; read them with `Client::blob`.
@@ -1953,6 +1980,9 @@ pub struct TimelineMessageBody {
     pub attachments: Vec<Attachment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<TimelineBlock>,
+    /// With a long message: the length of the whole text, of which the content entry is the start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_bytes: Option<u64>,
     /// Who signed a message a person wrote, and whether it checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<MessageProvenance>,

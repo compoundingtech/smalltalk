@@ -45,7 +45,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case staleFence, cursorGap, pageCursorExpired, rateLimited
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete, conversationContentInvalidated, transcriptUnavailable
-    case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired
+    case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired, messageTooLarge
     case unknown(String)
 
     public init(from decoder: Decoder) throws {
@@ -71,6 +71,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "terminal-unavailable": .terminalUnavailable; case "terminal-ended": .terminalEnded
         case "blob-too-large": .blobTooLarge; case "unsupported-media-type": .unsupportedMediaType; case "blob-content-mismatch": .blobContentMismatch
         case "blob-quota-exceeded": .blobQuotaExceeded; case "blob-not-found": .blobNotFound; case "blob-expired": .blobExpired
+        case "message-too-large": .messageTooLarge
         case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
         default: .unknown(raw)
         }
@@ -97,6 +98,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .terminalUnavailable: "terminal-unavailable"; case .terminalEnded: "terminal-ended"
         case .blobTooLarge: "blob-too-large"; case .unsupportedMediaType: "unsupported-media-type"; case .blobContentMismatch: "blob-content-mismatch"
         case .blobQuotaExceeded: "blob-quota-exceeded"; case .blobNotFound: "blob-not-found"; case .blobExpired: "blob-expired"
+        case .messageTooLarge: "message-too-large"
         case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
         case .unknown(let value): value
         }
@@ -125,9 +127,11 @@ public struct Capability: Codable, Sendable { public let id: String; public let 
 public struct Limits: Codable, Sendable {
     public let maxPageItems: Int; public let maxEventItems: Int; public let maxResponseBytes: Int; public let maxWaitMS: UInt64
     public let maxGlassBodyBytes, maxGlasses, maxGlassDepth, maxGlassNodes: Int?
+    /// The longest message body in UTF-8 bytes the daemon takes now; nil on older daemons, which take 4096.
+    public let maxMessageBytes: Int?
     public let maxArrangementBodyBytes, maxArrangements, maxArrangementNameBytes, maxArrangementKeyBytes, maxArrangementOperations, maxArrangementFolders, maxArrangementPlacements: Int?
     public let maxArrangementResourceBytes: Int?
-    enum CodingKeys: String, CodingKey { case maxArrangementResourceBytes = "max_arrangement_resource_bytes", maxArrangementBodyBytes = "max_arrangement_body_bytes", maxArrangements = "max_arrangements", maxArrangementNameBytes = "max_arrangement_name_bytes", maxArrangementKeyBytes = "max_arrangement_key_bytes", maxArrangementOperations = "max_arrangement_operations", maxArrangementFolders = "max_arrangement_folders", maxArrangementPlacements = "max_arrangement_placements", maxGlassBodyBytes = "max_glass_body_bytes", maxGlasses = "max_glasses", maxGlassDepth = "max_glass_depth", maxGlassNodes = "max_glass_nodes", maxPageItems = "max_page_items", maxEventItems = "max_event_items", maxResponseBytes = "max_response_bytes", maxWaitMS = "max_wait_ms" }
+    enum CodingKeys: String, CodingKey { case maxArrangementResourceBytes = "max_arrangement_resource_bytes", maxArrangementBodyBytes = "max_arrangement_body_bytes", maxArrangements = "max_arrangements", maxArrangementNameBytes = "max_arrangement_name_bytes", maxArrangementKeyBytes = "max_arrangement_key_bytes", maxArrangementOperations = "max_arrangement_operations", maxArrangementFolders = "max_arrangement_folders", maxArrangementPlacements = "max_arrangement_placements", maxMessageBytes = "max_message_bytes", maxGlassBodyBytes = "max_glass_body_bytes", maxGlasses = "max_glasses", maxGlassDepth = "max_glass_depth", maxGlassNodes = "max_glass_nodes", maxPageItems = "max_page_items", maxEventItems = "max_event_items", maxResponseBytes = "max_response_bytes", maxWaitMS = "max_wait_ms" }
 }
 public struct Capabilities: Codable, Sendable {
     public let machineVersion: String?
@@ -164,6 +168,9 @@ public struct AttentionResource: Codable, Sendable { public let customForm: JSON
 public struct AttentionBlocked: Codable, Sendable { public let stepRunID, step, goal: String; public let attempt: Int; enum CodingKeys: String, CodingKey { case stepRunID = "step_run_id", step, goal, attempt } }
 public struct AttentionTargetState: Codable, Sendable { public let id, state: String; public let since: String? }
 public struct DocumentContent: Codable, Sendable { public let reference: String; public let bytes: [UInt8] }
+/// The whole text of a message, of which a long message's `content` is only the start.
+public struct MessageBody: Codable, Sendable, Equatable { public let message, text: String; public let bytes: UInt64; /// False when the owner could not be reached: `text` is then the preview and a note.
+    public let complete: Bool? }
 public struct ClientConnections: Codable, Sendable { public let kind, member: String; public let items: [ClientConnection] }
 public struct ClientConnection: Codable, Sendable { public let actor, person, member, via, since, lastSeen: String; public let client, deviceID, deviceName: String?; public let connected: Bool; public let streams: UInt64; public let follows: [String]?; enum CodingKeys: String, CodingKey { case actor, person, member, via, since, client, connected, streams, follows, lastSeen = "last_seen", deviceID = "device_id", deviceName = "device_name" } }
 public struct MailBacklog: Codable, Sendable { public let count, thresholdMS: UInt64; public let cleanupCommand: String; enum CodingKeys: String, CodingKey { case count, thresholdMS = "threshold_ms", cleanupCommand = "cleanup_command" } }
@@ -189,7 +196,8 @@ public struct PublicationDefinition: Codable, Sendable { public let kind, subjec
 public struct SubjectDefinition: Codable, Sendable { public let kind, subject, kdl, desiredRevision, desiredToken: String; public let desired: CanonicalNode; public let conflicts: [String]; enum CodingKeys: String, CodingKey { case kind, subject, desired, kdl, desiredRevision = "desired_revision", desiredToken = "desired_token", conflicts } }
 public struct AgentWorkspace: Codable, Sendable { public let kind, agentID, hostID, workspace, desiredToken, declarationToken: String; enum CodingKeys: String, CodingKey { case kind, workspace, agentID = "agent_id", hostID = "host_id", desiredToken = "desired_token", declarationToken = "declaration_token" } }
 public struct LaunchPreview: Codable, Sendable { public let goal: String; public let steps, agents: [JSONValue]; public let gates: JSONValue; public let diagnosticsCount: UInt64; public let requestExcerpt: String; enum CodingKeys: String, CodingKey { case goal, steps, agents, gates, diagnosticsCount = "diagnostics_count", requestExcerpt = "request_excerpt" } }
-public struct MessageResource: Codable, Sendable { public let id, kind, revision, updatedAt, from, to, content, state, sentAt: String; public let title, inReplyTo, sessionID: String?; public let tags: [String]; public let attachments: [Attachment]?; public let operational: Operational?; enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", from, to, title, content, state, sentAt = "sent_at", inReplyTo = "in_reply_to", sessionID = "session_id", tags, attachments, operational } }
+public struct MessageResource: Codable, Sendable { public let id, kind, revision, updatedAt, from, to, content, state, sentAt: String; public let title, inReplyTo, sessionID: String?; public let tags: [String]; public let attachments: [Attachment]?; public let operational: Operational?; /// With `bodyBytes`: `content` is only the start of a longer message; read it whole with `messageBodyGet`.
+    public let bodyRef: String?; public let bodyBytes: UInt64?; enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", from, to, title, content, state, sentAt = "sent_at", inReplyTo = "in_reply_to", sessionID = "session_id", tags, attachments, operational, bodyRef = "body_ref", bodyBytes = "body_bytes" } }
 /// What an upload answers: the reference to name in a message's attachments.
 public struct BlobUpload: Codable, Sendable, Equatable { public let blob, sha256, mediaType: String; public let size: UInt64; enum CodingKeys: String, CodingKey { case blob, sha256, size, mediaType = "media_type" } }
 /// One slice of an attachment: `data` is base64.
@@ -397,7 +405,7 @@ public enum TimelineToolStatus: String, Codable, Sendable { case success, error 
 public enum TimelineStatus: String, Codable, Sendable { case queued, running, waiting, completed, failed, cancelled }
 public enum TimelineUsageSemantics: String, Codable, Sendable { case contextOccupancy = "context_occupancy", sessionCumulative = "session_cumulative", response }
 public struct MessageProvenance: Codable, Sendable { public let verdict: String; public let reason, signer, key, device: String? }
-public struct TimelineMessageBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let messageID: String; public let replyTo, from, to, title: String?; public let tags: [String]?; public let attachments: [Attachment]?; public let provenance: MessageProvenance?; enum CodingKeys: String, CodingKey { case blocks; case messageID = "message_id", replyTo = "reply_to", from, to, title, tags, attachments, provenance } }
+public struct TimelineMessageBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let messageID: String; public let replyTo, from, to, title: String?; public let tags: [String]?; public let attachments: [Attachment]?; public let provenance: MessageProvenance?; public let bodyBytes: UInt64?; enum CodingKeys: String, CodingKey { case blocks; case messageID = "message_id", replyTo = "reply_to", from, to, title, tags, attachments, provenance, bodyBytes = "body_bytes" } }
 public struct TimelineContentBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let mediaType: String; public let text: String?; public let attachmentID: String?; enum CodingKeys: String, CodingKey { case blocks; case mediaType = "media_type", text, attachmentID = "attachment_id" } }
 public struct TimelineToolCallBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let callID: String; public let name: String; public let arguments: JSONValue; enum CodingKeys: String, CodingKey { case blocks; case callID = "call_id", name, arguments } }
 public struct TimelineToolResultBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let callID: String; public let status: TimelineToolStatus; public let mediaType: String; public let content: JSONValue; enum CodingKeys: String, CodingKey { case blocks; case callID = "call_id", status, mediaType = "media_type", content } }

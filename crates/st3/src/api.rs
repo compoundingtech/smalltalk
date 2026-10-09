@@ -27,6 +27,7 @@ use tower::ServiceExt as _;
 
 use crate::archive::hydrate_eval;
 use crate::graph::{parse_intent, resolve_document_references};
+use crate::message_body;
 #[cfg(test)]
 use crate::model::AttentionRequest;
 use crate::model::ClientReplicated;
@@ -59,6 +60,7 @@ use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_blobs;
+mod message_bodies;
 mod client_adapters;
 mod client_presence;
 mod client_v0;
@@ -522,6 +524,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/attention/{*id}", get(client_attention_detail))
         .route("/v1/client/messages", get(client_messages))
         .route("/v1/client/messages/{*id}", get(client_messages_detail))
+        .route("/v1/client/message-bodies/{*id}", get(message_bodies::client_body))
         .route("/v1/client/launches", get(client_launches))
         .route(
             "/v1/client/launches/{id}/variants",
@@ -737,6 +740,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/mailbox/receipts", post(mailbox::receipt))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/read/{*subject}", get(read_message))
+        .route("/v1/messages/body/{*subject}", get(message_bodies::body))
         .route("/v1/messages/delivery/{*subject}", get(message_delivery))
         .route("/v1/messages/by-key", get(message_by_key))
         .route("/v1/status", get(status))
@@ -1369,6 +1373,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "transcript-unavailable"
         | "terminal-ended"
         | "blob-too-large"
+        | "message-too-large"
         | "unsupported-media-type"
         | "blob-content-mismatch"
         | "blob-quota-exceeded"
@@ -1793,6 +1798,8 @@ async fn client_capabilities(
     let oldest = oldest.saturating_sub(1);
     let cursor = format!("event-cursor/{}/{newest}", state.node);
     let capabilities = client_v0::capabilities(&session);
+    // The longest message body this daemon takes, so a composer shows a limit only when told.
+    let max_message_bytes = message_body::MAX_BYTES;
     Ok(Json(json!({
         "kind": "capabilities",
         "machine_version": st_drivers::version::machine_version(),
@@ -1804,6 +1811,7 @@ async fn client_capabilities(
             "max_event_items": 500,
             "max_response_bytes": CLIENT_MAX_RESPONSE_BYTES,
             "max_wait_ms": 30_000,
+            "max_message_bytes": max_message_bytes,
             "max_glass_body_bytes": st3_schema::glasses::MAX_BODY_BYTES,
             "max_glasses": st3_schema::glasses::MAX_GLASSES,
             "max_glass_depth": st3_schema::glasses::MAX_DEPTH,
@@ -3459,7 +3467,7 @@ fn client_message_resources(
             reasons.push("superseded");
         }
         let current = reasons.is_empty();
-        resources.push(json!({
+        let mut resource = json!({
             "id": message.subject,
             "kind": "message",
             "revision": last.map(|claim| claim.id.as_str()).unwrap_or("message/unknown"),
@@ -3476,7 +3484,13 @@ fn client_message_resources(
             "tags": message.tags,
             "attachments": message.attachments.iter().map(client_attachment).collect::<Vec<_>>(),
             "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
-        }));
+        });
+        // Only a long message names its body, so every other resource reads as it always has.
+        if let (Some(reference), Some(bytes)) = (&message.body_ref, message.body_bytes) {
+            resource["body_ref"] = json!(reference);
+            resource["body_bytes"] = json!(bytes);
+        }
+        resources.push(resource);
     }
     resources.sort_by(|left, right| {
         right["sent_at"]
@@ -12047,11 +12061,19 @@ fn accept_message_receipt_with_upload_owner(
             "a message needs nonempty content",
         )));
     }
-    if request.content.len() > 4096 && !request.content.starts_with("doc/") {
-        return Err(ApiError::bad(St3Error::new(
-            "message-too-large",
-            "an inline message cannot exceed 4 KiB; post a document first",
-        )));
+    let long_body = request.content.len() > message_body::INLINE_MAX_BYTES
+        && !request.content.starts_with("doc/");
+    if long_body {
+        if request.content.len() > message_body::MAX_BYTES {
+            return Err(ApiError::bad(St3Error::new(
+                "message-too-large",
+                format!(
+                    "a message cannot be longer than {} KiB; this one is {} KiB. Shorten it or send it as several messages.",
+                    message_body::MAX_BYTES / 1024,
+                    request.content.len().div_ceil(1024)
+                ),
+            )));
+        }
     }
     if request.content.starts_with("doc/") {
         let (name, hash) = request.content.rsplit_once('@').ok_or_else(|| {
@@ -12086,7 +12108,14 @@ fn accept_message_receipt_with_upload_owner(
     let mut fields = BTreeMap::from([
         ("from".into(), Value::String(from.clone())),
         ("to".into(), Value::String(to.clone())),
-        ("content".into(), Value::String(request.content.clone())),
+        (
+            "content".into(),
+            Value::String(if long_body {
+                message_body::preview(&request.content)
+            } else {
+                request.content.clone()
+            }),
+        ),
         ("status".into(), Value::String("sent".into())),
         (
             "title".into(),
@@ -12112,14 +12141,37 @@ fn accept_message_receipt_with_upload_owner(
     if let Some(session_id) = session_id {
         fields.insert("session_id".into(), Value::String(session_id));
     }
-    if !attachments.is_empty() {
+    // A long body is a file on this member, named in the claim like an image: nothing of it but
+    // the preview and this reference enters the database or replication.
+    let mut body = None;
+    let mut claim_attachments = attachments.clone();
+    if long_body {
+        let hash = message_body::directory(&state.state_dir)
+            .put(request.content.as_bytes())
+            .map_err(ApiError::internal)?;
+        let entry = crate::model::MessageAttachment {
+            sha256: hash,
+            media_type: message_body::MEDIA_TYPE.into(),
+            name: None,
+            size: request.content.len() as u64,
+            origin: client_host_id(&state.node),
+        };
+        claim_attachments.push(entry.clone());
+        body = Some(entry);
+    }
+    if !claim_attachments.is_empty() {
         fields.insert(
             "attachments".into(),
-            serde_json::to_value(&attachments).map_err(ApiError::internal)?,
+            serde_json::to_value(&claim_attachments).map_err(ApiError::internal)?,
         );
     }
     if let Some(signature) = &device_signature {
-        check_device_signature(state, signature, &request, &subject, &from, &fields)?;
+        // A device signs the whole text it sent, which no other member holds. This member checks
+        // that signature against the whole text, then writes the claim without it: the claim
+        // holds a preview, and a signature over other text would read as invalid everywhere else.
+        let mut signed = fields.clone();
+        signed.insert("content".into(), Value::String(request.content.clone()));
+        check_device_signature(state, signature, &request, &subject, &from, &signed)?;
     }
     let input = ClaimInput {
         subject: subject.clone(),
@@ -12132,8 +12184,8 @@ fn accept_message_receipt_with_upload_owner(
     };
     // A repeated key returns the first claim and says it appended nothing.
     let (record, appended) = match &device_signature {
-        Some(signature) => state.store.append_signed_message(&input, signature),
-        None => state.store.append_claim_outcome(&input),
+        Some(signature) if body.is_none() => state.store.append_signed_message(&input, signature),
+        _ => state.store.append_claim_outcome(&input),
     }
     .map_err(ApiError::bad)?;
     let mut work_wake = is_work_wake(&request.tags);
@@ -12152,13 +12204,20 @@ fn accept_message_receipt_with_upload_owner(
             subject,
             from,
             to,
-            content: request.content,
+            content: if long_body {
+                message_body::preview(&request.content)
+            } else {
+                request.content
+            },
             status: "sent".into(),
             title: request.title,
             in_reply_to: request.in_reply_to,
             tags: request.tags,
             created_index: record.store_index,
             attachments,
+            body_ref: body.as_ref().map(|body| message_body::reference(&body.sha256)),
+            body_bytes: body.as_ref().map(|body| body.size),
+            body_origin: body.map(|body| body.origin),
         },
         idempotency_key: request.idempotency_key,
         already_sent: !appended,
@@ -25940,3 +25999,5 @@ agent "seat" { workspace "/tmp"; command "true" }
 
 #[cfg(test)]
 mod work_incarnation_tests;
+#[cfg(test)]
+mod message_bodies_tests;

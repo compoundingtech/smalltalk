@@ -145,6 +145,9 @@ mod tests {
             title: Some("work".into()),
             in_reply_to: None,
             tags: Vec::new(),
+            body_ref: None,
+            body_bytes: None,
+            body_origin: None,
             created_index: 7,
             attachments: Vec::new(),
         };
@@ -184,6 +187,9 @@ mod tests {
             title: None,
             in_reply_to: None,
             tags: Vec::new(),
+            body_ref: None,
+            body_bytes: None,
+            body_origin: None,
             created_index: 8,
             attachments: Vec::new(),
         };

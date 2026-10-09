@@ -1930,7 +1930,31 @@ pub struct MessageView {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<MessageAttachment>,
+    /// A long body's reference, `blob/<sha256>`, when `content` is only its preview. Absent for
+    /// a message whose `content` is the whole text, and on daemons that predate long bodies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_ref: Option<String>,
+    /// The length in bytes of the whole body, with `body_ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_bytes: Option<u64>,
+    /// The member holding the body's file, such as `host/laptop`, with `body_ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_origin: Option<String>,
     pub created_index: u64,
+}
+
+impl MessageView {
+    /// A long body as the attachment record it is kept as: a file on the member that took the
+    /// send, fetched from there like an image. See [`crate::message_body`].
+    pub fn body_attachment(&self) -> Option<MessageAttachment> {
+        Some(MessageAttachment {
+            sha256: crate::message_body::parse_reference(self.body_ref.as_deref()?)?.to_owned(),
+            media_type: crate::message_body::MEDIA_TYPE.into(),
+            name: None,
+            size: self.body_bytes?,
+            origin: self.body_origin.clone()?,
+        })
+    }
 }
 
 /// The daemon's answer to a message send, and what a send's idempotency key landed as. Older

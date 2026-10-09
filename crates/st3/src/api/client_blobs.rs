@@ -108,7 +108,7 @@ pub(super) async fn upload(
 
 /// Whether a person may read a message's attachments: the people in the conversation, and
 /// anyone, under free mode, where an agent is a party.
-fn person_reads_message(store: &Store, person: &str, message: &MessageView) -> bool {
+pub(super) fn person_reads_message(store: &Store, person: &str, message: &MessageView) -> bool {
     let mut current = Some(message.clone());
     for _ in 0..16 {
         let Some(view) = current else {
@@ -142,10 +142,12 @@ fn authorize(
         .map_err(ApiError::internal)?
         .flatten()
         .and_then(|view| {
+            // A long message's body is a file kept like an image, and read the same way.
             view.attachments
                 .iter()
                 .find(|attachment| attachment.sha256 == hash)
                 .cloned()
+                .or_else(|| view.body_attachment().filter(|body| body.sha256 == hash))
                 .map(|attachment| (view, attachment))
         });
     let actor = session.authority_actor.as_str();
@@ -179,7 +181,7 @@ fn blob_parts(id: &str) -> Result<String, ApiError> {
     })
 }
 
-fn read_error(state: &AppState, host: &str, error: anyhow::Error) -> ApiError {
+pub(super) fn read_error(state: &AppState, host: &str, error: anyhow::Error) -> ApiError {
     match error.downcast_ref::<ClientReadRejected>() {
         Some(rejected) if rejected.code != "remote-unavailable" => ApiError {
             status: StatusCode::from_u16(rejected.status).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -193,7 +195,7 @@ fn read_error(state: &AppState, host: &str, error: anyhow::Error) -> ApiError {
 
 /// Make the bytes local: fetch them from the member that took the upload, over the same peer
 /// route a relayed client read takes, and keep a copy. The hash is checked before keeping.
-async fn ensure_local(
+pub(super) async fn ensure_local(
     state: &AppState,
     session: &ClientSession,
     hash: &str,
@@ -293,6 +295,15 @@ pub(super) async fn get(
     require_scope(&session, "read.projections")?;
     let hash = blob_parts(&id)?;
     let attachment = authorize(&state, &session, &hash, query.message.as_deref())?;
+    if attachment
+        .as_ref()
+        .is_some_and(|attachment| attachment.media_type == crate::message_body::MEDIA_TYPE)
+    {
+        return Err(blob_error(St3Error::new(
+            "blob-not-found",
+            "this is a message's body; read it with the message-body route",
+        )));
+    }
     ensure_local(
         &state,
         &session,
@@ -338,24 +349,42 @@ pub(super) async fn chunk(
     require_scope(&session, "read.projections")?;
     let hash = blob_parts(&id)?;
     let attachment = authorize(&state, &session, &hash, query.message.as_deref())?;
-    ensure_local(
-        &state,
-        &session,
-        &hash,
-        query.message.as_deref(),
-        attachment.as_ref(),
-        query.local.unwrap_or(false),
-    )
-    .await?;
+    // A long message body is this member's own file, never fetched into another directory.
+    let body = attachment
+        .as_ref()
+        .is_some_and(|attachment| attachment.media_type == crate::message_body::MEDIA_TYPE);
+    if !body {
+        ensure_local(
+            &state,
+            &session,
+            &hash,
+            query.message.as_deref(),
+            attachment.as_ref(),
+            query.local.unwrap_or(false),
+        )
+        .await?;
+    }
     let offset = query.offset.unwrap_or(0);
-    let (size, bytes) = BlobDir::under(&state.state_dir)
+    let directory = if body {
+        crate::message_body::directory(&state.state_dir)
+    } else {
+        BlobDir::under(&state.state_dir)
+    };
+    let (size, bytes) = directory
         .read_range(&hash, offset, blobs::CHUNK_BYTES)
         .map_err(ApiError::internal)?
         .ok_or_else(|| {
-            blob_error(St3Error::new(
-                "blob-expired",
-                "the attachment was removed after its retention window",
-            ))
+            if body {
+                blob_error(St3Error::new(
+                    "blob-not-found",
+                    "the full text of this message is no longer on this machine",
+                ))
+            } else {
+                blob_error(St3Error::new(
+                    "blob-expired",
+                    "the attachment was removed after its retention window",
+                ))
+            }
         })?;
     Ok(Json(json!({
         "sha256": hash,
