@@ -236,6 +236,9 @@ async fn expert_status(client: &Client) -> Result<Option<crate::model::SubjectSt
 }
 
 fn workspace() -> Result<PathBuf> {
+    if let Some(instance) = crate::instance::current() {
+        return Ok(instance.agents_dir().join("st-expert"));
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())

@@ -38,13 +38,48 @@ pub fn skills_dir(harness: &str, home: &Path, claude_config: Option<&Path>) -> R
 
 /// Install the bundled skill for one harness in the current user's home and return its path.
 pub fn install(harness: &str) -> Result<PathBuf> {
+    install_in(&installed_skills_dir(harness)?)
+}
+
+/// Where this process puts the skill for `harness`. An instance never writes to the shared
+/// `~/.agents/skills`: its Claude skill goes to its own Claude directory, its Codex skill to its
+/// own Codex home, and the other harnesses to a directory of its own that only it uses.
+fn installed_skills_dir(harness: &str) -> Result<PathBuf> {
+    if let Some(instance) = crate::instance::current() {
+        if harness == "codex" {
+            return Ok(instance.codex_home().join("skills"));
+        }
+        return skills_dir(
+            harness,
+            &instance.root().join("home"),
+            Some(&instance.claude_config_dir()),
+        );
+    }
     let home = std::env::var_os("HOME").context("install the st skill: HOME is not set")?;
     let claude_config = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty());
-    install_in(&skills_dir(
+    skills_dir(
         harness,
         Path::new(&home),
         claude_config.as_deref().map(Path::new),
-    )?)
+    )
+}
+
+/// The `st` skill directories this build wrote and has not changed since: the ones `st uninstall`
+/// may remove. A skill someone edited is theirs and stays.
+pub fn untouched_installs() -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for harness in HARNESSES {
+        let Ok(directory) = installed_skills_dir(harness).map(|dir| dir.join("st")) else {
+            continue;
+        };
+        let untouched = fs::read(directory.join("SKILL.md")).is_ok_and(|bytes| bytes == SKILL.as_bytes());
+        let only_the_skill = fs::read_dir(&directory)
+            .is_ok_and(|entries| entries.flatten().all(|entry| entry.file_name() == "SKILL.md"));
+        if untouched && only_the_skill && !found.contains(&directory) {
+            found.push(directory);
+        }
+    }
+    found
 }
 
 /// Write `st/SKILL.md` below `skills_dir` unless it already holds exactly these bytes. Seats start

@@ -8142,16 +8142,16 @@ fn codex_before_approve_for_me_gets_the_flags_seats_ran_with_before() {
 #[test]
 fn the_st_bridge_is_added_only_for_st3_seats_and_never_over_an_authored_one() {
     let authored = |parts: &[&str]| parts.iter().map(|part| part.to_string()).collect::<Vec<_>>();
-    let seat = Some("agent/fleet/example/seat");
+    let seat = Some("agent/fleet/fixture-seat");
     assert!(st_bridge_overrides(None, &authored(&["--approve-for-me"])).is_empty());
-    assert!(st_bridge_overrides(Some("person/nathan"), &authored(&[])).is_empty());
+    assert!(st_bridge_overrides(Some("person/example"), &authored(&[])).is_empty());
     assert!(st_bridge_overrides(Some("agent/"), &authored(&[])).is_empty());
     let overrides = st_bridge_overrides(seat, &authored(&["--approve-for-me"]));
     assert!(overrides.iter().any(|value| value.contains("codex-bridge")));
     assert!(
         overrides
             .iter()
-            .any(|value| value.contains("--subject=agent/fleet/example/seat"))
+            .any(|value| value.contains("--subject=agent/fleet/fixture-seat"))
     );
     assert!(
         st_bridge_overrides(seat, &authored(&["-c", "mcp_servers.st.command=\"mine\""])).is_empty()

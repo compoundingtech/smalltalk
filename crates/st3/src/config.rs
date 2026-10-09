@@ -507,6 +507,9 @@ pub fn default_agent_workspace(identity: &str) -> Result<PathBuf> {
                 .all(|part| !part.is_empty() && part != "." && part != ".."),
         "agent identity `{identity}` cannot name a workspace directory"
     );
+    if let Some(instance) = crate::instance::current() {
+        return Ok(instance.agents_dir().join(identity));
+    }
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|home| home.is_absolute())
@@ -524,6 +527,14 @@ fn xdg_dir(variable: &str, home_suffix: &str) -> PathBuf {
 }
 
 fn host_name() -> String {
+    let host = machine_host_name();
+    match crate::instance::current() {
+        Some(instance) => instance.node_name(&host),
+        None => host,
+    }
+}
+
+fn machine_host_name() -> String {
     env::var("HOSTNAME")
         .ok()
         .filter(|value| !value.trim().is_empty())

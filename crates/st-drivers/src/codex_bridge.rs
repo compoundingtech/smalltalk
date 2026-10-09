@@ -562,7 +562,7 @@ pub fn run(subject: &str, executable: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    const SEAT: &str = "agent/fleet/example/seat";
+    const SEAT: &str = "agent/fleet/fixture-seat";
 
     fn command(tool: &str, arguments: Value) -> Result<Vec<String>> {
         tool_command(SEAT, tool, &arguments)
@@ -594,10 +594,10 @@ mod tests {
     #[test]
     fn identity_cannot_be_supplied_or_overridden_by_the_model() {
         for tool in ["st_messages", "st_work_ls", "st_work_claim"] {
-            let error = command(tool, json!({ "step": "step-run/g/x", "as": "person/nathan" })).unwrap_err();
+            let error = command(tool, json!({ "step": "step-run/g/x", "as": "person/example" })).unwrap_err();
             assert!(error.to_string().contains("not an argument"), "{error}");
         }
-        assert!(command("st_message_reply", json!({ "reference": "message/a", "body": "x", "from": "person/n" })).is_err());
+        assert!(command("st_message_reply", json!({ "reference": "message/a", "body": "x", "from": "person/example" })).is_err());
     }
 
     #[test]
@@ -611,25 +611,25 @@ mod tests {
 
     #[test]
     fn values_are_one_argument_each_and_cannot_start_an_option() {
-        let built = command("st_message_reply", json!({ "reference": "message/a1", "body": "--as=person/x extra" })).unwrap();
+        let built = command("st_message_reply", json!({ "reference": "message/a1", "body": "--as=person/example extra" })).unwrap();
         assert_eq!(
             built,
             [
                 "conversations",
                 "reply",
                 &format!("--from={SEAT}"),
-                "--body=--as=person/x extra",
+                "--body=--as=person/example extra",
                 "--",
                 "message/a1"
             ]
         );
-        for bad in ["--as=person/x", "-x", "message/a b", "message/../x", "message/a;ls", "a\nb"] {
+        for bad in ["--as=person/example", "-x", "message/a b", "message/../x", "message/a;ls", "a\nb"] {
             assert!(command("st_message_read", json!({ "reference": bad })).is_err(), "{bad:?}");
         }
         for bad in ["step-run/g/x y", "work/x", "-step-run/g/x", "step-run/../x"] {
             assert!(command("st_work_claim", json!({ "step": bad })).is_err(), "{bad:?}");
         }
-        for bad in ["nobody", "agent/", "person/a b", "-agent/x", "agent/../x"] {
+        for bad in ["nobody", "agent/", "person/example b", "-agent/x", "agent/../x"] {
             assert!(command("st_message_send", json!({ "to": bad, "body": "x" })).is_err(), "{bad:?}");
         }
         for bad in ["", "30", "m", "1w", "30m ", "-5m", "5mm"] {

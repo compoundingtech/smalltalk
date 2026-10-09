@@ -71,3 +71,7 @@ certificate fingerprint checks the embedded signature without requiring its priv
 on the receiving machine. Building/signing a candidate still requires the explicitly
 configured keychain identity. The helper restores installation files, not
 application databases; schema compatibility must be checked by the deployment caller.
+
+A second install for testing: `scripts/install --instance NAME` (or `install.sh --instance NAME`) puts
+the app, commands, bundle identifier and launchd services below `~/.st-instance/NAME` and never
+rewrites the default install's plists. See [Instances](instances.md).

@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Prove that a named st instance cannot touch the default install, and that its uninstall is
+# complete. Everything happens in a throwaway HOME with a scrubbed environment and without a
+# service manager, so it never reads or changes the machine's real st install or daemon.
+#
+# 1. Install the default st in the throwaway HOME (config, executables, install manifest, skill).
+# 2. Snapshot the whole HOME: every path, mode, size, symlink target and file hash.
+# 3. Set up an instance, start its daemon, create a seat declaration, stop it, and uninstall it.
+# 4. Snapshot again. The two snapshots must be identical, and the instance directory gone.
+#
+# Usage: run ST3_BINARY PTY_BINARY [OUT_DIR]
+#
+# Writes before.snapshot, after.snapshot, the transcript and result.txt to OUT_DIR (default: a
+# temporary directory that is kept). Exits 0 only when the snapshots match and nothing remains.
+set -Eeuo pipefail
+
+st3="$(readlink -f "$1")"
+pty="$(readlink -f "$2")"
+out="${3:-$(mktemp -d)}"
+mkdir -p "$out"
+out="$(cd "$out" && pwd)"
+home="$(mktemp -d "${TMPDIR:-/var/tmp}/st-instance-home.XXXXXX")"
+tools="$home/../$(basename "$home").tools"
+mkdir -p "$tools"
+# setup finds pty beside the st3 it runs, so use a copy of st3 that has one beside it.
+cp --reflink=auto "$pty" "$tools/pty"
+cp --reflink=auto "$st3" "$tools/st3"
+st3="$tools/st3"
+trap 'pkill -u "$(id -u)" -f "$home" 2>/dev/null || true; rm -rf "$home" "$tools"' EXIT
+
+# The only environment st sees: no XDG variables, no ST_* variables, no real HOME.
+run() {
+  env -i HOME="$home" PATH="$tools:/usr/bin:/bin" USER="$(id -un)" LANG=C.UTF-8 \
+    SHELL=/bin/sh HOSTNAME=proofhost "$@"
+}
+snapshot() {
+  # Sockets and pid files churn while a daemon runs; the default install runs none.
+  (cd "$home" && find . -mindepth 1 \( -type f -o -type l -o -type d \) -printf '%y %m %s %p %l\n' | sort
+   find . -type f -print0 | sort -z | xargs -0 -r sha256sum) >"$1"
+}
+
+{
+  echo "== default install"
+  run "$st3" setup --yes --person ada --node base --service false --install true --start false \
+    --harness none --claude-channel false
+  run "$home/.local/bin/st3" skill install >/dev/null
+  snapshot "$out/before.snapshot"
+  echo "snapshot: $(wc -l <"$out/before.snapshot") entries"
+
+  echo "== instance"
+  inst=(env -i HOME="$home" PATH="$tools:/usr/bin:/bin" USER="$(id -un)" LANG=C.UTF-8 SHELL=/bin/sh
+    HOSTNAME=proofhost "$st3" --instance proof)
+  "${inst[@]}" setup --yes --person ada --node proof-node --service false --install true --start true \
+    --harness none --claude-channel false
+  test -d "$home/.st-instance/proof/state" && echo "instance state: ok"
+  test -x "$home/.st-instance/proof/bin/st3" && echo "instance executables: ok"
+  "${inst[@]}" skill install >/dev/null
+  "${inst[@]}" agents ls || true
+  "${inst[@]}" uninstall --dry-run
+  # Stop the daemon the way a person would, then remove everything.
+  pkill -u "$(id -u)" -f "$home/.st-instance/proof" || true
+  sleep 1
+  "${inst[@]}" uninstall --yes --erase-local-graph
+
+  echo "== after"
+  snapshot "$out/after.snapshot"
+  if [ -e "$home/.st-instance/proof" ]; then
+    echo "FAIL: the instance directory remains"
+    find "$home/.st-instance" | head -20
+    exit 1
+  fi
+  if diff -u "$out/before.snapshot" "$out/after.snapshot" >"$out/diff.txt"; then
+    echo "PASS: the default install is byte-identical after the instance ran and was uninstalled"
+  else
+    echo "FAIL: the default install changed"
+    head -40 "$out/diff.txt"
+    exit 1
+  fi
+  # The default install is still there and removes itself completely, with nothing left in HOME.
+  run "$home/.local/bin/st3" uninstall --yes --erase-local-graph
+  # Empty directories such as ~/.config or ~/.local/bin are shared parents, not st's files.
+  leftovers="$(cd "$home" && find . -mindepth 1 -not -type d -print)"
+  if [ -n "$leftovers" ]; then
+    echo "FAIL: the default uninstall left files behind:"
+    echo "$leftovers"
+    exit 1
+  fi
+  echo "PASS: the default uninstall leaves no file behind"
+} 2>&1 | tee "$out/transcript.txt"
+status=${PIPESTATUS[0]}
+echo "$status" >"$out/result.txt"
+exit "$status"

@@ -23,7 +23,7 @@ impl Commands for NativeCommands<'_> {
     }
 
     fn output(&mut self, arguments: &[&str]) -> Result<Output> {
-        Command::new(self.0)
+        super::host_command(self.0)
             .args(arguments)
             .output()
             .with_context(|| format!("run {} {}", self.0, arguments.join(" ")))
@@ -120,12 +120,12 @@ pub(super) fn launchd(
     if spec.config.fleet_id.is_some() {
         fs::write(replication_plist, &replication_candidate)?;
     }
-    let replication_target = format!("{domain}/{REPLICATION_SERVICE_LABEL}");
+    let replication_target = format!("{domain}/{}", replication_service_label());
     let install = (|| -> Result<()> {
         activate_launchd(
             commands,
             domain,
-            SERVICE_LABEL,
+            service_label(),
             plist,
             previous.as_deref() == Some(candidate.as_bytes()),
         )?;
@@ -133,7 +133,7 @@ pub(super) fn launchd(
             activate_launchd(
                 commands,
                 domain,
-                REPLICATION_SERVICE_LABEL,
+                replication_service_label(),
                 replication_plist,
                 previous_replication.as_deref() == Some(replication_candidate.as_bytes()),
             )?;
@@ -149,9 +149,9 @@ pub(super) fn launchd(
             restore_file(plist, previous.as_deref())?;
             restore_file(replication_plist, previous_replication.as_deref())?;
             for (label, path, prior) in [
-                (SERVICE_LABEL, plist, &previous),
+                (service_label(), plist, &previous),
                 (
-                    REPLICATION_SERVICE_LABEL,
+                    replication_service_label(),
                     replication_plist,
                     &previous_replication,
                 ),
@@ -201,15 +201,15 @@ pub(super) fn systemd(
     }
     let install = (|| -> Result<()> {
         commands.run(&["--user", "daemon-reload"])?;
-        commands.run(&["--user", "enable", SERVICE_NAME])?;
+        commands.run(&["--user", "enable", service_name()])?;
         // `enable --now` alone would leave an already-running old binary alive.
-        commands.run(&["--user", "restart", SERVICE_NAME])?;
+        commands.run(&["--user", "restart", service_name()])?;
         if spec.config.fleet_id.is_some() {
-            commands.run(&["--user", "enable", REPLICATION_SERVICE_NAME])?;
-            commands.run(&["--user", "restart", REPLICATION_SERVICE_NAME])?;
+            commands.run(&["--user", "enable", replication_service_name()])?;
+            commands.run(&["--user", "restart", replication_service_name()])?;
         } else {
             if previous_replication.is_some() {
-                commands.run(&["--user", "disable", "--now", REPLICATION_SERVICE_NAME])?;
+                commands.run(&["--user", "disable", "--now", replication_service_name()])?;
             }
             restore_file(replication_path, None)?;
             commands.run(&["--user", "daemon-reload"])?;
@@ -220,8 +220,8 @@ pub(super) fn systemd(
         let rollback = (|| -> Result<()> {
             // Stop candidate-only services while their definitions are still installed.
             for (name, prior) in [
-                (SERVICE_NAME, &previous),
-                (REPLICATION_SERVICE_NAME, &previous_replication),
+                (service_name(), &previous),
+                (replication_service_name(), &previous_replication),
             ] {
                 if prior.is_none() {
                     let _ = commands.output(&["--user", "disable", "--now", name]);
@@ -231,8 +231,8 @@ pub(super) fn systemd(
             restore_file(replication_path, previous_replication.as_deref())?;
             commands.run(&["--user", "daemon-reload"])?;
             for (name, prior) in [
-                (SERVICE_NAME, &previous),
-                (REPLICATION_SERVICE_NAME, &previous_replication),
+                (service_name(), &previous),
+                (replication_service_name(), &previous_replication),
             ] {
                 if prior.is_some() {
                     commands.run(&["--user", "restart", name])?;
@@ -364,10 +364,10 @@ mod tests {
                         return Ok(output(5, "fixture bootstrap refused"));
                     }
                     let definition = fs::read_to_string(args[2])?;
-                    let label = if definition.contains(REPLICATION_SERVICE_LABEL) {
-                        REPLICATION_SERVICE_LABEL
+                    let label = if definition.contains(replication_service_label()) {
+                        replication_service_label()
                     } else {
-                        SERVICE_LABEL
+                        service_label()
                     };
                     let target = format!("{}/{label}", args[1]);
                     if self.loaded.contains_key(&target) {
@@ -601,7 +601,7 @@ mod tests {
             systemd_manager
                 .calls
                 .iter()
-                .any(|args| args == &["--user", "disable", "--now", REPLICATION_SERVICE_NAME,])
+                .any(|args| args == &["--user", "disable", "--now", replication_service_name(),])
         );
     }
 }
