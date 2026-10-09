@@ -4,6 +4,19 @@ use super::*;
 pub(crate) const CHANGE_ROWS: usize = 256;
 pub(crate) const CHANGE_BYTES: u64 = 1024 * 1024;
 
+// Direct column arguments preserve SQLite's byte-length/type metadata opcodes. In particular,
+// do not introduce CAST or JSON extraction before this admission check.
+const CLAIM_METADATA: &str = "SELECT COUNT(*),COALESCE(SUM(bytes),0),COALESCE(SUM(invalid),0) FROM (
+    SELECT octet_length(subject)+octet_length(kind)+COALESCE(octet_length(actor),0)+octet_length(body) AS bytes,
+      CASE WHEN typeof(subject)='text' AND typeof(kind)='text' AND typeof(body)='text'
+        AND typeof(actor) IN ('text','null') THEN 0 ELSE 1 END AS invalid
+    FROM claims WHERE store_index>?1 AND store_index<=?2 ORDER BY store_index LIMIT ?3)";
+const LOCAL_METADATA: &str = "SELECT COUNT(*),COALESCE(SUM(bytes),0),COALESCE(SUM(invalid),0) FROM (
+    SELECT octet_length(subject)+octet_length(kind)+COALESCE(octet_length(actor),0)+octet_length(body) AS bytes,
+      CASE WHEN typeof(subject)='text' AND typeof(kind)='text' AND typeof(body)='text'
+        AND typeof(actor) IN ('text','null') THEN 0 ELSE 1 END AS invalid
+    FROM local_observations WHERE id>?1 AND id<=?2 ORDER BY id LIMIT ?3)";
+
 pub(crate) struct ReconcileChanges {
     pub feed: ChangeFeed,
     /// A reset or a range beyond either limit requires all consumers to read again.
@@ -12,7 +25,8 @@ pub(crate) struct ReconcileChanges {
 
 impl Store {
     /// Read both append ranges and their frontiers at one cut, releasing it before effects.
-    /// Metadata probes count at most limit+1 rows without copying their bodies. Overflow
+    /// Direct-column metadata probes admit text identities/body and text-or-null actors,
+    /// counting at most limit+1 rows without loading overflow payloads. Overflow/type refusal
     /// returns no partial hints: consumers must invalidate every retained evaluation.
     /// Physical edits/removals at unchanged frontiers are outside this append-only seam.
     pub(crate) fn reconcile_changes_since(
@@ -61,31 +75,21 @@ impl Store {
                 return Ok(result);
             }
             let limit = (CHANGE_ROWS + 1) as u64;
-            let measure = |sql: &str, from: i64, to: i64| -> Result<(u64, u64)> {
+            let measure = |sql: &str, from: i64, to: i64| -> Result<(u64, u64, u64)> {
                 Ok(connection.query_row(sql, params![from, to, limit], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })?)
             };
             let claims = measure(
-                "SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM (
-                   SELECT length(CAST(subject AS BLOB))+length(CAST(kind AS BLOB))+
-                     COALESCE(length(CAST(actor AS BLOB)),0)+length(CAST(body AS BLOB)) AS bytes
-                   FROM claims WHERE store_index>?1 AND store_index<=?2
-                   ORDER BY store_index LIMIT ?3)",
+                CLAIM_METADATA,
                 index.min(i64::MAX as u64) as i64,
                 to_index.min(i64::MAX as u64) as i64,
             )?;
-            let observations = measure(
-                "SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM (
-                   SELECT length(CAST(subject AS BLOB))+length(CAST(kind AS BLOB))+
-                     COALESCE(length(CAST(actor AS BLOB)),0)+length(CAST(body AS BLOB)) AS bytes
-                   FROM local_observations WHERE id>?1 AND id<=?2
-                   ORDER BY id LIMIT ?3)",
-                local,
-                to_local,
-            )?;
+            let observations = measure(LOCAL_METADATA, local, to_local)?;
             if claims.0.saturating_add(observations.0) > CHANGE_ROWS as u64
                 || claims.1.saturating_add(observations.1) > CHANGE_BYTES
+                || claims.2 != 0
+                || observations.2 != 0
             {
                 result.invalidate_all = true;
                 return Ok(result);
@@ -199,6 +203,183 @@ mod tests {
             assert_eq!(observed.invalidate_all, overflow);
             assert_eq!(observed.feed.changes.len(), usize::from(!overflow));
             assert_eq!(observed.feed.index, 1);
+        }
+    }
+
+    #[test]
+    fn actual_metadata_queries_use_locked_sqlite_column_byte_and_type_opcodes() {
+        assert_eq!(rusqlite::version_number(), 3_046_000);
+        let store = Store::open_memory("node").unwrap();
+        claim(&store.connection.write(), 1, "{}");
+        local(&store.connection.write(), 1);
+        let connection = store.readers.get();
+        for (table, sql) in [
+            ("claims", CLAIM_METADATA),
+            ("local_observations", LOCAL_METADATA),
+        ] {
+            let root: i32 = connection
+                .query_row(
+                    "SELECT rootpage FROM sqlite_schema WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let columns = connection
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let ops = connection
+                .prepare(&format!("EXPLAIN {sql}"))
+                .unwrap()
+                .query_map(params![0, 1, CHANGE_ROWS + 1], |row| {
+                    Ok((
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i32>(2)?,
+                        row.get::<_, i32>(3)?,
+                        row.get::<_, i32>(6)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let cursor = ops
+                .iter()
+                .find(|(op, _, p2, _)| op == "OpenRead" && *p2 == root)
+                .unwrap()
+                .1;
+            assert!(
+                !ops.iter().any(|(op, _, _, _)| op == "Cast"),
+                "{table}: {ops:?}"
+            );
+            for column in ["subject", "kind", "actor", "body"] {
+                let index = columns.iter().find(|(_, name)| name == column).unwrap().0;
+                let reads = ops
+                    .iter()
+                    .filter(|(op, p1, p2, _)| op == "Column" && *p1 == cursor && *p2 == index)
+                    .collect::<Vec<_>>();
+                assert!(!reads.is_empty(), "{table}.{column}: {ops:?}");
+                assert!(
+                    reads.iter().all(|(_, _, _, p5)| p5 & 0xc0 != 0),
+                    "payload column read before admission: {table}.{column}: {ops:?}"
+                );
+                assert!(
+                    reads.iter().any(|(_, _, _, p5)| p5 & 0xc0 == 0xc0),
+                    "direct byte-length opcode missing: {table}.{column}: {ops:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_overflow_cells_are_refused_without_fetching_their_contents() {
+        assert_eq!(rusqlite::version_number(), 3_046_000);
+        for table in ["claims", "local_observations"] {
+            for column in ["subject", "kind", "actor", "body"] {
+                let store = Store::open_memory("node").unwrap();
+                if table == "claims" {
+                    claim(&store.connection.write(), 1, "{}");
+                } else {
+                    local(&store.connection.write(), 1);
+                }
+                store
+                    .connection
+                    .write()
+                    .execute(
+                        &format!("UPDATE {table} SET {column}=?1"),
+                        [&"x".repeat(2 * CHANGE_BYTES as usize)],
+                    )
+                    .unwrap();
+                store
+                    .read_snapshot(|_| {
+                        let connection = store.readers.get();
+                        // A private reader handle: no global limit, writer/admission or production
+                        // setting is changed. A real wide-cell fetch is the negative control.
+                        let prior = unsafe {
+                            rusqlite::ffi::sqlite3_limit(
+                                connection.handle(),
+                                rusqlite::ffi::SQLITE_LIMIT_LENGTH,
+                                128 * 1024,
+                            )
+                        };
+                        assert!(
+                            connection
+                                .query_row(&format!("SELECT {column} FROM {table}"), [], |row| {
+                                    row.get::<_, String>(0)
+                                })
+                                .is_err(),
+                            "wide-cell negative: {table}.{column}"
+                        );
+                        let observed = store.reconcile_changes_since(0, 0);
+                        unsafe {
+                            rusqlite::ffi::sqlite3_limit(
+                                connection.handle(),
+                                rusqlite::ffi::SQLITE_LIMIT_LENGTH,
+                                prior,
+                            );
+                        }
+                        let observed = observed?;
+                        assert!(
+                            observed.invalidate_all && observed.feed.changes.is_empty(),
+                            "{table}.{column}"
+                        );
+                        assert_eq!(observed.feed.index + observed.feed.local as u64, 1);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_physical_storage_types_invalidate_without_partial_hints() {
+        let store = Store::open_memory("node").unwrap();
+        // Reader corruption model only. Untyped private columns preserve physical numeric/null
+        // cases that production TEXT affinity/NOT NULL would normally prevent at insertion.
+        // This models neither a schema migration nor Store/replication admission eligibility.
+        store
+            .connection
+            .write()
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+            DROP TABLE claims; DROP TABLE local_observations;
+            CREATE TABLE claims(store_index INTEGER PRIMARY KEY,subject,kind,actor,body);
+            CREATE TABLE local_observations(id INTEGER PRIMARY KEY,subject,kind,actor,body);",
+            )
+            .unwrap();
+        for table in ["claims", "local_observations"] {
+            for column in ["subject", "kind", "actor", "body"] {
+                for value in [
+                    rusqlite::types::Value::Blob(b"{}".to_vec()),
+                    rusqlite::types::Value::Integer(17),
+                    rusqlite::types::Value::Real(1.5),
+                    rusqlite::types::Value::Null,
+                    rusqlite::types::Value::Text("{}".into()),
+                ] {
+                    let accepted = matches!(value, rusqlite::types::Value::Text(_))
+                        || (column == "actor" && matches!(value, rusqlite::types::Value::Null));
+                    {
+                        let writer = store.connection.write();
+                        writer
+                            .execute_batch("DELETE FROM claims; DELETE FROM local_observations;")
+                            .unwrap();
+                        writer.execute(&format!("INSERT INTO {table} VALUES(1,'resource/a','resource.observed',NULL,'{{}}')"), []).unwrap();
+                        writer
+                            .execute(&format!("UPDATE {table} SET {column}=?1"), [&value])
+                            .unwrap();
+                    }
+                    let observed = store.reconcile_changes_since(0, 0).unwrap();
+                    assert_eq!(
+                        observed.invalidate_all, !accepted,
+                        "{table}.{column}: {value:?}"
+                    );
+                    assert_eq!(observed.feed.changes.len(), usize::from(accepted));
+                }
+            }
         }
     }
 

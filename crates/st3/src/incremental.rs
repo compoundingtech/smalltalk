@@ -89,24 +89,53 @@ struct Item {
 pub fn change_keys(change: &Change) -> Vec<String> {
     let body = serde_json::from_str::<Value>(&change.body).ok();
     let mut keys = Vec::new();
-    visit_change_keys(change, body.as_ref(), |key| {
-        keys.push(key.to_owned());
+    visit_change_keys(change, body.as_ref(), |prefix, value| {
+        keys.push(format!("{prefix}{value}"));
         true
     });
     keys
 }
 
-/// Stop BEFORE cloning the next dependency key. The parsed JSON remains covered by the feed's
-/// byte budget; in particular, a large members/retired object is never cloned into an unbounded
-/// second vector. Incomplete expansion is usable only for conservative global invalidation.
-fn bounded_change_keys(change: &Change, budget: usize) -> Result<(Vec<String>, bool)> {
-    let body: Value = serde_json::from_str(&change.body)?;
-    let mut keys = Vec::new();
-    let complete = visit_change_keys(change, Some(&body), |key| {
-        if keys.len() == budget {
+const CHANGE_KEYS: usize = 4096;
+const CHANGE_KEY_BYTES: usize = 1024 * 1024;
+const CHANGE_KEY_MAX_BYTES: usize = 4096;
+
+struct KeyBudget {
+    remaining_keys: usize,
+    remaining_bytes: usize,
+}
+impl KeyBudget {
+    fn admit(&mut self, prefix: &str, value: &str) -> bool {
+        let Some(bytes) = prefix.len().checked_add(value.len()) else {
+            return false;
+        };
+        if self.remaining_keys == 0 || bytes > CHANGE_KEY_MAX_BYTES || bytes > self.remaining_bytes
+        {
             return false;
         }
-        keys.push(key.to_owned());
+        self.remaining_keys -= 1;
+        self.remaining_bytes -= bytes;
+        true
+    }
+}
+
+/// The visitor passes borrowed parts, so refusal precedes ALL key formatting/cloning. Parsed
+/// JSON remains separately covered by the feed byte cap. An incomplete expansion may only
+/// trigger conservative global invalidation, never application of its partial keys.
+fn bounded_change_keys(change: &Change, budget: &mut KeyBudget) -> Result<(Vec<String>, bool)> {
+    if budget.remaining_keys == 0
+        || change.subject.len() > CHANGE_KEY_MAX_BYTES
+        || change.subject.len() > budget.remaining_bytes
+    {
+        return Ok((Vec::new(), false));
+    }
+    let body: Value = serde_json::from_str(&change.body)?;
+    let mut keys = Vec::new();
+    let complete = visit_change_keys(change, Some(&body), |prefix, value| {
+        if !budget.admit(prefix, value) {
+            return false;
+        }
+        keys.push(format!("{prefix}{value}"));
         true
     });
     Ok((keys, complete))
@@ -115,18 +144,18 @@ fn bounded_change_keys(change: &Change, budget: usize) -> Result<(Vec<String>, b
 fn visit_change_keys(
     change: &Change,
     body: Option<&Value>,
-    mut visit: impl FnMut(&str) -> bool,
+    mut visit: impl FnMut(&str, &str) -> bool,
 ) -> bool {
     let mut agent = false;
-    let mut emit = |key: &str| {
-        agent |= key.starts_with("agent/");
-        visit(key)
+    let mut emit = |prefix: &str, value: &str| {
+        agent |= prefix.is_empty() && value.starts_with("agent/");
+        visit(prefix, value)
     };
-    if !emit(&change.subject) || !emit(&format!("kind:{}", change.kind)) {
+    if !emit("", &change.subject) || !emit("kind:", &change.kind) {
         return false;
     }
     if let Some(actor) = &change.actor
-        && !emit(&format!("actor:{actor}"))
+        && !emit("actor:", actor)
     {
         return false;
     }
@@ -156,20 +185,20 @@ fn visit_change_keys(
     };
     for (name, prefix) in fields {
         if let Some(value) = field(name)
-            && !emit(&format!("{prefix}{value}"))
+            && !emit(prefix, value)
         {
             return false;
         }
     }
     if change.kind == "owned-set.revised" {
-        if !emit("kind:intent.desired") {
+        if !emit("", "kind:intent.desired") {
             return false;
         }
         if let Some(body) = body {
             for map in ["members", "retired"] {
                 if let Some(members) = body["fields"]["body"][map].as_object() {
                     for key in members.keys() {
-                        if !emit(key) {
+                        if !emit("", key) {
                             return false;
                         }
                     }
@@ -178,7 +207,7 @@ fn visit_change_keys(
         }
     }
     if matches!(change.kind.as_str(), "intent.desired" | "owned-set.revised") && agent {
-        return visit("desired-kind:agent");
+        return visit("", "desired-kind:agent");
     }
     true
 }
@@ -216,12 +245,15 @@ impl Incremental {
         }
         // Bound discovery expansion, including a single owned-set receipt's large membership
         // and a widely shared dependency. No partial fanout is allowed to stand as clean.
-        let mut keys_seen = 0_usize;
+        let mut key_budget = KeyBudget {
+            remaining_keys: CHANGE_KEYS,
+            remaining_bytes: CHANGE_KEY_BYTES,
+        };
         let mut readers_seen = 0_usize;
         let mut affected = BTreeSet::new();
         let mut overflow = false;
         'changes: for change in &feed.changes {
-            let (keys, complete) = match bounded_change_keys(change, 4096 - keys_seen) {
+            let (keys, complete) = match bounded_change_keys(change, &mut key_budget) {
                 Ok(expanded) => expanded,
                 Err(_) => {
                     overflow = true;
@@ -232,7 +264,6 @@ impl Incremental {
                 overflow = true;
                 break;
             }
-            keys_seen += keys.len();
             for key in keys {
                 for item in state.readers.get(&key).into_iter().flatten() {
                     readers_seen += 1;
@@ -240,7 +271,16 @@ impl Incremental {
                         overflow = true;
                         break 'changes;
                     }
-                    affected.insert(item.clone());
+                    if !affected.contains(item) {
+                        // Share the byte allowance with copied affected item names. A large
+                        // retained reader key cannot bypass the bounded discovery allocation.
+                        if item.len() > key_budget.remaining_bytes {
+                            overflow = true;
+                            break 'changes;
+                        }
+                        key_budget.remaining_bytes -= item.len();
+                        affected.insert(item.clone());
+                    }
                 }
             }
         }
@@ -819,7 +859,8 @@ mod tests {
             &receipt.to_string(),
         );
         assert!(large.body.len() + large.subject.len() + large.kind.len() < 1024 * 1024);
-        let (keys, complete) = bounded_change_keys(&large, 4096).unwrap();
+        let (keys, complete) =
+            bounded_change_keys(&large, &mut budget(4096, CHANGE_KEY_BYTES)).unwrap();
         assert!(!complete);
         assert_eq!(
             keys.len(),
@@ -827,7 +868,8 @@ mod tests {
             "no cloned membership suffix beyond the budget"
         );
         assert!(!keys.contains(&"agent/4199".to_owned()));
-        let (empty, complete) = bounded_change_keys(&large, 0).unwrap();
+        let (empty, complete) =
+            bounded_change_keys(&large, &mut budget(0, CHANGE_KEY_BYTES)).unwrap();
         assert!(!complete && empty.is_empty());
         // The same producer retains every old key for a small, fully expanded receipt, and
         // the boundary is inclusive rather than silently truncating the final agent-kind key.
@@ -856,13 +898,16 @@ mod tests {
             .map(str::to_owned)
         );
         assert_eq!(
-            bounded_change_keys(&small_change, small.len()).unwrap(),
+            bounded_change_keys(&small_change, &mut budget(small.len(), CHANGE_KEY_BYTES)).unwrap(),
             (small.clone(), true)
         );
         assert!(
-            !bounded_change_keys(&small_change, small.len() - 1)
-                .unwrap()
-                .1
+            !bounded_change_keys(
+                &small_change,
+                &mut budget(small.len() - 1, CHANGE_KEY_BYTES)
+            )
+            .unwrap()
+            .1
         );
 
         let store = Store::open_memory("node").unwrap();
@@ -891,6 +936,165 @@ mod tests {
         for name in ["visited", "unvisited", "unrelated"] {
             assert!(incremental.needs(name, 0));
         }
+    }
+
+    #[test]
+    fn key_admission_is_before_prefix_construction_and_cumulative_across_changes() {
+        let huge = "x".repeat(32_768);
+        let first = change(
+            "agent/a",
+            "intent.desired",
+            Some(&huge),
+            &serde_json::json!({"fields":{"owner_step":huge}}).to_string(),
+        );
+        let mut emitted = Vec::new();
+        let body: Value = serde_json::from_str(&first.body).unwrap();
+        assert!(!visit_change_keys(&first, Some(&body), |prefix, value| {
+            // Exactly one borrowed subject is allowed. The next borrowed kind is refused;
+            // neither the huge actor nor the huge prefixed field can be reached/constructed.
+            if !emitted.is_empty() {
+                return false;
+            }
+            assert!(prefix.is_empty());
+            assert_eq!(value.as_ptr(), first.subject.as_ptr());
+            emitted.push(value.to_owned());
+            true
+        }));
+        assert_eq!(emitted, ["agent/a"]);
+        let (keys, complete) =
+            bounded_change_keys(&first, &mut budget(2, CHANGE_KEY_BYTES)).unwrap();
+        assert!(!complete);
+        assert_eq!(keys, ["agent/a", "kind:intent.desired"]);
+
+        let a = change(
+            "message/a",
+            "message.sent",
+            None,
+            r#"{"fields":{"to":"agent/a"}}"#,
+        );
+        let b = change(
+            "message/b",
+            "message.sent",
+            None,
+            r#"{"fields":{"to":"agent/b"}}"#,
+        );
+        let expected = ["message/a", "kind:message.sent", "mailbox:agent/a"];
+        let bytes = expected.iter().map(|key| key.len()).sum::<usize>();
+        let mut allowance = budget(6, bytes);
+        let (keys, complete) = bounded_change_keys(&a, &mut allowance).unwrap();
+        assert!(complete);
+        assert_eq!(keys, expected);
+        assert_eq!(allowance.remaining_bytes, 0);
+        let (keys, complete) = bounded_change_keys(&b, &mut allowance).unwrap();
+        assert!(
+            !complete && keys.is_empty(),
+            "no formatting after cumulative byte exhaustion"
+        );
+        let mut allowance = budget(3, CHANGE_KEY_BYTES);
+        assert!(bounded_change_keys(&a, &mut allowance).unwrap().1);
+        let (keys, complete) = bounded_change_keys(&b, &mut allowance).unwrap();
+        assert!(
+            !complete && keys.is_empty(),
+            "no cloning after cumulative count exhaustion"
+        );
+        let mut allowance = budget(6, bytes * 2);
+        assert!(bounded_change_keys(&a, &mut allowance).unwrap().1);
+        assert!(bounded_change_keys(&b, &mut allowance).unwrap().1);
+        assert_eq!(
+            (allowance.remaining_keys, allowance.remaining_bytes),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn cumulative_key_exhaustion_discards_the_partial_affected_set() {
+        let store = Store::open_memory("node").unwrap();
+        let incremental = Incremental::default();
+        incremental.observe(&store).unwrap();
+        for (item, key) in [
+            ("visited", "agent/0000"),
+            ("unvisited", "agent/9999"),
+            ("unrelated", "doc/unrelated"),
+        ] {
+            incremental.evaluated(item, BTreeSet::from([key.into()]), None);
+        }
+        let members = (0..300)
+            .map(|n| (format!("agent/{n:04}"), Value::Object(Default::default())))
+            .collect::<serde_json::Map<String, Value>>();
+        let body = serde_json::json!({"fields":{"body":{"members":members}}}).to_string();
+        assert!(body.len() * 14 < CHANGE_KEY_BYTES);
+        for _ in 0..14 {
+            store.connection.write().execute(
+                "INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+                    VALUES(0,'owned-set/cumulative','owned-set.revised',?1,1)", [&body],
+            ).unwrap();
+        }
+        assert!(
+            !store.reconcile_changes_since(0, 0).unwrap().invalidate_all,
+            "metadata admission must allow these small hints"
+        );
+        incremental.observe(&store).unwrap();
+        for item in ["visited", "unvisited", "unrelated"] {
+            assert!(incremental.needs(item, 0));
+        }
+        let state = incremental.state.lock().unwrap();
+        assert!(
+            state.items.values().all(|item| !item.dirty),
+            "global generation invalidation, not application of a partial affected set"
+        );
+        assert!(
+            state
+                .items
+                .values()
+                .all(|item| item.generation != state.generation)
+        );
+    }
+
+    #[test]
+    fn oversized_key_under_the_feed_cap_invalidates_all_before_key_allocation() {
+        let store = Store::open_memory("node").unwrap();
+        let incremental = Incremental::default();
+        incremental.observe(&store).unwrap();
+        let large = "agent/".to_owned() + &"x".repeat(CHANGE_KEY_MAX_BYTES);
+        let hint = change(
+            "owned-set/large-key",
+            "owned-set.revised",
+            None,
+            &serde_json::json!({"fields":{"body":{"members":{large.clone():{}}}}}).to_string(),
+        );
+        let (keys, complete) =
+            bounded_change_keys(&hint, &mut budget(CHANGE_KEYS, CHANGE_KEY_BYTES)).unwrap();
+        assert!(!complete);
+        assert_eq!(
+            keys,
+            [
+                "owned-set/large-key",
+                "kind:owned-set.revised",
+                "kind:intent.desired"
+            ]
+        );
+        for item in ["visited", "unvisited", "unrelated"] {
+            incremental.evaluated(item, BTreeSet::from([item.into()]), None);
+        }
+        store.connection.write().execute(
+            "INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+                VALUES(0,?1,?2,?3,1)", rusqlite::params![hint.subject,hint.kind,hint.body],
+        ).unwrap();
+        assert!(!store.reconcile_changes_since(0, 0).unwrap().invalidate_all);
+        incremental.observe(&store).unwrap();
+        for item in ["visited", "unvisited", "unrelated"] {
+            assert!(incremental.needs(item, 0));
+        }
+        // A too-large retained item name is refused before its affected-set clone as well.
+        incremental.evaluated(
+            &"z".repeat(CHANGE_KEY_BYTES + 1),
+            BTreeSet::from(["resource/tiny".into()]),
+            None,
+        );
+        incremental.evaluated("otherwise-clean", BTreeSet::new(), None);
+        observe(&store, "tiny");
+        incremental.observe(&store).unwrap();
+        assert!(incremental.needs("otherwise-clean", 0));
     }
 
     #[test]
@@ -981,6 +1185,13 @@ mod tests {
     }
 
     use super::*;
+
+    fn budget(keys: usize, bytes: usize) -> KeyBudget {
+        KeyBudget {
+            remaining_keys: keys,
+            remaining_bytes: bytes,
+        }
+    }
 
     fn change(subject: &str, kind: &str, actor: Option<&str>, body: &str) -> Change {
         Change {

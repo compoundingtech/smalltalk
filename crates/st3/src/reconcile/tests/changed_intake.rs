@@ -638,6 +638,7 @@ async fn an_elapsed_schedule_deadline_is_consumed_until_its_real_timer_notifies(
     let store = Arc::new(Store::open_memory("node").unwrap());
     store.set_write_clock_at(START).unwrap();
     let revision = scheduled_mission_revision(&store);
+    let workspace = tempfile::tempdir().unwrap();
     let due = START + 10;
     let anchor = chrono::DateTime::from_timestamp_millis(due as i64)
         .unwrap()
@@ -647,8 +648,9 @@ async fn an_elapsed_schedule_deadline_is_consumed_until_its_real_timer_notifies(
         &format!(
             r#"version 2
 schedule "later" {{ every "1h"; anchor "{anchor}"
-    work {{ mission "scheduled-cycle@{revision}"; workspace "/tmp" }} }}
-"#
+    work {{ mission "scheduled-cycle@{revision}"; workspace "{}" }} }}
+"#,
+            workspace.path().display()
         ),
         "pending-schedule-timer",
     );
@@ -725,6 +727,50 @@ schedule "later" {{ every "1h"; anchor "{anchor}"
             .unwrap()
             .is_empty()
     );
+    let active = store.active_mission_run_ids_for_origin("node").unwrap();
+    assert_eq!(active.len(), 1);
+    assert!(
+        store
+            .schedule_has_active_started_run("schedule/later")
+            .unwrap()
+    );
+    reconciler.reconcile_schedules(&desired).unwrap();
+    assert_eq!(reconciler.incremental.next_due("schedule:"), None);
+    assert_eq!(
+        store
+            .claims_for("schedule/later", Some("schedule.occurrence-scheduled"))
+            .unwrap()
+            .len(),
+        1,
+        "a real running run blocks another occurrence"
+    );
+    // Use the existing mission evaluator, including agentless admission, step completion and
+    // cleanup. Pass its COMPLETE active roster, never a dirty subset that could evict live caches.
+    for _ in 0..8 {
+        reconciler.evaluate_mission_runs().unwrap();
+        if store
+            .active_mission_run_ids_for_origin("node")
+            .unwrap()
+            .is_empty()
+        {
+            break;
+        }
+    }
+    let finished = store.mission_run(&active[0]).unwrap().unwrap();
+    assert_eq!(finished.status, "completed");
+    assert_eq!(finished.phase, "terminal");
+    assert_eq!(finished.steps[0].status, "completed");
+    assert!(
+        !store
+            .schedule_has_active_started_run("schedule/later")
+            .unwrap()
+    );
+    assert!(
+        store
+            .active_mission_run_ids_for_origin("node")
+            .unwrap()
+            .is_empty()
+    );
     reconciler.reconcile_schedules(&desired).unwrap();
     assert_eq!(
         reconciler.incremental.next_due("schedule:"),
@@ -742,7 +788,7 @@ schedule "later" {{ every "1h"; anchor "{anchor}"
 #[test]
 fn an_overlapping_timer_completion_survives_selected_evaluation_recording() {
     let _clock = Clock::at(START);
-    let (store, reconciler, _) = fixture(1);
+    let (store, reconciler, _) = fixture(2);
     let desired = store.desired_subjects().unwrap();
     stages(&reconciler, &desired);
     let item = "observer:observer/repo-0";
@@ -753,6 +799,11 @@ fn an_overlapping_timer_completion_survives_selected_evaluation_recording() {
         Ok(())
     });
     assert!(reconciler.incremental.needs(item, START));
+    assert!(
+        !reconciler
+            .incremental
+            .needs("observer:observer/repo-1", START)
+    );
     reconciler.reconcile_selected_intake("observer", item, "observer/repo-0", true, || Ok(()));
     assert!(!reconciler.incremental.needs(item, START));
     let new = "observer:observer/new";
@@ -772,6 +823,17 @@ async fn unchanged_provider_failure_without_a_claim_still_selects_the_new_retry_
     let store = Arc::new(Store::open_memory("node").unwrap());
     store.set_write_clock_at(START).unwrap();
     apply_source(&store, SCRIPTED_OBSERVER, "unchanged-provider-failure");
+    let away = Store::open_memory("away").unwrap();
+    apply_source(
+        &away,
+        &SCRIPTED_OBSERVER
+            .replace("\"repo\"", "\"unrelated\"")
+            .replace("resource/repo", "resource/unrelated"),
+        "unrelated-foreign-observer",
+    );
+    store
+        .import_replication("away", &away.export_replication(0).unwrap())
+        .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -836,6 +898,11 @@ async fn unchanged_provider_failure_without_a_claim_still_selects_the_new_retry_
             .incremental
             .needs("observer:observer/repo", now_ms())
     );
+    assert!(
+        !reconciler
+            .incremental
+            .needs("observer:observer/unrelated", now_ms())
+    );
     let before = store.index();
     release.notify_one();
     tokio::time::timeout(Duration::from_secs(2), completion.changed())
@@ -852,6 +919,12 @@ async fn unchanged_provider_failure_without_a_claim_still_selects_the_new_retry_
             .incremental
             .needs("observer:observer/repo", now_ms()),
         "completion itself must select work without append hints"
+    );
+    assert!(
+        !reconciler
+            .incremental
+            .needs("observer:observer/unrelated", now_ms()),
+        "completion selects only the affected observer"
     );
     reconciler
         .reconcile_resource_observers(&desired, &desired)
