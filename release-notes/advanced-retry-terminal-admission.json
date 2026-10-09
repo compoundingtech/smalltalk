@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Refuse an advanced exchange success after its permission expires or changes",
+  "replay": {
+    "status": "none",
+    "detail": "Envelope receipt, duplicate handling, projection and replay are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No durable table, index or data-format changes; retry credit is private task-local state."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim or checkpoint rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Only the private advanced retry wrapper changes: after a successful exchange completes, recheck its current authority, routes, removal and monotonic expiry before reporting success. Ordinary exchanges and original errors, including signed overload, retain their existing behavior."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration or additional service interruption beyond a normal binary swap."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new configuration or manual action."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "A final receive, notification or empty checkpoint-need await cannot turn an invalidated advanced permission into a successful exchange and a fresh five-minute credit. Typed refusal preserves committed effects and does not create an adoption cooldown. One opportunity remains a full exchange with potentially multiple POSTs. Source-only draft; original recovery and performance qualification remain open."
+  }
+}

@@ -607,6 +607,11 @@ struct CallerBackend {
     need_entered: Arc<tokio::sync::Semaphore>,
     need_release: Arc<tokio::sync::Semaphore>,
     pause_need: bool,
+    receive_entered: Arc<tokio::sync::Semaphore>,
+    receive_release: Arc<tokio::sync::Semaphore>,
+    pause_receive: bool,
+    completed_receives: Arc<std::sync::atomic::AtomicUsize>,
+    summary_digest: Arc<std::sync::Mutex<Option<String>>>,
     adoptions: Arc<std::sync::atomic::AtomicUsize>,
     exports: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -620,9 +625,14 @@ impl Backend for CallerBackend {
         signatures: &[crate::claim::ReplicaEnvelopeId],
     ) -> Result<crate::replication::ReplicationExportResponse> {
         self.exports.fetch_add(1, Ordering::Relaxed);
-        self.local
+        let result = self
+            .local
             .export(fleet_id, inventory, summary_only, signatures)
-            .await
+            .await?;
+        if summary_only {
+            *self.summary_digest.lock().unwrap() = Some(result.exchange.inventory.digest.clone());
+        }
+        Ok(result)
     }
     async fn receive(
         &self,
@@ -631,9 +641,22 @@ impl Backend for CallerBackend {
         exchange: &ReplicationExchange,
         round_trip: Option<Duration>,
     ) -> Result<crate::replication::ReplicationReceiveResponse> {
-        self.local
+        let result = self
+            .local
             .receive(peer, fleet_id, exchange, round_trip)
-            .await
+            .await?;
+        self.completed_receives.fetch_add(1, Ordering::Relaxed);
+        if self.pause_receive {
+            // Prove this pause is on the terminal-success path, so a later follow-up
+            // export/page guard cannot accidentally satisfy the negative control.
+            let query_digest = self.summary_digest.lock().unwrap().clone().unwrap();
+            assert_eq!(exchange.inventory.digest, query_digest);
+            assert!(exchange.inventory.checkpoint.is_none());
+            assert!(exchange.signature_requests.is_empty());
+            self.receive_entered.add_permits(1);
+            self.receive_release.acquire().await.unwrap().forget();
+        }
+        Ok(result)
     }
     async fn heal_answer(
         &self,
@@ -699,6 +722,11 @@ fn caller_backend(path: &Path, origin: &str, auth: &FleetAuth) -> CallerBackend 
         need_entered: Arc::new(tokio::sync::Semaphore::new(0)),
         need_release: Arc::new(tokio::sync::Semaphore::new(0)),
         pause_need: false,
+        receive_entered: Arc::new(tokio::sync::Semaphore::new(0)),
+        receive_release: Arc::new(tokio::sync::Semaphore::new(0)),
+        pause_receive: false,
+        completed_receives: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        summary_digest: Arc::new(std::sync::Mutex::new(None)),
         adoptions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         exports: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     }
@@ -1048,4 +1076,103 @@ async fn real_head405_caller_advances_once_then_resumes_original_deadline_and_ba
     })
     .await
     .expect("actual HEAD/exchange/resume caller exceeded finite bound");
+}
+
+#[tokio::test]
+async fn advanced_success_rechecks_after_final_receive_without_rearming_credit() {
+    use std::future::IntoFuture as _;
+    for change in 0..4 {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let root = tempfile::tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (fleet, auth, _unused, _unused_rx) = fixture();
+            let (tx, routes) = watch::channel(vec![Route::Http(url.clone())]);
+            let mut backend = caller_backend(&root.path().join("caller.sqlite"), "birch", &auth);
+            let remote = caller_backend(&root.path().join("remote.sqlite"), "beacon", &auth);
+            let state = PeerState {
+                backend: remote,
+                node: "beacon".into(),
+                auth: auth.clone(),
+                fleet: FleetContext::legacy(BTreeSet::from(["birch".into()])),
+                outbound_notify: watch::channel(0).0,
+            };
+            let server = tokio::spawn(
+                axum::serve(listener, peer_router(state, Router::new())).into_future(),
+            );
+            let http = reqwest::Client::builder().no_proxy().build().unwrap();
+            let peer = PeerConfig {
+                name: "beacon".into(),
+                url: url.clone(),
+            };
+            // Genuine signed success supplies the normal earning precondition. Both
+            // stores are empty, so the later receive is terminal: no follow-up or manifest
+            // submission can catch the invalidation instead of the wrapper's final check.
+            let generation = retry_generation(&fleet, &routes, &url);
+            exchange(&http, &backend, "birch", &peer, &auth, &fleet)
+                .await
+                .unwrap();
+            let mut credit = RecoveryCredit::default();
+            credit.earn(generation, &fleet, &routes, &url);
+            let mut advance = credit
+                .spend(&fleet, &auth, &routes, &url, schedule())
+                .unwrap();
+            if change == 2 {
+                advance.expires = tokio::time::Instant::now() + Duration::from_secs(2);
+            }
+            let expires = advance.expires;
+            backend.pause_receive = true;
+            let before_receives = backend.completed_receives.load(Ordering::Relaxed);
+            let before_exports = backend.exports.load(Ordering::Relaxed);
+            let call = exchange_with_recovery(
+                &http, &backend, "birch", &peer, &auth, &fleet, &routes, advance,
+            );
+            let controller = async {
+                // The actual local receive completed before this pause. Refusal does not
+                // undo it. This control tests the success boundary, not a fake send/result.
+                backend.receive_entered.acquire().await.unwrap().forget();
+                match change {
+                    0 => {
+                        let _view = fleet.view.write().unwrap();
+                        fleet
+                            .view_changed
+                            .send_modify(|generation| *generation += 1);
+                    }
+                    1 => {
+                        tx.send_replace(vec![Route::Http("http://127.0.0.1:1".into())]);
+                    }
+                    2 => tokio::time::sleep_until(expires).await,
+                    3 => fleet.removed.store(true, Ordering::Release),
+                    _ => unreachable!(),
+                }
+                backend.receive_release.add_permits(1);
+            };
+            let (result, ()) = tokio::join!(call, controller);
+            assert!(result.unwrap_err().is::<RetryAdmissionInvalidated>());
+            assert!(
+                credit.earned.is_none(),
+                "terminal refusal restored spent credit"
+            );
+            assert_eq!(
+                backend.completed_receives.load(Ordering::Relaxed),
+                before_receives + 1
+            );
+            assert_eq!(backend.exports.load(Ordering::Relaxed), before_exports + 1);
+            assert_eq!(backend.adoptions.load(Ordering::Relaxed), 0);
+            // Ordinary None-admission success remains available through the same actual
+            // HTTP/export/receive path; no retry of the failed advanced call is performed.
+            backend.pause_receive = false;
+            exchange(&http, &backend, "birch", &peer, &auth, &fleet)
+                .await
+                .unwrap();
+            assert_eq!(
+                backend.completed_receives.load(Ordering::Relaxed),
+                before_receives + 2
+            );
+            assert!(credit.earned.is_none());
+            server.abort();
+        })
+        .await
+        .expect("terminal success caller/control exceeded finite bound");
+    }
 }

@@ -2262,7 +2262,7 @@ async fn exchange_with_recovery<B: Backend>(
     routes: &watch::Receiver<Vec<Route>>,
     advance: RecoveryAdvance,
 ) -> Result<(bool, bool)> {
-    exchange_checked(
+    let result = exchange_checked(
         http,
         backend,
         node,
@@ -2274,7 +2274,12 @@ async fn exchange_with_recovery<B: Backend>(
             routes,
         }),
     )
-    .await
+    .await?;
+    // Every success exit must still own admission, including empty checkpoint need and
+    // the final receive/changed awaits. Committed effects stay committed on refusal.
+    // Preserve original errors (especially signed overload) before this success-only check.
+    advance.check(fleet, auth, routes, &peer.url)?;
+    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)]
