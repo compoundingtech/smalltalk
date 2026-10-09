@@ -52,6 +52,7 @@ pub use binary_payloads::PayloadConversion;
 pub mod canonical;
 pub mod checkpoint;
 pub mod checkpoint_agreement;
+mod checkpoint_completion;
 pub mod checkpoint_trim;
 pub mod document_index;
 pub mod heal;
