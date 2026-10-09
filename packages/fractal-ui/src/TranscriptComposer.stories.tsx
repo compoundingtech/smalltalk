@@ -1,7 +1,9 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import type { Meta, StoryObj } from '@storybook/react-vite'
-import { expect, waitFor } from 'storybook/test'
+import { expect, userEvent, waitFor, within } from 'storybook/test'
+import type { AppendMessage } from '@assistant-ui/react'
+import { Button } from 'react-aria-components'
 import { Transcript, type TranscriptTurn } from './assistant-ui/composition/Transcript'
 import { EmbraceComposer } from './assistant-ui/EmbraceComposer'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
@@ -9,7 +11,7 @@ import type { TextItem } from './assistant-ui/embrace-data/model'
 import { workLogTurnFromItems } from './assistant-ui/taste/work-log'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
-import { surfaceVars as surface, textVars as ink, spaceVars as s, typeVars as t } from './assistant-ui/composition-tokens.stylex'
+import { accentVars as accent, borderVars as border, geometryVars as g, radiusVars as r, surfaceVars as surface, textVars as ink, spaceVars as s, typeVars as t } from './assistant-ui/composition-tokens.stylex'
 
 const now = Date.parse('2026-01-15T12:30:00Z')
 const minute = (index: number) => new Date(Date.parse('2026-01-15T12:00:00Z') + index * 60_000).toISOString()
@@ -90,9 +92,67 @@ export const Placeholder: Story = { render: args => <PlaceholderStory scheme={ar
 } }
 export const PlaceholderLight: Story = { ...Placeholder, args: { scheme: 'light' } }
 
+function OwnSendStory({ scheme }: { scheme: Scheme }) {
+  const [turns, setTurns] = React.useState(historyTurns)
+  // A defined key from the first render: rerenders under it must never count as a command.
+  const [sendKey, setSendKey] = React.useState('pending/opened')
+  const next = React.useRef(historyTurns.length)
+  const messages = React.useMemo(() => turns.flatMap(entry => entry.prompt === undefined ? entry.items : [entry.prompt, ...entry.items]), [turns])
+  const onNew = React.useCallback(async (message: AppendMessage) => {
+    const index = next.current++
+    const text = message.content.flatMap(part => part.type === 'text' ? [part.text] : []).join('\n')
+    setTurns(previous => [...previous, turn(index, text, undefined, true)])
+    setSendKey(`pending/${index}`)
+  }, [])
+  const appendReply = React.useCallback(() => {
+    const index = next.current++
+    setTurns(previous => [...previous, turn(index, undefined, answers[index % answers.length])])
+  }, [])
+  const options = React.useMemo(() => ({ messages, isRunning: false, onNew }), [messages, onNew])
+  return <Surface scheme={scheme}><EmbraceRuntimeProvider options={options}>
+    <div {...stylex.props(styles.toolbar)}><Button onPress={appendReply} {...stylex.props(styles.button)}>Append agent reply</Button></div>
+    <div {...stylex.props(styles.transcript)}><Transcript title="Row projection" turns={turns} sync={columnSync} now={now} observedAt={now - 8000} scrollToBottomKey={sendKey} /></div>
+    <div {...stylex.props(styles.dock)}><EmbraceComposer variant="C1" readingColumn /></div>
+  </EmbraceRuntimeProvider></Surface>
+}
+async function settleFrames() {
+  // The package lib is ES2022 (no Promise.withResolvers). Three frames cover the viewport's scheduled write and capture.
+  for (let frame = 0; frame < 3; frame++) await new Promise(resolve => requestAnimationFrame(resolve))
+}
+/** An agent reply keeps a scrolled-up reader's line and offers the jump; the reader's own send brings it into view. */
+export const OwnSendFollows: Story = { render: args => <OwnSendStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const viewport = await waitFor(() => { const found = canvasElement.querySelector<HTMLElement>('[data-testid="transcript-scroll"]'); if (found === null || found.querySelectorAll('[data-testid="transcript-turn"]').length < historyTurns.length) throw new Error('History not committed'); return found })
+  const jump = canvas.getByText('New messages ↓')
+  await waitFor(() => expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeLessThanOrEqual(2))
+  // The reader scrolls up into history.
+  viewport.dispatchEvent(new WheelEvent('wheel', { deltaY: -viewport.scrollHeight }))
+  viewport.scrollTop = 0
+  await settleFrames()
+  // Negative control: an incoming reply under the same key never moves the reader.
+  await userEvent.click(canvas.getByRole('button', { name: 'Append agent reply' }))
+  await waitFor(() => expect(jump).toBeVisible())
+  await settleFrames()
+  await expect(viewport.scrollTop, 'unchanged key scrolled the reader').toBeLessThanOrEqual(1)
+  // The reader's own send changes the key: once its pending row commits, it is in view and the jump is gone.
+  await userEvent.type(canvas.getByRole('textbox', { name: 'Message' }), 'Ship the grouped rows{Enter}')
+  await waitFor(() => {
+    const row = viewport.querySelector('[data-testid="transcript-turn"][data-item-id^="pending/"]')
+    if (row === null) throw new Error('Pending send not committed')
+    const shown = viewport.getBoundingClientRect(), placed = row.getBoundingClientRect()
+    expect(placed.top).toBeGreaterThanOrEqual(shown.top - 0.5)
+    expect(placed.bottom).toBeLessThanOrEqual(shown.bottom + 0.5)
+    expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeLessThanOrEqual(2)
+    expect(jump).not.toBeVisible()
+  }, { timeout: 3000 })
+} }
+export const OwnSendFollowsLight: Story = { ...OwnSendFollows, args: { scheme: 'light' } }
+
 const styles = stylex.create({
   root: { height: '100vh', width: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans },
   transcript: { flex: '1 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' },
   dock: { flexShrink: 0, paddingBlock: s.lg },
   placeholders: { display: 'flex', flexDirection: 'column', gap: s.lg, padding: s.lg },
+  toolbar: { display: 'flex', gap: s.md, padding: s.md, flexShrink: 0 },
+  button: { minHeight: g.controlMd, paddingInline: s.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.controlFill, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
 })
