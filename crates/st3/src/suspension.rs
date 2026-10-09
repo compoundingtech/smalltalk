@@ -28,6 +28,8 @@ use serde_json::Value;
 
 /// The environment variable that names the native session a resumed driver must relaunch.
 pub const RESUME_ENV: &str = "ST3_NATIVE_RESUME_SESSION";
+/// Launcher-owned declaration identity forwarded into the durable native binding.
+pub const LAUNCH_DESIRED_TOKEN_ENV: &str = "ST3_LAUNCH_DESIRED_TOKEN";
 /// The diagnostic code a driver records when it cannot relaunch the named native session.
 pub const RESUME_UNAVAILABLE_CODE: &str = "native-resume-unavailable";
 /// The environment variable that names the native session a relaunched driver continues when
@@ -292,6 +294,62 @@ pub fn continue_unavailable_key(subject: &str, session: &str) -> String {
     format!("{CONTINUE_UNAVAILABLE_CODE}:{subject}:{session}")
 }
 
+/// Whether a durable driver binding proves a launch under the current import pair.
+/// Launch provenance survives observation trimming and replication; unrelated declaration
+/// edits do not reset bootstrap, and a late pre-repair binding cannot consume it.
+pub fn omp_import_bootstrap_bound(
+    store: &Store,
+    subject: &str,
+    session: &str,
+    path: &str,
+) -> Result<bool> {
+    let Some(selected) = store.selected_desired_token(subject)? else {
+        return Ok(false);
+    };
+    let declarations = store.claims_for(subject, Some("intent.desired"))?;
+    let Some(position) = declarations.iter().position(|claim| claim.id == selected) else {
+        anyhow::bail!("the selected import declaration {selected} is missing");
+    };
+    let carries_pair = |claim: &ClaimRecord| {
+        let environment = &claim.body["member"]["environment"];
+        environment[RESUME_ENV].as_str() == Some(session)
+            && environment[crate::rollout::RESUME_PATH_ENV].as_str() == Some(path)
+    };
+    let mut introduced = &declarations[position];
+    for prior in declarations[..position].iter().rev() {
+        if !carries_pair(prior) {
+            break;
+        }
+        introduced = prior;
+    }
+    for bound in store
+        .claims_for(subject, Some("harness.session-file"))?
+        .iter()
+        .rev()
+    {
+        if field(bound, "harness") != Some("omp")
+            || !field(bound, "session_id").is_some_and(|id| !id.is_empty())
+        {
+            continue;
+        }
+        if !field(bound, "incarnation_id").is_some_and(|id| !id.is_empty()) {
+            continue;
+        }
+        let Some(token) = field(bound, "desired_token").filter(|token| !token.is_empty()) else {
+            continue;
+        };
+        let Some(declaration) = declarations.iter().find(|claim| claim.id == token) else {
+            continue;
+        };
+        if carries_pair(declaration)
+            && (token == introduced.id || store.claim_is_after(token, &introduced.id)?)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The native session a relaunch of `subject` on `harness` continues, with its path: the last
 /// one the seat's driver bound for that harness. A seat relaunched for a fresh context since,
 /// or whose driver could not continue that session before, starts a new one.
@@ -317,15 +375,19 @@ pub fn continue_session(
     let Some(session) = field(&bound, "session_id").map(str::to_owned) else {
         return Ok(None);
     };
-    let fresh_since = store
-        .claims_for(subject, Some("runtime.action.requested"))?
-        .iter()
-        .any(|claim| {
-            claim.store_index > bound.store_index && field(claim, "action") == Some("fresh-context")
-        });
-    let refused = store
-        .operation_claim(&continue_unavailable_key(subject, &session))?
-        .is_some();
+    let mut fresh_since = false;
+    for claim in store.claims_for(subject, Some("runtime.action.requested"))? {
+        if field(&claim, "action") == Some("fresh-context")
+            && store.claim_is_after(&claim.id, &bound.id)?
+        {
+            fresh_since = true;
+            break;
+        }
+    }
+    let refused = match store.operation_claim(&continue_unavailable_key(subject, &session))? {
+        Some(refusal) => store.claim_is_after(&refusal.id, &bound.id)?,
+        None => false,
+    };
     if fresh_since || refused {
         return Ok(None);
     }

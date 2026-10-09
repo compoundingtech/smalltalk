@@ -2082,13 +2082,20 @@ pub(crate) fn import_seat(session: &ExternalSession) -> Result<ImportSeat> {
                 .push(KdlEntry::new(session.native_id.clone()));
         }
         ExternalDriver::Omp => {
-            // Managed omp seats use a seat-owned --session-dir. An external
-            // session ID cannot be resolved there; the absolute path loads
-            // the selected transcript without looking up another copy.
-            args.entries_mut().push(KdlEntry::new(format!(
-                "--resume={}",
-                session.transcript.display()
-            )));
+            // Select through the strict handshake, pinning the external transcript
+            // rather than looking up an ID in the seat-owned session directory.
+            let mut env = KdlNode::new("env");
+            let mut body = KdlDocument::new();
+            body.nodes_mut().push(string_node(
+                crate::suspension::RESUME_ENV,
+                &session.native_id,
+            ));
+            body.nodes_mut().push(string_node(
+                crate::rollout::RESUME_PATH_ENV,
+                session.transcript.to_string_lossy().as_ref(),
+            ));
+            env.set_children(body);
+            agent_body.nodes_mut().push(env);
         }
         ExternalDriver::Pi => {
             args.entries_mut().push(KdlEntry::new("--session"));
@@ -5324,6 +5331,106 @@ mod tests {
             format!("part {}", part_count - 1)
         );
         assert!(serde_json::to_vec(&timeline).unwrap().len() <= MAX_TIMELINE_BYTES as usize);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omp_import_strict_resume_pins_the_transcript_without_authored_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let external = root.path().join("external");
+        fs::create_dir(&external).unwrap();
+        let id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
+        let transcript = external.join(format!("2026-10-06_{id}.jsonl"));
+        fs::write(
+            &transcript,
+            format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n"),
+        )
+        .unwrap();
+        let mut saved = transcript_session(ExternalDriver::Omp, &transcript);
+        saved.native_id = id.into();
+        saved.cwd = Some(root.path().into());
+        let imported = import_seat(&saved).unwrap();
+        let document: KdlDocument = imported.kdl.parse().unwrap();
+        let body = document.get("agent").unwrap().children().unwrap();
+        let environment = body.get("env").unwrap().children().unwrap();
+        assert_eq!(
+            environment
+                .get(crate::suspension::RESUME_ENV)
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .as_string(),
+            Some(id)
+        );
+        assert_eq!(
+            environment
+                .get(crate::rollout::RESUME_PATH_ENV)
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .as_string(),
+            transcript.to_str()
+        );
+        assert!(
+            body.get("harness")
+                .unwrap()
+                .children()
+                .unwrap()
+                .get("args")
+                .is_none()
+        );
+        let managed = root.path().join("provider-sessions");
+        let argv = vec!["omp".into(), "--model".into(), "chosen-model".into()];
+        let selected = crate::native_resume::pi_family_argv(
+            "omp",
+            argv.clone(),
+            &managed,
+            id,
+            Some(&transcript),
+        )
+        .unwrap();
+        assert_eq!(
+            selected,
+            vec![
+                "omp",
+                "--resume",
+                transcript.to_str().unwrap(),
+                "--model",
+                "chosen-model"
+            ]
+        );
+        assert_eq!(fs::read_link(&managed).unwrap(), external);
+        assert_eq!(
+            crate::native_resume::pi_family_argv(
+                "omp",
+                vec!["omp".into(), format!("--resume={}", transcript.display())],
+                &managed,
+                id,
+                Some(&transcript),
+            )
+            .unwrap_err()
+            .code,
+            "authored-session-selection"
+        );
+        assert_eq!(
+            crate::native_resume::pi_family_argv(
+                "omp",
+                argv.clone(),
+                &managed,
+                "other-session",
+                Some(&transcript),
+            )
+            .unwrap_err()
+            .code,
+            "transcript-header-mismatch"
+        );
+        fs::remove_file(&transcript).unwrap();
+        assert_eq!(
+            crate::native_resume::pi_family_argv("omp", argv, &managed, id, Some(&transcript))
+                .unwrap_err()
+                .code,
+            "transcript-header-mismatch"
+        );
     }
 
     #[cfg(unix)]

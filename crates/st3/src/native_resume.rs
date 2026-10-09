@@ -271,8 +271,6 @@ pub fn pi_family_transcript(sessions: &Path, id: &str) -> Option<PathBuf> {
 /// a file the provider will keep appending to. `Ok(false)` means no link was needed.
 #[cfg(unix)]
 pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<bool, Refusal> {
-    use std::os::unix::fs::{MetadataExt as _, symlink};
-
     let mut arguments = argv
         .iter()
         .skip(1)
@@ -291,7 +289,17 @@ pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<boo
     let Some(selected) = selected else {
         return Ok(false);
     };
-    let transcript = Path::new(selected);
+    pi_family_link_selected_transcript(Path::new(selected), sessions)
+}
+
+/// Make an exact transcript selected by the strict resume handshake visible to inventory.
+#[cfg(unix)]
+pub fn pi_family_link_selected_transcript(
+    transcript: &Path,
+    sessions: &Path,
+) -> Result<bool, Refusal> {
+    use std::os::unix::fs::{MetadataExt as _, symlink};
+
     if !transcript.is_absolute() {
         return Err(Refusal::new(
             "resume-path-relative",
@@ -367,13 +375,14 @@ pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<boo
     Ok(true)
 }
 
-/// pi resumes by transcript path, omp by session ID. pi silently starts a new session at a
-/// path that does not exist, so both check the transcript first.
+/// pi resumes by transcript path, omp by session ID or a pinned imported transcript.
+/// Check the transcript first rather than allowing the provider to start a new session.
 pub fn pi_family_argv(
     driver: &str,
     argv: Vec<String>,
     sessions: &Path,
     id: &str,
+    resume_path: Option<&Path>,
 ) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
     refuse_authored(
@@ -389,6 +398,22 @@ pub fn pi_family_argv(
             "--no-session",
         ],
     )?;
+    if driver == "omp"
+        && let Some(path) = resume_path
+    {
+        if pi_family_header_id(path).as_deref() != Some(id) {
+            return Err(Refusal::new(
+                "transcript-header-mismatch",
+                "the imported transcript does not name the required session",
+            ));
+        }
+        #[cfg(unix)]
+        pi_family_link_selected_transcript(path, sessions)?;
+        return Ok(insert_after_program(
+            argv,
+            &["--resume", &path.to_string_lossy()],
+        ));
+    }
     let transcript = pi_family_transcript(sessions, id).ok_or_else(|| {
         Refusal::new(
             "transcript-missing",
@@ -755,7 +780,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pi_family_argv("pi", argv(&["pi"]), &sessions, "one")
+            pi_family_argv("pi", argv(&["pi"]), &sessions, "one", None)
                 .unwrap_err()
                 .code,
             "transcript-missing"
@@ -767,15 +792,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pi_family_argv("pi", argv(&["pi", "-e", "x"]), &sessions, "two").unwrap(),
+            pi_family_argv("pi", argv(&["pi", "-e", "x"]), &sessions, "two", None).unwrap(),
             argv(&["pi", "--session", &path.to_string_lossy(), "-e", "x"])
         );
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp"]), &sessions, "two").unwrap(),
+            pi_family_argv("omp", argv(&["omp"]), &sessions, "two", None).unwrap(),
             argv(&["omp", "--resume", "two"])
         );
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp", "--no-session"]), &sessions, "two")
+            pi_family_argv("omp", argv(&["omp", "--no-session"]), &sessions, "two", None)
                 .unwrap_err()
                 .code,
             "authored-session-selection"
