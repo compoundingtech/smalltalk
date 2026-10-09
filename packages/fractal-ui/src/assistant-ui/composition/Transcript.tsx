@@ -136,14 +136,16 @@ const scrollerOf = (timeline: Element | null) => timeline?.parentElement?.parent
 const TurnProximityRef = React.createContext<TurnProximity['observe'] | undefined>(undefined)
 const turnGroupSize = 16
 /**
- * Turns from `start` in fixed groups of 16 by position in the transcript, so group keys stay put as turns are added.
- * A distant full group skips as one box: revealing a pane styles the groups, not every turn. A partial group (the
- * oldest one while older turns backfill, the newest one while turns arrive) is not observed, so it never skips as a
- * whole; once full it renders a frame at its full height before its first report can mark it distant.
+ * Turns from `start` in fixed groups of 16 counted from the turn at `origin`. The caller keeps `origin` on the same
+ * turn while it stays in the transcript, so neither prepended history nor new turns move an existing turn to another
+ * group: turns keep their React identity, disclosure state and focus. A distant full group skips as one box:
+ * revealing a pane styles the groups, not every turn. A partial group (the oldest one while older turns backfill or
+ * history is prepended, the newest one while turns arrive) is not observed, so it never skips as a whole; once full
+ * it renders a frame at its full height before its first report can mark it distant.
  */
-const turnGroups = (turns: readonly TranscriptTurn[], start: number) => {
+const turnGroups = (turns: readonly TranscriptTurn[], start: number, origin: number) => {
   const groups: { readonly key: number; readonly turns: readonly TranscriptTurn[] }[] = []
-  for (let first = start - start % turnGroupSize; first < turns.length; first += turnGroupSize) groups.push({ key: first / turnGroupSize, turns: turns.slice(Math.max(first, start), first + turnGroupSize) })
+  for (let key = Math.floor((start - origin) / turnGroupSize), first = origin + key * turnGroupSize; first < turns.length; key++, first += turnGroupSize) groups.push({ key, turns: turns.slice(Math.max(first, start), first + turnGroupSize) })
   return groups
 }
 function TurnGroup({ full, children }: { readonly full: boolean; readonly children: React.ReactNode }) {
@@ -263,6 +265,13 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
   // tree see every turn.
   const [mounted, setMounted] = React.useState<MountedTurns>({ _tag: 'NewestPage' })
   const start = mountedStart(mounted, committed)
+  // The group grid hangs off the first turn this transcript showed, for as long as that turn stays in it.
+  const [gridTurn, setGridTurn] = React.useState<string | undefined>(undefined)
+  let gridOrigin = committed.findIndex(turn => turn.id === gridTurn)
+  if (gridOrigin === -1 && committed.length > 0) {
+    gridOrigin = 0
+    setGridTurn(committed[0]!.id)
+  }
   const latest = React.useRef({ committed, start })
   React.useLayoutEffect(() => { latest.current = { committed, start } })
   const mountOlder = React.useCallback((all: boolean) => {
@@ -326,7 +335,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     </header>
     <ErrorOverlayHost lane><EmbraceScrollViewport items={rows} stateKey={viewportKey} scrollToBottomKey={scrollToBottomKey} isRunning={running !== undefined} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={-1} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
       {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
-      {committed.length === 0 ? empty : <div ref={timeline} {...stylex.props(styles.timeline)}><TurnProximityRef.Provider value={proximity.observe}>{turnGroups(committed, start).map(group => <TurnGroup key={group.key} full={group.turns.length === turnGroupSize}>{group.turns.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} landmarkContext={landmarkContext} />)}</TurnGroup>)}</TurnProximityRef.Provider></div>}
+      {committed.length === 0 ? empty : <div ref={timeline} {...stylex.props(styles.timeline)}><TurnProximityRef.Provider value={proximity.observe}>{turnGroups(committed, start, gridOrigin).map(group => <TurnGroup key={group.key} full={group.turns.length === turnGroupSize}>{group.turns.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} landmarkContext={landmarkContext} />)}</TurnGroup>)}</TurnProximityRef.Provider></div>}
     </EmbraceScrollViewport>{failure?.tone === 'error' && <ErrorOverlay id={`sync-${failure.text}`} title={failure.text} detail="History stays on screen." onRetry={onRetrySync} />}</ErrorOverlayHost>
   </ThreadPrimitive.Root></RetrySend.Provider></MarkdownImagePolicy.Provider>
 }
