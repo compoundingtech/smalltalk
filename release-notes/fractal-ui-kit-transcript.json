@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "none",
-    "detail": "Only packages/fractal-ui changes; no protocol, harness or CLI change. The package exports Transcript, TranscriptFeedback and EmbraceScrollViewport, and the conversation model gains an optional sendState that the host may leave unreported. TranscriptAvailability's Unavailable variant gains an optional action ({ label, onPress }) for the host's recovery button; hosts that omit it render no button. The unavailable state no longer shows a sync line and keeps its detail behind Show details. Sync line wording changes; its inputs do not."
+    "detail": "Only packages/fractal-ui changes; no protocol, harness or CLI change. The package exports Transcript, TranscriptFeedback and EmbraceScrollViewport, and the conversation model gains an optional sendState that the host may leave unreported. Two additive host options: TranscriptAvailability's Unavailable variant gains an optional action ({ label, onPress }) for the host's recovery button, and ThreadHeader gains an optional terminalDisabledReason that shows the terminal toggle disabled with that reason; hosts that omit either see no new control. The unavailable state no longer shows a sync line and keeps its detail behind Show details. The assistant-ui/shell entry also exports TerminalDrawer. Sync line wording changes; its inputs do not."
   },
   "downtime": {
     "status": "none",
