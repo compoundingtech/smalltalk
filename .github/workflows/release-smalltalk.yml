@@ -15,6 +15,13 @@ on:
       - .gitignore
       - build.rs
       - crates/st-drivers/src/version.rs
+      - install.sh
+      - scripts/download-install-test
+      - scripts/linux-release-cc
+      - scripts/check-linux-release.py
+      - scripts/release-build-stamp.py
+      - scripts/release-rust-version
+      - scripts/fixtures/install-release-v0.3.17
       - scripts/release-smalltalk*
       - scripts/release_notes*
       - scripts/ci-build-snapshot*
@@ -85,7 +92,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: 1.97.0
       - name: Name the pinned compiler cache
         run: printf 'CI_ZIG_CACHE_DIR=%s/zig/0.15.2\n' "$RUNNER_TOOL_CACHE" >> "$GITHUB_ENV"
       - id: build-snapshot

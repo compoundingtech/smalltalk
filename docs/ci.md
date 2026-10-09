@@ -281,7 +281,7 @@ The gate covers st3 and the code st3 uses. The `ci` profile's `default-filter` i
 `.config/nextest.toml` selects it on every event, with no path filter or scheduled full run:
 
 - every test of the other workspace crates: st3, st3-client, st3-client-codegen, st3-schema,
-  st3-migrate, stui, st-runtime, st-drivers (the harness drivers, channels, hooks, messages,
+  st3-migrate, stui (the terminal UI library), st-runtime, st-drivers (the harness drivers, channels, hooks, messages,
   harness state and sessions st3 and st2 share) and the shared and resource-provider crates;
 - st2's integration test files, apart from those below.
 

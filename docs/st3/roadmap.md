@@ -14,7 +14,7 @@ This file records accepted future work. Active fleet work belongs in st missions
 
 ## User interfaces
 
-- [ ] Hold a product design session for `stui` and the Smalltalk mobile application.
+- [ ] Hold a product design session for `st` and the Smalltalk mobile application.
 - [x] Prepare the [design-session brief](app-design-session-brief.md), including Expo delivery,
   autonomous app-update missions, Tailscale day-one access, and the Fabric-on-iOS spike.
 - [x] Define the shared v0 data, actions, live-update, transport, authentication, and online-only

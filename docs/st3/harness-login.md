@@ -40,5 +40,5 @@ a default operator. The item disappears when the condition clears.
 It does not create an independent mission lease or a historical repair request.
 
 The daemon does not enter credentials or restart a shared harness to test this
-behavior. The phone and stui can use the additive detail and attention kind; source
+behavior. The phone and the terminal UI can use the additive detail and attention kind; source
 validation alone does not establish deployed UI or real-login acceptance.

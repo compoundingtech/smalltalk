@@ -182,3 +182,8 @@ Equal count membership produces no upsert, including agent progress/usage
 updates and another person's attention changes. Core list/filter/get behavior
 is unchanged. Summary freshness is carried by its snapshot fence; equal counts
 retain their prior row timestamp so an unchanged count emits no delta.
+
+Unchecked diagnostic operations use the existing `degraded` state and `warning` severity.
+Their revision ends in `:unknown` and their summary says evidence is incomplete; this does
+not certify a failed invariant or start a diagnostic job. The published Operation enum is
+unchanged. Doctor reports retain the explicit `unknown` check status.

@@ -43,6 +43,7 @@ pub mod mailbox;
 /// Bounded local maintenance workers shared by daemon startup and lifecycle fixtures.
 pub mod maintenance;
 pub(crate) mod memory;
+pub(crate) mod read_cache;
 pub mod mission;
 pub mod model;
 /// A driver relaunches its harness on the native session a suspended seat resumes.
@@ -79,6 +80,9 @@ pub mod seat_queue;
 /// Runs any CLI with credentials no seat can read, through a gateway the sekrets user owns.
 pub mod sekrets;
 pub mod service;
+/// First-run configuration and human-only daemon startup.
+pub mod setup;
+pub mod onboarding;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
 pub mod startup;

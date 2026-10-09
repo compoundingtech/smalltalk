@@ -1,7 +1,7 @@
 # macOS installation and signing
 
 Source installs (`scripts/install`) and extracted release installs (`install.sh`) put
-`st3` and `stui` inside `~/Applications/SmallTalk.app`. The selected bin directory
+`st3` inside `~/Applications/SmallTalk.app`. The selected bin directory
 contains links to these tools, with `st` linking to `st3`. Other tools remain regular
 executables in that directory. Python 3 is required on macOS.
 
@@ -11,13 +11,13 @@ plists at its executable. It preserves their arguments and does not restart serv
 or agent seats. For a first daemon install, run `st service install` from the installed
 app executable; for an update, restart the daemon and replication services when ready.
 
-When the `--from` directory also holds `StListen.app` (stui's speech helper, built by
+When the `--from` directory also holds `StListen.app` (the terminal UI's speech helper, built by
 `apps/macos/listen/build.sh DIR` with Xcode's Swift and the macOS 26 SDK), the installer
 nests it at `SmallTalk.app/Contents/Helpers/StListen.app`. It signs the helper before the app,
 and gives the app the microphone and speech usage strings. macOS asks for the microphone on
 behalf of the outermost app, so the prompt names Smalltalk and the answer lasts across updates
 signed with the same identity. `scripts/install` and release archives build the helper when they
-can; without it, stui's voice mode says that it is missing.
+can; without it, the terminal UI's voice mode says that it is missing.
 
 Configure one persistent signing identity to retain its code identity across builds:
 
@@ -50,7 +50,16 @@ Before replacing anything, the installer signs and verifies a complete candidate
 An unchanged payload with the same signing settings keeps its existing signed bundle.
 A changed app replaces the whole bundle through an atomic directory swap on the same
 filesystem. The installer keeps the prior app, CLI links/files and service plists under
-`~/.local/state/st3/macos-installs/`; if installation fails, it restores them.
+`~/.local/state/st3/macos-installs/`. The helper restores them if its own installation
+fails, while still holding its shared transaction lock.
+
+The extracted archive caller also keeps prior command files and transaction locks.
+If a later archive step fails after the helper completes its backup, the caller leaves
+the current app and command links intact and reports the retained job and files.
+The helper's existing restore API cannot check ownership atomically against other
+source or historical installers, so the archive caller does not restore the app
+automatically after that point. Inspect any newer installation before using the
+retained job for recovery, and remove the reported locks only after recovery.
 
 Automation can use the helper's explicit transaction modes (`--prepare-only`,
 `--backup-only`, `--install-app APP`, `--verify-app APP`, `--restore-app`) with a

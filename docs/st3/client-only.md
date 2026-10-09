@@ -1,6 +1,6 @@
-# stui on a device without a daemon
+# Terminal UI on a device without a daemon
 
-A laptop can run `stui` as a paired client device. It holds a private read-only display cache and
+A laptop can run `st` as a paired client device. It holds a private read-only display cache and
 device credentials, connects to a member's client gateway, and sends confirmed actions through
 that member. It runs no st daemon or replication worker, holds no graph replica, and needs no
 fleet membership, member key, peer exposure, or fleet sync secret. Members continue to sync as
@@ -25,37 +25,37 @@ st devices --as person/avery pair --full-control "Demo laptop"
 ```
 
 This returns a `pairing_id`, a code, and its expiration time. `--full-control` grants the actions
-stui offers; omit it for the API's limited read/terminal/attention/launch scopes, or pass
+the terminal UI offers; omit it for the API's limited read/terminal/attention/launch scopes, or pass
 `--read-only` for a device that may only observe projections, glasses, and terminal output.
-stui cannot expand the member's grant.
+The terminal UI cannot expand the member's grant.
 
-On the laptop, install the stui binary and run one setup command:
+On the laptop, install Smalltalk and run one setup command:
 
 ```sh
-stui pair https://member.example pairing/CHALLENGE_ID
+st devices complete https://member.example pairing/CHALLENGE_ID --fingerprint sha256:FINGERPRINT
 ```
 
-Enter the code at the prompt. Input is hidden, and the code and credential are never printed.
+Obtain the member fingerprint through a trusted channel. Enter the code at the prompt. Input is hidden, and the code and credential are never printed.
 Automation can provide the code on stdin; keep it out of shell arguments and history. Pairing
 does not require a local daemon or `ST3_PERSON`. The member's grant determines the person and
 session actor; local actor settings cannot change that authority.
 
-Then run `stui`. A saved profile selects client-only mode automatically. `stui --client` requires
-a saved pairing; `stui --local` explicitly selects the usual local Unix socket and configured
-person. `stui --help` lists these choices.
+Then run `st`. A saved profile selects client-only mode automatically. `st ui --client` requires
+a saved pairing; `st ui --local` explicitly selects the usual local Unix socket and configured
+person. `st ui --help` lists these choices.
 
 ## Several members and reconnecting
 
-Repeat `stui pair URL PAIRING_ID` for another member to add its route and its own device grant.
+Repeat `st devices complete URL PAIRING_ID --fingerprint sha256:FINGERPRINT` for another member to add its route and its own device grant.
 All routes in one profile must delegate the same person; use separate `XDG_CONFIG_HOME`
 directories for different people. Each credential goes only to the member it was paired with.
-The profile is read at startup, so restart stui after adding a route. A reachable member stays
-selected until its connection drops. stui tries the other saved routes before waiting again,
+The profile is read at startup, so restart the terminal UI after adding a route. A reachable member stays
+selected until its connection drops. The terminal UI tries the other saved routes before waiting again,
 and uses the selected member for both live projections and actions.
 
 When none answers, the header says **offline** and the footer says **Last connected at** a UTC
 time (or **No member reachable** before the first connection). The last lists and conversation
-stay visible. The display cache also survives restarting stui while offline. Mutations require
+stay visible. The display cache also survives restarting the terminal UI while offline. Mutations require
 a live projection and fresh server fences; offline input queues no mutation and reconnecting
 does not replay it. An action whose response was lost is not automatically submitted again.
 
@@ -71,7 +71,7 @@ live windows and open conversation and reattaches a terminal when its incarnatio
 
 The profile is `$XDG_CONFIG_HOME/st3/stui-devices.json`, defaulting to
 `~/.config/st3/stui-devices.json`. It stores scoped bearer credentials in a `0600` file under a
-`0700` directory, replaced atomically. stui refuses profiles readable by other users, symlinks,
+`0700` directory, replaced atomically. The terminal UI refuses profiles readable by other users, symlinks,
 and files owned by another user. Treat this file as a secret: do not commit, share, or paste it.
 The client cache uses the normal private `$XDG_CACHE_HOME/st3/stui` directory and is scoped to
 the paired person, routes, and device IDs. It contains display data, never graph authority, and
@@ -82,18 +82,18 @@ challenge and run the pairing command again to replace a route's grant. List and
 on the member with `st devices --as person/avery ls` and
 `st devices --as person/avery revoke device/DEVICE_ID --reason "Retired laptop grant"`.
 Re-pairing creates a new grant; revoke any old grant that is no longer needed. Removing the
-local profile makes stui select local mode again but does not revoke the server-side grants.
+local profile makes the terminal UI select local mode again but does not revoke the server-side grants.
 
 ## Isolated verification
 
 ```sh
-cargo test -p stui --locked
+cargo test -p st3 --locked --test integration client_only
 cargo run -p st3-client-codegen --locked -- --check
 ```
 
-The `client_only` end-to-end test launches the actual stui binary in a PTY with an isolated
+The `client_only` end-to-end test launches the actual st binary in a PTY with an isolated
 client home and deliberately absent local socket. Independent member routers and paired-only
 network carriers prove pairing, a confirmed remote action, loss of the gateway, retained data
 and a last-connected time, no queued action, offline cache after a client restart, automatic
 recovery, an idle network blackhole, and selection and control of another reachable member,
-including failover while stui is running. It touches no shared daemon.
+including failover while the terminal UI is running. It touches no shared daemon.

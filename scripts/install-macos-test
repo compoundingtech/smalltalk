@@ -32,7 +32,7 @@ class Installer(unittest.TestCase):
         self.source = self.home / 'built'
         self.source.mkdir()
         self.built = {}
-        for name in ['st3', 'stui']:
+        for name in ['st3']:
             p = self.source / name
             p.write_bytes((name + '-one').encode())
             p.chmod(0o755)
@@ -144,6 +144,7 @@ class Installer(unittest.TestCase):
         (bin_dir / 'st3').write_bytes(b'previous executable')
         (bin_dir / 'st3').chmod(0o755)
         (bin_dir / 'st').symlink_to('st3')
+        (bin_dir / 'stui').symlink_to('/previous/SmallTalk.app/Contents/MacOS/stui')
         service = self.home / 'Library/LaunchAgents' / (m.SERVICES[0] + '.plist')
         service.parent.mkdir(parents=True)
         original = plistlib.dumps({'ProgramArguments': [str(bin_dir / 'st3'), 'daemon', '--socket', 'keep.sock']})
@@ -152,6 +153,9 @@ class Installer(unittest.TestCase):
             app, _, _ = m.prepare(self.home, self.job, self.built)
             had_app = m.backup(self.home, self.job)
             m.install(app, self.home, self.job)
+            self.assertFalse((bin_dir / 'stui').exists())
+            self.assertFalse((bin_dir / 'stui').is_symlink())
+            self.assertEqual(set(p.name for p in (m.fixed(self.home) / 'Contents/MacOS').iterdir()), {'st3'})
             self.assertEqual(os.readlink(bin_dir / 'st3'), str(m.binaries(m.fixed(self.home))['st3']))
             args = plistlib.loads(service.read_bytes())['ProgramArguments']
             self.assertEqual(args, [str(m.binaries(m.fixed(self.home))['st3']), 'daemon', '--socket', 'keep.sock'])
@@ -162,7 +166,7 @@ class Installer(unittest.TestCase):
             m.restore(self.home, self.job, had_app)
             self.assertEqual((bin_dir / 'st3').read_bytes(), b'previous executable')
             self.assertEqual(os.readlink(bin_dir / 'st'), 'st3')
-            self.assertFalse((bin_dir / 'stui').exists())
+            self.assertEqual(os.readlink(bin_dir / 'stui'), '/previous/SmallTalk.app/Contents/MacOS/stui')
             self.assertEqual(service.read_bytes(), original)
 
     def test_speech_helper_is_nested_signed_before_the_app_and_hashed(self):
@@ -193,10 +197,10 @@ class Installer(unittest.TestCase):
             first = {name: m.sha(path) for name, path in m.binaries(m.fixed(self.home)).items()}
             second_job = self.home / 'second'; second_job.mkdir()
             had_app = m.backup(self.home, second_job)
-            self.built['stui'].write_bytes(b'stui-two')
+            self.built['st3'].write_bytes(b'st3-two')
             app, _, _ = m.prepare(self.home, second_job, self.built)
             m.install(app, self.home, second_job)
-            self.assertNotEqual(m.sha(m.binaries(m.fixed(self.home))['stui']), first['stui'])
+            self.assertNotEqual(m.sha(m.binaries(m.fixed(self.home))['st3']), first['st3'])
             m.restore(self.home, second_job, had_app)
             self.assertEqual({name: m.sha(path) for name, path in m.binaries(m.fixed(self.home)).items()}, first)
 
@@ -223,16 +227,18 @@ class Installer(unittest.TestCase):
         helper = fakebin / 'python3'
         helper.write_text('#!' + sys.executable + '\n' +
             'import os,pathlib,sys\n' +
+            'if sys.argv[1] == "-": os.execv(sys.executable, [sys.executable] + sys.argv[1:])\n' +
             'source=pathlib.Path(sys.argv[sys.argv.index("--from")+1])\n' +
             'destination=pathlib.Path(sys.argv[sys.argv.index("--bin-dir")+1])\n' +
-            'for name in ["st3","stui"]:\n' +
+            'for name in ["st3"]:\n' +
             '    (destination/name).symlink_to(source/name)\n')
         for path in fakebin.iterdir():
             path.chmod(0o755)
-        for name in ['st3', 'stui', 'st3-migrate', 'pty']:
+        for name in ['st3', 'st3-migrate', 'pty']:
             path = self.source / name
             path.write_text('#!/bin/sh\nexit 0\n'); path.chmod(0o755)
-        env = dict(os.environ, PATH=str(fakebin) + os.pathsep + os.environ['PATH'])
+        env = dict(os.environ, PATH=str(fakebin) + os.pathsep + os.environ['PATH'],
+                   ST_MACOS_INSTALL_HOME=str(self.home))
         first = self.home / 'source-bin'
         subprocess.run([str(repo / 'scripts/install'), '--from', str(self.source), '--bin-dir', str(first)],
                        env=env, check=True, stdout=subprocess.PIPE)
@@ -244,14 +250,14 @@ class Installer(unittest.TestCase):
                        env=env, check=True, stdout=subprocess.PIPE)
         for destination in [first, second]:
             self.assertTrue((destination / 'st3').is_symlink())
-            self.assertTrue((destination / 'stui').is_symlink())
+            self.assertFalse((destination / 'stui').exists())
+            self.assertFalse((destination / 'stui').is_symlink())
             self.assertEqual(os.readlink(destination / 'st'), 'st3')
             self.assertFalse((destination / 'st3-migrate').is_symlink())
 
     @unittest.skipUnless(sys.platform == 'darwin', 'native macOS signing and atomic directory exchange')
     def test_native_ad_hoc_install_upgrade_and_rollback(self):
         shutil.copyfile('/usr/bin/true', self.built['st3'])
-        shutil.copyfile('/bin/echo', self.built['stui'])
         app, _, _ = m.prepare(self.home, self.job, self.built)
         m.install(app, self.home, self.job)
         first = m.sha(m.binaries(m.fixed(self.home))['st3'])

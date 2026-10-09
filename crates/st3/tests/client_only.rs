@@ -11,11 +11,7 @@ use alacritty_terminal::{
     vte::ansi::Processor,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use st3::{
-    api::AppState,
-    model::PersonAskRequest,
-    store::Store,
-};
+use st3::{api::AppState, model::PersonAskRequest, store::Store};
 use st3_client::{Client, PairingBegin};
 use std::{
     io::{Read, Write},
@@ -69,9 +65,9 @@ impl Tui {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut command = CommandBuilder::new(test_env!("CARGO_BIN_EXE_stui"));
+        let mut command = CommandBuilder::new(test_env!("CARGO_BIN_EXE_st3"));
         // This proves pairing and control, read off the classic layout's screens.
-        command.arg("--classic");
+        command.args(["ui", "--classic"]);
         command.env_clear();
         command.env("HOME", root);
         command.env("XDG_CONFIG_HOME", root.join("config"));
@@ -138,7 +134,11 @@ impl Tui {
 fn state(root: &Path, node: &str) -> AppState {
     let store = Store::open_memory(node).unwrap();
     // Real pairing now enrolls a key; the member must hold its node authority to grant it.
-    store.set_node_key(Arc::new(smallclaims::fleet::MemberKey::generate().unwrap().0)).unwrap();
+    store
+        .set_node_key(Arc::new(
+            smallclaims::fleet::MemberKey::generate().unwrap().0,
+        ))
+        .unwrap();
     AppState {
         store: Arc::new(store),
         notify: Arc::new(Notify::new()),
@@ -155,15 +155,33 @@ fn state(root: &Path, node: &str) -> AppState {
     }
 }
 fn person_ask(state: &AppState, name: &str, title: &str) -> String {
-    let intent = st3::graph::parse_intent("version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }", state.store.origin()).unwrap();
-    state.store.apply_internal(&intent, "tui-person-asker").unwrap();
-    let step = state.store.ask_person(&PersonAskRequest {
-        legacy_request: None, person: "person/avery".into(), title: title.into(),
-        reason: "Confirm on the remote member".into(), actor: format!("agent/{}.asker", state.store.origin()),
-        step: None, new_run: Some(name.into()), incarnation: None, idempotency_key: name.into(),
-        request: None,
-    }).unwrap();
-    state.event_notify.send_modify(|index| *index = state.store.index().unwrap());
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+        state.store.origin(),
+    )
+    .unwrap();
+    state
+        .store
+        .apply_internal(&intent, "tui-person-asker")
+        .unwrap();
+    let step = state
+        .store
+        .ask_person(&PersonAskRequest {
+            legacy_request: None,
+            person: "person/avery".into(),
+            title: title.into(),
+            reason: "Confirm on the remote member".into(),
+            actor: format!("agent/{}.asker", state.store.origin()),
+            step: None,
+            new_run: Some(name.into()),
+            incarnation: None,
+            idempotency_key: name.into(),
+            request: None,
+        })
+        .unwrap();
+    state
+        .event_notify
+        .send_modify(|index| *index = state.store.index().unwrap());
     step.subject
 }
 
@@ -228,9 +246,10 @@ async fn pair(root: &Path, local: &Client, url: &str) {
 }
 
 async fn complete_challenge(root: &Path, url: &str, challenge: &st3_client::PairingChallenge) {
-    let mut child = Command::new(test_env!("CARGO_BIN_EXE_stui"))
+    let mut child = Command::new(test_env!("CARGO_BIN_EXE_st3"))
         .args([
-            "pair",
+            "devices",
+            "complete",
             url,
             &challenge.pairing_id,
             "--fingerprint",
@@ -419,12 +438,7 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     })
     .await;
     assert_eq!(
-        state
-            .store
-            .step_run(&online_step)
-            .unwrap()
-            .unwrap()
-            .status,
+        state.store.step_run(&online_step).unwrap().unwrap().status,
         "completed"
     );
 
@@ -473,12 +487,7 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     })
     .await;
     assert_eq!(
-        state
-            .store
-            .step_run(&offline_step)
-            .unwrap()
-            .unwrap()
-            .status,
+        state.store.step_run(&offline_step).unwrap().unwrap().status,
         "ready",
         "recovery must not replay offline input"
     );
@@ -582,12 +591,7 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     })
     .await;
     assert_eq!(
-        state
-            .store
-            .step_run(&return_step)
-            .unwrap()
-            .unwrap()
-            .status,
+        state.store.step_run(&return_step).unwrap().unwrap().status,
         "completed"
     );
     drop(tui);

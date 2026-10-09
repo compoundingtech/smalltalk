@@ -329,6 +329,11 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The database opened by the local daemon and excluded from offline audit inputs.
+    pub fn database_path(&self) -> PathBuf {
+        self.state_dir.join("claims.sqlite3")
+    }
+
     pub fn default_path() -> PathBuf {
         xdg_dir("XDG_CONFIG_HOME", ".config")
             .join("st3")

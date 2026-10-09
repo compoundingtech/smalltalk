@@ -8,6 +8,8 @@ mod ui;
 mod version;
 mod voice;
 
+pub use version::display_version;
+
 use st3_feed as feed;
 #[cfg(test)]
 use st3_feed::terminal_screen_fence;
@@ -663,8 +665,95 @@ async fn send_terminal_key(
     Ok(())
 }
 
-fn main() -> Result<()> {
-    // What `st clients` lists for this stui: its name and build, as reported.
+/// Options for the terminal interface shared by `st ui` and plain interactive `st`.
+#[derive(clap::Args, Debug, Default)]
+pub struct Args {
+    #[arg(skip)]
+    endpoint: Option<PathBuf>,
+    #[arg(skip)]
+    initial_subject: Option<String>,
+    /// Open a named space instead of the last space used on this device.
+    #[arg(long, alias = "glass", conflicts_with = "classic")]
+    pub space: Option<String>,
+    /// Use the layout from before spaces.
+    #[arg(long)]
+    pub classic: bool,
+    /// Show invented data without connecting to a daemon.
+    #[arg(long)]
+    pub demo: bool,
+    /// Use the local daemon even when a paired-device profile exists.
+    #[arg(long, conflicts_with = "client")]
+    pub local: bool,
+    /// Require a paired device; pair with `st devices complete` first.
+    #[arg(long)]
+    pub client: bool,
+    #[arg(long, hide = true)]
+    glasses: bool,
+    #[arg(long, hide = true, requires = "demo")]
+    dump: bool,
+    #[arg(long, hide = true, requires = "dump")]
+    width: Option<u16>,
+    #[arg(long, hide = true, requires = "dump")]
+    height: Option<u16>,
+    #[arg(long, hide = true, requires = "dump")]
+    loading: bool,
+    #[arg(long, hide = true, requires = "dump")]
+    keys: Option<String>,
+    #[arg(long, hide = true, requires = "dump")]
+    click: Option<String>,
+    #[arg(long, hide = true, requires = "dump")]
+    pane: Option<String>,
+}
+
+impl Args {
+    /// Override local socket discovery with the CLI's global endpoint option.
+    pub fn with_endpoint(mut self, endpoint: PathBuf) -> Self {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// Open this agent's conversation once it appears in the live inventory.
+    /// Used by first-run setup; paired-device clients ignore this request.
+    pub fn with_initial_subject(mut self, subject: impl Into<String>) -> Self {
+        self.initial_subject = Some(subject.into());
+        self
+    }
+
+    // Keep the renderer's option handling together; the CLI owns validation and help.
+    fn render_args(&self) -> Vec<String> {
+        let mut args = vec!["st ui".to_owned()];
+        for (enabled, flag) in [
+            (self.classic, "--classic"),
+            (self.demo, "--demo"),
+            (self.local, "--local"),
+            (self.client, "--client"),
+            (self.glasses, "--glasses"),
+            (self.dump, "--dump"),
+            (self.loading, "--loading"),
+        ] {
+            if enabled {
+                args.push(flag.into());
+            }
+        }
+        for (flag, value) in [
+            ("--space", self.space.clone()),
+            ("--width", self.width.map(|v| v.to_string())),
+            ("--height", self.height.map(|v| v.to_string())),
+            ("--keys", self.keys.clone()),
+            ("--click", self.click.clone()),
+            ("--pane", self.pane.clone()),
+        ] {
+            if let Some(value) = value {
+                args.extend([flag.into(), value]);
+            }
+        }
+        args
+    }
+}
+
+/// Run the TUI before starting a CLI runtime. This owns its runtime and terminal guards,
+/// and sets the client name before any connection can initialize the shared name lock.
+pub fn run(options: Args) -> Result<()> {
     st3_client::set_client_name(version::client_name());
     ui::lastrun_log_panics(&version::short(version::now()));
     // A designated test client (scripts/stui-test-client) can log the timing of its own requests
@@ -672,67 +761,12 @@ fn main() -> Result<()> {
     if let Some(path) = std::env::var_os("STUI_TIMING_LOG") {
         install_timing_log(path.into());
     }
-    let args = std::env::args().collect::<Vec<_>>();
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--version" | "-V"))
-    {
-        println!("stui {}", version::display_version());
-        return Ok(());
-    }
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
-    {
-        println!(
-            "stui [--client | --local] [--space NAME | --classic]\nstui pair MEMBER_URL PAIRING_ID --fingerprint SHA256 [--allow-public-http] (or explicitly --unpinned)\n\nPairing reads the single-use code privately from the terminal (or stdin).\nPaired devices use the network automatically; --local selects the local daemon.\n--client requires a paired device. --demo opens invented data.\nstui opens spaces: splits with their own tabs, Ctrl+K to open anything and Ctrl+S for\nthe sidebar; --space NAME opens that space. --classic keeps the old layout for now; it\nis going away. --version names this build."
-        );
-        return Ok(());
-    }
-    if args.get(1).is_some_and(|arg| arg == "pair") {
-        anyhow::ensure!(
-            args.len() >= 4,
-            "Usage: stui pair MEMBER_URL PAIRING_ID --fingerprint SHA256 [--allow-public-http] (or explicitly --unpinned)"
-        );
-        let mut options = st3_client::device::CompletionOptions::default();
-        let mut tail = args[4..].iter();
-        while let Some(flag) = tail.next() {
-            match flag.as_str() {
-                "--allow-public-http" => options.allow_public_http = true,
-                "--unpinned" => options.unpinned = true,
-                "--fingerprint" if options.fingerprint.is_none() => {
-                    options.fingerprint = Some(tail.next().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "--fingerprint needs the fingerprint from the trusted machine"
-                        )
-                    })?)
-                }
-                _ => anyhow::bail!(
-                    "Usage: stui pair MEMBER_URL PAIRING_ID --fingerprint SHA256 [--allow-public-http] (or explicitly --unpinned)"
-                ),
-            }
-        }
-        options.validate()?;
-        let path = connection::profile_path()?;
-        let code = connection::read_code()?;
-        let runtime = tokio::runtime::Runtime::new()?;
-        let person = runtime.block_on(connection::pair(
-            &path,
-            &args[2],
-            &args[3],
-            &code,
-            options.allow_public_http,
-            options.fingerprint,
-            options.unpinned,
-        ))?;
-        println!("Paired as {person}. Run stui to connect; no local daemon is needed.");
-        return Ok(());
-    }
+    let args = options.render_args();
     if args.iter().any(|arg| arg == "--demo") {
         return ui::run_demo(&args);
     }
     if !io::stdout().is_terminal() {
-        anyhow::bail!("stui needs an interactive terminal");
+        anyhow::bail!("st ui needs an interactive terminal");
     }
     let stopping = Arc::new(AtomicBool::new(false));
     for signal in [
@@ -754,7 +788,7 @@ fn main() -> Result<()> {
     };
     anyhow::ensure!(
         !client_only || profile.is_some(),
-        "Run stui pair MEMBER_URL PAIRING_ID first"
+        "Run st devices complete MEMBER_URL PAIRING_ID --fingerprint SHA256 first"
     );
     let person = match &profile {
         Some(profile) => Some(profile.person()?.to_owned()),
@@ -764,7 +798,7 @@ fn main() -> Result<()> {
         person
             .as_deref()
             .is_some_and(|person| person.starts_with("person/") && person.len() > 7),
-        "stui needs ST3_PERSON=person/NAME or person = \"person/NAME\" in the st config"
+        "st ui needs ST3_PERSON=person/NAME or person = \"person/NAME\" in the st config"
     );
     let (clients, cache_path) = match &profile {
         Some(profile) => {
@@ -785,7 +819,9 @@ fn main() -> Result<()> {
         }
         None => {
             let path = st3_client::discover_unix_endpoint(
-                std::env::var_os("ST3_ENDPOINT").map(PathBuf::from),
+                options
+                    .endpoint
+                    .or_else(|| std::env::var_os("ST3_ENDPOINT").map(PathBuf::from)),
             )?;
             let actor = person.as_deref().unwrap_or_default();
             (
@@ -822,6 +858,7 @@ fn main() -> Result<()> {
         cache_path,
         cached,
         glass: ui::glass_request(&args),
+        initial_subject: options.initial_subject.filter(|_| profile.is_none()),
     })
 }
 
@@ -1022,8 +1059,14 @@ mod tests {
         let agent = |name: &str, host: &str| -> st3_client::Agent {
             serde_json::from_value(serde_json::json!({"kind":"agent","id":format!("agent/{name}"),"revision":"one","updated_at":"2026-10-04T08:00:00Z","name":name,"state":"running","reachability":"local","runtime_ids":[],"under":[],"host_id":host})).unwrap()
         };
-        assert_eq!(agent_label(&agent("harbor.image-sorter", "host/harbor")), "Image Sorter");
-        assert_eq!(agent_label(&agent("Harbor.image-sorter", "host/harbor")), "Image Sorter");
+        assert_eq!(
+            agent_label(&agent("harbor.image-sorter", "host/harbor")),
+            "Image Sorter"
+        );
+        assert_eq!(
+            agent_label(&agent("Harbor.image-sorter", "host/harbor")),
+            "Image Sorter"
+        );
         // A dot that is not its host's stays part of the name.
         assert_eq!(agent_label(&agent("v2.parser", "host/harbor")), "V2.parser");
     }
@@ -1647,7 +1690,11 @@ fn timing_start_line(now: std::time::SystemTime) -> String {
 fn install_timing_log(path: PathBuf) {
     use std::io::Write as _;
     let started = std::time::Instant::now();
-    let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
         return;
     };
     let mut file = file;
@@ -1658,12 +1705,23 @@ fn install_timing_log(path: PathBuf) {
     st3_client::set_observer(move |observation| {
         let at_ms = started.elapsed().as_millis() as u64;
         let line = match observation {
-            st3_client::Observation::Request { method, route, outcome, status, took } => serde_json::json!({
+            st3_client::Observation::Request {
+                method,
+                route,
+                outcome,
+                status,
+                took,
+            } => serde_json::json!({
                 "at_ms": at_ms, "type": "request", "method": method, "route": route,
                 "outcome": format!("{outcome:?}"), "status": status,
                 "took_ms": took.as_secs_f64() * 1000.0,
             }),
-            st3_client::Observation::Frame { id, kind, bytes, since_subscribe } => serde_json::json!({
+            st3_client::Observation::Frame {
+                id,
+                kind,
+                bytes,
+                since_subscribe,
+            } => serde_json::json!({
                 "at_ms": at_ms, "type": "frame", "id": id, "kind": kind, "bytes": bytes,
                 "since_subscribe_ms": since_subscribe.map(|d| d.as_secs_f64() * 1000.0),
             }),

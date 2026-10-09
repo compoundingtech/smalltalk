@@ -55,7 +55,7 @@ pub fn available() -> bool {
 fn candidates(exe: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     const INNER: &str = "StListen.app/Contents/MacOS/st-listen";
     let mut found = Vec::new();
-    // SmallTalk.app/Contents/MacOS/stui → SmallTalk.app/Contents/Helpers/StListen.app
+    // SmallTalk.app/Contents/MacOS/st3 → SmallTalk.app/Contents/Helpers/StListen.app
     if let Some(contents) = exe.parent().and_then(Path::parent) {
         found.push(contents.join("Helpers").join(INNER));
     }
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn the_helper_is_looked_for_in_the_app_then_the_try_out_folder() {
         let found = candidates(
-            Path::new("/Apps/SmallTalk.app/Contents/MacOS/stui"),
+            Path::new("/Apps/SmallTalk.app/Contents/MacOS/st3"),
             Some(Path::new("/home/example")),
         );
         assert_eq!(

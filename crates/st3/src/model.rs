@@ -2126,6 +2126,22 @@ pub struct DoctorReport {
     pub performance: Value,
 }
 
+impl DoctorReport {
+    /// Both live and offline commands certify only checks that were computed.
+    pub fn exit_status(&self, strict: bool) -> u8 {
+        if self.status == "fail"
+            || self
+                .checks
+                .iter()
+                .any(|check| check.status == "fail" || (strict && check.status == "warn"))
+        {
+            2
+        } else {
+            0
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct OperationalRepairItem {
     pub id: String,
@@ -2898,5 +2914,38 @@ mod person_inbox_tests {
         assert!(chat < PERSON_HAS_NO_INBOX.find("`work update`").unwrap());
         assert!(PERSON_HAS_NO_INBOX.contains("only if the person asked for it"));
         assert!(!PERSON_HAS_NO_INBOX.contains("NO REPLY"));
+    }
+}
+
+#[cfg(test)]
+mod doctor_strict_tests {
+    use super::*;
+
+    #[test]
+    fn strict_certifies_computed_checks_without_certifying_unknowns() {
+        for (aggregate, checks, ordinary, strict) in [
+            ("warn", vec!["unknown"], 0, 0),
+            ("warn", vec!["pass", "unknown"], 0, 0),
+            ("warn", vec![], 0, 0),
+            ("warn", vec!["warn", "unknown"], 0, 2),
+            ("warn", vec!["fail", "unknown"], 2, 2),
+            ("fail", vec!["unknown"], 2, 2),
+        ] {
+            let report = DoctorReport {
+                machine_version: None,
+                status: aggregate.into(),
+                checks: checks
+                    .into_iter()
+                    .map(|status| DoctorCheck {
+                        name: format!("fixture-{status}"),
+                        status: status.into(),
+                        message: "named fixture evidence".into(),
+                    })
+                    .collect(),
+                performance: serde_json::json!({}),
+            };
+            assert_eq!(report.exit_status(false), ordinary, "{report:?}");
+            assert_eq!(report.exit_status(true), strict, "{report:?}");
+        }
     }
 }

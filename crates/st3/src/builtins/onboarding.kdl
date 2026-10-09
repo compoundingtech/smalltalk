@@ -1,0 +1,46 @@
+version 2
+mission "st/onboarding" state="ready" {
+  goal "Learn to see agents, give them work, and answer their questions from Home."
+  assigned-to "agent/st/expert"
+  baseline "the bundled guide is available" {
+    document "@GUIDE@"
+  }
+  constraint "Read @GUIDE@ before guiding the person. Read the configured person, machines and doctor results from the graph; do not assume installation facts."
+  constraint "Never ask for or type a password. Offer exact commands for the person to run when their decision or system privileges are needed."
+  constraint "Keep sample work inside the scratch workspace and graph. Use invented names. Do not publish outside this machine or require GitHub. Optional steps may be skipped."
+  step "hello" {
+    goal "Greet the configured person and check st doctor and machines. Explain seats, missions and Home in five sentences; store the checked results as evidence."
+  }
+  step "tour" {
+    depends-on { step "hello" completed }
+    goal "Guide the person through Home, Agents, Missions and the command palette. Explain attaching, detaching and quitting while work keeps running. Ask for a short choice on Home to check that the sidebar opened."
+  }
+  step "first-mission" {
+    depends-on { step "tour" completed }
+    goal "Show a tiny private garden-note mission, preview its KDL, ask for a decision on Home before starting it, and follow its completed run and answered review."
+  }
+  step "your-project" {
+    depends-on { step "first-mission" completed }
+    goal "Ask which directory and harness the person wants, create their seat through st agents new, send a first message, and check its incarnation and read receipt."
+  }
+  step "keep-running" {
+    depends-on { step "your-project" completed }
+    goal "Check service status and platform permissions. Explain reboot behavior and give exact manual commands for any missing permissions; never run sudo."
+  }
+  step "phone" {
+    depends-on { step "keep-running" completed }
+    goal "Offer phone pairing through st devices, or record that the person skipped it."
+  }
+  step "second-machine" {
+    depends-on { step "phone" completed }
+    goal "Explain fleets and invites only if the person wants another machine; otherwise record a skip."
+  }
+  step "github" {
+    depends-on { step "second-machine" completed }
+    goal "Offer the optional GitHub observer. If gh is absent or the person declines, record a skip and continue. Never require it for onboarding."
+  }
+  step "wrap-up" {
+    depends-on { step "github" completed }
+    goal "List the checked work and objects that now exist, explain messaging agent/st/expert again, and point to @GUIDE@ and st --help. Finish the run and remain available for future messages."
+  }
+}

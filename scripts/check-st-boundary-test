@@ -25,6 +25,8 @@ class BoundaryCheck(unittest.TestCase):
             (crate / "src").mkdir(parents=True)
             (crate / "src/lib.rs").write_text("pub fn fixture() {}\n")
             (crate / "Cargo.toml").write_text(f'[package]\nname="{name}"\nversion="0.1.0"\nedition="2024"\n')
+        with (self.root / "crates/st3/Cargo.toml").open("a") as manifest:
+            manifest.write('\n[dependencies]\nstui={path="../stui"}\n')
         (self.root / "Cargo.toml").write_text('[workspace]\nresolver="3"\nmembers=["crates/*"]\n')
         # This dependency-free workspace needs no restored registry, compiler
         # cache or runner Cargo configuration. Keep the pinned Cargo/toolchain.
@@ -90,11 +92,11 @@ class BoundaryCheck(unittest.TestCase):
         for product in ("st3", "stui"):
             manifest = self.root / "crates" / product / "Cargo.toml"
             original = manifest.read_text()
-            manifest.write_text(original + '\n[dependencies]\nlegacy={package="st2",path="../st2"}\n')
+            manifest.write_text(original + ('\n' if product == 'st3' else '\n[dependencies]\n') + 'legacy={package="st2",path="../st2"}\n')
             result = self.check_sources()
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(f"{product} -> st2", result.stderr)
-            manifest.write_text(original + '\n[dependencies]\nst-drivers={path="../st-drivers"}\n')
+            manifest.write_text(original + ('\n' if product == 'st3' else '\n[dependencies]\n') + 'st-drivers={path="../st-drivers"}\n')
             shared = self.root / "crates/st-drivers/Cargo.toml"
             shared_original = shared.read_text()
             shared.write_text(shared_original + '\n[dependencies]\nlegacy={package="st2",path="../st2",optional=true}\n')

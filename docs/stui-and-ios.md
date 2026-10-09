@@ -1,27 +1,27 @@
-# Using stui and the iOS app
+# Using the terminal UI and the iOS app
 
 Both clients show the work in your fleet. Finish [getting started](getting-started.md) on the daemon machine first.
 
-## Use stui
+## Use the terminal UI
 
 In a terminal on that machine, run:
 
 ```sh
-stui
+st
 ```
 
-stui opens a space with tabs and splits. **Ctrl+S** shows or hides the sidebar; choose **Agents** or **Missions** there. **Ctrl+K** finds an agent, mission, machine, space, or text in conversations; type a name and press **Enter** to open it.
+The terminal UI opens a space with tabs and splits. **Ctrl+S** shows or hides the sidebar; choose **Agents** or **Missions** there. **Ctrl+K** finds an agent, mission, machine, space, or text in conversations; type a name and press **Enter** to open it.
 
 - **Home** shows attention items: decisions, requests, unread messages, and failures that need you. Open it with **Ctrl+H** when you are not typing, or click the need-you count. Follow each card's displayed actions; opening a card does not approve it.
 - **Agents** opens a seat's conversation, with messages, the harness transcript, and tool output. Scroll to read earlier entries; type in the message box and press **Enter** to reply.
 - **Missions** shows each run's steps, progress, waiting reason, and who is working on it.
 - **Usage** shows observed tokens, estimated cost, and account limits. Click **$ usage** in the top bar (widen the terminal if needed); **b** changes grouping and **p** changes the period.
 
-In an agent's conversation, **Ctrl+]** attaches its live terminal. Finish harness login or trust prompts there; **Ctrl+\\** detaches back to the conversation. Detach before using stui's navigation keys. **Ctrl+Q** quits stui; the daemon, agents, and their work keep running. See the [terminal client reference](../crates/stui/README.md) for more controls.
+In an agent's conversation, **Ctrl+]** attaches its live terminal. Finish harness login or trust prompts there; **Ctrl+\\** detaches back to the conversation. Detach before using the terminal UI's navigation keys. **Ctrl+Q** quits the terminal UI; the daemon, agents, and their work keep running. See the [terminal client reference](../crates/stui/README.md) for more controls.
 
 ### Connect from another machine
 
-Install stui on the client machine. Publish the daemon's **paired-only gateway** with the [gateway setup](st3/client-v0/README.md#tailnet-carrier), using HTTPS or an encrypted tailnet route. On the daemon machine, make a pairing challenge:
+Install Smalltalk on the client machine. Publish the daemon's **paired-only gateway** with the [gateway setup](st3/client-v0/README.md#tailnet-carrier), using HTTPS or an encrypted tailnet route. On the daemon machine, make a pairing challenge:
 
 ```sh
 st devices --as person/ada pair --full-control 'Garden laptop'
@@ -32,11 +32,12 @@ On the client machine, use your gateway URL and the returned pairing ID:
 ```sh
 printf 'Gateway URL: '; read -r st_gateway_url
 printf 'Pairing ID: '; read -r st_pairing_id
-stui pair "$st_gateway_url" "$st_pairing_id"
-stui --client
+# Set st_member_fingerprint to the fingerprint obtained through a trusted channel.
+st devices complete "$st_gateway_url" "$st_pairing_id" --fingerprint "$st_member_fingerprint"
+st ui --client
 ```
 
-Enter the single-use code privately when prompted. The saved pairing supplies your person identity and lets stui connect without a local daemon. See [client-only setup](st3/client-only.md) for multiple members and reconnecting.
+Enter the single-use code privately when prompted. The saved pairing supplies your person identity and lets the terminal UI connect without a local daemon. See [client-only setup](st3/client-only.md) for multiple members and reconnecting.
 
 ## Put the iOS app on your phone
 

@@ -31,7 +31,7 @@ the PTY runtime. Styled runs carry terminal-cell widths (including wide characte
 continuations, strikethrough and admitted OSC 8 links; keyboard modes include kitty flags.
 The Nix package and developer shell link the shared static library through pkg-config, so
 building Smalltalk does not require Zig or a Ghostty source checkout.
-The runtime, screen projector and terminal UI pin their PTY protocol crates to the same
+The runtime, screen projector and the terminal UI pin their PTY protocol crates to the same
 producer revision, keeping one shared protocol source in the workspace.
 
 Nix vendors the PTY Cargo git dependencies from the existing `pty` flake input's
@@ -55,8 +55,8 @@ source instead, which needs Zig 0.15.2 on `PATH`. On macOS, the vendored
 [`libghostty-vt-sys`](../vendor/libghostty-vt-sys/README.md) build script lets Zig 0.15.2 link against
 the macOS 26.5 and 27 SDKs.
 
-The script builds and installs `st3`, `stui`, and `st3-migrate`, and makes `st` a symlink to
-the installed `st3`. `st` is never a separate build. On macOS, both tools live in a fixed app bundle; see [macOS installation and signing](st3/macos-installation.md). A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
+The script builds and installs `st3` and `st3-migrate`, and makes `st` a symlink to
+the installed `st3`. `st` is never a separate build. On macOS, st3 lives in a fixed app bundle; see [macOS installation and signing](st3/macos-installation.md). A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
 
 ## Continuous integration
 
@@ -81,12 +81,12 @@ See [CI operations](ci.md) for stage scope, routing, caches, and failure inspect
 and includes a small [example TUI](../examples/client-tui/) built and tested in CI.
 
 `crates/st3-ui-model` provides renderer-independent UI semantics without a ratatui dependency.
-Its broad name is intentional; initially it contains only stui's mission model (`Word`,
-`StepState`, `Mission`, `Step`) and mission derivation. stui consumes that same model.
+Its broad name is intentional; initially it contains only the terminal UI's mission model (`Word`,
+`StepState`, `Mission`, `Step`) and mission derivation. The terminal UI consumes that same model.
 `missions::adapt` borrows typed mission and agent projections plus unresolved, actor-filtered
 attention. Callers supply the current time and display policies explicitly; collection loading,
 clocks and application naming remain outside the crate. Mission precedence, queue/keep-open
-rules, outcomes and rich step details retain stui's existing behavior.
+rules, outcomes and rich step details retain the terminal UI's existing behavior.
 Adapted steps retain their stable step-run `id` and claimant-or-assignee `seat` (absent for
 agentless steps), so consumers can select duplicate paths across open runs and navigate to
 the actual execution seat without reconstructing identity from display labels.
@@ -109,7 +109,7 @@ by ID. Frame `has_more` is `Option<bool>`: an absent delta leaves the timeline's
 unchanged, while an explicit value updates it. A replacement or changed session starts fresh.
 The timeline keeps a boolean for the current window, and older pages track their own start.
 
-The shared crate and `stui` use workspace Ratatui 0.30. An embedding application must align its
+The shared crate and the `stui` library use workspace Ratatui 0.30. An embedding application must align its
 rendering dependency before passing buffers or lines across this boundary. Native conversations are not a terminal emulator: harness menus and arbitrary
 permission prompts still require access to the harness terminal.
 
@@ -121,7 +121,7 @@ Ratatui builds, and [build your own client](clients/build-your-own.md) for the c
 | Path | Contents |
 | --- | --- |
 | `crates/st3` | Current daemon and CLI. |
-| `crates/stui` | Terminal app. |
+| `crates/stui` | Terminal UI library used by `st`. |
 | `crates/st-drivers`, `crates/st-runtime` | Harness drivers and shared runtime. |
 | `crates/st3-client`, `crates/st3-feed`, `crates/st3-schema`, `crates/st3-client-codegen` | Client API, feeds, schema, and code generation. |
 | `crates/st3-ui-model`, `crates/st3-conversation-ui` | Shared mission and conversation presentation. |
@@ -131,3 +131,8 @@ Ratatui builds, and [build your own client](clients/build-your-own.md) for the c
 | `components`, `evals`, `fixtures` | Provider components, evals, and proof fixtures. |
 | `examples/st3`, `docs` | Runnable declarations and documentation. |
 | `nix`, `flake.nix`, `scripts`, `.github` | Packaging, developer tools, and generated CI workflows. |
+
+The `stui` package is a library embedded in `st`; it has no standalone executable. Its existing
+Clippy baseline allowances remain under the `stui` package key because the library still owns
+the renderer and its existing lint baseline.
+Removing the binary does not rename the library or the protocol client identity.

@@ -5,7 +5,7 @@ Fleet replication is optional. A node outside a fleet is a complete local-only s
 `st fleet create` or `st fleet join`. It reports “intentionally local-only after leaving its
 fleet” only when `st fleet leave` has recorded that explicit decision in `left-fleet.json`.
 
-A laptop running only stui can instead be a [paired client device](client-only.md), with no daemon
+A laptop running only the terminal UI can instead be a [paired client device](client-only.md), with no daemon
 or replica. Devices read and act through a member's client gateway and are not sync peers.
 
 Replication makes the logical authority equal across configured nodes. It does not make the SQLite files byte-identical.
@@ -508,7 +508,7 @@ An unknown or invalid record stays in `replica_records`. It does not block a val
 
 Admission commits once per pass over the pending envelopes, so one disk flush covers an exchange. Each envelope is admitted in its own savepoint, so an invalid one is rolled back and recorded alone.
 
-A node catching up with a peer, one more than one exchange behind it, projects at most every 30 seconds and again as soon as it has caught up. History arrives older than the node's own claims, so the node cannot extend its projection incrementally; projecting after every exchange would replay the whole graph each time. Meanwhile `st now`, `st missions ls` and stui say the node is syncing.
+A node catching up with a peer, one more than one exchange behind it, projects at most every 30 seconds and again as soon as it has caught up. History arrives older than the node's own claims, so the node cannot extend its projection incrementally; projecting after every exchange would replay the whole graph each time. Meanwhile `st now`, `st missions ls` and the terminal UI say the node is syncing.
 
 Person-work asks, completions and cancellations rebuild only their owning mission run tree.
 Standalone asks embed their run and generation in the asking claim; indexed lookups recover
@@ -694,7 +694,7 @@ a disk flush. `/v1/replication/status` carries the same numbers as `timings`.
 A node is catching up while a peer measured in the last five minutes holds more envelopes than one
 exchange carries. During that time its projections can show early history as current: a request
 that a later envelope resolves still looks open. Every client page then carries a `sync` notice,
-`st now` and the other product commands print a `SYNCING` line before their items, and stui shows
+`st now` and the other product commands print a `SYNCING` line before their items, and the terminal UI shows
 `⟳ Syncing` with the same line.
 
 Two nodes are in sync only when they hold the same envelopes and project the same graph from
@@ -715,7 +715,7 @@ peer	node-b	up
 
 While any peer has diverged, `st doctor` fails its replication check, every client page carries a
 `sync` notice in the `diverged` state, `st now` and the other product commands print a `DIVERGED`
-line, and stui's header shows `⚠ diverged`. A shorter difference shows as `graphs differ` and fails
+line, and the terminal UI's header shows `⚠ diverged`. A shorter difference shows as `graphs differ` and fails
 nothing. A comparison stands until the next exchange at which both nodes hold the same envelopes;
 the first one that finds equal graphs clears it. Like the envelope difference, comparisons live in
 memory and the first exchanges after a restart rebuild them.
@@ -855,7 +855,7 @@ without checkpoints. Three days after a checkpoint became due, a participant ask
 `st now` to bring the machine back or excuse it:
 
 ```sh
-st replication checkpoint status                  # the newest stable checkpoint, and who sealed the next
+st replication checkpoint status                  # evidence incomplete: unknown, exit 2
 st replication checkpoint plan --cut 2026-09-27    # what it would drop here, proved on a copy
 st replication checkpoint excuse node-c --reason "away for a week" --as person/operator
 ```
@@ -872,7 +872,10 @@ answer stays the same, and the nodes still agree with each other. Person and mis
 never dropped, so they are never forgotten. Issue #1052 tracks keeping those tombstones too.
 
 When verifications differ, that checkpoint never becomes stable, and the next due checkpoint
-tries again. `status` names which digests differ for each participant. Seals that differ in
+tries again. Until maintained comparison evidence is integrated, `status` returns an
+`evidence incomplete` error (HTTP 503, `comparison_state=uncomputed`) and exits 2 for
+all clients. It does not seal or start an audit, and it does not mean the daemon is down.
+No participant digest comparison is certified by this response. Seals that differ in
 `rules` mean the nodes run builds with different checkpoint rules; they wait until every
 participant runs the same rules.
 

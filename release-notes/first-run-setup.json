@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A first terminal run of st configures the person and machine, installs stable binaries and starts the daemon; st setup provides the same flow with scriptable flags.",
+  "replay": {
+    "status": "none",
+    "detail": "Setup uses existing daemon startup and does not change claim replay, projection rebuilding or recovery."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, columns, indexes, triggers or schema transitions change. Person and node are existing config.toml keys."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or coordinated fleet-upgrade requirements change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Add st setup. Bare st in a terminal prepares local setup before opening the terminal interface. Agent seats and redirected streams retain help and exit 2; paired clients bypass local setup. Configuration retains other keys and stable store identity. Wire protocols, paired-device profiles and harness admission are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional daemon restart is required on upgrade. Setup starts a stopped daemon and leaves an answering daemon running. Native service installation uses the existing service lifecycle."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Existing configured installations need no migration. A new local installation chooses lowercase person and machine slugs; local is reserved. Setup defaults to a user service and copies unpacked binaries to ~/.local/bin when needed. If lingering is refused or the login PATH lacks st, setup prints the exact command or profile line. No password is requested. Flags allow configuration without installation or daemon startup."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Setup writes existing config keys and uses existing store startup without a new persisted-state transition. Repeating setup is supported; it refuses a different node for an existing store. A prior binary can read the resulting configuration; existing daemon migration and backup rules still apply."
+  }
+}

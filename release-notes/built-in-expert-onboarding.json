@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Setup publishes the persistent st/expert seat, a pinned bundled guide and the st/onboarding mission once per store; --onboarding explicitly starts another run.",
+  "replay": {
+    "status": "none",
+    "detail": "Ordinary declaration and mission-run replay is unchanged. Initial onboarding uses a deterministic run name and the graph's complete historical run count, not a local marker."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or claim schema changes. Built-ins use existing declarations, documents and mission runs."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or replication rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Add st setup --onboarding. When a provider is installed, setup publishes agent/st/expert and mission/st/onboarding and pins doc/st/guide. The expert uses the ordinary agent creation builder without a model pin. All provider declarations retain the required harness body, including an empty body for providers with no default flags. Declining Claude plugin installation keeps Claude selected and uses the existing inline development channel."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon or existing-seat restart is required by this change. The built-in expert is a new persistent seat; explicit rerunning may restore its stopped declaration."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "On a store with no prior onboarding run, the person can install a provider then rerun setup or plain st to begin. Stopping the expert keeps it stopped on later launches. Use st setup --onboarding intentionally to run onboarding again after any active run is finished or cancelled. Provider login remains the person's action; no gh or password is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No store migration or recovery procedure changes. A partially published built-in definition resumes through the ordinary publication fences; completed and cancelled run history prevents automatic reruns."
+  }
+}

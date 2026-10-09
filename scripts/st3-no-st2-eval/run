@@ -8,7 +8,7 @@ The eval checks, from outside the seat, that st3 alone:
 - binds Claude's native session, so the client API timeline shows the native transcript;
 - records the status line (harness.usage carries the stand-in's model and context);
 - delivers a message through the channel and sees it read;
-- reports claude-hooks pass in `st doctor`;
+- keeps claude-hooks explicitly unchecked in `st doctor`;
 - launches nothing whose argv or environment names an `st2` program or an `/st2/` path, and
   creates no st2 state directory.
 """
@@ -260,7 +260,7 @@ agent "native-seat" {{
         doctor = node.api("/v1/doctor") or {}
         hook_check = next((row for row in doctor.get("checks", []) if row.get("name") == "claude-hooks"), None)
         checks["doctor"] = hook_check
-        if not hook_check or hook_check["status"] != "pass" or "1 running sessions are bound" not in hook_check["message"]:
+        if not hook_check or hook_check["status"] != "unknown" or "evidence incomplete" not in hook_check["message"]:
             fail(f"doctor claude-hooks: {hook_check}")
 
         processes = node.seat_processes()

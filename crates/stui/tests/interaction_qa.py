@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise a conversation's mouse in an installed stui (spaces) PTY: open an agent from the
+"""Exercise a conversation's mouse in an installed st ui (spaces) PTY: open an agent from the
 sidebar, scroll it with the wheel, and drag to select and copy.
 
 Requires a live st3 daemon and its normal agent tree. Prints no conversation text.
@@ -73,13 +73,13 @@ def text_row(value: str) -> tuple[int, int] | None:
 
 
 def start(binary: str, prefix: str) -> str:
-    """Start stui in a detached PTY session and wait for its first frame."""
+    """Start st ui in a detached PTY session and wait for its first frame."""
     session = f"{prefix}-{uuid.uuid4().hex[:10]}"
     actor = os.environ.get("ST3_PERSON", "person/alex")
     subprocess.run(
         [PTY, "run", "-d", "-e", "--id", session,
          "--env", f"ST3_PERSON={actor}", "--env", "TERM=xterm-256color",
-         "--", os.path.abspath(binary)],
+         "--", os.path.abspath(binary), "ui"],
         check=True, capture_output=True, text=True,
     )
     wait_screen(session, lambda value: FIRST_FRAME in value, "first frame")

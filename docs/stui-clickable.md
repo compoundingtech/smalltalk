@@ -1,4 +1,4 @@
-# stui pointer targets
+# Terminal UI pointer targets
 
 This inventory covers both spaces and the classic layout. The source of truth is
 [`Hit`](../crates/stui/src/ui/doc.rs), the rectangles painted into `FrameInfo.hits`,
@@ -97,7 +97,7 @@ from the painted label, so a card's specific action stays visible in the footer.
 The shared conversation document's `PaneIntent` has five variants. `Expand`
 toggles a folded tool/thinking block; `Image` reads and opens an image attachment.
 Those are currently painted by the shared renderer. `Open` opens a subject,
-`Send` sends its text, and `LoadOlder` requests earlier conversation entries; stui
+`Send` sends its text, and `LoadOlder` requests earlier conversation entries; terminal UI
 handles these embedding intents but the current shared renderer registers no
 visible control for those three. The shell's new-lines badge is `JumpLatest`,
 not `LoadOlder`.
@@ -149,7 +149,7 @@ making hidden rows clickable. Test-only synthetic hits are excluded.
 
 The shared [`st3-conversation-ui`](../crates/st3-conversation-ui/src) renderer
 adds `Expand` targets in tool/thinking blocks and `Image` targets for user/mail
-attachments. Its document card/append helpers transport those targets; the stui
+attachments. Its document card/append helpers transport those targets; the terminal UI
 adapter and shell `pane` turn them into the final visible hit map. `usage.rs`
 registers no card targets: selectable usage list rows come through `draw_list_as`.
 
@@ -169,8 +169,8 @@ registers no card targets: selectable usage list rows come through `draw_list_as
 | Scrollbars | Scroll position indicators; wheel/PageUp/PageDown scroll the pane, scrollbar track is not a button |
 | Popover backdrop / palette or Home outside | Dismissal gestures, no button styling or hover; Esc provides the keyboard exit |
 | Help | Full-screen dismissal gesture, title says any key or click closes; no hover behind it |
-| Native terminal body | Program owns its mouse events, including motion and right-click when requested; stui adds no UI highlight or menu there. Alt/Shift drag or terminal selection mode selects text; Ctrl+\\ leaves; Ctrl+K opens palette; Ctrl+Alt+R resets modes |
-| Legacy terminal body | Existing terminal/text-selection handling, no stui Hit; its status row remains Detach |
+| Native terminal body | Program owns its mouse events, including motion and right-click when requested; the terminal UI adds no UI highlight or menu there. Alt/Shift drag or terminal selection mode selects text; Ctrl+\\ leaves; Ctrl+K opens palette; Ctrl+Alt+R resets modes |
+| Legacy terminal body | Existing terminal/text-selection handling, no terminal UI Hit; its status row remains Detach |
 
 When adding a control, register its visible rectangle or document target, update
 this inventory and the exhaustive footer match, and verify both pointer and

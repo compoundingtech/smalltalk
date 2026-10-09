@@ -202,7 +202,7 @@ agent seats, and running a machine or fleet. `st help --all` also lists commands
 Use `st help agents new` to open a command's full help.
 
 Lists show what is happening now. Add `--all` to see history. Every command has `--help`.
-The global `--json` flag prints data in the stable format the apps use. Run `stui` to see
+The global `--json` flag prints data in the stable format the apps use. Run `st` to see
 the same information in a terminal app.
 
 For work without a mission file, `st work start "Inspect the fixture" --as agent/example/worker` opens a

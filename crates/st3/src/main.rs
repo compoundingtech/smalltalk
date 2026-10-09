@@ -57,6 +57,7 @@ use completion::{Complete, Entity, WorkFilter};
 
 mod cli_help;
 mod completion;
+mod doctor_cli;
 #[cfg(test)]
 mod follow_tests;
 mod presentation;
@@ -102,6 +103,11 @@ const DEFAULT_DAEMON_WAIT_SECS: u64 = 30;
 
 #[derive(Subcommand)]
 enum Command {
+    /// Configure this machine and start st, with flags for unattended setup.
+    Setup(st3::setup::SetupArgs),
+    /// Open the terminal interface: spaces, conversations, Home and agent terminals.
+    #[command(version = st_drivers::version::display_version())]
+    Ui(stui::Args),
     /// Validate and publish KDL files containing seats, missions and schedules.
     /// Use --dry-run to preview, or --set with source flags to publish a complete owned set.
     Apply(ApplyArgs),
@@ -2592,11 +2598,29 @@ enum TraceCommand {
 
 #[derive(Args)]
 struct DoctorArgs {
+    /// Inspect local source-build tools instead of daemon health; does not compile or contact GitHub.
+    #[arg(long, conflicts_with_all = ["performance", "offline_audit"])]
+    developer: bool,
+    /// Fail on computed warnings; unchecked invariants remain visible without failing strict.
     #[arg(long)]
     strict: bool,
     /// Show only the slowest requests and queries over the last five minutes.
     #[arg(long)]
     performance: bool,
+    /// Fully audit a private database copy offline, without contacting the daemon or network.
+    #[arg(
+        long,
+        value_name = "DATABASE",
+        conflicts_with = "performance",
+        requires = "audit_scratch_dir"
+    )]
+    offline_audit: Option<PathBuf>,
+    /// Filesystem for private audit databases and SQLite temporary files.
+    #[arg(long, requires = "offline_audit", value_name = "DIRECTORY")]
+    audit_scratch_dir: Option<PathBuf>,
+    /// Maximum private audit scratch bytes; the audit refuses insufficient space.
+    #[arg(long, requires = "offline_audit")]
+    audit_max_bytes: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -2659,11 +2683,11 @@ enum ServiceCommand {
 enum ClaudeChannelCommand {
     /// Install channel assets and approval policy; activate only in st seats.
     Install {
-        /// Install only plugin assets. An administrator will manage the machine policy.
+        /// Install user assets only; seats use development admission without machine policy.
         #[arg(long)]
         no_policy: bool,
     },
-    /// Verify the embedded files, Claude registration, plugin, and machine policy.
+    /// Verify user assets and report approved or development channel admission.
     Status,
     /// Remove the user plugin, marketplace, embedded files, and machine policy.
     Uninstall {
@@ -4602,8 +4626,6 @@ fn main() -> ExitCode {
     if let Some(program) = st3::recorder::invoked_program() {
         st3::recorder::run(program);
     }
-    // What `st clients` lists for this process: its name and build, as reported.
-    st3_client::set_client_name(format!("st {}", st_drivers::version::machine_version()));
     // A shell stub from `st completions` calls back with `COMPLETE=<shell>` on each TAB. Answer
     // before any config, runtime, or daemon work; this exits when the variable is set.
     clap_complete::env::CompleteEnv::with_factory(Cli::command).complete();
@@ -4636,6 +4658,25 @@ fn main() -> ExitCode {
         st_drivers::reexec::unblock_stop_signals();
     }
     let arguments = std::env::args_os().collect::<Vec<_>>();
+    if plain_ui_requested(
+        arguments.len(),
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        std::env::var_os("ST_AGENT").is_some(),
+    ) {
+        let subject = match st3::setup::prepare_plain_ui() {
+            Ok(subject) => subject,
+            Err(error) => {
+                eprintln!("st: {}", plain_error(&error));
+                return ExitCode::FAILURE;
+            }
+        };
+        let options = match subject {
+            Some(subject) => stui::Args::default().with_initial_subject(subject),
+            None => stui::Args::default(),
+        };
+        return run_terminal_ui(options, None);
+    }
     if cli_help::all_help_requested(&arguments) {
         print!("{}", cli_help::root_help(true));
         return ExitCode::SUCCESS;
@@ -4656,6 +4697,23 @@ fn main() -> ExitCode {
         Err(error) => exit_usage_error(error),
     };
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| exit_usage_error(error));
+    if let Command::Doctor(args) = &cli.command
+        && args.offline_audit.is_some()
+    {
+        // Full audits run before the async runtime, client, telemetry or networking.
+        return match run_offline_doctor(args, cli.json) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("st: {error:#}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if let Command::Ui(options) = cli.command {
+        return run_terminal_ui(options, cli.endpoint.as_deref());
+    }
+    // Set the CLI identity only after the TUI path has chosen its stui client identity.
+    st3_client::set_client_name(format!("st {}", st_drivers::version::machine_version()));
     if let Command::Up(args) = &cli.command {
         record_daemon_commands(args);
     }
@@ -4675,6 +4733,85 @@ fn main() -> ExitCode {
         cli,
         matches.subcommand_name().expect("a subcommand was parsed"),
     )
+}
+
+fn run_offline_doctor(args: &DoctorArgs, json_output: bool) -> Result<()> {
+    let config = Config::load_unvalidated(None)?;
+    let scratch_root = args
+        .audit_scratch_dir
+        .as_ref()
+        .context("offline audit requires an explicit --audit-scratch-dir")?;
+    std::fs::create_dir_all(scratch_root)?;
+    extern "C" fn interrupt(_: libc::c_int) {
+        st3::store::offline_audit::AUDIT_INTERRUPTED
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    // SAFETY: this command executes before threads start; the signal callback only sets an
+    // atomic flag. Copy loops and SQLite progress handlers observe it and unwind temp guards.
+    unsafe {
+        libc::signal(libc::SIGINT, interrupt as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, interrupt as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, interrupt as *const () as libc::sighandler_t);
+    }
+    let scratch = tempfile::Builder::new()
+        .prefix("st3-offline-command-")
+        .tempdir_in(scratch_root)?;
+    // SAFETY: no thread or SQLite connection has been started by this command.
+    unsafe {
+        std::env::set_var("SQLITE_TMPDIR", scratch.path());
+    }
+    let audit = st3::store::offline_audit::offline_full_audit_in(
+        args.offline_audit
+            .as_deref()
+            .context("offline audit input missing")?,
+        &config.database_path(),
+        scratch.path(),
+        args.audit_max_bytes
+            .unwrap_or(st3::store::offline_audit::DEFAULT_SCRATCH_LIMIT),
+    )?;
+    if json_output {
+        print_value(&audit, true)?;
+    } else {
+        println!(
+            "offline-full-audit\tschema {}\tstore index {:?}",
+            audit.schema_version, audit.store_index
+        );
+        for check in &audit.report.checks {
+            println!("{}\t{}\t{}", check.status, check.name, check.message);
+        }
+    }
+    anyhow::ensure!(
+        audit.report.exit_status(args.strict) == 0,
+        "offline audit found a computed failure or strict warning"
+    );
+    Ok(())
+}
+
+/// Bare st opens the TUI only for a person using both sides of a terminal.
+fn plain_ui_requested(arguments: usize, stdin: bool, stdout: bool, seat: bool) -> bool {
+    arguments == 1 && stdin && stdout && !seat
+}
+
+/// The TUI owns its runtime and terminal restoration; never enter it from run_cli.
+fn run_terminal_ui(mut options: stui::Args, endpoint: Option<&str>) -> ExitCode {
+    let result = (|| -> Result<()> {
+        if let Some(endpoint) = endpoint {
+            match Endpoint::parse(endpoint) {
+                Endpoint::Unix(path) => options = options.with_endpoint(path),
+                _ => anyhow::bail!(
+                    "st ui uses a local Unix socket; pair remote devices with st devices complete"
+                ),
+            }
+        }
+        stui::run(options)
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("st: {}", plain_error(&error));
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Export the runtime fence before any provider or runtime worker thread starts. Fresh
@@ -4827,7 +4964,8 @@ fn record_daemon_commands(args: &UpArgs) {
 
 #[tokio::main]
 async fn run_cli(cli: Cli, command_name: &str) -> ExitCode {
-    if matches!(&cli.command, Command::Driver(_)) {
+    let native_driver = matches!(&cli.command, Command::Driver(_));
+    if native_driver {
         st3::telemetry::local_only();
     }
     let _telemetry = (!matches!(
@@ -4860,7 +4998,13 @@ async fn run_cli(cli: Cli, command_name: &str) -> ExitCode {
             if let Some(exit) = error.downcast_ref::<CommandExit>() {
                 return ExitCode::from(exit.0);
             }
-            eprintln!("st: {}", plain_error(&error));
+            let message = if native_driver {
+                plain_error(&error)
+            } else {
+                doctor_cli::human_outage_message(&error)
+                    .unwrap_or_else(|| plain_error(&error))
+            };
+            eprintln!("st: {message}");
             if refused_command(&error) {
                 st3::gate_report::note_refusal(&plain_error(&error));
             }
@@ -4972,6 +5116,9 @@ async fn run(cli: Cli) -> Result<()> {
     let own = std::env::var("ST_AGENT").ok();
     let mission_run = std::env::var("ST_MISSION_RUN").ok();
     guard_mutating_cli_actor(&cli.command, own.as_deref(), mission_run.as_deref())?;
+    if let Command::Setup(args) = cli.command {
+        return st3::setup::run(args).await.map(|_| ());
+    }
     // Completion is a remote device operation. It needs neither a local daemon nor its config.
     if let Command::Devices(DevicesArgs {
         command:
@@ -5072,8 +5219,10 @@ async fn run(cli: Cli) -> Result<()> {
     // Drivers outlive daemon restarts and handle an outage in their own loops; doctor reports one.
     let immediate = Client::new(endpoint.clone());
     match cli.command {
+        Command::Setup(_) => unreachable!(),
         Command::Apply(args) => run_apply(&client, args, cli.json).await,
         Command::Sets { command } => run_owned_sets(&endpoint, command, cli.json).await,
+        Command::Ui(_) => unreachable!("the TUI runs before the CLI runtime"),
         Command::Up(_) => unreachable!(),
         Command::Skill(_) => unreachable!(),
         Command::Sekrets(_) => unreachable!(),
@@ -5945,7 +6094,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     raise_open_file_limit();
     startup.phase("open-store");
     let store = Arc::new(st3::profile::task("startup open-store", || {
-        Store::open(&config.state_dir.join("claims.sqlite3"), &config.node)
+        Store::open(&config.database_path(), &config.node)
     })?);
     if let Some(fleet_id) = &config.fleet_id {
         store.bind_fleet(fleet_id)?;
@@ -6154,9 +6303,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     let local_socket = config.socket.clone();
     let state_socket = config.state_dir.join("run/st3.sock");
     let client_gateway_socket = config.client_gateway_socket.clone();
-    // The first diagnostic report reads the whole claim log; no read waits for it.
-    st3::api::start_operation_report(&state);
-    // Nor does the first session list wait to read every native transcript's header.
+    // The first session list does not wait to read every native transcript's header.
     st3::api::start_native_session_discovery(&state);
     // Nor does the first agents roster read fold every agent's card.
     st3::api::start_agent_roster(&state);
@@ -10763,11 +10910,38 @@ async fn doctor_request<T: serde::de::DeserializeOwned>(
             }
             anyhow::bail!("the daemon is starting; the API is not ready");
         }
+        Err(error) if st3::client::daemon_unreachable(&error).is_some() => {
+            if json_output {
+                let message = doctor_cli::human_outage_message(&error)
+                    .unwrap_or_else(|| plain_error(&error));
+                print_value(&json!({"status": "fail", "checks": [{
+                    "name": "daemon", "status": "fail", "message": message
+                }]}), true)?;
+            }
+            Err(error)
+        }
         outcome => outcome,
     }
 }
 
 async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Result<()> {
+    if args.developer {
+        let environment = st3::environment::snapshot()?;
+        let check = doctor_cli::developer_tools(&environment);
+        if json_output {
+            print_value(
+                &json!({"status": check.status, "scope": "local developer tools", "checks": [check]}),
+                true,
+            )?;
+        } else {
+            println!("{}\t{}\t{}", check.status, check.name, check.message);
+        }
+        anyhow::ensure!(
+            !args.strict || check.status != "warn",
+            "st doctor found a computed warning in strict mode"
+        );
+        return Ok(());
+    }
     let readiness = client.socket_path().and_then(st3::startup::read);
 
     if args.performance {
@@ -10815,10 +10989,9 @@ async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Res
         }
         print!("{}", render_performance(&report.performance));
     }
-    anyhow::ensure!(report.status != "fail", "st doctor found a failed check");
     anyhow::ensure!(
-        !args.strict || report.status == "pass",
-        "st doctor found a warning in strict mode"
+        report.exit_status(args.strict) == 0,
+        "st doctor found a computed failure or strict warning"
     );
     Ok(())
 }
@@ -11578,8 +11751,28 @@ async fn run_replication(
         ReplicationCommand::Checkpoint {
             command: CheckpointCommand::Status,
         } => {
-            let status: st3::store::CheckpointStatusView =
-                client.get("/v1/checkpoint/status").await?;
+            let response = client
+                .get::<st3::store::CheckpointStatusView>("/v1/checkpoint/status")
+                .await;
+            if let Err(error) = &response
+                && let Some((_, "diagnostic-evidence-incomplete", message, details)) =
+                    st3::client::api_error_parts(error)
+            {
+                if json_output {
+                    print_value(
+                        &json!({"status":"unknown", "message":message, "details":details}),
+                        true,
+                    )?;
+                } else {
+                    let comparison = details
+                        .get("comparison_state")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unavailable");
+                    eprintln!("unknown\tcheckpoint-status\t{comparison}: {message}");
+                }
+                return Err(CommandExit(2).into());
+            }
+            let status = response?;
             if json_output {
                 return print_value(&status, true);
             }
@@ -11726,7 +11919,10 @@ fn render_checkpoint_plan(plan: &st3::store::CheckpointPlanView) -> String {
 fn run_service(command: ServiceCommand, json_output: bool) -> Result<()> {
     match command {
         ServiceCommand::Install { config } => {
-            st3::service::install(Config::load_with_fleet(config.as_deref())?)
+            st3::service::install_from_config_path(
+                Config::load_with_fleet(config.as_deref())?,
+                config.as_deref(),
+            )
         }
         ServiceCommand::Status => {
             let mut report = st3::service::status()?;
@@ -13262,6 +13458,23 @@ async fn run_agent_new(
     if args.print_kdl {
         print!("{kdl}");
         return Ok(());
+    }
+    let health: Value = client.get("/v1/health").await?;
+    let local = health["node"]
+        .as_str()
+        .context("the daemon health response has no node")?;
+    let host = args
+        .host
+        .as_deref()
+        .unwrap_or(local)
+        .trim_start_matches("host/");
+    if host == local || host == "local" {
+        let available: Vec<String> = client.get("/v1/harnesses").await?;
+        anyhow::ensure!(
+            available.contains(&args.harness),
+            "{} is not installed on the daemon's login PATH; install it and open a new login shell before creating a seat",
+            args.harness
+        );
     }
     let source_name = format!("st agents new {}", args.name);
     let preview: MissionResponse = client
@@ -24775,6 +24988,47 @@ mod tests {
         assert!(renewals_per_second.iter().filter(|n| **n > 0).count() >= 35);
     }
 
+    #[test]
+    fn offline_doctor_parses_only_explicit_local_audit_options() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "doctor",
+            "--offline-audit",
+            "/private/evidence.sqlite3",
+            "--audit-scratch-dir",
+            "/private/scratch",
+            "--audit-max-bytes",
+            "2147483648",
+        ])
+        .unwrap();
+        let Command::Doctor(args) = cli.command else {
+            panic!("doctor command");
+        };
+        assert_eq!(
+            args.offline_audit.as_deref(),
+            Some(std::path::Path::new("/private/evidence.sqlite3"))
+        );
+        assert_eq!(args.audit_max_bytes, Some(2147483648));
+        assert!(
+            Cli::try_parse_from(["st3", "doctor", "--audit-scratch-dir", "/private/scratch"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "doctor",
+                "--offline-audit",
+                "/private/copy",
+                "--performance"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["st3", "doctor"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "st3", "doctor", "--offline-audit", "/private/copy"
+        ]).is_err());
+    }
+
     // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
     #[test]
     fn omp_pending_ask_retry_is_bound_to_the_expected_call_and_sent_once_across_reexec() {
@@ -31234,5 +31488,75 @@ mission "review" state="ready" {
             "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0}, "truncated":false,
         })).unwrap();
         tokio::time::timeout(Duration::from_secs(1), observations.recv()).await.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod terminal_ui_tests {
+    use super::*;
+
+    #[test]
+    fn plain_st_requires_two_terminals_and_no_seat() {
+        for arguments in [1, 2] {
+            for stdin in [false, true] {
+                for stdout in [false, true] {
+                    for seat in [false, true] {
+                        assert_eq!(
+                            plain_ui_requested(arguments, stdin, stdout, seat),
+                            arguments == 1 && stdin && stdout && !seat
+                        );
+                    }
+                }
+            }
+        }
+        assert!(Cli::try_parse_from(["st"]).is_err());
+    }
+
+    #[test]
+    fn terminal_ui_arguments_and_help_match_the_documented_surface() {
+        Cli::command().debug_assert();
+        for flag in [
+            "--client",
+            "--local",
+            "--space",
+            "--classic",
+            "--demo",
+            "--glass",
+            "--glasses",
+        ] {
+            let mut argv = vec!["st", "ui", flag];
+            if matches!(flag, "--space" | "--glass") {
+                argv.push("harbor");
+            }
+            assert!(matches!(
+                Cli::try_parse_from(argv).unwrap().command,
+                Command::Ui(_)
+            ));
+        }
+        assert!(Cli::try_parse_from(["st", "ui", "--client", "--local"]).is_err());
+        assert!(Cli::try_parse_from(["st", "ui", "--space", "harbor", "--classic"]).is_err());
+        assert!(Cli::try_parse_from(["st", "ui", "pair"]).is_err());
+        assert!(Cli::try_parse_from(["st", "ui", "--space"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "st", "ui", "--demo", "--dump", "--click", "5,8", "--pane", "home"
+            ])
+            .is_ok()
+        );
+        for flag in ["--version", "-V"] {
+            let error = match Cli::try_parse_from(["st", "ui", flag]) {
+                Err(error) => error, Ok(_) => panic!("version exits"),
+            };
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        }
+        let error = match Cli::try_parse_from(["st", "ui", "--help"]) {
+            Err(error) => error,
+            Ok(_) => panic!("help exits"),
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(error.to_string().contains("st ui"));
+        let help = cli_help::root_help(false);
+        assert!(help.contains("Open the terminal interface"));
+        assert!(help.contains("Run st in a terminal"));
     }
 }
