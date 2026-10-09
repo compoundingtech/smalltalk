@@ -1,4 +1,4 @@
-# Proposal: one selected agent details collection
+# Proposal: selected agent details, execution tree and observations
 
 Status: **design proposal, not an implemented client-v0 contract**. This document
 proposes an additive read model for a web client. Existing schemas, fixtures,
@@ -361,30 +361,40 @@ still require `terminal.attach`, `terminal.read`, the attachment capability and
 incarnation, then their own subscription slot. Inventory timing says nothing
 about screen cost.
 
-### 6. Harness subagents
+### 6. Harness subagents and execution details
 
-**Source.** Reuse canonical claims on the parent:
-`subagent.appeared`, `subagent.renewed`, `subagent.ended`, as reduced in
-[`store/subagents.rs`](../../../crates/st3/src/store/subagents.rs) and joined by
-`overlay_subagents` in [`api.rs`](../../../crates/st3/src/api.rs). Read at S/T,
-including parent incarnation/session and lease. IDs, type, description, driver,
-session/work IDs, started time and lease expiry are present-day harness
-subagents, not the separately declared `under` relationships and not historical
-child activity.
+**Source today.** Reuse canonical `subagent.appeared`, `subagent.renewed` and
+`subagent.ended` claims on the parent, reduced in
+[`store/subagents.rs`](../../../crates/st3/src/store/subagents.rs).
+`overlay_subagents` in [`api.rs`](../../../crates/st3/src/api.rs) exposes only
+open children with unexpired leases. The durable end claims include outcome,
+end time, duration and optional token buckets; the live DTO does not expose
+them. Its `session_id` is the parent hook session/thread, not a child
+conversation route. See the adapter appendix below.
 
-**Invalidation.** These three claim kinds on the parent, parent
-`runtime.observed`, relevant harness end/restart, `intent.desired` stop/removal,
-and the earliest live subagent lease expiry. Expiry can change membership
-without a new claim; schedule an exact wakeup/removal. Do not reuse the old
-array until another unrelated claim or periodic refresh happens.
+**Proposed extension.** Keep the `subagents` section, but add a session-scoped,
+cursor-paged `ChildExecution` inventory and typed execution observations as
+defined below. The hierarchy is seat → native root session → child executions,
+including nested and finished children. Children do not become seats or gain
+roster membership. Finished summaries survive separately from transcript
+content. This is an extension of this proposal, not a change to today's DTO.
 
-**Bounds and currentness.** Default 25 rows, at most 200 per page, 64 KiB;
-order by start time then subagent ID. An admitted live lease certifies the
-lease-backed projection at T, not proof that a child process is presently
-running. Parent observation loss makes the observational part not current;
-expired entries leave the current page. Descriptions are bounded whole
-fields; oversized individual entries are explicitly unavailable, not clipped.
-No subagent action or terminal stream is invented by this read model.
+**Invalidation.** The three subagent claim kinds, admitted child registration,
+parent/child links, child observations, content availability, source correction,
+parent runtime/session changes, authorization changes and retention deadlines.
+Schedule exact lease and freshness wakeups. Expiry removes live eligibility,
+not the retained row: absent a positive terminal observation, state becomes
+Unknown. A store sweep's `expired` end claim does not prove child completion.
+
+**Bounds and currentness.** Default 25 inventory rows, at most 200 per page,
+64 KiB for this section including observations. Order by start time, then
+`execution_id`, with unknown start times ordered last. Page the tree, never
+embed an unbounded recursive array. Oversized whole fields are Unknown with
+`payload_too_large`; do not clip them into misleading complete values.
+Transcript bytes and full task content stay outside this section. Lease-backed
+live facts require certified source coverage; retained terminal facts remain
+history even after their observer stops. No child control or terminal authority
+is implied by this read.
 
 ### 7. Queue, work and missions
 
@@ -511,6 +521,372 @@ canonical source position as the tie breaker. A covered history is
 `current/history` at S/T even when incomplete; source gaps are explicitly not
 current. Add continuation without changing old `/status-history/{a}` responses.
 
+## Execution identity and session tree
+
+The following types are a proposed wire sketch. Use `kind` discriminators and
+snake-case fields, as in the existing client-v0 collection protocol. Nathan
+decides the normative schema, claim kinds and capability version.
+
+```ts
+type Id = string;
+type Time = string; // RFC 3339 UTC, producer clock
+type Freshness = {
+  state: "current" | "not_current";
+  basis: "declaration" | "projection" | "observation" | "history";
+  source_index: number | null;
+  observed_at: Time | null;
+  valid_until: Time | null;
+  reason: string | null;
+};
+type Fact<T> =
+  | { kind: "known"; value: T; freshness: Freshness }
+  | { kind: "unknown"; reason:
+      "not_observed" | "unsupported_observer" | "source_lost" |
+      "lease_expired" | "identity_unresolved" | "read_failed" |
+      "payload_too_large" };
+type Support =
+  | { kind: "supported"; version: number }
+  | { kind: "unsupported"; reason: string };
+type ObservationAxis =
+  | "runtime" | "activity" | "needs_you" | "quota_retry" | "progress"
+  | "heartbeat" | "host_reachability" | "harness_exit";
+type AdapterSupport = {
+  adapter: string;
+  adapter_version: string;
+  root_axes: Record<ObservationAxis, Support>;
+  child_axes: Record<ObservationAxis, Support>;
+  child_inventory: Support;
+  child_conversation: Support;
+  exact_turn: Support;
+  tool_start: Support;
+  token_deltas: Support;
+  heartbeat_policy: Fact<{
+    version: number;
+    cadence_ms: number;
+    freshness_threshold_ms: number;
+    lease_horizon_ms: number;
+    allowed_clock_skew_ms: number;
+    on_coverage_loss: "invalidate";
+  }>;
+};
+type ExecutionKey = {
+  seat_id: Id;
+  owner_host_id: Id; // canonical host identity, not a hostname or fetch address
+  runtime_incarnation: Id;
+  native_session_id: Id;
+  execution_id: Id;
+};
+type Observation = {
+  observed_at: Time;
+  received_at: Time; // owner admission time, not browser arrival time
+  source_sequence: string;
+};
+```
+
+`ExecutionKey` names one root or child **run**, not only a transcript. The native
+session belongs to that execution. A resumed native session keeps its
+`native_session_id` but receives a new `execution_id`. The owner assigns and
+persists the run ID; reconnect, observer retry and claim replay do not allocate
+another run. An owner/incarnation change cannot retarget an old key to the new
+runtime. Native session IDs are adapter-scoped; do not join on that string alone.
+
+Register the root execution and child links before exposing a navigable key.
+Incomplete legacy identity is `Fact<ExecutionKey>` Unknown, not a fabricated
+session ID or a sentinel incarnation. A durable inventory row can still carry
+its assigned `execution_id` while its route is unresolved. Controls require a
+fully known key. A future exact-turn contract uses `turn_id` scoped to this key;
+a native session ID, timeline entry ID or mission step is not a turn ID.
+`active_turn_id: Fact<Id | null>` distinguishes positively observed no active
+turn (Known(null)) from an unknown active turn. See the separate composer
+proposal in #1824; this proposal adds no queue, steer or stop operation.
+
+Known(null), zero and an empty page are positive facts. Unknown means no
+certified answer. Unsupported is an adapter capability, not an observation.
+Known last-observed facts retain `not_current` and their original provenance.
+Fact wrappers do not replace the section's denied serialization: denied data
+exposes no child IDs, names, counts, source metadata or cursors.
+
+### ChildExecution inventory and retention
+
+```ts
+type ChildState =
+  | { kind: "queued"; accepted_at: Time }
+  | { kind: "running"; started_at: Time; lease_expires_at: Time }
+  | { kind: "ended"; ended_at: Time;
+      outcome: "completed" | "failed" | "cancelled" | "interrupted" }
+  | { kind: "unknown";
+      reason: "lease_expired" | "source_lost" | "not_observed" };
+type ChildExecution = {
+  execution_id: Id;
+  key: Fact<ExecutionKey>;
+  root_execution: Fact<ExecutionKey>;
+  parent_execution: Fact<ExecutionKey>;
+  native_agent_id: Fact<Id>;
+  launch_call_id: Fact<Id>;
+  name: Fact<string>;
+  agent_type: Fact<string>;
+  task: Fact<{ preview: string; content_ref: string | null }>;
+  model: Fact<string>;
+  state: ChildState;
+  active_turn_id: Fact<Id | null>;
+  duration_ms: Fact<number>;
+  usage: Fact<{
+    scope: "self" | "including_descendants";
+    input_tokens: number;
+    output_tokens: number;
+    cached_tokens: number;
+    cache_write_tokens: number;
+    total_tokens: number;
+  }>;
+  finished_summary: Fact<string | null>;
+  conversation: Fact<{ id: Id }>;
+  content: Fact<
+    | { kind: "available"; expires_at: Time | null }
+    | { kind: "expired"; expired_at: Time }
+  >;
+  summary_expires_at: Fact<Time | null>;
+  observations: ExecutionObservation[];
+  observation: Observation;
+};
+```
+
+Return live, finished and nested rows in the same bounded inventory. Each page
+has `items`, `has_more`, `next_cursor`, `cursor_expires_at`, its S/T fence,
+retention coverage and source completeness. An unknown parent link stays
+Unknown; do not attach the row to the root using a name, file basename or
+transcript-entry `parentId`. Cycles or unresolved links cannot certify a complete
+tree. A row's child-page `has_more:false` does not certify all session history.
+
+Within this proposal, a capability-gated command
+`{kind:"set-section-window", id:"details", section:"subagents",
+root_execution:KEY, parent_execution:KEY_OR_NULL,
+state:"all"|"live"|"finished"|"unknown", limit:N, cursor:CURSOR_OR_NULL}`
+selects a bounded held live window. A null parent selector covers all descendants
+of the exact root; an exact parent selects its direct children. It does not
+allocate another details slot. Advertise supported selectors and limits.
+Relevant mutation replaces the held page under a new full-row fence or
+explicitly invalidates it; cursor expiry requires a user-driven restart.
+Snapshot-only continuation remains labelled inspection, not a hidden follow.
+The paging and authorization rules below apply to this window too.
+
+Persist finished summaries and identity/parent links beyond heavy transcript
+content. Publish separate summary and content retention horizons and
+availability; Nathan must choose their values. No infinite retention is implied.
+Content expiry leaves the summary and a typed expired-content result. Summary
+expiry removes the row with reason `retention_expired` and updates retention
+coverage; it never masquerades as proof that the child did not exist.
+
+Only positive lifecycle evidence yields `ended`. On lease expiry or source loss,
+an unconfirmed live child becomes Unknown and keeps its last-known facts as
+not current. A canonical `subagent.ended` with outcome `expired` records loss of
+lease evidence, not a successful end; `harness-exited` and `seat-stopped` record
+parent conditions, not an invented child result. Preserve their source reason
+and distinguish them from a native child terminal observation. A previously
+confirmed terminal fact is history and does not become unknown merely because
+its lease is no longer renewed.
+
+Duration comes from producer-reported duration or explicit start/end boundaries.
+Live elapsed time uses the original execution start, never renewal or heartbeat
+time. A duration from an expiry sweep is the observed interval, not proof of
+actual child runtime. Token buckets must have an explicit aggregation scope.
+Do not copy parent cumulative usage into each child, add inclusive totals to
+descendant totals, or count provisional and settled usage twice.
+Missing token buckets make the aggregate Unknown unless each missing component
+is independently wrapped as a Fact; absence is never converted to zero.
+
+### Opening and following a child transcript
+
+1. The adapter registers the child session on its owner with an exact execution
+   and parent link. Core returns an opaque, authorized `conversation.id`.
+   The ledger's parent `session_id` is not this route.
+2. A web client opens the existing conversation read using that ID and follows
+   it with `{kind:"subscribe",id:"child",collection:"conversation",
+   conversation:CHILD_CONVERSATION_ID}`. The owner resolves the registration;
+   the gateway does not read a guessed local file or expose a path-fetch API.
+3. Reuse `conversation_owner_host`, `conversation_page`,
+   `conversation_changes_value` and `follow_conversation` in
+   [`client_v0.rs`](../../../crates/st3/src/api/client_v0.rs), plus the existing
+   [conversation frames](collections.md#conversations). Child registration and
+   route resolution are missing implementation work, not shipped child support.
+4. Keep cursor and retained reading/follow state separate per child conversation
+   and execution. Follow replacement/revision and full-resync rules. A resumed
+   run must not silently replace the selected old execution. If one native
+   transcript spans runs, its registration must expose run boundaries and make
+   that shared-content scope explicit.
+5. Transcript follow consumes its own conversation slot. Inventory membership
+   grants no content, send, reply, steer, stop or terminal authority. Resolve
+   read authority at the gateway and owner, recheck it for each page/frame, and
+   clear denied content on revocation. Child content must not inherit a broader
+   grant merely because the parent summary is readable.
+
+Owner loss makes the route unavailable and held content not current; it does
+not mean the child ended. Expired content is not an empty transcript or an
+automatically retried read. Retained summaries can remain readable when content
+is expired or separately denied, only under their own allowed metadata policy.
+Nathan must settle the child registration and content-security boundary.
+
+## Typed per-execution observations
+
+Capture every live/progress axis as typed data, even if a web client does not
+render it. Runtime, activity, needs-you, quota/retry, todo progress, heartbeat,
+host reachability and harness exit remain independent. Do not collapse them
+into one working/idle enum or infer facts from display strings.
+
+```ts
+// Reuse HarnessTodoSnapshot from the generated client models.
+type ObservationScope =
+  | { kind: "execution" }
+  | { kind: "request"; request_id: Id }
+  | { kind: "tool"; call_id: Id; request_id: Fact<Id> };
+type Activity =
+  | { kind: "ready" }
+  | { kind: "idle" }
+  | { kind: "active" }
+  | { kind: "thinking"; request_id: Id }
+  | { kind: "tool_running"; call_id: Id; tool: string;
+      started_at: Fact<Time> }
+  | { kind: "streaming"; request_id: Id; channel: "text" | "reasoning";
+      last_chunk_at: Time }
+  | { kind: "waiting_dependency"; targets: Id[] }
+  | { kind: "compacting"; started_at: Time; trigger: Fact<"manual" | "auto"> };
+type NeedsYou = {
+  request_id: Fact<Id>;
+  call_id: Fact<Id>;
+  person_id: Fact<Id>;
+  ask: "permission" | "question" | "review";
+};
+type QuotaRetry =
+  | { kind: "not_waiting" }
+  | { kind: "quota_wait"; account_id: Fact<Id>; resume_at: Fact<Time> }
+  | { kind: "retrying"; attempt: number; code: string; retry_at: Fact<Time> };
+type Progress =
+  | { kind: "tasks"; snapshot: HarnessTodoSnapshot }
+  | { kind: "milestones"; completed: number; total: number; unit: string }
+  | { kind: "reported_percent"; value: number; meaning: string };
+type Runtime = {
+  state: "starting" | "running" | "exited" | "failed";
+  runtime_id: Fact<Id>;
+};
+type Health =
+  | { kind: "heartbeat"; at: Time }
+  | { kind: "host_reachability"; state: "online" | "offline";
+      last_success_at: Fact<Time> }
+  | { kind: "harness_exit"; at: Time; exit_code: Fact<number>;
+      signal: Fact<string>; cause: Fact<"completed" | "stopped" | "crashed"> };
+type ExecutionObservation = {
+  key: ExecutionKey;
+  turn_id: Fact<Id>;
+  scope: ObservationScope;
+  observation: Observation;
+} & (
+  | { kind: "runtime_observed"; runtime: Fact<Runtime> }
+  | { kind: "activity_changed"; since: Fact<Time>; activity: Fact<Activity> }
+  | { kind: "needs_you_observed"; needs_you: Fact<NeedsYou | null> }
+  | { kind: "quota_retry_observed"; quota_retry: Fact<QuotaRetry> }
+  | { kind: "progress_observed"; progress: Fact<Progress> }
+  | { kind: "health_observed"; health: Fact<Health> }
+);
+```
+
+The `subagents` section holds `root: {key: Fact<ExecutionKey>,
+active_turn_id: Fact<Id | null>, observations: ExecutionObservation[]}` plus the
+bounded child page. Root observations do not depend on whether that page is
+empty. Each child's `observations` holds the latest independent axis records,
+not an unbounded event log. Detailed historical events and content use separate
+owner reads. Section readiness is separate from Fact/freshness: a pending
+reduction is not a Known empty inventory or a proof of no active tools.
+
+Unknown facts retain explicit reasons. Observations lacking a known execution
+cannot be attached to a guessed current run. Keep source sequence/cursor scoped
+to owner, incarnation, execution and producer; duplicated or delayed records
+cannot restore an older state. Missing turn correlation is Unknown, never the
+current turn chosen by timestamp proximity. Retain simultaneous request/tool
+records so one concurrent tool's completion cannot clear another's activity or
+an unrelated human ask.
+
+Tool elapsed time requires an actual execution start. An invocation without that
+edge has Unknown start time; unresolved tool output after source loss is not
+proof of continued execution. Thinking/streaming/compacting require positive
+phase edges. Historical reasoning, completed compaction or timeline revision
+support alone does not prove a current phase. Account quota observations do not
+prove this request is quota-waiting; retryable errors do not prove retry began.
+Known(null) needs-you clears a positively answered ask; silence cannot clear it.
+
+Reuse `HarnessTodoSnapshot` with its phases, totals, blockers, truncation and
+provenance. Completed/total tasks is “tasks complete”, not overall percent done.
+Only an explicit milestone or percent producer supplies those variants. No
+fabricated percentage, ETA, model or completion state is allowed.
+
+### Support, heartbeat and freshness policy
+
+Advertise `Support` per adapter/version and observation axis, including root
+versus child coverage, exact turn correlation, tool-start timing, token deltas,
+child registration and conversation follow. Support means a producer exists;
+it does not mean the current fact is Known. Unsupported axes remain explicit,
+not implicitly idle/healthy. The capability must also advertise bounded active
+record counts and section limits; overflow invalidates completeness instead of
+silently dropping concurrent activity.
+
+Advertise a versioned heartbeat/freshness policy per producer: heartbeat cadence,
+projection freshness threshold, lease horizon, allowed clock skew and coverage
+loss behavior. Last token/tool edge measures activity; owner heartbeat measures
+liveness; S/T measures admitted projection freshness; socket state measures
+client transport. A heartbeat changes none of the execution start, activity
+`since`, last-progress time or task counts. A disconnected client cannot declare
+the owner offline. Only owner/relay reachability evidence supplies that axis.
+
+Existing [`harness_state.rs`](../../../crates/st-drivers/src/harness_state.rs)
+defines a 20-second record refresh and a 15-minute record stale threshold.
+[`api.rs`](../../../crates/st3/src/api.rs) marks harness observations stale after
+90 seconds. These are different source-level policies, not a verified
+end-to-end cadence for every adapter. The capability must identify which policy
+certifies each observation. At coverage loss or its deadline, live facts become
+Unknown or known-not-current before rebuild. “Suspected stalled” is a derived,
+labelled diagnosis with its evidence and threshold, never an observed crash.
+A crash requires positive exit/failure evidence distinct from intentional stop.
+
+### Reused surfaces and adapter appendix
+
+- **Core.** Reuse `overlay_subagents` and the canonical subagent reducer, not a
+  second parser of parent tool text. [`subagents.rs`](../../../crates/st3/src/subagents.rs)
+  publishes durable appeared/renewed/ended claims and settled usage. Extend its
+  read projection to finished summaries and exact execution/parent joins.
+  Existing sweep outcomes must preserve the uncertainty described above.
+- **Harness axes.** Reuse activity, `blocked_on`, `ask`, composer and exit from
+  [`harness_state.rs`](../../../crates/st-drivers/src/harness_state.rs) and the
+  [current activity contract](README.md#agent-activity-and-human-blocking).
+  `Activity::Child` is reserved, not evidence of a child observer. Reuse
+  `harness.todo.observed`, structured attention and mission progress where their
+  execution attribution is known; mission steps are not harness turns.
+- **Claude.** [`st-drivers/src/subagents.rs`](../../../crates/st-drivers/src/subagents.rs)
+  (`apply_claude`, `claude_subagent_transcript`, `claude_subagent_meta`,
+  `claude_transcript_tokens`) consumes launch/start/stop hooks, sidechain
+  metadata and token records. Current hook `session_id` is the parent session.
+  Type/prompt matching can be provisional until exact launch metadata arrives.
+  Register the owner-local sidechain as child content; do not advertise existing
+  token-reading paths as public conversation support. Parent usage already
+  includes Claude child responses; preserve that aggregation convention.
+- **Codex.** The same file (`observe_codex`, `apply_codex`, `subagent_thread`)
+  consumes `subAgentActivity` and `collabAgentToolCall`; repeated thread tasks
+  receive `THREAD#N` run IDs. The ledger `session_id` is the parent thread.
+  [`codex_app_server.rs`](../../../crates/st-drivers/src/codex_app_server.rs)
+  supplies typed item/turn observations. Exact child-thread → owner transcript
+  registration and nested joins still need implementation. Preserve existing
+  settled usage accounting, not another addition of inclusive parent totals.
+- **OMP.** [`st-drivers/hooks/omp-channel.ts`](../../../crates/st-drivers/hooks/omp-channel.ts)
+  (`isSubagentSession`) deliberately ignores child events to keep seat mail,
+  registry identity and receipts on the top-level session (#852). Its
+  [smoke assertions](../../../crates/st-drivers/hooks/typecheck/st-smoke.mjs)
+  require that boundary. [`st3/hooks/omp-channel.ts`](../../../crates/st3/hooks/omp-channel.ts)
+  likewise guards its handlers and observes top-level ask/todo, message-end
+  timeline, retries and completed compaction. None proves child follow support.
+  Add a separate owner-local child observer with its own identity, registration,
+  cursor and lifecycle/parent links. It must not reuse seat credentials, bind
+  the seat channel, take seat mail or publish child turns as parent state.
+  Structured native launch/session/progress records can supply child facts;
+  a saved Task result alone cannot certify ongoing live coverage. Observer API,
+  crash recovery and complete nested-session coverage need adapter proof.
+
 ## Incremental source and subscription cost
 
 Reuse the roster incremental classifier and selected-card construction as the
@@ -619,7 +995,8 @@ re-fetching to simulate a missing stream is not.
   fallback. Revoked pairing/delegation clears access, not just freshness.
 
 Advertise an optional `agent_details` capability/version with selector,
-section bounds, continuation and freshness/control-frame support. Add typed
+section bounds, continuation, execution inventory, per-adapter observation
+Support, heartbeat policy and freshness/control-frame support. Add typed
 command/resource/frame definitions and regenerated clients only in an
 implementation PR. New collection/fields/operations are opt-in and additive;
 existing `agents`, `work`, `attention`, `missions`, terminal/conversation
@@ -660,11 +1037,35 @@ this proposal.
    projection scope, optional env values under declaration scope, and the split
    between declared account/terminal/authority relationships and observations
    of effective state. No additional secret/environment surface is intended.
+10. **Execution schema and authority:** approve the session-scoped tree and
+    distinct run identity across resumed native sessions. Which durable
+    registration/claim schema owns `ExecutionKey`, parent links and turn IDs?
+    The proposed boundary is core-owned identity/admission and adapter-owned
+    positive observations, not child seats.
+11. **Separate retention horizons:** choose summary/link retention and child
+    transcript/task-content expiry independently. Approve summaries outliving
+    content, explicit retained-range completeness and expiry results, and
+    Unknown rather than completion on lease expiry/source loss. Which stored
+    evidence must survive checkpoint trimming to retain this projection?
+12. **Child ownership and security:** choose the owner-local registration and
+    read grant/redaction boundary for child transcripts and task content,
+    including nested children, resumed-run content boundaries, revocation and
+    metadata visibility when content is denied. A parent summary grant must not
+    automatically grant child content or control.
+13. **Typed observations and policy:** approve the Known/Unknown and per-adapter
+    Support shapes, concurrent call/request scope, exact-turn correlation,
+    independent health/needs-you/progress axes and advertised heartbeat policy.
+    Which producers can certify each axis, rather than infer it from silence?
+14. **OMP observer boundary:** approve a separate child observer with its own
+    identity/cursor while retaining #852's top-level seat-channel guard. What
+    owner admission and adapter lifecycle evidence is required before child
+    conversations can be opened/followed live?
 
 ## Non-goals
 
 No implementation, live-daemon changes, builds, load tests, polling workaround,
-age-based cache, terminal-screen join, provider refresh API, full resource or
-subagent history, or expanded audit retention. Source references establish
-what exists; every new behavior above is a proposal requiring implementation
-and focused correctness/authorization/coverage tests in a separate change.
+age-based cache, terminal-screen join, provider refresh API, unbounded resource
+or child history, child controls, or expanded audit retention. Source references
+establish what exists; every new behavior above is a proposal requiring
+implementation and focused correctness/authorization/coverage tests in a
+separate change.
