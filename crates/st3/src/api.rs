@@ -4394,16 +4394,22 @@ const AGENT_ROSTER_ASSEMBLY_ROUNDS: usize = 3;
 /// whose claims changed, and completion is tried again. Readers keep the previous complete
 /// roster meanwhile; if it cannot be assembled, they keep it until its requests are overdue.
 fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
+    if store.read_snapshot(|index| store.agent_roster_current(index, history))? {
+        return Ok(());
+    }
     let complete = |store: &Store| store.read_snapshot(|index| {
-        if !store.agent_roster_completion_bounded(index, history, AGENT_ROSTER_WARM_CHUNK)? {
-            return Ok(false);
+        if let Some(reason) =
+            store.agent_roster_unbounded_because(index, history, AGENT_ROSTER_WARM_CHUNK)?
+        {
+            return Ok(Some(reason));
         }
-        client_agent_resources_cached(store, history, index).map(|_| true)
+        client_agent_resources_cached(store, history, index).map(|_| None)
     });
     for _ in 0..AGENT_ROSTER_ASSEMBLY_ROUNDS {
-        if complete(store)? {
+        let Some(reason) = complete(store)? else {
             return Ok(());
-        }
+        };
+        store.note_agent_roster_chunked(&reason);
         let order = store.read_snapshot(|index| {
             Ok(client_agent_page_refs(store, history, index)?.iter()
                 .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
@@ -4416,7 +4422,7 @@ fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
             })?;
         }
     }
-    if complete(store)? {
+    if complete(store)?.is_none() {
         return Ok(());
     }
     anyhow::bail!("the agents roster kept changing in ways no short fold can follow; keeping the previous one")
@@ -4471,7 +4477,8 @@ fn client_agents_published_page(
     query: &ClientListQuery,
 ) -> Result<Option<ClientPageResponse>, ApiError> {
     let store = &state.store;
-    let index = store.index().map_err(ApiError::internal)?;
+    let current = store.index().map_err(ApiError::internal)?;
+    let index = current;
     let Some((index, cards, published_at)) = store.published_agent_roster(index, query.history) else {
         // Before the first complete roster, an unfiltered first page can come from its head.
         if query.status.is_some() || query.history {
@@ -4490,10 +4497,14 @@ fn client_agents_published_page(
         )?;
         return Ok(Some((Extension(snapshot), Json(page))));
     };
-    if query.history {
-        store.request_agent_roster_history();
-    } else {
-        store.request_agent_roster_refresh();
+    // A roster older than the current cut, its local activity or its queue deadline needs a
+    // refresh; the newest one needs none.
+    if index < current || !store.agent_roster_current(current, query.history).map_err(ApiError::internal)? {
+        if query.history {
+            store.request_agent_roster_history();
+        } else {
+            store.request_agent_roster_refresh();
+        }
     }
     let snapshot = roster_snapshot(state, index, published_at);
     if let Some(status) = query.status.as_deref() {
@@ -5435,11 +5446,13 @@ pub fn start_native_session_discovery(state: &AppState) {
 }
 
 /// The shortest pause between two roster refreshes. A refresh also pauses as long as it took,
-/// so refreshing never takes more than about half a core however often readers ask.
-const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_millis(20);
+/// so refreshing never takes more than about half a core however often readers ask. Reads
+/// never wait for it: this bounds how stale a served roster can be, about a second plus a fold.
+const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_secs(1);
 
-/// How long a first page waits for the refresher to publish a roster at or after its own cut.
-const AGENT_ROSTER_READ_WAIT: Duration = Duration::from_secs(1);
+/// How long a read asking for a fresh roster waits for one at or after its own cut: long enough
+/// for the refresher's pause and one fold.
+const AGENT_ROSTER_READ_WAIT: Duration = Duration::from_secs(2);
 
 /// Keep the complete agents roster published off the request path. As the daemon starts it
 /// folds every agent's refs and the cards the largest window shows, then the rest of the cards.
