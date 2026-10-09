@@ -200,15 +200,13 @@ pub(crate) fn render_mission_run_page(
     style: OutputStyle,
     now_unix_ms: u128,
 ) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "TREE PAGE  {} · {} runs", selected.root_mission_run, runs.len());
-    if !runs.iter().any(|run| run.subject == selected.subject) {
-        let _ = writeln!(output, "SELECTED   {} · {}", selected.subject, style.status(&selected.status));
-    }
+    let mut output = render_mission_run(selected, &[], style, now_unix_ms);
+    let _ = writeln!(output, "\nTREE PAGE  {} · {} runs", selected.root_mission_run, runs.len());
     for run in runs {
-        if !output.is_empty() {
-            output.push('\n');
+        if run.subject == selected.subject {
+            continue;
         }
+        output.push('\n');
         if let Some(parent) = &run.parent_step_run {
             let _ = writeln!(output, "PARENT    {parent}");
         }
@@ -1724,7 +1722,7 @@ mod tests {
             vec![step("step-run/child-generation/publish", "publish", "ready")],
         );
         let rendered = render_mission_run_page(&root, &[child], OutputStyle::plain(), 3_000);
-        assert!(rendered.contains("SELECTED   mission-run/demo/run"));
+        assert!(rendered.contains("RUN       mission-run/demo/run"));
         assert!(rendered.contains("PARENT    step-run/demo-generation/release"));
         assert!(rendered.contains("RUN       mission-run/demo/child"));
         assert!(rendered.contains("publish — publish"));
