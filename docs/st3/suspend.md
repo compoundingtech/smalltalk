@@ -46,6 +46,17 @@ stops the runtime, and freezes portable transcript files after the process ends.
 stays declared. Its restart policy does not restart it, `st agents restart` refuses it, and mail
 sent to it waits until it resumes.
 
+An incarnation-bearing report is accepted only while the latest runtime observation records
+that incarnation as running. The writer checks this authority before replaying or deduplicating
+a report, so retries from an ended or superseded incarnation cannot replace its successor's
+binding. During a rollout, verification records the observed replacement's runtime authority
+before waiting for its native binding.
+
+Consecutive identical native-session reports reuse the current binding claim. Switching to
+another session and then returning appends a fresh binding for the revisited session, so the
+latest claim continues to identify the active native session. Todo observations from another
+session or incarnation remain visible with stale provenance rather than appearing current.
+
 Resume launches the driver with the session in `ST3_NATIVE_RESUME_SESSION`. Each driver
 relaunches its harness on exactly that session:
 

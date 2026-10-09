@@ -17220,13 +17220,25 @@ mission "example/zero-run" state="ready" {
                     .transcript
                     .is_err()
             );
-            // Neither a stale binding nor no binding can justify guessing in a linked inventory.
+            // A previously accepted binding becomes stale when the successor starts;
+            // it cannot justify guessing another seat's transcript in the linked inventory.
+            write_session(
+                &authored,
+                id,
+                "2026-09-25T14:00:00Z",
+                "Seat A's bound conversation",
+            );
+            let successor = "successor-incarnation";
             append(
-                "harness.session-file",
-                json!({"harness":driver,"agent":owner,"incarnation_id":"old-incarnation","session_id":sibling_id,"path":legacy.join(format!("2026-09-25T16-00-00-000Z_{sibling_id}.jsonl"))}),
+                "runtime.observed",
+                json!({"status":"running","runtime_id":"example.resumed","incarnation_id":successor}),
+            );
+            append(
+                "harness.observed",
+                json!({"state":"idle","driver":driver,"incarnation_id":successor}),
             );
             assert!(
-                managed_transcript(&state, owner, incarnation)
+                managed_transcript(&state, owner, successor)
                     .unwrap()
                     .unwrap()
                     .transcript
