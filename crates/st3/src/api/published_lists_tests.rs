@@ -495,6 +495,7 @@ fn published_lists_follow_many_changes_and_a_revision_proposal() {
             r#"version 2
 mission "garden/proposed" state="ready" revisions="human-only" revision-reviewer="person/reviewer" {{
   goal "Grow by proposal."
+  agent "owner" {{ workspace "."; command "true" }}
   step "plant" {{ assigned-to "agent/garden/ash"; goal {goal:?} }}
 }}"#
         );
