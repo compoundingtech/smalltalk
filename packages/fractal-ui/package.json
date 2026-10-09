@@ -13,7 +13,8 @@
     "./assistant-ui/tool-attention": "./src/assistant-ui/embrace-tool-attention.ts",
     "./assistant-ui/workbench-model": "./src/assistant-ui/workbench/workbench-model.ts",
     "./assistant-ui/sync": "./src/assistant-ui/st3-views/index.ts",
-    "./assistant-ui/sync-status": "./src/assistant-ui/st3-views/sync-line.ts"
+    "./assistant-ui/sync-status": "./src/assistant-ui/st3-views/sync-line.ts",
+    "./assistant-ui/live-state": "./src/assistant-ui/live-state/index.ts"
   },
   "scripts": {
     "storybook": "storybook dev -p 53705 --host 127.0.0.1 --no-open --disable-telemetry",

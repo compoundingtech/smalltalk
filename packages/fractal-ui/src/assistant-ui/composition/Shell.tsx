@@ -5,6 +5,8 @@ import { colorVars as c, typeVars as t, radiusVars as r, geometryVars as g } fro
 import { SidebarStatus as StatusGlyph } from '../sidebar/SidebarStatus'
 import { Icon } from './Icons'
 import type { AgentStatus } from '../sidebar/model'
+import { LiveState } from '../live-state/LiveState'
+import type { LiveStateSnapshot } from '../live-state/types'
 
 /**
  * Keyboard/pointer resizable separator. Arrow ±8, Shift+Arrow ±32,
@@ -115,6 +117,8 @@ export function ThreadHeader({
   onCommit,
   statusSince,
   freshness,
+  diagnostics,
+  landmarkContext,
   panelOpen,
   drawerOpen,
   onTogglePanel,
@@ -130,6 +134,10 @@ export function ThreadHeader({
   statusLabel?: string
   statusSince?: number
   freshness?: 'live' | 'stale' | 'unobserved'
+  /** Full, independent live axes. The compact legacy glyph is used only without this snapshot. */
+  diagnostics?: { readonly snapshot: LiveStateSnapshot; readonly now: number }
+  /** Distinguishes navigation landmarks when multiple thread headers share a surface. */
+  landmarkContext?: string
   /** Elapsed label; a ReactNode so an isolated ticker can be passed in. */
   elapsed?: React.ReactNode
   now?: number
@@ -150,20 +158,20 @@ export function ThreadHeader({
 }) {
   const terminalReasonId = React.useId()
   return (
-    <header data-testid="thread-header" {...stylex.props(styles.header)}>
+    <><header data-testid="thread-header" {...stylex.props(styles.header)}>
       {sidebarCollapsed && onToggleSidebar !== undefined ? (
         <button type="button" aria-label="Expand sidebar" title="Expand sidebar" onClick={onToggleSidebar} {...stylex.props(styles.ghostMd)}>
           <Icon name="chevron-right" />
         </button>
       ) : null}
-      <nav aria-label="Breadcrumb" {...stylex.props(styles.breadcrumb)}>
+      <nav aria-label={landmarkContext === undefined ? 'Breadcrumb' : `Breadcrumb: ${landmarkContext}`} {...stylex.props(styles.breadcrumb)}>
         <span {...stylex.props(styles.crumbFolder)}>{folder}</span>
         <span aria-hidden="true" {...stylex.props(styles.crumbSlash)}>/</span>
         <span {...stylex.props(styles.crumbTitle)}>{title}</span>
       </nav>
       <div {...stylex.props(styles.actions)}>
-        {status !== undefined ? <StatusGlyph status={status} statusLabel={statusLabel} statusSince={statusSince} freshness={freshness} now={now} /> : null}
-        {elapsed !== undefined ? <span role="timer" aria-label="Current conversation turn elapsed">{elapsed}</span> : null}
+        {diagnostics === undefined && status !== undefined ? <StatusGlyph status={status} statusLabel={statusLabel} statusSince={statusSince} freshness={freshness} now={now} /> : null}
+        {diagnostics === undefined && elapsed !== undefined ? <span role="timer" aria-label="Current conversation turn elapsed">{elapsed}</span> : null}
         <div data-testid="native-action-slot" ref={actionPortalRef}>{nativeActions}</div>
         {onOpen !== undefined && <button type="button" onClick={onOpen} {...stylex.props(styles.outlineXs)}>Open <Icon name="chevron-down" size={12} /></button>}
         {onCommit !== undefined && <button type="button" onClick={onCommit} {...stylex.props(styles.outlineXs)}>Commit <Icon name="chevron-down" size={12} /></button>}
@@ -181,7 +189,7 @@ export function ThreadHeader({
           <Icon name="panel" />
         </button>
       </div>
-    </header>
+    </header>{diagnostics !== undefined && <LiveState label={title} snapshot={diagnostics.snapshot} now={diagnostics.now} variant="header" />}</>
   )
 }
 
