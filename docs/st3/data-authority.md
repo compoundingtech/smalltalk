@@ -83,6 +83,9 @@ the stop flush even when the final current snapshot or stop marker dropped. Dead
 leaves unpublished events spooled and permits the driver to exit. Quarantine retains at most
 256 records and 64 MiB of payloads, pruning oldest inspection evidence first. Unknown publication
 failures and future event schemas remain spooled rather than being classified as permanent.
+After 100 publication refusals, a retained head attempts a visible `accounting-publication-stalled`
+diagnostic, at most once per minute with a stable reason and idempotency key. Its refusal counter
+survives re-exec; reporting never acknowledges or changes the original event provenance.
 The daemon also recovers retained numeric work in indexed batches of at most 64 rows,
 continuing past a failed subject with bounded per-subject backoff,
 including adopted providers without a spool and daemon restarts. `context_occupancy` from upgraded drivers is exclusively a current

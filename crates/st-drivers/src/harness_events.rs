@@ -630,6 +630,65 @@ pub fn prepare_publication(
     Ok(serde_json::from_str(&body)?)
 }
 
+/// Track one retained event's repeated refusal without changing its acknowledgement.
+/// A bounded prepared row survives re-exec and is deleted with the event's normal prefix ack.
+pub fn note_publication_refusal(
+    agent_dir: &Path,
+    sequence: u64,
+    refusal: &str,
+    now_ms: u64,
+) -> Result<Option<String>> {
+    #[derive(Serialize, Deserialize)]
+    struct Refusal {
+        reason: String,
+        attempts: u64,
+        last_notice_ms: Option<u64>,
+    }
+    let mut connection = open(agent_dir)?;
+    connection.busy_timeout(Duration::ZERO)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let pending: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE sequence=?1)",
+        [sequence],
+        |r| r.get(0),
+    )?;
+    if !pending {
+        return Ok(None);
+    }
+    let prior: Option<String> = tx
+        .query_row(
+            "SELECT body FROM prepared WHERE sequence=?1 AND slot='publication-refusal'",
+            [sequence],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let mut state: Refusal = match prior {
+        Some(body) => serde_json::from_str(&body)?,
+        None => Refusal {
+            reason: refusal.chars().take(512).collect(),
+            attempts: 0,
+            last_notice_ms: None,
+        },
+    };
+    state.attempts = state.attempts.saturating_add(1);
+    // Retain facts by default, but surface a stuck head after 100 refusals. Failed notices
+    // retry at most once per minute with the same original reason/idempotency key.
+    let notice = state.attempts >= 100
+        && state
+            .last_notice_ms
+            .is_none_or(|at| now_ms.saturating_sub(at) >= 60_000);
+    if notice {
+        state.last_notice_ms = Some(now_ms);
+    }
+    tx.execute(
+        "INSERT INTO prepared VALUES(?1,'publication-refusal',?2)
+        ON CONFLICT(sequence,slot) DO UPDATE SET body=excluded.body",
+        params![sequence, serde_json::to_string(&state)?],
+    )?;
+    tx.commit()?;
+    Ok(notice.then_some(state.reason))
+}
+
 pub fn acknowledge(agent_dir: &Path, sequence: u64) -> Result<()> {
     let mut connection = open(agent_dir)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -805,6 +864,59 @@ pub(crate) fn read_timeline(agent_dir: &Path) -> Result<Option<Record>> {
 mod tests {
     use super::*;
     use crate::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer, claim};
+    #[test]
+    fn repeated_publication_refusal_survives_reexec_and_reports_without_acknowledging() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime-a").unwrap();
+        let connection = open(root.path()).unwrap();
+        connection.execute("INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES('runtime-a',1,'fixture','{}')", []).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value='2' WHERE key='pending-bytes'",
+                [],
+            )
+            .unwrap();
+        for _ in 0..99 {
+            assert!(
+                note_publication_refusal(root.path(), 1, "unconfirmed binding", 1)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        enable(root.path(), "runtime-b").unwrap();
+        assert_eq!(
+            note_publication_refusal(root.path(), 1, "a later error", 2)
+                .unwrap()
+                .as_deref(),
+            Some("unconfirmed binding")
+        );
+        assert!(
+            note_publication_refusal(root.path(), 1, "a later error", 60_001)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            note_publication_refusal(root.path(), 1, "a later error", 60_002)
+                .unwrap()
+                .as_deref(),
+            Some("unconfirmed binding")
+        );
+        assert_eq!(
+            pending(root.path(), 10).unwrap()[0].runtime_incarnation,
+            "runtime-a"
+        );
+        acknowledge(root.path(), 1).unwrap();
+        assert!(
+            note_publication_refusal(root.path(), 1, "gone", 120_002)
+                .unwrap()
+                .is_none()
+        );
+        let prepared: u64 = connection
+            .query_row("SELECT COUNT(*) FROM prepared", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(prepared, 0);
+    }
+
     #[test]
     fn quarantine_retains_provenance_and_advances_only_the_acknowledged_prefix() {
         let root = tempfile::tempdir().unwrap();

@@ -19310,6 +19310,19 @@ impl NativeObservations {
                     );
                     continue;
                 } else if accounting_request_is_transient(&error) {
+                    if let Ok(Some(reason)) = st_drivers::harness_events::note_publication_refusal(
+                        &self.dir,
+                        event.sequence,
+                        &format!("{error:#}"),
+                        st_drivers::message::now_ms(),
+                    ) {
+                        let _: Result<ClaimRecord> = client.post("/v1/diagnostics/harness", &json!({
+                            "actor": subject, "severity":"error", "status":"accounting-stalled",
+                            "code":"accounting-publication-stalled", "incarnation_id":self.runtime,
+                            "reason":format!("Retained event {} from runtime {} is blocking accounting: {}", event.sequence, event.runtime_incarnation, reason),
+                            "idempotency_key":format!("accounting-stalled:{subject}:{}:{}", self.runtime, event.sequence),
+                        })).await;
+                    }
                     return Err(error);
                 } else {
                     st_drivers::harness_events::quarantine(
