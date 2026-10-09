@@ -141,7 +141,16 @@ fn claims_attention_never_reads_republish_the_same_rows_without_a_fold() {
     store
         .append_claim(&input("host/one", "transport.observed", None, json!({"status":"up"})))
         .unwrap();
-    // A seat that was never asked to log in: its harness observations reach no attention.
+    // A seat that was never asked to log in and is not retiring: neither its harness nor its
+    // runtime observations reach attention.
+    store
+        .append_claim(&input(
+            "agent/alder.asker",
+            "runtime.observed",
+            None,
+            json!({"status":"running","runtime_id":"asker","incarnation_id":"one"}),
+        ))
+        .unwrap();
     store
         .append_claim(&input(
             "agent/alder.asker",
