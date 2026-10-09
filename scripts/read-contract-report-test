@@ -168,6 +168,20 @@ async fn ambiguous_handler() {}
                 invented_root, {"GET /ambiguous": "ambiguous_handler"}
             )
 
+    def test_lifetimes_do_not_hide_test_module_braces(self):
+        source = '''#[cfg(test)]
+mod tests {
+    fn first<'a>() { let _ = { 1 }; }
+    mod nested { fn second<'b>() {} }
+}
+async fn real_handler() {}
+'''
+        production = report.without_root_test_modules(source)
+        self.assertNotIn("first", production)
+        self.assertNotIn("second", production)
+        self.assertEqual(production.count("\n"), source.count("\n"))
+        self.assertIn("async fn real_handler()", production)
+
     def test_new_client_read_variant_changes_inventory(self):
         peer = (ROOT / "crates/st3/src/peer.rs").read_text()
         changed = peer.replace("pub enum ClientReadOperation {",
@@ -325,7 +339,9 @@ async fn ambiguous_handler() {}
             "cli_inventory_sha256": hashlib.sha256(payload.encode()).hexdigest(),
             "cli_aliases": {"invented": ["i"], "invented read": ["r"]},
         }
-        self.assertTrue(report.complete_cli_registration(manifest, set(commands)))
+        self.assertFalse(report.complete_cli_registration(manifest, set(commands)))
+        self.assertTrue(report.complete_cli_registration(
+            manifest, set(commands), trusted_build=True))
         forged = self.artifact.parent / "forged-ci-attestation.json"
         forged.write_text(json.dumps({"result": "pass", "checkout_head": HEAD,
                                       "checkout_tree": HEAD, "binary_sha256": binary_sha,
@@ -333,11 +349,46 @@ async fn ambiguous_handler() {}
         manifest["cli_ci_attestation_path"] = str(forged)
         manifest["cli_ci_attestation_sha256"] = hashlib.sha256(forged.read_bytes()).hexdigest()
         self.assertFalse(report.complete_cli_source_provenance(manifest, HEAD, HEAD))
-        self.assertFalse(report.complete_cli_registration(manifest, {"invented read"}))
         self.assertFalse(report.complete_cli_registration(
-            {**manifest, "cli_aliases": {}}, set(commands)))
+            manifest, {"invented read"}, trusted_build=True))
+        self.assertFalse(report.complete_cli_registration(
+            {**manifest, "cli_aliases": {}}, set(commands), trusted_build=True))
         binary.write_text(binary.read_text() + "# changed\n")
-        self.assertFalse(report.complete_cli_registration(manifest, set(commands)))
+        self.assertFalse(report.complete_cli_registration(
+            manifest, set(commands), trusted_build=True))
+
+    def test_unattested_manifest_cannot_execute_its_binary(self):
+        source_head = report.subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip()
+        ledger = self.artifact.parent / "ledger.json"
+        ledger.write_text(json.dumps({"get": [], "operations": [], "cli": []}))
+        binary = self.artifact.parent / "untrusted-cli"
+        marker = self.artifact.parent / "executed"
+        binary.write_text(f"#!/usr/bin/env python3\nopen({str(marker)!r}, 'w').write('ran')\n")
+        binary.chmod(0o755)
+        manifest = self.artifact.parent / "manifest.json"
+        manifest.write_text(json.dumps({
+            "source_head": source_head,
+            "routes": {}, "cli": {}, "claim_view_edges": {},
+            "client_read_variants": {}, "peer_protocol_routes": {},
+            "cli_binary_path": str(binary),
+            "cli_binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        }))
+        with mock.patch.object(report, "run_bounded_cli_inventory",
+                               side_effect=AssertionError("untrusted execution")):
+            result = report.report(ROOT, ledger, manifest)
+        self.assertEqual(result["gate_status"], "red")
+        self.assertFalse(marker.exists())
+        self.assertIn("CLI build/source provenance lacks independently qualified CI attestation",
+                      result["blockers"])
+
+    def test_malformed_ledger_returns_red_blocker(self):
+        ledger = self.artifact.parent / "malformed-ledger.json"
+        ledger.write_text(json.dumps({"get": [{}], "operations": [], "cli": []}))
+        result = report.report(ROOT, ledger)
+        self.assertEqual(result["gate_status"], "red")
+        self.assertIn("historical ledger is malformed or unreadable", result["blockers"])
 
     def test_cli_aliases_expand_to_exact_semantic_invocations(self):
         commands = {"st invented read", "st invented write"}

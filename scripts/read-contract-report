@@ -224,6 +224,18 @@ def matching_rust_brace(source, opener):
                 raise InventoryError("unclosed Rust string in handler source")
             continue
         if char == "'":
+            # A Rust lifetime such as 'a or '_ is not a character literal. In
+            # particular, two lifetimes on one line must not hide intervening
+            # braces from this diagnostic lexer.
+            if next_char.isalpha() or next_char == "_":
+                lifetime_end = index + 2
+                while lifetime_end < len(source) and (
+                    source[lifetime_end].isalnum() or source[lifetime_end] == "_"
+                ):
+                    lifetime_end += 1
+                if lifetime_end >= len(source) or source[lifetime_end] != "'":
+                    index = lifetime_end
+                    continue
             end = index + 1
             while end < len(source) and source[end] != "\n":
                 if source[end] == "\\":
@@ -540,6 +552,7 @@ def complete_target_approval(manifest, head, tree):
 
 
 def run_bounded_cli_inventory(binary, timeout_s=5, limit_bytes=1_000_000):
+    """Run only a caller-qualified binary; limits are not an OS sandbox."""
     try:
         process = subprocess.Popen(
             [str(binary), "--read-contract-inventory-json"],
@@ -596,8 +609,10 @@ def run_bounded_cli_inventory(binary, timeout_s=5, limit_bytes=1_000_000):
                 pass
 
 
-def complete_cli_registration(manifest, expected):
-    if not isinstance(manifest, dict):
+def complete_cli_registration(manifest, expected, *, trusted_build=False):
+    # A manifest's own binary digest is self-attestation. Never execute it
+    # before independent CI build provenance has been checked by the caller.
+    if trusted_build is not True or not isinstance(manifest, dict):
         return False
     if not artifact_matches(manifest, "cli_binary"):
         return False
@@ -779,7 +794,24 @@ def complete_kind_mutation_edge(kind, edge, head):
 
 
 def report(root, ledger_path, manifest_path=None):
-    ledger = json.loads(ledger_path.read_text())
+    ledger_error = False
+    ledger_digest = None
+    try:
+        ledger_digest = sha256(ledger_path)
+        ledger = json.loads(ledger_path.read_text())
+        required = {"get": ("route",), "operations": ("method", "route"),
+                    "cli": ("command",)}
+        if not isinstance(ledger, dict) or any(
+            not isinstance(ledger.get(group), list)
+            or any(not isinstance(row, dict)
+                   or any(not isinstance(row.get(field), str) for field in fields)
+                   for row in ledger[group])
+            for group, fields in required.items()
+        ):
+            raise ValueError("malformed historical ledger")
+    except (OSError, UnicodeError, ValueError, TypeError):
+        ledger = {"get": [], "operations": [], "cli": []}
+        ledger_error = True
     checker_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     checker_tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True).strip()
     checker_dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT))
@@ -787,6 +819,8 @@ def report(root, ledger_path, manifest_path=None):
     tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True).strip()
     dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=root))
     manifest, blockers = checked_manifest(manifest_path, head)
+    if ledger_error:
+        blockers.append("historical ledger is malformed or unreadable")
     try:
         route_handlers = registered_route_handlers(
             (root / "crates/st3/src/api.rs").read_text(),
@@ -834,11 +868,12 @@ def report(root, ledger_path, manifest_path=None):
         blockers.append("route/manifest equality failed")
     if missing_cli or extra_cli:
         blockers.append("CLI/manifest equality failed; checked-tree binary inventory also required")
-    if not complete_cli_registration(manifest, expected_cli):
+    trusted_cli_build = complete_cli_source_provenance(manifest, head, tree)
+    if not complete_cli_registration(manifest, expected_cli, trusted_build=trusted_cli_build):
         blockers.append("checked-tree CLI executable commands/aliases inventory is missing or differs")
     if not complete_cli_alias_semantics(manifest, expected_cli, head):
         blockers.append("CLI alias forms lack exact invocation and populated semantic receipts")
-    if not complete_cli_source_provenance(manifest, head, tree):
+    if not trusted_cli_build:
         blockers.append("CLI build/source provenance lacks independently qualified CI attestation")
     if missing_kinds or extra_kinds:
         blockers.append("claim-kind/view dependency equality failed")
@@ -922,7 +957,7 @@ def report(root, ledger_path, manifest_path=None):
         "checker_head": checker_head,
         "checker_tree": checker_tree,
         "checker_dirty": checker_dirty,
-        "ledger_sha256": sha256(ledger_path),
+        "ledger_sha256": ledger_digest,
         "inventory": {"pinned_cli": len(expected_cli), "pinned_get": len(ledger["get"]),
                       "pinned_non_get": len(ledger["operations"]), "source_routes": len(routes),
                       "source_claim_kinds_including_wildcard": len(kinds),
