@@ -33,6 +33,10 @@ single/group publication parity and unsupported second-table refusal. Current
 successor work counts and controls are UNRUN; this is not a measured improvement.
 The separate optional cost job failed link-minutes delivery/read/receipt evidence;
 no cause is attributed to this dormant source or the metadata walk.
+The first grouped source `ce5ccfb7e` failed its hosted producer before control
+execution: the new malformed-metadata refusal used an unimported bail macro.
+The current correction explicitly qualifies anyhow::bail; traversal, publication,
+controls and accounting assertions are unchanged. No grouped work result exists.
 
 ## Source and actual dependencies
 

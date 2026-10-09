@@ -253,7 +253,7 @@ impl PreparedPage {
                         "prepared output foreign keys unsupported"
                     );
                 }
-                _ => bail!("prepared malformed foreign-key metadata"),
+                _ => anyhow::bail!("prepared malformed foreign-key metadata"),
             }
             ensure!(
                 inventory.len() <= SCHEMA_TABLES,
