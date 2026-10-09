@@ -1,13 +1,23 @@
 # Admitted input and applied output: next bounded slice
 
 Status: first reviewable source slice, 2026-10-09, following plan `938933bcb`.
-The additive fixture and narrow input-budget method are authored; all controls
-are UNRUN. No local compiler, SQLite execution, load, collector, production
+The additive fixture and narrow input-budget method are authored. Current
+successor controls are UNRUN; earlier hosted outcomes stay at their tested heads. No local compiler, SQLite execution, load, collector, production
 registration or activation occurred. The asynchronous-catch-up claim remains open.
 The first hosted test producer on `59ee523dc` failed before any selected control:
 the native savepoint fixture passed a Savepoint where Runtime requires Transaction.
 Its correction uses an explicit nested savepoint on that managed outer transaction;
 failure-qualified cleanup remains a separate prerequisite, not a waived failure.
+At `442d6365a`, the hosted producer compiled and selected all fifteen names on
+merge `68246f099b7fea81462e4f134576e29677fc7b7c` (main `4f0e4787e`).
+Fourteen substantive controls failed setup because the fixture rejected Store's
+native TEMP write_clock; only the no-phase child entry passed. The accounting
+control did not reach measurement. Clippy separately rejected unused PENDING_BYTES.
+This fixture-only correction permits that unrelated TEMP table name/type while
+refusing every other TEMP object, including Installer/native/output shadows and
+TEMP triggers attached to main. A new control checks refusal before output/P DML,
+then publication after fresh validation. The quota SQL now uses PENDING_BYTES
+instead of the identical 2 MiB literal; limits and assertions are unchanged.
 
 ## Source and actual dependencies
 
@@ -25,7 +35,7 @@ a bare Connection fixture or edit a production Runtime.
 The earlier `ivm_prepared.rs` controls establish a useful fixture shape but
 are not an execution certificate for this slice.
 
-There is no named live PR/CI dependency for this work. #1981 closed unmerged
+PR #2143 supplies the current hosted dependency for this source slice. #1981 closed unmerged
 with no successor. Its former reactor owner and private source callback APIs
 are historical, not an installed current-main provider. PRIVATE writer `78`,
 checked reader `91`, and retained publication `d3ed` remain unadopted; their
@@ -97,7 +107,7 @@ and indexed next revision, never a cached process cursor or a replay from zero.
 
 ## Proposed limits to enforce and test
 
-Rows/bytes/fanout guards and boundary controls are authored, not executed.
+Rows/bytes/fanout guards and boundary controls await successful successor execution.
 Statement/VM ceilings remain an unexecuted accounting prerequisite; current
 metadata discovery must not be called qualified on result limits alone.
 
@@ -143,7 +153,7 @@ durable source fence or delete input.
 No unbounded shadow namespaces, retention scan or cleanup on GET/admission.
 No retained parent graph is needed for this one-output-per-input slice.
 
-## Real Store controls to author, all UNRUN
+## Real Store control obligations
 
 The authored test file is
 `crates/smallclaims/tests/ivm_admitted_applied_slice.rs`, with support under
@@ -212,9 +222,10 @@ post-success commit counter lines stay its owner’s. No st3 Runtime/constructor
 reactor, route, thread candidate, card or health-source hunk is reserved.
 
 The first source slice is the additive real-Store fixture and bounded-input
-page adapter above, ready for exact review against this pinned base. Fourteen
-normal tests (including the crash subprocess entry) and one named work-accounting
-prerequisite are authored, all UNRUN. With test-support that prerequisite requires
+page adapter above, ready for exact review against this pinned base. Fifteen
+normal tests (including the crash subprocess entry and TEMP-boundary control)
+and one named work-accounting prerequisite are authored. Current successor
+outcomes remain UNRUN; the failed 442 cohort is recorded above. With test-support that prerequisite requires
 positive traced statements and unchanged 128-statement/50,000-VM ceilings;
 without test-support its same-name twin fails explicitly rather than disappearing.
 The byte-bound control admits exactly one fitting reference while leaving the
@@ -242,4 +253,4 @@ cost and commit-inclusive hold/queue/CPU remain unmeasured. The strict
 work-accounting test may expose a needed metadata-cost
 correction; its assertions must not be waived or weakened. Native writer startup,
 supervisor/quarantine and actual work questions remain explicit before adoption.
-No live dependency or historical callback is invented to postpone the source step.
+Current PR checks supply the live dependency; no historical callback is invented.

@@ -201,7 +201,7 @@ impl Slice {
                        OR EXISTS(SELECT 1 FROM slice_output WHERE namespace=(SELECT namespace FROM ivm_install_roots WHERE view='{VIEW}') AND claim_id=NEW.id)
                        OR EXISTS(SELECT 1 FROM slice_limits WHERE id=1 AND
                        (retained_rows>=256 OR total_rows>=4096 OR
-                        retained_bytes>2097152-(8+octet_length(NEW.id)+octet_length(NEW.subject)+octet_length(NEW.kind)+octet_length(NEW.body)))));
+                        retained_bytes>{PENDING_BYTES}-(8+octet_length(NEW.id)+octet_length(NEW.subject)+octet_length(NEW.kind)+octet_length(NEW.body)))));
                    UPDATE slice_limits SET capturing=1 WHERE id=1;
                    {append}
                    INSERT INTO slice_images SELECT {revision},NEW.store_index,NEW.id,NEW.subject,NEW.kind,CAST(NEW.body AS BLOB),
@@ -304,10 +304,17 @@ impl Slice {
             schema(db)? == self.manifest.schema,
             "fixture schema lifetime changed"
         );
-        // Existing unqualified Installer helpers require an explicit no-TEMP-shadow precondition.
+        // Store::create_schema installs the unrelated TEMP write_clock table on its writer.
+        // Permit only that table name/type; it cannot shadow any Installer/native/image/output
+        // dependency. Every other TEMP object (including a trigger attached to main) refuses
+        // before unqualified Installer helpers run. This does not certify clock/schema VM cost.
         ensure!(
-            !db.query_row("SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema)", [], |r| r
-                .get::<_, bool>(0))?,
+            !db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema
+                 WHERE NOT(type='table' AND name='write_clock' AND tbl_name='write_clock'))",
+                [],
+                |r| r.get::<_, bool>(0)
+            )?,
             "fixture TEMP metadata is unsupported"
         );
         let position = self.installer.position(db, SOURCE)?;
@@ -960,6 +967,73 @@ fn page_row_bound_and_missing_image_never_skip_to_a_ready_prefix() -> Result<()>
         .map_err(anyhow::Error::msg)??;
     assert!(slice.capture().is_err());
     assert!(slice.ready_rows().is_err());
+    Ok(())
+}
+
+#[test]
+fn native_temp_clock_is_allowed_but_shadows_and_main_attached_temp_triggers_refuse() -> Result<()> {
+    let (_root, slice) = fixture()?;
+    {
+        let writer = slice.store.connection.write_background();
+        assert!(writer.query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema WHERE type='table' AND name='write_clock')",
+            [],
+            |r| r.get::<_, bool>(0)
+        )?);
+        slice.check(&writer)?;
+    }
+    append(&slice, "note/temp-boundary")?;
+    let page = slice.capture()?.reduce()?;
+    let before = slice.tuple()?;
+    for name in [
+        "ivm_install_sources",
+        "ivm_install_roots",
+        "ivm_install_jobs",
+        "ivm_install_journal",
+        "ivm_install_deferred",
+        "claims",
+        "slice_images",
+        "slice_output",
+        "slice_coverage",
+        "slice_limits",
+    ] {
+        {
+            let writer = slice.store.connection.write_background();
+            writer.execute_batch(&format!("CREATE TEMP TABLE {name}(unrelated INTEGER);"))?;
+        }
+        let error = slice
+            .publish(&page)
+            .expect_err("TEMP shadow must refuse publication");
+        assert!(format!("{error:#}").contains("fixture TEMP metadata is unsupported"));
+        assert_eq!(
+            slice.tuple()?,
+            before,
+            "no output/prefix work under shadow {name}"
+        );
+        {
+            let writer = slice.store.connection.write_background();
+            writer.execute_batch(&format!("DROP TABLE temp.{name};"))?;
+            slice.check(&writer)?;
+        }
+    }
+    {
+        let writer = slice.store.connection.write_background();
+        writer.execute_batch(
+            "CREATE TEMP TRIGGER slice_temp_output AFTER INSERT ON main.slice_output
+             BEGIN SELECT RAISE(ABORT,'TEMP trigger reached output DML'); END;",
+        )?;
+    }
+    let error = slice
+        .publish(&page)
+        .expect_err("TEMP main trigger must refuse publication");
+    assert!(format!("{error:#}").contains("fixture TEMP metadata is unsupported"));
+    assert_eq!(slice.tuple()?, before);
+    {
+        let writer = slice.store.connection.write_background();
+        writer.execute_batch("DROP TRIGGER temp.slice_temp_output;")?;
+    }
+    slice.publish(&page)?; // fresh metadata check, not a wake-based recovery of coverage
+    assert_eq!(slice.ready_rows()?.len(), 1);
     Ok(())
 }
 
