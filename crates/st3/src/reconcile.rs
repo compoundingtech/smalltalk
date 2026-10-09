@@ -35,6 +35,7 @@ use crate::store::Store;
 
 mod channel_recovery;
 mod placement;
+mod run_report;
 
 /// The actor of every attention request the reconciler raises.
 const RECONCILER_ACTOR: &str = "agent/st3/reconciler";
@@ -7011,6 +7012,25 @@ impl<R: RuntimeControl> Reconciler<R> {
                         // From the view the evaluation started with: a write it makes changes subjects
                         // it read, so the next pass evaluates it again and takes the new times.
                         due = crate::incremental::run_due(&run, now_ms());
+                        // Telling a run's reporter never holds the run back or fails it.
+                        match self.run_report(&run).and_then(|report| {
+                            report
+                                .map(|report| self.report_run(&run, &report, now_ms()))
+                                .transpose()
+                        }) {
+                            Ok(stalls_at) => {
+                                due = [due, stalls_at.flatten()].into_iter().flatten().min();
+                            }
+                            Err(error) => {
+                                if let Err(error) = self.record_fault(
+                                    &run.subject,
+                                    run_report::REPORT_FAULT_SCOPE,
+                                    Err(error),
+                                ) {
+                                    eprintln!("st3: run report for {}: {error:#}", run.subject);
+                                }
+                            }
+                        }
                         let evaluated = self.evaluate_active_mission_run(&run);
                         // Recovery is diagnostic too: admission and execution writes come first.
                         if (!first_readiness_pending(&run)
@@ -7072,7 +7092,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             .iter()
             .flatten()
             .filter(|((subject, scope), _)| match scope.as_str() {
-                "mission-run" | FIRST_READINESS_FAULT_SCOPE => !active.contains(subject),
+                "mission-run" | FIRST_READINESS_FAULT_SCOPE | run_report::REPORT_FAULT_SCOPE => {
+                    !active.contains(subject)
+                }
                 "step" => !active_steps.contains(subject),
                 _ => false,
             })
@@ -15812,6 +15834,7 @@ mod tests {
     mod ready_idle_wake;
     mod ref_watch_tests;
     mod rollout_tests;
+    mod run_report_tests;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
         use super::{NativeRuntime, RuntimeControl};

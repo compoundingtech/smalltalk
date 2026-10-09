@@ -1889,6 +1889,15 @@ struct MissionRunStartArgs {
     #[arg(long, value_name = "RUN")]
     #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     after: Option<String>,
+    /// Tell this agent when the run fails, is cancelled or stalls, replacing the mission's own
+    /// `report-to`. A run that sits 30 minutes without progress counts as stalled unless the
+    /// mission sets `stalled-after`.
+    #[arg(long, value_name = "AGENT")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
+    report_to: Option<String>,
+    /// Also tell the reporting agent when the run completes.
+    #[arg(long, requires = "report_to")]
+    report_completed: bool,
     /// Follow until finished or stopped; retry timeouts and wait up to 5min for an unreachable daemon.
     #[arg(long)]
     follow: bool,
@@ -6899,6 +6908,8 @@ async fn start_mission_run(
         &inputs,
         "run",
         after.as_deref(),
+        args.report_to.as_deref(),
+        args.report_completed,
     );
     if args.print_kdl {
         print!("{kdl}");
@@ -7190,6 +7201,8 @@ fn mission_run_intent(
     inputs: &BTreeMap<String, String>,
     mode: &str,
     after: Option<&str>,
+    report_to: Option<&str>,
+    report_completed: bool,
 ) -> String {
     let mut run = KdlNode::new("mission-run");
     run.entries_mut().push(KdlEntry::new(run_id));
@@ -7211,6 +7224,13 @@ fn mission_run_intent(
     }
     if let Some(after) = after {
         body.nodes_mut().push(kdl_node("after", [after]));
+    }
+    if let Some(report_to) = report_to {
+        body.nodes_mut().push(kdl_node("report-to", [report_to]));
+        if report_completed {
+            body.nodes_mut()
+                .push(kdl_node("report-completed", ["true"]));
+        }
     }
     run.set_children(body);
     publication_document(run)
@@ -27385,6 +27405,8 @@ mod tests {
                     &BTreeMap::new(),
                     "run",
                     None,
+                    None,
+                    false,
                 );
                 let intent = st3::graph::parse_intent(&kdl, "node").unwrap();
                 assert!(
@@ -27464,6 +27486,8 @@ mod tests {
             &BTreeMap::new(),
             "run",
             Some("mission-run/release/build/1"),
+            None,
+            false,
         );
         assert!(
             kdl.contains("after \"mission-run/release/build/1\""),
@@ -27477,6 +27501,79 @@ mod tests {
         assert_eq!(
             creation.after.as_deref(),
             Some("mission-run/release/build/1")
+        );
+    }
+
+    #[test]
+    fn mission_start_report_to_names_an_agent_and_completion_needs_one() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "missions",
+            "start",
+            "release/demo",
+            "--report-to",
+            "agent/ops/watcher",
+            "--report-completed",
+            "--as",
+            "person/operator",
+        ])
+        .unwrap();
+        let Command::Missions {
+            command: MissionViewCommand::Start(args),
+        } = cli.command
+        else {
+            panic!("the mission start command did not parse");
+        };
+        assert_eq!(args.report_to.as_deref(), Some("agent/ops/watcher"));
+        assert!(args.report_completed);
+        let kdl = mission_run_intent(
+            "release/demo/3",
+            "release/demo",
+            &"a".repeat(64),
+            Path::new("/work/demo"),
+            "person/operator",
+            &BTreeMap::new(),
+            "run",
+            None,
+            args.report_to.as_deref(),
+            args.report_completed,
+        );
+        let intent = st3::graph::parse_intent(&kdl, "node").unwrap();
+        let creation = intent.mission_runs["mission-run/release/demo/3"]
+            .creation
+            .as_ref()
+            .unwrap();
+        assert_eq!(creation.report_to.as_deref(), Some("agent/ops/watcher"));
+        assert!(creation.report_completed);
+
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "missions",
+                "start",
+                "release/demo",
+                "--report-completed",
+                "--as",
+                "person/operator",
+            ])
+            .is_err(),
+            "--report-completed means nothing without --report-to"
+        );
+        let person = mission_run_intent(
+            "release/demo/4",
+            "release/demo",
+            &"a".repeat(64),
+            Path::new("/work/demo"),
+            "person/operator",
+            &BTreeMap::new(),
+            "run",
+            None,
+            Some("person/ada"),
+            false,
+        );
+        assert_eq!(
+            st3::graph::parse_intent(&person, "node").unwrap_err().code,
+            "invalid-report-to"
         );
     }
 
@@ -30179,6 +30276,8 @@ mission "review" state="ready" {
                     workspace: root.path().to_path_buf(),
                     inputs: Vec::new(),
                     after: None,
+                    report_to: None,
+                    report_completed: false,
                     follow: false,
                     actor: "person/test".into(),
                     print_kdl: false,
@@ -30256,6 +30355,8 @@ mission "review" state="ready" {
                 workspace: starter_root.path().to_path_buf(),
                 inputs: Vec::new(),
                 after: None,
+                report_to: None,
+                report_completed: false,
                 follow: false,
                 actor: "person/test".into(),
                 print_kdl: false,
