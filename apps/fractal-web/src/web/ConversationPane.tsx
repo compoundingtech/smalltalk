@@ -49,6 +49,7 @@ export const ConversationPane = ({
     <div data-testid="conversation-history-host" style={{ flex: '1 1 0', minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
     <Transcript
       turns={state._tag === 'Observed' ? state.turns : []}
+      scrollToBottomKey={feed._tag === 'Observed' ? feed.value.lastSendId : undefined}
       title={agentName}
       sync={transcriptSyncStatus(observation, feed, now)}
       now={now}
@@ -73,7 +74,7 @@ export const ConversationPane = ({
     <LiveAgentTodos agentRef={agentRef} />
     {/* An unreadable conversation keeps its composer and draft; the binding names why sending waits. */}
     <div data-testid="conversation-composer-dock" style={{ flexShrink: 0, paddingBottom: spaceVars.lg }}>
-      <EmbraceComposer variant="C1" disabledReason={binding.disabledReason} />
+      <EmbraceComposer variant="C1" readingColumn disabledReason={binding.disabledReason} />
     </div>
     </EmbraceRuntimeProvider>
   </div>

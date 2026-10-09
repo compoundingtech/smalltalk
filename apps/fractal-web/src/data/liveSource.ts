@@ -572,6 +572,7 @@ export const liveSource = ({
     // owner-side read-after-send visibility, an absent row on even a later replace page proves
     // nothing: out-of-window Sent rows persist with their retained conversation's LRU lifetime.
     const pending = new Map<string, PendingSend>()
+    let lastSendId: string | undefined
     let painted = false
     let publishedItems: ConversationPage['items'] = []
     let changedFrom = Infinity
@@ -591,6 +592,7 @@ export const liveSource = ({
       } else changedFrom = Math.min(changedFrom, projection.changedFrom)
       return {
         items,
+        ...(lastSendId === undefined ? {} : { lastSendId }),
         hasOlder: timeline.hasOlder,
         change: { from: publishedItems, index: changedFrom },
         ...(timeline.observation === undefined ? {} : { observation: timeline.observation }),
@@ -651,6 +653,7 @@ export const liveSource = ({
       // Resend names mail the stream may already show, so its authoritative identity is
       // reconciled before any optimistic row can duplicate it.
       if (request._tag === 'Send') {
+        lastSendId = id
         pending.set(id, local)
         publishPending()
       }

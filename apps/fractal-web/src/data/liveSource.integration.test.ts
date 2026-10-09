@@ -129,7 +129,8 @@ class Gateway {
       if (action.type === 'message.send') {
         const count = this.messageActions.push(action)
         const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(action.idempotency_key)))
-        this.echoMessageId = `message/${[...hash.slice(0, 8)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`
+        const messageId = `message/${[...hash.slice(0, 8)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`
+        this.echoMessageId = messageId
         this.readyActions.add(count)
         for (let index = 0; index < this.actionArrivals.length;) {
           const waiter = this.actionArrivals[index]!
@@ -172,7 +173,7 @@ class Gateway {
           action_id: action.id,
           operation_id: 'operation/send',
           status: this.rejectSend ? 'rejected' : 'completed',
-          affected_ids: [this.echoMessageId],
+          affected_ids: [messageId],
           snapshot_id: snapshot.id,
         }
       } else if (action.type === 'terminal.attach') {
@@ -678,6 +679,82 @@ describe('optimistic conversation sends', () => {
           }] },
         })
       }),
+    ),
+  )
+
+  it.live('changes lastSendId only on new Send, retaining it through concurrent settlement, Retry and echo', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        const conversation = live.source.conversation(agent.id)
+        live.registry.mount(conversation)
+        yield* settle
+        expect(live.registry.get(conversation)).not.toHaveProperty('value.lastSendId')
+        const observed = () => {
+          const feed = live.registry.get(conversation)
+          if (feed._tag !== 'Observed') throw new Error('Expected an observed conversation')
+          return feed.value
+        }
+        const commands: (string | undefined)[] = []
+        let previous: string | undefined
+        yield* Effect.acquireRelease(
+          Effect.sync(() => live.registry.subscribe(conversation, (feed) => {
+            if (feed._tag !== 'Observed' || feed.value.lastSendId === previous) return
+            previous = feed.value.lastSendId
+            commands.push(previous)
+          })),
+          stop => Effect.sync(stop),
+        )
+        let releaseFirst!: () => void
+        gateway.sendGate = new Promise<void>((resolve) => { releaseFirst = resolve })
+        const firstSending = live.source.attachments!.send(request)
+        yield* Effect.promise(() => gateway.nextAction(1))
+        yield* settle
+        const first = observed().items[0]!
+        expect(observed().lastSendId).toBe(first.id)
+        let releaseSecond!: () => void
+        gateway.sendGate = new Promise<void>((resolve) => { releaseSecond = resolve })
+        const secondSending = live.source.attachments!.send(request)
+        yield* Effect.promise(() => gateway.nextAction(2))
+        yield* settle
+        const second = observed().items[1]!
+        expect(observed().lastSendId).toBe(second.id)
+        expect(observed().items).toMatchObject([
+          { id: first.id, sendState: { _tag: 'Pending' } },
+          { id: second.id, sendState: { _tag: 'Pending' } },
+        ])
+        gateway.rejectSend = true
+        releaseSecond()
+        yield* Effect.promise(() => secondSending)
+        expect(observed().items[1]).toMatchObject({ id: second.id, sendState: { _tag: 'Failed' } })
+        expect(observed().lastSendId).toBe(second.id)
+        expect(observed().items[0]).toMatchObject({ id: first.id, sendState: { _tag: 'Pending' } })
+        gateway.rejectSend = false
+        releaseFirst()
+        yield* Effect.promise(() => firstSending)
+        expect(observed().lastSendId).toBe(second.id)
+        let releaseRetry!: () => void
+        gateway.sendGate = new Promise<void>((resolve) => { releaseRetry = resolve })
+        const retrying = live.source.attachments!.send({
+          ...request, _tag: 'Resend', idempotencyKey: gateway.messageActions[1]!.idempotency_key,
+        })
+        yield* Effect.promise(() => gateway.nextAction(3))
+        yield* settle
+        expect(observed().items[1]).toMatchObject({ id: second.id, sendState: { _tag: 'Pending' } })
+        expect(observed().lastSendId).toBe(second.id)
+        releaseRetry()
+        yield* Effect.promise(() => retrying)
+        expect(observed().lastSendId).toBe(second.id)
+        gateway.mailEcho()
+        yield* settle
+        expect(observed().items.some(item => item.id === second.id)).toBe(false)
+        expect(observed().lastSendId).toBe(second.id)
+        yield* Effect.promise(() => live.source.attachments!.send(request))
+        yield* settle
+        const third = observed().items.at(-1)!
+        expect(observed().lastSendId).toBe(third.id)
+        expect(commands).toEqual([first.id, second.id, third.id])
+      }).pipe(Effect.scoped),
     ),
   )
 

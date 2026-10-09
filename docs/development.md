@@ -196,6 +196,10 @@ transcript rows, before later replies. Multiple own sends retain submission orde
 authoritative message-identity echo replaces the matching outbox row.
 Merging visits transcript and retained outbox timestamps at most once each per projection,
 using monotone insertion boundaries to preserve that order even if send times move backward.
+The source retains the newest new Send's identity as `lastSendId`, which the pane passes
+through as the kit's `scrollToBottomKey`. Settlement, echo and Retry keep that identity
+unchanged; only another new submission resumes following. The composer opts into the
+transcript's shared reading column without overriding the default placeholder or adding hints.
 Pending, Sent and Failed (reason plus disclosed detail) are rendered by kit A.
 Send failures use allowlisted human-readable explanations; raw diagnostics never enter row
 disclosures, composer help, status text or accessible names. Unclassified reasons use generic copy.

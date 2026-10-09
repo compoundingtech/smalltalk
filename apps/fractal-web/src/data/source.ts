@@ -123,6 +123,8 @@ export interface ConversationPage {
   readonly observation?: { readonly empty: boolean }
   /** Incremental boundary relative to this exact preceding projection. */
   readonly change?: { readonly from: readonly ConversationItem[]; readonly index: number }
+  /** Scroll command identity: retained until another new Send, never changed by Retry or echo. */
+  readonly lastSendId?: string
 }
 
 /** Independently granted operations; a broad action grant cannot authorize a message send. */

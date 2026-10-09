@@ -31,6 +31,8 @@ const source = vi.hoisted(() => ({
   now: 1000,
   runtimeItems: [] as NonNullable<ConversationRuntimeOptions['messages']>[],
   transcriptTurns: [] as (readonly TranscriptTurn[])[],
+  scrollToBottomKeys: [] as (string | undefined)[],
+  composerProps: [] as React.ComponentProps<typeof Kit.EmbraceComposer>[],
 }))
 
 vi.mock('../data/react.tsx', async () => {
@@ -58,7 +60,12 @@ vi.mock('@smalltalk/fractal-ui/assistant-ui', async importOriginal => {
     },
     Transcript: (props: React.ComponentProps<typeof Kit.Transcript>) => {
       source.transcriptTurns.push(props.turns)
+      source.scrollToBottomKeys.push(props.scrollToBottomKey)
       return <kit.Transcript {...props} />
+    },
+    EmbraceComposer: (props: React.ComponentProps<typeof Kit.EmbraceComposer>) => {
+      source.composerProps.push(props)
+      return <kit.EmbraceComposer {...props} />
     },
   }
 })
@@ -83,6 +90,8 @@ beforeEach(() => {
   source.now = 1000
   source.runtimeItems = []
   source.transcriptTurns = []
+  source.scrollToBottomKeys = []
+  source.composerProps = []
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true)
   // jsdom has no layout observers; the kit instantiates one while attaching scroll.
   // Test-environment sizing (react-aria renders every row) needs no measured entries.
@@ -173,6 +182,50 @@ describe('ConversationPane composition activation', () => {
       if (elementFromPoint === undefined) Reflect.deleteProperty(document, 'elementFromPoint')
       else Object.defineProperty(document, 'elementFromPoint', elementFromPoint)
     }
+  })
+  it('opts the composer into the shared reading column without overriding its placeholder', async () => {
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
+    await mount()
+    expect(source.composerProps.length).toBeGreaterThan(0)
+    expect(source.composerProps.every(props => props.readingColumn === true)).toBe(true)
+    expect(source.composerProps.every(props => props.placeholder === undefined)).toBe(true)
+  })
+
+  it('keeps the source-owned scroll command stable through settlement, echo and Retry until a new Send', async () => {
+    const first: ConversationItem = {
+      _tag: 'Text', id: 'pending/first', role: 'user', text: 'First send',
+      attachments: [], streaming: false, at: at(9), sendState: { _tag: 'Pending' },
+    }
+    const second: ConversationItem = { ...first, id: 'pending/second', text: 'Second send', at: at(10) }
+    const renderItems = async (items: readonly ConversationItem[], lastSendId?: string) => {
+      source.feed = { _tag: 'Observed', freshness: 'live', value: { items, lastSendId, hasOlder: false, observation: { empty: false } } }
+      await mount()
+    }
+    await renderItems(scenario)
+    expect(source.scrollToBottomKeys.at(-1)).toBeUndefined()
+    await renderItems([...scenario, first], first.id)
+    expect(source.scrollToBottomKeys.at(-1)).toBe(first.id)
+    await renderItems([...scenario, first, second], second.id)
+    expect(source.scrollToBottomKeys.at(-1)).toBe(second.id)
+    // Settling the newer send must not fall back to the older Pending row.
+    await renderItems([...scenario, first, { ...second, sendState: { _tag: 'Failed', reason: 'failed', detail: 'Unavailable' } }], second.id)
+    expect(source.scrollToBottomKeys.at(-1)).toBe(second.id)
+    await renderItems([...scenario, first, second], second.id)
+    expect(source.scrollToBottomKeys.at(-1)).toBe(second.id)
+    await renderItems([...scenario, { ...first, sendState: { _tag: 'Sent' } }, { ...second, sendState: { _tag: 'Sent' } }], second.id)
+    expect(source.scrollToBottomKeys.at(-1)).toBe(second.id)
+    await renderItems([...scenario, { ...first, id: 'timeline-entry/echo' }], second.id)
+    expect(source.scrollToBottomKeys.at(-1)).toBe(second.id)
+    // Retrying an older outbox row still does not issue a new scroll command.
+    await renderItems([...scenario, first], second.id)
+    expect(source.scrollToBottomKeys.at(-1)).toBe(second.id)
+    await renderItems([], second.id)
+    expect(source.scrollToBottomKeys.at(-1)).toBe(second.id)
+    const third = { ...second, id: 'pending/third' }
+    await renderItems([third], third.id)
+    expect(source.scrollToBottomKeys.at(-1)).toBe(third.id)
+    const changes = source.scrollToBottomKeys.filter((key, index, keys) => index === 0 || key !== keys[index - 1])
+    expect(changes).toEqual([undefined, first.id, second.id, third.id])
   })
   it('keeps runtime items and transcript turns stable for sixty idle clock, sync and no-op frame updates', async () => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
