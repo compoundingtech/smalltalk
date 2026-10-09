@@ -1,6 +1,7 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { Button, Tooltip, TooltipTrigger } from 'react-aria-components'
+import { useToolbar } from 'react-aria'
 import { surfaceVars as surface, textVars as ink, borderVars as border, accentVars as accent, statusVars as status, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
 import { Icon } from '../composition/Icons'
 import { ErrorOverlay, useErrorOverlaySurface } from '../composition/ErrorOverlay'
@@ -26,6 +27,8 @@ export function WorkLogV1({ turn, listStyle, renderCallDetail, previewCallDetail
   readonly onOpenOutput?: (call: WorkLogCall) => void
 }) {
   const overlayLayer = useErrorOverlaySurface()
+  const toolbar = React.useRef<HTMLDivElement>(null)
+  const { toolbarProps } = useToolbar({ 'aria-label': `${ariaLabel} controls`, orientation: 'vertical' }, toolbar)
   const settled = !turn.running && !turn.failed && !turn.interrupted && turn.foldable !== false
   const durationLabel = formatWorkDuration(turn.durationMs)
   const [open, setOpen] = React.useState(false)
@@ -38,11 +41,13 @@ export function WorkLogV1({ turn, listStyle, renderCallDetail, previewCallDetail
   const detail = [failedCommand, failedCall?.detail, turn.failureNote].filter((value, index, values) => value !== undefined && values.indexOf(value) === index).join('\n') || undefined
   const summaryContent = <><span {...stylex.props(styles.summaryLabel)}>{summary}</span>{Number.isFinite(started) && <time dateTime={new Date(started).toISOString()} {...stylex.props(styles.time)}>{timeFormat.format(started)}</time>}</>
   return <CallDetailRenderer.Provider value={renderCallDetail}><CallPresentation.Provider value={{ preview: previewCallDetail, interactive: interactiveCalls }}><section aria-label={ariaLabel} data-testid="work-log">
+    <div ref={toolbar} {...toolbarProps}>
     {turn.running && !hideLiveRow && <div data-testid="live-work" role="status" aria-label="Response in progress" {...stylex.props(styles.live)}><Icon name="spinner" spinning /><span>Working</span></div>}
     {interactiveCalls ? <Button isDisabled={!settled} aria-expanded={!settled || open} onPress={() => setOpen(value => !value)} {...stylex.props(styles.summary, failed && styles.failureInk)}><Icon name={!settled || open ? 'chevron-down' : 'chevron-right'} size={12} />{summaryContent}</Button> : <div {...stylex.props(styles.summary, styles.staticCall, failed && styles.failureInk)}>{summaryContent}</div>}
     {(!interactiveCalls || !settled || open) && <><div {...stylex.props(styles.list, listStyle)}>{turn.calls.map(call => <TimelineCall key={call.id} call={call} />)}</div>{expandedBody}<hr data-testid="work-log-divider" {...stylex.props(styles.divider)} /></>}
     {failed && (overlayLayer !== null ? <ErrorOverlay id={`work-failure-${turn.calls[0]?.id ?? 'turn'}`} title={failedCommand === undefined ? 'Run failed.' : 'Command did not complete'} detail={detail} onRetry={onRetry} onOpenOutput={failedCall === undefined || onOpenOutput === undefined ? undefined : () => onOpenOutput(failedCall)} /> : <div role="alert" {...stylex.props(styles.promoted, styles.failed)}><Icon name="x" size={14} /><span>{failedCall?.detail ?? turn.failureNote ?? 'Run failed.'}</span></div>)}
     {turn.interrupted && <div {...stylex.props(styles.promoted)}><Icon name="stop" size={14} /><span>Run interrupted.</span></div>}
+    </div>
   </section></CallPresentation.Provider></CallDetailRenderer.Provider>
 }
 function TimelineCall({ call }: { call: WorkLogCall }) {
