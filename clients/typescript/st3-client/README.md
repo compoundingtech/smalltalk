@@ -5,6 +5,8 @@
 The package exports TypeScript source with explicit `.ts` relative import specifiers. NodeNext
 consumers use `allowImportingTsExtensions` for no-emit checking, or
 `rewriteRelativeImportExtensions` when emitting JavaScript.
+The generated source uses erasable TypeScript syntax, and the package type checks enforce
+`erasableSyntaxOnly` for both the raw client and rich schemas.
 
 The client uses standard `fetch`, so callers can supply a fetch implementation and a credential callback. Call `discover()` before rendering capability-dependent controls. List and event limits are checked against the server's advertised bounds. Submit fenced actions with the generated typed methods, then use `followOperation(operation_id)` for accepted actions. `terminalStream` opens the screen stream a `terminal.attach` capability allows and calls `onScreen` with each changed screen; it needs a WebSocket that accepts headers, such as React Native's, or a `socket` factory. `collectionStream` opens the one collections socket: `subscribe` holds a window of missions, attention, agents, or work, `subscribeTerminal` follows a terminal with its attach capability, and `subscribeConversation` follows an agent's or a session's conversation, each by a client-chosen ID; `onFrame` receives every frame. `applyWindow` folds `snapshot` and `changes` frames into a window's ordered rows. Commands sent before the socket opens wait for it.
 
