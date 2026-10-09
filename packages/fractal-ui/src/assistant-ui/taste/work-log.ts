@@ -1,5 +1,6 @@
 /** Controlled presentation types for the work log. */
 import type { ConversationItem } from '../embrace-data/model'
+import { toolOutput } from '../embrace-tool-preview'
 export type WorkKind = 'read' | 'run' | 'edit'
 export interface WorkLogCall {
   readonly id: string
@@ -67,7 +68,7 @@ export function workLogTurnFromItems(items: readonly ConversationItem[], facts: 
     return [{
       id: call.id, kind, title: call.name, argsSummary: summarizeArgs(call.input),
       status: call.status, startedAt: call.at, endedAt: call.result?.at,
-      detail: typeof call.result?.content === 'string' ? call.result.content : undefined,
+      detail: toolOutput(call.result?.content) || undefined,
       outputLanguage: (media === undefined ? undefined : outputMediaLanguages[media]) ?? (kind === 'run' ? 'bash' : kind === 'read' ? extension : undefined),
       changedPath: kind === 'edit' && call.callSeen && call.status === 'success' ? path : undefined,
     }]
