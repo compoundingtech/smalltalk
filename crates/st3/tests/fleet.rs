@@ -2019,6 +2019,7 @@ async fn a_removed_member_is_refused() {
     let status = b.st_json(&["replication", "status"]);
     assert_eq!(status["removed"]["code"], "member-removed", "{status}");
     let doctor = b.st(&["--json", "doctor"]);
+    assert!(!doctor.status.success(), "a retained removal must fail doctor");
     let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
     let check = report["checks"]
         .as_array()

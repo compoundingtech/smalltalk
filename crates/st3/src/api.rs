@@ -74,6 +74,7 @@ mod mail_backlog;
 mod read_deadline;
 mod owned_sets;
 mod request_latency;
+mod retained_removal;
 mod terminal_view;
 mod work_response;
 
@@ -6730,7 +6731,6 @@ fn current_doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiErro
         "runtime-drift",
         "driver-readiness",
         "graph-references",
-        "replication",
         "shared-projections",
         "fleet-admission",
         "idempotency-keys",
@@ -6746,6 +6746,11 @@ fn current_doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiErro
         checks.push(DoctorCheck { name: name.into(), status: "unknown".into(),
             message: "evidence incomplete; a current invariant has not been certified; this read does not start an audit".into() });
     }
+    checks.push(retained_removal::check(
+        &state.state_dir,
+        &state.node,
+        state.fleet_id.as_deref(),
+    ));
     checks.push(match crate::disk::disk_space(&state.state_dir) {
         Ok(space) => DoctorCheck {
             name: "disk-space".into(),
@@ -19234,6 +19239,97 @@ agent "good" {{ workspace {:?}; command "true" }}
                 frontier
             );
         }
+    }
+
+    #[test]
+    fn doctor_retained_removal_fails_without_sql_or_read_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        let fleet_id = "3b241101-e2bb-4255-8caf-4136c566a962";
+        state.fleet_id = Some(fleet_id.into());
+        crate::fleet::FleetFile {
+            fleet_id: fleet_id.into(),
+            node: Some(state.node.clone()),
+            removed: Some(crate::fleet::FleetRemoval {
+                code: "member-removed".into(),
+                reported_by: "alder".into(),
+            }),
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        let settings_path = crate::fleet::FleetFile::path(root.path());
+        let settings_before = fs::read(&settings_path).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for size in [0, 1000] {
+            for number in 0..size {
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: format!("resource/removal-growth/{number}"),
+                        kind: "resource.observed".into(),
+                        actor: None,
+                        fields: BTreeMap::from([("kind".into(), json!("vcs.pull-request"))]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            }
+            let index = state.store.index().unwrap();
+            let frontier = state
+                .store
+                .seeded_batch_rowid
+                .load(std::sync::atomic::Ordering::Acquire);
+            crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+            let check =
+                retained_removal::check(&state.state_dir, &state.node, state.fleet_id.as_deref());
+            assert_eq!(crate::store::STATEMENTS_RUN.with(std::cell::Cell::get), 0);
+            assert_eq!(check.status, "fail");
+            let started = Instant::now();
+            let (status, response) =
+                runtime.block_on(get_request(router(state.clone()), "/v1/doctor"));
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(response["status"], "fail");
+            let replication = response["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["name"] == "replication")
+                .unwrap();
+            assert_eq!(replication["status"], "fail");
+            assert!(
+                replication["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("st fleet leave --offline")
+            );
+            assert!(serde_json::to_vec(replication).unwrap().len() < 1024);
+            assert!(started.elapsed() < Duration::from_millis(250));
+            assert_eq!(state.store.index().unwrap(), index);
+            assert_eq!(
+                state
+                    .store
+                    .seeded_batch_rowid
+                    .load(std::sync::atomic::Ordering::Acquire),
+                frontier
+            );
+            assert_eq!(fs::read(&settings_path).unwrap(), settings_before);
+        }
+        crate::fleet::FleetFile::remove(root.path()).unwrap();
+        let (_, response) = runtime.block_on(get_request(router(state.clone()), "/v1/doctor"));
+        assert_eq!(
+            response["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["name"] == "replication")
+                .unwrap()["status"],
+            "unknown"
+        );
     }
 
     /// Two members apart, as during a partition, can each accept the same idempotency key for

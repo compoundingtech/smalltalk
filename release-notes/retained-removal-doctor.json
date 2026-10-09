@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Doctor preserves a retained local fleet-removal failure without scanning or sealing on read.",
+  "replay": {"status": "none", "detail": "No diagnostic replay, initialization or report job."},
+  "schema": {"status": "none", "detail": "No database, migration or persisted-format change."},
+  "rules": {"status": "none", "detail": "The existing signed-refusal writer and current-key/leave guards are unchanged."},
+  "compatibility": {"status": "changed", "detail": "A bounded, current local removed/left settings marker makes the existing replication Doctor check fail and the existing CLI exit nonzero. Missing, stale, malformed, oversized or unsupported evidence stays unknown. This does not certify graph health or change strict CLI policy."},
+  "downtime": {"status": "unknown", "detail": "No lifecycle change; runtime and filesystem latency are not qualified by source or byte caps."},
+  "manual": {"status": "none", "detail": "Existing offline-leave advice is preserved; no new action or probe is required."},
+  "recovery": {"status": "none", "detail": "The existing leave/rejoin path clears the marker; absence remains unknown. No diagnostic mutation."}
+}
