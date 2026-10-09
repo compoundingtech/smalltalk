@@ -27505,11 +27505,11 @@ mod tests {
         );
         assert_eq!(
             contract["purposes"]["attention"]["human_example"],
-            "st attention ls --as person/alex"
+            "st alerts ls --as person/alex"
         );
         assert_eq!(
             contract["purposes"]["attention"]["json_example"],
-            "st attention ls --as person/alex --json"
+            "st alerts ls --as person/alex --json"
         );
     }
 
