@@ -304,6 +304,72 @@ checks Retry reuses the key, and prints build revision, seat and timings. The ne
 removes the submit binding and proves the send criterion rejects it without issuing mail.
 Both commands skip all live activity when the one-minute `/proc/loadavg` value is 32 or higher.
 
+## Fractal web arrangement edits
+
+The Sidebar first adopts the live reserved subject
+`arrangement/<owner>/00000000-0000-7000-8000-000000000001`, regardless of its name.
+Without it, the owner's lowest-UUIDv7 live legacy arrangement named exactly `Sidebar`
+wins. Multiple legacy candidates are named in a non-blocking note; there is no chooser
+or automatic consolidation.
+`apps/fractal-web/src/folders/edit.ts` exports `sidebarOperations` and the memory-only
+editor; the live `folders` atom exposes `edit(operations)` and `retryEdit()`. The kit can
+bind its edit/DnD controls to that seam without translating through legacy folder stamps.
+The current Tree has no folder menu or rename field; this change adds affected-row refusal
+feedback and an explicit retry control, not a second DnD implementation.
+
+Folder creation, rename, move/reorder and deletion map to `folder.create`, `folder.rename`,
+`folder.move` and `folder.delete`. Agent move/reorder/unfile maps to `subject.place`; the
+caller supplies its canonical fractional key and can include required rekeys atomically.
+Sidebar creation is managed internally: only a user's first edit without an adopted
+Sidebar includes `create` with name `Sidebar`, targeting the reserved subject shared
+by concurrent clients. Complete owner inventory reads precede submission; uncertain
+creation replies replay the same action and subject, never a random replacement.
+An acknowledged creation stays guarded until a complete inventory observes its subject.
+A native rename preserves reserved identity. Retirement is terminal: once observed or
+refused by the server, the session shows an empty Sidebar with unavailable Restore and
+never sends another create. New sessions learn invisible retired subjects from admission
+refusals because the current list exposes only live rows. `arrangement-exists` refreshes
+and adopts a live Sidebar, but applying the refused edit requires explicit retry.
+Renaming or retiring the arrangement itself is not offered by this folder editing seam.
+
+Actions use the SDK HTTP `snapshot`/`submitAction` port and the generated action contract.
+Optimistic registers appear synchronously and roll back to the newest complete inventory
+on refusal. Typed daemon codes and complete envelopes are preserved; uncoded transport
+failures, rejected acknowledgements without reasons and future codes stay explicitly
+Unknown in structured data. A stale fence refetches snapshot and inventory but never silently retries.
+Unknown delivery retries retain the original action identity, parameters and key.
+An uncertain edit is refused rather than replayed when its original subject is no longer
+the adopted Sidebar, including when the refreshed inventory has no winner.
+An authoritative action refusal or rejected acknowledgement is definitely non-applied:
+explicit retry prepares against the freshly adopted Sidebar, with a new identity/key if
+the target or operations change. This includes retrying a refused reserved create against
+a later-visible legacy Sidebar. A new explicit edit replaces a finished failed attempt,
+but never silently replays its operations; every submission still refreshes its fence.
+Snapshot refusal alone does not establish the delivery outcome of a previous action.
+Complete native inventories retain the first page's snapshot frontier. Older responses
+from the same host and projection cannot replace a newer accepted inventory, even when
+a subscription read completes after the editor's post-submit read.
+Concurrent editor/subscription inventory reads use generated clients bound permanently
+to each read's AbortSignal. They share capability discovery, but refreshing a subscription
+cannot abort an editor request or leave the abandoned subscription request uncancelled.
+Refused request labels remain as ephemeral target-specific rows outside normal filtering,
+with explicit retry, without reinserting rolled-back folders into the authoritative document.
+Visible refusal feedback is one plain sentence with an actionable next step for known
+arrangement errors, or “The change was not saved.” for other cases. Server detail and raw
+codes never appear in that copy; `data-wf-refusal-reason` and `data-wf-refusal-code` retain
+diagnostics for tests on both the affected-row and ephemeral-target feedback.
+Native root/unfiled ordering uses placement keys and a deterministic subject tie-break;
+subjects without placements follow keyed roots. Non-manual view sorts stay independent.
+No folder-edit state is written to localStorage, IndexedDB or another client store.
+`control.arrangements` must be granted separately from the arrangement read capability.
+
+```sh
+CI=1 pnpm --dir apps/fractal-web exec vitest run src/folders/edit.unit.test.ts src/folders/sidebar.unit.test.ts src/shell/AgentFolders.unit.test.tsx
+CI=1 pnpm --dir apps/fractal-web exec vitest run src/folders/inventory-frontier.unit.test.ts src/folders/edit.lifecycle.unit.test.ts src/folders/root-order.unit.test.ts src/shell/AgentFolders.edit-refusal.unit.test.tsx
+CI=1 pnpm --dir apps/fractal-web exec vitest run src/data/inventory-transport.unit.test.ts
+pnpm --filter fractal-web typecheck
+```
+
 ## Fractal web roster lifecycle
 
 The generated client-v0 `Agent` schema models lifecycle as an optional open enum:

@@ -12,7 +12,7 @@ import { scale, tokens } from '../../ui-compat/tokens.stylex.ts'
 import { fixtureSource } from '../../data/fixtureSource.ts'
 import { DataSourceProvider, useSubjectList } from '../../data/react.tsx'
 import { fixtureProjections } from '../../fixtures/projections.ts'
-import { createFolder, place, type FolderOp } from '../../folders/core.mts'
+import type { SidebarOperation } from '../../folders/edit.ts'
 import { fixtureFolders } from '../../folders/fixture.ts'
 import { SubjectAddress } from '../../resources/contract.ts'
 import { AgentFolders } from '../AgentFolders.tsx'
@@ -79,25 +79,18 @@ const treeWorld = {
     }),
   ],
 }
-/** Same CRDT document and projection as live Fractal; four nesting levels, multiple hosts. */
-const folderOps = (refs: readonly string[]): readonly FolderOp[] => [
-  createFolder('product', 'Product', null, 'V', [1, 0, 'fixture']),
-  createFolder('webfractal', 'webfractal', 'product', 'V', [2, 0, 'fixture']),
-  createFolder('interface', 'Interface', 'webfractal', 'V', [3, 0, 'fixture']),
-  createFolder('review', 'Review', 'interface', 'V', [4, 0, 'fixture']),
-  createFolder('infra', 'Infrastructure', null, 'W', [5, 0, 'fixture']),
-  ...refs
-    .slice(0, 8)
-    .map((ref, index) =>
-      place(
-        ref,
-        ['interface', 'review', 'webfractal', 'product', 'infra', 'infra', 'interface', 'review'][
-          index
-        ]!,
-        String.fromCharCode(86 + index),
-        [10 + index, 0, 'fixture'],
-      ),
-    ),
+/** Same native arrangement projection as live Fractal; four nesting levels, multiple hosts. */
+const folderOps = (refs: readonly string[]): readonly SidebarOperation[] => [
+  { op: 'folder.create', id: 'product', name: 'Product', parent: null, key: 'V' },
+  { op: 'folder.create', id: 'webfractal', name: 'webfractal', parent: 'product', key: 'V' },
+  { op: 'folder.create', id: 'interface', name: 'Interface', parent: 'webfractal', key: 'V' },
+  { op: 'folder.create', id: 'review', name: 'Review', parent: 'interface', key: 'V' },
+  { op: 'folder.create', id: 'infra', name: 'Infrastructure', parent: null, key: 'W' },
+  ...refs.slice(0, 8).map((ref, index): SidebarOperation => ({
+    op: 'subject.place', subject: ref,
+    folder: ['interface', 'review', 'webfractal', 'product', 'infra', 'infra', 'interface', 'review'][index]!,
+    key: String.fromCharCode(86 + index),
+  })),
 ]
 const TreeSurface = ({ narrow = false }: { readonly narrow?: boolean }) => {
   const subjects = useSubjectList()

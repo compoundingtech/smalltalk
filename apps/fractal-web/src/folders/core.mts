@@ -362,8 +362,10 @@ export const wouldCycle = (doc: FolderDoc, id: FolderId, parent: FolderId | null
   }
   return false
 }
-/** Live subjects must each be listed once. Unfiled subjects retain the caller's order. */
-export const project = (doc: FolderDoc, live: Iterable<AgentSubject>): Projection => {
+/** Legacy roots retain caller order; native arrangements opt into key/subject ordering. */
+export const project = (doc: FolderDoc, live: Iterable<AgentSubject>, { rootOrder }: {
+  readonly rootOrder?: 'placement'
+} = {}): Projection => {
   const children = new Map<FolderId | null, FolderId[]>()
   for (const [id, parent] of drawnParents(doc)) {
     let siblings = children.get(parent)
@@ -382,6 +384,13 @@ export const project = (doc: FolderDoc, live: Iterable<AgentSubject>): Projectio
       placements.push([placement.key, agent])
     }
   }
+  if (rootOrder === 'placement') unfiled.sort((left, right) => {
+    const a = own(doc.placements, left)
+    const b = own(doc.placements, right)
+    if (a === undefined) return b === undefined ? compareString(left, right) : 1
+    if (b === undefined) return -1
+    return compareString(a.key, b.key) || compareString(left, right)
+  })
   const subtree = (parent: FolderId | null): ProjectedFolder[] => (children.get(parent) ?? [])
     .sort((a, b) => compareString(positionKey(doc, a), positionKey(doc, b)) || compareString(a, b))
     .map((id) => ({

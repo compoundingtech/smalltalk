@@ -31,6 +31,7 @@ import {
 import type { Feed, Fleet } from '../data/source.ts'
 import { folders } from '../folders/client.ts'
 import { liveAncestor, project, type ProjectedFolder } from '../folders/core.mts'
+import { refusalText } from '../folders/edit.ts'
 import { fixtureFolders } from '../folders/fixture.ts'
 import { WfIcon } from '../icons/WfIcon.tsx'
 import { SubjectAddress } from '../resources/contract.ts'
@@ -201,8 +202,7 @@ export const AgentFolders = React.memo(
   }) => {
     const source = useDataSource()
     const snapshot = useAtomValue(source.mode === 'fixtures' ? fixtureFolders : folders)
-    // This build renders folders read-only; edit notices stay empty until a later layer restores writes.
-    const [notice] = React.useState('')
+    const editRefusal = snapshot.refusal
     const stateAtoms = (source.mode === 'fixtures' ? fixtureSidebarState : sidebarState)(
       source.gateway ?? source.mode,
     )
@@ -230,6 +230,7 @@ export const AgentFolders = React.memo(
     const view = project(
       doc,
       workspaces.map((workspace) => workspace.id),
+      { rootOrder: 'placement' },
     )
     const folderViews = new Map<string, ProjectedFolder>()
     const parents = new Map<string, string | null>()
@@ -407,6 +408,7 @@ export const AgentFolders = React.memo(
                 </span>
               </span>
               <span {...stylex.props(styles.folderCount)}>{count}</span>
+              <ArrangementEditFeedback target={folder.id} />
             </div>
           )}
         </TreeItemContent>
@@ -516,6 +518,26 @@ export const AgentFolders = React.memo(
           update={setFilters}
           hosts={[...new Set(workspaces.map((workspace) => workspace.host))].toSorted()}
         />
+        {(snapshot.sidebarCandidates?.length ?? 0) > 1 ? (
+          <div role="note" aria-label="Multiple legacy Sidebars" {...stylex.props(styles.notice)}>
+            <p>Multiple legacy Sidebars were found. The lowest UUID is used unless the reserved Sidebar is present.</p>
+            <ul>
+              {snapshot.sidebarCandidates?.map((candidate) => (
+                <li key={candidate.id}>
+                  {candidate.label}{candidate.id === snapshot.sidebarSubject ? ' · Currently used' : ''}
+                </li>
+              ))}
+            </ul>
+            {snapshot.sidebarSubject === undefined ? null : <p>Currently used Sidebar: {snapshot.sidebarSubject}</p>}
+          </div>
+        ) : null}
+        {snapshot.restoreUnavailable ? (
+          <div role="status" aria-label="Removed Sidebar" {...stylex.props(styles.notice)}>
+            <p>Sidebar removed.</p>
+            <p>Restoring a removed Sidebar is not available yet.</p>
+            <Button size="sm" variant="secondary" isDisabled>Restore</Button>
+          </div>
+        ) : null}
         <AgentFolderTree
           items={collectionCache.items}
           expanded={expanded}
@@ -523,6 +545,25 @@ export const AgentFolders = React.memo(
           layout={layout}
           treeRef={treeRef}
         />
+        {editRefusal?.attemptedTargets?.map((target) => (
+          <div
+            key={target.id}
+            data-wf-refused-folder={target.kind === 'folder' ? target.id : undefined}
+            data-wf-refused-agent={target.kind === 'agent' ? target.id : undefined}
+            data-wf-refusal-reason={editRefusal.reason._tag}
+            data-wf-refusal-code={editRefusal.reason.code}
+            role="status"
+            {...stylex.props(styles.notice)}
+          >
+            <strong>{target.kind === 'agent' ? rows.get(target.id)?.workspace.title ?? target.label : target.label}</strong>
+            {' '}{refusalText(editRefusal)}{' '}
+            {snapshot.retryEdit !== undefined ? (
+              <Button size="sm" variant="secondary" isDisabled={snapshot.restoreUnavailable === true} onPress={() => { void snapshot.retryEdit?.() }}>
+                {snapshot.retryReady ? 'Retry edit' : 'Refresh for retry'}
+              </Button>
+            ) : null}
+          </div>
+        ))}
         <RevealSelectedAgent
           selection={selection}
           layout={layout}
@@ -547,7 +588,7 @@ export const AgentFolders = React.memo(
           {snapshot.phase === 'fixture' ? (
             'Fixture folders · local preview'
           ) : snapshot.phase === 'synced' ? (
-            snapshot.readOnly ? snapshot.detail : notice
+            snapshot.detail
           ) : snapshot.phase === 'pending' ? (
             'Syncing folder edits…'
           ) : snapshot.phase === 'connecting' ? (
@@ -555,13 +596,15 @@ export const AgentFolders = React.memo(
           ) : (
             <>
               {snapshot.detail}{' '}
-              <Button
-                size="sm"
-                variant="secondary"
-                {...(snapshot.retry === undefined ? {} : { onPress: snapshot.retry })}
-              >
-                Retry
-              </Button>
+              {snapshot.retryEdit !== undefined ? (
+                <Button size="sm" variant="secondary" isDisabled={snapshot.restoreUnavailable === true} onPress={() => { void snapshot.retryEdit?.() }}>
+                  {snapshot.retryReady ? 'Retry edit' : 'Refresh for retry'}
+                </Button>
+              ) : (
+                <Button size="sm" variant="secondary" {...(snapshot.retry === undefined ? {} : { onPress: snapshot.retry })}>
+                  Refresh
+                </Button>
+              )}
             </>
           )}
         </div>
@@ -893,12 +936,24 @@ const AgentFolderRow = React.memo(
                 </div>
               </RenderProfiler>
             </AgentUsageRow>
+            <ArrangementEditFeedback target={workspace.id} />
           </>
         )}
       </CurrentAgent>
     )
   },
 )
+
+/** Keyed feedback subscribes independently of the Tree's cached collection elements. */
+export const ArrangementEditFeedback = ({ target }: { readonly target: string }) => {
+  const source = useDataSource()
+  const refusal = useAtomValue(source.mode === 'fixtures' ? fixtureFolders : folders,
+    (snapshot) => snapshot.refusal?.targets.includes(target) ? snapshot.refusal : undefined)
+  if (refusal === undefined) return null
+  return (
+    <span role="status" data-wf-refusal-reason={refusal.reason._tag} data-wf-refusal-code={refusal.reason.code} {...stylex.props(styles.notice)}>{refusalText(refusal)}</span>
+  )
+}
 
 /** Only the previous and next selected rows subscribe to the window's current agent. */
 const CurrentAgent = ({

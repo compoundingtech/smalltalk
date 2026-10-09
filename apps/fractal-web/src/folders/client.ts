@@ -63,18 +63,25 @@ export const createFoldersClient = (gateway: ArrangementsGateway, selection: Sel
   }
 }
 
-// Sidebar adapter is read-only. Generated arrangements stay authoritative; this document is
-// only the existing Tree's presentation shape, never a legacy replica or an edit input.
+// Generated arrangements are authoritative. FolderDoc is only the Tree's presentation shape.
 import * as Atom from 'effect/reactivity/Atom'
 import type { CollectionSocketFactory } from '@smalltalk/st3-client'
-import { followArrangementInventory, sidebarWinner, st3InventoryGateway, type ArrangementInventoryGateway, type InventoryFollow } from '../data/arrangements.ts'
-import { emptyDoc, type FolderDoc, type FolderOp, type Stamp } from './core.mts'
+import { arrangementActions, type ArrangementActionPort } from '@st3/sdk/effect'
+import { followArrangementInventory, readArrangementInventory, reservedSidebarSubject, sidebarCandidates, sidebarWinner, st3InventoryGateway, type ArrangementInventoryGateway, type InventoryFollow } from '../data/arrangements.ts'
+import { emptyDoc, type FolderDoc, type Stamp } from './core.mts'
+import { createArrangementEditor, refusalText, type ArrangementEditor, type ArrangementRefusal, type EditOutcome, type SidebarOperation } from './edit.ts'
 export interface FolderState {
   readonly doc: FolderDoc
   readonly phase: 'fixture' | 'connecting' | 'synced' | 'pending' | 'unavailable'
   readonly detail?: string
   readonly readOnly?: boolean
-  readonly edit: (operations: readonly FolderOp[]) => void
+  readonly refusal?: ArrangementRefusal
+  readonly sidebarCandidates?: readonly { readonly id: string; readonly label: string }[]
+  readonly sidebarSubject?: string
+  readonly restoreUnavailable?: boolean
+  readonly edit: (operations: readonly SidebarOperation[]) => Promise<EditOutcome>
+  readonly retryEdit?: () => Promise<EditOutcome>
+  readonly retryReady?: boolean
   readonly retry?: () => void
 }
 export const arrangementSidebarDoc = (arrangement: Arrangement): FolderDoc => {
@@ -89,78 +96,112 @@ export const arrangementSidebarDoc = (arrangement: Arrangement): FolderDoc => {
       [subject, { ...placement.value, at: at(placement.revision) }])),
   }
 }
-export type SidebarGateway = ArrangementInventoryGateway & Pick<St3Client, 'discover'>
+export type SidebarGateway = ArrangementInventoryGateway & Pick<St3Client, 'discover'> & {
+  readonly actions: ArrangementActionPort
+}
 /**
- * The discovered person's live Sidebar: the owner's lowest-UUIDv7 arrangement, taken from a
- * complete owner inventory that every owner-wide arrangements frame re-reads.
+ * The discovered person's winning Sidebar. The complete inventory drives both the
+ * projection and the edit target; serialized edits never create a second Sidebar.
  */
 export const sidebarFolders = ({ gateway, socket }: {
   readonly gateway: () => SidebarGateway
-  /** Test seam for the collections WebSocket. */
   readonly socket?: CollectionSocketFactory
 }): Atom.Atom<FolderState> => Atom.make((get): FolderState => {
   const client = gateway()
   let active = true
   let follow: InventoryFollow | undefined
+  let editor: ArrangementEditor | undefined
   let doc = emptyDoc()
-  // Winner ID plus body text: an unchanged reread keeps the Tree's document identity.
   let shown: string | undefined
-  let current: Pick<FolderState, 'phase' | 'detail'> = { phase: 'connecting' }
-  const edit = () => { throw new Error('Arrangement sidebar is read-only; edits are unavailable.') }
+  let reservedObserved = false
+  let current: FolderState
   let starting = false
+  const edit = (operations: readonly SidebarOperation[]): Promise<EditOutcome> =>
+    current.restoreUnavailable ? Promise.resolve({
+      _tag: 'Refused', reason: { _tag: 'Unknown' }, detail: 'Restoring a removed Sidebar is not available yet.', targets: [],
+    }) : editor?.edit(operations) ?? Promise.resolve({
+      _tag: 'Refused', reason: { _tag: 'Unknown' }, detail: 'A granted, complete owner inventory is required before editing.', targets: [],
+    })
   const retry = () => { if (follow !== undefined) follow.refresh(); else if (!starting) void start() }
-  const publish = (phase: FolderState['phase'], detail: string, next = doc) => {
-    if (!active || (next === doc && phase === current.phase && detail === current.detail)) return
-    doc = next
-    current = { phase, detail }
-    get.setSelf({ doc, phase, detail, readOnly: true, edit, retry })
+  const publish = (next: FolderState) => {
+    if (!active) return
+    if (next.doc === current.doc && next.phase === current.phase && next.detail === current.detail &&
+      next.refusal === current.refusal && next.retryEdit === current.retryEdit && next.retryReady === current.retryReady && next.readOnly === current.readOnly &&
+      next.sidebarSubject === current.sidebarSubject && next.restoreUnavailable === current.restoreUnavailable &&
+      (next.sidebarCandidates === current.sidebarCandidates || (next.sidebarCandidates?.length === current.sidebarCandidates?.length &&
+        next.sidebarCandidates?.every((candidate, index) => candidate.id === current.sidebarCandidates?.[index]?.id && candidate.label === current.sidebarCandidates?.[index]?.label)))) return
+    current = next
+    get.setSelf(next)
   }
   const start = async () => {
     starting = true
-    publish('connecting', 'Loading arrangements…')
+    publish({ ...current, phase: 'connecting', detail: 'Loading arrangements…', readOnly: true })
     try {
       const discovery = await client.discover()
       requireArrangements(discovery.value)
-      // A person session actor is person/<id>/session/<id>; machine/agent actors cannot choose a person.
       const owner = /^(person\/[^/\s]+)(?:\/session\/[^/\s]+)?$/.exec(discovery.value.session_actor)?.[1]
       if (owner === undefined) throw new Error('Select an explicit person owner before loading arrangements.')
       if (!active) return
+      const editable = discovery.value.capabilities.some((capability) => capability.id === 'control.arrangements' && capability.state === 'granted')
+      if (editable) editor = createArrangementEditor({
+        owner, actions: client.actions,
+        read: (signal) => readArrangementInventory(client, owner, signal),
+        onState: (state) => {
+          const key = state.arrangement === undefined ? undefined : `${state.arrangement.id}\n${JSON.stringify(state.arrangement.body)}`
+          if (key !== shown) { doc = state.arrangement === undefined ? emptyDoc() : arrangementSidebarDoc(state.arrangement); shown = key }
+          publish({
+            doc, phase: state.phase === 'refused' ? 'unavailable' : state.phase, readOnly: state.restoreUnavailable === true, edit, retry,
+            ...(state.sidebarCandidates === undefined ? {} : { sidebarCandidates: state.sidebarCandidates }),
+            ...(state.sidebarSubject === undefined ? {} : { sidebarSubject: state.sidebarSubject }),
+            ...(state.restoreUnavailable === undefined ? {} : { restoreUnavailable: state.restoreUnavailable }),
+            detail: state.refusal === undefined ? 'Arrangement folders' : refusalText(state.refusal),
+            ...(state.refusal === undefined ? {} : { refusal: state.refusal }),
+            ...(state.refusal !== undefined && editor !== undefined ? { retryEdit: editor.retryEdit, retryReady: state.retryReady } : {}),
+          })
+        },
+      })
       follow = followArrangementInventory({ gateway: client, owner, ...(socket === undefined ? {} : { socket }), onEvent: (event) => {
         switch (event._tag) {
           case 'Complete': {
-            const winner = sidebarWinner(event.inventory.items)
-            if (winner === undefined) {
-              shown = undefined
-              publish('unavailable', 'No arrangement exists for this person yet. Folders appear once a native client creates one.', emptyDoc())
-              return
-            }
-            const key = `${winner.id}\n${JSON.stringify(winner.body)}`
-            const next = key === shown ? doc : arrangementSidebarDoc(winner)
-            shown = key
-            publish('synced', 'Arrangement folders · read-only', next)
+            if (editor !== undefined) { editor.accept(event.inventory); return }
+            const winner = sidebarWinner(event.inventory.items, owner)
+            const candidates = sidebarCandidates(event.inventory.items, owner)
+            const reserved = reservedSidebarSubject(owner)
+            reservedObserved ||= event.inventory.items.some((item) => item.id === reserved)
+            const restoreUnavailable = winner === undefined && reservedObserved
+            const key = winner === undefined ? undefined : `${winner.id}\n${JSON.stringify(winner.body)}`
+            if (key !== shown) { doc = winner === undefined ? emptyDoc() : arrangementSidebarDoc(winner); shown = key }
+            publish({
+              doc, phase: 'synced', detail: 'Arrangement folders · read-only (control.arrangements is not granted)', readOnly: true, edit, retry,
+              ...(candidates.length > 1 ? { sidebarCandidates: candidates.map((candidate) => ({ id: candidate.id, label: `${candidate.body.name.value} (${candidate.id})` })) } : {}),
+              ...(winner === undefined ? (restoreUnavailable ? { sidebarSubject: reserved } : {}) : { sidebarSubject: winner.id }),
+              ...(restoreUnavailable ? { restoreUnavailable: true } : {}),
+            })
             return
           }
           case 'ReadFailed':
-            publish('unavailable', `Arrangement read failed: ${event.error.message}`)
+            publish({ ...current, phase: 'unavailable', detail: `Arrangement read failed: ${event.error.message}`, readOnly: true })
             return
           case 'Interrupted':
-            publish('unavailable', `Arrangement updates interrupted; reconnecting in ${Math.ceil(event.retryInMs / 1000)}s.`)
+            publish({ ...current, phase: 'unavailable', detail: `Arrangement updates interrupted; reconnecting in ${Math.ceil(event.retryInMs / 1000)}s.`, readOnly: true })
             return
           case 'Refused':
-            publish('unavailable', `Arrangement updates refused: ${event.error.message}`)
+            publish({ ...current, phase: 'unavailable', detail: `Arrangement updates refused: ${event.error.message}`, readOnly: true })
         }
       } })
     } catch (error) {
-      publish('unavailable', error instanceof Error ? error.message : String(error))
-    } finally {
-      starting = false
-    }
+      publish({ ...current, phase: 'unavailable', detail: error instanceof Error ? error.message : String(error), readOnly: true })
+    } finally { starting = false }
   }
-  get.addFinalizer(() => { active = false; follow?.close() })
+  get.addFinalizer(() => { active = false; follow?.close(); editor?.close() })
+  current = { doc, phase: 'connecting', readOnly: true, edit, retry }
   void Promise.resolve().then(start)
-  return { doc, phase: 'connecting', readOnly: true, edit, retry }
+  return current
 })
 /** Same-origin paired client API, scoped to the discovered person. */
 export const folders = sidebarFolders({
-  gateway: () => st3InventoryGateway({ baseUrl: globalThis.location.origin, fetchImpl: globalThis.fetch.bind(globalThis) }),
+  gateway: () => {
+    const options = { baseUrl: globalThis.location.origin, fetchImpl: globalThis.fetch.bind(globalThis) }
+    return { ...st3InventoryGateway(options), actions: arrangementActions(new St3Client(options)) }
+  },
 })

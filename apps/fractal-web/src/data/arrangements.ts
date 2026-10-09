@@ -11,7 +11,7 @@
  * the follow aborts it between pages and cancels its in-flight request.
  */
 import { St3Client } from '@smalltalk/st3-client'
-import type { Arrangement, ArrangementPage, CollectionSocketFactory, CollectionStream, EnvelopeOf, PageOptions } from '@smalltalk/st3-client'
+import type { Arrangement, ArrangementPage, CollectionSocketFactory, CollectionStream, EnvelopeOf, PageOptions, Snapshot } from '@smalltalk/st3-client'
 import { ArrangementId as ArrangementIdSchema, ArrangementPage as ArrangementPageSchema } from '@smalltalk/st3-client/schema'
 import { Schema } from 'effect'
 
@@ -33,24 +33,30 @@ export interface ArrangementInventoryGateway {
 }
 
 /**
- * The generated client for ONE follow. A follow runs one list request at a time, so the
- * request being sent belongs to the most recent read's signal; never share it between follows.
+ * A generated client per read captures cancellation permanently. Pagination reuses that
+ * read's client; discovery and sockets stay shared without sharing a mutable signal slot.
  */
 export const st3InventoryGateway = ({ baseUrl, fetchImpl }: {
   readonly baseUrl: string
   readonly fetchImpl: typeof globalThis.fetch
 }): ArrangementInventoryGateway & Pick<St3Client, 'discover'> => {
-  let signal: AbortSignal | undefined
-  const client = new St3Client({
-    baseUrl,
-    fetchImpl: (input, init) => fetchImpl(input, signal === undefined ? init : { ...init, signal }),
-  })
+  const client = new St3Client({ baseUrl, fetchImpl })
+  const readers = new WeakMap<AbortSignal, St3Client>()
   return {
     discover: () => client.discover(),
     collectionStream: (options) => client.collectionStream(options),
     arrangementsList: (person, options, read) => {
-      signal = read
-      return client.arrangementsList(person, options)
+      let reader = readers.get(read)
+      if (reader === undefined) {
+        reader = new St3Client({
+          baseUrl,
+          fetchImpl: (input, init) => fetchImpl(input, { ...init, signal: read }),
+        })
+        // Generated GET calls discover on its receiver. Share negotiation, not cancellation.
+        reader.discover = () => client.discover()
+        readers.set(read, reader)
+      }
+      return reader.arrangementsList(person, options)
     },
   }
 }
@@ -59,6 +65,8 @@ export const st3InventoryGateway = ({ baseUrl, fetchImpl }: {
 export interface ArrangementInventory {
   readonly owner: string
   readonly items: readonly Arrangement[]
+  /** The first page's read frontier. In-memory adapters may omit transport provenance. */
+  readonly snapshot?: Snapshot
 }
 
 export type InventoryEvent =
@@ -80,15 +88,21 @@ export interface InventoryFollow {
 const subscriptionId = 'arrangements-inventory'
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)))
 
-/**
- * Shared cross-client rule (matches the native client's arrangement list): among the owner's live
- * arrangements named exactly "Sidebar", the lowest UUIDv7 wins. Inventory rows are already checked
- * to be under the owner prefix with lowercase UUIDv7 IDs, so ID order is creation order. The web
- * client only reads; folding duplicates is the native client's job.
- */
-export const sidebarWinner = (items: readonly Arrangement[]): Arrangement | undefined =>
-  items.reduce<Arrangement | undefined>((winner, item) =>
-    !item.deleted && item.body.name.value === 'Sidebar' && (winner === undefined || item.id < winner.id) ? item : winner, undefined)
+// TODO(#2043): use the exported client-v0 constant once it lands
+const sidebarUuid = '00000000-0000-7000-8000-000000000001'
+export const reservedSidebarSubject = (owner: string): string => `arrangement/${owner}/${sidebarUuid}`
+
+/** Exact-name legacy candidates are live, person-owned and ordered by lowercase UUIDv7. */
+export const sidebarCandidates = (items: readonly Arrangement[], owner: string | undefined = items[0]?.owner): readonly Arrangement[] =>
+  owner === undefined || !/^person\/[^/\s]+$/.test(owner) ? [] : items.filter((item) =>
+    !item.deleted && item.owner === owner && item.id.startsWith(`arrangement/${owner}/`) &&
+    isArrangementId(item.id) && item.body.name.value === 'Sidebar' && item.id !== reservedSidebarSubject(owner))
+    .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+
+/** The reserved subject is identity, regardless of name; otherwise use the deterministic legacy pick. */
+export const sidebarWinner = (items: readonly Arrangement[], owner: string | undefined = items[0]?.owner): Arrangement | undefined =>
+  owner === undefined ? undefined : items.find((item) => !item.deleted && item.owner === owner && item.id === reservedSidebarSubject(owner)) ??
+    sidebarCandidates(items, owner)[0]
 
 /** Rows requested per page; a page returning more is malformed. */
 export const inventoryPageLimit = 100
@@ -106,6 +120,7 @@ export const readArrangementInventory = async (
   signal: AbortSignal,
 ): Promise<ArrangementInventory> => {
   const items: Arrangement[] = []
+  let snapshot: Snapshot | undefined
   const visited = new Set<string>()
   const prefix = `arrangement/${owner}/`
   // Abandon a request at once even if its transport ignores the signal.
@@ -117,7 +132,10 @@ export const readArrangementInventory = async (
     for (;;) {
       signal.throwIfAborted()
       const options = cursor === undefined ? { limit: inventoryPageLimit } : { cursor, limit: inventoryPageLimit }
-      const page = (await Promise.race([gateway.arrangementsList(owner, options, signal), abandoned.promise])).value
+      const response = await Promise.race([gateway.arrangementsList(owner, options, signal), abandoned.promise])
+      const page = response.value
+      // Continuation pages belong to the initial read, even if a later response has a newer envelope.
+      snapshot ??= response.snapshot
       if (!isArrangementPage(page) || page.items.some((item) => item.owner !== owner || !item.id.startsWith(prefix) || !isArrangementId(item.id)))
         throw new TypeError('Invalid owner-scoped arrangements page')
       if (page.items.length > inventoryPageLimit)
@@ -125,7 +143,7 @@ export const readArrangementInventory = async (
       if (items.length + page.items.length > inventoryItemBudget)
         throw new RangeError(`Arrangement inventory exceeds ${inventoryItemBudget} arrangements`)
       items.push(...page.items)
-      if (!page.page.has_more) return { owner, items }
+      if (!page.page.has_more) return { owner, items, snapshot }
       if (page.items.length === 0) throw new TypeError('Arrangement pagination did not advance')
       const next = page.page.next_cursor
       if (next === null || next === undefined) throw new TypeError('Arrangement page omitted its continuation cursor')
