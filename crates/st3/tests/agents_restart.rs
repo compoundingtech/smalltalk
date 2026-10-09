@@ -501,6 +501,7 @@ async fn restart_waits_for_replacement_after_mailbox_disconnect() {
         "agent/example/operator",
         "3s",
     );
+    let mut driver = None;
     let drive_after_old_card = async {
         // No reconciliation can replace the runtime until the CLI has received an
         // actual card response containing the old incarnation's loss fault.
@@ -527,13 +528,14 @@ async fn restart_waits_for_replacement_after_mailbox_disconnect() {
                 idempotency_key: None,
             })
             .unwrap();
-        fixture.drive()
+        driver = Some(fixture.drive());
     };
-    let (output, driver) = tokio::time::timeout(Duration::from_secs(5), async {
+    let (output, ()) = tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(command, drive_after_old_card)
     })
     .await
     .unwrap();
+    let driver = driver.unwrap();
     driver.abort();
     let _ = driver.await;
     assert!(
