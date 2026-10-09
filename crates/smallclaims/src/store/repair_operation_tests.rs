@@ -350,3 +350,300 @@ fn repair_work_does_not_grow_with_unrelated_operations_or_checkpoint_receipts() 
         "repair grew with unrelated history: {small}->{large}"
     );
 }
+// Frozen legacy keyed oracle: deliberately retains every dropped candidate before folding.
+fn legacy_expected_operation(
+    connection: &Connection,
+    operation: &str,
+) -> Result<Option<(String, String, String)>> {
+    let mut statement = connection.prepare(
+        "SELECT id, body FROM claims WHERE json_extract(body, '$._operation.id')=?1
+         AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id) ORDER BY id",
+    )?;
+    let mut stored = Vec::new();
+    for row in statement.query_map([operation], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (id, body) = row?;
+        let body: Value = serde_json::from_str(&body)?;
+        if let Some((_, digest)) = operation_parts(&body) {
+            stored.push((digest.to_owned(), id));
+        }
+    }
+    if stored.is_empty() {
+        return Ok(None);
+    }
+    let dropped = checkpoint::checkpointed_operation(connection, operation)?
+        .into_iter()
+        .filter(|(_, id)| !stored.iter().any(|(_, stored)| stored == id))
+        .collect();
+    Ok(Some(operation_row(&stored, dropped)))
+}
+
+fn checkpoint_candidate(connection: &Connection, operation: &str, digest: &str, id: &str) {
+    connection
+        .execute(
+            "INSERT INTO checkpoint_claims(id,writer,sequence,envelope_hash,subject,kind,actor,
+         predecessors,operation_id,request_digest,accepted_at_unix_ms,checkpoint)
+         VALUES (?1,'alder',1,'fixture-envelope','note/checkpoint','example.note',NULL,
+         '[]',?2,?3,0,'checkpoint/2026-10-01')",
+            params![id, operation, digest],
+        )
+        .unwrap();
+}
+
+fn assert_keyed_oracle(connection: &Connection, operation: &str) {
+    let expected = legacy_expected_operation(connection, operation).unwrap();
+    assert_eq!(expected_operation(connection, operation).unwrap(), expected);
+    assert_eq!(
+        expected,
+        expected_operations(connection)
+            .unwrap()
+            .get(operation)
+            .cloned()
+    );
+}
+
+#[test]
+fn repair_checkpoint_extrema_preserve_legacy_membership_and_canonical_fallback() {
+    let store = node();
+    let stored = operation_claim(&store, "op/target", "b", "stored");
+    operation_claim(&store, "op/target", "c", "second");
+    let mut connection = store.connection.write();
+    let tx = connection.transaction().unwrap();
+    // Duplicate metadata cannot lower the stored claim's real digest.
+    checkpoint_candidate(&tx, "op/target", "!duplicate", &stored.id);
+    checkpoint_candidate(&tx, "op/target", "!repaired", "cp/repaired");
+    tx.execute(
+        "INSERT INTO projection_digest_repaired_claims(id) VALUES ('cp/repaired')",
+        [],
+    )
+    .unwrap();
+    checkpoint_candidate(&tx, "op/target", "ignored", "cp/null-digest");
+    tx.execute("UPDATE checkpoint_claims SET request_digest=NULL WHERE id='cp/null-digest'", []).unwrap();
+    assert_keyed_oracle(&tx, "op/target");
+    for (n, digest) in ["b", "c", "", "é", "𐀀", "0"].into_iter().enumerate() {
+        checkpoint_candidate(&tx, "op/target", digest, &format!("cp/{n}"));
+        assert_keyed_oracle(&tx, "op/target");
+    }
+    // Both sources keep conflict refusal, even with a prior cached active receipt.
+    assert_eq!(
+        checkpointed_operation_outcome(&tx, "op/target", "b")
+            .unwrap_err()
+            .code,
+        "idempotency-conflict"
+    );
+    tx.commit().unwrap();
+}
+
+#[test]
+fn repair_checkpoint_extrema_observe_late_arrival_deletion_and_rollback() {
+    let store = node();
+    operation_claim(&store, "op/target", "b", "stored");
+    {
+        let mut connection = store.connection.write();
+        let tx = connection.transaction().unwrap();
+        assert_keyed_oracle(&tx, "op/target");
+        checkpoint_candidate(&tx, "op/target", "a", "cp/late");
+        assert_keyed_oracle(&tx, "op/target");
+        tx.execute_batch("SAVEPOINT changed_candidates").unwrap();
+        tx.execute("DELETE FROM checkpoint_claims WHERE id='cp/late'", [])
+            .unwrap();
+        checkpoint_candidate(&tx, "op/target", "z", "cp/transient");
+        assert_keyed_oracle(&tx, "op/target");
+        tx.execute_batch("ROLLBACK TO changed_candidates; RELEASE changed_candidates")
+            .unwrap();
+        assert_keyed_oracle(&tx, "op/target");
+        assert_eq!(
+            expected_operation(&tx, "op/target").unwrap().unwrap().0,
+            "a"
+        );
+        tx.commit().unwrap();
+    }
+    operation_claim(&store, "op/target", "0", "late-stored");
+    assert_keyed_oracle(&store.readers.get(), "op/target");
+    {
+        let mut connection = store.connection.write();
+        let tx = connection.transaction().unwrap();
+        tx.execute("DELETE FROM operations WHERE id='op/target'", [])
+            .unwrap();
+        tx.execute(
+            "DELETE FROM claims WHERE json_extract(body,'$._operation.id')='op/target'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(expected_operation(&tx, "op/target").unwrap(), None);
+        assert_eq!(legacy_expected_operation(&tx, "op/target").unwrap(), None);
+        tx.commit().unwrap();
+    }
+}
+
+#[test]
+fn repair_checkpoint_extrema_refuse_corruption_and_roll_back_the_entire_repair() {
+    let store = node();
+    let old = operation_claim(&store, "op/old", "a", "old");
+    let replacement = operation_claim(&store, "op/new", "b", "new");
+    let record = record(&store, &old);
+    repair(&store, &record, &replacement.id, "bad-checkpoint");
+    {
+        let connection = store.connection.write();
+        checkpoint_candidate(&connection, "op/new", "a", "cp/least");
+        checkpoint_candidate(&connection, "op/new", "z", "cp/greatest");
+        checkpoint_candidate(&connection, "op/new", "c", "cp/bad");
+        // Invalid UTF-8 in an interior TEXT ID must fail too, even though neither digest
+        // extremum names it. Refusing only non-text fields would silently accept this.
+        connection
+            .execute(
+                "UPDATE checkpoint_claims SET id=CAST(x'80' AS TEXT) WHERE id='cp/bad'",
+                [],
+            )
+            .unwrap();
+        assert!(legacy_expected_operation(&connection, "op/new").is_err());
+        assert!(expected_operation(&connection, "op/new").is_err());
+        connection
+            .execute("DELETE FROM checkpoint_claims WHERE request_digest='c'", [])
+            .unwrap();
+        checkpoint_candidate(&connection, "op/new", "c", "cp/bad");
+        connection
+            .execute(
+                "UPDATE checkpoint_claims SET id=x'80' WHERE id='cp/bad'",
+                [],
+            )
+            .unwrap();
+        assert!(legacy_expected_operation(&connection, "op/new").is_err());
+        assert!(expected_operation(&connection, "op/new").is_err());
+    }
+    let before = rows(&store);
+    assert!(store.apply_replication_repairs().is_err());
+    assert_eq!(rows(&store), before);
+    assert_eq!(
+        store
+            .readers
+            .get()
+            .query_row(
+                "SELECT state FROM replica_records WHERE record_ref=?1",
+                [&record],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "valid"
+    );
+    store
+        .connection
+        .write()
+        .execute("DELETE FROM checkpoint_claims WHERE typeof(id)<>'text'", [])
+        .unwrap();
+    assert_eq!(store.apply_replication_repairs().unwrap(), 1);
+    assert_canonical(&store);
+}
+
+#[test]
+fn repair_checkpoint_extrema_do_not_bless_a_damaged_unrelated_receipt() {
+    let store = node();
+    let old = operation_claim(&store, "op/old", "a", "old");
+    let replacement = operation_claim(&store, "op/new", "b", "new");
+    operation_claim(&store, "unrelated/damaged", "z", "damaged");
+    store
+        .connection
+        .write()
+        .execute(
+            "UPDATE operations SET request_digest='prior-corruption' WHERE id='unrelated/damaged'",
+            [],
+        )
+        .unwrap();
+    let damaged = rows(&store)["unrelated/damaged"].clone();
+    let record = record(&store, &old);
+    repair(&store, &record, &replacement.id, "keyed");
+    protect_unrelated(&store);
+    assert_eq!(store.apply_replication_repairs().unwrap(), 1);
+    assert_eq!(rows(&store)["unrelated/damaged"], damaged);
+    assert_keyed_oracle(&store.readers.get(), "op/new");
+    assert_ne!(
+        rows(&store),
+        expected_operations(&store.readers.get()).unwrap(),
+        "targeted repair must not certify unrelated corruption"
+    );
+}
+
+#[test]
+fn repair_checkpoint_extrema_use_the_affected_key_as_unrelated_inventory_grows() {
+    fn sample(unrelated: usize) -> crate::sqlite::work::SqliteWork {
+        let store = node();
+        operation_claim(&store, "op/target", "b", "stored");
+        {
+            let mut connection = store.connection.write();
+            let tx = connection.transaction().unwrap();
+            checkpoint_candidate(&tx, "op/target", "a", "cp/least");
+            checkpoint_candidate(&tx, "op/target", "z", "cp/greatest");
+            for n in 0..unrelated {
+                checkpoint_candidate(
+                    &tx,
+                    &format!("unrelated/{n}"),
+                    "0",
+                    &format!("cp/unrelated/{n}"),
+                );
+            }
+            tx.commit().unwrap();
+        }
+        let connection = store.readers.get();
+        {
+            let query = format!("EXPLAIN QUERY PLAN {CHECKPOINT_OPERATION_EXTREMA_QUERY}");
+            let plan = connection
+                .prepare(&query)
+                .unwrap()
+                .query_map(["op/target"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(plan.iter().any(|line|line.contains("SEARCH checkpoint_claims USING COVERING INDEX checkpoint_claims_operation_digest")),"{plan:?}");
+            assert!(
+                !plan.iter().any(|line| line.contains("USE TEMP B-TREE")),
+                "{plan:?}"
+            );
+        }
+        let scope = crate::sqlite::work::SqliteWorkScope::start();
+        let result = expected_operation(&connection, "op/target").unwrap();
+        let work = scope.finish();
+        assert_eq!(
+            result,
+            legacy_expected_operation(&connection, "op/target").unwrap()
+        );
+        assert!(work.vm_steps > 0);
+        assert_eq!(work.fullscan_steps, 0);
+        work
+    }
+    let small = sample(16);
+    let large = sample(2048);
+    eprintln!("checkpoint extrema keyed work: 16={small:?},2048={large:?}");
+    assert_eq!(small.statements, large.statements);
+    assert!(large.vm_steps <= small.vm_steps * 2, "{small:?}->{large:?}");
+}
+
+#[test]
+fn repair_checkpoint_extrema_index_is_added_on_reopen_without_receipt_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let before;
+    {
+        let store = Store::open(&path, "alder", Arc::new(Plain)).unwrap();
+        operation_claim(&store, "op/target", "b", "stored");
+        checkpoint_candidate(&store.connection.write(), "op/target", "a", "cp/dropped");
+        before = rows(&store);
+        store
+            .connection
+            .write()
+            .execute_batch("DROP INDEX checkpoint_claims_operation_digest")
+            .unwrap();
+    }
+    let reopened = Store::open(&path, "alder", Arc::new(Plain)).unwrap();
+    assert_eq!(rows(&reopened), before);
+    assert_keyed_oracle(&reopened.readers.get(), "op/target");
+    assert_eq!(
+        reopened
+            .readers
+            .get()
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        17
+    );
+    assert!(reopened.readers.get().query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='checkpoint_claims_operation_digest')", [], |row| row.get::<_,bool>(0)).unwrap());
+}
