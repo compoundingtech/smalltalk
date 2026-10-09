@@ -40,6 +40,8 @@ export type ArrangementRefusal = {
   readonly awaitingVisibility?: boolean
   /** Ephemeral request labels survive rollback, deletion and view filtering. */
   readonly attemptedTargets?: readonly ArrangementAttempt[]
+  /** Fixed client copy: restaging this intent against fresh state is invalid, so retrying cannot help. */
+  readonly restageRefusal?: string
 }
 export const arrangementRefusal = (failure: ActionFailure, targets: readonly string[]): ArrangementRefusal => {
   if (failure._tag !== 'ActionRefused') return { reason: { _tag: 'Unknown' }, detail: failure.message, targets }
@@ -73,7 +75,7 @@ const refusalSentences: Readonly<Partial<Record<Extract<typeof ErrorCode.Type, s
   'validation-failed': 'This change could not be accepted; refresh and try again.',
   'idempotency-conflict': 'This change conflicts with an earlier change; refresh and try again.',
 }
-export const refusalText = (refusal: ArrangementRefusal): string =>
+export const refusalText = (refusal: ArrangementRefusal): string => refusal.restageRefusal ??
   (refusal.awaitingVisibility ? undefined : refusal.reason._tag === 'Known' ? refusalSentences[refusal.reason.code] : undefined) ?? 'The change was not saved.'
 
 const optimisticRevision = 'claim/optimistic'
@@ -117,13 +119,29 @@ export interface ArrangementEditorState {
   readonly phase: 'synced' | 'pending' | 'refused'
   readonly refusal?: ArrangementRefusal
   readonly retryReady: boolean
+  readonly pendingTargets?: readonly string[]
   readonly sidebarCandidates?: readonly { readonly id: string; readonly label: string }[]
   readonly sidebarSubject?: string
   readonly restoreUnavailable?: boolean
 }
 export type EditOutcome = { readonly _tag: 'Success' } | ({ readonly _tag: 'Refused' } & ArrangementRefusal)
+/** Recomputed structural intent: already satisfied is success; invalid against fresh state stays refused. */
+export type RestageVerdict =
+  | { readonly _tag: 'Operations'; readonly operations: readonly SidebarOperation[] }
+  | { readonly _tag: 'Satisfied' }
+  | { readonly _tag: 'Refused'; readonly sentence: string }
+/** Recompute structural intent after a fresh inventory read, before staging a new request. */
+export type SidebarRestage = (arrangement: Arrangement | undefined) => RestageVerdict
+export interface StructuralIntent {
+  readonly restage: SidebarRestage
+  /** Continues a combined intent once this edit is applied, including after an explicit retry. */
+  readonly onApplied?: () => void
+}
 interface EditJob {
-  readonly operations: readonly SidebarOperation[]
+  operations: readonly SidebarOperation[]
+  readonly intent?: StructuralIntent
+  /** Sidebar selected when the gesture was accepted; undefined only for a bootstrap with no Sidebar. */
+  readonly sidebar?: string
   readonly id: string
   readonly key: string
   readonly done: PromiseWithResolvers<EditOutcome>
@@ -134,7 +152,7 @@ interface EditJob {
 }
 export interface ArrangementEditor {
   readonly accept: (inventory: ArrangementInventory) => void
-  readonly edit: (operations: readonly SidebarOperation[]) => Promise<EditOutcome>
+  readonly edit: (operations: readonly SidebarOperation[], intent?: StructuralIntent) => Promise<EditOutcome>
   readonly retryEdit: () => Promise<EditOutcome>
   readonly close: () => void
 }
@@ -158,6 +176,10 @@ export const createArrangementEditor = ({ owner, actions, read, onState }: {
   let retryReady = false
   const prepareRetry = (job: EditJob): EditJob => {
     const winner = inventory === undefined ? undefined : sidebarWinner(inventory.items, owner)
+    if (job.intent !== undefined) {
+      const { request: _request, ...fields } = job
+      return { ...fields, id: `action/${crypto.randomUUID()}`, key: crypto.randomUUID() }
+    }
     const request = job.request
     if (request === undefined || (request.parameters.subject === (winner?.id ?? reservation) &&
       request.parameters.operations.some((operation) => operation.op === 'create') === (winner === undefined))) return job
@@ -184,7 +206,7 @@ export const createArrangementEditor = ({ owner, actions, read, onState }: {
       ...(arrangement === undefined && !reservedRetired ? {} : { sidebarSubject: arrangement?.id ?? reservation }),
       ...(reservedRetired && arrangement === undefined ? { restoreUnavailable: true } : {}),
     }
-    onState({ ...selection, ...(arrangement === undefined ? {} : { arrangement }), phase: queue.length > 0 ? 'pending' : refusal === undefined ? 'synced' : 'refused', ...(refusal === undefined ? {} : { refusal }), retryReady: !selection.restoreUnavailable && retryReady })
+    onState({ ...selection, ...(arrangement === undefined ? {} : { arrangement }), phase: queue.length > 0 ? 'pending' : refusal === undefined ? 'synced' : 'refused', pendingTargets: [...new Set(queue.flatMap(targets))], ...(refusal === undefined ? {} : { refusal }), retryReady: !selection.restoreUnavailable && retryReady })
   }
   const accept = (next: ArrangementInventory) => {
     if (closed || next.owner !== owner) return
@@ -213,7 +235,7 @@ export const createArrangementEditor = ({ owner, actions, read, onState }: {
     publish()
   }
   const fail = (job: EditJob, reason: ArrangementRefusal, waitForRefresh = false) => {
-    failed = job
+    failed = reason.restageRefusal === undefined ? job : undefined
     const winner = inventory === undefined ? undefined : sidebarWinner(inventory.items, owner)
     const attempts = job.operations.map((operation): ArrangementAttempt => operation.op === 'subject.place'
       ? { id: operation.subject, label: operation.subject, kind: 'agent' }
@@ -223,7 +245,7 @@ export const createArrangementEditor = ({ owner, actions, read, onState }: {
           ? operation.name : winner?.body.folders[operation.id]?.name.value ?? operation.id,
       })
     refusal = { ...reason, attemptedTargets: [...new Map(attempts.map((attempt) => [attempt.id, attempt])).values()] }
-    retryReady = reason.error?.code !== 'stale-fence' && reason.error?.code !== 'arrangement-exists'
+    retryReady = reason.restageRefusal === undefined && reason.error?.code !== 'stale-fence' && reason.error?.code !== 'arrangement-exists'
     const abandoned = queue.splice(0)
     publish() // Remove every optimistic edit before returning the refusal.
     if (!waitForRefresh) job.done.resolve({ _tag: 'Refused', ...reason })
@@ -252,6 +274,24 @@ export const createArrangementEditor = ({ owner, actions, read, onState }: {
         }
         // Retarget only a definitive non-applied refusal, after the fresh inventory is accepted.
         if (job.requestRefused) { job = prepareRetry(job); queue[0] = job }
+        // A structural intent uses fresh siblings, but only within the Sidebar the user edited.
+        // Bootstrap is the narrow exception: no Sidebar existed, so only the reserved creation target qualifies.
+        if (job.request === undefined && job.intent !== undefined) {
+          const bound = job.sidebar === undefined ? winner === undefined || winner.id === reservation : winner?.id === job.sidebar
+          const verdict: RestageVerdict = bound ? job.intent.restage(winner) : { _tag: 'Refused', sentence: 'The folder layout changed elsewhere; make the change again.' }
+          if (verdict._tag === 'Refused') {
+            fail(job, { ...unknown(verdict.sentence, job), restageRefusal: verdict.sentence })
+            return
+          }
+          if (verdict._tag === 'Satisfied') {
+            queue.shift()
+            publish()
+            job.done.resolve({ _tag: 'Success' })
+            job.intent.onApplied?.()
+            continue
+          }
+          job.operations = structuredClone(verdict.operations)
+        }
         if (job.request === undefined) {
           if (winner === undefined && creation?.phase === 'acknowledged') {
             fail(job, unknown('The created Sidebar is not visible in the complete inventory yet. Refresh before retrying.', job))
@@ -307,14 +347,16 @@ export const createArrangementEditor = ({ owner, actions, read, onState }: {
         queue.shift()
         publish()
         job.done.resolve({ _tag: 'Success' })
+        job.intent?.onApplied?.()
       }
     } catch (cause) {
       if (!closed && queue[0] !== undefined) fail(queue[0], unknown(cause instanceof Error ? cause.message : String(cause), queue[0]))
       // A failed stale-fence refresh keeps retry disabled until an explicit refresh succeeds.
     } finally { running = false }
   }
-  const edit = (operations: readonly SidebarOperation[]): Promise<EditOutcome> => {
-    const job: EditJob = { operations: structuredClone(operations), id: `action/${crypto.randomUUID()}`, key: crypto.randomUUID(), done: Promise.withResolvers<EditOutcome>() }
+  const edit = (operations: readonly SidebarOperation[], intent?: StructuralIntent): Promise<EditOutcome> => {
+    const sidebar = inventory === undefined ? undefined : sidebarWinner(inventory.items, owner)?.id
+    const job: EditJob = { operations: structuredClone(operations), ...(intent === undefined ? {} : { intent }), ...(sidebar === undefined ? {} : { sidebar }), id: `action/${crypto.randomUUID()}`, key: crypto.randomUUID(), done: Promise.withResolvers<EditOutcome>() }
     if (reservedRetired && sidebarWinner(inventory?.items ?? [], owner) === undefined)
       return Promise.resolve({ _tag: 'Refused', ...unknown('Restoring a removed Sidebar is not available yet.', job) })
     if (!running) failed = undefined // A new explicit edit is not a replay of the failed request.

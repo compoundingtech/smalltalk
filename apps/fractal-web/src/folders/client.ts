@@ -69,7 +69,7 @@ import type { CollectionSocketFactory } from '@smalltalk/st3-client'
 import { arrangementActions, type ArrangementActionPort } from '@st3/sdk/effect'
 import { followArrangementInventory, readArrangementInventory, reservedSidebarSubject, sidebarCandidates, sidebarWinner, st3InventoryGateway, type ArrangementInventoryGateway, type InventoryFollow } from '../data/arrangements.ts'
 import { emptyDoc, type FolderDoc, type Stamp } from './core.mts'
-import { createArrangementEditor, refusalText, type ArrangementEditor, type ArrangementRefusal, type EditOutcome, type SidebarOperation } from './edit.ts'
+import { createArrangementEditor, refusalText, type ArrangementEditor, type ArrangementRefusal, type EditOutcome, type SidebarOperation, type StructuralIntent } from './edit.ts'
 export interface FolderState {
   readonly doc: FolderDoc
   readonly phase: 'fixture' | 'connecting' | 'synced' | 'pending' | 'unavailable'
@@ -79,9 +79,10 @@ export interface FolderState {
   readonly sidebarCandidates?: readonly { readonly id: string; readonly label: string }[]
   readonly sidebarSubject?: string
   readonly restoreUnavailable?: boolean
-  readonly edit: (operations: readonly SidebarOperation[]) => Promise<EditOutcome>
+  readonly edit: (operations: readonly SidebarOperation[], intent?: StructuralIntent) => Promise<EditOutcome>
   readonly retryEdit?: () => Promise<EditOutcome>
   readonly retryReady?: boolean
+  readonly pendingTargets?: readonly string[]
   readonly retry?: () => void
 }
 export const arrangementSidebarDoc = (arrangement: Arrangement): FolderDoc => {
@@ -116,10 +117,10 @@ export const sidebarFolders = ({ gateway, socket }: {
   let reservedObserved = false
   let current: FolderState
   let starting = false
-  const edit = (operations: readonly SidebarOperation[]): Promise<EditOutcome> =>
+  const edit = (operations: readonly SidebarOperation[], intent?: StructuralIntent): Promise<EditOutcome> =>
     current.restoreUnavailable ? Promise.resolve({
       _tag: 'Refused', reason: { _tag: 'Unknown' }, detail: 'Restoring a removed Sidebar is not available yet.', targets: [],
-    }) : editor?.edit(operations) ?? Promise.resolve({
+    }) : editor?.edit(operations, intent) ?? Promise.resolve({
       _tag: 'Refused', reason: { _tag: 'Unknown' }, detail: 'A granted, complete owner inventory is required before editing.', targets: [],
     })
   const retry = () => { if (follow !== undefined) follow.refresh(); else if (!starting) void start() }
@@ -127,6 +128,7 @@ export const sidebarFolders = ({ gateway, socket }: {
     if (!active) return
     if (next.doc === current.doc && next.phase === current.phase && next.detail === current.detail &&
       next.refusal === current.refusal && next.retryEdit === current.retryEdit && next.retryReady === current.retryReady && next.readOnly === current.readOnly &&
+      (next.pendingTargets === current.pendingTargets || (next.pendingTargets?.length === current.pendingTargets?.length && next.pendingTargets?.every((target, index) => target === current.pendingTargets?.[index]))) &&
       next.sidebarSubject === current.sidebarSubject && next.restoreUnavailable === current.restoreUnavailable &&
       (next.sidebarCandidates === current.sidebarCandidates || (next.sidebarCandidates?.length === current.sidebarCandidates?.length &&
         next.sidebarCandidates?.every((candidate, index) => candidate.id === current.sidebarCandidates?.[index]?.id && candidate.label === current.sidebarCandidates?.[index]?.label)))) return
@@ -154,6 +156,7 @@ export const sidebarFolders = ({ gateway, socket }: {
             ...(state.sidebarCandidates === undefined ? {} : { sidebarCandidates: state.sidebarCandidates }),
             ...(state.sidebarSubject === undefined ? {} : { sidebarSubject: state.sidebarSubject }),
             ...(state.restoreUnavailable === undefined ? {} : { restoreUnavailable: state.restoreUnavailable }),
+            ...(state.pendingTargets === undefined ? {} : { pendingTargets: state.pendingTargets }),
             detail: state.refusal === undefined ? 'Arrangement folders' : refusalText(state.refusal),
             ...(state.refusal === undefined ? {} : { refusal: state.refusal }),
             ...(state.refusal !== undefined && editor !== undefined ? { retryEdit: editor.retryEdit, retryReady: state.retryReady } : {}),

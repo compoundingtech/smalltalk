@@ -278,30 +278,35 @@ export const keyBetween = (lower: string | null = null, upper: string | null = n
     b = undefined
   }
 }
-const spread = (lower: string | null | undefined, upper: string | null, count: number): string[] | undefined => {
+/** Native generators refuse invalid neighbours by throwing; that marks the gap as needing a rekey. */
+export type KeyGenerator = (lower: string | null, upper: string | null) => string
+const legacyBetween: KeyGenerator = (lower, upper) => keyBetween(lower, upper)
+const spread = (lower: string | null | undefined, upper: string | null, count: number, between: KeyGenerator): string[] | undefined => {
   const keys: string[] = []
   for (let i = 0; i < count; i += 1) {
     const after = keys.at(-1) ?? lower
-    let key = keyBetween(after, upper)
-    if (after != null && compareString(key, after) <= 0) key = `${after}V`
+    let key: string
+    if (between === legacyBetween) key = keyBetween(after, upper)
+    else try { key = between(after ?? null, upper) } catch { return undefined }
+    if (between === legacyBetween && after != null && compareString(key, after) <= 0) key = `${after}V`
     if ((after != null && compareString(after, key) >= 0) || (upper != null && compareString(key, upper) >= 0)) return undefined
     keys.push(key)
   }
   return keys
 }
-/** Siblings are in projected order, with the moved item removed. */
-export const insertAt = (siblings: readonly string[], index: number): Insertion => {
+/** Siblings are in projected order, with the moved item removed. Defaults to the legacy claim key alphabet. */
+export const insertAt = (siblings: readonly string[], index: number, between: KeyGenerator = legacyBetween): Insertion => {
   integer(index, 'index', siblings.length)
   const lower = index > 0 ? siblings[index - 1] : null
   let best: Insertion | undefined
   for (let end = index; end <= siblings.length; end += 1) {
-    const keys = spread(lower, siblings[end] ?? null, end - index + 1)
+    const keys = spread(lower, siblings[end] ?? null, end - index + 1, between)
     const key = keys?.[0]
     if (keys !== undefined && key !== undefined) { best = { key, rekeyed: keys.slice(1).map((key, offset) => [index + offset, key]) }; break }
   }
   const forward = best?.rekeyed.length ?? Infinity
   for (let start = index - 1; start >= 0 && index - start < forward; start -= 1) {
-    const keys = spread(start > 0 ? siblings[start - 1] : null, siblings[index] ?? null, index - start + 1)
+    const keys = spread(start > 0 ? siblings[start - 1] : null, siblings[index] ?? null, index - start + 1, between)
     const key = keys?.at(-1)
     if (keys !== undefined && key !== undefined) { best = { key, rekeyed: keys.slice(0, -1).map((key, offset) => [start + offset, key]) }; break }
   }
