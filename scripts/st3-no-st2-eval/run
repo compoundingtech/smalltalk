@@ -244,6 +244,9 @@ agent "native-seat" {{
         if not lines or any(row.get("exit") != 0 or "missing" in row.get("stdout", "") for row in lines):
             fail(f"the status line failed: {lines[-3:]}")
 
+        # Prove the delivered turn, independently of the initial startup turn.
+        observed_states.clear()
+        (root / "ws/working-observed").unlink(missing_ok=True)
         sent = json.loads(node.cli("conversations", "send", SUBJECT, "--from", "person/eval",
                                    "--subject", "native-seat probe", "--body", "reply-token:native-seat", "--json"))
         message = sent["subject"]
