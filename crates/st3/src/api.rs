@@ -13116,9 +13116,12 @@ async fn list_mission_runs(
     let store = state.store.clone();
     match (query.root, query.mission) {
         (Some(root), None) => blocking_store(move || {
-            let mut runs = store.mission_runs_for_root(&root)?;
-            annotate_stuck_gates(&store, &mut runs)?;
-            Ok(runs)
+            store.read_snapshot(|_| {
+                let _clock = smallclaims::store::clock_snapshot();
+                let mut tree = store.mission_run_tree_for_root(&root)?;
+                annotate_stuck_gates_with_definitions(&store, &mut tree.runs, &tree.definitions)?;
+                Ok(tree.runs)
+            })
         })
         .await
         .map(Json),
@@ -13141,6 +13144,14 @@ fn annotate_stuck_gates(store: &Store, runs: &mut [MissionRunView]) -> anyhow::R
         .map(|run| run.subject.clone())
         .collect::<Vec<_>>();
     let missions = store.mission_specs_for_runs(&active)?;
+    annotate_stuck_gates_with_definitions(store, runs, &missions)
+}
+
+fn annotate_stuck_gates_with_definitions(
+    store: &Store,
+    runs: &mut [MissionRunView],
+    missions: &BTreeMap<String, crate::model::MissionSpec>,
+) -> anyhow::Result<()> {
     for run in runs {
         if let Some(mission) = missions.get(&run.subject) {
             run.stuck_gates = crate::reconcile::stuck_field_gates(store, run, mission)?;
@@ -15194,6 +15205,10 @@ fn normalize_message_party(value: &str) -> String {
         format!("agent/{value}")
     }
 }
+
+#[cfg(test)]
+#[path = "api/default_read_tests.rs"]
+mod default_read_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Reuse pinned mission definitions within current work reads and mission run trees",
+  "replay": {
+    "status": "none",
+    "detail": "No projection, admission or replay changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers or persisted formats change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Effective work state, visibility, queue ranking and gate evaluation rules are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Public fields and pagination are unchanged. Definition reuse is confined to one read; root tree queue fields and active diagnostics use the same pinned snapshot."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Only the normal binary restart is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing stores require no manual action or coordinated upgrade."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No migration is introduced; older binaries can read the unchanged database."
+  }
+}
