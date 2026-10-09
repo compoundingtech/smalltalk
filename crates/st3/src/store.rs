@@ -3035,6 +3035,11 @@ impl Store {
             .unwrap_or_default())
     }
 
+    /// Never waits; multi-gate readers release unrelated guards before queuing on a miss.
+    pub(crate) fn try_admit_agent_resources(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.smalltalk.agent_resources_admission.clone().try_lock_owned().ok()
+    }
+
     /// One physical roster reader across HTTP pages and differently authorized WS windows.
     /// Waiting happens before SQLite snapshot acquisition, so followers pin no old WAL mark.
     pub(crate) async fn admit_agent_resources(&self) -> tokio::sync::OwnedMutexGuard<()> {
@@ -11456,63 +11461,73 @@ impl Store {
         store_index: u64,
         include_history: bool,
     ) -> Result<StatusResponse> {
-        let subjects = if include_history {
-            subjects
-        } else {
-            self.current_view_candidates(&self.readers.get(), subjects, store_index, true)?
-        };
-        if subjects.len() <= 64 {
-            return self.status_at_view_for_names(
-                None,
-                None,
-                Some(store_index),
-                include_history,
-                Some(subjects),
-            );
-        }
-        // Divide a large bounded projection across a few threads, each reading its slice on its
-        // own connection at the same store index, then merge in subject order.
-        let subjects = subjects.into_iter().collect::<Vec<_>>();
-        let chunk_size = subjects.len().div_ceil(STATUS_WORKERS);
-        let profile = crate::profile::current();
-        let read_budget = smallclaims::read_budget::current();
-        let parts = std::thread::scope(|scope| {
-            subjects
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
-                    let profile = profile.clone();
-                    let read_budget = read_budget.clone();
-                    scope.spawn(move || {
-                        let _entered = crate::profile::enter(profile.as_ref());
-                        let read = || self.status_at_view_for_names(
+        self.readers.request_read(|| {
+            let subjects = if include_history {
+                subjects
+            } else {
+                self.current_view_candidates(&self.readers.get(), subjects, store_index, true)?
+            };
+            if subjects.len() <= 64 {
+                return self.status_at_view_for_names(
+                    None, None, Some(store_index), include_history, Some(subjects),
+                );
+            }
+            // The caller keeps its loan and reduces the LAST slice on it, so a full
+            // four-way split uses three extra permits and no extra connection for the
+            // parent. Other slices must never wait for admission: when a permit is
+            // unavailable they also reduce inline on that same loan. Slices stay in
+            // subject order regardless of which ones execute in parallel.
+            enum Part<'scope> {
+                Worker(std::thread::ScopedJoinHandle<'scope, Result<StatusResponse>>),
+                Inline(Result<StatusResponse>),
+            }
+            let subjects = subjects.into_iter().collect::<Vec<_>>();
+            let chunk_size = subjects.len().div_ceil(STATUS_WORKERS);
+            let profile = crate::profile::current();
+            let read_budget = smallclaims::read_budget::current();
+            let parts = std::thread::scope(|scope| {
+                subjects
+                    .chunks(chunk_size)
+                    .enumerate()
+                    .map(|(position, chunk)| {
+                        let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
+                        let read = move || self.status_at_view_for_names(
                             None, None, Some(store_index), include_history, Some(names),
                         );
-                        if let Some(budget) = read_budget {
-                            smallclaims::read_budget::with(Some(budget), || {
-                                self.readers.request_read(read)?
-                            })
+                        let last = position + 1 == subjects.len().div_ceil(chunk_size);
+                        if !last && let Some(permit) = self.readers.try_admit_read() {
+                            let profile = profile.clone();
+                            let read_budget = read_budget.clone();
+                            Part::Worker(scope.spawn(move || {
+                                let _entered = crate::profile::enter(profile.as_ref());
+                                smallclaims::read_budget::with(read_budget, || {
+                                    self.readers.request_read_with_permit(permit, read)?
+                                })
+                            }))
                         } else {
-                            read()
+                            Part::Inline(read())
                         }
                     })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|worker| worker.join().expect("status projection worker panicked"))
-                .collect::<Vec<_>>()
-        });
-        let mut merged = StatusResponse {
-            store_index,
-            subjects: Vec::new(),
-            pending_actions: Vec::new(),
-        };
-        for part in parts {
-            let part = part?;
-            merged.subjects.extend(part.subjects);
-            merged.pending_actions.extend(part.pending_actions);
-        }
-        Ok(merged)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|part| match part {
+                        Part::Worker(worker) => worker.join().expect("status projection worker panicked"),
+                        Part::Inline(result) => result,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let mut merged = StatusResponse {
+                store_index,
+                subjects: Vec::new(),
+                pending_actions: Vec::new(),
+            };
+            for part in parts {
+                let part = part?;
+                merged.subjects.extend(part.subjects);
+                merged.pending_actions.extend(part.pending_actions);
+            }
+            Ok(merged)
+        })?
     }
 
     fn status_at_view(
@@ -12687,11 +12702,7 @@ impl Store {
 
     pub fn unread_mail_count_before(&self, before_unix_ms: u128) -> Result<u64> {
         smallclaims::touched::note_read(|| "kind:message.sent".to_owned());
-        if PINNED_READER.with(|slot| {
-            slot.borrow()
-                .as_ref()
-                .is_some_and(|(pool, _)| *pool == self.readers.key())
-        }) {
+        if self.readers.has_pinned_reader() {
             return unread_mail::count_in_snapshot(&self.readers.get(), before_unix_ms);
         }
         let mut connection = self.connection.write();
@@ -37298,6 +37309,93 @@ mission "card-owner" state="ready" {
         assert_eq!(result.subjects.len(), 65);
         assert!(!eligible.expired());
         assert!(store.readers.get().is_autocommit());
+    }
+
+    #[test]
+    fn bound_one_nested_large_status_reuses_its_snapshot_reader() {
+        let store = Arc::new(smallclaims::sqlite::with_read_limit_for_test(
+            1, || Store::open_memory("node").unwrap(),
+        ));
+        let names = (0..80).map(|n| format!("agent/admitted/seat-{n:03}"))
+            .collect::<BTreeSet<_>>();
+        for name in &names {
+            observe_runtime(&store, name, "running", "incarnation");
+        }
+        let budget = smallclaims::read_budget::ReadBudget::new(
+            "/nested-status", std::time::Duration::from_secs(15),
+        );
+        let worker_budget = budget.clone();
+        let worker_store = store.clone();
+        let expected = names.iter().cloned().collect::<Vec<_>>();
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = smallclaims::read_budget::with(Some(worker_budget), || {
+                worker_store.readers.request_read(|| {
+                    worker_store.read_snapshot(|cut| {
+                        worker_store.readers.request_read(|| {
+                            worker_store.status_for_subject_names_at(names, cut, true)
+                        })?
+                    })
+                })?
+            });
+            done.send(result).unwrap();
+        });
+        let completed = finished.recv_timeout(std::time::Duration::from_secs(5));
+        if completed.is_err() {
+            budget.cancel();
+        }
+        let result = completed.expect("bound-one nested status fanout deadlocked").unwrap();
+        worker.join().unwrap();
+        assert_eq!(result.subjects.iter().map(|subject| subject.subject.clone())
+            .collect::<Vec<_>>(), expected);
+        assert_eq!(store.readers.usage().peak, 1);
+        assert_eq!(store.readers.usage().idle, 1);
+        assert!(!budget.expired());
+    }
+
+    #[test]
+    fn admitted_status_fanout_and_inline_reduction_have_identical_values_and_digests() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("status.sqlite3");
+        let inline = smallclaims::sqlite::with_read_limit_for_test(
+            1, || Store::open(&path, "node").unwrap(),
+        );
+        let names = (0..80).map(|n| format!("agent/admitted/seat-{n:03}"))
+            .collect::<BTreeSet<_>>();
+        for name in &names {
+            observe_runtime(&inline, name, "stopped", "old");
+            observe_runtime(&inline, name, "running", "current");
+        }
+        // Two fresh pools over the same real claims keep provenance and accepted times
+        // identical, making the entire serialized result (not a normalized subset) comparable.
+        let parallel = smallclaims::sqlite::with_read_limit_for_test(
+            32, || Store::open(&path, "node").unwrap(),
+        );
+        let cut = inline.index().unwrap();
+        assert_eq!(parallel.index().unwrap(), cut);
+        for history in [false, true] {
+            let values = [&inline, &parallel].map(|store| {
+                let budget = smallclaims::read_budget::ReadBudget::new(
+                    "/admitted-status", std::time::Duration::from_secs(15),
+                );
+                let result = smallclaims::read_budget::with(Some(budget), || {
+                    store.readers.request_read(|| {
+                        store.status_for_subject_names_at(names.clone(), cut, history)
+                    })
+                }).unwrap().unwrap();
+                assert_eq!(result.subjects.len(), names.len());
+                assert!(result.subjects.windows(2).all(|pair| pair[0].subject < pair[1].subject));
+                serde_json::to_value(result).unwrap()
+            });
+            assert_eq!(values[0], values[1]);
+            let digests = values.map(|value| {
+                hex::encode(Sha256::digest(serde_json::to_vec(&value).unwrap()))
+            });
+            assert_eq!(digests[0], digests[1]);
+        }
+        assert_eq!(inline.readers.usage().peak, 1);
+        assert!(parallel.readers.usage().peak > 1);
+        assert!(parallel.readers.usage().peak <= 32);
     }
 
     #[test]
