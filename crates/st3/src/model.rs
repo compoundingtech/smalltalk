@@ -2030,17 +2030,7 @@ pub struct Attachment {
     pub expires_at_unix_ms: u128,
 }
 
-/// A running terminal that this daemon owns on its own host: the PTY session a local attach
-/// connects to directly, with no WebSocket bridge through the daemon and no graph write.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LocalTerminal {
-    pub subject: String,
-    pub runtime_id: String,
-    /// The graph's incarnation, `DAEMON_PID:CREATED_AT`, which the PTY itself must prove.
-    pub incarnation_id: String,
-    /// The daemon's PTY root as an absolute path.
-    pub pty_root: std::path::PathBuf,
-}
+pub use st3_terminal_direct::LocalTerminal;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AttachRequest {
