@@ -85,7 +85,7 @@ function ComposerFrame({ policy, state, effort, frameId, composerWidth }: { read
     recipients, models, limitedMentions, allMentions, mentionHints, failure: snapshot.failure, offline: snapshot.offline,
     effortControl: snapshot.effortControl, queuedEffort: snapshot.queuedEffort,
   }), [snapshot, policy, source, seeded])
-  return <section aria-label={`${policyId(policy)} composer`} data-composer-frame={frameId} data-footer-budget-width={composerWidth} data-footer-budget-layout={composerWidth === undefined ? undefined : policy.layout} data-footer-budget-target={composerWidth === undefined ? undefined : policy.target} data-footer-budget-running={composerWidth === undefined ? undefined : policy.running} {...stylex.props(styles.frame, composerWidth !== undefined && styles.budgetFrame(composerWidth))}>
+  return <section aria-label={`${policyId(policy)} composer · ${state} · effort ${effort}${composerWidth === undefined ? '' : ` · ${composerWidth}px`}`} data-composer-frame={frameId} data-footer-budget-width={composerWidth} data-footer-budget-layout={composerWidth === undefined ? undefined : policy.layout} data-footer-budget-target={composerWidth === undefined ? undefined : policy.target} data-footer-budget-running={composerWidth === undefined ? undefined : policy.running} {...stylex.props(styles.frame, composerWidth !== undefined && styles.budgetFrame(composerWidth))}>
     <header {...stylex.props(styles.frameHeader)}>
       <h3 {...stylex.props(styles.frameTitle)}>{policyId(policy)}</h3>
       <span {...stylex.props(styles.caption)}>{state}</span>
@@ -289,6 +289,9 @@ export const TargetTooltips: Story = {
     await expect(readout.closest('[data-testid="composer-footer"]')!.querySelectorAll('[title]')).toHaveLength(0)
     await userEvent.keyboard('{Escape}')
     await waitFor(() => expect(page.queryByRole('tooltip')).toBeNull())
+    // RAC ignores restored hover in keyboard modality; start pointer checks
+    // with the same real textbox click used by the reviewed native gate.
+    await userEvent.click(canvasElement.querySelector<HTMLElement>('[data-composer-frame="tooltip.K3"] [role="textbox"]')!)
     for (const [name, value] of [['Select recipient', recipients[0].label], ['Select model', recipients[0].model]] as const) {
       const control = within(canvasElement.querySelector<HTMLElement>('[data-composer-frame="tooltip.K3"]')!).getByRole('button', { name: `${name}: ${value}` })
       const label = control.querySelector('[data-composer-picker-label]')?.textContent
@@ -428,7 +431,7 @@ export const EffortSupported: Story = {
     await userEvent.click(picker)
     const high = await page.findByRole('menuitemradio', { name: 'High' })
     await expect(page.getByRole('menuitemradio', { name: 'Medium' })).toHaveAttribute('aria-checked', 'true')
-    await expect(within(page.getByRole('menu', { name: 'Message effort' })).getByText('Default')).toBeVisible()
+    await expect(within(page.getByRole('menu', { name: 'Select effort: Medium' })).getByText('Default')).toBeVisible()
     await expect(page.getByRole('menuitemcheckbox', { name: 'Keep for next messages' })).toHaveAttribute('aria-checked', 'false')
     // Frame budget: one choice commits the value subtree exactly once without dropping frames.
     const engine = developmentMeasurements?.createMeasurementEngine()

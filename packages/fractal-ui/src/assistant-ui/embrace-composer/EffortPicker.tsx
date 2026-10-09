@@ -35,7 +35,7 @@ export function EffortPicker({ control, value, pinned, onChange, onPinnedChange,
         <Tooltip {...stylex.props(styles.popup)}>Effort: {effortLabel(selected)}</Tooltip>
       </TooltipTrigger>
       <Popover {...stylex.props(styles.popup)}>
-        <Menu aria-label="Message effort" onAction={key => { if (key === pinItemId) onPinnedChange(!pinned); else onChange(String(key)) }}>
+        <Menu onAction={key => { if (key === pinItemId) onPinnedChange(!pinned); else onChange(String(key)) }}>
           <MenuSection selectionMode="single" selectedKeys={[selected]} shouldCloseOnSelect={false}>
             <Header {...stylex.props(styles.header)}>Effort</Header>
             {control.values.map(effort => <MenuItem id={effort} key={effort} textValue={effortLabel(effort)} aria-label={effortLabel(effort)} {...stylex.props(styles.option)}>
