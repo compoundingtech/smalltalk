@@ -1570,7 +1570,7 @@ export type MissionRunOutcomeEncoded = typeof MissionRunOutcome.Encoded
 
 export const MissionWake = /*#__PURE__*/ (() => Schema.Struct({
   "acknowledged_by": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
-  "assignee": AgentId,
+  "assignee": ActorRef,
   "assignee_state": Schema.String,
   "attempts": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "failure": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
@@ -1582,12 +1582,12 @@ export type MissionWakeEncoded = typeof MissionWake.Encoded
 
 export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   "agentless": optionalKey(Schema.Boolean),
-  "assignee": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
+  "assignee": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE),
   "attempt": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "blocked_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "blockers": optionalKey(Schema.Array(Id)),
   "claim_expires_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
-  "claimant": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
+  "claimant": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE),
   "constraints": optionalKey(Schema.Array(Schema.String)),
   "goals": optionalKey(Schema.Array(Schema.String)),
   "id": Id,
@@ -1617,7 +1617,7 @@ export type MustActEncoded = typeof MustAct.Encoded
 export const MissionRunSummary = /*#__PURE__*/ (() => Schema.Struct({
   "after": Schema.OptionFromOptionalNullOr(Id, NULL_NONE),
   "blocker": Schema.OptionFromOptionalNullOr(Schema.Record(Schema.String, Schema.Unknown), NULL_NONE),
-  "current_steps": Schema.Array(Schema.Struct({ "assignee": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE), "claimant": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE), "id": StepRunId, "since": Timestamp, "state": WorkState, "title": Schema.OptionFromNullOr(Schema.String) })),
+  "current_steps": Schema.Array(Schema.Struct({ "assignee": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "claimant": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "id": StepRunId, "since": Timestamp, "state": WorkState, "title": Schema.OptionFromNullOr(Schema.String) })),
   "deadline": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "generation_id": optionalKey(RunGenerationId),
   "id": MissionRunId,

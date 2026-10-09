@@ -451,6 +451,7 @@ impl IntoResponse for ApiError {
 }
 
 pub fn router(state: AppState) -> Router {
+    crate::relay_trace::init();
     delivery_presence::start();
     router_for_transport(state, ClientTransportBoundary::Unix)
 }
@@ -950,6 +951,7 @@ async fn response_envelope_unbounded(
     let started = Instant::now();
     let request_method = request.method().clone();
     let request_path = request.uri().path().to_owned();
+    let request_query = request.uri().query().map(str::to_owned);
     let request_route = request
         .extensions()
         .get::<axum::extract::MatchedPath>()
@@ -998,14 +1000,22 @@ async fn response_envelope_unbounded(
         let transport = transport.as_str();
         let auth_profile = profile.clone();
         let admission_queue = profile.as_ref().map(|op| op.wall_span("admission/queue"));
+        let mut diagnostic_queue =
+            crate::relay_trace::span(crate::relay_trace::Phase::AdmissionQueue);
         let admitted = crate::api::read_deadline::spawn_blocking(move || {
+            diagnostic_queue.finish(crate::relay_trace::Outcome::Completed);
             drop(admission_queue);
             let _entered = crate::profile::enter(auth_profile.as_ref());
             let authentication_span = crate::profile::span("admission/authenticate");
-            let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
+            let authentication =
+                crate::relay_trace::result(crate::relay_trace::Phase::Authenticate, || {
+                    client_v0::authenticate(&auth_state, &auth_request, transport)
+                });
             drop(authentication_span);
             let snapshot_span = crate::profile::span("admission/snapshot");
-            let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
+            let snapshot = crate::relay_trace::work(crate::relay_trace::Phase::Snapshot, || {
+                client_request_snapshot(&auth_state, cursor_snapshot.flatten())
+            });
             drop(snapshot_span);
             (authentication, snapshot)
         })
@@ -1038,15 +1048,20 @@ async fn response_envelope_unbounded(
             let cpu_kind = request_route.clone();
             let cpu_client = caller.clone();
             let handler_queue = profile.as_ref().map(|op| op.wall_span("handler/queue"));
+            let mut diagnostic_queue =
+                crate::relay_trace::span(crate::relay_trace::Phase::HandlerQueue);
             let forwarded_handler = request_path == crate::peer::CLIENT_READ_FORWARD_PATH;
             match crate::api::read_deadline::spawn_handler(move || {
+                diagnostic_queue.finish(crate::relay_trace::Outcome::Completed);
                 drop(handler_queue);
                 if let Some(profile) = &handler_profile {
                     profile.queued();
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
                 crate::performance::with_cpu(Some(&cpu_kind), Some(&cpu_client), || {
-                    runtime.block_on(crate::api::read_deadline::handler(async move {
+                    let mut diagnostic_handler =
+                        crate::relay_trace::span(crate::relay_trace::Phase::Handler);
+                    let response = runtime.block_on(crate::api::read_deadline::handler(async move {
                         // Cancel the actual forwarded relay, not only its outer waiter.
                         // Other routes retain their existing cooperative cancellation;
                         // this transport's mutation variants carry no read budget.
@@ -1063,7 +1078,13 @@ async fn response_envelope_unbounded(
                         } else {
                             next.run(request).await
                         }
-                    }))
+                    }));
+                    diagnostic_handler.finish(if response.status().is_success() {
+                        crate::relay_trace::Outcome::Completed
+                    } else {
+                        crate::relay_trace::Outcome::Failed
+                    });
+                    response
                 })
             })
             .await
@@ -1084,6 +1105,7 @@ async fn response_envelope_unbounded(
             &request_method,
             &request_route,
             &request_path,
+            request_query.as_deref(),
             &caller,
             started,
         );
@@ -1093,6 +1115,7 @@ async fn response_envelope_unbounded(
         return response;
     }
     let enveloping = Instant::now();
+    let mut diagnostic_envelope = crate::relay_trace::span(crate::relay_trace::Phase::Envelope);
     let status = response.status();
     let (mut parts, body) = response.into_parts();
     // A page read inside one SQLite snapshot names that snapshot, which can be newer than the
@@ -1124,10 +1147,16 @@ async fn response_envelope_unbounded(
         state.store.index().unwrap_or_default()
     };
     let request_id = if client_request {
-        format!("request/{}", new_request_id())
+        crate::relay_trace::current().map_or_else(
+            || format!("request/{}", new_request_id()),
+            |trace| trace.id().to_owned(),
+        )
     } else {
         new_request_id()
     };
+    if let Some(trace) = crate::relay_trace::current() {
+        trace.response(&request_id);
+    }
     let envelope = if client_request && status.is_success() {
         json!({
             "api_version": CLIENT_API_VERSION,
@@ -1157,11 +1186,17 @@ async fn response_envelope_unbounded(
         })
     };
     let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
+    diagnostic_envelope.finish(if status.is_success() {
+        crate::relay_trace::Outcome::Completed
+    } else {
+        crate::relay_trace::Outcome::Failed
+    });
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     record_request_latency(
         &request_method,
         &request_route,
         &request_path,
+        request_query.as_deref(),
         &caller,
         started,
     );
@@ -1186,6 +1221,7 @@ fn record_request_latency(
     method: &axum::http::Method,
     route: &str,
     path: &str,
+    query: Option<&str>,
     caller: &str,
     started: Instant,
 ) {
@@ -1194,7 +1230,7 @@ fn record_request_latency(
     request_latency()
         .lock()
         .unwrap()
-        .record(method, route, path, elapsed);
+        .record(method, route, path, query, elapsed);
     if elapsed < Duration::from_secs(1) {
         return;
     }
@@ -1204,7 +1240,7 @@ fn record_request_latency(
     eprintln!("st3: slow request {path} took {} ms", elapsed.as_millis());
 }
 
-fn new_request_id() -> String {
+pub(crate) fn new_request_id() -> String {
     let mut bytes = [0_u8; 16];
     if getrandom::fill(&mut bytes).is_err() {
         let fallback = format!(
@@ -1267,12 +1303,19 @@ fn client_request_snapshot(
 }
 
 fn client_snapshot_at(state: &AppState, store_index: u64) -> ClientSnapshot {
-    let created_at = client_timestamp(
+    client_snapshot_with_time(
+        state,
+        store_index,
         state
             .store
             .projection_time_at(store_index)
             .unwrap_or_default(),
-    );
+    )
+}
+
+/// The snapshot at `store_index` when its acceptance time (`projection_time_at`) is already known.
+fn client_snapshot_with_time(state: &AppState, store_index: u64, unix_ms: u128) -> ClientSnapshot {
+    let created_at = client_timestamp(unix_ms);
     let fingerprint = hex::encode(Sha256::digest(
         format!(
             "{CLIENT_PROJECTION_VERSION}:{}:{store_index}:{created_at}",
@@ -4491,8 +4534,10 @@ fn client_agent_roster_head(store: &Store, index: u64) -> anyhow::Result<()> {
 }
 
 /// For a read that asked to see what was written before it: wait, briefly, for the refresher
-/// to publish a roster at or after the current cut. The read itself folds nothing.
-async fn wait_for_agent_roster(store: &Store, history: bool) {
+/// to publish a roster at or after the current cut, unless no claim since the newest
+/// publication changes a card, so that a refresh would fold nothing. The read itself folds
+/// nothing.
+async fn wait_for_agent_roster(store: &Arc<Store>, history: bool) {
     let Ok(wanted) = store.index() else { return };
     let published = |store: &Store| {
         let index = store.index().ok()?;
@@ -4504,11 +4549,15 @@ async fn wait_for_agent_roster(store: &Store, history: bool) {
     let mut publications = store.subscribe_agent_roster();
     let _ = tokio::time::timeout(AGENT_ROSTER_READ_WAIT, async {
         while published(store).is_none_or(|cut| cut < wanted) {
-            if history {
-                store.request_agent_roster_history();
-            } else {
-                store.request_agent_roster_refresh();
+            // Claims on unrelated subjects move the cut all the time; the paced refresher
+            // would publish the same cards. One bounded range read tells.
+            let reader = Arc::clone(store);
+            if let Ok(true) = blocking_store(move || {
+                reader.published_agent_roster_unchanged_through(wanted, history)
+            }).await {
+                return;
             }
+            store.request_fresh_agent_roster(history);
             if publications.changed().await.is_err() {
                 return;
             }
@@ -4747,10 +4796,14 @@ async fn client_sessions_detail(
 ) -> Result<Json<Value>, ApiError> {
     if let Some(id) = id.strip_suffix("/timeline") {
         // An agent's timeline is its current session's: st resolves it, not the client.
-        let session_id = client_v0::conversation_session_id(&state, id)?;
+        let session_id = crate::relay_trace::result(crate::relay_trace::Phase::Session, || {
+            client_v0::conversation_session_id(&state, id)
+        })?;
         let id = session_id.as_str();
-        let managed = managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
-            .map_err(ApiError::internal)?;
+        let managed = crate::relay_trace::result(crate::relay_trace::Phase::Owner, || {
+            managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
+        })
+        .map_err(ApiError::internal)?;
         if let Some((_, _, origin)) = managed {
             let remote_host = origin
                 .as_deref()
@@ -5501,10 +5554,15 @@ pub fn start_native_session_discovery(state: &AppState) {
 /// The shortest pause between two roster refreshes. A refresh also pauses as long as it took,
 /// so refreshing never takes more than about half a core however often readers ask. Reads
 /// never wait for it: this bounds how stale a served roster can be, about a second plus a fold.
+/// A read waiting for a fresh roster cuts it short to the refresh's own length.
 const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_secs(1);
 
+/// The shortest pause a read waiting for a fresh roster can cut the refresher's pause to, so
+/// that a very cheap fold cannot turn fresh reads into many refreshes a second.
+const AGENT_ROSTER_FRESH_PAUSE: Duration = Duration::from_millis(100);
+
 /// How long a read asking for a fresh roster waits for one at or after its own cut: long enough
-/// for the refresher's pause and one fold.
+/// for the refresher to finish a fold, pause as long, and fold again.
 const AGENT_ROSTER_READ_WAIT: Duration = Duration::from_secs(2);
 
 /// Keep the complete agents roster published off the request path. As the daemon starts it
@@ -5563,7 +5621,15 @@ pub fn start_agent_roster(state: &AppState) {
             if first {
                 continue;
             }
-            tokio::time::sleep(started.elapsed().max(AGENT_ROSTER_REFRESH_PAUSE)).await;
+            // Pause as long as the refresh took, so refreshing stays under about half a core
+            // however often readers ask, and at least the minimum pause unless a reader waits
+            // for a fresh roster: that read then waits for one fold, not the rest of the pause.
+            let pause = started.elapsed().max(AGENT_ROSTER_FRESH_PAUSE);
+            tokio::time::sleep(pause).await;
+            tokio::select! {
+                () = tokio::time::sleep(AGENT_ROSTER_REFRESH_PAUSE.saturating_sub(pause)) => {}
+                () = store.fresh_agent_roster_wanted() => {}
+            }
             wake.notified().await;
         }
     });
@@ -5670,24 +5736,37 @@ async fn serve_unix_with_ancestor_ready(
             }
         };
         // Every local connection names its caller, so request counts by client are always on.
+        let mut diagnostic_connection = crate::relay_trace::Connection::capture();
         let peer_pid = local_peer_pid(&stream);
         let app = app.clone();
         tokio::spawn(async move {
+            if let Some(connection) = &mut diagnostic_connection {
+                connection.dispatched();
+            }
             // /proc ancestry may fault in pages on a loaded host. Keep that work
             // out of the accept loop so a slow lookup delays only this peer.
-            let (bound_agent, caller, delivery_peer) = match peer_pid {
+            if let Some(connection) = &mut diagnostic_connection {
+                connection.queued();
+            }
+            let (bound_agent, caller, delivery_peer, diagnostic_connection) = match peer_pid {
                 Some(pid) => crate::api::read_deadline::spawn_blocking(move || {
+                    if let Some(connection) = &mut diagnostic_connection {
+                        connection.started();
+                    }
                     let bound_agent = bind_ancestry.then(|| ancestor(pid)).flatten();
                     let caller = Some(crate::profile::Caller::of_command(
                         local_process_arguments(pid).map(|(arguments, _)| arguments),
                         bound_agent.as_deref(),
                     ));
                     let delivery_peer = bind_harness.then(|| native_delivery_peer(pid)).flatten();
-                    (bound_agent, caller, delivery_peer)
+                    if let Some(connection) = &mut diagnostic_connection {
+                        connection.finished();
+                    }
+                    (bound_agent, caller, delivery_peer, diagnostic_connection)
                 })
                 .await
                 .unwrap_or_default(),
-                None => (None, None, None),
+                None => (None, None, None, diagnostic_connection),
             };
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let app = app.clone();
@@ -5696,6 +5775,9 @@ async fn serve_unix_with_ancestor_ready(
                 let delivery_peer = delivery_peer.clone();
                 async move {
                     let mut request = request.map(Body::new);
+                    if let Some(connection) = diagnostic_connection {
+                        request.extensions_mut().insert(connection);
+                    }
                     if let Some(pid) = peer_pid {
                         request.extensions_mut().insert(LocalPeer {
                             pid,
@@ -14243,13 +14325,24 @@ async fn work_action_response(
     // An exact retry returns the transaction's durable response even if the provider exited after
     // committing it. The store repeats this lookup under its mutation boundary; this early read
     // only prevents the live-incarnation precondition from breaking idempotent recovery.
-    if let Some(response) = state
+    if let Some(mut response) = state
         .store
         .cached_idempotency_response::<StepRunView>(&request.idempotency_key)
         .map_err(ApiError::internal)?
     {
         if let Some(input) = handoff.as_ref() {
             state.store.handoff_retry(&subject, input).map_err(ApiError::bad)?;
+        }
+        if action == "renew" {
+            // A renewal caches its view without the fields the writer no longer folds.
+            let store = state.store.clone();
+            response = blocking_action(move || {
+                store
+                    .enrich_work_response(&mut response)
+                    .map_err(|error| St3Error::new("store-read-failed", format!("{error:#}")))?;
+                Ok(response)
+            })
+            .await?;
         }
         return Ok(Json(response));
     }
@@ -16059,6 +16152,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             &axum::http::Method::GET,
             "/v1/client/agents",
             "/v1/client/agents",
+            None,
             "stui",
             Instant::now() - Duration::from_secs(2),
         );
