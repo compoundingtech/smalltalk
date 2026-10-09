@@ -37,9 +37,9 @@ export interface ComposerSessionProps {
 }
 const SavedDraft = Schema.Struct({
   text: Schema.String,
-  segments: Schema.optionalKey(Schema.Array(Schema.Union([
+  segments: Schema.optional(Schema.Array(Schema.Union([
     Schema.Struct({ type: Schema.Literal('text'), text: Schema.String }),
-    Schema.Struct({ type: Schema.Literal('token'), text: Schema.String, value: Schema.optionalKey(DraftToken) }),
+    Schema.Struct({ type: Schema.Literal('token'), text: Schema.String, value: Schema.optional(DraftToken) }),
   ]))),
 })
 type SavedDraft = typeof SavedDraft.Type
