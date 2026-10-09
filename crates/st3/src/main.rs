@@ -1788,6 +1788,12 @@ struct MissionShowArgs {
     /// Follow until finished or stopped; retry timeouts and wait up to 5min for an unreachable daemon.
     #[arg(long)]
     follow: bool,
+    /// Continue the human root tree after the preceding page's cursor.
+    #[arg(long, conflicts_with = "follow")]
+    cursor: Option<String>,
+    /// Maximum root runs to include in one human tree page.
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
 }
 
 #[derive(Args)]
@@ -6451,6 +6457,11 @@ async fn run_mission_view(
             )
         }
         MissionViewCommand::Show(args) => {
+            anyhow::ensure!((1..=50).contains(&args.limit), "mission tree limit must be 1 through 50");
+            anyhow::ensure!(
+                !json_output || args.cursor.is_none(),
+                "--cursor continues the human tree; omit --json"
+            );
             let client = if args.follow {
                 client.clone().with_follow_retry()
             } else {
@@ -6493,12 +6504,13 @@ async fn run_mission_view(
             if json_output {
                 return print_value(&run, true);
             }
-            let runs = load_mission_run_tree(client, &run).await?;
+            let page = load_mission_run_tree(client, &run, args.cursor.as_deref(), args.limit).await?;
             let now = current_unix_ms()?;
             print!(
                 "{}",
-                render_mission_run(&run, &runs, OutputStyle::stdout(), now)
+                render_mission_run(&run, &page.runs, OutputStyle::stdout(), now)
             );
+            print_mission_tree_continuation(&run, &page);
             // A daemon without lanes answers 404; the run itself is still shown.
             if let Ok(lanes) = client
                 .get::<Vec<st3::model::LaneView>>(&format!(
@@ -7151,10 +7163,24 @@ async fn follow_mission_run_to(
     let client = &client;
     let mut prior = String::new();
     loop {
-        let runs = load_mission_run_tree(client, &run).await?;
-        let summary = mission_run_signature(&runs)?;
-        if summary != prior && !json_output {
-            let frame = render_mission_run(&run, &runs, style, current_unix_ms()?);
+        let page = if json_output {
+            None
+        } else {
+            Some(load_mission_run_tree(client, &run, None, 50).await?)
+        };
+        let summary = if let Some(page) = &page {
+            format!("{}:{}", run.updated_at_unix_ms, mission_run_signature(&page.runs)?)
+        } else {
+            String::new()
+        };
+        if summary != prior && let Some(page) = &page {
+            let mut frame = render_mission_run(&run, &page.runs, style, current_unix_ms()?);
+            if let Some(cursor) = &page.next_cursor {
+                frame.push_str(&format!(
+                    "\nTREE      More runs follow; st missions show {} --cursor {cursor}\n",
+                    run.subject
+                ));
+            }
             write!(
                 output,
                 "{}",
@@ -7191,19 +7217,32 @@ async fn follow_mission_run_to(
 async fn load_mission_run_tree(
     client: &Client,
     selected: &MissionRunView,
-) -> Result<Vec<MissionRunView>> {
-    let runs: Vec<MissionRunView> = client
-        .get(&format!(
-            "/v1/mission-runs?root={}",
-            urlencoding::encode(&selected.root_mission_run)
-        ))
-        .await?;
-    anyhow::ensure!(
-        runs.iter().any(|run| run.subject == selected.subject),
-        "mission run `{}` is absent from its root graph",
-        selected.subject
+    after: Option<&str>,
+    limit: usize,
+) -> Result<st3::model::MissionRunTreePage> {
+    let mut query = format!(
+        "/v1/mission-runs/tree?root={}&limit={limit}",
+        urlencoding::encode(&selected.root_mission_run)
     );
-    Ok(runs)
+    if let Some(after) = after {
+        query.push_str("&after=");
+        query.push_str(&urlencoding::encode(after));
+    }
+    client
+        .get(&query)
+        .await
+}
+
+fn print_mission_tree_continuation(
+    selected: &MissionRunView,
+    page: &st3::model::MissionRunTreePage,
+) {
+    if let Some(cursor) = &page.next_cursor {
+        println!(
+            "\nTREE      More runs follow; st missions show {} --cursor {cursor}",
+            selected.subject
+        );
+    }
 }
 
 fn mission_run_follow_succeeded(status: &str) -> bool {
@@ -27868,6 +27907,24 @@ mod tests {
         };
         assert_eq!(args.mission_or_run, "mission-run/release/demo");
         assert!(args.follow);
+        assert_eq!(args.limit, 50);
+        assert!(args.cursor.is_none());
+        let continued = Cli::try_parse_from([
+            "st3", "missions", "show", "mission-run/release/demo", "--cursor", "child-run",
+            "--limit", "20",
+        ])
+        .unwrap();
+        let Command::Missions {
+            command: MissionViewCommand::Show(continued),
+        } = continued.command else {
+            panic!("mission show pagination did not parse");
+        };
+        assert_eq!(continued.cursor.as_deref(), Some("child-run"));
+        assert_eq!(continued.limit, 20);
+        assert!(Cli::try_parse_from([
+            "st3", "missions", "show", "mission-run/release/demo", "--follow", "--cursor", "child-run",
+        ])
+        .is_err());
     }
 
     #[test]
