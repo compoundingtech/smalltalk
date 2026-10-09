@@ -6,6 +6,7 @@ import {
   type Key,
 } from 'react-aria-components'
 import { surfaceVars as surface, textVars as text, borderVars as border, accentVars as accent, statusVars as status, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from './composition-tokens.stylex'
+import { readingColumnStyles } from './reading-column.stylex'
 import { Icon } from './composition/Icons'
 import { EffortPicker } from './embrace-composer/EffortPicker'
 import {
@@ -17,6 +18,8 @@ export interface EmbraceComposerProps {
   readonly variant: 'C1' | 'C2' | 'C3'
   /** Text-only capability, independent of the selected layout variant. */
   readonly plainText?: boolean
+  /** Host opt-in: bound the composer to the shared reading column beside the transcript. */
+  readonly readingColumn?: boolean
   readonly input?: (inputStyle: stylex.StyleXStyles, descriptionId: string) => React.ReactNode
   readonly actions?: (compact: boolean) => React.ReactNode
   /** Oldest first. ArrowUp on an empty field recalls the most recent entry. */
@@ -240,7 +243,7 @@ export function EmbraceComposer(props: EmbraceComposerProps) {
     footerStyle: [styles.adaptiveFooter, props.footerStyle],
     submitIcon: compact ? <Icon name="send" /> : props.submitIcon,
   }
-  return <CompactComposerContext.Provider value={densityContext}><div ref={root} data-testid="kit-composer">
+  return <CompactComposerContext.Provider value={densityContext}><div ref={root} data-testid="kit-composer" {...stylex.props(props.readingColumn === true && readingColumnStyles.column)}>
     {(props.plainText ?? props.variant === 'C1') || props.input !== undefined ? <PlainComposer {...composerProps} /> : <TokenComposer {...composerProps} />}
   </div></CompactComposerContext.Provider>
 }
