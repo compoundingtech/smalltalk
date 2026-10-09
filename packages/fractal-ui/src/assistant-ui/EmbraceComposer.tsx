@@ -30,12 +30,19 @@ export interface EmbraceComposerHandle {
   /** Returns false without changing the field when a newer edit or restore has won. */
   restoreDraft(draft: ComposerDraftRestore): boolean
 }
+export interface ComposerConnectionNotice {
+  readonly tone: 'offline' | 'reconnecting'
+  readonly text: string
+  readonly action?: { readonly label: string; readonly onPress: () => void }
+}
 
 export interface EmbraceComposerProps {
   readonly variant: 'C1' | 'C2' | 'C3'
   readonly ref?: React.Ref<EmbraceComposerHandle>
   /** Browser-local storage is host-owned; called for runtime text changes, including send clears. */
   readonly onDraftChange?: (draft: ComposerDraftSnapshot) => void
+  /** Host-owned connection copy; independent of editable/send-disabled reasons. */
+  readonly connectionNotice?: ComposerConnectionNotice
   /** Text-only capability, independent of the selected layout variant. */
   readonly plainText?: boolean
   /** Host opt-in: bound the composer to the shared reading column beside the transcript. */
@@ -81,6 +88,10 @@ export interface EmbraceComposerProps {
 }
 
 const styles = stylex.create({
+  connectionSlot: { height: g.band, flexShrink: 0, display: 'flex', alignItems: 'end' },
+  connectionNotice: { display: 'flex', alignItems: 'center', gap: s.md, width: '100%', maxHeight: g.band, overflowY: 'auto', paddingBlock: s.sm, color: text.fgMuted, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading },
+  connectionOffline: { color: status.dangerFg },
+  connectionCopy: { flex: '1 1 0', minWidth: 0, overflowWrap: 'anywhere' },
   root: {
     backgroundColor: surface.glassFill, color: text.fg, borderWidth: g.hairline,
     borderStyle: 'solid', borderColor: border.glassBorder, borderRadius: r.slab,
@@ -297,6 +308,9 @@ export function EmbraceComposer(props: EmbraceComposerProps) {
     submitIcon: compact ? <Icon name="send" /> : props.submitIcon,
   }
   return <CompactComposerContext.Provider value={densityContext}><div ref={root} data-testid="kit-composer" {...stylex.props(props.readingColumn === true && readingColumnStyles.column)}>
+    <div data-testid="composer-connection-slot" {...stylex.props(styles.connectionSlot)}>
+      {props.connectionNotice !== undefined && <div data-testid="composer-connection-notice" role="status" aria-live="polite" aria-atomic="true" {...stylex.props(styles.connectionNotice, props.connectionNotice.tone === 'offline' && styles.connectionOffline)}><span {...stylex.props(styles.connectionCopy)}>{props.connectionNotice.text}</span>{props.connectionNotice.action !== undefined && <Button onPress={props.connectionNotice.action.onPress} {...stylex.props(styles.button)}>{props.connectionNotice.action.label}</Button>}</div>}
+    </div>
     {(props.plainText ?? props.variant === 'C1') || props.input !== undefined ? <PlainComposer {...composerProps} /> : <TokenComposer {...composerProps} />}
   </div></CompactComposerContext.Provider>
 }

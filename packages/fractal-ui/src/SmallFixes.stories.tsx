@@ -1,7 +1,7 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import type { Meta, StoryObj } from '@storybook/react-vite'
-import { expect, userEvent, within } from 'storybook/test'
+import { expect, userEvent, within, waitFor } from 'storybook/test'
 import { Button } from 'react-aria-components'
 import { WorkLogV1 } from './assistant-ui/taste/WorkLogV1'
 import { ThinkingEntry } from './assistant-ui/composition/ThinkingEntry'
@@ -119,3 +119,47 @@ export const PreserveNewerDraft: Story = { render: args => <DraftRestore {...arg
   await expect(input).toHaveValue('')
 } }
 export const PreserveNewerDraftLight: Story = { ...PreserveNewerDraft, args: { scheme: 'light' } }
+
+function ConnectionDock({ scheme = 'dark' }: { scheme?: Scheme }) {
+  const [notice, setNotice] = React.useState<'offline' | 'reconnecting'>()
+  const [actions, setActions] = React.useState(0)
+  return <section {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><EmbraceRuntimeProvider options={{ messages: [], isRunning: false, onNew: async () => {} }}>
+    <EmbraceComposer variant="C1" onDraftChange={() => setNotice('offline')} connectionNotice={notice === undefined ? undefined : { tone: notice, text: notice === 'offline' ? 'Offline: your browser-local draft remains editable.' : 'Reconnecting to the conversation…', action: notice === 'offline' ? { label: 'Reconnect', onPress: () => { setActions(value => value + 1); setNotice('reconnecting') } } : undefined }} />
+    <output data-testid="connection-actions">{actions}</output>
+  </EmbraceRuntimeProvider></section>
+}
+export const ComposerConnectionNotice: Story = { render: args => <ConnectionDock {...args} />, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const input = canvas.getByRole('textbox', { name: 'Message' })
+  await expect(canvas.queryByTestId('composer-connection-notice')).toBeNull()
+  input.focus()
+  const before = input.getBoundingClientRect()
+  let inputShift = 0
+  const observer = new PerformanceObserver(list => {
+    for (const entry of list.getEntries()) {
+      const shift = entry as PerformanceEntry & { value: number; sources?: readonly { node?: Node }[] }
+      if (shift.sources?.some(source => source.node === input || source.node instanceof Element && source.node.contains(input))) inputShift += shift.value
+    }
+  })
+  observer.observe({ type: 'layout-shift' })
+  try {
+    await userEvent.type(input, 'Keep my draft')
+    const notice = await canvas.findByTestId('composer-connection-notice')
+    await expect(notice).toHaveAttribute('role', 'status')
+    await expect(notice).toHaveAttribute('aria-live', 'polite')
+    await expect(notice).toHaveTextContent('Offline: your browser-local draft remains editable.')
+    await expect(input).toHaveFocus()
+    await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+    const after = input.getBoundingClientRect()
+    await expect([after.x, after.y, after.width, after.height]).toEqual([before.x, before.y, before.width, before.height])
+    await expect(inputShift).toBe(0)
+    await userEvent.tab({ shift: true })
+    await expect(canvas.getByRole('button', { name: 'Reconnect' })).toHaveFocus()
+    await userEvent.keyboard('{Enter}')
+    await expect(canvas.getByTestId('connection-actions')).toHaveTextContent('1')
+    await waitFor(() => expect(notice).toHaveTextContent('Reconnecting to the conversation…'))
+    await expect(within(notice).queryByRole('button')).toBeNull()
+    await expect(input).toHaveValue('Keep my draft')
+  } finally { observer.disconnect() }
+} }
+export const ComposerConnectionNoticeLight: Story = { ...ComposerConnectionNotice, args: { scheme: 'light' } }
