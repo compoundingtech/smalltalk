@@ -85,55 +85,100 @@ struct Item {
 /// The keys a change can affect: its subject, its actor's work, its kind, and for some kinds a
 /// key a read notes for subjects it cannot name in advance.
 pub fn change_keys(change: &Change) -> Vec<String> {
-    let mut keys = vec![change.subject.clone(), format!("kind:{}", change.kind)];
-    if let Some(actor) = &change.actor {
-        keys.push(format!("actor:{actor}"));
+    let body = serde_json::from_str::<Value>(&change.body).ok();
+    let mut keys = Vec::new();
+    visit_change_keys(change, body.as_ref(), |key| {
+        keys.push(key.to_owned());
+        true
+    });
+    keys
+}
+
+/// Stop BEFORE cloning the next dependency key. The parsed JSON remains covered by the feed's
+/// byte budget; in particular, a large members/retired object is never cloned into an unbounded
+/// second vector. Incomplete expansion is usable only for conservative global invalidation.
+fn bounded_change_keys(change: &Change, budget: usize) -> Result<(Vec<String>, bool)> {
+    let body: Value = serde_json::from_str(&change.body)?;
+    let mut keys = Vec::new();
+    let complete = visit_change_keys(change, Some(&body), |key| {
+        if keys.len() == budget {
+            return false;
+        }
+        keys.push(key.to_owned());
+        true
+    });
+    Ok((keys, complete))
+}
+
+fn visit_change_keys(
+    change: &Change,
+    body: Option<&Value>,
+    mut visit: impl FnMut(&str) -> bool,
+) -> bool {
+    let mut agent = false;
+    let mut emit = |key: &str| {
+        agent |= key.starts_with("agent/");
+        visit(key)
+    };
+    if !emit(&change.subject) || !emit(&format!("kind:{}", change.kind)) {
+        return false;
     }
-    let field = |name: &str| -> Option<String> {
-        let body: Value = serde_json::from_str(&change.body).ok()?;
+    if let Some(actor) = &change.actor
+        && !emit(&format!("actor:{actor}"))
+    {
+        return false;
+    }
+    let field = |name: &str| -> Option<&str> {
+        let body = body?;
         body.get("fields")
-            .unwrap_or(&body)
+            .unwrap_or(body)
             .get(name)
             .and_then(Value::as_str)
-            .map(str::to_owned)
     };
-    match change.kind.as_str() {
-        "message.sent" => keys.extend(field("to").map(|to| format!("mailbox:{to}"))),
-        "mission-run.created" => {
-            keys.extend(field("root_mission_run").map(|root| format!("children:{root}")));
-            keys.extend(field("parent_step_run").map(|step| format!("children-of-step:{step}")));
+    let fields: &[(&str, &str)] = match change.kind.as_str() {
+        "message.sent" => &[("to", "mailbox:")],
+        "mission-run.created" => &[
+            ("root_mission_run", "children:"),
+            ("parent_step_run", "children-of-step:"),
+        ],
+        "intent.desired" => &[
+            ("owner_run", "owned:"),
+            ("owner_step", "owned-step:"),
+            ("previous_owner_step", "owned-step:"),
+            ("previous_owner_generation", ""),
+            ("owner_generation", ""),
+        ],
+        "run-generation.created" => &[("run", "generations:")],
+        "subscription.mission-started" => &[("mission_run", "subscription-run:")],
+        _ => &[],
+    };
+    for (name, prefix) in fields {
+        if let Some(value) = field(name)
+            && !emit(&format!("{prefix}{value}"))
+        {
+            return false;
         }
-        "owned-set.revised" => {
-            keys.push("kind:intent.desired".into());
-            if let Ok(body) = serde_json::from_str::<Value>(&change.body) {
-                for map in ["members", "retired"] {
-                    if let Some(members) = body["fields"]["body"][map].as_object() {
-                        keys.extend(members.keys().cloned());
+    }
+    if change.kind == "owned-set.revised" {
+        if !emit("kind:intent.desired") {
+            return false;
+        }
+        if let Some(body) = body {
+            for map in ["members", "retired"] {
+                if let Some(members) = body["fields"]["body"][map].as_object() {
+                    for key in members.keys() {
+                        if !emit(key) {
+                            return false;
+                        }
                     }
                 }
             }
         }
-        "intent.desired" => {
-            keys.extend(field("owner_run").map(|run| format!("owned:{run}")));
-            keys.extend(field("owner_step").map(|step| format!("owned-step:{step}")));
-            keys.extend(field("previous_owner_step").map(|step| format!("owned-step:{step}")));
-            keys.extend(field("previous_owner_generation"));
-            keys.extend(field("owner_generation"));
-        }
-        "run-generation.created" => {
-            keys.extend(field("run").map(|run| format!("generations:{run}")));
-        }
-        "subscription.mission-started" => {
-            keys.extend(field("mission_run").map(|run| format!("subscription-run:{run}")));
-        }
-        _ => {}
     }
-    if matches!(change.kind.as_str(), "intent.desired" | "owned-set.revised")
-        && keys.iter().any(|key| key.starts_with("agent/"))
-    {
-        keys.push("desired-kind:agent".into());
+    if matches!(change.kind.as_str(), "intent.desired" | "owned-set.revised") && agent {
+        return visit("desired-kind:agent");
     }
-    keys
+    true
 }
 
 impl Incremental {
@@ -174,16 +219,19 @@ impl Incremental {
         let mut affected = BTreeSet::new();
         let mut overflow = false;
         'changes: for change in &feed.changes {
-            if serde_json::from_str::<Value>(&change.body).is_err() {
+            let (keys, complete) = match bounded_change_keys(change, 4096 - keys_seen) {
+                Ok(expanded) => expanded,
+                Err(_) => {
+                    overflow = true;
+                    break;
+                }
+            };
+            if !complete {
                 overflow = true;
                 break;
             }
-            for key in change_keys(change) {
-                keys_seen += 1;
-                if keys_seen > 4096 {
-                    overflow = true;
-                    break 'changes;
-                }
+            keys_seen += keys.len();
+            for key in keys {
                 for item in state.readers.get(&key).into_iter().flatten() {
                     readers_seen += 1;
                     if readers_seen > 1024 {
@@ -686,6 +734,108 @@ mod tests {
         observe(&store, "changed");
         incremental.observe(&store).unwrap();
         for name in ["reader:0", "reader:1024", "otherwise-unrelated"] {
+            assert!(incremental.needs(name, 0));
+        }
+    }
+
+    #[test]
+    fn one_large_membership_receipt_stops_materialization_and_invalidates_all_readers() {
+        let members = (0..4200)
+            .map(|n| {
+                (
+                    format!("agent/{n:04}"),
+                    serde_json::json!({
+                        "kind":"agent", "claim":"a".repeat(64), "revision":"b".repeat(64)
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>();
+        let mut receipt = serde_json::json!({"fields":{"revision":"c".repeat(64), "body":{
+            "previous":null, "source":{"repository":"acme/repo", "ref":"refs/heads/main",
+                "sha":"d".repeat(40), "sequence":1},
+            "bundle_digest":"e".repeat(64), "members":members, "retired":{}, "adoptions":{}
+        }}});
+        let revision: crate::store::owned_sets::Revision =
+            serde_json::from_value(receipt["fields"]["body"].clone()).unwrap();
+        receipt["fields"]["revision"] =
+            Value::String(smallclaims::hash::canonical_hash(&revision).unwrap());
+        let large = change(
+            "owned-set/large",
+            "owned-set.revised",
+            None,
+            &receipt.to_string(),
+        );
+        assert!(large.body.len() + large.subject.len() + large.kind.len() < 1024 * 1024);
+        let (keys, complete) = bounded_change_keys(&large, 4096).unwrap();
+        assert!(!complete);
+        assert_eq!(
+            keys.len(),
+            4096,
+            "no cloned membership suffix beyond the budget"
+        );
+        assert!(!keys.contains(&"agent/4199".to_owned()));
+        let (empty, complete) = bounded_change_keys(&large, 0).unwrap();
+        assert!(!complete && empty.is_empty());
+        // The same producer retains every old key for a small, fully expanded receipt, and
+        // the boundary is inclusive rather than silently truncating the final agent-kind key.
+        let small = change_keys(&change(
+            "owned-set/small",
+            "owned-set.revised",
+            None,
+            r#"{"fields":{"body":{"members":{"agent/a":{}},"retired":{"agent/b":{}}}}}"#,
+        ));
+        let small_change = change(
+            "owned-set/small",
+            "owned-set.revised",
+            None,
+            r#"{"fields":{"body":{"members":{"agent/a":{}},"retired":{"agent/b":{}}}}}"#,
+        );
+        assert_eq!(
+            small,
+            [
+                "owned-set/small",
+                "kind:owned-set.revised",
+                "kind:intent.desired",
+                "agent/a",
+                "agent/b",
+                "desired-kind:agent"
+            ]
+            .map(str::to_owned)
+        );
+        assert_eq!(
+            bounded_change_keys(&small_change, small.len()).unwrap(),
+            (small.clone(), true)
+        );
+        assert!(
+            !bounded_change_keys(&small_change, small.len() - 1)
+                .unwrap()
+                .1
+        );
+
+        let store = Store::open_memory("node").unwrap();
+        let incremental = Incremental::default();
+        incremental.observe(&store).unwrap();
+        for (name, dependency) in [
+            ("visited", "agent/0000"),
+            ("unvisited", "agent/4199"),
+            ("unrelated", "doc/elsewhere"),
+        ] {
+            incremental.evaluated(name, BTreeSet::from([dependency.into()]), None);
+        }
+        // Reader-only injection of a receipt-shaped hint. This exercises the actual bounded
+        // discovery path, not admission, member-reference eligibility or replication proof.
+        store.connection.write().execute(
+            "INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+                VALUES(0,?1,?2,?3,1)",
+            rusqlite::params![large.subject, large.kind, large.body],
+        ).unwrap();
+        let observed = store.reconcile_changes_since(0, 0).unwrap();
+        assert!(
+            !observed.invalidate_all && observed.feed.changes.len() == 1,
+            "the key cap, not the row/byte cap, must select the fallback"
+        );
+        incremental.observe(&store).unwrap();
+        for name in ["visited", "unvisited", "unrelated"] {
             assert!(incremental.needs(name, 0));
         }
     }

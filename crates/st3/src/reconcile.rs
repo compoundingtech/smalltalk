@@ -11774,15 +11774,22 @@ impl<R: RuntimeControl> Reconciler<R> {
             scheduled_at
         };
         let operation = format!("{}:{revision}:{occurrence}", schedule.subject);
-        smallclaims::touched::note_due(scheduled_at.max(0) as u128);
+        let timer_due = scheduled_at.max(0) as u128;
         if !self
             .armed_schedules
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(operation.clone())
         {
+            // A sleeping arm still needs deadline discovery. Once its instant is reached,
+            // that arm owns progress and signals completion/rejection; do not keep selecting
+            // no-op evaluations while it waits to run or finish its existing work.
+            if timer_due > now_ms() {
+                smallclaims::touched::note_due(timer_due);
+            }
             return Ok(());
         }
+        smallclaims::touched::note_due(timer_due);
         let request = self.store.append_claim(&ClaimInput {
             subject: schedule.subject.clone(),
             kind: "schedule.occurrence-scheduled".into(),
@@ -12993,13 +13000,21 @@ impl<R: RuntimeControl> Reconciler<R> {
             refresh_attempt.as_deref().unwrap_or("scheduled"));
         let cadence_prefix = format!("{operation_prefix}{}:", spec.every_ms.map_or("default".into(), |ms| ms.to_string()));
         let operation = format!("{cadence_prefix}{}", uuid::Uuid::now_v7());
-        smallclaims::touched::note_due(next_check);
         {
             let mut armed = self.armed_observers.lock().unwrap_or_else(PoisonError::into_inner);
             armed.retain(|key| !key.starts_with(&operation_prefix) || key.starts_with(&cadence_prefix));
-            if armed.iter().any(|key| key.starts_with(&cadence_prefix)) { return Ok(()); }
+            if armed.iter().any(|key| key.starts_with(&cadence_prefix)) {
+                // Preserve future timer discovery, but consume an elapsed deadline while the
+                // existing arm/provider owns progress. Its completion signals a fresh pass
+                // and records the next cadence or retry deadline.
+                if next_check > now_ms() {
+                    smallclaims::touched::note_due(next_check);
+                }
+                return Ok(());
+            }
             armed.insert(operation.clone());
         }
+        smallclaims::touched::note_due(next_check);
         let store = self.store.clone();
         let provider = self.resource_provider.clone();
         let notify = self.notify.clone();

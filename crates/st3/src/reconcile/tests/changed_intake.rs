@@ -478,4 +478,258 @@ schedule "later" {{ at "{at}"; work {{ mission "scheduled-cycle@{revision}"; wor
             ("schedule".into(), "schedule/later".into()),
         ])
     );
+    assert_eq!(reconciler.incremental.next_due("observer:"), None);
+    assert_eq!(reconciler.incremental.next_due("schedule:"), None);
+    stages(&reconciler, &desired);
+    assert!(
+        entries.take().is_empty(),
+        "elapsed cached arms must not keep selecting no-ops"
+    );
+}
+
+/// A real provider call remains pending after the observer's armed timer has fired.
+struct PendingProvider {
+    calls: Arc<AtomicUsize>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+impl ResourceProvider for PendingProvider {
+    fn observe(
+        &self,
+        _request: ObservationRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<crate::resource::ProviderObservation>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(crate::resource::ProviderObservation {
+                facts: serde_json::json!({"issues":[]}),
+                cursor: Some("completed".into()),
+                next_check_unix_ms: now_ms() + 60_000,
+            })
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_elapsed_observer_deadline_is_consumed_while_the_real_provider_is_pending() {
+    let clock = Clock::at(START);
+    let store = Arc::new(Store::open_memory("node").unwrap());
+    store.set_write_clock_at(START).unwrap();
+    apply_source(&store, SCRIPTED_OBSERVER, "pending-provider");
+    let entries = Arc::new(Entries::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let reconciler = Reconciler::new(
+        store.clone(),
+        Arc::new(FakeRuntime::default()),
+        "node".into(),
+        Arc::new(Notify::new()),
+    )
+    .skipping_unneeded(true)
+    .with_fault_injection(entries.clone())
+    .with_resource_provider(Arc::new(PendingProvider {
+        calls: calls.clone(),
+        entered: entered.clone(),
+        release: release.clone(),
+    }));
+    let revision = store
+        .selected_desired_revision("observer/repo")
+        .unwrap()
+        .unwrap();
+    let due = START + 10;
+    reconciler
+        .observer_deadlines
+        .lock()
+        .unwrap()
+        .insert(format!("observer/repo:{revision}"), due);
+    let desired = store.desired_subjects().unwrap();
+    reconciler
+        .reconcile_resource_observers(&desired, &desired)
+        .unwrap();
+    assert_eq!(reconciler.incremental.next_due("observer:"), Some(due));
+    entries.take();
+    // Let the real spawned arm install its sleep before advancing its deadline.
+    tokio::task::yield_now().await;
+    clock.set(due);
+    tokio::time::advance(Duration::from_millis(10)).await;
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(reconciler.armed_observers.lock().unwrap().len(), 1);
+    let mut completion = reconciler.event_notify.subscribe();
+    reconciler
+        .reconcile_resource_observers(&desired, &desired)
+        .unwrap();
+    assert_eq!(
+        entries.take(),
+        [("observer".into(), "observer/repo".into())]
+    );
+    assert_eq!(reconciler.incremental.next_due("observer:"), None);
+    assert!(!reconciler.incremental.needs("observer:observer/repo", due));
+    reconciler
+        .reconcile_resource_observers(&desired, &desired)
+        .unwrap();
+    assert!(entries.take().is_empty());
+    assert!(
+        reconciler
+            .next_reconcile_deadline()
+            .is_none_or(|at| at > due)
+    );
+    entries.take(); // Deadline discovery has its own fault-injection scopes.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!completion.has_changed().unwrap());
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), completion.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reconciler.armed_observers.lock().unwrap().is_empty());
+    assert_eq!(
+        store.latest_actual_value("resource/repo").unwrap().unwrap()["facts"]["issues"],
+        serde_json::json!([])
+    );
+    let next = due + 60_000;
+    assert_eq!(
+        reconciler.observer_deadlines.lock().unwrap()[&format!("observer/repo:{revision}")],
+        next
+    );
+    // The real completion's claim/notification selects a fresh read and arms the next cadence.
+    entries.take(); // Completion's writer probes are distinct from item evaluation.
+    reconciler
+        .reconcile_resource_observers(&desired, &desired)
+        .unwrap();
+    assert_eq!(
+        entries.take(),
+        [("observer".into(), "observer/repo".into())]
+    );
+    assert_eq!(reconciler.incremental.next_due("observer:"), Some(next));
+    tokio::task::yield_now().await;
+    clock.set(next);
+    tokio::time::advance(Duration::from_millis(60_000)).await;
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), completion.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reconciler.armed_observers.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_elapsed_schedule_deadline_is_consumed_until_its_real_timer_notifies() {
+    let clock = Clock::at(START);
+    let store = Arc::new(Store::open_memory("node").unwrap());
+    store.set_write_clock_at(START).unwrap();
+    let revision = scheduled_mission_revision(&store);
+    let due = START + 10;
+    let anchor = chrono::DateTime::from_timestamp_millis(due as i64)
+        .unwrap()
+        .to_rfc3339();
+    apply_source(
+        &store,
+        &format!(
+            r#"version 2
+schedule "later" {{ every "1h"; anchor "{anchor}"
+    work {{ mission "scheduled-cycle@{revision}"; workspace "/tmp" }} }}
+"#
+        ),
+        "pending-schedule-timer",
+    );
+    let entries = Arc::new(Entries::default());
+    let reconciler = Reconciler::new(
+        store.clone(),
+        Arc::new(FakeRuntime::default()),
+        "node".into(),
+        Arc::new(Notify::new()),
+    )
+    .skipping_unneeded(true)
+    .with_fault_injection(entries.clone());
+    let desired = store.desired_subjects().unwrap();
+    reconciler.reconcile_schedules(&desired).unwrap();
+    assert_eq!(reconciler.incremental.next_due("schedule:"), Some(due));
+    tokio::task::yield_now().await;
+    // Consume arming's append hints while the real timer is still sleeping.
+    reconciler.reconcile_schedules(&desired).unwrap();
+    assert_eq!(reconciler.incremental.next_due("schedule:"), Some(due));
+    entries.take();
+    clock.set(due);
+    let mut completion = reconciler.event_notify.subscribe();
+    // Wall clock has reached the deadline. Hold Tokio's actual timer until after these reads,
+    // modeling an armed wake whose runnable task has not yet received executor time.
+    reconciler.reconcile_schedules(&desired).unwrap();
+    assert_eq!(
+        entries.take(),
+        [("schedule".into(), "schedule/later".into())]
+    );
+    assert_eq!(reconciler.incremental.next_due("schedule:"), None);
+    assert!(!reconciler.incremental.needs("schedule:schedule/later", due));
+    reconciler.reconcile_schedules(&desired).unwrap();
+    assert!(entries.take().is_empty());
+    assert_eq!(reconciler.armed_schedules.lock().unwrap().len(), 1);
+    assert!(
+        store
+            .claims_for("schedule/later", Some("schedule.occurrence-reached"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!completion.has_changed().unwrap());
+    tokio::time::advance(Duration::from_millis(10)).await;
+    tokio::time::timeout(Duration::from_secs(2), completion.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reconciler.armed_schedules.lock().unwrap().is_empty());
+    assert_eq!(
+        store
+            .claims_for("schedule/later", Some("schedule.occurrence-reached"))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .pending_schedule_work_requests("schedule/later")
+            .unwrap()
+            .len(),
+        1
+    );
+    // The completed timer still feeds the real work consumer, then the next occurrence.
+    reconciler.reconcile_scheduled_work(&desired).unwrap();
+    assert_eq!(
+        store
+            .claims_for("schedule/later", Some("schedule.work-started"))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .pending_schedule_work_requests("schedule/later")
+            .unwrap()
+            .is_empty()
+    );
+    reconciler.reconcile_schedules(&desired).unwrap();
+    assert_eq!(
+        reconciler.incremental.next_due("schedule:"),
+        Some(due + 3_600_000)
+    );
+    assert_eq!(
+        store
+            .claims_for("schedule/later", Some("schedule.occurrence-scheduled"))
+            .unwrap()
+            .len(),
+        2
+    );
 }
