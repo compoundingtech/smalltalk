@@ -3,19 +3,23 @@ import { useAtomValue } from '@effect/atom-react'
 import { systemEventsPreference } from './conversationPreferences.ts'
 import { EmbraceComposer, EmbraceRuntimeProvider, Transcript, type WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
 import { useConversation, useConversationSync, useDataSource, useFeedInterest, useGrants, useNow } from '../data/react.tsx'
-import { createConversationTranscript, openableImageUrl, transcriptObservedAt, transcriptSyncStatus } from './conversationTranscript.ts'
+import { createConversationTranscript, openableImageUrl, transcriptObservedAt, transcriptSyncStatus, type ConversationTranscriptState } from './conversationTranscript.ts'
 import { composerSendBinding, type SendRefusal } from './composerSend.ts'
 import { spaceVars } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 import { LiveAgentTodos } from '../conversation/todos/AgentTodos.tsx'
 import type { UxTelemetry } from '../telemetry/ux.ts'
+import type { ConversationPage, Feed } from '../data/source.ts'
 
 /** The follow owns content and the kit owns its presentation. The display-contents host
- * boundary observes asynchronous runtime adoption without inventing a kit commit hook. */
+ * boundary observes asynchronous runtime adoption without inventing a kit commit hook.
+ * Visibility lives only in this wrapper: toggling it never re-renders the memoized content,
+ * so a retained pane is revealed without re-importing its runtime messages. */
 export const ConversationPane = ({
   agentRef,
   agentName,
   onOpenTool,
   ux,
+  visible = true,
 }: {
   readonly agentRef: string
   /** Roster display name: the composition header and assistant sender captions. */
@@ -23,30 +27,40 @@ export const ConversationPane = ({
   /** Host-owned detail surface for a tool call opened from the transcript. */
   readonly onOpenTool: (call: WorkLogCall) => void
   readonly ux?: UxTelemetry
+  /** A retained hidden pane keeps its DOM but releases visible follow demand (setVisible false). */
+  readonly visible?: boolean
 }) => {
   const source = useDataSource()
   const showSystemEvents = useAtomValue(systemEventsPreference)
-  // A cold or deep-linked route must follow on mount; the pane is keyed by agent ref, so
-  // switching agents releases the previous conversation's demand with this component.
+  // Visible demand is an effect: hiding unmounts the interest, whose finalizer marks the
+  // SDK follow invisible and therefore evictable, while the retained DOM stays mounted.
   const interest = React.useMemo(() => source.conversationInterest?.(agentRef), [source, agentRef])
-  useFeedInterest({ interest, visible: true })
-  const now = useNow()
+  useFeedInterest({ interest, visible })
   const feed = useConversation(agentRef)
-  const observation = useConversationSync(agentRef)
   const projectTranscript = React.useMemo(createConversationTranscript, [])
   const state = projectTranscript(feed, { agentName, showSystemEvents })
+  const observed = state._tag === 'Observed'
+  const hasTurns = observed && state.turns.length > 0
   const boundary = React.useRef<HTMLDivElement>(null)
-  const content = state._tag !== 'Observed' ? 'waiting' : state.turns.length === 0 ? 'empty' : 'turns'
   React.useLayoutEffect(() => {
     const node = boundary.current
-    if (node === null || ux === undefined || content === 'waiting') return
+    if (node === null) return
+    // Only the small composer is inert. Locking the entire transcript would restyle every
+    // row in the switch frame. The boundary hides covered content from assistive technology.
+    const composer = node.querySelector('textarea')?.closest('form')
+    if (composer !== null && composer !== undefined) composer.inert = !visible
+    const focused = node.ownerDocument.activeElement
+    if (!visible && focused instanceof HTMLElement && node.contains(focused)) focused.blur()
+  }, [visible, state._tag])
+  React.useLayoutEffect(() => {
+    const node = boundary.current
+    if (node === null || ux === undefined || !visible || !observed) return
     let cancelPaint: (() => void) | undefined
     const committed = () => {
       if (cancelPaint !== undefined) return
       const lane = node.querySelector('[data-testid="transcript-scroll"]')
       if (lane === null || lane.querySelector('[data-testid="transcript-placeholder"]') !== null) return
-      const selector = content === 'turns' ? '[data-testid="transcript-turn"]' : '[data-testid="transcript-empty"]'
-      if (lane.querySelector(selector) === null) return
+      if (lane.querySelector(hasTurns ? '[data-testid="transcript-turn"]' : '[data-testid="transcript-empty"]') === null) return
       cancelPaint = ux.transcriptCommitted(agentRef)
       observer.disconnect()
     }
@@ -56,7 +70,28 @@ export const ConversationPane = ({
     observer.observe(node, { childList: true, subtree: true })
     committed()
     return () => { observer.disconnect(); cancelPaint?.() }
-  }, [agentRef, content, ux])
+  }, [agentRef, observed, hasTurns, ux, visible])
+  // Diagnostics stay in data-wf-* attributes; the kit renders only the fixed unavailable copy.
+  return <div ref={boundary} style={{ display: 'contents' }} aria-hidden={!visible}
+    data-wf-unavailable={state._tag === 'Unavailable' ? state.classification : undefined}
+    data-wf-unavailable-code={state._tag === 'Unavailable' ? state.code : undefined}
+    onFocusCapture={event => { if (!visible) event.target.blur() }}
+    onKeyDownCapture={event => { if (!visible) { event.preventDefault(); event.stopPropagation() } }}
+    onClickCapture={event => { if (!visible) { event.preventDefault(); event.stopPropagation() } }}>
+    <ConversationContent agentRef={agentRef} agentName={agentName} onOpenTool={onOpenTool} feed={feed} state={state} />
+  </div>
+}
+
+const ConversationContent = React.memo(function ConversationContent({ agentRef, agentName, onOpenTool, feed, state }: {
+  readonly agentRef: string
+  readonly agentName: string
+  readonly onOpenTool: (call: WorkLogCall) => void
+  readonly feed: Feed<ConversationPage>
+  readonly state: ConversationTranscriptState
+}) {
+  const source = useDataSource()
+  const now = useNow()
+  const observation = useConversationSync(agentRef)
   const grants = useGrants()
   const [refusal, setRefusal] = React.useState<SendRefusal>()
   const binding = composerSendBinding({
@@ -66,10 +101,7 @@ export const ConversationPane = ({
     refusal, onRefused: setRefusal,
   })
   const retryConversation = source.retryConversation
-  return <div ref={boundary} style={{ display: 'contents' }}
-    data-wf-unavailable={state._tag === 'Unavailable' ? state.classification : undefined}
-    data-wf-unavailable-code={state._tag === 'Unavailable' ? state.code : undefined}>
-    <EmbraceRuntimeProvider key={agentRef} options={{ ...binding.runtime, isRunning: state._tag === 'Observed' && state.isRunning }}>
+  return <EmbraceRuntimeProvider key={agentRef} options={{ ...binding.runtime, isRunning: state._tag === 'Observed' && state.isRunning }}>
     {/* Bound the 100%-height kit frame to the space left above the composer. */}
     <div data-testid="conversation-history-host" style={{ flex: '1 1 0', minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
     <Transcript
@@ -101,6 +133,5 @@ export const ConversationPane = ({
     <div data-testid="conversation-composer-dock" style={{ flexShrink: 0, paddingBottom: spaceVars.lg }}>
       <EmbraceComposer variant="C1" readingColumn disabledReason={binding.disabledReason} />
     </div>
-    </EmbraceRuntimeProvider>
-  </div>
-}
+  </EmbraceRuntimeProvider>
+})

@@ -147,6 +147,7 @@ test('incremental roster lifecycle changes invalidate the retained sidebar row',
   expect(project.fleetFromAgents([row]).agents[0])
     .toHaveProperty('lifecycle', { _tag: 'Unknown' })
 })
+
 test('incremental fleet projection retains unchanged rows, hosts and collection identity', () => {
   const project = createProjections()
   const second: Agent = { ...row, id: 'agent/second', name: 'Second' }

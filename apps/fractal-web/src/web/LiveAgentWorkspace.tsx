@@ -1,11 +1,13 @@
 import { sidebarRow } from './sidebarRow.ts'
-import { ConversationPane } from './ConversationPane.tsx'
+import { ConversationPaneFallback } from './ConversationPaneFallback.tsx'
+import type * as ConversationPaneModule from './ConversationPane.tsx'
 import { ConversationHeaderActions } from './ConversationHeaderActions.tsx'
-import { workspaceView, workspaceViewNotice, type WorkspaceView } from './workspaceView.ts'
+import { retainPane, workspaceView, workspaceViewNotice, type RetainedPane, type WorkspaceView } from './workspaceView.ts'
 import { ThreadHeaderSlotContext } from '../shell/threadHeaderSlot.tsx'
 import { liveLegacyTheme } from '../ui-compat/live-theme.stylex.ts'
 import { colorVars as c, typeVars as t, spaceVars as s, geometryVars as g } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 import * as React from 'react'
+import { createPortal } from 'react-dom'
 import * as Aria from 'react-aria-components'
 import * as stylex from '@stylexjs/stylex'
 import { useAtom } from '@effect/atom-react'
@@ -18,7 +20,55 @@ import { useFleet, useSubjectList, useConnection, useNow } from '../data/react.t
 import { persistedAtom } from '../state/persistence.ts'
 import { WorkbenchContextProvider, ResourcePanelProvider, MonitorDetailProvider, type OpenRequest } from '../shell/context.tsx'
 import type { ResourcePanelState } from '../shell/state.ts'
-import type { UxTelemetry } from '../telemetry/ux.ts'
+import { afterNextPaint, type UxTelemetry } from '../telemetry/ux.ts'
+
+// A static import would evaluate the kit Transcript/Markdown/refractor before the shell paints.
+// Demand and speculative prefetch share one in-flight request; rejection releases it for retry.
+let conversationPaneModule: Promise<typeof ConversationPaneModule> | undefined
+const loadConversationPane = () => {
+  if (conversationPaneModule === undefined) {
+    conversationPaneModule = import('./ConversationPane.tsx').catch(error => {
+      conversationPaneModule = undefined
+      throw error
+    })
+  }
+  return conversationPaneModule
+}
+const ConversationPane = React.lazy(() => loadConversationPane().then(module => ({ default: module.ConversationPane })))
+let prefetchedConversationPane: typeof ConversationPane | undefined
+const prefetchConversationPane = () => {
+  const request = loadConversationPane()
+  // Preserve this attempt's failure for the requested pane's honest, local error surface.
+  // A retry creates a fresh lazy wrapper, not React's permanently rejected cached wrapper.
+  prefetchedConversationPane = React.lazy(() => request.then(module => ({ default: module.ConversationPane })))
+  void request.catch(() => {})
+}
+
+class ConversationPaneLoadBoundary extends React.Component<React.ComponentProps<typeof ConversationPaneModule.ConversationPane>> {
+  state: { readonly failed: boolean; readonly Pane: typeof ConversationPane } = {
+    failed: false,
+    Pane: prefetchedConversationPane ?? ConversationPane,
+  }
+
+  static getDerivedStateFromError() {
+    return { failed: true }
+  }
+
+  render() {
+    if (this.state.failed) return <div role="alert" aria-hidden={!this.props.visible} {...stylex.props(styles.empty)}>
+      <p>This conversation view could not load.</p>
+      <button type="button" onClick={() => {
+        const Pane = React.lazy(() => loadConversationPane().then(module => ({ default: module.ConversationPane })))
+        prefetchedConversationPane = Pane
+        this.setState({ failed: false, Pane })
+      }}>Try again</button>
+    </div>
+    const Pane = this.state.Pane
+    return <React.Suspense fallback={<ConversationPaneFallback agentName={this.props.agentName} visible={this.props.visible} />}>
+      <Pane {...this.props} />
+    </React.Suspense>
+  }
+}
 
 // The kit diff viewer imports Markdown; keep it outside the shell's eager graph too.
 const ChangesInspector = React.lazy(() => import('./ChangesInspector.tsx').then(module => ({ default: module.ChangesInspector })))
@@ -67,7 +117,14 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
   }, [location])
   const agents = fleet._tag === 'Observed' ? fleet.value.agents : []
   const rosterObserved = fleet._tag === 'Observed'
-  const shellCommit = React.useCallback((node: HTMLDivElement | null) => node === null ? undefined : ux?.shellCommitted(), [ux])
+  const shellCommit = React.useCallback((node: HTMLDivElement | null) => {
+    if (node === null) return
+    const cancelCapture = ux?.shellCommitted()
+    // The shared paint scheduler posts a task after the first shell frame, not a second rAF.
+    // A selected pane requests code immediately through lazy; the empty shell warms it here.
+    const cancelPrefetch = afterNextPaint(prefetchConversationPane)
+    return () => { cancelCapture?.(); cancelPrefetch() }
+  }, [ux])
   const rosterCommit = React.useCallback((node: HTMLElement | null) => node === null || !rosterObserved ? undefined : ux?.rosterCommitted(), [ux, rosterObserved])
   const current = initialAgentFromUrl() ?? (storedAgent || agents[0]?.ref || '')
   const agent = agents.find((row) => row.ref === current)
@@ -75,6 +132,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
   // claim that the runtime has a terminal or that terminal input is granted.
   const terminalRef = agent?.terminal ?? terminalSubjectForAgent(current)
   const [headerSlot, setHeaderSlot] = React.useState<HTMLDivElement | null>(null)
+  const [paneHost, setPaneHost] = React.useState<HTMLDivElement | null>(null)
   const [search, setSearch] = React.useState('')
   const [panes, setPanes] = useAtom(workspacePanes(current))
   const query = new URLSearchParams(location.split('?')[1])
@@ -123,7 +181,10 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
   const panelSize = dragPanel ?? Math.min(maxPanel, Math.max(240, Math.round(panelFraction * viewport)))
   const maxSidebar = Math.max(208, Math.min(440, viewport - 640))
   const agentName = agent?.name ?? current.split('/').at(-1) ?? 'Conversation'
-  return (
+  // The panes are portalled from outside the shell providers: those values change on every
+  // switch, and React then scans every fiber below a memoized pane for consumers, which costs
+  // O(retained turns) per click. No pane reads these shell contexts.
+  return (<>
     <WorkbenchContextProvider value={{ open, focusedRef: address.ref || null, subjects: byRef, platform: navigator.platform.includes('Mac') ? 'mac' : 'other' }}>
       <ResourcePanelProvider value={{ state: resourcePanel, onChange: (change) => setResourcePanel((value) => ({ ...value, ...change })) }}>
         <MonitorDetailProvider value={{ size: 380, onSizeChange: (value) => setPanelFraction(value / viewport) }}>
@@ -185,9 +246,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                     })}
                   </div>
                 ) : null}
-                <div {...stylex.props(styles.body)}>
-                  <WorkspaceBody current={current} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />
-                </div>
+                <div ref={setPaneHost} {...stylex.props(styles.body)} />
               </section>
               {diffOpen && openedTool === undefined && current !== '' ? (
                 <>
@@ -214,14 +273,42 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
         </MonitorDetailProvider>
       </ResourcePanelProvider>
     </WorkbenchContextProvider>
-  )
+    {paneHost === null ? null : createPortal(<WorkspaceBody current={current} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />, paneHost)}
+  </>)
 }
 
-/** The selected tab decides the body; a non-thread pane never falls back to the transcript. */
+/** The three most recently opened panes stay mounted in a stable DOM order; hidden ones skip
+ * rendering through `content-visibility: hidden`, which keeps their style/layout state so a
+ * switch back only reveals them. Hidden panes release visible follow demand; the SDK may
+ * evict their follows. Render-time history updates avoid a second committed selection.
+ * Locking a pane costs O(its rows) in the browser, so the outgoing pane is only covered by the
+ * opaque shown pane during the switch frame and locked after that frame paints. */
 export function WorkspaceBody({ current, view, agentName, onOpenTool, ux }: { readonly current: string; readonly view: WorkspaceView; readonly agentName: string; readonly onOpenTool: (call: WorkLogCall) => void; readonly ux?: UxTelemetry }) {
-  if (current === '') return <div {...stylex.props(styles.empty)}>Choose an agent to open its live thread.</div>
-  if (view._tag === 'Thread') return <ConversationPane key={current} agentRef={current} agentName={agentName} onOpenTool={onOpenTool} ux={ux} />
-  return <p role="status" {...stylex.props(styles.empty)}>{workspaceViewNotice(view)}</p>
+  const [retained, setRetained] = React.useState<readonly RetainedPane[]>([])
+  const [switched, setSwitched] = React.useState<{ readonly shown: string; readonly covered: string | undefined }>({ shown: current, covered: undefined })
+  const visible = current !== '' && view._tag === 'Thread'
+  const latest = retained.reduce<RetainedPane | undefined>((best, pane) => best === undefined || pane.used > best.used ? pane : best, undefined)
+  if (visible && (latest?.ref !== current || latest.name !== agentName)) {
+    setRetained(retainPane({ panes: retained, ref: current, name: agentName, limit: 3 }))
+  }
+  if (visible && switched.shown !== current) setSwitched({ shown: current, covered: switched.shown })
+  React.useEffect(() => {
+    if (switched.covered === undefined) return
+    let timer: number | undefined
+    // rAF runs before the switch frame paints; the timeout runs after it.
+    const frame = window.requestAnimationFrame(() => { timer = window.setTimeout(() => setSwitched(value => ({ shown: value.shown, covered: undefined }))) })
+    return () => { window.cancelAnimationFrame(frame); window.clearTimeout(timer) }
+  }, [switched])
+  return <>
+    {retained.map(pane => {
+      const shown = visible && pane.ref === current
+      return <div key={pane.ref} {...stylex.props(styles.retainedPane, shown ? styles.shownPane : visible && pane.ref === switched.covered ? null : styles.hiddenPane)}>
+        <ConversationPaneLoadBoundary agentRef={pane.ref} agentName={pane.name} onOpenTool={onOpenTool} ux={ux} visible={shown} />
+      </div>
+    })}
+    {current === '' ? <div {...stylex.props(styles.empty)}>Choose an agent to open its live thread.</div>
+      : view._tag === 'Thread' ? null : <p role="status" {...stylex.props(styles.empty)}>{workspaceViewNotice(view)}</p>}
+  </>
 }
 
 const styles = stylex.create({
@@ -237,10 +324,16 @@ const styles = stylex.create({
   footer: { height: 40, display: 'flex', alignItems: 'center', gap: s.md, paddingInline: s.lg, flexShrink: 0 },
   connection: { marginLeft: 'auto', fontSize: t.denseSize, color: c.fgMuted },
   workspace: { display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0 },
-  body: { display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0, overflow: 'hidden' },
+  body: { position: 'relative', display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0, overflow: 'hidden' },
+  // Identical geometry in both states: revealing a pane must not invalidate its layout. Only
+  // non-inherited properties toggle (no inert/pointer-events/visibility), so a reveal does not
+  // restyle the retained subtree; content-visibility already removes it from focus and a11y.
+  retainedPane: { position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, backgroundColor: c.canvas },
+  shownPane: { zIndex: 1 },
+  hiddenPane: { contentVisibility: 'hidden' },
   tabs: { height: 32, display: 'flex', alignItems: 'center', gap: s.xs, paddingInline: s.lg, borderBottomWidth: 1, borderBottomStyle: 'solid', borderBottomColor: c.border, flexShrink: 0 },
   notice: { padding: s.lg, fontSize: t.metaSize, color: c.fgMuted },
-  empty: { margin: 'auto', padding: s.section, color: c.fgMuted },
+  empty: { position: 'relative', zIndex: 2, margin: 'auto', padding: s.section, color: c.fgMuted },
   changesPanel: { display: 'flex', flexDirection: 'column', flexShrink: 0, minWidth: 0, minHeight: 0, overflowY: 'auto', borderLeftWidth: 1, borderLeftStyle: 'solid', borderLeftColor: c.border },
   toolDetailHeader: { height: 40, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: s.md, paddingInline: s.lg, flexShrink: 0, borderBottomWidth: 1, borderBottomStyle: 'solid', borderBottomColor: c.border },
   toolDetailTitle: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: t.metaSize },

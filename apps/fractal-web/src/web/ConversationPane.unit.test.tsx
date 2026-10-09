@@ -161,11 +161,13 @@ describe('ConversationPane kit composition', () => {
     expect(html).not.toContain('raw')
     expect(html).toContain('Conversation unavailable')
   })
+
   it('keeps the composer with its draft slot and a send reason while the conversation cannot be read', () => {
     const { html } = notFound()
     expect(html).toContain('textarea')
     expect(html).toContain('This view cannot send messages.')
   })
+
   it('keeps rendering the transcript when the sync status is not Live, with the honest SyncLine', () => {
     source.sync = { status: { _tag: 'Failed', cause: { _tag: 'Server', code: 'forbidden', message: 'Denied' } }, observedAt: 500 }
     source.feed = { _tag: 'Observed', freshness: 'stale', value: { items: scenario.slice(0, 5), hasOlder: false, observation: { empty: false } } }
@@ -197,8 +199,9 @@ describe('ConversationPane kit composition', () => {
     expect(pane.match(/<[a-z][a-z\d]*(?:\s|>)/g)).toEqual(['<div ', '<div ', '<div '])
     expect(pane).toContain("style={{ display: 'contents' }}")
     const workspace = readFileSync(new URL('./LiveAgentWorkspace.tsx', import.meta.url), 'utf8')
-    expect(workspace).toContain('<WorkspaceBody current={current} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />')
-    expect(workspace).toContain('<ConversationPane key={current} agentRef={current} agentName={agentName} onOpenTool={onOpenTool} ux={ux} />')
+    expect(workspace).toContain('createPortal(<WorkspaceBody current={current} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />, paneHost)')
+    expect(workspace).toContain("hiddenPane: { contentVisibility: 'hidden'")
+    expect(workspace).toContain('<ConversationPaneLoadBoundary agentRef={pane.ref} agentName={pane.name} onOpenTool={onOpenTool} ux={ux} visible={shown} />')
     expect(workspace).not.toContain('This subject has no available native view.')
   })
 })

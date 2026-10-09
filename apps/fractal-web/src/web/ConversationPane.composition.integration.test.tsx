@@ -273,6 +273,17 @@ describe('ConversationPane composition activation', () => {
       paints.add(callback)
       return () => { paints.delete(callback) }
     } })
+    const commits: { readonly turn: boolean; readonly empty: boolean; readonly message: string }[] = []
+    const report = ux.transcriptCommitted
+    vi.spyOn(ux, 'transcriptCommitted').mockImplementation((ref) => {
+      // Inspect synchronously, before act drains the runtime's passive message adoption.
+      commits.push({
+        turn: container.querySelector('[data-testid="transcript-turn"]') !== null,
+        empty: container.querySelector('[data-testid="transcript-empty"]') !== null,
+        message: container.querySelector('[data-testid="agent-message"]')?.textContent ?? '',
+      })
+      return report(ref)
+    })
     try {
       ux.beginSwitch({ ref: 'agent/selected', warm: false, slotCount: 1 })
       source.feed = { _tag: 'Waiting' }
@@ -288,6 +299,10 @@ describe('ConversationPane composition activation', () => {
       expect(container.querySelector('[data-testid="transcript-placeholder"]')).toBeNull()
       expect(container.querySelector(`[data-testid="transcript-${kind === 'turns' ? 'turn' : 'empty'}"]`)).not.toBeNull()
       expect(paints.size).toBe(1)
+      expect(commits).toHaveLength(1)
+      expect(commits[0]?.turn).toBe(kind === 'turns')
+      expect(commits[0]?.empty).toBe(kind === 'empty')
+      if (kind === 'turns') expect(commits[0]?.message).toContain('visible rows')
       expect(ended.find(span => span.name === 'wf.ux.switch')).toBeUndefined()
       for (const paint of paints) paint()
       expect(ended.find(span => span.name === 'wf.ux.switch')?.attributes.get('wf.ux.painted')).toBe(true)

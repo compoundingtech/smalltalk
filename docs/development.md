@@ -172,6 +172,33 @@ commit. The pane observes that adoption inside a display-contents host boundary 
 its pending paint when hidden or unmounted. Telemetry completes after rAF plus MessageChannel,
 not inside render.
 
+The shell loads the conversation pane through `React.lazy` and per-pane `Suspense`, keeping
+the transcript, Markdown parser and syntax grammar registration outside its eager module
+graph. A selected thread requests its chunk immediately; an empty shell prefetches it after
+its first paint. Demand and prefetch share one import. While code loads, the lightweight
+app-side fallback mirrors the kit's Waiting transcript chrome and skeleton. Its drift test
+compares the real kit structure, testids, accessibility labels and geometry; replace this
+mirror when the kit exposes its standalone skeleton.
+An import failure stays local to the requested pane, with the fixed message “This conversation
+view could not load.” and a “Try again” action. Rejection clears the shared request; explicit
+retry creates and shares a fresh lazy wrapper so React's cached rejection cannot poison the
+next attempt or conversations opened after recovery.
+
+Switching back to one of the three most recently opened agents reveals its retained pane
+instead of mounting the kit transcript again. The retained panes live only in memory, in
+first-open order, so a pane's DOM never moves. Hidden panes use `content-visibility: hidden`:
+the browser keeps their layout but skips their rendering, focus and accessibility tree.
+The outgoing pane stays under the opaque shown pane for the switch frame and is hidden after
+that paint, because hiding costs time proportional to its rows. Covered panes are immediately
+excluded from the accessibility tree, lose focus, and have only their small composer made
+inert; hidden-pane input events are suppressed. Non-thread notices paint above retained
+backgrounds. A hidden pane unmounts its
+feed interest, so the SDK marks its follow invisible, and the follow may be evicted when an
+open needs the slot. The pane's visibility lives in a wrapper, and the kit transcript is
+memoized, so a switch never re-renders a retained transcript. The panes are portalled from
+outside the workspace's shell context providers. Those providers change on every switch, and
+React would otherwise walk every retained fiber looking for consumers.
+
 ## Fractal web captured changes
 
 The Changes panel reuses `source.conversation(agentRef)`: its live source follows

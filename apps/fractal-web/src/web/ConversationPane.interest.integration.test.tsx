@@ -23,6 +23,7 @@ import { liveSource, type LiveSource } from '../data/liveSource.ts'
 import { DataSourceProvider } from '../data/react.tsx'
 import { ConversationPane } from './ConversationPane.tsx'
 import { LiveAgentWorkspace } from './LiveAgentWorkspace.tsx'
+import type { UxTelemetry } from '../telemetry/ux.ts'
 
 const snapshot: Snapshot = {
   id: 'snapshot/1',
@@ -93,6 +94,7 @@ class Gateway {
   readonly actions: Native.ActionRequest[] = []
   echoId: string | undefined
   sendMessageId: string | undefined
+  onUnsubscribe: (() => void) | undefined
 
   readonly fetch: typeof fetch = async (input, init) => {
     const path = new URL(String(input)).pathname
@@ -143,7 +145,11 @@ class Gateway {
       onmessage: null,
       onclose: null,
       onerror: null,
-      send: (text: string) => this.commands.push(JSON.parse(text)),
+      send: (text: string) => {
+        const command: CollectionCommand = JSON.parse(text)
+        this.commands.push(command)
+        if (command.kind === 'unsubscribe') this.onUnsubscribe?.()
+      },
       close: () => {},
     }
     this.socket = socket
@@ -390,6 +396,175 @@ describe('ConversationPane conversation demand', () => {
     gateway!.conversationFrame('agent/route', [prompt(1, 'Recovered ask'), entry(2, 'Recovered thread')])
     await until(() => paneText().includes('Recovered thread'))
     expect(container.querySelector('[data-wf-unavailable]')).toBeNull()
+  })
+})
+
+describe('LiveAgentWorkspace retained panes', () => {
+  const committed: string[] = []
+  const ux: UxTelemetry = {
+    activeSpan: () => undefined,
+    traceContext: () => undefined,
+    shellCommitted: () => () => {},
+    rosterCommitted: () => () => {},
+    beginSwitch: () => {},
+    switchDataReady: () => {},
+    transcriptCommitted: (ref) => { committed.push(ref); return () => {} },
+    beginSendEcho: () => ({ committed: () => () => {}, cancel: () => {} }),
+    observeSync: () => {},
+    dispose: () => {},
+  }
+  const mountWorkspace = (ref: string) => {
+    committed.length = 0
+    window.history.replaceState(null, '', `/w/${ref}`)
+    root = createRoot(container)
+    flushSync(() => root!.render(<DataSourceProvider source={live!.source} registry={live!.registry}><LiveAgentWorkspace ux={ux} /></DataSourceProvider>))
+  }
+  const go = (ref: string) => flushSync(() => {
+    window.history.pushState(null, '', `/w/${ref}`)
+    window.dispatchEvent(new PopStateEvent('popstate'))
+  })
+  const lanes = () => [...container.querySelectorAll('[data-testid="transcript-scroll"]')]
+  const lane = (text: string) => lanes().find(node => node.textContent?.includes(text))
+  afterEach(() => window.history.replaceState(null, '', '/'))
+
+  it('paints a cold pane reselected during eviction, then reveals its retained DOM immediately', async () => {
+    open(1)
+    const waitForEvent = async (check: () => boolean) => {
+      for (let round = 0; round < 400 && !check(); round += 1) await settle()
+      expect(check()).toBe(true)
+    }
+    mountWorkspace('agent/route')
+    await waitForEvent(() => gateway!.subscribesFor('agent/route') === 1)
+    let reselected = false
+    const switchedAt = performance.now()
+    gateway!.onUnsubscribe = () => {
+      if (reselected) return
+      reselected = true
+      go('agent/route')
+    }
+    go('agent/other')
+    await waitForEvent(() => reselected)
+    await waitForEvent(() => gateway!.subscribesFor('agent/route') === 2)
+    const firstFrameAt = performance.now()
+    gateway!.conversationFrame('agent/route', [prompt(1, 'Cold prompt'), entry(2, 'Recovered cold transcript')])
+    await waitForEvent(() => committed.includes('agent/route'))
+    const paintedAt = performance.now()
+    const first = lane('Recovered cold transcript')!
+    expect(first.querySelector('[data-testid="transcript-placeholder"]')).toBeNull()
+    go('agent/other')
+    const warmSwitchAt = performance.now()
+    go('agent/route')
+    expect(lane('Recovered cold transcript')).toBe(first)
+    expect(committed.filter(ref => ref === 'agent/route')).toHaveLength(2)
+    console.log(`conversation-switch-measurement ${JSON.stringify({
+      switchToPaintMs: paintedAt - switchedAt,
+      firstFrameToPaintMs: paintedAt - firstFrameAt,
+      retainedSwitchToCommitMs: performance.now() - warmSwitchAt,
+    })}`)
+  })
+
+  it('reveals a switched-away pane without remounting it or refollowing its warm thread', async () => {
+    open()
+    mountWorkspace('agent/route')
+    await until(() => gateway!.subscribesFor('agent/route') === 1)
+    gateway!.conversationFrame('agent/route', [prompt(1, 'First ask'), entry(2, 'First thread')])
+    await until(() => lane('First thread') !== undefined)
+    const first = lane('First thread')!
+    expect(committed).toEqual(['agent/route'])
+
+    go('agent/other')
+    await until(() => gateway!.subscribesFor('agent/other') === 1)
+    gateway!.conversationFrame('agent/other', [prompt(2, 'Second ask'), entry(3, 'Second thread')])
+    await until(() => lane('Second thread') !== undefined)
+    // Only the shown pane reports a transcript commit; the hidden one stays attached.
+    expect(committed).toEqual(['agent/route', 'agent/other'])
+    expect(first.isConnected).toBe(true)
+
+    go('agent/route')
+    await settle()
+    expect(lane('First thread')).toBe(first)
+    expect(committed).toEqual(['agent/route', 'agent/other', 'agent/route'])
+    expect(gateway!.subscribesFor('agent/route')).toBe(1)
+    expect(gateway!.unsubscribedRefs()).toEqual([])
+  })
+
+  it('releases a hidden pane follow so a single conversation slot can move to the shown agent', async () => {
+    // A hidden pane that still held visible demand would pin the only slot: visible follows are
+    // never evicted, so the second agent could not subscribe.
+    open(1)
+    mountWorkspace('agent/route')
+    await until(() => gateway!.subscribesFor('agent/route') === 1)
+    gateway!.conversationFrame('agent/route', [prompt(1, 'First ask'), entry(2, 'First thread')])
+    await until(() => lane('First thread') !== undefined)
+    const first = lane('First thread')!
+
+    go('agent/other')
+    await until(() => gateway!.subscribesFor('agent/other') === 1)
+    expect(gateway!.unsubscribedRefs()).toEqual(['agent/route'])
+    expect(first.isConnected).toBe(true)
+
+    go('agent/route')
+    await until(() => gateway!.subscribesFor('agent/route') === 2)
+    expect(lanes()).toHaveLength(2)
+  })
+
+  it('locks and blurs the outgoing composer in the switch commit, then restores its retained draft', async () => {
+    open('advertised', true)
+    mountWorkspace('agent/route')
+    await until(() => gateway!.subscribesFor('agent/route') === 1)
+    gateway!.conversationFrame('agent/route', [])
+    await until(() => container.querySelector('[data-testid="transcript-empty"]') !== null && container.querySelector('textarea:not(:disabled)') !== null)
+    const input = container.querySelector('textarea')!
+    const form = input.closest('form')!
+    const send = vi.spyOn(live!.source.attachments!, 'send')
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!
+    flushSync(() => {
+      setter.call(input, 'Retained draft')
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.focus()
+    })
+    await settle()
+    expect(document.activeElement).toBe(input)
+
+    go('agent/other')
+    // No switch frame has run yet: the outgoing pane is still covered, not layout-locked.
+    expect(form.inert).toBe(true)
+    expect(document.activeElement).not.toBe(input)
+    expect(input.closest('[aria-hidden]')?.getAttribute('aria-hidden')).toBe('true')
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+    const click = new MouseEvent('click', { bubbles: true, cancelable: true })
+    expect(input.dispatchEvent(enter)).toBe(false)
+    expect(form.dispatchEvent(click)).toBe(false)
+    expect(send).not.toHaveBeenCalled()
+    await until(() => gateway!.subscribesFor('agent/other') === 1)
+
+    go('agent/route')
+    await settle()
+    expect(container.querySelector('textarea')).toBe(input)
+    expect(input.value).toBe('Retained draft')
+    expect(form.inert).toBe(false)
+    expect(input.closest('[aria-hidden]')?.getAttribute('aria-hidden')).toBe('false')
+    expect(gateway!.subscribesFor('agent/route')).toBe(1)
+    expect(send).not.toHaveBeenCalled()
+  })
+
+  it('bounds retained panes to the three most recently opened agents', async () => {
+    open()
+    mountWorkspace('agent/route')
+    await until(() => gateway!.subscribesFor('agent/route') === 1)
+    gateway!.conversationFrame('agent/route', [prompt(1, 'First ask'), entry(2, 'First thread')])
+    await until(() => lane('First thread') !== undefined)
+    const first = lane('First thread')!
+    for (const ref of ['agent/two', 'agent/three']) {
+      go(ref)
+      await until(() => gateway!.subscribesFor(ref) === 1)
+    }
+    expect(lanes()).toHaveLength(3)
+    expect(first.isConnected).toBe(true)
+    go('agent/four')
+    await until(() => gateway!.subscribesFor('agent/four') === 1)
+    expect(lanes()).toHaveLength(3)
+    expect(first.isConnected).toBe(false)
   })
 })
 
