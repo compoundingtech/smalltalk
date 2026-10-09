@@ -31,6 +31,7 @@ Stories:
 - **Fractal UI / Sync Line**: every observation across both schemes; `TransitionSequence` asserts fixed-height slots and CLS 0 across all transitions.
 - **Fractal UI / Transcript**: the locked U2·F3·Y3 transcript in dark and light: settled/expanded work, streamed answers, failed/interrupted/unknown work, loading, retained-history synchronization, answer metadata, unavailable conversations, the older-history boundary with and without a load action, pending and failed sends (including Pending→Sent identity) and the read-only empty state.
 - **Fractal UI / Sidebar/Agent Row**: compact hover-card facts, omitted unreported fields, the known-vs-none time cohort and the quick Open hover action.
+- **Fractal UI / Transcript Bench**: synthetic settled transcripts of 50, 100 and 200 turns for the switch budget. `scripts/transcript-bench.mjs` (run with `playwright-cli run-code --filename`) traces first open to the first painted frame with turns, and switch back from a retained `content-visibility: hidden` pane to its first painted frame.
 
 ## Families
 
