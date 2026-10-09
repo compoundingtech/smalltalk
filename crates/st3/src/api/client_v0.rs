@@ -926,10 +926,19 @@ async fn follow_conversation(
         frame_limit = first_frame_limit;
         // With older history the client holds nothing before this frame's oldest entry. A
         // revision of such an entry is left out of later deltas: it would arrive above a gap,
-        // and the client sees it when it pages back through `older_cursor`.
-        let oldest_sent = (frame["has_more"] == true)
-            .then(|| frame["items"].get(0).cloned())
-            .flatten();
+        // and the client sees it when it pages back through `older_cursor`. "Before" is decided
+        // in the order the page itself was built in.
+        let oldest = frame["items"].get(0).filter(|_| frame["has_more"] == true).cloned();
+        let oldest_sent = match oldest {
+            None => None,
+            Some(oldest) => match conversation_window_order(&state, &session_id, &page).await {
+                Ok(order) => Some((order, oldest)),
+                Err(error) => {
+                    let _ = outbox.send((id.clone(), generation, failed(&error)));
+                    return;
+                }
+            },
+        };
         if outbox.send((id.clone(), generation, frame)).is_err() {
             return;
         }
@@ -950,8 +959,8 @@ async fn follow_conversation(
                         Value::Array(items) => items,
                         _ => Vec::new(),
                     };
-                    if let Some(oldest) = &oldest_sent {
-                        items.retain(|item| delta_follows_window(item, oldest));
+                    if let Some((order, oldest)) = &oldest_sent {
+                        items.retain(|item| delta_follows_window(*order, item, oldest));
                     }
                     if !items.is_empty() {
                         let frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":false, "items":items});
@@ -990,11 +999,66 @@ fn frame_bytes(frame: &Value) -> usize {
     serde_json::to_vec(frame).map_or(usize::MAX, |bytes| bytes.len())
 }
 
+/// The order a conversation page was built in: native pages by their timeline key, stored
+/// pages by sequence alone. A follower places later changes with the same comparison.
+#[derive(Clone, Copy)]
+enum WindowOrder {
+    Native(crate::external_sessions::TimelineOrder),
+    Stored,
+}
+
+/// Which order `page` was built in. Native pages are recognised by their native cursor or
+/// transcript entries; their order is the one `native_slice_page` and `native_timeline_page`
+/// sort by.
+async fn conversation_window_order(
+    state: &AppState,
+    session_id: &str,
+    page: &Value,
+) -> Result<WindowOrder, ApiError> {
+    let native_cursor = page["page"]["next_cursor"]
+        .as_str()
+        .is_some_and(|cursor| cursor.starts_with(NATIVE_PAGE_CURSOR_PREFIX));
+    let native_entries = page["items"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(is_native_record));
+    if !native_cursor && !native_entries {
+        return Ok(WindowOrder::Stored);
+    }
+    let (state, session_id) = (state.clone(), session_id.to_owned());
+    crate::api::read_deadline::spawn_blocking(move || {
+        native_timeline_order(&state, &new_client_snapshot(&state), &session_id)
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map(WindowOrder::Native)
+}
+
+fn is_native_record(item: &Value) -> bool {
+    item["id"].as_str().is_some_and(|id| id.starts_with("timeline-entry/native-"))
+}
+
+/// A native page's key for one entry: transcript records rank 0, Small Talk messages 1, as
+/// the native page builders assign by source.
+fn native_entry_key(item: &Value) -> crate::external_sessions::TimelineKey {
+    crate::external_sessions::timeline_key(item, u8::from(!is_native_record(item)))
+}
+
+/// A stored page's position for one entry; the stored projection sorts by it alone.
+fn stored_timeline_position(item: &Value) -> u64 {
+    item["sequence"].as_u64().unwrap_or(u64::MAX)
+}
+
 /// Whether a changed entry belongs after a replacement frame whose oldest entry is `oldest`:
 /// a new entry, or a revision of one the client holds. Entries keep their position across
-/// revisions, so a revision of anything older than the frame compares before it.
-fn delta_follows_window(item: &Value, oldest: &Value) -> bool {
-    item["id"] == oldest["id"] || timeline_order(item, oldest) != std::cmp::Ordering::Less
+/// revisions, so a revision of anything older than the frame sorts before it.
+fn delta_follows_window(order: WindowOrder, item: &Value, oldest: &Value) -> bool {
+    item["id"] == oldest["id"]
+        || match order {
+            WindowOrder::Native(order) => native_entry_key(item)
+                .cmp_in(&native_entry_key(oldest), order)
+                .is_ge(),
+            WindowOrder::Stored => stored_timeline_position(item) >= stored_timeline_position(oldest),
+        }
 }
 
 /// A conversation's replacement frame from one timeline page. With older history it carries
@@ -5667,7 +5731,7 @@ fn timeline_first_page(
         });
         items.extend([query_notice, prefix_notice].into_iter().flatten());
     }
-    items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
+    items.sort_by_key(stored_timeline_position);
     // A conversation opens at its newest bounded window. The cursor walks toward older
     // windows, while each individual page remains chronological for straightforward rendering.
     items.reverse();
@@ -16011,6 +16075,120 @@ mission "example/zero-run" state="ready" {
         assert!(walked.iter().any(|item| item["id"] == "timeline-entry/stored-30"
             && item["body"]["text"] == "stored 30 revised"));
         let _ = start;
+    }
+
+    /// Stored pages sort by sequence alone. When observed timestamps run against the sequence,
+    /// a follower must still place changes by sequence, as its frame was built.
+    #[tokio::test]
+    async fn stored_deltas_follow_sequence_order_when_timestamps_run_against_it() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "first-frame-skewed");
+        let owner = "agent/first-frame-skewed";
+        let incarnation = "skewed-runtime:i1";
+        let claim = |kind: &str, fields: Value| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: owner.into(),
+                    kind: kind.into(),
+                    actor: Some(owner.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        claim("runtime.observed", json!({"status":"running", "runtime_id":"skewed-runtime",
+            "incarnation_id":incarnation}));
+        let base: u64 = 1_790_000_000_000;
+        // Entry 5 was observed long after the others, entry 25 long before them.
+        let observed = |index: usize| match index {
+            5 => base + 10_000_000,
+            25 => base - 10_000_000,
+            _ => base + index as u64 * 1_000,
+        };
+        let entry = |index: usize, revision: u64, text: &str| {
+            json!({"operation": if revision == 1 { "append" } else { "replace" },
+                "entry_id":format!("timeline-entry/skewed-{index}"), "sequence": index + 1,
+                "revision":revision, "role":"assistant", "entry_type":"content", "final":revision > 1,
+                "body":{"media_type":"text/plain", "text":text}, "driver":"codex",
+                "incarnation_id":incarnation, "observed_at_unix_ms":observed(index)})
+        };
+        for index in 0..30 {
+            claim("harness.timeline", entry(index, 1, &format!("skewed {index}")));
+        }
+        let session_id = managed_session_id(owner, incarnation);
+        // The page itself is in sequence order whatever the timestamps say.
+        let full = timeline_walk(&state, &session_id, 200);
+        let position = |id: &str| full.iter().position(|item| item["id"] == id).unwrap();
+        assert!(position("timeline-entry/skewed-5") < position("timeline-entry/skewed-25"));
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let follow = |limit: Option<usize>| {
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let follower = tokio::spawn(follow_conversation(
+                state.clone(), session.clone(), "chat".into(), 1, session_id.clone(), None,
+                conversation_first_frame_limit(limit), sender,
+            ));
+            (follower, receiver)
+        };
+        let (small_follower, mut small_frames) = follow(Some(10));
+        let (full_follower, mut full_frames) = follow(None);
+        let ids = |items: &[Value]| -> Vec<String> {
+            items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned)).collect()
+        };
+        let (_, _, small_first) = tokio::time::timeout(Duration::from_secs(10), small_frames.recv())
+            .await.unwrap().unwrap();
+        let held = ids(small_first["items"].as_array().unwrap());
+        assert_eq!(small_first["has_more"], true, "{small_first}");
+        assert!(held.contains(&"timeline-entry/skewed-25".to_owned()), "{held:?}");
+        assert!(!held.contains(&"timeline-entry/skewed-5".to_owned()), "{held:?}");
+        tokio::time::timeout(Duration::from_secs(10), full_frames.recv()).await.unwrap().unwrap();
+        // A new entry, a revision of a held entry with an early timestamp, and a revision of
+        // an older entry with a late one.
+        claim("harness.timeline", entry(30, 1, "skewed 30"));
+        claim("harness.timeline", entry(25, 2, "skewed 25 revised"));
+        claim("harness.timeline", entry(5, 2, "skewed 5 revised"));
+        async fn sent_until(
+            frames: &mut tokio::sync::mpsc::UnboundedReceiver<(String, u64, Value)>,
+            wanted: &[&str],
+        ) -> Vec<Value> {
+            let mut items = Vec::new();
+            while !wanted.iter().all(|id| items.iter().any(|item: &Value| item["id"] == *id)) {
+                let (_, _, frame) = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("waiting for {wanted:?}; got {items:?}"))
+                    .unwrap();
+                assert_eq!(frame["replace"], false, "{frame}");
+                items.extend(frame["items"].as_array().unwrap().iter().cloned());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            while let Ok((_, _, frame)) = frames.try_recv() {
+                items.extend(frame["items"].as_array().unwrap().iter().cloned());
+            }
+            items
+        }
+        // Control: the change feed carries all three to a follower that holds everything.
+        sent_until(
+            &mut full_frames,
+            &["timeline-entry/skewed-30", "timeline-entry/skewed-25", "timeline-entry/skewed-5"],
+        )
+        .await;
+        let small = sent_until(
+            &mut small_frames,
+            &["timeline-entry/skewed-30", "timeline-entry/skewed-25"],
+        )
+        .await;
+        assert!(
+            small.iter().any(|item| item["id"] == "timeline-entry/skewed-25" && item["revision"] == 2),
+            "a held entry's revision arrives despite its early timestamp: {small:?}"
+        );
+        assert!(
+            small.iter().all(|item| item["id"] != "timeline-entry/skewed-5"),
+            "an older entry's revision stays out despite its late timestamp: {small:?}"
+        );
+        small_follower.abort();
+        full_follower.abort();
     }
 
     #[tokio::test]
