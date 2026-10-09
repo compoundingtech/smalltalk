@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Fix retained-removal diagnostic and fixture references to the existing fleet-file module.",
+  "replay": {
+    "status": "none",
+    "detail": "No production replay, initialization, collector or writer activation."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database, schema version, index, migration or persisted-format change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint and signed/current-key refusal producer rules are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Use the existing FleetFile and FleetRemoval types through their exported file module. No wire, schema, producer, refusal, aggregate or strict policy change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional daemon lifecycle transition. Source and selector validation do not establish runtime or filesystem latency."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "The first hosted cost job stopped at FleetFile resolution before producing any measurements. The original and removal eight-control selections remain unchanged and need source-bound execution."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional production mutation or rollback constraint. Actual control execution and broader signed-refusal/nonzero integration remain separately required."
+  }
+}

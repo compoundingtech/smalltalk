@@ -19252,10 +19252,10 @@ agent "good" {{ workspace {:?}; command "true" }}
         let mut state = state(root.path());
         let fleet_id = "3b241101-e2bb-4255-8caf-4136c566a962";
         state.fleet_id = Some(fleet_id.into());
-        crate::fleet::FleetFile {
+        crate::fleet::file::FleetFile {
             fleet_id: fleet_id.into(),
             node: Some(state.node.clone()),
-            removed: Some(crate::fleet::FleetRemoval {
+            removed: Some(crate::fleet::file::FleetRemoval {
                 code: "member-removed".into(),
                 reported_by: "alder".into(),
             }),
@@ -19263,7 +19263,7 @@ agent "good" {{ workspace {:?}; command "true" }}
         }
         .save(root.path())
         .unwrap();
-        let settings_path = crate::fleet::FleetFile::path(root.path());
+        let settings_path = crate::fleet::file::FleetFile::path(root.path());
         let settings_before = fs::read(&settings_path).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -19325,7 +19325,7 @@ agent "good" {{ workspace {:?}; command "true" }}
             );
             assert_eq!(fs::read(&settings_path).unwrap(), settings_before);
         }
-        crate::fleet::FleetFile::remove(root.path()).unwrap();
+        crate::fleet::file::FleetFile::remove(root.path()).unwrap();
         assert_eq!(current_doctor_report(&state).unwrap().0.status, "warn");
         let (_, response) = runtime.block_on(get_request(router(state.clone()), "/v1/doctor"));
         assert_eq!(

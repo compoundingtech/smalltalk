@@ -92,7 +92,7 @@ fn capture(
     fleet_id: &str,
     after_decode: impl FnOnce(),
 ) -> Result<Option<(EndedMembership, String)>, &'static str> {
-    let path = crate::fleet::FleetFile::path(state_dir);
+    let path = crate::fleet::file::FleetFile::path(state_dir);
     let mut file = open_regular(&path)?;
     let before = file
         .metadata()
@@ -121,7 +121,7 @@ fn capture(
         return Err("local fleet settings exceed the diagnostic syntax limit");
     }
     let text = std::str::from_utf8(&bytes).map_err(|_| "local fleet settings have invalid text")?;
-    let settings: crate::fleet::FleetFile =
+    let settings: crate::fleet::file::FleetFile =
         toml::from_str(text).map_err(|_| "local fleet settings cannot be decoded")?;
     let id = uuid::Uuid::parse_str(&settings.fleet_id)
         .map_err(|_| "local fleet settings have an invalid fleet identity")?;
@@ -167,11 +167,11 @@ mod tests {
 
     const FLEET: &str = "3b241101-e2bb-4255-8caf-4136c566a962";
 
-    fn settings(code: Option<&str>) -> crate::fleet::FleetFile {
-        crate::fleet::FleetFile {
+    fn settings(code: Option<&str>) -> crate::fleet::file::FleetFile {
+        crate::fleet::file::FleetFile {
             fleet_id: FLEET.into(),
             node: Some("birch".into()),
-            removed: code.map(|code| crate::fleet::FleetRemoval {
+            removed: code.map(|code| crate::fleet::file::FleetRemoval {
                 code: code.into(),
                 reported_by: "alder".into(),
             }),
@@ -190,7 +190,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         for code in ["member-removed", "member-left"] {
             settings(Some(code)).save(root.path()).unwrap();
-            let path = crate::fleet::FleetFile::path(root.path());
+            let path = crate::fleet::file::FleetFile::path(root.path());
             let before = std::fs::read(&path).unwrap();
             let result = check(root.path(), "birch", Some(FLEET));
             assert_eq!(result.status, "fail");
@@ -237,7 +237,7 @@ mod tests {
     fn byte_syntax_utf8_and_decode_limits_refuse_before_healthy_results() {
         let root = tempfile::tempdir().unwrap();
         settings(Some("member-removed")).save(root.path()).unwrap();
-        let path = crate::fleet::FleetFile::path(root.path());
+        let path = crate::fleet::file::FleetFile::path(root.path());
         for bytes in [
             vec![b' '; MAX_SETTINGS_BYTES + 1],
             vec![0xff],
@@ -263,7 +263,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt as _;
         let root = tempfile::tempdir().unwrap();
         settings(Some("member-removed")).save(root.path()).unwrap();
-        let path = crate::fleet::FleetFile::path(root.path());
+        let path = crate::fleet::file::FleetFile::path(root.path());
         let target = root.path().join("settings.toml");
         std::fs::rename(&path, &target).unwrap();
         std::os::unix::fs::symlink(&target, &path).unwrap();
@@ -292,14 +292,14 @@ mod tests {
             use std::io::Write as _;
             OpenOptions::new()
                 .append(true)
-                .open(crate::fleet::FleetFile::path(root.path()))
+                .open(crate::fleet::file::FleetFile::path(root.path()))
                 .unwrap()
                 .write_all(b"\n# changed after decode\n")
                 .unwrap();
         });
         assert!(mutated.is_err());
         let removed = capture(root.path(), "birch", FLEET, || {
-            crate::fleet::FleetFile::remove(root.path()).unwrap();
+            crate::fleet::file::FleetFile::remove(root.path()).unwrap();
         });
         assert!(removed.is_err());
         assert_unknown(root.path());
@@ -309,7 +309,7 @@ mod tests {
     fn replacing_the_parent_after_decode_requires_path_validation() {
         let root = tempfile::tempdir().unwrap();
         settings(Some("member-removed")).save(root.path()).unwrap();
-        let path = crate::fleet::FleetFile::path(root.path());
+        let path = crate::fleet::file::FleetFile::path(root.path());
         let before = std::fs::metadata(&path).unwrap();
         let captured = capture(root.path(), "birch", FLEET, || {
             std::fs::rename(root.path().join("fleet"), root.path().join("old-fleet")).unwrap();
@@ -329,7 +329,7 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(check(root.path(), "birch", Some(FLEET)).status, "fail");
         }
-        crate::fleet::FleetFile::remove(root.path()).unwrap();
+        crate::fleet::file::FleetFile::remove(root.path()).unwrap();
         assert_unknown(root.path());
         settings(None).save(root.path()).unwrap();
         assert_unknown(root.path());
