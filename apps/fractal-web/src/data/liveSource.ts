@@ -57,6 +57,10 @@ import { gatewaySubjectReads, SubjectReadPort, subjectReaderFromAtom } from './s
 import { gatewaySessionTraceLayer } from './stSessionTrace.ts'
 import { sessionTrace, type SessionTraceProvider } from './sessionTrace.ts'
 
+/** Open/silent subscriptions have no SDK idle deadline. Bound only the first roster snapshot;
+ * transport failures trigger the published fallback immediately instead of waiting this long. */
+export const ROSTER_FIRST_SNAPSHOT_DEADLINE_MS = 3_000
+
 /** The owned source registry and runtime teardown handle. */
 export interface LiveSource {
   readonly source: DataSource
@@ -230,7 +234,7 @@ export const liveSource = ({
       readonly st3: St3['Service']
       readonly spec: TSpec
     }) => Stream.Stream<FollowEvent<A>>
-    /** A cheap published page races the live follow; it never gates subscribe or replaces live data. */
+    /** A published fallback after transport failure or a stalled first snapshot, never a parallel bootstrap read. */
     readonly initialRead?: (st3: St3['Service']) => Effect.Effect<{ readonly value: A; readonly hasMore: boolean }, AttachFailure>
     readonly keepAlive?: boolean
     readonly onCommit?: (value: A) => void
@@ -307,6 +311,8 @@ export const liveSource = ({
       spec = undefined
       let freshnessFiber: Fiber.Fiber<void, unknown> | undefined
       let initialReadFiber: Fiber.Fiber<void> | undefined
+      let initialReadDeadlineFiber: Fiber.Fiber<void> | undefined
+      let initialReadConnectionFiber: Fiber.Fiber<void> | undefined
       const fiber = runtime.runFork(
         Effect.gen(function* () {
           // Release the old socket slot before binding the replacement owner.
@@ -327,7 +333,11 @@ export const liveSource = ({
           const boundSpec = yield* resolving
           spec = boundSpec
           const key = followKey(boundSpec)
-          if (initialRead !== undefined && latest._tag === 'Waiting') {
+          const startInitialRead = () => {
+            if (initialRead === undefined || initialReadFiber !== undefined || !active
+              || readRejection !== undefined || terminalFailure || latest._tag !== 'Waiting') return
+            initialReadDeadlineFiber?.interruptUnsafe()
+            initialReadDeadlineFiber = undefined
             initialReadFiber = runtime.runFork(initialRead(st3).pipe(
               Effect.tap(({ value, hasMore }) => Effect.sync(() => {
                 if (!active || readRejection !== undefined || terminalFailure || latest._tag !== 'Waiting') return
@@ -351,6 +361,13 @@ export const liveSource = ({
               Effect.asVoid,
             ))
           }
+          if (initialRead !== undefined) {
+            initialReadConnectionFiber = runtime.runFork(st3.connection.pipe(
+              Stream.runForEach(state => Effect.sync(() => {
+                if (state._tag === 'Reconnecting' || state._tag === 'Closed' || state._tag === 'Rejected') startInitialRead()
+              })),
+            ))
+          }
           freshnessFiber = runtime.runFork(
             Effect.gen(function* () {
               freshnessConsumers += 1
@@ -360,6 +377,15 @@ export const liveSource = ({
                   Effect.sync(() => {
                     if (!active || readRejection !== undefined) return
                     setSync(status)
+                    if (status._tag === 'Live') {
+                      initialReadDeadlineFiber?.interruptUnsafe()
+                      initialReadDeadlineFiber = undefined
+                    } else if (status._tag === 'Requested' && initialRead !== undefined
+                      && initialReadFiber === undefined && initialReadDeadlineFiber === undefined && latest._tag === 'Waiting') {
+                      initialReadDeadlineFiber = runtime.runFork(
+                        Effect.sleep(ROSTER_FIRST_SNAPSHOT_DEADLINE_MS).pipe(Effect.andThen(Effect.sync(startInitialRead))),
+                      )
+                    }
                   }),
                 ),
               )
@@ -378,6 +404,8 @@ export const liveSource = ({
               Effect.sync(() => {
                 if (!active || readRejection !== undefined) return
                 if (event._tag === 'Observed') {
+                  initialReadDeadlineFiber?.interruptUnsafe()
+                  initialReadDeadlineFiber = undefined
                   latest = observed({ value: event.value })
                   syncLatest = observeFeedSync(syncLatest, event.value, Date.now())
                 } else if (event._tag === 'Failed') {
@@ -441,6 +469,8 @@ export const liveSource = ({
                 Effect.andThen(
                   Effect.sync(() => {
                     initialReadFiber?.interruptUnsafe()
+                    initialReadDeadlineFiber?.interruptUnsafe()
+                    initialReadConnectionFiber?.interruptUnsafe()
                     if (!active) return
                     ended = true
                     // Interest can return between SDK eviction and this finalizer. Its

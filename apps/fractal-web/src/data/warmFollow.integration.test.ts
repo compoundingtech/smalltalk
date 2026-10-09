@@ -19,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getDebug } from '../telemetry/measurement/index.ts'
 
-import { liveSource, type LiveSource } from './liveSource.ts'
+import { liveSource, ROSTER_FIRST_SNAPSHOT_DEADLINE_MS, type LiveSource } from './liveSource.ts'
 import type { ConversationPage, Feed } from './source.ts'
 
 const snapshot: Snapshot = {
@@ -291,15 +291,62 @@ const summarize = (values: number[]) => ({
   max: Math.max(...values),
 })
 
+const stallInitialRoster = async (gateway: Gateway) => {
+  await until(() => gateway.commands.some(command => command.kind === 'subscribe' && command.collection === 'agents'))
+  await vi.advanceTimersByTimeAsync(ROSTER_FIRST_SNAPSHOT_DEADLINE_MS)
+  await drain()
+}
+
 describe('warm conversation switching at the data layer', () => {
+  it('skips the published roster request when the socket snapshot arrives first', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8 })
+    gateway.publishedRoster = [agent]
+    const release = live.registry.mount(live.source.agents)
+    try {
+      await until(() => gateway.commands.some(command => command.kind === 'subscribe' && command.collection === 'agents'))
+      gateway.fleet([agent])
+      await until(() => live.registry.get(live.source.agents)._tag === 'Observed')
+      await vi.advanceTimersByTimeAsync(ROSTER_FIRST_SNAPSHOT_DEADLINE_MS)
+      await drain()
+      expect(gateway.requests.filter(url => url.pathname === '/v1/client/agents')).toHaveLength(0)
+    } finally { release(); await live.dispose() }
+  })
+
+  it('reads a published roster only after the open silent socket reaches its 3 s deadline', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8 })
+    gateway.publishedRoster = [agent]
+    const release = live.registry.mount(live.source.agents)
+    try {
+      await until(() => gateway.commands.some(command => command.kind === 'subscribe' && command.collection === 'agents'))
+      await vi.advanceTimersByTimeAsync(ROSTER_FIRST_SNAPSHOT_DEADLINE_MS - 10)
+      expect(gateway.requests.filter(url => url.pathname === '/v1/client/agents')).toHaveLength(0)
+      await vi.advanceTimersByTimeAsync(10)
+      await until(() => live.registry.get(live.source.agents)._tag === 'Observed')
+      expect(gateway.requests.filter(url => url.pathname === '/v1/client/agents')).toHaveLength(1)
+      expect(live.registry.get(live.source.agents)).toMatchObject({ _tag: 'Observed', freshness: 'stale' })
+    } finally { release(); await live.dispose() }
+  })
+
+  it('reads the published roster immediately when the collections socket errors', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8 })
+    gateway.publishedRoster = [agent]
+    const release = live.registry.mount(live.source.agents)
+    try {
+      await until(() => gateway.commands.some(command => command.kind === 'subscribe' && command.collection === 'agents'))
+      expect(gateway.requests.filter(url => url.pathname === '/v1/client/agents')).toHaveLength(0)
+      gateway.socket?.onerror?.(new Error('socket failed'))
+      await until(() => live.registry.get(live.source.agents)._tag === 'Observed')
+      expect(gateway.requests.filter(url => url.pathname === '/v1/client/agents')).toHaveLength(1)
+      expect(live.registry.get(live.source.agents)).toMatchObject({ _tag: 'Observed', freshness: 'stale' })
+    } finally { release(); await live.dispose() }
+  })
+
   it('paints the published roster before any collection snapshot without asking for fresh=true', async () => {
     const { live, gateway } = openLive({ maxFollows: 8 })
     gateway.publishedRoster = [agent]
     const release = live.registry.mount(live.source.agents)
     try {
-      await drain()
-      await drain()
-      await drain()
+      await stallInitialRoster(gateway)
       const feed = live.registry.get(live.source.agents)
       expect(gateway.requests.filter(url => url.pathname === '/v1/client/agents')).toHaveLength(1)
       expect(gateway.requests.filter(url => url.pathname === '/v1/client/capabilities')).toHaveLength(1)
@@ -318,9 +365,7 @@ describe('warm conversation switching at the data layer', () => {
     gateway.rosterFailure = 503
     const release = live.registry.mount(live.source.agents)
     try {
-      await drain()
-      await drain()
-      await drain()
+      await stallInitialRoster(gateway)
       expect(live.registry.get(live.source.agents)).toEqual({ _tag: 'Waiting' })
       gateway.fleet([agent])
       await until(() => live.registry.get(live.source.agents)._tag === 'Observed')
@@ -335,6 +380,7 @@ describe('warm conversation switching at the data layer', () => {
     const release = live.registry.mount(live.source.agents)
     try {
       await until(() => gateway.commands.some(command => command.kind === 'subscribe' && command.collection === 'agents'))
+      await stallInitialRoster(gateway)
       releaseRead()
       await until(() => live.registry.get(live.source.agents)._tag === 'Unavailable')
       gateway.fleet([agent])
@@ -350,6 +396,7 @@ describe('warm conversation switching at the data layer', () => {
     gateway.publishedHasMore = true
     const release = live.registry.mount(live.source.agents)
     try {
+      await stallInitialRoster(gateway)
       await until(() => live.registry.get(live.source.agents)._tag === 'Observed')
       expect(live.registry.get(live.source.agents)).toMatchObject({ _tag: 'Observed', freshness: 'stale', coverage: { _tag: 'Partial' } })
       expect(gateway.requests.filter(url => url.pathname === '/v1/client/agents')).toHaveLength(1)
@@ -370,6 +417,7 @@ describe('warm conversation switching at the data layer', () => {
     const release = live.registry.mount(live.source.agents)
     try {
       await until(() => gateway.commands.some(command => command.kind === 'subscribe' && command.collection === 'agents'))
+      await stallInitialRoster(gateway)
       gateway.fleet([agent])
       await until(() => live.registry.get(live.source.agents)._tag === 'Observed')
       releaseRead()
@@ -389,6 +437,7 @@ describe('warm conversation switching at the data layer', () => {
     const release = live.registry.mount(live.source.agents)
     try {
       await until(() => gateway.commands.some(command => command.kind === 'subscribe' && command.collection === 'agents'))
+      await stallInitialRoster(gateway)
       gateway.fleet([{ ...agent, name: 'Newer roster' }])
       await until(() => {
         const feed = live.registry.get(live.source.agents)
