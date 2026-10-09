@@ -22,6 +22,7 @@ function FollowStory({ scheme = 'dark', virtual = false }: { scheme?: Scheme; vi
   const [expandedRow, setExpandedRow] = React.useState<string>()
   const [older, setOlder] = React.useState(false)
   const [thread, setThread] = React.useState('one')
+  const [latestRowKey, setLatestRowKey] = React.useState('latest')
   const [send, setSend] = React.useState(0)
   const [store] = React.useState(() => new ViewportStore())
   const [inspections, setInspections] = React.useState(0)
@@ -30,13 +31,13 @@ function FollowStory({ scheme = 'dark', virtual = false }: { scheme?: Scheme; vi
   const rows = React.useMemo(() => [
     ...(older ? Array.from({ length: 8 }, (_, index) => ({ id: `older-${index}`, text: `Earlier observation ${index + 1}: the history anchor stays on the reader's line.` })) : []),
     ...Array.from({ length: 40 }, (_, index) => ({ id: `entry-${index}`, text: `Message ${index + 1}: the transcript follows the live conversation unless the reader chooses to read earlier messages.` })),
-    { id: 'latest', text: `Latest reply in conversation ${thread}.\n${'Observed streaming chunk adds a new line to the conversation.\n'.repeat(chunks)}` },
+    { id: latestRowKey, text: `Latest reply in conversation ${thread}.\n${'Observed streaming chunk adds a new line to the conversation.\n'.repeat(chunks)}` },
     ...(send > 0 ? [{ id: `own-${send}`, text: `Own message ${send}: preserve the reader's draft and follow the pending turn.` }] : []),
-  ], [chunks, older, thread, send])
+  ], [chunks, older, thread, send, latestRowKey])
   const renderRow = (row: typeof rows[number]) => <article data-item-id={row.id} {...stylex.props(styles.row)}>
     {expandedRow === row.id && <pre>{'An expanded observation above the reader line.\n'.repeat(8)}</pre>}
     <p data-follow-anchor {...stylex.props(styles.paragraph)}>{row.text}</p>
-    {row.id === 'latest' && <><img src={image} alt="Conversation attachment" {...stylex.props(styles.image, expanded && styles.expandedImage)} /><Button {...stylex.props(styles.button)} onPress={() => setInspections(value => value + 1)}>Inspect latest</Button><span> Inspected {inspections} times</span>{toolExpanded && <pre>{'Observed tool output: completed one measured operation.\n'.repeat(24)}</pre>}</>}
+    {row.id === latestRowKey && <><img src={image} alt="Conversation attachment" {...stylex.props(styles.image, expanded && styles.expandedImage)} /><Button {...stylex.props(styles.button)} onPress={() => setInspections(value => value + 1)}>Inspect latest</Button><span> Inspected {inspections} times</span>{toolExpanded && <pre>{'Observed tool output: completed one measured operation.\n'.repeat(24)}</pre>}</>}
   </article>
   return <ViewportStoreContext.Provider value={store}><main ref={root} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme, virtual && scheme === 'dark' && virtualDarkTheme)}>
     <div {...stylex.props(styles.toolbar)}>
@@ -57,6 +58,7 @@ function FollowStory({ scheme = 'dark', virtual = false }: { scheme?: Scheme; vi
         setExpandedRow(line?.closest<HTMLElement>('[data-item-id]')?.dataset['itemId'])
       }}>Expand above reading line</Button>
       <Button {...stylex.props(styles.button)} onPress={() => setSend(value => value + 1)}>Send own message</Button>
+      <Button {...stylex.props(styles.button)} onPress={() => setLatestRowKey('timeline-entry/ack')}>Acknowledge own send</Button>
       <Button {...stylex.props(styles.button)} onPress={() => setThread(value => value === 'one' ? 'two' : 'one')}>Switch thread</Button>
       <Button {...stylex.props(styles.button)} onPress={() => setInvalidPill(true)}>Inject invalid pill</Button>
       <span data-testid="stream-progress">{streaming ? `Streaming ${streamChunk}` : `Complete ${streamChunk}`}</span>
@@ -308,6 +310,43 @@ export const PinnedImageExpansionLight: Story = { ...PinnedImageExpansion, args:
 export const PinnedToolExpansionLight: Story = { ...PinnedToolExpansion, args: { scheme: 'light' } }
 export const ProgrammaticScrollDoesNotDetachLight: Story = { ...ProgrammaticScrollDoesNotDetach, args: { scheme: 'light' } }
 export const ControlledNegativeLight: Story = { ...ControlledNegative, args: { scheme: 'light' } }
+export const AckRekeyKeepsOwnSendVisible: Story = { play: async ({ canvasElement }) => {
+  const { canvas, viewport } = await ready(canvasElement)
+  const previous = canvasElement.querySelector<HTMLElement>('[data-item-id="latest"]')!
+  const content = previous.textContent
+  const height = viewport.scrollHeight
+  await userEvent.click(canvas.getByRole('button', { name: 'Acknowledge own send' }))
+  await frame()
+  await expect(previous.isConnected).toBe(false)
+  await expect(canvasElement.querySelector('[data-item-id="timeline-entry/ack"]')?.textContent).toBe(content)
+  await expect(viewport.scrollHeight).toBe(height)
+  // Project the measured acknowledgement's 47px layout scroll without inventing user input.
+  viewport.scrollTop -= 47
+  viewport.dispatchEvent(new Event('scroll'))
+  await expectAttached(canvasElement, viewport)
+  await expect(viewport.dataset['followState']).toBe('attached')
+} }
+export const UserWheelUpTenPixelsDetaches: Story = { play: async ({ canvasElement }) => {
+  const { canvas, viewport } = await ready(canvasElement)
+  await scrollByReader(viewport, viewport.scrollHeight - viewport.clientHeight - 10)
+  await expect(viewport.dataset['followState']).toBe('detached')
+  const top = viewport.scrollTop
+  await userEvent.click(canvas.getByRole('button', { name: 'Expand image' }))
+  await frame()
+  await expect(Math.abs(viewport.scrollTop - top)).toBeLessThanOrEqual(2)
+  await waitFor(() => expect(canvas.getByRole('button', { name: jumpName })).toBeVisible())
+} }
+export const UserPageUpDetaches: Story = { play: async ({ canvasElement }) => {
+  const { canvas, viewport } = await ready(canvasElement)
+  await scrollByReader(viewport, viewport.scrollTop - viewport.clientHeight, 'PageUp')
+  await expect(viewport.dataset['followState']).toBe('detached')
+  await waitFor(() => expect(canvas.getAllByRole('button', { name: jumpName })).toHaveLength(1))
+} }
+export const WheelUpPillKeyboard: Story = { ...AffordanceKeyboard }
+export const AckRekeyKeepsOwnSendVisibleLight: Story = { ...AckRekeyKeepsOwnSendVisible, args: { scheme: 'light' } }
+export const UserWheelUpTenPixelsDetachesLight: Story = { ...UserWheelUpTenPixelsDetaches, args: { scheme: 'light' } }
+export const UserPageUpDetachesLight: Story = { ...UserPageUpDetaches, args: { scheme: 'light' } }
+export const WheelUpPillKeyboardLight: Story = { ...WheelUpPillKeyboard, args: { scheme: 'light' } }
 export const VirtualPinnedStreaming: Story = { ...PinnedStreaming, args: { virtual: true } }
 export const VirtualScrollUpDetaches: Story = { ...ScrollUpDetaches, args: { virtual: true } }
 export const VirtualThreadSwitch: Story = { ...ThreadSwitch, args: { virtual: true } }
