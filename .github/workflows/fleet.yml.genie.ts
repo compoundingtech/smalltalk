@@ -301,6 +301,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         before: [
           nixDevelopStep({ name: 'Prove both shards cover every selected test', command: ['python3', 'scripts/ci-test-partitions'] }),
           nixDevelopStep({ name: 'Run eight doctor correctness controls without retries', command: ['python3', 'scripts/ci-doctor-correctness'] }),
+          nixDevelopStep({ name: 'Run eight retained removal controls without retries', command: ['python3', 'scripts/ci-doctor-removal'] }),
         ],
       }),
       needs: [pickRunnerJobId, 'linux-test-build'],
