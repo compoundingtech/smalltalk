@@ -192,6 +192,31 @@ pub(crate) fn render_mission_run(
     output
 }
 
+/// A seek page can start after a parent run, so render each returned run directly instead of
+/// building a partial parent-to-child map that would hide disconnected continuation rows.
+pub(crate) fn render_mission_run_page(
+    selected: &MissionRunView,
+    runs: &[MissionRunView],
+    style: OutputStyle,
+    now_unix_ms: u128,
+) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "TREE PAGE  {} · {} runs", selected.root_mission_run, runs.len());
+    if !runs.iter().any(|run| run.subject == selected.subject) {
+        let _ = writeln!(output, "SELECTED   {} · {}", selected.subject, style.status(&selected.status));
+    }
+    for run in runs {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        if let Some(parent) = &run.parent_step_run {
+            let _ = writeln!(output, "PARENT    {parent}");
+        }
+        output.push_str(&render_mission_run(run, &[], style, now_unix_ms));
+    }
+    output
+}
+
 #[cfg(test)]
 pub(crate) fn render_work_list(
     actor: Option<&str>,
@@ -1688,6 +1713,21 @@ mod tests {
         assert!(rendered.contains("queue issues #1"));
         assert!(rendered.contains("↳ demo · completed · 1/1 completed"));
         assert!(!rendered.contains("publish — publish"));
+    }
+
+    #[test]
+    fn mission_tree_continuation_shows_a_child_without_its_parent_on_the_page() {
+        let root = run("mission-run/demo/run", None, vec![]);
+        let child = run(
+            "mission-run/demo/child",
+            Some("step-run/demo-generation/release"),
+            vec![step("step-run/child-generation/publish", "publish", "ready")],
+        );
+        let rendered = render_mission_run_page(&root, &[child], OutputStyle::plain(), 3_000);
+        assert!(rendered.contains("SELECTED   mission-run/demo/run"));
+        assert!(rendered.contains("PARENT    step-run/demo-generation/release"));
+        assert!(rendered.contains("RUN       mission-run/demo/child"));
+        assert!(rendered.contains("publish — publish"));
     }
 
     #[test]

@@ -64,7 +64,7 @@ mod presentation;
 use presentation::{
     OutputStyle, follow_snapshot, glance, mission_run_signature, relative_time,
     render_attention_show, render_generation, render_generations, render_host_facts,
-    render_human_value, render_mission_run, render_revision_proposal, render_step_run,
+    render_human_value, render_mission_run_page, render_revision_proposal, render_step_run,
     shell_argument,
 };
 
@@ -6508,7 +6508,7 @@ async fn run_mission_view(
             let now = current_unix_ms()?;
             print!(
                 "{}",
-                render_mission_run(&run, &page.runs, OutputStyle::stdout(), now)
+                render_mission_run_page(&run, &page.runs, OutputStyle::stdout(), now)
             );
             print_mission_tree_continuation(&run, &page);
             // A daemon without lanes answers 404; the run itself is still shown.
@@ -7174,7 +7174,7 @@ async fn follow_mission_run_to(
             String::new()
         };
         if summary != prior && let Some(page) = &page {
-            let mut frame = render_mission_run(&run, &page.runs, style, current_unix_ms()?);
+            let mut frame = render_mission_run_page(&run, &page.runs, style, current_unix_ms()?);
             if let Some(cursor) = &page.next_cursor {
                 frame.push_str(&format!(
                     "\nTREE      More runs follow; st missions show {} --cursor {cursor}\n",
