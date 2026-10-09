@@ -712,8 +712,44 @@ fn validate_surfaces(
         "ArrangementMembershipEditParameters",
         "OrderedMembership",
         "OrderedMembershipPage",
+        "OrderedMembershipState",
     ] {
         validate_model(schema, definition, definition, definition, rust, swift)?;
+    }
+    // Membership window frames decode by hand into typed events; every schema field of an
+    // `ordered-memberships` snapshot/changes branch must reach the Rust and Swift frames.
+    let swift_frame = struct_block(swift, "public struct OrderedMembershipCollectionFrame:")?;
+    for branch in schema["$defs"]["CollectionFrame"]["oneOf"]
+        .as_array()
+        .context("CollectionFrame.oneOf")?
+        .iter()
+        .filter(|branch| branch["properties"]["collection"]["const"] == "ordered-memberships")
+    {
+        let (variant, kind) = match branch["properties"]["kind"]["const"].as_str() {
+            Some("snapshot") => ("MembershipSnapshot", "snapshot"),
+            Some("changes") => ("MembershipChanges", "changes"),
+            other => bail!("ordered-memberships frame has unexpected kind {other:?}"),
+        };
+        let start = rust_client
+            .find(&format!("    {variant} {{"))
+            .with_context(|| format!("Rust CollectionEvent has no `{variant}`"))?;
+        let rust_variant = &rust_client[start..];
+        let rust_variant = &rust_variant[..rust_variant.find("\n    },").unwrap_or(rust_variant.len())];
+        for property in branch["properties"]
+            .as_object()
+            .context("ordered-memberships frame properties")?
+            .keys()
+            .filter(|name| !matches!(name.as_str(), "kind" | "collection"))
+        {
+            if !rust_variant.contains(&format!("        {property}:"))
+                || !rust_client.contains(&format!("(&frame, \"{property}\")"))
+            {
+                bail!("Rust `{variant}` does not decode `{kind}` frame field `{property}`");
+            }
+            if !swift_frame.contains(&lower_camel_snake(property)) {
+                bail!("Swift `OrderedMembershipCollectionFrame` does not model `{property}`");
+            }
+        }
     }
     for token in [
         "pub async fn pairing_begin",

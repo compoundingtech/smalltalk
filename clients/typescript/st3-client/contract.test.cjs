@@ -231,6 +231,23 @@ test('applyWindow keeps a window in the order each frame names', () => {
     assert.equal(window.hasMore, false);
     assert.equal(window.snapshot.id, 'snapshot/later');
     assert.equal(applyWindow(window, { kind: 'resync', id: 'm' }), window);
+    assert.equal('membership' in window, false);
+});
+
+test('applyWindow keeps the newest membership state even when the window is unchanged', () => {
+    const fixture = require('../../../fixtures/clients/ordered-memberships-v2.json');
+    let window = applyWindow(undefined, fixture.snapshot_frame);
+    assert.deepEqual(window.membership, fixture.snapshot_frame.membership);
+    window = applyWindow(window, fixture.changes_frame);
+    assert.deepEqual(window.items.map(item => item.id), ['mission/m1']);
+    assert.deepEqual(window.membership, fixture.changes_frame.membership);
+    const before = window;
+    window = applyWindow(window, fixture.outside_window_changes_frame);
+    assert.deepEqual(window.items, before.items);
+    assert.equal(window.hasMore, before.hasMore);
+    assert.deepEqual(window.membership, fixture.outside_window_changes_frame.membership);
+    assert(window.membership.changed_index > before.membership.changed_index);
+    assert.equal(applyWindow(window, { kind: 'resync', id: 'sidebar' }), window);
 });
 
 test('glass methods preserve structure, null creation base, and idempotency headers', async () => {

@@ -89,6 +89,48 @@ fn lifecycle(store: &Store, member: &str) -> (bool, String) {
 fn sync(source: &Store, target: &Store) {
     receive_and_project(target, &source.origin, &exchange_from(source, &ReplicationInventory::default()));
 }
+#[test]
+fn membership_state_tracks_same_count_edits_and_is_not_checkpoint_authority() {
+    let store = Store::open_memory("membership-state").unwrap();
+    assert_eq!(store.ordered_membership_state(CONTAINER).unwrap(),
+        st3_schema::ordered_membership::State { live_count: 0, changed_index: 0 });
+    create(&store);
+    declare(&store, SEAT_A, "true", "state-a");
+    declare(&store, SEAT_B, "true", "state-b");
+    edit(&store, json!([place(SEAT_A, None, "a0"), place(SEAT_B, None, "a1")]));
+    let first = store.ordered_membership_state(CONTAINER).unwrap();
+    assert_eq!(first.live_count, 2);
+    edit(&store, json!([place(SEAT_B, None, "a2")]));
+    let second = store.ordered_membership_state(CONTAINER).unwrap();
+    assert_eq!(second.live_count, first.live_count);
+    assert_eq!(second.changed_index, store.index().unwrap());
+    assert!(second.changed_index > first.changed_index);
+    retire(&store, SEAT_B, "state-retire-b");
+    let retired = store.ordered_membership_state(CONTAINER).unwrap();
+    assert_eq!(retired.live_count, 1);
+    assert!(retired.changed_index > second.changed_index);
+    declare(&store, SEAT_B, "true", "state-restore-b");
+    let restored = store.ordered_membership_state(CONTAINER).unwrap();
+    assert_eq!(restored.live_count, 2);
+    assert!(restored.changed_index > retired.changed_index);
+    let digests = layout_digests(&store);
+    store.connection.write().execute(
+        "UPDATE ordered_membership_counts SET changed_index=?1 WHERE container=?2",
+        params![restored.changed_index + 7, CONTAINER],
+    ).unwrap();
+    store.connection.write().execute(
+        "INSERT INTO meta(key,value) VALUES('local_ordered_membership_repair_index',?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [(restored.changed_index + 11).to_string()],
+    ).unwrap();
+    assert_eq!(store.ordered_membership_state(CONTAINER).unwrap().changed_index,
+        restored.changed_index + 11);
+    assert_eq!(layout_digests(&store), digests);
+    let directory = tempfile::tempdir().unwrap();
+    let (_, proof) = store.plan_checkpoint(now_ms() + 1, directory.path()).unwrap();
+    assert!(proof.passed, "local frontier values must not affect checkpoint witnesses");
+}
+
 
 fn membership_digests(store: &Store) -> BTreeMap<String, String> {
     let digests = store.replication_status(true, None, &[]).unwrap().projection_digests;
@@ -492,6 +534,8 @@ fn membership_repair_invalidates_the_receiver_frontier_even_after_rebuild_and_he
     assert_eq!(changed, repaired, "repair must invalidate at its own frontier, not the retained operation's index");
     assert!(receiver.ordered_memberships(CONTAINER, before, None, 1000).is_err());
     assert_eq!(members(&receiver), vec![SEAT_A]);
+    assert_eq!(receiver.ordered_membership_state(CONTAINER).unwrap(),
+        st3_schema::ordered_membership::State { live_count: 1, changed_index: repaired });
     let expected = receiver.ordered_memberships(CONTAINER, repaired, None, 1000).unwrap();
     let digests = layout_digests(&receiver);
     for heal in [false, true] {
@@ -504,6 +548,7 @@ fn membership_repair_invalidates_the_receiver_frontier_even_after_rebuild_and_he
         assert!(receiver.ordered_memberships_changed(before, repaired).unwrap());
         assert!(receiver.ordered_memberships(CONTAINER, before, None, 1000).is_err());
         assert_eq!(receiver.ordered_memberships(CONTAINER, repaired, None, 1000).unwrap(), expected);
+        assert_eq!(receiver.ordered_membership_state(CONTAINER).unwrap().changed_index, repaired);
     }
 }
 
@@ -524,6 +569,8 @@ fn creation_repair_invalidates_even_when_the_membership_count_row_disappears() {
         [CONTAINER], |row| row.get(0),
     ).unwrap();
     assert_eq!(counts, 0, "retracting version-two creation removes its count row");
+    assert_eq!(receiver.ordered_membership_state(CONTAINER).unwrap(),
+        st3_schema::ordered_membership::State { live_count: 0, changed_index: repaired });
     let digests = layout_digests(&receiver);
     for heal in [None, Some(false), Some(true)] {
         match heal {
@@ -542,6 +589,7 @@ fn creation_repair_invalidates_even_when_the_membership_count_row_disappears() {
         let error = receiver.ordered_memberships(CONTAINER, repaired, None, 1000).unwrap_err();
         assert_eq!(error.downcast_ref::<St3Error>().unwrap().code, "not-found");
         assert_eq!(layout_digests(&receiver), digests);
+        assert_eq!(receiver.ordered_membership_state(CONTAINER).unwrap().changed_index, repaired);
     }
 }
 
@@ -570,6 +618,8 @@ fn retained_claim_member_repair_refreshes_lifecycle_without_changing_its_pair() 
     assert_eq!(head(&receiver, member), retained);
     assert_eq!(members(&receiver), vec![member]);
     assert!(receiver.ordered_memberships_changed(before, repaired).unwrap());
+    assert_eq!(receiver.ordered_membership_state(CONTAINER).unwrap(),
+        st3_schema::ordered_membership::State { live_count: 1, changed_index: repaired });
     assert!(receiver.ordered_memberships(CONTAINER, before, None, 1000).is_err());
     let expected = rows(&receiver);
     let digests = membership_digests(&receiver);

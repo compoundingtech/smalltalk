@@ -3,7 +3,7 @@ import { API_VERSION } from './Models.generated.ts';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
-    Arrangement, ArrangementId, ArrangementPage, OrderedMembership, OrderedMembershipPage,
+    Arrangement, ArrangementId, ArrangementPage, OrderedMembership, OrderedMembershipPage, OrderedMembershipState,
     PublicationDefinition, SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationContentChunk, ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
@@ -76,8 +76,12 @@ export type CollectionStream = {
     close(): void;
 };
 /** A window's rows in display order, as `applyWindow` keeps them: resources, or the
- * `ordered-memberships` rows of an `OrderedMembershipFrame`. */
-export type CollectionWindow<TItem extends { id: string } = Resource> = { items: TItem[]; hasMore: boolean; snapshot: Snapshot };
+ * `ordered-memberships` rows of an `OrderedMembershipFrame`. A membership window also holds the
+ * whole container's latest `membership` state, which moves on edits outside its rows too.
+ * `membership.changed_index` is an opaque host-local invalidation frontier scoped by
+ * `snapshot.host_id`: not a canonical revision, and never comparable across hosts. */
+export type CollectionWindow<TItem extends { id: string } = Resource> = { items: TItem[]; hasMore: boolean; snapshot: Snapshot }
+    & ([TItem] extends [OrderedMembership] ? { membership: OrderedMembershipState } : unknown);
 /** A `snapshot` or `changes` frame of an `ordered-memberships` subscription. */
 export type OrderedMembershipFrame = Extract<CollectionFrame, { collection: 'ordered-memberships' }>;
 /** Every frame except an `ordered-memberships` window's: its windows hold resources. */
@@ -85,17 +89,20 @@ export type ResourceCollectionFrame = Exclude<CollectionFrame, OrderedMembership
 
 /** Apply one `snapshot` or `changes` frame to a window: removals and upserts first, then the
  * frame's complete order. A `changes` frame without an earlier snapshot has nothing to apply to.
- * Membership frames keep membership windows; narrow on `frame.collection` to pick one. */
+ * Membership frames keep membership windows; narrow on `frame.collection` to pick one. A
+ * membership `changes` frame that leaves rows, order, and `hasMore` alone still replaces the
+ * window's `membership` state. */
 export function applyWindow(window: CollectionWindow<OrderedMembership> | undefined, frame: OrderedMembershipFrame): CollectionWindow<OrderedMembership> | undefined;
 export function applyWindow(window: CollectionWindow | undefined, frame: ResourceCollectionFrame): CollectionWindow | undefined;
-export function applyWindow(window: CollectionWindow<{ id: string }> | undefined, frame: CollectionFrame): CollectionWindow<{ id: string }> | undefined {
+export function applyWindow(window: CollectionWindow<{ id: string }> | undefined, frame: CollectionFrame): CollectionWindow<{ id: string }> | CollectionWindow<OrderedMembership> | undefined {
     if (frame.kind !== 'snapshot' && frame.kind !== 'changes') return window;
     if (frame.kind === 'changes' && !window) return undefined;
     const rows = new Map<string, { id: string }>(frame.kind === 'snapshot' ? [] : window!.items.map(item => [item.id, item]));
     if (frame.kind === 'changes') for (const id of frame.removes) rows.delete(id);
     for (const item of frame.kind === 'snapshot' ? frame.items : frame.upserts) rows.set(item.id, item);
     const items = frame.order.flatMap(id => rows.get(id) ?? []);
-    return { items, hasMore: frame.has_more, snapshot: frame.snapshot };
+    const next = { items, hasMore: frame.has_more, snapshot: frame.snapshot };
+    return frame.collection === 'ordered-memberships' ? { ...next, membership: frame.membership } : next;
 }
 
 function defaultTerminalSocket(url: string, protocols: string[], headers: Record<string, string>): TerminalSocket {

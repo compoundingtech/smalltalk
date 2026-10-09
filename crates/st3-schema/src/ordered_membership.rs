@@ -17,6 +17,15 @@ pub const MAX_OPERATIONS: usize = arrangements::MAX_OPERATIONS;
 pub const MAX_KEY_BYTES: usize = arrangements::MAX_KEY_BYTES;
 pub const MAX_EDIT_BYTES: usize = arrangements::MAX_BODY_BYTES;
 
+/// Local membership invalidation state. The frontier is opaque and comparable only
+/// within one host; it is neither a canonical revision nor checkpoint authority.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct State {
+    pub live_count: u64,
+    pub changed_index: u64,
+}
+
 /// A member's position: `bucket: None` is the container root.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]

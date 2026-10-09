@@ -322,9 +322,27 @@ test('ordered membership frames and envelopes decode only as membership variants
     const changes = decode(Rich.CollectionFrame, fixture.changes_frame);
     assert.deepEqual(changes.removes, ['agent/ada/worker']);
     assert.equal(changes.upserts[0].position.key, 'Zz');
+    assert.deepEqual(snapshot.membership, fixture.snapshot_frame.membership);
+    assert.deepEqual(Schema.encodeSync(Rich.CollectionFrame)(snapshot).membership, fixture.snapshot_frame.membership);
+    assert.deepEqual(Schema.encodeSync(Rich.OrderedMembershipState)(decode(Rich.OrderedMembershipState, fixture.changes_frame.membership)), fixture.changes_frame.membership);
+    const outside = decode(Rich.CollectionFrame, fixture.outside_window_changes_frame);
+    assert.deepEqual([outside.upserts, outside.removes, outside.order, outside.has_more], [[], [], changes.order, changes.has_more]);
+    assert(outside.membership.changed_index > changes.membership.changed_index);
+    for (const frame of [fixture.snapshot_frame, fixture.changes_frame]) {
+        const { membership, ...missingState } = frame;
+        assert.throws(() => decode(Rich.CollectionFrame, missingState));
+        for (const field of ['container', 'live_count', 'changed_index']) {
+            const { [field]: _, ...partial } = membership;
+            assert.throws(() => decode(Rich.CollectionFrame, { ...frame, membership: partial }));
+        }
+        assert.throws(() => decode(Rich.CollectionFrame, { ...frame, membership: { ...membership, live_count: -1 } }));
+        assert.throws(() => decode(Rich.CollectionFrame, { ...frame, membership: { ...membership, extra: true } }));
+    }
+    const { membership: _state, ...resourceShape } = fixture.snapshot_frame;
     const empty = { ...fixture.snapshot_frame, items: [], order: [] };
     assert.equal(decode(Rich.CollectionFrame, empty).collection, 'ordered-memberships');
-    assert.equal(decode(Rich.CollectionFrame, { ...empty, collection: 'agents' }).collection, 'agents');
+    assert.equal(decode(Rich.CollectionFrame, { ...resourceShape, items: [], order: [], collection: 'agents' }).collection, 'agents');
+    assert.throws(() => decode(Rich.CollectionFrame, { ...empty, collection: 'agents' }));
     assert.throws(() => decode(Rich.CollectionFrame, { ...fixture.snapshot_frame, collection: 'agents' }));
     const missingBucket = structuredClone(fixture.changes_frame);
     delete missingBucket.upserts[0].position.bucket;

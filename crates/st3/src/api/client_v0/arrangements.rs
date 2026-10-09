@@ -398,18 +398,19 @@ mod tests {
         let mut subscription: CollectionSubscribe = serde_json::from_value(json!({
             "kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","limit":100
         })).unwrap();
-        let (_, prefix, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, prefix, has_more, membership_state) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        assert!(membership_state.is_none());
         assert_eq!(prefix.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(), [SUBJECT]);
         assert!(has_more);
         subscription.subject = Some(sidebar.into());
-        let (_, selected, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, selected, has_more, _) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(selected.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(), [sidebar]);
         assert!(!has_more);
         assert_eq!(selected[0]["body"]["name"]["value"], "Sidebar");
         let mut rename = request(&state, "selected-rename", json!([{"op":"rename","name":"Selected edit"}]));
         rename.parameters["subject"] = json!(sidebar);
         edit(&state, &session, &rename).await.unwrap();
-        let (_, updated, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, updated, has_more, _) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(updated[0]["body"]["name"]["value"], "Selected edit");
         assert_ne!(updated[0]["revision"], selected[0]["revision"]);
         assert!(!has_more);
@@ -419,11 +420,11 @@ mod tests {
         let mut retire = request(&state, "selected-retire", json!([{"op":"retire"}]));
         retire.parameters["subject"] = json!(sidebar);
         edit(&state, &session, &retire).await.unwrap();
-        let (_, removed, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, removed, has_more, _) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert!(removed.is_empty());
         assert!(!has_more);
         subscription.subject = None;
-        let (_, unfiltered, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, unfiltered, has_more, _) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(unfiltered, prefix);
         assert!(!has_more);
     }
@@ -550,7 +551,7 @@ mod tests {
         let subscription: CollectionSubscribe = serde_json::from_value(json!({
             "kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","limit":10
         })).unwrap();
-        let (_, before, _) = collection_items(&state, &agent, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, before, _, _) = collection_items(&state, &agent, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(before[0]["id"], SUBJECT);
         let mut omitted = subscription.clone();
         omitted.person = None;
@@ -560,7 +561,7 @@ mod tests {
         assert_eq!(person(&ClientSession::local(None).unwrap(), Some("person/ada"), false).unwrap_err().code, "forbidden");
         let _ = action(State(state.clone()), Extension(new_client_snapshot(&state)), Extension(agent.clone()),
             Json(request(&state, "retire", json!([{"op":"retire"}])))).await.unwrap();
-        let (_, after, _) = collection_items(&state, &agent, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, after, _, _) = collection_items(&state, &agent, &subscription, read_slots.acquire_owned().await.unwrap()).await.unwrap();
         assert!(after.is_empty());
         let response = app.oneshot(Request::builder()
             .uri("/v1/client/arrangements/ada/019a0000-0000-7000-8000-000000000001")
@@ -864,27 +865,31 @@ mod tests {
             "kind":"subscribe","id":"repair-memberships","collection":"ordered-memberships",
             "person":"person/ada","subject":SUBJECT,"limit":1
         })).unwrap();
-        let (snapshot, first, has_more) = collection_items_with_windows(
+        let (snapshot, first, has_more, first_state) = collection_items_with_windows(
             &state, &session, &subscription, slots.clone().acquire_owned().await.unwrap(),
             Some(windows.clone())).await.unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0]["member"], "resource/b");
         assert!(has_more);
-        let (_, cached, cached_has_more) = collection_items_with_windows(
+        assert_eq!(first_state.unwrap().live_count, 2);
+        assert_eq!(first_state.unwrap(), state.store.ordered_membership_state(SUBJECT).unwrap());
+        let (_, cached, cached_has_more, cached_state) = collection_items_with_windows(
             &state, &session, &subscription, slots.clone().acquire_owned().await.unwrap(),
             Some(windows.clone())).await.unwrap();
         assert_eq!(cached, first);
         assert_eq!(cached_has_more, has_more);
+        assert_eq!(cached_state, first_state);
         assert_eq!(windows.builds(), 1);
         let arrangement_subscription: CollectionSubscribe = serde_json::from_value(json!({
             "kind":"subscribe","id":"repair-layout","collection":"arrangements",
             "person":"person/ada","subject":SUBJECT,"limit":1
         })).unwrap();
-        let (_, layout, _) = collection_items_with_windows(
+        let (_, layout, _, layout_state) = collection_items_with_windows(
             &state, &session, &arrangement_subscription, slots.clone().acquire_owned().await.unwrap(),
             Some(windows.clone())).await.unwrap();
         assert_eq!(layout[0]["revision"], original.id);
-        let (_, cached_layout, _) = collection_items_with_windows(
+        assert!(layout_state.is_none());
+        let (_, cached_layout, _, _) = collection_items_with_windows(
             &state, &session, &arrangement_subscription, slots.clone().acquire_owned().await.unwrap(),
             Some(windows.clone())).await.unwrap();
         assert_eq!(cached_layout, layout);
@@ -913,7 +918,7 @@ mod tests {
         assert!(collection_windows::Windows::changed("ordered-memberships", &before, &after));
         assert!(collection_windows::Windows::changed("arrangements", &before, &after));
 
-        let (current, repaired, has_more) = collection_items_with_windows(
+        let (current, repaired, has_more, repaired_state) = collection_items_with_windows(
             &state, &session, &subscription, slots.clone().acquire_owned().await.unwrap(),
             Some(windows.clone())).await.unwrap();
         assert_eq!(repaired.len(), 1);
@@ -921,8 +926,11 @@ mod tests {
         assert_eq!(repaired[0]["position"]["key"], "a2");
         assert!(!has_more);
         assert!(current.store_index > snapshot.store_index);
+        assert_eq!(repaired_state.unwrap().live_count, 1);
+        assert_eq!(repaired_state.unwrap().changed_index, current.store_index);
+        assert!(repaired_state.unwrap().changed_index > first_state.unwrap().changed_index);
         assert_eq!(windows.builds(), 3);
-        let (_, repaired_layout, _) = collection_items_with_windows(
+        let (_, repaired_layout, _, _) = collection_items_with_windows(
             &state, &session, &arrangement_subscription, slots.acquire_owned().await.unwrap(),
             Some(windows.clone())).await.unwrap();
         assert_eq!(repaired_layout[0]["revision"], replacement.id);
@@ -936,6 +944,97 @@ mod tests {
             .uri(format!("{path}&cursor={cursor}")).header(LOCAL_PERSON_HEADER, "person/ada")
             .body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::GONE);
+    }
+
+    async fn membership_frame(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Value {
+        use futures_util::StreamExt as _;
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        serde_json::from_str(frame.to_text().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn membership_stream_signals_outside_window_edits_and_same_count_reorders() {
+        use futures_util::SinkExt as _;
+        use tokio_tungstenite::tungstenite::Message;
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "membership-upstream-signal");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        create_v2(&state, &session).await;
+        for member in ["resource/a", "resource/b", "resource/c", "resource/d"] {
+            declare_resource_member(&state, member);
+        }
+        edit_memberships(&state, &session, &membership_request(&state, "initial", json!([
+            {"op":"place","member":"resource/a","bucket":null,"key":"a0"},
+            {"op":"place","member":"resource/b","bucket":null,"key":"a1"}
+        ]))).await.unwrap();
+        let route_state = state.clone();
+        let app = axum::Router::new().route("/stream", axum::routing::get(
+            move |upgrade: WebSocketUpgrade| {
+                let state = route_state.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        let windows = collection_windows::Windows::attach(&state.store);
+                        collection_stream_socket_with_reader(socket, state,
+                            ClientSession::local(Some("person/ada")).unwrap(), None,
+                            move |state, session, request, permit| {
+                                let windows = windows.clone();
+                                async move {
+                                    collection_items_with_windows(
+                                        &state, &session, &request, permit, windows,
+                                    ).await
+                                }
+                            })
+                    })
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await.unwrap();
+        socket.send(Message::Text(json!({
+            "kind":"subscribe","id":"memberships","collection":"ordered-memberships",
+            "person":"person/ada","subject":SUBJECT,"limit":1
+        }).to_string().into())).await.unwrap();
+        let initial = membership_frame(&mut socket).await;
+        assert_eq!(initial["kind"], "snapshot");
+        assert_eq!(initial["items"][0]["member"], "resource/a");
+        assert_eq!(initial["membership"]["container"], SUBJECT);
+        assert_eq!(initial["membership"]["live_count"], 2);
+        let mut frontier = initial["membership"]["changed_index"].as_u64().unwrap();
+        // Every edit leaves the held first row and has_more unchanged. Counts alone
+        // cannot distinguish the rekey or the net-zero outside-window replacement.
+        for (key, operations, count) in [
+            ("outside-insert", json!([{"op":"place","member":"resource/c","bucket":null,"key":"a2"}]), 3),
+            ("outside-rekey", json!([{"op":"place","member":"resource/b","bucket":null,"key":"a3"}]), 3),
+            ("outside-replace", json!([
+                {"op":"remove","member":"resource/b"},
+                {"op":"place","member":"resource/d","bucket":null,"key":"a4"}
+            ]), 3),
+            ("outside-remove", json!([{"op":"remove","member":"resource/c"}]), 2),
+        ] {
+            edit_memberships(&state, &session, &membership_request(&state, key, operations))
+                .await.unwrap();
+            state.event_notify.send_replace(state.store.index().unwrap());
+            let frame = membership_frame(&mut socket).await;
+            assert_eq!(frame["kind"], "changes", "{key}: {frame}");
+            assert_eq!(frame["upserts"], json!([]));
+            assert_eq!(frame["removes"], json!([]));
+            assert_eq!(frame["order"], json!(["resource/a"]));
+            assert_eq!(frame["has_more"], true);
+            assert_eq!(frame["membership"]["live_count"], count);
+            let next = frame["membership"]["changed_index"].as_u64().unwrap();
+            assert!(next > frontier, "{key}: {frame}");
+            frontier = next;
+        }
+        socket.close(None).await.unwrap();
+        server.abort();
     }
 
     #[tokio::test]
@@ -956,26 +1055,31 @@ mod tests {
             "person":"person/ada","subject":SUBJECT,"limit":1
         })).unwrap();
         let before = windows.changes(&state.store).unwrap();
-        let (_, first, has_more) = collection_items_with_windows(&state, &session, &subscription,
+        let (_, first, has_more, first_state) = collection_items_with_windows(&state, &session, &subscription,
             slots.clone().acquire_owned().await.unwrap(), Some(windows.clone())).await.unwrap();
         assert_eq!(first[0]["member"], "resource/b");
         assert!(!has_more);
+        assert_eq!(first_state.unwrap().live_count, 1);
         let index = state.store.index().unwrap();
         declare_resource_member(&state, "resource/a");
         assert!(state.store.ordered_memberships_changed(index, state.store.index().unwrap()).unwrap());
         let after = windows.changes(&state.store).unwrap();
         assert!(collection_windows::Windows::changed("ordered-memberships", &before, &after));
-        let (_, second, has_more) = collection_items_with_windows(&state, &session, &subscription,
+        let (_, second, has_more, second_state) = collection_items_with_windows(&state, &session, &subscription,
             slots.clone().acquire_owned().await.unwrap(), Some(windows.clone())).await.unwrap();
         assert_eq!(second[0]["member"], "resource/a");
         assert!(has_more);
+        assert_eq!(second_state.unwrap().live_count, 2);
+        assert!(second_state.unwrap().changed_index > first_state.unwrap().changed_index);
         edit_memberships(&state, &session, &membership_request(&state, "remove-first", json!([
             {"op":"remove","member":"resource/a"}
         ]))).await.unwrap();
-        let (_, third, has_more) = collection_items_with_windows(&state, &session, &subscription,
+        let (_, third, has_more, third_state) = collection_items_with_windows(&state, &session, &subscription,
             slots.clone().acquire_owned().await.unwrap(), Some(windows)).await.unwrap();
         assert_eq!(third[0]["member"], "resource/b");
         assert!(!has_more);
+        assert_eq!(third_state.unwrap().live_count, 1);
+        assert!(third_state.unwrap().changed_index > second_state.unwrap().changed_index);
     }
 
     #[tokio::test]
@@ -1000,10 +1104,11 @@ mod tests {
             "kind":"subscribe","id":"agent-window","collection":"ordered-memberships",
             "person":"person/ada","subject":SUBJECT,"limit":1
         })).unwrap();
-        let (_, first, has_more) = collection_items_with_windows(&state, &session, &subscription,
+        let (_, first, has_more, first_state) = collection_items_with_windows(&state, &session, &subscription,
             slots.clone().acquire_owned().await.unwrap(), Some(windows.clone())).await.unwrap();
         assert_eq!(first[0]["member"], "agent/ada/seat");
         assert!(has_more);
+        assert_eq!(first_state.unwrap().live_count, 2);
         let before = windows.changes(&state.store).unwrap();
         let stop = crate::graph::parse_internal_intent(
             "version 2\nstop \"agent/ada/seat\"\n", "membership-agent-lifecycle",
@@ -1011,15 +1116,19 @@ mod tests {
         state.store.apply_internal(&stop, "retire-seat").unwrap();
         let after = windows.changes(&state.store).unwrap();
         assert!(collection_windows::Windows::changed("ordered-memberships", &before, &after));
-        let (_, second, has_more) = collection_items_with_windows(&state, &session, &subscription,
+        let (_, second, has_more, second_state) = collection_items_with_windows(&state, &session, &subscription,
             slots.clone().acquire_owned().await.unwrap(), Some(windows.clone())).await.unwrap();
         assert_eq!(second[0]["member"], "resource/fallback");
         assert!(!has_more);
+        assert_eq!(second_state.unwrap().live_count, 1);
+        assert!(second_state.unwrap().changed_index > first_state.unwrap().changed_index);
         state.store.apply_internal(&declare, "restore-seat").unwrap();
-        let (_, restored, has_more) = collection_items_with_windows(&state, &session, &subscription,
+        let (_, restored, has_more, restored_state) = collection_items_with_windows(&state, &session, &subscription,
             slots.clone().acquire_owned().await.unwrap(), Some(windows)).await.unwrap();
         assert_eq!(restored[0]["member"], "agent/ada/seat");
         assert_eq!(restored[0]["position"], first[0]["position"]);
+        assert_eq!(restored_state.unwrap().live_count, 2);
+        assert!(restored_state.unwrap().changed_index > second_state.unwrap().changed_index);
         assert!(has_more);
         assert_eq!(state.store.claims_for(SUBJECT, Some("ordered-membership.edited")).unwrap().len(), 1);
     }

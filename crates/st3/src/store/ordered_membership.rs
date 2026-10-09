@@ -370,6 +370,17 @@ pub(super) fn witness(connection: &Connection, container: &str) -> Result<Value>
     Ok(json!({"raw":raw,"live":live,"count":count,"dependencies":dependencies}))
 }
 
+fn state_at(connection: &Connection, container: &str) -> Result<schema::State> {
+    Ok(connection.query_row(
+        "SELECT COALESCE(c.live_count,0),
+           MAX(COALESCE(c.changed_index,0),COALESCE(CAST(r.value AS INTEGER),0))
+         FROM (SELECT ?1 AS container) requested
+         LEFT JOIN ordered_membership_counts c ON c.container=requested.container
+         LEFT JOIN meta r ON r.key='local_ordered_membership_repair_index'",
+        [container], |row| Ok(schema::State { live_count: row.get(0)?, changed_index: row.get(1)? }),
+    )?)
+}
+
 pub(super) fn items_at(connection: &Connection, container: &str, through: u64, after: Option<(&str,&str,&str)>, limit: usize) -> Result<Vec<Value>> {
     anyhow::ensure!(limit <= 1001, "ordered membership pages are bounded to 1000 entries plus one lookahead");
     let created: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM arrangements WHERE subject=?1 AND created=1)", [container], |row| row.get(0))?;
@@ -377,12 +388,8 @@ pub(super) fn items_at(connection: &Connection, container: &str, through: u64, a
     if arrangements::version(connection, container)? != 2 {
         return Err(anyhow::Error::new(St3Error::new("invalid-arrangement-operations", "ordered membership reads require version 2; version-1 placements are not an empty membership collection")));
     }
-    let changed: u64 = connection.query_row(
-        "SELECT MAX(COALESCE((SELECT changed_index FROM ordered_membership_counts WHERE container=?1),0),
-           COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='local_ordered_membership_repair_index'),0))",
-        [container], |row| row.get(0),
-    )?;
-    anyhow::ensure!(changed <= through, "ordered membership snapshot frontier is stale");
+    anyhow::ensure!(state_at(connection, container)?.changed_index <= through,
+        "ordered membership snapshot frontier is stale");
     let read_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
         let member: String = row.get(2)?;
         let bucket: String = row.get(0)?;
@@ -410,6 +417,9 @@ impl Store {
     }
     pub fn ordered_memberships(&self, container: &str, through: u64, after: Option<(&str,&str,&str)>, limit: usize) -> Result<Vec<Value>> {
         self.read_snapshot(|_| items_at(&self.readers.get(),container,through,after,limit))
+    }
+    pub fn ordered_membership_state(&self, container: &str) -> Result<schema::State> {
+        self.read_snapshot(|_| state_at(&self.readers.get(),container))
     }
     pub fn ordered_membership_count(&self, container: &str) -> Result<u64> {
         Ok(self.readers.get().query_row("SELECT COALESCE((SELECT live_count FROM ordered_membership_counts WHERE container=?1),0)", [container], |row| row.get(0))?)

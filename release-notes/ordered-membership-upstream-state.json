@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Signal complete ordered membership state when held windows do not change",
+  "replay": {"status": "none", "detail": "Exposes existing indexed live counts and the maximum of the container changed index and local repair watermark. No projection authority, replay order, shared digest, checkpoint witness or retention rule changes."},
+  "schema": {"status": "none", "detail": "No database tables, indexes, meta keys, numeric schema version or shared projection layout changes. Membership state is read from existing transactional projections."},
+  "rules": {"status": "none", "detail": "Checkpoint rules remain version 14. Host-local invalidation frontiers remain excluded from shared projection digests and checkpoint answers."},
+  "compatibility": {"status": "changed", "detail": "Ordered-memberships snapshot and changes frames now require membership {container, live_count, changed_index}. Generated Rust, TypeScript and Swift clients expose this state and require it when decoding membership data frames. Resource frames remain unchanged. Upgrade these draft clients and server together; cross-version clients have not been exercised. Capability versions and pairing scopes are unchanged."},
+  "downtime": {"status": "none", "detail": "No startup migration, replay or additional background work is introduced. The count and frontier are read in the same snapshot as the held rows, with no lifetime-history scan."},
+  "manual": {"status": "none", "detail": "No new manual data migration is required. Consumers use the opaque monotonic changed_index only within one snapshot.host_id to invalidate complete-set reads. Canonical-winner-preserving v1 placement migration and exclusive reader/writer cutover remain in the follow-up stacked PR above #1958."},
+  "recovery": {"status": "none", "detail": "No recovery procedure changes. The exposed frontier has no cross-host ordering or canonical revision meaning and is not checkpoint authority; previous backup and roll-forward guidance remains applicable."}
+}

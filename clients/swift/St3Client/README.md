@@ -22,6 +22,9 @@ Use `ArrangementEditParameters(version: 2)` when creating a new folder-only arra
 root buckets. `arrangementsMemberships` returns a snapshot-bound typed page; pass the
 route's person name/UUID and owning `person/NAME`. `orderedMembershipsStream` requires
 that person and arrangement subject and follows lifecycle-aware held-window changes.
+Its `snapshot` and `changes` frames require `membership: OrderedMembershipState` for the whole
+container, which moves on edits outside the window too; `changedIndex` is an opaque host-local
+invalidation frontier scoped by `snapshot.hostID`, not a canonical revision or cross-host value.
 Existing v1 placements are not implicitly migrated.
 
 The generated models and complete typed operation surfaces are refreshed from the normative schema
