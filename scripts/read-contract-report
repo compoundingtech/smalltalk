@@ -1,0 +1,981 @@
+#!/usr/bin/env python3
+"""Source-only, nonrequired read-contract coverage diagnostic.
+
+It never infers a semantic success from HTTP status, an empty result, help, or an
+error. The pinned census is historical evidence, not a receipt for this HEAD.
+Exit 0 is reserved for a complete checked manifest; today's partial report is red.
+"""
+
+import argparse
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import selectors
+import signal
+import subprocess
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+# Set only in a reviewed source commit after target and approval bytes are accepted.
+APPROVED_TARGET_CONFIG_SHA256 = None
+APPROVED_TARGET_APPROVAL_SHA256 = None
+TRUSTED_CLI_BUILD_ATTESTATION_SHA256 = None
+
+
+class InventoryError(ValueError):
+    pass
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def digest(value):
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
+
+
+def artifact_matches(receipt, name):
+    expected = receipt.get(f"{name}_sha256")
+    filename = receipt.get(f"{name}_path")
+    if not digest(expected) or not isinstance(filename, str):
+        return False
+    try:
+        path = Path(filename)
+        if not path.is_absolute() or not path.is_file():
+            return False
+        return sha256(path) == expected
+    except (OSError, ValueError):
+        return False
+
+
+def positive_count(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def route_calls(source):
+    try:
+        text = source.split("fn router_for_transport", 1)[1].split("\nasync fn schema()", 1)[0]
+    except IndexError as error:
+        raise InventoryError("cannot bound router_for_transport registration source") from error
+    if ";" not in text:
+        raise InventoryError("cannot bound router builder expression")
+    builder, tail = text.split(";", 1)
+    compact_tail = re.sub(r"\s+", "", tail)
+    expected_tail = (
+        "app.layer(from_fn_with_state(state.clone(),refuse_while_leaving))"
+        ".layer(from_fn_with_state((state.clone(),transport),response_envelope,))"
+        ".with_state(state)}"
+    )
+    if compact_tail != expected_tail:
+        raise InventoryError("unknown router helper or middleware registration")
+    offset = 0
+    residual = []
+    while (start := builder.find(".route(", offset)) >= 0:
+        cursor = start + len(".route(")
+        depth, quoted, escaped = 1, False, False
+        argument_start = cursor
+        while cursor < len(builder) and depth:
+            char = builder[cursor]
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+            elif char == '"':
+                quoted = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            cursor += 1
+        if depth:
+            raise InventoryError("unclosed .route( registration")
+        residual.append(builder[offset:start])
+        yield builder[argument_start:cursor - 1]
+        offset = cursor
+    residual.append(builder[offset:])
+    expected_builder = (
+        "(state:AppState,transport:ClientTransportBoundary)->Router"
+        "{letapp=Router::new()"
+    )
+    if re.sub(r"\s+", "", "".join(residual)) != expected_builder:
+        raise InventoryError("unknown router method, nest or helper registration")
+
+
+def split_route_arguments(arguments):
+    depth, quoted, escaped = 0, False, False
+    for index, char in enumerate(arguments):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            return arguments[:index].strip(), arguments[index + 1:]
+    raise InventoryError(f"route has no path/handler separator: {arguments[:100]}")
+
+
+def registered_route_handlers(api_source, peer_source):
+    forward = re.search(r'pub const CLIENT_READ_FORWARD_PATH:\s*&str\s*=\s*"([^"]+)"', peer_source)
+    if not forward:
+        raise InventoryError("client-read forward constant is unresolved")
+    constants = {"crate::peer::CLIENT_READ_FORWARD_PATH": forward.group(1)}
+    routes = {}
+    for arguments in route_calls(api_source):
+        path_expression, handlers = split_route_arguments(arguments)
+        if path_expression in constants:
+            path = constants[path_expression]
+        elif re.fullmatch(r'"[^"\\]*"', path_expression):
+            path = path_expression[1:-1]
+        else:
+            raise InventoryError(f"unknown route path expression: {path_expression}")
+        methods = re.findall(r"(?<!\w)(get|post|put|delete|patch)\s*\(", handlers)
+        named_handlers = re.findall(
+            r"(?<!\w)(get|post|put|delete|patch)\s*\(\s*([A-Za-z_][\w:]*)\s*\)",
+            handlers,
+        )
+        if not methods:
+            raise InventoryError(f"route has no recognized HTTP method: {path}")
+        if len(methods) != len(named_handlers):
+            raise InventoryError(f"route has an unresolved handler expression: {path}")
+        unknown_chains = set(re.findall(r"\.\s*([A-Za-z_]\w*)\s*\(", handlers)) - {
+            "get", "post", "put", "delete", "patch", "layer"
+        }
+        if unknown_chains:
+            raise InventoryError(f"unknown route method chain: {path}: {sorted(unknown_chains)}")
+        for method, handler in named_handlers:
+            key = f"{method.upper()} {path}"
+            if key in routes:
+                raise InventoryError(f"duplicate route registration: {key}")
+            routes[key] = handler
+    if not routes:
+        raise InventoryError("no API routes registered")
+    return routes
+
+
+def registered_routes(api_source, peer_source):
+    return set(registered_route_handlers(api_source, peer_source))
+
+
+RAW_RUST_STRING = re.compile(r"(?:br|rb|r)(#*)\"")
+
+
+def matching_rust_brace(source, opener):
+    """Find the close of one Rust block, skipping comments and string/char literals."""
+    depth = 0
+    index = opener
+    while index < len(source):
+        char = source[index]
+        next_char = source[index + 1] if index + 1 < len(source) else ""
+        if char == "/" and next_char == "/":
+            end = source.find("\n", index + 2)
+            index = len(source) if end < 0 else end + 1
+            continue
+        if char == "/" and next_char == "*":
+            comment_depth = 1
+            index += 2
+            while index < len(source) and comment_depth:
+                pair = source[index:index + 2]
+                if pair == "/*":
+                    comment_depth += 1
+                    index += 2
+                elif pair == "*/":
+                    comment_depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            if comment_depth:
+                raise InventoryError("unclosed Rust block comment in handler source")
+            continue
+        raw = RAW_RUST_STRING.match(source, index) if (
+            char in "rb" and (index == 0 or not (source[index - 1].isalnum() or source[index - 1] == "_"))
+        ) else None
+        if raw:
+            delimiter = '"' + raw.group(1)
+            end = source.find(delimiter, index + len(raw.group(0)))
+            if end < 0:
+                raise InventoryError("unclosed Rust raw string in handler source")
+            index = end + len(delimiter)
+            continue
+        if char == '"':
+            index += 1
+            while index < len(source):
+                if source[index] == "\\":
+                    index += 2
+                elif source[index] == '"':
+                    index += 1
+                    break
+                else:
+                    index += 1
+            else:
+                raise InventoryError("unclosed Rust string in handler source")
+            continue
+        if char == "'":
+            end = index + 1
+            while end < len(source) and source[end] != "\n":
+                if source[end] == "\\":
+                    end += 2
+                elif source[end] == "'":
+                    index = end + 1
+                    break
+                else:
+                    end += 1
+            if index == end + 1:
+                continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+            if depth < 0:
+                raise InventoryError("unexpected Rust close brace in handler source")
+        index += 1
+    raise InventoryError("unclosed root test module in handler source")
+
+
+def without_root_test_modules(source):
+    pattern = re.compile(
+        r"(?m)^#\[cfg\(test\)\][ \t]*\n[ \t]*mod[ \t]+[A-Za-z_]\w*[ \t]*\{"
+    )
+    spans = []
+    for match in pattern.finditer(source):
+        if spans and match.start() <= spans[-1][1]:
+            continue
+        spans.append((match.start(), matching_rust_brace(source, match.end() - 1) + 1))
+    parts = []
+    start = 0
+    for left, right in spans:
+        parts.extend((source[start:left], "\n" * source[left:right].count("\n")))
+        start = right
+    parts.append(source[start:])
+    return "".join(parts)
+
+
+def registered_handler_definitions(source_root, route_handlers):
+    """Locate lexical handler candidates in supported shapes, excluding root tests.
+
+    The count does not resolve Rust cfg, macros, visibility, or module selection.
+    The unconditional qualification blocker below keeps these locations diagnostic.
+    """
+    definitions = {}
+    production_by_path = {}
+    for key, handler in route_handlers.items():
+        parts = handler.split("::")
+        path = (source_root / "crates/st3/src/api.rs" if len(parts) == 1 else
+                source_root / "crates/st3/src/api" / ("/".join(parts[:-1]) + ".rs"))
+        if path not in production_by_path:
+            try:
+                source = path.read_text()
+            except OSError as error:
+                raise InventoryError(f"handler source file is missing: {key}: {handler}") from error
+            production_by_path[path] = without_root_test_modules(source)
+        production = production_by_path[path]
+        pattern = re.compile(
+            r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?(?:async[ \t]+)?fn[ \t]+"
+            + re.escape(parts[-1]) + r"[ \t]*\("
+        )
+        matches = list(pattern.finditer(production))
+        if len(matches) != 1:
+            raise InventoryError(
+                f"handler has {len(matches)} lexical candidate definitions: {key}: {handler}"
+            )
+        definitions[key] = {
+            "handler": handler,
+            "source_file": path.relative_to(source_root).as_posix(),
+            "source_line": production.count("\n", 0, matches[0].start()) + 1,
+            "qualification": "source-location-only",
+        }
+    return definitions
+
+
+def registered_claim_specs(schema_source):
+    try:
+        definitions = schema_source.split("let definitions: &[ClaimDefinition<'_>] = &[", 1)[1].split(
+            "    ];\n    for (kind", 1
+        )[0]
+    except IndexError as error:
+        raise InventoryError("cannot bound st3-schema claim definitions") from error
+    pattern = re.compile(
+        r'(?ms)^        \(\s*"([^"]+)",\s*&\[(.*?)\],\s*WritePolicy::[A-Za-z]+,'
+        r'\s*Cardinality::[A-Za-z]+,\s*(None|Some\("[^"]+"\)),'
+        r'\s*(true|false),\s*&\[(.*?)\],\s*\),'
+    )
+    matches = list(pattern.finditer(definitions))
+    names = [match.group(1) for match in matches]
+    tuple_count = len(re.findall(r"^        \($", definitions, re.M))
+    if len(names) != tuple_count or len(names) != len(set(names)) or not names:
+        raise InventoryError("claim registry has duplicate kinds or cannot be parsed")
+    if not re.search(r'kind:\s*"custom\.\*\.\*"', schema_source):
+        raise InventoryError("custom.*.* resource allowance is unresolved")
+    specs = {}
+    for match in matches:
+        projection = match.group(3)
+        specs[match.group(1)] = {
+            "subject_types": re.findall(r'"([^"]+)"', match.group(2)),
+            "declared_primary_projection": projection[6:-2] if projection != "None" else None,
+            "wakes_reconciler": match.group(4) == "true",
+        }
+    specs["custom.*.*"] = {
+        "subject_types": ["custom"],
+        "declared_primary_projection": None,
+        "wakes_reconciler": False,
+    }
+    return specs
+
+
+def registered_claim_kinds(schema_source):
+    return set(registered_claim_specs(schema_source))
+
+
+def registered_client_read_variants(peer_source):
+    try:
+        body = peer_source.split("pub enum ClientReadOperation {", 1)[1].split(
+            "\n}\n\n#[derive(Clone, Debug, Deserialize, Serialize)]", 1
+        )[0]
+    except IndexError as error:
+        raise InventoryError("cannot bound client-read operation enum") from error
+    members = re.findall(r"^    ([A-Za-z_][A-Za-z0-9_]*)\s*([({,=])", body, re.M)
+    if any(form != "{" for _, form in members):
+        raise InventoryError("unsupported client-read operation variant form")
+    names = [name for name, _ in members]
+    inline = len(re.findall(r"^    [A-Z][A-Za-z0-9_]*\s*\{[^\n]*\},", body, re.M))
+    if len(names) != body.count("    },") + inline or len(names) != len(set(names)) or not names:
+        raise InventoryError("client-read operation variants cannot be parsed exhaustively")
+    return set(names)
+
+
+def registered_peer_protocol_routes(peer_source):
+    names = ("CLIENT_READ_PATH", "CLIENT_READ_FORWARD_PATH")
+    routes = set()
+    for name in names:
+        matches = re.findall(rf'(?:pub )?const {name}: &str = "([^"]+)";', peer_source)
+        if len(matches) != 1:
+            raise InventoryError(f"peer protocol route {name} is unresolved or duplicated")
+        routes.add(f"POST {matches[0]}")
+    if len(routes) != len(names):
+        raise InventoryError("peer protocol routes collide")
+    return routes
+
+
+def checked_manifest(path, head):
+    if path is None:
+        return None, ["no checked-tree contract manifest supplied"]
+    manifest = json.loads(path.read_text())
+    errors = []
+    if not isinstance(manifest, dict):
+        return None, ["checked-tree contract manifest must be an object"]
+    for key in ("routes", "cli", "claim_view_edges", "client_read_variants", "peer_protocol_routes"):
+        if not isinstance(manifest.get(key), dict):
+            errors.append(f"contract manifest {key} must be an object")
+            manifest[key] = {}
+    if manifest.get("source_head") != head:
+        errors.append("contract manifest source_head differs from checked HEAD")
+    return manifest, errors
+
+
+def complete_receipt(receipt, head):
+    if not isinstance(receipt, dict) or receipt.get("source_head") != head:
+        return False
+    if receipt.get("result") != "pass" or receipt.get("populated") is not True:
+        return False
+    if not positive_count(receipt.get("selected_tests")) or not positive_count(
+        receipt.get("meaningful_units")
+    ):
+        return False
+    if not positive_count(receipt.get("successful_calls")) or receipt.get("error_count") != 0:
+        return False
+    if receipt.get("exit_code") != 0:
+        return False
+    expected = receipt.get("canonical_expected_sha256")
+    actual = receipt.get("canonical_actual_sha256")
+    return bool(expected == actual and all(
+        artifact_matches(receipt, name) for name in
+        ("fixture", "oracle", "raw_log", "canonical_expected", "canonical_actual")
+    ))
+
+
+def complete_shards(manifest, head):
+    if not manifest:
+        return False
+    required = manifest.get("required_shards")
+    receipts = manifest.get("shard_receipts")
+    if not isinstance(required, list) or not required or not all(
+        isinstance(name, str) for name in required
+    ) or len(required) != len(set(required)):
+        return False
+    if not isinstance(receipts, list) or len(receipts) != len(required):
+        return False
+    by_name = {receipt.get("name"): receipt for receipt in receipts if isinstance(receipt, dict)}
+    return set(by_name) == set(required) and all(
+        receipt.get("status") == "passed"
+        and receipt.get("source_head") == head
+        and positive_count(receipt.get("selected_tests"))
+        and artifact_matches(receipt, "raw_log")
+        for receipt in by_name.values()
+    )
+
+
+def complete_absolute_receipt(receipt, target, head):
+    if not isinstance(receipt, dict) or not isinstance(target, dict):
+        return False
+    if receipt.get("source_head") != head or receipt.get("result") != "pass":
+        return False
+    minimum = target.get("min_samples")
+    if not positive_count(minimum) or not positive_count(receipt.get("sample_count")):
+        return False
+    if receipt["sample_count"] < minimum:
+        return False
+    budget = target.get("budget_ms")
+    maximum = receipt.get("max_ms")
+    if not isinstance(budget, (int, float)) or isinstance(budget, bool) or not math.isfinite(budget) or budget <= 0:
+        return False
+    if not isinstance(maximum, (int, float)) or isinstance(maximum, bool) or not math.isfinite(maximum) or maximum < 0:
+        return False
+    return bool(
+        maximum <= budget
+        and receipt.get("exceedances") == 0
+        and receipt.get("error_count") == 0
+        and receipt.get("empty_count") == 0
+        and receipt.get("host_qualified") is True
+        and receipt.get("independent_reset") is True
+        and all(artifact_matches(receipt, name) for name in ("binary", "fixture", "raw_log"))
+    )
+
+
+WORK_METRICS = ("vm_steps", "fullscan_steps", "sort_rows", "statement_count", "answer_count")
+
+# These require independent validators before a manifest may produce a green verdict.
+# Keep them explicit while the diagnostic runs against incomplete source coverage.
+UNIMPLEMENTED_SAFETY_GATES = (
+    "class target policy and decision provenance are omitted from this public diagnostic",
+    "kind-to-view mutation, affected/unrelated-row and growth receipts lack byte-level validation",
+    "client-read operation and stream/readiness phase receipts lack exhaustive validation",
+    "handler lexical resolution lacks exhaustive Rust cfg, macro and conditional-compilation validation",
+)
+
+
+def complete_work_receipt(receipt, target, head):
+    if not isinstance(receipt, dict) or not isinstance(target, dict):
+        return False
+    if not artifact_matches(receipt, "work_log"):
+        return False
+    try:
+        data = json.loads(Path(receipt["work_log_path"]).read_text())
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    caps = target.get("work_caps")
+    rows = data.get("observations")
+    if data.get("source_head") != head or data.get("result") != "pass":
+        return False
+    if not isinstance(caps, dict) or set(caps) != set(WORK_METRICS):
+        return False
+    if any(not isinstance(cap, int) or isinstance(cap, bool) or cap < 0 for cap in caps.values()):
+        return False
+    if not isinstance(rows, list) or len(rows) != 2:
+        return False
+    if {row.get("scale") for row in rows if isinstance(row, dict)} != {"small", "large"}:
+        return False
+    by_scale = {row["scale"]: row for row in rows}
+    if not (positive_count(by_scale["small"].get("graph_claims"))
+            and positive_count(by_scale["large"].get("graph_claims"))
+            and by_scale["large"]["graph_claims"] > by_scale["small"]["graph_claims"]):
+        return False
+    for row in rows:
+        if row.get("populated") is not True or not positive_count(row.get("successful_calls")):
+            return False
+        if row.get("error_count") != 0 or not positive_count(row.get("answer_count")):
+            return False
+        if any(not isinstance(row.get(metric), int) or isinstance(row.get(metric), bool)
+               or row[metric] < 0 or row[metric] > caps[metric] for metric in WORK_METRICS):
+            return False
+    return True
+
+
+def complete_target_approval(manifest, head, tree):
+    if not isinstance(manifest, dict):
+        return False
+    if not (digest(APPROVED_TARGET_CONFIG_SHA256)
+            and digest(APPROVED_TARGET_APPROVAL_SHA256)):
+        return False
+    if not (artifact_matches(manifest, "target_config")
+            and artifact_matches(manifest, "target_approval")):
+        return False
+    if (manifest["target_config_sha256"] != APPROVED_TARGET_CONFIG_SHA256
+            or manifest["target_approval_sha256"] != APPROVED_TARGET_APPROVAL_SHA256):
+        return False
+    try:
+        config = json.loads(Path(manifest["target_config_path"]).read_text())
+        approval = json.loads(Path(manifest["target_approval_path"]).read_text())
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+    return bool(
+        isinstance(config, dict)
+        and config.get("source_head") == head
+        and config.get("source_tree") == tree
+        and config.get("targets") == manifest.get("approved_absolute_targets")
+        and isinstance(approval, dict)
+        and approval.get("status") == "approved"
+        and approval.get("source_head") == head
+        and approval.get("source_tree") == tree
+        and approval.get("target_config_sha256") == APPROVED_TARGET_CONFIG_SHA256
+        and isinstance(approval.get("reviewer"), str)
+        and bool(approval["reviewer"].strip())
+    )
+
+
+def run_bounded_cli_inventory(binary, timeout_s=5, limit_bytes=1_000_000):
+    try:
+        process = subprocess.Popen(
+            [str(binary), "--read-contract-inventory-json"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+    except OSError:
+        return None
+    selector = selectors.DefaultSelector()
+    chunks = []
+    total = 0
+    complete = False
+    deadline = time.monotonic() + timeout_s
+    try:
+        for stream in (process.stdout, process.stderr):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            events = selector.select(remaining)
+            if not events:
+                return None
+            for event, _ in events:
+                data = os.read(event.fileobj.fileno(), 65_536)
+                if not data:
+                    selector.unregister(event.fileobj)
+                    continue
+                if event.fileobj is process.stderr:
+                    return None
+                total += len(data)
+                if total > limit_bytes:
+                    return None
+                chunks.append(data)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or process.wait(timeout=remaining) != 0:
+            return None
+        complete = True
+        return b"".join(chunks)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        selector.close()
+        for stream in (process.stdout, process.stderr):
+            stream.close()
+        if not complete:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def complete_cli_registration(manifest, expected):
+    if not isinstance(manifest, dict):
+        return False
+    if not artifact_matches(manifest, "cli_binary"):
+        return False
+    binary = Path(manifest["cli_binary_path"])
+    if not os.access(binary, os.X_OK):
+        return False
+    stdout = run_bounded_cli_inventory(binary)
+    if stdout is None:
+        return False
+    if hashlib.sha256(stdout).hexdigest() != manifest.get("cli_inventory_sha256"):
+        return False
+    try:
+        inventory = json.loads(stdout)
+    except (UnicodeError, ValueError):
+        return False
+    if not isinstance(inventory, dict):
+        return False
+    commands = inventory.get("commands")
+    aliases = inventory.get("aliases")
+    expected_aliases = manifest.get("cli_aliases")
+    return bool(
+        inventory.get("kind") == "st3.cli-inventory.v1"
+        and inventory.get("modes") == ["human", "json"]
+        and isinstance(commands, list)
+        and len(commands) == len(expected)
+        and all(isinstance(command, str) for command in commands)
+        and set(commands) == expected
+        and isinstance(aliases, dict)
+        and isinstance(expected_aliases, dict)
+        and aliases == expected_aliases
+        and all((key in expected or any(command.startswith(key + " ") for command in expected))
+                and isinstance(names, list) and names
+                and all(isinstance(name, str) and name for name in names)
+                and len(names) == len(set(names))
+                for key, names in aliases.items())
+    )
+
+
+def expanded_cli_alias_forms(commands, aliases):
+    """Expand each subcommand alias at every depth; reject ambiguous inventories."""
+    if not isinstance(aliases, dict) or not isinstance(commands, set):
+        return None
+    forms = set()
+    seen = set(commands)
+    consumed_alias_keys = set()
+    for command in sorted(commands):
+        parts = command.split()
+        if len(parts) < 2 or parts[0] != "st":
+            return None
+        alternatives = [["st"]]
+        for index, canonical in enumerate(parts[1:], 1):
+            prefix = " ".join(parts[:index + 1])
+            names = aliases.get(prefix, [])
+            if prefix in aliases:
+                consumed_alias_keys.add(prefix)
+            if (not isinstance(names, list) or len(names) != len(set(names))
+                    or any(not isinstance(name, str) or not name or name != name.strip()
+                           or any(char.isspace() for char in name) or name == canonical
+                           for name in names)):
+                return None
+            alternatives.append([canonical, *names])
+        expanded = [""]
+        for names in alternatives:
+            expanded = [f"{start} {name}".strip() for start in expanded for name in names]
+            if len(expanded) > 10_000:
+                return None
+        for form in expanded:
+            if form != command:
+                if form in seen:
+                    return None
+                forms.add(form)
+        seen.update(forms)
+    return forms if consumed_alias_keys == set(aliases) else None
+
+
+def complete_cli_alias_semantics(manifest, commands, head):
+    if not isinstance(manifest, dict):
+        return False
+    aliases = manifest.get("cli_aliases")
+    expected = expanded_cli_alias_forms(commands, aliases)
+    rows = manifest.get("cli_alias_forms")
+    return bool(expected is not None and isinstance(rows, dict)
+                and set(rows) == expected
+                and all(isinstance(rows[form], dict)
+                        and rows[form].get("invoked_command") == form
+                        and complete_receipt(rows[form].get("semantic_receipt"), head)
+                        for form in expected))
+
+
+def complete_cli_source_provenance(manifest, head, tree):
+    if not isinstance(manifest, dict) or not digest(TRUSTED_CLI_BUILD_ATTESTATION_SHA256):
+        return False
+    if not artifact_matches(manifest, "cli_ci_attestation"):
+        return False
+    if manifest["cli_ci_attestation_sha256"] != TRUSTED_CLI_BUILD_ATTESTATION_SHA256:
+        return False
+    try:
+        attestation = json.loads(Path(manifest["cli_ci_attestation_path"]).read_text())
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+    return bool(
+        isinstance(attestation, dict)
+        and attestation.get("result") == "pass"
+        and attestation.get("checkout_head") == head
+        and attestation.get("checkout_tree") == tree
+        and attestation.get("binary_sha256") == manifest.get("cli_binary_sha256")
+        and isinstance(attestation.get("ci_run_id"), str)
+        and bool(attestation["ci_run_id"].strip())
+        and isinstance(attestation.get("workflow_sha256"), str)
+        and digest(attestation["workflow_sha256"])
+    )
+
+
+def complete_kind_mutation_edge(kind, edge, head):
+    if not isinstance(edge, dict):
+        return False
+    view, key = edge.get("view"), edge.get("invalidation_key")
+    receipt = edge.get("mutation_receipt")
+    caps = edge.get("work_caps")
+    if not (isinstance(view, str) and view and isinstance(key, str) and key
+            and isinstance(receipt, dict) and artifact_matches(receipt, "mutation_log")
+            and artifact_matches(receipt, "fixture")):
+        return False
+    if not isinstance(caps, dict) or set(caps) != set(WORK_METRICS):
+        return False
+    if any(not isinstance(cap, int) or isinstance(cap, bool) or cap < 0 for cap in caps.values()):
+        return False
+    try:
+        data = json.loads(Path(receipt["mutation_log_path"]).read_text())
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+    if not isinstance(data, dict) or not (
+        data.get("source_head") == head and data.get("kind") == kind
+        and data.get("view") == view and data.get("invalidation_key") == key
+        and data.get("result") == "pass"
+    ):
+        return False
+    cases = data.get("cases")
+    if not isinstance(cases, list) or len(cases) != 2:
+        return False
+    if any(not isinstance(case, dict) for case in cases):
+        return False
+    by_scale = {case.get("scale"): case for case in cases}
+    if set(by_scale) != {"small", "large"}:
+        return False
+    if not (positive_count(by_scale["small"].get("graph_claims"))
+            and positive_count(by_scale["large"].get("graph_claims"))
+            and by_scale["large"]["graph_claims"] > by_scale["small"]["graph_claims"]):
+        return False
+    mutations = {case.get("mutation") for case in cases}
+    if len(mutations) != 1 or not mutations <= {"insert", "supersede", "retract"}:
+        return False
+    for case in cases:
+        if not all(artifact_matches(case, name) for name in (
+            "affected_before", "affected_after", "unrelated_before", "unrelated_after",
+            "canonical_expected", "canonical_actual"
+        )):
+            return False
+        if not (
+            case["affected_before_sha256"] != case["affected_after_sha256"]
+            and case["unrelated_before_sha256"] == case["unrelated_after_sha256"]
+            and case["canonical_expected_sha256"] == case["canonical_actual_sha256"]
+            and type(case.get("changed_rows")) is int and case["changed_rows"] == 1
+            and type(case.get("unrelated_changed_rows")) is int
+            and case["unrelated_changed_rows"] == 0
+            and type(case.get("invalidation_events")) is int
+            and case["invalidation_events"] == 1
+            and positive_count(case.get("successful_calls"))
+            and case.get("error_count") == 0
+            and case.get("populated") is True
+        ):
+            return False
+        if any(not isinstance(case.get(metric), int) or isinstance(case.get(metric), bool)
+               or case[metric] < 0 or case[metric] > caps[metric] for metric in WORK_METRICS):
+            return False
+        if not positive_count(case["answer_count"]):
+            return False
+    return True
+
+
+def report(root, ledger_path, manifest_path=None):
+    ledger = json.loads(ledger_path.read_text())
+    checker_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    checker_tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True).strip()
+    checker_dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT))
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True).strip()
+    dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=root))
+    manifest, blockers = checked_manifest(manifest_path, head)
+    try:
+        route_handlers = registered_route_handlers(
+            (root / "crates/st3/src/api.rs").read_text(),
+            (root / "crates/st3/src/peer.rs").read_text(),
+        )
+        routes = set(route_handlers)
+        handler_definitions = registered_handler_definitions(root, route_handlers)
+        peer_source = (root / "crates/st3/src/peer.rs").read_text()
+        claim_specs = registered_claim_specs((root / "crates/st3-schema/src/lib.rs").read_text())
+        kinds = set(claim_specs)
+        client_read_variants = registered_client_read_variants(peer_source)
+        peer_protocol_routes = registered_peer_protocol_routes(peer_source)
+    except InventoryError as error:
+        routes, route_handlers, handler_definitions, kinds, claim_specs = set(), {}, {}, set(), {}
+        client_read_variants, peer_protocol_routes = set(), set()
+        blockers.append(str(error))
+    pinned_routes = {f"GET {row['route']}" for row in ledger["get"]} | {
+        f"{row['method']} {row['route']}" for row in ledger["operations"]
+    }
+    route_delta = {"new_since_pinned": sorted(routes - pinned_routes),
+                   "missing_from_source": sorted(pinned_routes - routes)}
+    if route_delta["new_since_pinned"] or route_delta["missing_from_source"]:
+        blockers.append("checked route registration differs from pinned baseline; reconcile manifest")
+    expected_cli = {row["command"] for row in ledger["cli"]}
+    if manifest is None:
+        manifest_routes, manifest_cli, manifest_kinds = set(), set(), set()
+        manifest_variants, manifest_peer_routes = set(), set()
+    else:
+        manifest_routes = set(manifest.get("routes", {}))
+        manifest_cli = set(manifest.get("cli", {}))
+        manifest_kinds = set(manifest.get("claim_view_edges", {}))
+        manifest_variants = set(manifest.get("client_read_variants", {}))
+        manifest_peer_routes = set(manifest.get("peer_protocol_routes", {}))
+    missing_routes = sorted(routes - manifest_routes)
+    extra_routes = sorted(manifest_routes - routes)
+    missing_cli = sorted(expected_cli - manifest_cli)
+    extra_cli = sorted(manifest_cli - expected_cli)
+    missing_kinds = sorted(kinds - manifest_kinds)
+    extra_kinds = sorted(manifest_kinds - kinds)
+    missing_variants = sorted(client_read_variants - manifest_variants)
+    extra_variants = sorted(manifest_variants - client_read_variants)
+    missing_peer_routes = sorted(peer_protocol_routes - manifest_peer_routes)
+    extra_peer_routes = sorted(manifest_peer_routes - peer_protocol_routes)
+    if missing_routes or extra_routes:
+        blockers.append("route/manifest equality failed")
+    if missing_cli or extra_cli:
+        blockers.append("CLI/manifest equality failed; checked-tree binary inventory also required")
+    if not complete_cli_registration(manifest, expected_cli):
+        blockers.append("checked-tree CLI executable commands/aliases inventory is missing or differs")
+    if not complete_cli_alias_semantics(manifest, expected_cli, head):
+        blockers.append("CLI alias forms lack exact invocation and populated semantic receipts")
+    if not complete_cli_source_provenance(manifest, head, tree):
+        blockers.append("CLI build/source provenance lacks independently qualified CI attestation")
+    if missing_kinds or extra_kinds:
+        blockers.append("claim-kind/view dependency equality failed")
+    if missing_variants or extra_variants or missing_peer_routes or extra_peer_routes:
+        blockers.append("client-read operation and peer protocol inventory equality failed")
+    historical = {
+        "cli": sum(row.get("semantic_assertion") == "passed" for row in ledger["cli"]),
+        "get": sum(row.get("semantic_assertion") == "passed" for row in ledger["get"]),
+        "non_get": sum(row.get("semantic_assertion") == "passed" for row in ledger["operations"]),
+    }
+    current_semantic = []
+    if manifest is not None:
+        for group in ("routes", "cli"):
+            for key, row in manifest.get(group, {}).items():
+                if not isinstance(row, dict):
+                    blockers.append(f"malformed contract row: {group}:{key}")
+                    continue
+                if complete_receipt(row.get("semantic_receipt"), head):
+                    current_semantic.append(f"{group}:{key}")
+                else:
+                    blockers.append(f"missing populated exact-head semantic receipt: {group}:{key}")
+                if not row.get("dependency_edges") and not row.get("reviewed_non_view_reason"):
+                    blockers.append(f"missing route/CLI dependency declaration: {group}:{key}")
+        for kind, edges in manifest.get("claim_view_edges", {}).items():
+            if not isinstance(edges, list) or not edges:
+                blockers.append(f"incomplete kind-to-view edge: {kind}")
+                continue
+            for edge in edges:
+                if not complete_kind_mutation_edge(kind, edge, head):
+                    view = edge.get("view") if isinstance(edge, dict) else "unknown"
+                    blockers.append(f"missing qualified kind/view mutation receipt: {kind}:{view}")
+    if not current_semantic:
+        blockers.append("no populated semantic receipt qualifies the checked HEAD")
+    if dirty:
+        blockers.append("checked source tree is dirty")
+    if checker_dirty:
+        blockers.append("checker/policy source tree is dirty")
+    if (digest(APPROVED_TARGET_CONFIG_SHA256) or digest(APPROVED_TARGET_APPROVAL_SHA256)
+            or digest(TRUSTED_CLI_BUILD_ATTESTATION_SHA256)) and checker_head == head:
+        blockers.append("approved policy revision is not separate from measured source HEAD")
+    targets = manifest.get("approved_absolute_targets") if manifest else None
+    if not isinstance(targets, dict) or set(targets) != routes | expected_cli or any(
+        not isinstance(target, dict)
+        or isinstance(target.get("budget_ms"), bool)
+        or not isinstance(target.get("budget_ms"), (int, float))
+        or not math.isfinite(target["budget_ms"])
+        or target["budget_ms"] <= 0
+        or not positive_count(target.get("min_samples"))
+        or not target.get("approval_receipt")
+        for target in targets.values()
+    ):
+        blockers.append("absolute targets are unapproved or absent")
+    if not complete_target_approval(manifest, head, tree):
+        blockers.append("absolute target approval lacks a source-pinned reviewed config and receipt")
+    if manifest and isinstance(targets, dict):
+        for group, keys in (("routes", routes), ("cli", expected_cli)):
+            for key in keys & set(manifest[group]):
+                if not complete_absolute_receipt(
+                    manifest[group][key].get("absolute_receipt")
+                    if isinstance(manifest[group][key], dict) else None,
+                    targets.get(key), head
+                ):
+                    blockers.append(f"missing qualified absolute receipt: {group}:{key}")
+                if not complete_work_receipt(
+                    manifest[group][key].get("work_receipt")
+                    if isinstance(manifest[group][key], dict) else None,
+                    targets.get(key), head
+                ):
+                    blockers.append(f"missing qualified two-scale work receipt: {group}:{key}")
+    if not complete_shards(manifest, head):
+        blockers.append("missing, failed, skipped or cancelled shard receipt")
+    blockers.extend(UNIMPLEMENTED_SAFETY_GATES)
+    proposal_upper = 1 - 0.05 ** (1 / 300)
+    return {
+        "kind": "read-contract-diagnostic.v1",
+        "gate_status": "red" if blockers else "green",
+        "required_ci_status": "nonrequired source diagnostic; no required gate installed",
+        "source_head": head,
+        "source_tree": tree,
+        "source_dirty": dirty,
+        "checker_head": checker_head,
+        "checker_tree": checker_tree,
+        "checker_dirty": checker_dirty,
+        "ledger_sha256": sha256(ledger_path),
+        "inventory": {"pinned_cli": len(expected_cli), "pinned_get": len(ledger["get"]),
+                      "pinned_non_get": len(ledger["operations"]), "source_routes": len(routes),
+                      "source_claim_kinds_including_wildcard": len(kinds),
+                      "source_client_read_variants": len(client_read_variants),
+                      "source_peer_protocol_routes": len(peer_protocol_routes)},
+        "pinned_route_delta": route_delta,
+        "checked_route_registration_handlers": route_handlers,
+        "checked_handler_definitions": handler_definitions,
+        "handler_definition_resolution": (
+            "lexical source locations for supported shapes only; not Rust compiler name resolution "
+            "or transitive table/view/claim dependencies"
+        ),
+        "declared_primary_projection_hints_only": claim_specs,
+        "manifest_gaps": {"missing_routes": missing_routes, "extra_routes": extra_routes,
+                          "missing_cli": missing_cli, "extra_cli": extra_cli,
+                          "missing_claim_kinds": missing_kinds, "extra_claim_kinds": extra_kinds,
+                          "missing_client_read_variants": missing_variants,
+                          "extra_client_read_variants": extra_variants,
+                          "missing_peer_protocol_routes": missing_peer_routes,
+                          "extra_peer_protocol_routes": extra_peer_routes},
+        "historical_populated_assertions": historical,
+        "current_head_qualified_semantic_keys": sorted(current_semantic),
+        "class_policy": {
+            "status": "omitted from public diagnostic",
+            "per_key_targets_qualified": False,
+            "full_transfer_budget_specified": False,
+        },
+        "sampling_rule_proposal_not_yet_qualified": {
+            "independent_observations_per_contract": 300,
+            "allowed_budget_exceedances": 0,
+            "one_sided_confidence": 0.95,
+            "upper_exceedance_probability_if_zero": proposal_upper,
+            "order_statistic": "observed maximum of 300 independent calls",
+            "conditions": "independent reset/load per regime and variant, fixed fixture and binary, qualified host; capacity and every receipt must be reviewed",
+        },
+        "blockers": sorted(set(blockers)),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-root", type=Path, default=ROOT,
+                        help="clean measured source checkout; checker revision remains separate")
+    parser.add_argument("--ledger", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    result = report(args.source_root.resolve(), args.ledger, args.manifest)
+    args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    print(json.dumps({"gate_status": result["gate_status"], "inventory": result["inventory"],
+                      "blockers": len(result["blockers"])}, sort_keys=True))
+    raise SystemExit(0 if result["gate_status"] == "green" else 1)
+
+
+if __name__ == "__main__":
+    main()
