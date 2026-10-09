@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep peer failure telemetry intact on advanced retry admission refusal",
+  "replay": {
+    "status": "none",
+    "detail": "Envelope receipt, duplicate handling, projection and replay are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No durable table, index or data-format changes; retry credit is private task-local state."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim or checkpoint rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Typed local advanced-admission refusal bypasses the generic peer-failure record and HTTP client reset. Original transport, authentication and signed-overload failures retain their existing effects. Ordinary exchange APIs are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration or additional service interruption beyond a normal binary swap."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new configuration or manual action."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "No peer-down report or client reset is generated solely because a completed advanced exchange lost its permission before returning success. Credit remains spent and retained deadline/backoff behavior is unchanged; committed effects remain committed. The rate-policy disclosure now distinguishes nominal 3s probing from the 30s cap, credit lifetime from aggregate rate, and a full multi-POST exchange from a single request. Source-only; original recovery/performance and quarantine gates remain open."
+  }
+}

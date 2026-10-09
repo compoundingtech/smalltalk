@@ -1272,21 +1272,27 @@ async fn dial_peer<B: Backend>(
                     if !eligible {
                         recovery.invalidate();
                     }
-                    http = replication_http_client();
+                    let admission_refused = error.is::<RetryAdmissionInvalidated>();
+                    if !admission_refused {
+                        http = replication_http_client();
+                    }
                     route = route.wrapping_add(1);
                     let overloaded = error.is::<PeerOverloaded>();
-                    let status = if overloaded {
-                        "overloaded"
-                    } else if error.to_string().contains("signature")
-                        || error.to_string().contains("fleet")
-                    {
-                        "auth-failed"
-                    } else {
-                        "down"
-                    };
-                    let _ = backend
-                        .record_failure(&peer.name, status, &error.to_string())
-                        .await;
+                    if !admission_refused {
+                        // Admission refusal is local permission loss, not peer failure.
+                        let status = if overloaded {
+                            "overloaded"
+                        } else if error.to_string().contains("signature")
+                            || error.to_string().contains("fleet")
+                        {
+                            "auth-failed"
+                        } else {
+                            "down"
+                        };
+                        let _ = backend
+                            .record_failure(&peer.name, status, &error.to_string())
+                            .await;
+                    }
                     let resumed = resumed_schedule.take();
                     let plan = failed_retry_plan(&mut backoff, resumed, |backoff| {
                         retry_delay(backoff.next(), &fleet, &name)
