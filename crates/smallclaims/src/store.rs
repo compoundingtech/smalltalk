@@ -53,6 +53,7 @@ pub mod canonical;
 pub mod checkpoint;
 pub mod checkpoint_agreement;
 mod checkpoint_completion;
+pub use checkpoint_completion::{AllocatorReclaimStats, allocator_reclaim_stats};
 pub mod checkpoint_trim;
 pub mod document_index;
 pub mod heal;
