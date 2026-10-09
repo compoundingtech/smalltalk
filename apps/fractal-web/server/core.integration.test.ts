@@ -1,6 +1,6 @@
 import { afterEach, expect, it } from 'vitest'
 import { createServer } from 'node:http'
-import type { IncomingMessage, Server } from 'node:http'
+import type { IncomingMessage, OutgoingHttpHeaders, Server } from 'node:http'
 import { connect } from 'node:net'
 import { once } from 'node:events'
 import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
@@ -23,7 +23,11 @@ const listen = async (server: Server, path?: string): Promise<void> => {
   else server.listen(path)
   await once(server, 'listening')
 }
-const fixture = async (admit: (request: IncomingMessage) => boolean | Promise<boolean> = () => true) => {
+const fixture = async (
+  admit: (request: IncomingMessage) => boolean | Promise<boolean> = () => true,
+  responseBody: string | Buffer = '{"paired":true}',
+  responseHeaders: OutgoingHttpHeaders = { 'content-type': 'application/json' },
+) => {
   const root = await mkdtemp(join(tmpdir(), 'fractal-server-test-'))
   cleanups.push(() => rm(root, { recursive: true, force: true }))
   const dist = join(root, 'dist')
@@ -39,7 +43,7 @@ const fixture = async (admit: (request: IncomingMessage) => boolean | Promise<bo
     const chunks: Buffer[] = []
     for await (const chunk of req) chunks.push(Buffer.from(chunk))
     received.push({ path: req.url ?? '', auth: req.headers.authorization, cookie: req.headers.cookie, trace: req.headers.traceparent, host: req.headers.host, body: Buffer.concat(chunks).toString('utf8') })
-    res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"paired":true}')
+    res.writeHead(200, { 'content-length': Buffer.byteLength(responseBody), ...responseHeaders }); res.end(responseBody)
   })().catch(() => res.destroy()) })
   gateway.on('upgrade', (req, socket, head) => {
     sockets.add(socket)
@@ -76,6 +80,44 @@ it('proxies only the paired client API, streams bodies and injects trusted crede
   expect(setup.received).toHaveLength(1)
   expect(setup.spans.some((span) => span.name === 'fractal.gateway.request')).toBe(true)
 })
+it.each([
+  ['br, gzip', 'br'],
+  ['gzip, br;q=0', 'gzip'],
+  ['br;q=0, gzip;q=0', undefined],
+  ['br;q=0.1, gzip;q=0.5, identity;q=0', 'gzip'],
+] as const)('negotiates streaming roster JSON compression (%s)', async (accept, coding) => {
+  const body = JSON.stringify({ items: Array.from({ length: 100 }, (_, index) => ({ id: `agent/${index}`, name: `Agent ${index}`, details: 'reported observation '.repeat(100) })) })
+  const setup = await fixture(undefined, body, { 'content-type': 'application/json', etag: '"published"', vary: 'Origin' })
+  const response = await fetch(`${setup.base}/v1/client/agents?limit=100`, { headers: { 'accept-encoding': accept } })
+  expect(response.headers.get('content-encoding')).toBe(coding ?? null)
+  expect(response.headers.get('vary')).toBe('Origin, Accept-Encoding')
+  expect(response.headers.get('content-length')).toBe(coding === undefined ? String(Buffer.byteLength(body)) : null)
+  expect(response.headers.get('etag')).toBe(coding === undefined ? '"published"' : 'W/"published"')
+  expect(await response.text()).toBe(body)
+})
+it('does not encode JSON when every representation is refused', async () => {
+  const setup = await fixture()
+  const response = await fetch(`${setup.base}/v1/client/agents`, { headers: { 'accept-encoding': '*;q=0' } })
+  expect(response.status).toBe(406)
+  expect(response.headers.get('vary')).toBe('Accept-Encoding')
+})
+it.each([
+  { 'content-type': 'text/event-stream' },
+  { 'content-type': 'application/json', 'cache-control': 'no-transform' },
+])('leaves streaming and no-transform responses untouched (%j)', async headers => {
+  const setup = await fixture(undefined, 'data: reported\n\n', headers)
+  const response = await fetch(`${setup.base}/v1/client/collections/stream`, { headers: { 'accept-encoding': 'br, gzip' } })
+  expect(response.headers.get('content-encoding')).toBeNull()
+  expect(await response.text()).toBe('data: reported\n\n')
+})
+it('never recompresses an encoded upstream JSON response', async () => {
+  const body = '{"paired":true}'
+  const setup = await fixture(undefined, brotliCompressSync(body), { 'content-type': 'application/json', 'content-encoding': 'br' })
+  const response = await fetch(`${setup.base}/v1/client/agents`, { headers: { 'accept-encoding': 'br, gzip' } })
+  expect(response.headers.get('content-encoding')).toBe('br')
+  expect(await response.text()).toBe(body)
+})
+
 it('fails closed for auth-hook refusal and failures, without tracing or proxying', async () => {
   const setup = await fixture(async (req) => { if (req.url === '/throws') throw new TypeError('auth failure'); return false })
   expect((await fetch(`${setup.base}/v1/client/capabilities`)).status).toBe(403)

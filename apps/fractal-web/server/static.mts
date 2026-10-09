@@ -14,7 +14,7 @@ type Coding = 'br' | 'gzip' | 'identity'
 type EncodingQualities = Readonly<Record<Coding, number>>
 
 /** Explicit codings override the wildcard; identity is allowed unless explicitly excluded. */
-const encodingQualities = (header: string | undefined): EncodingQualities => {
+export const encodingQualities = (header: string | undefined): EncodingQualities => {
   const qualities = new Map<string, number>()
   if (header === undefined || header.trim() === '') return { br: 0, gzip: 0, identity: 1 }
   for (const entry of header.split(',')) {
