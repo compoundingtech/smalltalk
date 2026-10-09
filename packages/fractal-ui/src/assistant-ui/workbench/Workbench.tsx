@@ -88,7 +88,10 @@ export interface WorkbenchProps {
   viewportStore?: ViewportStore
 }
 
+const WorkbenchElementContext = React.createContext<React.RefObject<HTMLDivElement | null> | undefined>(undefined)
+
 export function Workbench({ layout, resources, workspaceId = 'default', scheme = 'dark', style, statusTheme, renderPane, hideSingleTabBar = false, focusedPaneKey, onPaneSelect, onLayoutChange, onRatioCommit, appearance, landmarkContext, previewPlacement, describePane, revealRequest, onOpenTerminal, viewportStore: providedStore }: WorkbenchProps) {
+  const element = React.useRef<HTMLDivElement>(null)
   const [seed] = React.useState(() => initialRatioValues(workspaceId, layout))
   const [ownStore] = React.useState(() => new ViewportStore())
   const viewportStore = providedStore ?? ownStore
@@ -135,12 +138,14 @@ export function Workbench({ layout, resources, workspaceId = 'default', scheme =
     <RegistryProvider initialValues={seed}>
       <WorkbenchPresentationContext.Provider value={presentation}>
       <ViewportStoreContext.Provider value={viewportStore}>
-      <div data-testid="workbench" data-scheme={scheme} {...stylex.props(styles.root, ...(scheme === 'light' ? lightThemeWithoutStatus : []), statusTheme ?? (scheme === 'light' ? lightStatusTheme : undefined), style)}>
+      <WorkbenchElementContext.Provider value={element}>
+      <div ref={element} data-testid="workbench" data-scheme={scheme} {...stylex.props(styles.root, ...(scheme === 'light' ? lightThemeWithoutStatus : []), statusTheme ?? (scheme === 'light' ? lightStatusTheme : undefined), style)}>
         <PaneSlotsProvider value={panes.slots}>
         <LayoutNode node={layout} path="0" layout={currentLayout} workspaceId={workspaceId} resources={resources} renderPane={renderPane} hideSingleTabBar={hideSingleTabBar} focusedPaneKey={focusedPaneKey ?? localFocus} onPaneSelect={selectPane} onLayoutChange={onLayoutChange === undefined ? undefined : changeLayout} onRatioCommit={onRatioCommit} />
         </PaneSlotsProvider>
         <PaneLayer visible={panes.visible} canClose={node => onLayoutChange !== undefined && !hideSingleTabBar && node.tabs.length === 1 && appearance?.chrome !== 'P2'} render={pane => <PaneHost pane={pane} resources={resources} workspaceId={workspaceId} renderPane={renderPane} />} />
       </div>
+      </WorkbenchElementContext.Provider>
       </ViewportStoreContext.Provider>
       </WorkbenchPresentationContext.Provider>
     </RegistryProvider>
@@ -280,7 +285,7 @@ function attachTabOverflow(list: HTMLElement | null) {
 /** Tab group: React Aria tabs, closable, with split-right / split-below and new-pane actions. */
 function TabGroupNode({ node, path, layout, workspaceId, resources, hideSingleTabBar, onPaneSelect, onLayoutChange }: NodeProps & { node: TabGroupLayout }) {
   const { appearance, landmarkContext, describePane, onOpenDiff, onOpenTerminal } = React.useContext(WorkbenchPresentationContext)
-  const groupElement = React.useRef<HTMLDivElement>(null)
+  const workbenchElement = React.useContext(WorkbenchElementContext)
   const registry = React.useContext(RegistryContext)
   const active = usePaneSlotKey(path)
   const select = (key: string) => {
@@ -338,14 +343,15 @@ function TabGroupNode({ node, path, layout, workspaceId, resources, hideSingleTa
     }
     // Capture the displayed host before promotion. Its persistent element moves with the pane;
     // focus must not depend on the old group's path or the replacement tab provider's timing.
-    const workbench = groupElement.current?.closest('[data-testid="workbench"]')
+    const workbench = workbenchElement?.current
     const neighbour = workbench?.querySelector<HTMLElement>(`[data-layout-path="${findGroupPath(sibling, undefined, siblingPath)}"] [data-pane-key]`)
     const neighbourKey = neighbour?.dataset.paneKey ?? layoutPaneKeys(sibling)[0]!
     change(next)
     onPaneSelect?.(neighbourKey)
     requestAnimationFrame(() => {
       const host = neighbour ?? workbench?.querySelector<HTMLElement>(`[data-pane-key="${CSS.escape(neighbourKey)}"]`)
-      host?.querySelector<HTMLElement>('[data-testid="composer-input"], [tabindex="0"], button')?.focus({ preventScroll: true })
+      const target = host?.querySelector<HTMLElement>('[data-testid="composer-input"]') ?? host?.querySelector<HTMLElement>('[tabindex="0"], button:not([disabled])')
+      target?.focus({ preventScroll: true })
     })
   }
 
@@ -372,7 +378,7 @@ function TabGroupNode({ node, path, layout, workspaceId, resources, hideSingleTa
   if (hideSingleTabBar && node.tabs.length === 1) {
     return (
       <AgentDropSurface path={path} labelPrefix={workspaceId} onOpen={openAgent} isDisabled={onLayoutChange === undefined}>
-      <div ref={groupElement} data-testid="tab-group" data-layout-path={path} {...stylex.props(styles.group)}>
+      <div data-testid="tab-group" data-layout-path={path} {...stylex.props(styles.group)}>
         <PaneSlot pane={activePane} path={path} />
       </div>
       </AgentDropSurface>
@@ -385,7 +391,7 @@ function TabGroupNode({ node, path, layout, workspaceId, resources, hideSingleTa
   if (paneKind(activePane) === 'diff' && node.tabs.length === 1 && appearance?.chrome !== 'P2') {
     return (
       <AgentDropSurface path={path} labelPrefix={workspaceId} onOpen={openAgent} isDisabled={onLayoutChange === undefined}>
-      <div ref={groupElement} data-testid="tab-group" data-layout-path={path} {...stylex.props(styles.group)}>
+      <div data-testid="tab-group" data-layout-path={path} {...stylex.props(styles.group)}>
         <div role="region" aria-label={`${describePane?.(activePane).title ?? paneTitle(activePane)}${landmarkContext ? `, ${landmarkContext}` : ''}`} {...stylex.props(styles.tabPanel)}>
           <PaneSlot pane={activePane} path={path} onClose={onLayoutChange === undefined ? undefined : () => close(active)} />
         </div>
@@ -397,7 +403,6 @@ function TabGroupNode({ node, path, layout, workspaceId, resources, hideSingleTa
   return (
     <AgentDropSurface path={path} labelPrefix={workspaceId} onOpen={openAgent} isDisabled={onLayoutChange === undefined}>
     <Tabs
-      ref={groupElement}
       selectedKey={active}
       onSelectionChange={key => select(String(key))}
       aria-label="Workspace panes"
