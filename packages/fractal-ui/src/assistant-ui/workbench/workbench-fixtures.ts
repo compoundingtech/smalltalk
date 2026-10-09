@@ -10,6 +10,8 @@ import type { WorkbenchAppearance, WorkbenchPaneDetails } from './workbench-appe
 import { terminalFixtureFrame } from './terminal-fixtures'
 
 type NewMessage = Parameters<NonNullable<ConversationRuntimeOptions['onNew']>>[0]
+/** Only the stateful story host can turn these facts into a resource with a real submit capability. */
+type FixtureThreadSnapshot = Omit<ThreadResource, 'runtime'> & { readonly runtime: Omit<ConversationRuntimeOptions, 'onNew'> }
 
 export const decidedAppearance: WorkbenchAppearance = { width: 'W3', header: 'H1', chrome: 'P3', dropZones: 'D2' }
 export const fixtureNow = Date.parse('2026-10-09T12:00:30.000Z')
@@ -31,13 +33,13 @@ const rows = [1, 2, 3, 4]
 const livePrompt = textItem('worker-1-live-prompt', 'user', 'Check the workbench snapshot before finishing.') as TextItem & { role: 'user' }
 const liveCall: ConversationItem = { _tag: 'ToolCall', id: 'worker-1-live-call', callId: 'fixture-read', name: 'Read', input: { path: 'sample/rows.ts' }, status: 'running', callSeen: true, at }
 const liveTurn: TranscriptTurn = { id: 'worker-1-live', prompt: livePrompt, items: [liveCall], work: { calls: [{ id: liveCall.id, kind: 'read', title: 'Read sample/rows.ts', argsSummary: 'sample/rows.ts', status: 'running', startedAt: at, detail: 'Reading the observed fixture snapshot.' }], durationMs: undefined, running: true, failed: false, interrupted: false, startedAt: at, foldable: true } }
-const projectThread = (turns: readonly TranscriptTurn[], running: boolean): ThreadResource => ({
+const projectThread = (turns: readonly TranscriptTurn[], running: boolean): FixtureThreadSnapshot => ({
   runtime: { messages: turns.flatMap(turn => [...(turn.prompt ? [turn.prompt] : []), ...turn.items]), isRunning: running },
   transcript: { turns, sync: { _tag: 'Live', since: fixtureNow - 30000 }, now: fixtureNow, observedAt: fixtureNow },
 })
 const currentTurnFiles: readonly DiffFile[] = [{ path: 'sample/rows.ts', diff: ['@@ -1,2 +1,3 @@', '-const rows = [1, 2, 3]', '+const rows = [1, 2, 3, 4]', '+', ' export { rows }'], added: 2, removed: 1 }]
 const branchFiles: readonly DiffFile[] = [...currentTurnFiles, { path: 'sample/README.md', diff: ['@@ -1 +1,3 @@', ' # Synthetic sample', '+', '+Four rows are ready for review.'], added: 2, removed: 0 }]
-export const workbenchResources: WorkbenchResources = {
+const initialWorkbenchResources = {
   threads: new Map([['agent:worker-1', projectThread([...initialTurns('worker-1'), liveTurn], true)], ['agent:worker-2', projectThread(initialTurns('worker-2'), false)]]),
   diffs: new Map([['diff:sample/rows.ts', { lines: currentTurnFiles[0]!.diff, path: 'sample/rows.ts', added: 2, removed: 1, currentTurnFiles, branchFiles }]]),
   terminals: terminalFixtureFrame,
@@ -50,7 +52,7 @@ export const nestedLayout = split('right', onePaneLayout,
 
 /** Story host owns explicit turn/command facts and deterministic local mutations. */
 export function useWorkbenchFixture() {
-  const [threads, setThreads] = React.useState(workbenchResources.threads)
+  const [threads, setThreads] = React.useState(initialWorkbenchResources.threads)
   const sequence = React.useRef(0)
   const send = React.useCallback((uri: string, text: string) => {
     const number = ++sequence.current
@@ -73,7 +75,7 @@ export function useWorkbenchFixture() {
     return next
   }), [])
   const resources = React.useMemo<WorkbenchResources>(() => ({
-    ...workbenchResources,
+    ...initialWorkbenchResources,
     threads: new Map([...threads].map(([uri, thread]) => [uri, {
       ...thread,
       runtime: {
