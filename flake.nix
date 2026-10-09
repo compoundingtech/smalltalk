@@ -32,6 +32,15 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
+        ciRustcWrapper = pkgs.writeShellApplication {
+          name = "ci-rustc-wrapper";
+          runtimeInputs = [ pkgs.coreutils pkgs.gnugrep ];
+          text = ''
+            export SCCACHE_BIN=${pkgs.sccache}/bin/sccache
+            ${builtins.readFile ./scripts/ci-rustc-wrapper}
+          '';
+        };
+
         # Reuse the GitHub-archive flake source instead of importCargoLock's git fetcher.
         # Reject new git sources until they also have an archive-backed input.
         cargoDeps =
@@ -1159,6 +1168,11 @@
           ST2_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
           ST3_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
           RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
+          shellHook = ''
+            if [ "''${GITHUB_ACTIONS:-}" = true ]; then
+              export RUSTC_WRAPPER=${ciRustcWrapper}/bin/ci-rustc-wrapper
+            fi
+          '';
         };
         # The in-process load test uses a stand-in PTY and needs no collector or harness tools.
         devShells.perf = pkgs.mkShell {
@@ -1175,6 +1189,9 @@
           # build.rs embeds the fixture PATH. Runner-specific directories would invalidate
           # st3's compiler cache even when its sources have not changed.
           shellHook = ''
+            if [ "''${GITHUB_ACTIONS:-}" = true ]; then
+              export RUSTC_WRAPPER=${ciRustcWrapper}/bin/ci-rustc-wrapper
+            fi
             export PATH="$(printf '%s' "$PATH" | tr ':' '\n' | sed -n '\|^/nix/store/|p' | paste -sd:):/usr/bin:/bin"
           '';
         };

@@ -89,7 +89,7 @@ printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_ST
           if: snapshotAttempt,
           run: `if ! python3 scripts/ci-perf-cache check-report; then exit 0; fi
 nix print-dev-env .#perf --profile "$RUNNER_TEMP/perf-shell" > /dev/null
-nix develop .#perf -c env TMPDIR="$RUNNER_TEMP" sccache --show-stats
+nix develop .#perf -c env TMPDIR="$RUNNER_TEMP" sccache --show-stats || echo "::warning::sccache statistics unavailable; retaining the successful build"
 CI_PERF_SHELL_ROOT="$RUNNER_TEMP/perf-shell" bash scripts/ci-nix-cache save
 python3 scripts/ci-perf-cache pack`,
         },

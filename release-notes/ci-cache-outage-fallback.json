@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Compile uncached after bounded pre-compile cache startup failures and isolate boundary-test Cargo metadata from runner cache settings.",
+  "replay": { "status": "none", "detail": "CI only; no replay or rebuild of runtime state." },
+  "schema": { "status": "none", "detail": "No database or wire schema change." },
+  "rules": { "status": "none", "detail": "No checkpoint or authority rules change." },
+  "compatibility": { "status": "none", "detail": "Known preflight startup failures compile uncached. Compiler and compatibility-test verdicts stay authoritative; compilation is never retried from stderr or interruption." },
+  "downtime": { "status": "none", "detail": "No runtime deployment is needed." },
+  "manual": { "status": "none", "detail": "Normal hosted CI picks up the shell and guard changes." },
+  "recovery": { "status": "none", "detail": "No production state is changed." }
+}
