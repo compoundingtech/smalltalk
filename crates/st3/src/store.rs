@@ -11,6 +11,7 @@ mod schedule_active_run_tests;
 mod glasses;
 pub(crate) mod mailbox_wakes;
 mod mailbox_changes;
+pub(crate) mod reconcile_changes;
 mod mailbox_lease;
 #[cfg(test)]
 mod message_send_tests;
