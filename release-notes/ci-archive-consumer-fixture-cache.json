@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "Reuse the shared protected-main Nix tool and fixture cache in Linux test archive consumers.",
+  "summary": "Reuse the shared protected-main Nix tool and fixture cache in Linux test shards and mail archive consumers, retaining the isolation VM driver cache and existing cache writers.",
   "replay": { "status": "none", "detail": "CI cache routing only; no deployed runtime or data changes." },
   "schema": { "status": "none", "detail": "CI cache routing only; no deployed runtime or data changes." },
   "rules": { "status": "none", "detail": "CI cache routing only; no deployed runtime or data changes." },
