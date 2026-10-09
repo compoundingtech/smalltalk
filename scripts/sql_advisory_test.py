@@ -104,6 +104,45 @@ class Overfetch(unittest.TestCase):
         self.assertEqual(self.detectors(report), [])
 
 
+class History(unittest.TestCase):
+    def history(self, **long):
+        keyed = {"vm_steps": 12_000, "statements": 40, "fullscan_steps": 100, "error": None}
+        return {
+            "history": [20, 200],
+            "short": {"GET /keyed": dict(keyed), "GET /x": dict(keyed)},
+            "long": {"GET /keyed": dict(keyed), "GET /x": {**keyed, **long}},
+        }
+
+    def detectors(self, history):
+        return sorted(f["detector"] for f in advisory.history_findings(history) if f["route"] == "GET /x")
+
+    def test_a_read_that_replays_history_is_flagged_and_a_keyed_read_is_quiet(self):
+        report = self.history(vm_steps=900_000, statements=400)
+        self.assertEqual(self.detectors(report), ["history-statements", "history-steps"])
+        self.assertFalse([f for f in advisory.history_findings(report) if f["route"] == "GET /keyed"])
+
+    def test_small_differences_under_the_slack_are_quiet(self):
+        self.assertEqual(self.detectors(self.history(vm_steps=16_000, statements=48, fullscan_steps=900)), [])
+
+    def test_a_failed_route_is_not_judged_for_history(self):
+        report = self.history(vm_steps=900_000, error="503")
+        self.assertEqual(self.detectors(report), [])
+        judged, failed = advisory.history_judged(report)
+        self.assertEqual(list(failed), ["GET /x"])
+        self.assertEqual(judged, {"GET /keyed"})
+
+    def test_main_reads_the_history_report_and_still_exits_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cost = os.path.join(directory, "cost.json")
+            json.dump(REPORT, open(cost, "w"))
+            history = os.path.join(directory, "history.json")
+            json.dump(self.history(vm_steps=900_000), open(history, "w"))
+            self.assertEqual(
+                advisory.main([cost, "--history", history, "--budget", os.path.join(directory, "none.json"), "--summary", ""]),
+                0,
+            )
+
+
 class Units(unittest.TestCase):
     def test_a_lookup_per_run_is_flagged_even_when_the_answer_also_lists_a_thousand_steps(self):
         shape = "SELECT status FROM runs WHERE id=?"

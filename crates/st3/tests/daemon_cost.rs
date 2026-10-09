@@ -1076,7 +1076,7 @@ const SUMMARY: &str = "POST /v1/internal/replication/export (summary)";
 
 /// What one request did at one scale.
 #[derive(Clone, Debug, Default, serde::Serialize)]
-struct Cost {
+pub(crate) struct Cost {
     vm_steps: u64,
     fullscan_steps: u64,
     sorts: u64,
@@ -1390,7 +1390,7 @@ async fn no_request_does_work_that_grows_with_the_store() {
     );
     let mut measured = Vec::new();
     for (scale, (store, peer)) in scales.iter().zip([stores.0, stores.1]) {
-        measured.push(measure(*scale, &store, &peer).await);
+        measured.push(measure(*scale, &store, &peer, None).await);
         println!(
             "scale {scale}: measured at {:.0}s",
             started.elapsed().as_secs_f64()
@@ -1597,9 +1597,9 @@ fn declared_routes(source: &str) -> BTreeSet<String> {
     routes
 }
 
-struct Measured {
-    claims: u64,
-    costs: BTreeMap<String, Cost>,
+pub(crate) struct Measured {
+    pub(crate) claims: u64,
+    pub(crate) costs: BTreeMap<String, Cost>,
 }
 
 /// Work counted while `request` runs and until the daemon's own work for it settles.
@@ -1651,7 +1651,15 @@ where
     }
 }
 
-async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
+/// `history` gives the first seat that many past observations before its current one, so a pair
+/// of runs with different `history` sees the same current state and a different past
+/// (`daemon_history`). `None` adds nothing, which is the cost check's own measurement.
+pub(crate) async fn measure(
+    scale: f64,
+    source: &Path,
+    peer_source: &Path,
+    history: Option<usize>,
+) -> Measured {
     let work_directory = tempfile::tempdir().unwrap();
     let root = work_directory.path();
     let database = root.join("state/claims.sqlite3");
@@ -1731,6 +1739,49 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
             .fields
             .insert("incarnation_id".into(), json!(SEAT_RUNTIME));
         store.append_claim(&running).unwrap();
+    }
+    if let Some(history) = history {
+        // Past observations first, in alternating states, then the one current observation: the
+        // seat's current harness is the same whatever the length of its past.
+        let seat = subjects.seats[0].clone();
+        for round in 0..=history {
+            let current = round == history;
+            let mut observation = claim_input("harness.observed", &format!("cost-history-{round}"), round, "");
+            observation.subject = seat.clone();
+            observation.actor = Some(seat.clone());
+            observation.fields.insert("incarnation_id".into(), json!(SEAT_RUNTIME));
+            observation.fields.insert(
+                "state".into(),
+                json!(if current || round % 2 == 0 { "idle" } else { "working" }),
+            );
+            observation.fields.insert("driver".into(), json!("codex"));
+            store.append_claim(&observation).unwrap();
+        }
+        // And usage rollups from forty days ago, outside any current period: a period read must
+        // not pay for them, a replay of every usage claim does.
+        let forty_days = 40 * 24 * 60 * 60 * 1000_u64;
+        let long_ago = u64::try_from(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()).unwrap() - forty_days;
+        for round in 0..history as u64 {
+            let at = long_ago + round * 60 * 60 * 1000;
+            let total = 100 * (round + 1);
+            let mut usage = claim_input("harness.usage", &format!("cost-history-usage-{round}"), round as usize, "");
+            usage.subject = seat.clone();
+            usage.actor = Some(seat.clone());
+            usage.fields = serde_json::from_value(json!({
+                "semantics": "response_rollup", "driver": "claude", "incarnation_id": SEAT_RUNTIME,
+                "model": "claude-example", "account": "claude/history",
+                "owner_run": "mission-run/example", "owner_step": "step-run/example/build",
+                "host": "alder", "total_tokens": total, "cost_microusd": total * 10,
+                "observed_at_unix_ms": at, "native_session_id": "history-session",
+                "pricing_provenance": [{"price_table_id": "st.api-list",
+                    "price_table_version": "example-version", "cost_source": "computed",
+                    "total_tokens": total, "cost_microusd": total * 10,
+                    "rates_usd_per_million_tokens": {"input": 10.0, "output": 10.0,
+                        "cache_read": 10.0, "cache_write_5m": 10.0, "cache_write_1h": 10.0}}],
+            })).unwrap();
+            store.append_claim(&usage).unwrap();
+        }
     }
     let mut fixture = fixture(&person, &client, subjects).await;
     fixture.items.insert(
