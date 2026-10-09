@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 /// More claims than this between two publications fold again rather than read them all.
 const DELTA_LIMIT: usize = 10_000;
 
-/// Claim kinds that no attention source reads, whatever their subject: harness activity and
+/// Claim kinds that no attention source reads, whatever their subject: harness timelines and
 /// usage, messages (attention leaves messages to conversations), transport and workspace
 /// observations, daemon diagnostics, and a person's glasses and arrangements. Work progress and
 /// lease renewals move no step's status, run or ask. These are most of a busy host's claims.
@@ -253,6 +253,7 @@ impl Store {
             return Ok(AttentionDelta::Refold("many".into()));
         }
         let mut logins = HashMap::<String, bool>::new();
+        let mut retiring = HashMap::<String, bool>::new();
         for (subject, kind) in claims {
             if UNREAD_KINDS.contains(&kind.as_str()) {
                 continue;
@@ -261,7 +262,8 @@ impl Store {
             // item, and only for a seat with a login-shaped claim: the candidates
             // `desired_harness_login_candidates` reads. A seat never asked to log in has none
             // before this claim or after it.
-            if matches!(kind.as_str(), "harness.observed" | "harness.diagnostic") {
+            let login = matches!(kind.as_str(), "harness.observed" | "harness.diagnostic" | "runtime.observed");
+            if login {
                 let candidate = match logins.get(&subject) {
                     Some(candidate) => *candidate,
                     None => {
@@ -270,7 +272,18 @@ impl Store {
                         candidate
                     }
                 };
-                if !candidate {
+                // A runtime observation is also the actual state an ask from a retiring seat
+                // reads (`rollouts::retiring_ask_live`), and only while its declaration is a stop.
+                let stopping = kind == "runtime.observed"
+                    && match retiring.get(&subject) {
+                        Some(stopping) => *stopping,
+                        None => {
+                            let stopping = declared_stop(&connection, &subject)?;
+                            retiring.insert(subject.clone(), stopping);
+                            stopping
+                        }
+                    };
+                if !candidate && !stopping {
                     continue;
                 }
             }
@@ -278,6 +291,16 @@ impl Store {
         }
         Ok(AttentionDelta::Unchanged)
     }
+}
+
+/// Whether `subject`'s current declaration is a stop: only then can a retiring seat's ask read
+/// its runtime.
+fn declared_stop(connection: &Connection, subject: &str) -> Result<bool> {
+    Ok(connection
+        .prepare_cached("SELECT kind='stop' FROM desired WHERE subject=?1")?
+        .query_row([subject], |row| row.get(0))
+        .optional()?
+        .unwrap_or(false))
 }
 
 /// Whether `subject` has a claim that makes it a harness login candidate, by the same indexed
