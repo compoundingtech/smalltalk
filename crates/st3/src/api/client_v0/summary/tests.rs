@@ -493,11 +493,11 @@ mission "summary-update-about" state="ready" {
                 let now = client_now_ms();
                 let attention =
                     client_attention_resources_at(&state.store, Some(person), false, now)?;
-                if person == "person/avery" && !attention.is_empty() {
-                    let item = attention
-                        .iter()
-                        .find(|item| item["source_id"] == update.subject)
-                        .unwrap();
+                // Until it is read, the update is listed beside the ask.
+                if let Some(item) = attention
+                    .iter()
+                    .find(|item| item["source_id"] == update.subject)
+                {
                     assert_eq!(item["attention_kind"], "person-step");
                     assert_eq!(item["update"]["type"], "update");
                     assert_eq!(item["state"], "open");

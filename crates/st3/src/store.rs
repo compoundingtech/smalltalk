@@ -13853,9 +13853,17 @@ impl Store {
         {
             let connection = self.readers.get();
             for review in reviews {
+                // The gate's owner is the step whose work it reviews, or its run.
+                let step = review
+                    .step
+                    .as_deref()
+                    .filter(|step| step.starts_with("step-run/"))
+                    .or_else(|| {
+                        Some(review.owner.as_str()).filter(|owner| owner.starts_with("step-run/"))
+                    });
                 let conversation = attention_snapshot::conversation_agent(
                     &connection,
-                    review.step.as_deref(),
+                    step,
                     Some(&review.mission_run),
                 )?;
                 items.push(AttentionItemView {
