@@ -215,9 +215,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                 </header>
                 {collapsed ? null : (
                   <>
-                    <Aria.SearchField aria-label="Search agents" value={search} onChange={setSearch} {...stylex.props(styles.search)}>
-                      <Aria.Input placeholder="Search agents" {...stylex.props(styles.searchInput)} />
-                    </Aria.SearchField>
+                    <LiveSidebarSearch value={search} onChange={setSearch} />
                     <nav ref={rosterCommit} aria-label="Agent roster" onMouseOverCapture={rememberHoverOwner} onFocusCapture={rememberHoverOwner} {...stylex.props(styles.roster)}>
                       {filtered.map((row) => (
                         <SidebarAgentRow key={row.ref} item={sidebarRow({ agent: row, stale, now })} now={now} variant="SR-2" layout="SR2-A" glyph="SG-1" extraSignals={[]} query={search} active={current === row.ref} onOpen={() => select(row.ref)} />
@@ -353,6 +351,13 @@ export function WorkspaceBody({ current, rosterRefs, view, agentName, onOpenTool
       </section>
     ) : null}
   </ViewportStoreContext.Provider>
+}
+
+/** Roster filter in the live sidebar. */
+export function LiveSidebarSearch({ value, onChange }: { readonly value: string; readonly onChange: (value: string) => void }) {
+  return <Aria.SearchField aria-label="Search agents" value={value} onChange={onChange} {...stylex.props(styles.search)}>
+    <Aria.Input placeholder="Search agents" {...stylex.props(styles.searchInput)} />
+  </Aria.SearchField>
 }
 
 const styles = stylex.create({
