@@ -2,11 +2,14 @@
 import * as React from 'react'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
+import { flushSync } from 'react-dom'
 import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type * as PaneModule from './ConversationPane.tsx'
 import type * as WorkspaceModule from './LiveAgentWorkspace.tsx'
+import type * as FallbackModule from './ConversationPaneFallback.tsx'
 import type { UxTelemetry } from '../telemetry/ux.ts'
+import type { Feed, Fleet } from '../data/source.ts'
 
 vi.mock('@stylexjs/stylex', () => ({
   create: (styles: unknown) => styles,
@@ -17,10 +20,22 @@ vi.mock('@stylexjs/stylex', () => ({
 }))
 // Header actions read resources from a data source; they are outside this import boundary.
 vi.mock('./ConversationHeaderActions.tsx', () => ({ ConversationHeaderActions: () => null }))
+let fallbackRenders = 0
+let rosterFeed: Feed<Fleet> = { _tag: 'Waiting' }
+vi.mock('./ConversationPaneFallback.tsx', async importOriginal => {
+  const original = await importOriginal<typeof FallbackModule>()
+  return {
+    ...original,
+    ConversationPaneFallback: (props: React.ComponentProps<typeof original.ConversationPaneFallback>) => {
+      fallbackRenders += 1
+      return <original.ConversationPaneFallback {...props} />
+    },
+  }
+})
 // Keep the shell and retained-pane implementation real; the import is deliberately held
 // pending, and no backend is needed to prove when its code is requested.
 vi.mock('../data/react.tsx', () => ({
-  useFleet: () => ({ _tag: 'Waiting' }),
+  useFleet: () => rosterFeed,
   useSubjectList: () => [],
   useConnection: () => ({ _tag: 'Waiting' }),
   useNow: () => 0,
@@ -43,6 +58,8 @@ beforeEach(async () => {
   vi.resetModules()
   requested.mockClear()
   mountCount = 0
+  fallbackRenders = 0
+  rosterFeed = { _tag: 'Waiting' }
   frameId = 0
   frames.clear()
   paintTasks.length = 0
@@ -115,6 +132,30 @@ const renderShell = async (ux?: UxTelemetry) => {
 }
 
 describe('conversation import boundary', () => {
+  it('reserves non-interactive roster rows while waiting and keeps the honest wait notice', async () => {
+    await renderShell()
+    const roster = container.querySelector('nav[aria-label="Agent roster"]')
+    const skeleton = roster?.querySelector('[data-wf-roster-skeleton]')
+    expect(skeleton).not.toBeNull()
+    expect(skeleton?.getAttribute('aria-hidden')).toBe('true')
+    expect(skeleton?.querySelectorAll('[data-wf-skeleton-row]')).toHaveLength(8)
+    expect(skeleton?.querySelectorAll('[data-wf-skeleton-line]')).toHaveLength(16)
+    expect(skeleton?.querySelectorAll('button, a, input, [tabindex]')).toHaveLength(0)
+    expect(container.textContent).toContain('Waiting for the agent roster.')
+  })
+
+  it('removes skeletons for observed empty rosters and read refusals rather than inventing rows', async () => {
+    rosterFeed = { _tag: 'Observed', freshness: 'live', value: { agents: [], hosts: [] } }
+    await renderShell()
+    expect(container.querySelector('[data-wf-roster-skeleton]')).toBeNull()
+    expect(container.textContent).not.toContain('Waiting for the agent roster.')
+    rosterFeed = { _tag: 'Unavailable', reason: 'ungranted', detail: 'not-for-display' }
+    await renderShell()
+    expect(container.querySelector('[data-wf-roster-skeleton]')).toBeNull()
+    expect(container.textContent).toContain('Read access to the agent roster has not been granted.')
+    expect(container.textContent).not.toContain('not-for-display')
+  })
+
   it('does not evaluate pane code when the shell module is imported', () => {
     expect(requested).not.toHaveBeenCalled()
   })
@@ -144,6 +185,25 @@ describe('conversation import boundary', () => {
     expect(first?.getAttribute('aria-hidden')).toBe('false')
     expect(mountCount).toBe(2)
     expect(requested).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not suspend a switch on already loaded code after the selected shell prefetch', async () => {
+    window.history.replaceState(null, '', '/w/agent/a')
+    await renderShell()
+    await act(async () => resolveImport())
+    expect(container.querySelector('[data-pane-ref="agent/a"]')).not.toBeNull()
+    await paintShellFrame()
+    await act(async () => paintTasks.shift()?.())
+    const before = fallbackRenders
+    await act(async () => {
+      flushSync(() => {
+        window.history.pushState(null, '', '/w/agent/b')
+        window.dispatchEvent(new PopStateEvent('popstate'))
+      })
+    })
+    expect(requested).toHaveBeenCalledTimes(1)
+    expect(fallbackRenders - before).toBe(0)
+    expect(container.querySelector('[data-pane-ref="agent/b"]')).not.toBeNull()
   })
 
   it('prefetches the empty shell after its first paint, then reuses that import for selection', async () => {

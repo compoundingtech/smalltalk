@@ -35,13 +35,18 @@ const loadConversationPane = () => {
   }
   return conversationPaneModule
 }
-const ConversationPane = React.lazy(() => loadConversationPane().then(module => ({ default: module.ConversationPane })))
+const ConversationPane = React.lazy(() => {
+  // An initially selected pane and later shell prefetch must retain the same lazy identity.
+  // A second wrapper suspends on an already resolved module during the first seat switch.
+  prefetchedConversationPane ??= ConversationPane
+  return loadConversationPane().then(module => ({ default: module.ConversationPane }))
+})
 let prefetchedConversationPane: typeof ConversationPane | undefined
 const prefetchConversationPane = () => {
   const request = loadConversationPane()
   // Preserve this attempt's failure for the requested pane's honest, local error surface.
   // A retry creates a fresh lazy wrapper, not React's permanently rejected cached wrapper.
-  prefetchedConversationPane = React.lazy(() => request.then(module => ({ default: module.ConversationPane })))
+  prefetchedConversationPane ??= React.lazy(() => request.then(module => ({ default: module.ConversationPane })))
   void request.catch(() => {})
 }
 
@@ -217,6 +222,13 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                   <>
                     <LiveSidebarSearch value={search} onChange={setSearch} />
                     <nav ref={rosterCommit} aria-label="Agent roster" onMouseOverCapture={rememberHoverOwner} onFocusCapture={rememberHoverOwner} {...stylex.props(styles.roster)}>
+                      {fleet._tag === 'Waiting' ? <div aria-hidden="true" data-wf-roster-skeleton="waiting" {...stylex.props(styles.rosterSkeleton)}>
+                        {Array.from({ length: 8 }, (_, index) => <div key={index} data-wf-skeleton-row="" {...stylex.props(styles.skeletonRow)}>
+                          <span {...stylex.props(styles.skeletonGlyph)} />
+                          <span data-wf-skeleton-line="name" {...stylex.props(styles.skeletonLine, styles.skeletonName)} />
+                          <span data-wf-skeleton-line="host" {...stylex.props(styles.skeletonLine, styles.skeletonHost)} />
+                        </div>)}
+                      </div> : null}
                       {filtered.map((row) => (
                         <SidebarAgentRow key={row.ref} item={sidebarRow({ agent: row, stale, now })} now={now} variant="SR-2" layout="SR2-A" glyph="SG-1" extraSignals={[]} query={search} active={current === row.ref} onOpen={() => select(row.ref)} />
                       ))}
@@ -227,7 +239,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                       </p>
                     ) : stale ? (
                       <p role="status" {...stylex.props(styles.notice)}>
-                        Last verified roster · reconnecting
+                        Last observed roster · live updates pending
                       </p>
                     ) : null}
                     <footer {...stylex.props(styles.footer)}>
@@ -371,6 +383,13 @@ const styles = stylex.create({
   search: { marginInline: s.md, padding: `calc(${s.md} - ${g.hairline})`, borderRadius: 8, borderWidth: g.hairline, borderStyle: 'solid', borderColor: c.border, backgroundColor: c.message, flexShrink: 0 },
   searchInput: { width: '100%', minWidth: 0, borderWidth: 0, outline: 'none', backgroundColor: 'transparent', color: c.fg, fontSize: t.metaSize },
   roster: { display: 'flex', flexDirection: 'column', overflowY: 'auto', padding: s.md, minHeight: 0, flexGrow: 1, gap: 2 },
+  // Match SR-2's shared row/control/icon geometry and the roster's 2px inter-row gap.
+  rosterSkeleton: { display: 'flex', flexDirection: 'column', gap: 2 },
+  skeletonRow: { height: g.sidebarRow, flexShrink: 0, display: 'grid', gridTemplateColumns: `${g.icon} minmax(0, 1fr)`, gridTemplateRows: `${g.controlSm} ${g.controlSm}`, alignContent: 'center', alignItems: 'center', columnGap: s.xs2, paddingInline: s.sm, boxSizing: 'border-box' },
+  skeletonGlyph: { gridColumn: '1', gridRow: '1', width: g.icon, height: g.icon, borderRadius: '50%', backgroundColor: c.border, opacity: 0.5 },
+  skeletonLine: { gridColumn: '2', height: 8, borderRadius: 4, backgroundColor: c.border, opacity: 0.5 },
+  skeletonName: { gridRow: '1', width: '68%' },
+  skeletonHost: { gridRow: '2', width: '44%' },
   footer: { height: 40, display: 'flex', alignItems: 'center', gap: s.md, paddingInline: s.lg, flexShrink: 0 },
   connection: { marginLeft: 'auto', fontSize: t.denseSize, color: c.fgMuted },
   workspace: { display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0 },
