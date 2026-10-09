@@ -132,7 +132,7 @@ fn glasses_read_again_only_the_people_whose_glasses_changed() {
     let unrelated = refresh_and_check(&store, OwnerView::Glasses);
     assert!(unrelated.cut > deleted.cut);
     assert!(Arc::ptr_eq(&unrelated.owners, &deleted.owners));
-    assert_eq!(store.owner_list_reads(OwnerView::Glasses), (5, 1));
+    assert_eq!(store.owner_list_reads(OwnerView::Glasses), (4, 1), "nobody read again");
 }
 
 #[test]
