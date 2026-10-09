@@ -37,6 +37,9 @@ pub(crate) struct MissionRows {
     pub(crate) next_lease_end_unix_ms: Option<u128>,
     /// The projection frontier at the fold, from [`Store::projection_frontier`].
     pub(crate) frontier: u64,
+    /// Every leased step's lease end at the fold. A quiet renewal moves one, and the step's
+    /// `since` on its card, with no claim.
+    pub(crate) leases: HashMap<String, u128>,
 }
 
 impl MissionRows {
@@ -222,6 +225,7 @@ impl Store {
         let mut runs = BTreeSet::new();
         let mut steps = BTreeSet::new();
         let mut requesters = BTreeSet::new();
+        let mut every_ask = false;
         let mut statement = connection.prepare_cached(
             "SELECT subject, kind, CASE WHEN kind LIKE 'work.person-%'
                     THEN json_extract(body,'$.fields.origin_step') END
@@ -242,14 +246,10 @@ impl Store {
                 changes.missions.insert(subject.clone());
             } else if let Some(run) = subject.strip_prefix("mission-run/") {
                 runs.insert(run.to_owned());
-                // A root run's state ends the steps of every run under it.
+                // A run's state ends the steps of the runs under it, and decides whether asks
+                // in them are current: refold its whole run tree.
                 if matches!(kind.as_str(), "mission-run.state" | "mission-run.created") {
-                    let mut children = connection.prepare_cached(
-                        "SELECT id FROM mission_runs WHERE root_run_id=?1 AND id<>?1",
-                    )?;
-                    for child in children.query_map([run], |row| row.get::<_, String>(0))? {
-                        runs.insert(child?);
-                    }
+                    runs.extend(self.runs_in_tree(run)?);
                 }
             } else if let Some(generation) = subject.strip_prefix("run-generation/") {
                 let mut owner = connection
@@ -261,15 +261,29 @@ impl Store {
                 // A proposal drains, applies or releases its run with no claim on the run.
                 runs.extend(self.revision_proposal_run(proposal)?);
             } else if subject.starts_with("step-run/") {
+                // A person's answer or a cancelled ask unblocks the step that asked, and ends
+                // a run the ask started; answers and cancellations name neither, the ask does.
+                if kind.starts_with("work.person-") {
+                    let (asked_from, started) = self.ask_origin_and_run(&subject)?;
+                    steps.extend(origin.or(asked_from));
+                    runs.extend(started.map(|run| run.trim_start_matches("mission-run/").to_owned()));
+                }
                 steps.insert(subject);
-                // A person's answer to an ask unblocks the step that asked.
-                steps.extend(origin);
+            } else if subject.starts_with("subscription/") || subject.starts_with("schedule/") {
+                // An ask's currency walks the subscription or schedule that delivered its run.
+                every_ask = true;
             } else if subject.starts_with("agent/") && published_list::decides_asks(&kind) {
                 requesters.insert(subject);
             }
         }
-        // A requester's declaration and runtime decide whether its asks still block steps.
-        for (ask, origin) in self.asks_by_requesters(&requesters)? {
+        // A requester's declaration and runtime decide whether its asks still block steps, and
+        // whether its runs wait on a person.
+        let mut asks = self.asks_by_requesters(&requesters)?;
+        if every_ask {
+            asks = self.every_ask()?;
+        }
+        changes.attention |= !asks.is_empty();
+        for (ask, origin) in asks {
             steps.insert(ask);
             steps.extend(origin);
         }
@@ -335,6 +349,24 @@ impl Store {
             )?
             .query_row([now.min(i64::MAX as u128) as i64], |row| row.get::<_, Option<i64>>(0))?;
         Ok(end.map(|end| end.max(0) as u128))
+    }
+
+    /// The missions that own each of `steps`.
+    pub(crate) fn missions_of_steps<'a>(
+        &self,
+        steps: impl IntoIterator<Item = &'a String>,
+    ) -> Result<BTreeSet<String>> {
+        let connection = self.readers.get();
+        let mut owner = connection.prepare_cached(
+            "SELECT r.mission_id FROM step_runs s JOIN mission_runs r ON r.id=s.run_id WHERE s.subject=?1",
+        )?;
+        let mut missions = BTreeSet::new();
+        for step in steps {
+            if let Some(mission) = owner.query_row([step], |row| row.get::<_, String>(0)).optional()? {
+                missions.insert(format!("mission/{mission}"));
+            }
+        }
+        Ok(missions)
     }
 
     /// The missions that own each of `runs`, which may name runs with or without their

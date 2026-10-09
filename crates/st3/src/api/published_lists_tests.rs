@@ -385,9 +385,12 @@ fn published_work_matches_the_direct_read_for_every_actor_as_time_passes() {
         })
         .unwrap();
     assert_eq!(store.index().unwrap(), before, "the renewal appended no claim");
-    // Folded on its own, with no claim and no new cut.
+    // Folded on its own, with no claim and no new cut, in both lists: the card shows the
+    // step's `since`, which the renewal moved too.
     let (_, changed) = fold_work_checked(&store);
     assert!(changed, "the quiet renewal moved the step's lease");
+    let (_, changed) = fold(&store);
+    assert!(changed, "the quiet renewal moved the step's since");
 
     // The seat asks a person; the ask's step shows on the list, and its answer later moves it.
     store

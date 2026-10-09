@@ -8,6 +8,7 @@ use super::*;
 use crate::store::mission_list::MissionRows;
 use crate::store::work_list::{WorkRow, WorkRows, work_state_rank};
 use crate::store::published_list::{Publication, PublishedList};
+use std::collections::HashMap;
 use smallclaims::store::now_ms;
 
 /// The shortest pause between two folds of one collection. A fold also pauses as long as it
@@ -231,6 +232,10 @@ fn fold_missions(
 struct Plan {
     cut: u64,
     frontier: u64,
+    /// When the plan was read: the earliest time any refolded card holds at, from which the
+    /// next fold looks for ended leases.
+    at: u128,
+    leases: HashMap<String, u128>,
     missions: BTreeSet<String>,
     /// The runs waiting on a person at `cut`, when they were reread, and when.
     attention: Option<(BTreeSet<String>, u128)>,
@@ -254,12 +259,9 @@ impl Plan {
             let chunk = chunk.iter().cloned().collect::<BTreeSet<_>>();
             store.read_snapshot(|_| refold(store, &mut rows, &chunk, now_ms()))?;
         }
-        store.read_snapshot(|_| {
-            let now = now_ms();
-            rows.folded_at_unix_ms = now;
-            rows.next_lease_end_unix_ms = store.next_lease_end(now)?;
-            Ok(())
-        })?;
+        rows.folded_at_unix_ms = self.at;
+        rows.next_lease_end_unix_ms = store.read_snapshot(|_| store.next_lease_end(self.at))?;
+        rows.leases = self.leases;
         rows.frontier = self.frontier;
         rows.sort();
         Ok(Publication { cut: self.cut, published_at_unix_ms: now_ms(), valid_until_unix_ms: None, rows })
@@ -276,6 +278,7 @@ fn missions_from_nothing(store: &Store) -> anyhow::Result<Publication<MissionRow
             attention_read_at_unix_ms: now,
             folded_at_unix_ms: now,
             next_lease_end_unix_ms: store.next_lease_end(now)?,
+            leases: store.work_leases()?,
             ..MissionRows::default()
         };
         Ok((cut, store.projection_frontier()?, store.mission_list_ids()?, rows))
@@ -344,6 +347,13 @@ fn missions_since(
         let mut missions = changes.missions;
         // Worker leases that ended since the last fold show their steps ready again.
         missions.extend(store.missions_with_leases_ended(rows.folded_at_unix_ms, now)?);
+        // A quiet renewal moves a lease, and its step's `since`, with no claim.
+        let leases = store.work_leases()?;
+        let moved = rows.leases.iter()
+            .filter(|(step, end)| leases.get(*step) != Some(end))
+            .map(|(step, _)| step)
+            .chain(leases.keys().filter(|step| !rows.leases.contains_key(*step)));
+        missions.extend(store.missions_of_steps(moved)?);
         // A recently ended mission leaves the list once its grace is over.
         missions.extend(rows.keys.iter()
             .filter(|(_, key)| key.visible_until.is_some_and(|until| until < now))
@@ -361,7 +371,7 @@ fn missions_since(
         }
         let attention = attention.map(|attention| (attention, now));
         if missions.len() > FOLD_CHUNK {
-            return Ok(Advance::TooMany(Plan { cut, frontier, missions, attention }));
+            return Ok(Advance::TooMany(Plan { cut, frontier, at: now, leases, missions, attention }));
         }
         let changed = !missions.is_empty();
         let mut rows = rows.clone();
@@ -371,6 +381,7 @@ fn missions_since(
         }
         rows.folded_at_unix_ms = now;
         rows.next_lease_end_unix_ms = store.next_lease_end(now)?;
+        rows.leases = leases;
         rows.frontier = frontier;
         refold(store, &mut rows, &missions, now)?;
         rows.sort();
@@ -519,11 +530,13 @@ fn refold_work(
         } else {
             None
         };
+        let next_claim_unix_ms = store.next_claim_after(&view.subject, time)?;
         rows.rows.insert(
             view.subject.clone(),
             Arc::new(WorkRow {
                 lease_unix_ms: leases.get(&view.subject).copied(),
                 timing_lease_unix_ms,
+                next_claim_unix_ms,
                 view: Arc::new(view),
                 value: Arc::new(value),
                 time_unix_ms: time,
@@ -560,6 +573,7 @@ fn retime_work(rows: &mut WorkRows, time: u128) -> bool {
             time_unix_ms: time,
             lease_unix_ms: row.lease_unix_ms,
             timing_lease_unix_ms: row.timing_lease_unix_ms,
+            next_claim_unix_ms: row.next_claim_unix_ms,
         });
     }
     changed
@@ -583,9 +597,13 @@ fn work_since(store: &Store, base: &Publication<WorkRows>) -> anyhow::Result<Adv
         // A quiet renewal moves a lease with no claim; a running step whose claims' lease
         // passed stops its execution time.
         let leases = store.work_leases()?;
+        // A claim accepted after a row's time, as replication can deliver, enters its
+        // time-fenced fields once the list's time passes it.
+        let passed = |at: Option<u128>| at.is_some_and(|at| at > rows.time_unix_ms && at <= time);
         steps.extend(rows.rows.iter().filter(|(step, row)| {
             row.lease_unix_ms != leases.get(*step).copied()
-                || row.timing_lease_unix_ms.is_some_and(|lease| lease > rows.time_unix_ms && lease <= time)
+                || passed(row.timing_lease_unix_ms)
+                || passed(row.next_claim_unix_ms)
         }).map(|(step, _)| step.clone()));
         if cut == base.cut && frontier == rows.frontier && steps.is_empty() && !changes.reorder {
             return Ok(Advance::Current);

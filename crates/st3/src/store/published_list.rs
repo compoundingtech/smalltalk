@@ -169,6 +169,48 @@ impl Store {
         Ok(asks)
     }
 
+    /// For a claim about a person ask's step: the step that asked and the run the ask started,
+    /// as the ask itself names them. Answers and cancellations name neither.
+    pub(crate) fn ask_origin_and_run(&self, ask: &str) -> Result<(Option<String>, Option<String>)> {
+        let connection = self.readers.get();
+        let found = connection
+            .prepare_cached(
+                "SELECT json_extract(body,'$.fields.origin_step'), json_extract(body,'$.fields.run')
+                 FROM claims WHERE subject=?1 AND kind='work.person-asked' LIMIT 1",
+            )?
+            .query_row([ask], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)))
+            .optional()?;
+        Ok(found.unwrap_or_default())
+    }
+
+    /// Every person ask, with the step it asked from: what a change to a subscription or
+    /// schedule, whose deliveries an ask's currency walks, can affect. Person asks are few.
+    pub(crate) fn every_ask(&self) -> Result<Vec<(String, Option<String>)>> {
+        let connection = self.readers.get();
+        let asks = connection
+            .prepare_cached(
+                "SELECT subject, json_extract(body,'$.fields.origin_step') FROM claims
+                 WHERE kind='work.person-asked'",
+            )?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(asks)
+    }
+
+    /// Every run in the same run tree as `run`: a run's state ends the steps of the runs under
+    /// it, and an ask's currency walks the runs above its step.
+    pub(crate) fn runs_in_tree(&self, run: &str) -> Result<Vec<String>> {
+        let connection = self.readers.get();
+        let runs = connection
+            .prepare_cached(
+                "SELECT id FROM mission_runs
+                 WHERE root_run_id=(SELECT root_run_id FROM mission_runs WHERE id=?1)",
+            )?
+            .query_map([run], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(runs)
+    }
+
     /// The run a revision proposal is for: its phase and timestamps change with the proposal.
     pub(crate) fn revision_proposal_run(&self, proposal: &str) -> Result<Option<String>> {
         let connection = self.readers.get();

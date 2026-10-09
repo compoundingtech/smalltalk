@@ -16,6 +16,9 @@ pub(crate) struct WorkRow {
     pub(crate) lease_unix_ms: Option<u128>,
     /// For a running step, the lease its claims last named, which bounds its execution time.
     pub(crate) timing_lease_unix_ms: Option<u128>,
+    /// The earliest claim about the step accepted after the row's time, which the row's
+    /// time-fenced fields (progress, timing, answers) leave out until the list's time passes it.
+    pub(crate) next_claim_unix_ms: Option<u128>,
 }
 
 /// One publication of the current work list.
@@ -88,6 +91,7 @@ impl Store {
         let mut reorder = false;
         let mut runs = BTreeSet::new();
         let mut requesters = BTreeSet::new();
+        let mut every_ask = false;
         let mut statement = connection.prepare_cached(
             "SELECT subject, kind, CASE WHEN kind LIKE 'work.person-%'
                     THEN json_extract(body,'$.fields.origin_step') END
@@ -105,14 +109,10 @@ impl Store {
         for (subject, kind, origin) in claims {
             if let Some(run) = subject.strip_prefix("mission-run/") {
                 runs.insert(run.to_owned());
-                // A root run's state ends the steps of every run under it.
+                // A run's state ends the steps of the runs under it, and decides whether asks
+                // in them are current: refold its whole run tree.
                 if matches!(kind.as_str(), "mission-run.state" | "mission-run.created") {
-                    let mut children = connection.prepare_cached(
-                        "SELECT id FROM mission_runs WHERE root_run_id=?1 AND id<>?1",
-                    )?;
-                    for child in children.query_map([run], |row| row.get::<_, String>(0))? {
-                        runs.insert(child?);
-                    }
+                    runs.extend(self.runs_in_tree(run)?);
                 }
             } else if let Some(generation) = subject.strip_prefix("run-generation/") {
                 let mut owner = connection
@@ -124,9 +124,17 @@ impl Store {
                 // A draining run shows only its held steps, with no claim on the run.
                 runs.extend(self.revision_proposal_run(proposal)?);
             } else if subject.starts_with("step-run/") {
+                // A person's answer or a cancelled ask unblocks the step that asked, and ends
+                // a run the ask started; answers and cancellations name neither, the ask does.
+                if kind.starts_with("work.person-") {
+                    let (asked_from, started) = self.ask_origin_and_run(&subject)?;
+                    steps.extend(origin.or(asked_from));
+                    runs.extend(started.map(|run| run.trim_start_matches("mission-run/").to_owned()));
+                }
                 steps.insert(subject);
-                // A person's answer to an ask unblocks the step that asked.
-                steps.extend(origin);
+            } else if subject.starts_with("subscription/") || subject.starts_with("schedule/") {
+                // An ask's currency walks the subscription or schedule that delivered its run.
+                every_ask = true;
             } else if subject.starts_with("agent/") {
                 // A seat a step owns shows on that step's row with its usage.
                 let mut owned = connection.prepare_cached(
@@ -145,7 +153,8 @@ impl Store {
             }
         }
         // A requester's declaration and runtime decide whether its asks still block steps.
-        for (ask, origin) in self.asks_by_requesters(&requesters)? {
+        let asks = if every_ask { self.every_ask()? } else { self.asks_by_requesters(&requesters)? };
+        for (ask, origin) in asks {
             steps.insert(ask);
             steps.extend(origin);
         }
@@ -209,6 +218,19 @@ impl Store {
         Ok(leases)
     }
 
+    /// When the earliest claim about `subject` accepted after `time` was accepted. Replicated
+    /// claims keep their own times, so one can arrive before the list's time reaches it.
+    pub(crate) fn next_claim_after(&self, subject: &str, time: u128) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        let next = connection
+            .prepare_cached(
+                "SELECT MIN(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims
+                 WHERE subject=?1 AND CAST(accepted_at_unix_ms AS INTEGER)>?2",
+            )?
+            .query_row(params![subject, time.min(i64::MAX as u128) as i64], |row| row.get::<_, Option<i64>>(0))?;
+        Ok(next.map(|next| next.max(0) as u128))
+    }
+
     /// The lease `subject`'s claims last named for the open execution interval of `attempt` at
     /// `at`, when one is open.
     pub(crate) fn step_timing_lease(&self, subject: &str, attempt: u32, at: u128) -> Result<Option<u128>> {
@@ -255,6 +277,7 @@ mod tests {
                     time_unix_ms: 0,
                     lease_unix_ms: None,
                     timing_lease_unix_ms: None,
+                    next_claim_unix_ms: None,
                 }),
             );
         }
