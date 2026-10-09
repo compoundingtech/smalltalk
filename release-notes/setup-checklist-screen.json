@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Replace the typed first-run setup questions with one full-screen checklist: names, start at login, every supported agent with its facts and paths, one consent line, one action with a result per agent.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay, projection rebuild or store recovery changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, columns, indexes, triggers or schema transitions."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or coordinated fleet-upgrade changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "st setup and the first plain st show the checklist when run in a terminal without --yes; pipes, --yes and non-terminals keep the line-mode setup and its flags unchanged. The config gains an optional top-level codex_access (ask, workspace or full), written only when Codex is found and the person saw the control; nothing reads it yet, so Codex seats launch as before. A build that does not know codex_access rejects a config that has it, so downgrading after setup stored one means deleting that line. Setup output is captured while the screen is up and printed afterwards."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon lifecycle changes or additional service restart requirement."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step or persisted-state migration."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Delete codex_access from config.toml to return to the unset state."
+  }
+}

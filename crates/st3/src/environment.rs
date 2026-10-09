@@ -103,6 +103,14 @@ fn capture_within(timeout: Duration) -> Result<Environment> {
     st_runtime::login_environment_within(timeout)
 }
 
+/// Forget the captured environment, so the next use reads the login shell again. Setup does this
+/// when the person asks to look for an agent they have just installed.
+pub fn refresh() {
+    if let Ok(mut cache) = cache().lock() {
+        cache.captured = None;
+    }
+}
+
 /// The environment the daemon starts with, captured patiently (see [`STARTUP_ATTEMPTS`]).
 pub fn snapshot_at_startup() -> Result<Environment> {
     cache()

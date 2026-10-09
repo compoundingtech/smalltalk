@@ -8,6 +8,7 @@ mod ui;
 mod version;
 mod voice;
 
+pub use ui::checklist;
 pub use version::display_version;
 
 use st3_feed as feed;

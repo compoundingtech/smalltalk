@@ -11,8 +11,42 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use clap::Args;
 
+mod screen;
+
 use crate::client::{Client, Endpoint};
 use crate::config::Config;
+
+type Sink = Box<dyn FnMut(String)>;
+
+thread_local! {
+    /// Where this thread's setup output goes instead of the terminal, while the setup screen
+    /// owns it. The caller prints what was said once the screen has gone.
+    static SINK: std::cell::RefCell<Option<Sink>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Say one line to the person: on the terminal, or into the sink when one is set.
+pub(crate) fn said(line: impl Into<String>) {
+    let line = line.into();
+    let unsent = SINK.with(|sink| match sink.borrow_mut().as_mut() {
+        Some(send) => {
+            send(line);
+            None
+        }
+        None => Some(line),
+    });
+    if let Some(line) = unsent {
+        println!("{line}");
+    }
+}
+
+/// Set (or clear) this thread's sink; returns the one it replaced.
+pub(crate) fn capture(sink: Option<Sink>) -> Option<Sink> {
+    SINK.with(|current| std::mem::replace(&mut *current.borrow_mut(), sink))
+}
+
+macro_rules! say {
+    ($($arg:tt)*) => { said(format!($($arg)*)) };
+}
 
 #[derive(Args, Clone, Debug, Default)]
 pub struct SetupArgs {
@@ -22,7 +56,7 @@ pub struct SetupArgs {
     /// A persistent machine name; `local` is reserved.
     #[arg(long)]
     pub node: Option<String>,
-    /// Accept defaults for questions not answered by flags.
+    /// Skip the setup screen: accept defaults for questions not answered by flags.
     #[arg(long)]
     pub yes: bool,
     /// Keep st running as a user service (default: true).
@@ -97,6 +131,7 @@ pub fn prepare_plain_ui() -> Result<Option<String>> {
                     &std::env::current_exe()?,
                     &Config::default_path(),
                     true,
+                    true,
                 )
                 .await?;
             }
@@ -128,13 +163,30 @@ pub async fn run(args: SetupArgs) -> Result<PreparedSetup> {
         || config.state_dir.join("claims.sqlite3").exists()
         || config.fleet.is_some();
 
-    println!("Welcome to Smalltalk.");
     let default_person = config
         .person
         .as_deref()
         .and_then(|p| p.strip_prefix("person/"))
         .map(str::to_owned)
         .unwrap_or_else(|| slug(&std::env::var("USER").unwrap_or_else(|_| "ada".into())));
+    let default_node = if path.exists() || existing_store {
+        config.node.clone()
+    } else {
+        machine_default(&config.node)
+    };
+    if interactive() && !args.yes {
+        return screen::run(screen::Start {
+            args,
+            path,
+            config,
+            previous_node,
+            existing_store,
+            default_person,
+            default_node,
+        })
+        .await;
+    }
+    println!("Welcome to Smalltalk.");
     let person = ask_name(
         "Your name",
         "--person",
@@ -143,11 +195,6 @@ pub async fn run(args: SetupArgs) -> Result<PreparedSetup> {
         args.yes,
         false,
     )?;
-    let default_node = if path.exists() || existing_store {
-        config.node.clone()
-    } else {
-        machine_default(&config.node)
-    };
     let node = ask_name(
         "This machine's name",
         "--node",
@@ -186,9 +233,9 @@ pub async fn run(args: SetupArgs) -> Result<PreparedSetup> {
     };
     // Validate every answer before writing, including the persisted machine identity.
     merge_config(&path, &config)?;
-    println!("Saved {}", path.display());
+    say!("Saved {}", path.display());
     if let Some(kib) = crate::read_cache::override_kib() {
-        println!("Read cache: {kib} KiB per reader.");
+        say!("Read cache: {kib} KiB per reader.");
     }
     let current_exe = std::env::current_exe()?;
     let executable = if install {
@@ -198,9 +245,9 @@ pub async fn run(args: SetupArgs) -> Result<PreparedSetup> {
     };
     check_login_path(&executable);
     if start {
-        start_daemon(&config, &executable, &path, service).await?;
+        start_daemon(&config, &executable, &path, service, true).await?;
     } else if !daemon_ready(&config).await {
-        println!("Configuration saved; the daemon remains stopped.");
+        say!("Configuration saved; the daemon remains stopped.");
     }
     let harness = prepare_harness(&config, &executable, &args).await?;
     let initial_subject = if let Some(harness) = &harness {
@@ -211,7 +258,7 @@ pub async fn run(args: SetupArgs) -> Result<PreparedSetup> {
                 !args.onboarding,
                 "rerunning onboarding needs a running daemon; pass --start true"
             );
-            println!("Start the st daemon and run st setup to begin onboarding.");
+            say!("Start the st daemon and run st setup to begin onboarding.");
             None
         }
     } else {
@@ -221,7 +268,7 @@ pub async fn run(args: SetupArgs) -> Result<PreparedSetup> {
         );
         None
     };
-    println!("Your agents run without permission prompts inside their own workspaces.");
+    say!("Your agents run without permission prompts inside their own workspaces.");
     Ok(PreparedSetup {
         config,
         harness,
@@ -235,7 +282,7 @@ async fn prepare_harness(
     args: &SetupArgs,
 ) -> Result<Option<String>> {
     if args.harness.as_deref() == Some("none") {
-        println!("Harness setup skipped; no onboarding seat was created.");
+        say!("Harness setup skipped; no onboarding seat was created.");
         return Ok(None);
     }
     let found = if daemon_ready(config).await {
@@ -252,7 +299,7 @@ async fn prepare_harness(
         );
     }
     if found.is_empty() {
-        println!(
+        say!(
             "No supported harness is installed on the daemon's login PATH. Install Claude Code, Codex, OpenCode, Pi or Omp, then run st setup. No onboarding seat was created."
         );
         return Ok(None);
@@ -290,7 +337,7 @@ async fn prepare_harness(
             if found.contains(&answer) {
                 break answer;
             }
-            println!("Choose one of {}.", found.join(", "));
+            say!("Choose one of {}.", found.join(", "));
         }
     };
     if chosen == "claude" {
@@ -302,53 +349,63 @@ async fn prepare_harness(
             true,
         )?;
         if !install {
-            println!(
+            say!(
                 "Claude user plugin installation skipped; seats use the inline server:st3 development channel. Provider or organization channel restrictions still apply."
             );
-            println!("Selected harness: {chosen}");
+            say!("Selected harness: {chosen}");
             return Ok(Some(chosen));
         }
         // CLI plugin commands must see the same account login environment as the daemon.
-        let environment = crate::environment::snapshot()?;
-        let status = Command::new(executable)
-            .args(["claude-channel", "status"])
-            .envs(&environment)
-            .stdin(Stdio::null())
-            .output()?;
-        if !status.status.success() {
-            let output = Command::new(executable)
-                .args(["claude-channel", "install", "--no-policy"])
-                .envs(&environment)
-                .stdin(Stdio::null())
-                .output()?;
-            if !output.status.success() {
-                println!(
-                    "Claude channel installation failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                return Ok(fallback_harness(&found));
-            }
+        if let Err(error) = ensure_claude_channel(executable) {
+            say!("Claude channel installation failed: {error}");
+            return Ok(fallback_harness(&found));
         }
         if st_drivers::claude_channel::st3_policy_available() {
-            println!(
+            say!(
                 "Claude channel policy is present; seats use --channels plugin:st-channel@st."
             );
         } else {
-            println!(
+            say!(
                 "Claude channel uses --dangerously-load-development-channels plugin:st-channel@st. st accepts its local-development dialog when starting a seat. Provider or organization channel restrictions still apply.\nOptional administrator approval policy: sudo st claude-channel install-policy"
             );
         }
     }
-    println!("Selected harness: {chosen}");
+    say!("Selected harness: {chosen}");
     Ok(Some(chosen))
+}
+
+/// Make sure the st Claude channel is installed for this account; the error is the install
+/// command's own stderr, whole.
+pub(crate) fn ensure_claude_channel(executable: &Path) -> std::result::Result<(), String> {
+    let environment = crate::environment::snapshot().map_err(|error| format!("{error:#}"))?;
+    let status = Command::new(executable)
+        .args(["claude-channel", "status"])
+        .envs(&environment)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| error.to_string())?;
+    if status.status.success() {
+        return Ok(());
+    }
+    let output = Command::new(executable)
+        .args(["claude-channel", "install", "--no-policy"])
+        .envs(&environment)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
 }
 
 fn fallback_harness(found: &[String]) -> Option<String> {
     let next = found.iter().find(|h| h.as_str() != "claude").cloned();
     if let Some(next) = &next {
-        println!("Selected harness: {next}");
+        say!("Selected harness: {next}");
     } else {
-        println!("No usable harness remains; no onboarding seat was created.");
+        say!("No usable harness remains; no onboarding seat was created.");
     }
     next
 }
@@ -441,7 +498,7 @@ fn ask_name(
         let answer = read_answer(question, default)?;
         match validate_name(&answer, machine) {
             Ok(()) => return Ok(answer),
-            Err(error) => println!("{error}"),
+            Err(error) => say!("{error}"),
         }
     }
 }
@@ -468,7 +525,7 @@ fn ask_bool(
             "y/n" => return Ok(default),
             "y" | "yes" => return Ok(true),
             "n" | "no" => return Ok(false),
-            _ => println!("Answer yes or no."),
+            _ => say!("Answer yes or no."),
         }
     }
 }
@@ -488,6 +545,9 @@ fn merge_config(path: &Path, config: &Config) -> Result<()> {
             .into(),
     );
     table.insert("node".into(), config.node.clone().into());
+    if let Some(access) = &config.codex_access {
+        table.insert("codex_access".into(), access.clone().into());
+    }
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -565,7 +625,7 @@ fn install_binaries(executable: &Path) -> Result<PathBuf> {
     }
     File::open(&bin)?.sync_all()?;
     record_installed_binaries(&bin)?;
-    println!("Installed st3, st and pty in {}", bin.display());
+    say!("Installed st3, st and pty in {}", bin.display());
     Ok(target)
 }
 
@@ -601,11 +661,11 @@ fn check_login_path(executable: &Path) {
             {
                 return;
             }
-            println!(
+            say!(
                 "Add this line to your login shell profile, then open a new terminal:\n  export PATH=\"$HOME/.local/bin:$PATH\""
             );
         }
-        Err(error) => println!(
+        Err(error) => say!(
             "Could not check the login shell PATH: {error:#}\nAdd this line to your login shell profile:\n  export PATH=\"$HOME/.local/bin:$PATH\""
         ),
     }
@@ -635,12 +695,12 @@ fn try_linger() {
         .output()
         .is_ok_and(|o| o.status.success());
     if enabled {
-        println!("Enabled lingering; st can keep running after you log out.");
+        say!("Enabled lingering; st can keep running after you log out.");
     } else {
         let quoted = user
             .map(|user| format!(" '{}'", user.replace('\'', "'\\''")))
             .unwrap_or_default();
-        println!(
+        say!(
             "Lingering was not enabled. To keep st running after logout, run:\n  loginctl enable-linger{quoted}"
         );
     }
@@ -651,6 +711,7 @@ async fn start_daemon(
     executable: &Path,
     path: &Path,
     service: bool,
+    linger: bool,
 ) -> Result<()> {
     if daemon_ready(config).await {
         return Ok(());
@@ -663,9 +724,13 @@ async fn start_daemon(
             .output();
         match result {
             Ok(output) if output.status.success() => {
-                println!("Installed the st user service; it starts when you log in.");
+                say!("Installed the st user service; it starts when you log in.");
                 #[cfg(target_os = "linux")]
-                try_linger();
+                if linger {
+                    try_linger();
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = linger;
                 anyhow::ensure!(
                     daemon_ready(config).await,
                     "the installed service did not answer at {}",
@@ -678,12 +743,12 @@ async fn start_daemon(
                 if daemon_ready(config).await {
                     return Ok(());
                 }
-                println!(
+                say!(
                     "The user service is unavailable: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
                 );
             }
-            Err(error) => println!("The user service is unavailable: {error}"),
+            Err(error) => say!("The user service is unavailable: {error}"),
         }
     }
     let pty = find_pty(executable)?;
@@ -720,7 +785,7 @@ async fn start_daemon(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if daemon_ready(config).await {
-            println!(
+            say!(
                 "Started st without a service. It stops when you reboot.\nRun `st service install` to keep it running."
             );
             return Ok(());

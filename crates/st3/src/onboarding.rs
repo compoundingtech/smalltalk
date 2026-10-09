@@ -70,7 +70,7 @@ pub async fn start(config: &Config, harness: &str, rerun: bool) -> Result<Option
             subject.desired_token.is_some() && subject.kind.as_deref() != Some("agent")
         })
     {
-        println!(
+        crate::setup::said(
             "The built-in expert is stopped; setup leaves it stopped. Use st setup --onboarding to begin again explicitly."
         );
         return Ok(None);
@@ -167,7 +167,7 @@ pub async fn start(config: &Config, harness: &str, rerun: bool) -> Result<Option
         .await?
         .context("built-in expert disappeared during publication")?;
     if current.kind.as_deref() != Some("agent") {
-        println!("The built-in expert was stopped; setup leaves it stopped.");
+        crate::setup::said("The built-in expert was stopped; setup leaves it stopped.");
         return Ok(None);
     }
     anyhow::ensure!(
@@ -210,7 +210,7 @@ pub async fn start(config: &Config, harness: &str, rerun: bool) -> Result<Option
         }
         return Err(error);
     }
-    println!(
+    crate::setup::said(
         "Started mission/st/onboarding with agent/st/expert. The expert stays available after onboarding."
     );
     Ok(Some(EXPERT_SUBJECT.into()))
@@ -221,7 +221,7 @@ fn declaration_changed(rerun: bool) -> Result<Option<String>> {
         !rerun,
         "the built-in expert changed during setup; retry setup to inspect its new state"
     );
-    println!(
+    crate::setup::said(
         "The onboarding declarations changed concurrently; ordinary setup preserves their current state. Run st setup again if onboarding has not started."
     );
     Ok(None)

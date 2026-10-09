@@ -14,6 +14,7 @@ mod contract;
 pub mod conversation;
 pub mod demo;
 pub mod doc;
+pub mod checklist;
 mod edit;
 mod glass;
 mod hover;

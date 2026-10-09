@@ -44,6 +44,11 @@ pub struct Config {
     /// What this node does when an account nears its weekly limit. Off unless enabled.
     #[serde(skip_serializing_if = "LimitsConfig::is_default")]
     pub limits: LimitsConfig,
+    /// How far Codex seats may go without asking: `ask`, `workspace` or `full`. Setup stores the
+    /// person's choice; unset keeps the launch the build already uses. Written only when set, so
+    /// a config this build writes still loads in a build that does not know the setting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_access: Option<String>,
     /// `STATE/fleet/fleet.toml`, merged by `apply_fleet_file` after command-line overrides.
     #[serde(skip)]
     pub fleet: Option<FleetFile>,
@@ -216,6 +221,7 @@ impl Default for Config {
             github: GithubConfig::default(),
             checkpoint: CheckpointConfig::default(),
             limits: LimitsConfig::default(),
+            codex_access: None,
             fleet: None,
         }
     }
@@ -329,6 +335,12 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         self.github.validate()?;
+        anyhow::ensure!(
+            self.codex_access
+                .as_deref()
+                .is_none_or(|value| matches!(value, "ask" | "workspace" | "full")),
+            "codex_access must be ask, workspace or full"
+        );
         anyhow::ensure!(
             matches!(
                 self.planner.provider.as_str(),

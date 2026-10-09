@@ -512,7 +512,7 @@ fn archive_setup_installs_st_and_starts_one_isolated_daemon_without_gh_or_harnes
 }
 
 #[test]
-fn plain_st_first_run_asks_names_starts_daemon_and_opens_home() {
+fn plain_st_first_run_shows_the_setup_screen_starts_daemon_and_opens_home() {
     if st3::test_support::supervise_test() {
         return;
     }
@@ -562,10 +562,11 @@ fn plain_st_first_run_asks_names_starts_daemon_and_opens_home() {
     });
     let mut output = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(45);
+    // The checklist screen, driven by keys: the machine's name is cleared and typed, "Start st when
+    // I log in" is unticked, and the one action is pressed. Without any agent installed it ends
+    // by itself and the interface opens.
     for (prompt, answer) in [
-        ("Your name", "ada\n"),
-        ("This machine's name", "studio\n"),
-        ("Keep st running in the background", "n\n"),
+        ("Smalltalk setup", "\t\u{15}studio\t \t\r"),
         ("Nothing needs you right now.", "\u{11}"),
     ] {
         while !String::from_utf8_lossy(&output).contains(prompt) {
@@ -769,4 +770,191 @@ async fn onboarding_publication_is_graph_decided_and_preserves_stopped_expert() 
         stopped
     );
     server.abort();
+}
+
+/// Run `command` in a PTY and play `steps` at it: for each, wait until the screen has shown
+/// `prompt`, then type `keys`. Returns the exit status text and all the output.
+fn play(
+    mut command: portable_pty::CommandBuilder,
+    steps: &[(&str, &str)],
+    fixture: &mut Fixture,
+) -> (bool, String) {
+    let pair = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 50,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    command.env_clear();
+    for (name, value) in [
+        ("HOME", fixture.path("home")),
+        ("PATH", fixture.path("bin")),
+        ("XDG_CONFIG_HOME", fixture.path("home/.config")),
+        ("XDG_STATE_HOME", fixture.path("home/.local/state")),
+        ("XDG_RUNTIME_DIR", fixture.path("run")),
+    ] {
+        command.env(name, value);
+    }
+    command.env("USER", "ada");
+    command.env("TERM", "xterm-256color");
+    command.cwd(fixture.root.path());
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reading = std::thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        while let Ok(count) = reader.read(&mut buffer) {
+            if count == 0 || sender.send(buffer[..count].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut output = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    for (prompt, keys) in steps {
+        while !String::from_utf8_lossy(&output).contains(prompt) {
+            assert!(
+                Instant::now() < deadline,
+                "missing {prompt}: {}",
+                String::from_utf8_lossy(&output[output.len().saturating_sub(4096)..])
+            );
+            if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(100)) {
+                output.extend(bytes);
+            }
+            if let Some(readiness) = st3::startup::read(&fixture.path("run/st3.sock")) {
+                fixture.daemon_pid = Some(readiness.pid);
+            }
+        }
+        writer.write_all(keys.as_bytes()).unwrap();
+        writer.flush().unwrap();
+    }
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(50)) {
+            output.extend(bytes);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!(
+                "the command did not finish: {}",
+                String::from_utf8_lossy(&output[output.len().saturating_sub(4096)..])
+            );
+        }
+    };
+    drop(writer);
+    drop(pair.master);
+    let _ = reading.join();
+    while let Ok(bytes) = receiver.try_recv() {
+        output.extend(bytes);
+    }
+    (status.success(), String::from_utf8_lossy(&output).into_owned())
+}
+
+fn fake(fixture: &Fixture, name: &str, script: &str) {
+    let path = fixture.path("bin").join(name);
+    fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn the_setup_screen_sets_up_each_agent_on_its_own_and_stores_the_codex_choice() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.unpack_archive();
+    // Codex has never been signed in: its own login writes the file setup looks for. Pi starts but
+    // keeps its sign-in where st cannot read it. Omp is installed and broken.
+    // The fake programs run with only the fixture's PATH, so they use shell built-ins alone.
+    fs::create_dir_all(fixture.path("home/.codex")).unwrap();
+    fake(
+        &fixture,
+        "codex",
+        "case \"$1\" in --version) echo codex-cli 0.0.0-test;; login) echo '{\"tokens\":{}}' > \"$HOME/.codex/auth.json\";; esac",
+    );
+    fake(&fixture, "pi", "echo pi 0.0.0-test");
+    fake(&fixture, "omp", "echo 'cannot load libomp.so.1' >&2; exit 3");
+    let mut command = portable_pty::CommandBuilder::new(fixture.path("archive/st"));
+    command.args([
+        "setup", "--person", "ada", "--node", "studio", "--install", "false", "--start", "false",
+        "--service", "false",
+    ]);
+    // Name, machine, start-at-login, then the three found agents, the Codex box and its levels.
+    let (success, output) = play(
+        command,
+        &[
+            ("Smalltalk setup", "\t\t\t\t\t\t \t\t \t\r"),
+            ("Codex is asking you to sign in", ""),
+            ("did not finish", "\x1b"),
+        ],
+        &mut fixture,
+    );
+    let text = String::from_utf8_lossy(output.as_bytes());
+    assert!(text.contains("Let Codex work without asking"), "{text}");
+    // The terminal went to Codex for its sign-in and came back to the same screen.
+    assert!(text.contains("Codex is asking you to sign in"), "{text}");
+    assert!(text.contains("Ready. codex-cli 0.0.0-test") || text.contains("codex starts (codex-cli 0.0.0-test)"), "{text}");
+    assert!(text.contains("Sign-in is checked when the first agent starts"), "{text}");
+    // A broken agent is told whole, and does not stop the others.
+    assert!(text.contains("cannot load libomp.so.1"), "{text}");
+    assert!(text.contains("Codex: ready."), "{text}");
+    assert!(text.contains("Pi: ready."), "{text}");
+    assert!(text.contains("Omp: failed."), "{text}");
+    assert!(success || text.contains("Omp: failed."), "{text}");
+    let table: toml::Table =
+        toml::from_str(&fs::read_to_string(fixture.path("home/.config/st3/config.toml")).unwrap())
+            .unwrap();
+    assert_eq!(table["person"].as_str(), Some("person/ada"));
+    assert_eq!(table["node"].as_str(), Some("studio"));
+    assert_eq!(table["codex_access"].as_str(), Some("full"));
+}
+
+#[test]
+fn leaving_the_setup_screen_before_the_button_changes_nothing() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.unpack_archive();
+    let mut command = portable_pty::CommandBuilder::new(fixture.path("archive/st"));
+    command.args(["setup", "--install", "false", "--start", "false", "--service", "false"]);
+    let (success, output) = play(command, &[("Smalltalk setup", "\x1b")], &mut fixture);
+    assert!(!success, "{output}");
+    assert!(output.contains("setup was cancelled; nothing was changed"), "{output}");
+    assert!(!fixture.path("home/.config/st3/config.toml").exists());
+    assert!(!fixture.path("home/.local").exists(), "no state was created");
+}
+
+#[test]
+fn skipping_sets_up_st_and_no_agent() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.unpack_archive();
+    fake(&fixture, "pi", "echo pi 0.0.0-test");
+    let mut command = portable_pty::CommandBuilder::new(fixture.path("archive/st"));
+    command.args([
+        "setup", "--person", "ada", "--node", "studio", "--install", "false", "--start", "false",
+        "--service", "false",
+    ]);
+    // Name, machine, login box, the Pi row, then the two buttons: Tab to Skip for now.
+    let (success, output) = play(
+        command,
+        &[("Smalltalk setup", "\t\t\t\t\t\r"), ("st is set up", "\r")],
+        &mut fixture,
+    );
+    assert!(success, "{output}");
+    assert!(!output.contains("Pi: ready"), "no agent was set up:\n{output}");
+    let table: toml::Table =
+        toml::from_str(&fs::read_to_string(fixture.path("home/.config/st3/config.toml")).unwrap())
+            .unwrap();
+    assert_eq!(table["person"].as_str(), Some("person/ada"));
+    assert!(table.get("codex_access").is_none(), "no Codex, so no setting");
 }
