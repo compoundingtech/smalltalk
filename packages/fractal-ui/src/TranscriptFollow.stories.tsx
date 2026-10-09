@@ -235,7 +235,7 @@ export const ThreadSwitch: Story = { play: async ({ canvasElement }) => {
   await frame()
   const returned = Array.from(canvas.getByTestId('transcript-scroll').querySelectorAll<HTMLElement>('[data-follow-anchor]')).find(node => node.textContent === text)!
   const restoredViewport = canvas.getByTestId('transcript-scroll')
-  await expect(Math.abs(returned.getBoundingClientRect().top - restoredViewport.getBoundingClientRect().top - offset)).toBeLessThanOrEqual(2)
+  await waitFor(() => expect(Math.abs(returned.getBoundingClientRect().top - restoredViewport.getBoundingClientRect().top - offset)).toBeLessThanOrEqual(2))
   const jump = await waitFor(() => canvas.getByRole('button', { name: jumpName }))
   await userEvent.click(jump)
   await expectAttached(canvasElement, restoredViewport)

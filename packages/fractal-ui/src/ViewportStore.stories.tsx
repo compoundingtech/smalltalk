@@ -19,7 +19,7 @@ function StoreStory({ scheme = 'dark', virtual = false }: { scheme?: Scheme; vir
   const [captured, setCaptured] = React.useState<ReadonlyArray<{ key: string; state: ViewportState }>>([])
   const rows = React.useMemo(() => Array.from({ length: 80 }, (_, index) => ({ id: `entry-${index}`, text: `Reading entry ${index + 1}: browser-local positions remain stable while another tab shares a newer position.` })), [])
   React.useLayoutEffect(() => store.subscribe(() => setNotifications(value => value + 1)), [store])
-  const renderRow = (row: typeof rows[number]) => <article data-item-id={row.id} {...stylex.props(styles.row)}><p data-follow-anchor {...stylex.props(styles.paragraph)}>{row.text}</p></article>
+  const renderRow = (row: typeof rows[number]) => <article data-item-id={row.id} {...stylex.props(styles.row)}><p data-follow-anchor {...stylex.props(styles.paragraph)}>{row.text}</p>{row.id === 'entry-79' && <Button {...stylex.props(styles.button)} onPress={() => setCaptured(store.snapshot())}>Capture latest reading position</Button>}</article>
   return <ViewportStoreContext.Provider value={store}><main {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme, virtual && scheme === 'dark' && virtualDarkTheme)}>
     <div {...stylex.props(styles.toolbar)}>
       <Button {...stylex.props(styles.button)} onPress={() => setCaptured(store.snapshot())}>Capture active position</Button>
