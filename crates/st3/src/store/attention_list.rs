@@ -29,8 +29,8 @@ const DELTA_LIMIT: usize = 10_000;
 
 /// Claim kinds that no attention source reads, whatever their subject: harness timelines and
 /// usage, messages (attention leaves messages to conversations), transport and workspace
-/// observations, daemon diagnostics, and a person's glasses and arrangements. Work progress and
-/// lease renewals move no step's status, run or ask. These are most of a busy host's claims.
+/// observations, daemon diagnostics, and a person's glasses and arrangements. Lease renewals
+/// move no step's status, run or ask. These are most of a busy host's claims.
 const UNREAD_KINDS: &[&str] = &[
     "harness.timeline",
     "harness.usage",
@@ -45,8 +45,17 @@ const UNREAD_KINDS: &[&str] = &[
     "glass.upserted",
     "glass.deleted",
     "arrangement.edited",
-    "work.progress",
     "work.renewed",
+];
+
+/// Runtime observations a seat writes over and over that attention reads only as the actual
+/// state of a retiring requester (`rollouts::retiring_ask_live`) or as a seat's runtime epoch
+/// for its login item. Every other kind on a seat (its declaration, its queue) folds.
+const SEAT_RUNTIME_KINDS: &[&str] = &[
+    "runtime.observed",
+    "runtime.reconcile-decision",
+    "runtime.restart-window-reset",
+    "transport.future-observed",
 ];
 
 /// The rows of one attention fold and the cut they were folded at.
@@ -58,6 +67,13 @@ pub(crate) struct AttentionPublication {
     pub(crate) projection: Option<(String, u64)>,
     /// The clock the rows were evaluated at: eligibility and grace periods depend on it.
     pub(crate) evaluated_at_unix_ms: u128,
+    /// The earliest acceptance time after `evaluated_at_unix_ms` among the claims this list's
+    /// folds and deltas read: a claim dated in the future that becomes eligible then. The
+    /// rows are evaluated again at that time, not only at the clock period.
+    pub(crate) due_at_unix_ms: Option<u128>,
+    /// Claims after this index may still be dated after the clock the rows were evaluated at;
+    /// `None` when none is.
+    pub(crate) future_after: Option<u64>,
     /// When these rows were published, in Unix ms: the list's "as of".
     pub(crate) published_at_unix_ms: u128,
     /// Every person's rows, most urgent first, as `client_attention_resources_at` orders them.
@@ -76,6 +92,8 @@ pub(crate) struct AttentionList {
     forgotten: AtomicU64,
     /// Counts publications, same cut or not, so streams that read an earlier one reread.
     revision: tokio::sync::watch::Sender<u64>,
+    /// The graph index through which pairing changes were rechecked.
+    pairings_checked: AtomicU64,
     /// Set when the refresher task ends: no view is served after that.
     stopped: AtomicBool,
     health: [ViewHealth; PUBLISHED_VIEWS.len()],
@@ -99,8 +117,9 @@ impl AttentionList {
 /// Why the newest publication can no longer stand for the rows at a newer cut.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AttentionDelta {
-    /// Nothing attention reads changed: the same rows hold at the newer cut.
-    Unchanged,
+    /// Nothing attention reads changed: the same rows hold at the newer cut, until the
+    /// earliest future acceptance time among the claims read, if any.
+    Unchanged(Option<u128>),
     /// Fold again, and why.
     Refold(String),
 }
@@ -164,6 +183,31 @@ impl Store {
             eprintln!("st3: WARN the {view} view has failed to refresh for {} s; its windows read for themselves until it publishes again", now.saturating_sub(since) / 1000);
             self.withdraw_collection_view(view);
         }
+    }
+
+    /// A paired client's grant completed or was revoked since the last check: every window of a
+    /// served view rereads, rechecking its session, as a commit of such a claim made it before
+    /// views were published.
+    pub(crate) fn recheck_pairings(&self) -> Result<()> {
+        let list = &self.smalltalk.attention_list;
+        let checked = list.pairings_checked.load(AtomicOrdering::Acquire);
+        let index = self.index()?;
+        if checked == 0 || index <= checked {
+            list.pairings_checked.store(index.max(checked), AtomicOrdering::Release);
+            return Ok(());
+        }
+        let changed: bool = self.readers.get().prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_kind_index
+             WHERE kind IN ('custom.client.pairing-completed','custom.client.pairing-revoked')
+               AND store_index>?1 AND store_index<=?2)",
+        )?.query_row(params![checked, index], |row| row.get(0))?;
+        list.pairings_checked.store(index, AtomicOrdering::Release);
+        if changed {
+            for view in PUBLISHED_VIEWS.into_iter().filter(|view| self.published_view_serving(view)) {
+                self.publish_collection_view(view);
+            }
+        }
+        Ok(())
     }
 
     /// The refresher task ended: windows of every view read for themselves from now on.
@@ -253,6 +297,11 @@ impl Store {
         }
     }
 
+    /// How many times the published attention rows changed (or were forgotten).
+    pub(crate) fn attention_list_revision(&self) -> u64 {
+        *self.smalltalk.attention_list.revision.borrow()
+    }
+
     /// Follows the revision of attention publications, so a stream that read an earlier one
     /// rereads the newer.
     #[cfg(test)]
@@ -282,6 +331,28 @@ impl Store {
             .clone()
     }
 
+    /// When the newest list must be evaluated again with no claim: its clock period after it
+    /// was evaluated, or sooner when a claim it read becomes eligible. `None` before the first.
+    pub(crate) fn attention_list_due_at(&self, period_ms: u128) -> Option<u128> {
+        let published = self.newest_attention_list().1?;
+        let clock = published.evaluated_at_unix_ms.saturating_add(period_ms);
+        Some(published.due_at_unix_ms.map_or(clock, |due| due.min(clock)))
+    }
+
+    /// The earliest acceptance time after `now` among the claims in `(after, through]`: a
+    /// fold at `now` left them out as not yet eligible. More claims than a delta reads are
+    /// left to the clock period.
+    pub(crate) fn attention_future_since(&self, after: u64, through: u64, now: u128) -> Result<Option<u128>> {
+        if through.saturating_sub(after) > DELTA_LIMIT as u64 {
+            return Ok(None);
+        }
+        let earliest: Option<i64> = self.readers.get().prepare_cached(
+            "SELECT MIN(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims
+             WHERE store_index>?1 AND store_index<=?2 AND CAST(accepted_at_unix_ms AS INTEGER)>?3",
+        )?.query_row(params![after, through, i64::try_from(now).unwrap_or(i64::MAX)], |row| row.get(0))?;
+        Ok(earliest.and_then(|at| u128::try_from(at).ok()))
+    }
+
     /// The graph projection's health row, read in the snapshot that folds or compares.
     pub(crate) fn attention_projection_frontier(&self) -> Result<Option<(String, u64)>> {
         Ok(self
@@ -295,75 +366,169 @@ impl Store {
             .optional()?)
     }
 
-    /// Whether the rows of `previous` still hold at `index`, read in the snapshot at `index`.
-    /// Only the kinds and subjects of the claims admitted since are read, and for harness
-    /// observations whether their seat was ever asked to log in.
+    /// Whether the rows of `previous` still hold at `index`, evaluated at `now`, read in the
+    /// snapshot at `index`. Only the subjects, kinds, actors and acceptance times of the claims
+    /// admitted (or projected) since are read, and for a seat's runtime claims whether the seat
+    /// has or now needs a login item, or is retiring.
     pub(crate) fn attention_list_delta(
         &self,
         previous: &AttentionPublication,
         index: u64,
+        now: u128,
     ) -> Result<AttentionDelta> {
         if index < previous.cut {
             return Ok(AttentionDelta::Refold("older cut".into()));
         }
-        if self.attention_projection_frontier()? != previous.projection {
-            return Ok(AttentionDelta::Refold("projection".into()));
+        let mut seats = SeatChecks::new(self, previous);
+        let projection = self.attention_projection_frontier()?;
+        let mut due = None;
+        if projection != previous.projection {
+            // Deferred replication projection caught up under claims already admitted: the
+            // claims it projected decide, as if they had just arrived.
+            match (&previous.projection, &projection) {
+                (Some((before, after)), Some((status, through)))
+                    if before == status && after <= through =>
+                {
+                    if let Some(cause) = self.attention_claims_matter(&mut seats, *after, *through, now, &mut due)? {
+                        return Ok(AttentionDelta::Refold(format!("projection {cause}")));
+                    }
+                }
+                _ => return Ok(AttentionDelta::Refold("projection".into())),
+            }
         }
-        if index == previous.cut {
-            return Ok(AttentionDelta::Unchanged);
+        if index > previous.cut
+            && let Some(cause) =
+                self.attention_claims_matter(&mut seats, previous.cut, index, now, &mut due)?
+        {
+            return Ok(AttentionDelta::Refold(cause));
         }
-        let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(
-            "SELECT subject, kind FROM claims WHERE store_index>?1 AND store_index<=?2
-             ORDER BY store_index LIMIT ?3",
-        )?;
-        let claims = statement
-            .query_map(
-                params![previous.cut, index, DELTA_LIMIT as u64 + 1],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(AttentionDelta::Unchanged(due))
+    }
+
+    /// The first reason a claim in `(after, through]` can change the attention list, if any,
+    /// noting in `due` the earliest acceptance time after `now` among them.
+    fn attention_claims_matter(
+        &self,
+        seats: &mut SeatChecks<'_>,
+        after: u64,
+        through: u64,
+        now: u128,
+        due: &mut Option<u128>,
+    ) -> Result<Option<String>> {
+        let claims = {
+            let connection = self.readers.get();
+            let mut statement = connection.prepare_cached(
+                "SELECT subject, kind, actor, CAST(accepted_at_unix_ms AS TEXT) FROM claims
+                 WHERE store_index>?1 AND store_index<=?2 ORDER BY store_index LIMIT ?3",
+            )?;
+            statement
+                .query_map(params![after, through, DELTA_LIMIT as u64 + 1], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
         if claims.len() > DELTA_LIMIT {
-            return Ok(AttentionDelta::Refold("many".into()));
+            return Ok(Some("many".into()));
         }
-        let mut logins = HashMap::<String, bool>::new();
-        let mut retiring = HashMap::<String, bool>::new();
-        for (subject, kind) in claims {
+        for (subject, kind, actor, accepted) in claims {
+            let accepted = accepted.parse::<u128>().unwrap_or(0);
+            if accepted > now {
+                *due = Some(due.map_or(accepted, |due: u128| due.min(accepted)));
+            }
             if UNREAD_KINDS.contains(&kind.as_str()) {
                 continue;
             }
-            // Harness observations and diagnostics reach attention only through a harness login
-            // item, and only for a seat with a login-shaped claim: the candidates
-            // `desired_harness_login_candidates` reads. A seat never asked to log in has none
-            // before this claim or after it.
-            let login = matches!(kind.as_str(), "harness.observed" | "harness.diagnostic" | "runtime.observed");
-            if login {
-                let candidate = match logins.get(&subject) {
-                    Some(candidate) => *candidate,
-                    None => {
-                        let candidate = harness_login_candidate(&connection, &subject)?;
-                        logins.insert(subject.clone(), candidate);
-                        candidate
-                    }
-                };
-                // A runtime observation is also the actual state an ask from a retiring seat
-                // reads (`rollouts::retiring_ask_live`), and only while its declaration is a stop.
-                let stopping = kind == "runtime.observed"
-                    && match retiring.get(&subject) {
-                        Some(stopping) => *stopping,
-                        None => {
-                            let stopping = declared_stop(&connection, &subject)?;
-                            retiring.insert(subject.clone(), stopping);
-                            stopping
-                        }
-                    };
-                if !candidate && !stopping {
-                    continue;
+            let matters = if kind == "work.progress" {
+                // Work by a seat counts as its activity in the login fold: it can only clear a
+                // login item the seat already has.
+                match actor.as_deref().filter(|actor| actor.starts_with("agent/")) {
+                    Some(seat) => seats.has_login_item(seat),
+                    None => false,
                 }
+            } else if kind.starts_with("harness.") {
+                seats.has_login_item(&subject) || seats.needs_login(&subject)?
+            } else if SEAT_RUNTIME_KINDS.contains(&kind.as_str()) {
+                seats.has_login_item(&subject)
+                    || seats.needs_login(&subject)?
+                    || seats.retiring(&subject)?
+            } else {
+                true
+            };
+            if matters {
+                return Ok(Some(kind));
             }
-            return Ok(AttentionDelta::Refold(kind));
         }
-        Ok(AttentionDelta::Unchanged)
+        Ok(None)
+    }
+}
+
+/// What one delta asks about seats, each answered once: whether the previous rows hold its
+/// login item, whether it needs a login now, and whether it is retiring.
+struct SeatChecks<'a> {
+    store: &'a Store,
+    previous: &'a AttentionPublication,
+    login_items: Option<BTreeSet<String>>,
+    needs_login: HashMap<String, bool>,
+    retiring: HashMap<String, bool>,
+}
+
+impl<'a> SeatChecks<'a> {
+    fn new(store: &'a Store, previous: &'a AttentionPublication) -> Self {
+        Self {
+            store,
+            previous,
+            login_items: None,
+            needs_login: HashMap::new(),
+            retiring: HashMap::new(),
+        }
+    }
+
+    /// Whether the previous rows hold a login item for `seat`: any claim about it can change
+    /// that item, its episode or its removal.
+    fn has_login_item(&mut self, seat: &str) -> bool {
+        let previous = self.previous;
+        self.login_items
+            .get_or_insert_with(|| {
+                previous
+                    .rows
+                    .iter()
+                    .filter(|row| row["attention_kind"] == "harness-login")
+                    .filter_map(|row| row["source_id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .contains(seat)
+    }
+
+    /// Whether `seat`'s harness needs a login at this snapshot, by the login fold attention
+    /// itself uses: it answers at once for a seat with no login evidence in its runtime epoch.
+    fn needs_login(&mut self, seat: &str) -> Result<bool> {
+        if !seat.starts_with("agent/") {
+            return Ok(false);
+        }
+        if let Some(needs) = self.needs_login.get(seat) {
+            return Ok(*needs);
+        }
+        let needs = self
+            .store
+            .current_harness_for_login(seat)?
+            .is_some_and(|harness| harness.state == "needs-login");
+        self.needs_login.insert(seat.to_owned(), needs);
+        Ok(needs)
+    }
+
+    /// Whether `seat`'s current declaration is a stop: only then can its asks read its runtime.
+    fn retiring(&mut self, seat: &str) -> Result<bool> {
+        if let Some(retiring) = self.retiring.get(seat) {
+            return Ok(*retiring);
+        }
+        let retiring = declared_stop(&self.store.readers.get(), seat)?;
+        self.retiring.insert(seat.to_owned(), retiring);
+        Ok(retiring)
     }
 }
 
@@ -375,25 +540,6 @@ fn declared_stop(connection: &Connection, subject: &str) -> Result<bool> {
         .query_row([subject], |row| row.get(0))
         .optional()?
         .unwrap_or(false))
-}
-
-/// Whether `subject` has a claim that makes it a harness login candidate, by the same indexed
-/// predicate `desired_harness_login_candidates` uses.
-fn harness_login_candidate(connection: &Connection, subject: &str) -> Result<bool> {
-    Ok(connection
-        .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_harness_login_candidate_index
-                 WHERE claims.subject=?1 AND (
-                   (kind='harness.observed' AND (
-                     json_type(body, '$.fields.provider_auth')='false'
-                     OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
-                         THEN '$.reason' ELSE '$.fields.reason' END)='providerAuth'
-                     OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
-                         THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
-                   OR (kind='harness.diagnostic'
-                     AND json_extract(body, '$.fields.code')='provider-auth-expired')))",
-        )?
-        .query_row([subject], |row| row.get(0))?)
 }
 
 #[cfg(test)]

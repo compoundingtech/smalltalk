@@ -141,6 +141,22 @@ fn claims_attention_never_reads_republish_the_same_rows_without_a_fold() {
     store
         .append_claim(&input("host/one", "transport.observed", None, json!({"status":"up"})))
         .unwrap();
+    store
+        .append_claim(&input(
+            "glass/person/avery/019a0000-0000-7000-8000-000000000001",
+            "glass.upserted",
+            Some("person/avery"),
+            json!({"body":{"name":"Desk","layout":{"tabs":[{"pane":"opaque:anything"}]}},"base_revision":null}),
+        ))
+        .unwrap();
+    store
+        .append_client_claim(&input(
+            "arrangement/person/avery/019a0000-0000-7000-8000-000000000002",
+            "arrangement.edited",
+            Some("person/avery"),
+            json!({"owner":"person/avery","operations":[{"op":"create","name":"Work"}]}),
+        ))
+        .unwrap();
     // A seat that was never asked to log in and is not retiring: neither its harness nor its
     // runtime observations reach attention.
     store
@@ -284,6 +300,8 @@ fn a_checkpoint_forgets_the_list_and_a_refresh_from_before_it_cannot_publish() {
             cut: before.cut,
             projection: before.projection.clone(),
             evaluated_at_unix_ms: before.evaluated_at_unix_ms,
+            due_at_unix_ms: None,
+            future_after: None,
             published_at_unix_ms: now_ms(),
             rows: Arc::clone(&before.rows),
         },
@@ -295,25 +313,50 @@ fn a_checkpoint_forgets_the_list_and_a_refresh_from_before_it_cannot_publish() {
 }
 
 #[test]
-fn a_projection_change_under_the_same_claims_folds_again() {
+fn a_projection_catching_up_folds_only_when_the_claims_it_projected_matter() {
     let (store, _, request) = fixture();
     store.start_attention_list_refresher().unwrap();
+    let project_through = |through: u64| {
+        store
+            .connection
+            .write()
+            .execute(
+                "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
+                 VALUES ('graph', 'healthy', ?1, '0')
+                 ON CONFLICT(aggregate) DO UPDATE SET status='healthy', last_good_store_index=?1",
+                [through],
+            )
+            .unwrap();
+    };
+    // Replication projection deferred past the ask: the list is published with that frontier.
+    let before_ask = store.index().unwrap();
     store.ask_person(&request).unwrap();
+    project_through(before_ask);
     refresh_and_check(&store);
     let folded = folds(&store);
-    store
-        .connection
-        .write()
-        .execute(
-            "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
-             VALUES ('graph', 'healthy', 1, '0')
-             ON CONFLICT(aggregate) DO UPDATE SET last_good_store_index=last_good_store_index+1",
-            [],
-        )
-        .unwrap();
+    // Catching up over the ask folds; over a message alone it does not.
+    project_through(store.index().unwrap());
     refresh_and_check(&store);
     assert_eq!(folds(&store), folded + 1);
-    assert_eq!(store.attention_list_folds().get("projection"), Some(&1));
+    assert!(
+        store.attention_list_folds().keys().any(|cause| cause.starts_with("projection ")),
+        "{:?}",
+        store.attention_list_folds()
+    );
+    let before_note = store.index().unwrap();
+    store
+        .append_claim(&input(
+            "message/seed-note",
+            "message.sent",
+            Some("person/robin"),
+            json!({"from":"person/robin","to":"agent/alder.asker","content":"A note","status":"sent"}),
+        ))
+        .unwrap();
+    project_through(before_note);
+    refresh_and_check(&store);
+    project_through(store.index().unwrap());
+    refresh_and_check(&store);
+    assert_eq!(folds(&store), folded + 1, "a projected message folds nothing");
 }
 
 #[test]
@@ -330,6 +373,8 @@ fn rows_older_than_the_clock_period_fold_again() {
             cut: before.cut,
             projection: before.projection.clone(),
             evaluated_at_unix_ms: stale,
+            due_at_unix_ms: None,
+            future_after: None,
             published_at_unix_ms: before.published_at_unix_ms,
             rows: Arc::clone(&before.rows),
         },
@@ -347,11 +392,13 @@ fn delta_reads_only_claims_since_the_cut() {
     let before = refresh_and_check(&store);
     let index = store.index().unwrap();
     assert_eq!(
-        store.read_snapshot(|index| store.attention_list_delta(&before, index)).unwrap(),
-        AttentionDelta::Unchanged
+        store.read_snapshot(|index| store.attention_list_delta(&before, index, now_ms())).unwrap(),
+        AttentionDelta::Unchanged(None)
     );
     store.ask_person(&request).unwrap();
-    let delta = store.read_snapshot(|index| store.attention_list_delta(&before, index)).unwrap();
+    let delta = store
+        .read_snapshot(|index| store.attention_list_delta(&before, index, now_ms()))
+        .unwrap();
     assert!(matches!(delta, AttentionDelta::Refold(_)), "{delta:?}");
     assert!(store.index().unwrap() > index);
 }
@@ -386,4 +433,31 @@ fn a_view_failing_for_its_limit_is_withdrawn_until_it_publishes_again() {
         assert!(!store.published_view_serving(view));
         assert!(!store.collection_view_published(view));
     }
+}
+
+#[test]
+fn an_ask_dated_in_the_future_appears_when_it_is_due_without_another_claim() {
+    let (store, _, request) = fixture();
+    store.start_attention_list_refresher().unwrap();
+    refresh_and_check(&store);
+    let accepted = now_ms() + 400;
+    store.set_write_clock_at(accepted).unwrap();
+    let ask = store.ask_person(&request).unwrap();
+    let asked = crate::store::person_work::request(&store.readers.get(), &ask.subject)
+        .unwrap()
+        .expect("the ask")
+        .accepted_at_unix_ms;
+    assert!(asked >= accepted);
+    let early = refresh_and_check(&store);
+    assert!(early.rows.iter().all(|row| row["source_id"] != ask.subject), "not yet eligible");
+    assert_eq!(early.due_at_unix_ms, Some(accepted));
+    assert_eq!(store.attention_list_due_at(30_000), Some(accepted));
+    // Once it is due, a refresh with no new claim folds it in.
+    while now_ms() < asked {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let due = refresh_and_check(&store);
+    assert!(due.rows.iter().any(|row| row["source_id"] == ask.subject));
+    assert_eq!(due.cut, early.cut);
+    assert_eq!(store.attention_list_folds().get("due"), Some(&1));
 }
