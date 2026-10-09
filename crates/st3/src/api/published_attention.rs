@@ -56,9 +56,13 @@ pub fn start_attention_list(state: &AppState) {
             let attention = store.attention_list_read_within(idle)
                 || store.newest_attention_list().1.is_none();
             // One view at a time: attention, every person's glasses and arrangements, then the
-            // summary rows windows read.
-            // One view's failure leaves the others refreshing.
+            // summary rows windows read. One view's failure leaves the others refreshing.
             let refreshed = tokio::task::spawn_blocking(move || {
+                // A pairing completed or revoked since the last pass changes which windows a
+                // session may hold; their windows reread to recheck it, as before.
+                if let Err(error) = reader.recheck_pairings() {
+                    eprintln!("st3: pairing recheck for published views failed: {error:#}");
+                }
                 [
                     ("attention", crate::performance::task("attention/refresh", || {
                         if attention { refresh_attention_list(&reader) } else { Ok(()) }
@@ -95,7 +99,34 @@ pub fn start_attention_list(state: &AppState) {
                     }
                 }
             }
+            // A summary selection a window is waiting for is computed at once, without the
+            // pause; it is computed only once its selection is registered.
+            if store.summary_selection_waiting() {
+                let summary_state = state.clone();
+                let refreshed = tokio::task::spawn_blocking(move || {
+                    crate::performance::task("summary/refresh", || {
+                        super::client_v0::summary::refresh_published(
+                            &summary_state,
+                            ATTENTION_LIST_IDLE.as_millis() as u64,
+                        )
+                    })
+                })
+                .await;
+                if let Ok(result) = &refreshed
+                    && let Err(error) = result
+                {
+                    eprintln!("st3: summary view refresh failed: {error:#}");
+                }
+                store.note_view_refreshed("summary", matches!(refreshed, Ok(Ok(_))));
+            }
             tokio::time::sleep(started.elapsed().max(ATTENTION_LIST_REFRESH_PAUSE)).await;
+            // Attention is evaluated again when its clock period ends or a claim it read
+            // becomes eligible, counted from when it was evaluated, not from this wait.
+            let due = store
+                .attention_list_due_at(ATTENTION_LIST_CLOCK.as_millis())
+                .map_or(ATTENTION_LIST_CLOCK, |due| {
+                    Duration::from_millis(due.saturating_sub(client_now_ms()) as u64)
+                });
             // A glasses or arrangements window rereads only when its view publishes, so every
             // commit is weighed; with nothing changed that is a few indexed reads.
             tokio::select! {
@@ -111,7 +142,7 @@ pub fn start_attention_list(state: &AppState) {
                         return;
                     }
                 }
-                () = tokio::time::sleep(ATTENTION_LIST_CLOCK) => {}
+                () = tokio::time::sleep(due) => {}
             }
         }
     });
@@ -120,28 +151,37 @@ pub fn start_attention_list(state: &AppState) {
 /// Publish the list at the current cut in one short snapshot: the same rows when nothing
 /// attention reads changed since the newest publication, else a fold of every person's rows.
 /// A fold that comes out equal keeps the published rows, so windows have nothing to reread.
+/// The clock is read inside the snapshot: every local claim in it was accepted before then.
 pub(crate) fn refresh_attention_list(store: &Store) -> anyhow::Result<()> {
     let (generation, previous) = store.newest_attention_list();
-    let now = client_now_ms();
     let clock = ATTENTION_LIST_CLOCK.as_millis();
     store.read_snapshot(|index| {
-        let cause = match &previous {
-            None => Some("first".to_owned()),
+        let now = client_now_ms();
+        let (cause, due) = match &previous {
+            None => (Some("first".to_owned()), None),
             Some(previous)
                 if now < previous.evaluated_at_unix_ms
                     || now - previous.evaluated_at_unix_ms >= clock =>
             {
-                Some("clock".to_owned())
+                (Some("clock".to_owned()), None)
             }
-            Some(previous) => match store.attention_list_delta(previous, index)? {
-                AttentionDelta::Unchanged if previous.cut == index => return Ok(()),
-                AttentionDelta::Unchanged => None,
-                AttentionDelta::Refold(cause) => Some(cause),
+            Some(previous) if previous.due_at_unix_ms.is_some_and(|due| now >= due) => {
+                (Some("due".to_owned()), None)
+            }
+            Some(previous) => match store.attention_list_delta(previous, index, now)? {
+                AttentionDelta::Unchanged(None) if previous.cut == index => return Ok(()),
+                AttentionDelta::Unchanged(due) => (None, due),
+                AttentionDelta::Refold(cause) => (Some(cause), None),
             },
         };
         let projection = store.attention_projection_frontier()?;
-        let (rows, evaluated_at_unix_ms) = match (cause, &previous) {
-            (None, Some(previous)) => (Arc::clone(&previous.rows), previous.evaluated_at_unix_ms),
+        let (rows, evaluated_at_unix_ms, due_at_unix_ms, future_after) = match (cause, &previous) {
+            (None, Some(previous)) => {
+                // Still pending future acceptance times stand beside the new ones.
+                let due = [previous.due_at_unix_ms, due].into_iter().flatten().min();
+                let future_after = due.and(previous.future_after.or(Some(previous.cut)));
+                (Arc::clone(&previous.rows), previous.evaluated_at_unix_ms, due, future_after)
+            }
             (cause, _) => {
                 store.note_attention_list_fold(cause.as_deref().unwrap_or("first"));
                 let rows = client_attention_resources_at(store, None, false, now)?;
@@ -149,7 +189,17 @@ pub(crate) fn refresh_attention_list(store: &Store) -> anyhow::Result<()> {
                     Some(previous) if *previous.rows == rows => Arc::clone(&previous.rows),
                     _ => Arc::new(rows),
                 };
-                (rows, now)
+                // Claims dated after `now` were folded as not yet eligible: those since the
+                // previous cut, and earlier ones still pending. Evaluate again when the first
+                // of them is.
+                let start = previous
+                    .as_ref()
+                    .map(|previous| previous.future_after.unwrap_or(previous.cut).min(previous.cut));
+                let due = match start {
+                    Some(start) if start < index => store.attention_future_since(start, index, now)?,
+                    _ => None,
+                };
+                (rows, now, due, due.and(start))
             }
         };
         let changed = previous
@@ -161,6 +211,8 @@ pub(crate) fn refresh_attention_list(store: &Store) -> anyhow::Result<()> {
                 cut: index,
                 projection,
                 evaluated_at_unix_ms,
+                due_at_unix_ms,
+                future_after,
                 published_at_unix_ms: client_now_ms(),
                 rows,
             },
