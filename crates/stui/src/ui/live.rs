@@ -219,6 +219,7 @@ enum Fetched {
     /// st started an agent asked for here.
     /// st started a shell asked for here.
     TerminalStarted(String),
+    MachinesFailed(String),
     /// A direct stream to an agent's (or a shell's) PTY session.
     Native {
         agent: String,
@@ -387,6 +388,12 @@ pub fn run(context: Context) -> Result<()> {
     let mut clients_read: Option<Instant> = None;
     let mut clients_reading = false;
     let mut usage_reading = false;
+    // The machine list has no stream of its own, and a cached copy can be days old. It is read
+    // again when a connection goes live and whenever st's live summary counts a different number
+    // of machines, never on a timer.
+    let mut machines_stale = true;
+    let mut machines_reading = false;
+    let mut summary_machines: Option<u64> = None;
     // The palette's conversation search: what st was last asked, and what is typed since when.
     let mut said_asked: Option<String> = None;
     let mut said_typed: Option<(String, Instant)> = None;
@@ -422,6 +429,7 @@ pub fn run(context: Context) -> Result<()> {
                 feed::Update::GlassesVersion(version) => super::set_glasses_version(version),
                 feed::Update::Connected(member) => {
                     client = member;
+                    machines_stale = true;
                     extras.live = false;
                     attached = None;
                     shown_tab = usize::MAX;
@@ -457,6 +465,11 @@ pub fn run(context: Context) -> Result<()> {
                             Resource::Summary(summary) => Some(summary.clone()),
                             _ => None,
                         });
+                        let counted = extras.summary.as_ref().map(machines_counted);
+                        if counted != summary_machines {
+                            summary_machines = counted;
+                            machines_stale = true;
+                        }
                         changed = true;
                         continue;
                     }
@@ -642,7 +655,15 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::Sessions(native) => {
                     model.sessions = native;
                 }
-                Fetched::Machines(machines) => model.machines = machines,
+                Fetched::Machines(machines) => {
+                    machines_reading = false;
+                    model.machines = machines;
+                }
+                Fetched::MachinesFailed(why) => {
+                    // Asked again when the connection or st's count changes, not at once.
+                    machines_reading = false;
+                    ui.flash(format!("Could not load machines: {why}"));
+                }
                 Fetched::Older {
                     target,
                     session_id,
@@ -809,6 +830,19 @@ pub fn run(context: Context) -> Result<()> {
                     }
                 });
             }
+        }
+        // The machines shown follow the live connection and st's own count of them.
+        if machines_stale && extras.live && !machines_reading {
+            machines_stale = false;
+            machines_reading = true;
+            let client = client.clone();
+            let tx = fetched_tx.clone();
+            runtime.spawn(async move {
+                let _ = tx.send(match model::read_machines(&client).await {
+                    Ok(collection) => Fetched::Machines(collection),
+                    Err(error) => Fetched::MachinesFailed(error.to_string()),
+                });
+            });
         }
         // Ctrl+K asks st's conversation search once what is typed has been still for a moment;
         // an answer to an earlier query is dropped where it lands (Ui::said_choices).
@@ -2265,6 +2299,24 @@ async fn send_message(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_different_machine_count_in_the_live_summary_means_the_machine_list_is_out_of_date() {
+        let summary = |connected: u64, indirect: u64, offline: u64| -> st3_client::Summary {
+            serde_json::from_value(serde_json::json!({
+                "kind": "summary", "id": "summary/current", "revision": "r",
+                "updated_at": "2026-10-09T17:00:00Z",
+                "person_id": "person/ada", "needs_you": 0, "working_agents": 0, "active_missions": 0,
+                "machines": {"connected": connected, "indirect": indirect, "offline": offline},
+            }))
+            .unwrap()
+        };
+        // Four machines counted, whatever their reach; a machine list cached before the fifth joined
+        // (or before hetz2 did) holds fewer, and the next summary frame says so.
+        assert_eq!(machines_counted(&summary(3, 0, 1)), 4);
+        assert_eq!(machines_counted(&summary(2, 1, 1)), 4);
+        assert_ne!(machines_counted(&summary(3, 0, 0)), machines_counted(&summary(3, 0, 1)));
+    }
+
+    #[test]
     fn a_slow_page_stops_the_first_screen_reading_on() {
         assert!(!super::slow_page(Duration::from_millis(400)));
         assert!(super::slow_page(Duration::from_secs(2)));
@@ -3170,6 +3222,12 @@ mod tests {
         assert_eq!(plain(&lines[1]), "Finished");
         assert_eq!(plain(&lines[2]), "[redacted]");
     }
+}
+
+/// How many machines st's live summary counts. A different number than last time means the
+/// machine list stui holds, possibly a cached one days old, is out of date.
+fn machines_counted(summary: &st3_client::Summary) -> u64 {
+    summary.machines.connected + summary.machines.indirect + summary.machines.offline
 }
 
 /// A direct stream to a terminal's PTY session, and what it is.
