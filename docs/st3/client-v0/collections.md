@@ -81,10 +81,13 @@ An `error` frame reports a permanent refusal and ends that subscription. A
 `resync` frame with `retryable: true` reports a temporary read failure; the server
 keeps the subscription and retries after its reread interval, including when the
 first snapshot failed. Once admitted, an opening remote conversation subscription
-starts retries for `remote-unavailable` failures for up to three seconds, with 250 ms
-between attempts. An admitted read keeps the normal peer RPC deadline, so a slow
-successful page is not canceled by the retry-start window. A persistent outage still
-reports `resync`. Other refusals and established conversations do not use this grace.
+may start retries for `remote-unavailable` during the three seconds after its first
+failed opening read, with 250 ms between attempts. This bounds when retries start,
+not when outage diagnostics arrive. An in-flight retry keeps the normal peer RPC
+deadline: a stalled retry can wait about 15 seconds before reporting `resync`, even
+after the retry-start window has closed. A slow successful page is not canceled by
+that window. A persistent outage still reports `resync`; other refusals and
+established conversations do not use this grace.
 A followed conversation's `resync` also carries the failure's `code` and `message`,
 so a client still showing its last copy can say that copy is stale. Clients may resubscribe with the same ID to request a
 fresh snapshot. If the socket closes, including during a daemon
