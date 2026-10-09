@@ -261,6 +261,63 @@ fn signal_visible_change(state: &AppState) {
 #[cfg(test)]
 mod storage_contention_response_tests {
     #[test]
+    fn cached_agent_freshness_uses_register_stamps_and_keeps_incarnation_fences() {
+        use serde_json::json;
+        let store = crate::store::Store::open_memory("owner").unwrap();
+        store
+            .append_claim(&crate::model::ClaimInput {
+                subject: "agent/freshness".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(
+                    json!({"status":"running","host":"owner","incarnation_id":"one"}),
+                )
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let now = st_drivers::message::now_ms();
+        let publish = |at| {
+            store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: "agent/freshness".into(),
+                    kind: "harness.observed".into(),
+                    actor: None,
+                    fields: serde_json::from_value(json!({"state":"working","driver":"codex",
+                    "incarnation_id":"one","observed_at_ms":at}))
+                    .unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        publish(now - 100_000);
+        let old = store.current_harness("agent/freshness").unwrap().unwrap();
+        let fresh = publish(now);
+        assert_eq!(
+            fresh.body["_semantic_transition"], true,
+            "a stale seat recovering is a semantic change"
+        );
+        let card = |incarnation| {
+            let mut source = serde_json::to_value(&old).unwrap();
+            source["incarnation_id"] = json!(incarnation);
+            json!({"id":"agent/freshness","state":"running","harness_state":"working",
+                "updated_at":"","_status_source":source})
+        };
+        let mut current = vec![card("one")];
+        super::overlay_agent_resources(&store, &mut current, "").unwrap();
+        assert_eq!(current[0]["observation"], "current");
+        assert_eq!(current[0]["harness_state"], "working");
+        let mut predecessor = vec![card("older")];
+        super::overlay_agent_resources(&store, &mut predecessor, "").unwrap();
+        assert_eq!(predecessor[0]["observation"], "stale");
+        assert_eq!(predecessor[0]["harness_state"], "indeterminate");
+    }
+
+    #[test]
     fn current_write_deadline_is_typed_unavailable_and_retryable() {
         let error = super::ApiError::bad(super::St3Error::new("current-value-deadline", "write expired"));
         assert_eq!(error.status, super::StatusCode::SERVICE_UNAVAILABLE);
@@ -393,7 +450,7 @@ impl ApiError {
             | "lane-approval-denied"
             | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
             "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
-            "database-busy" | "database-locked" | "current-value-deadline" => StatusCode::SERVICE_UNAVAILABLE,
+            "database-busy" | "database-locked" | "current-value-deadline" | "current-value-capacity" => StatusCode::SERVICE_UNAVAILABLE,
             "read-deadline" => StatusCode::GATEWAY_TIMEOUT,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -1346,6 +1403,7 @@ fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
         Some(
             "remote-unavailable"
                 | "current-value-deadline"
+                | "current-value-capacity"
                 | "terminal-unavailable"
                 | "cursor-gap"
                 | "conversation-content-invalidated"
@@ -1409,6 +1467,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "database-busy"
         | "database-locked"
         | "current-value-deadline"
+        | "current-value-capacity"
         | "internal" => code.unwrap_or("internal").to_owned(),
         "too-many-attachments" | "invalid-blob-reference" => "validation-failed".into(),
         "launch-review-not-authorized"
@@ -2425,6 +2484,11 @@ fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Re
 
 fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyhow::Result<()> {
     let local_host = client_host_id(store.origin());
+    let subjects = items
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let stamps = store.current_harness_stamps(&subjects)?;
     for item in items.iter_mut() {
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
             item["updated_at"] = Value::String(at.to_owned());
@@ -2434,9 +2498,15 @@ fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyh
             .unwrap()
             .remove("_status_source")
             .unwrap_or(Value::Null);
-        let harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
-        // Freshness is approximate presentation. Use the card's already reduced observation;
-        // querying diagnostic and local-observation history here made every read grow with it.
+        let mut harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
+        if let Some(harness) = harness.as_mut()
+            && let Some((incarnation, at)) = item["id"].as_str().and_then(|id| stamps.get(id))
+            && incarnation == &harness.incarnation_id
+        {
+            harness.observed_at_unix_ms = harness.observed_at_unix_ms.max(*at);
+        }
+        // Freshness uses the cached semantic fold plus current register timestamps. It never
+        // reads diagnostic or observation history; a same-incarnation heartbeat stays current.
         let observation = match harness {
             None => "missing",
             Some(harness)
@@ -2447,7 +2517,12 @@ fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyh
             Some(_) => "current",
         };
         item["observation"] = json!(observation);
-        if observation == "stale" && matches!(item["harness_state"].as_str(), Some("ready" | "idle" | "working")) {
+        if observation == "stale"
+            && matches!(
+                item["harness_state"].as_str(),
+                Some("ready" | "idle" | "working")
+            )
+        {
             item["harness_state"] = json!("indeterminate");
             if item["state"] == "running" {
                 item["state"] = json!("waiting");

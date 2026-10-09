@@ -626,10 +626,17 @@ async fn run_workload(seconds: u64) -> Report {
             .expect("accounting stop is reliable");
     }
     daemon.stop().await;
+    let workload_end = store.index().unwrap();
+    // Declare the simulated source seats after stopping the test reconciler. These fixtures
+    // authenticate the receive proof without launching synthetic providers during the workload.
+    let seats = harnesses.iter().map(|harness| format!("agent \"{}\" {{ host \"{}\"; workspace \"/tmp\"; argv \"fixture\"; }}\n",
+        harness.subject.trim_start_matches("agent/"),NODE)).collect::<String>();
+    let intent=st3::graph::parse_intent(&format!("version 2\n{seats}"),NODE).unwrap();
+    store.apply_internal(&intent,"declared-diet-current-producers").unwrap();
     let all = claims(&store);
     let workload = all
         .iter()
-        .filter(|claim| claim.store_index > setup_index)
+        .filter(|claim| claim.store_index > setup_index && claim.store_index <= workload_end)
         .collect::<Vec<_>>();
     let local = store.local_observations_after(0, usize::MAX).unwrap();
     // Per kind: (what main would replicate, what this build replicated). Main replicates

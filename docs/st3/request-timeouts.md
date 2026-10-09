@@ -55,10 +55,19 @@ after the next one.
 
 ## Writes since 2026-09-30
 
-One thread owns the store's only write connection, and every write queues in front of it in
-arrival order. Nothing else takes SQLite's write lock.
+One thread owns the managed writer connection. Durable writes queue in arrival order.
+Replaceable current registers use a separate connection with zero busy timeout and a 100 ms
+transaction deadline. They never queue or retry: contention drops that sample. A register
+commit can briefly hold SQLite's write lock while a managed write attempts admission; budgeted
+callers can receive `database-busy` and retain their existing retry policy. Reads remain read-only.
+Durable peer errors and `replication_refusals` still use the managed writer.
 
-- **Batched writes.** Claims, local observations such as heartbeats, work actions, step and run
+Each register commit uses its own `synchronous=FULL` flush. On an isolated test host, the native
+register probe measured 7.0–13.4 ms from `BEGIN IMMEDIATE` through `COMMIT` (including flush),
+versus 16.1–22.6 ms for the complete publication call. Fleet-scale throughput and request
+latency are checked by the load harness; these isolated numbers are not throughput guarantees.
+
+- **Batched writes.** Claims, legacy local observations, work actions, step and run
   state changes, publications (`apply`), documents, resource observations, mission outputs and
   the receipt of a peer's envelopes each run as one job. The writer thread runs the next job and
   the jobs queued behind it in one `BEGIN IMMEDIATE` transaction, each in its own savepoint. It

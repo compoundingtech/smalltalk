@@ -31675,6 +31675,69 @@ mission "review" state="ready" {
     }
 
     #[tokio::test]
+    async fn old_starting_handshake_propagates_typed_503_while_current_driver_drops_once() {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/v1/claims",
+            post({
+                let calls = calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"api_version":"st3.v1",
+                    "code":"current-value-deadline", "message":"write expired", "details":{}})),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(Endpoint::Http(format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // main's old publish_harness_state awaits this POST with '?', and its unchanged
+        // startup retry wrapper asks tolerate_driver_api_outage to classify the error.
+        let old: Result<ClaimRecord> = client
+            .post(
+                "/v1/claims",
+                &json!({"subject":"agent/cedar",
+            "kind":"harness.observed", "fields":{"state":"starting","incarnation_id":"one"}}),
+            )
+            .await;
+        let error = old.unwrap_err();
+        assert_eq!(st3::client::http_status(&error), Some(503));
+        assert_eq!(
+            st3::client::api_error_code(&error),
+            Some("current-value-deadline")
+        );
+        assert!(tolerate_driver_api_outage("agent/cedar", error, &mut None).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        publish_harness_state(
+            &client,
+            "agent/cedar",
+            "codex",
+            "starting",
+            Some("one"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the new driver makes one attempt, with no retry"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn legacy_activity_drop_continues_numeric_publication_in_the_same_tick() {
         use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
         use std::sync::Mutex;

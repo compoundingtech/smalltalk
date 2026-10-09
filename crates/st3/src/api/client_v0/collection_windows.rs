@@ -684,6 +684,74 @@ mod tests {
     }
 
     #[test]
+    fn restamped_heartbeats_keep_collection_windows_until_a_semantic_change() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let publish = |at, activity| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "agent/heartbeat".into(),
+                    kind: "harness.observed".into(),
+                    actor: None,
+                    fields: serde_json::from_value(json!({"state":activity,"driver":"codex",
+                    "incarnation_id":"one","observed_at_ms":at}))
+                    .unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        publish(10, "working");
+        let count = AtomicUsize::new(0);
+        for name in ["agents", "attention"] {
+            read(&windows, &state, &session, &request(name), 0, &count);
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let summary = state
+            .store
+            .read_snapshot(|index| {
+                windows.revision(&state.store, index, "summary", windows.commits())
+            })
+            .unwrap();
+        for at in 11..41 {
+            publish(at, "working");
+            for name in ["agents", "attention"] {
+                read(&windows, &state, &session, &request(name), 0, &count);
+            }
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "fresh timestamps must not rebuild held windows"
+        );
+        assert_eq!(
+            state
+                .store
+                .read_snapshot(|index| windows.revision(
+                    &state.store,
+                    index,
+                    "summary",
+                    windows.commits()
+                ))
+                .unwrap(),
+            summary
+        );
+        publish(41, "idle");
+        for name in ["agents", "attention"] {
+            read(&windows, &state, &session, &request(name), 0, &count);
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            4,
+            "state changes still invalidate the affected windows"
+        );
+    }
+
+    #[test]
     fn shared_windows_skip_irrelevant_claims_but_refresh_relevant_local_and_clock_inputs() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());

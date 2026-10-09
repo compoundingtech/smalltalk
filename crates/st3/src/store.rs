@@ -17266,12 +17266,16 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                &current_canonical_sql(
+                &harness_sql(
+                    &connection,
+                    subject,
+                    &canonical_sql(
                     "SELECT body FROM claims INDEXED BY claims_harness_auth_incarnation_index WHERE subject=?1 AND kind='harness.observed'
              AND json_extract(body, '$.fields.incarnation_id')=?2
              AND json_type(body, '$.fields.provider_auth') IN ('true','false')
              ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                ),
+                    ),
+                )?,
                 params![subject, incarnation],
                 |row| row.get::<_, String>(0),
             )
@@ -17336,6 +17340,39 @@ impl Store {
         smallclaims::touched::note_read(|| format!("actor:{subject}"));
         let connection = self.readers.get();
         current_harness_at(&connection, subject, None)
+    }
+
+    /// Refresh source times for cached cards with point seeks, without refolding any seat.
+    pub(crate) fn current_harness_stamps(
+        &self,
+        subjects: &[String],
+    ) -> Result<BTreeMap<String, (String, u128)>> {
+        if subjects.is_empty()
+            || self
+                .smalltalk
+                .current_harness_freshness
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+        {
+            return Ok(BTreeMap::new());
+        }
+        let connection = self.readers.get();
+        let mut query = connection.prepare_cached(
+            "SELECT v.subject,
+            coalesce(json_extract(v.body,'$.fields.incarnation_id'),''),
+            min(v.source_at,coalesce(json_extract(v.body,'$.fields.observed_at_ms'),v.source_at))
+            FROM json_each(?1) selected CROSS JOIN latest_values v
+            ON v.subject=selected.value AND v.kind='harness.observed' AND v.slot=''",
+        )?;
+        query
+            .query_map([serde_json::to_string(subjects)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get(1)?, u128::from(row.get::<_, u64>(2)?)),
+                ))
+            })?
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(Into::into)
     }
 
     /// The seat's harness for the one question the login attention item asks: does it need a
@@ -22403,8 +22440,12 @@ fn latest_actual_at(
     let legacy = fold_latest_actual(rows)?;
     let body: Option<String> = connection
         .query_row(
-            "SELECT body FROM latest_values WHERE subject=?1 AND kind='workspace.observed'",
-            [subject],
+            "SELECT body FROM latest_values v WHERE subject=?1 AND kind='workspace.observed'
+             AND source_at>=COALESCE((SELECT CAST(c.accepted_at_unix_ms AS INTEGER)
+                 FROM claims c INDEXED BY claims_subject_kind_accepted_index
+                 WHERE c.subject=v.subject AND c.kind=v.kind AND c.store_index<=?2
+                 ORDER BY length(c.accepted_at_unix_ms) DESC,c.accepted_at_unix_ms DESC LIMIT 1),0)",
+            params![subject, at_index],
             |row| row.get(0),
         )
         .optional()?;
@@ -23364,8 +23405,12 @@ fn agent_working_since_at(
 ) -> Result<Option<u128>> {
     let register: Option<(String, String)> = connection
         .query_row(
-            "SELECT body,source_at FROM latest_values WHERE subject=?1 AND kind='harness.observed'",
-            [agent],
+            "SELECT body,source_at FROM latest_values v WHERE subject=?1 AND kind='harness.observed'
+             AND source_at>=COALESCE((SELECT CAST(c.accepted_at_unix_ms AS INTEGER)
+                 FROM claims c INDEXED BY claims_subject_kind_accepted_index
+                 WHERE c.subject=v.subject AND c.kind=v.kind AND c.store_index<=?2
+                 ORDER BY length(c.accepted_at_unix_ms) DESC,c.accepted_at_unix_ms DESC LIMIT 1),0)",
+            params![agent, snapshot_index],
             |row| Ok((row.get(0)?, row.get::<_, i64>(1)?.to_string())),
         )
         .optional()?;

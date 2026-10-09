@@ -447,7 +447,8 @@ mod tests {
                 "replaced-terminal",
                 "ended",
                 "exited",
-                "other-running",
+                "predecessor-running",
+                "predecessor-driver",
                 "generation-mismatch",
                 "provider-ended",
                 "past-token",
@@ -531,8 +532,11 @@ mod tests {
                     json!({"status":"exited","runtime_id":"eval.worker","incarnation_id":fence.incarnation}))).unwrap();
                     }
                     "admitted" => crate::mailbox::tests::ready(&state.store, &fence.incarnation),
-                    "other-running" => {
-                        crate::mailbox::tests::ready(&state.store, "another-incarnation")
+                    "predecessor-running" | "predecessor-driver" => {
+                        crate::mailbox::tests::ready(&state.store, "another-incarnation");
+                        if case == "predecessor-driver" {
+                            fence.incarnation = "another-incarnation".into();
+                        }
                     }
                     "generation-mismatch" => {
                         metadata["createdAt"] = json!("another-launch-generation");
@@ -601,9 +605,9 @@ mod tests {
                 }
                 let error = routed.err().unwrap();
                 let expected = match case {
-                    "pending" => "mailbox-session-starting",
+                    "pending" | "predecessor-running" => "mailbox-session-starting",
                     "foreign-subject" => "foreign-mailbox",
-                    "generation-mismatch" => "mailbox-authority-unavailable",
+                    "generation-mismatch" | "predecessor-driver" => "mailbox-authority-unavailable",
                     _ => "stale-mailbox-session",
                 };
                 assert_eq!(error.code, expected, "{case}: {}", error.message);

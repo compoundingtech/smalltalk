@@ -31,6 +31,7 @@ pub struct SmalltalkRuntime {
     /// Successful register commits bypass the managed graph writer's commit callbacks.
     current_observation_revision: std::sync::atomic::AtomicU64,
     current_observation_kinds: [std::sync::atomic::AtomicU64; CURRENT_VALUE_KINDS.len()],
+    pub(super) current_harness_freshness: std::sync::atomic::AtomicU64,
     pub(crate) actual_cache: Mutex<HashMap<String, (ActualCacheKey, Option<Value>)>>,
     /// Immutable placement ancestry, keyed by the selected declaration claim.
     pub(crate) placement_cache: Mutex<HashMap<String, Option<Arc<crate::placement::Fence>>>>,
@@ -284,10 +285,16 @@ impl Runtime for SmalltalkRuntime {
             })
     }
 
-    fn current_observation_committed(&self, kind: &str) {
+    fn current_observation_committed(&self, kind: &str, semantic_changed: bool) {
         if let Some(position) = CURRENT_VALUE_KINDS.iter().position(|known| *known == kind) {
-            self.current_observation_kinds[position]
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            if kind == "harness.observed" {
+                self.current_harness_freshness
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            if semantic_changed {
+                self.current_observation_kinds[position]
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
             // Publish the aggregate after its kind, so an aggregate acquire observes that kind.
             self.current_observation_revision
                 .fetch_add(1, std::sync::atomic::Ordering::Release);

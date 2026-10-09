@@ -163,6 +163,37 @@ fn permission_blocked(fields: &Value) -> bool {
     )
 }
 
+// Source timestamps refresh liveness but do not change the value a collection folds.
+// Keep ownership, state, reasons, credential axes and episode starts in the comparison.
+fn semantic_fields(kind: &str, fields: &Value) -> Value {
+    let mut fields = fields.clone();
+    if let Some(fields) = fields.as_object_mut() {
+        for name in [
+            "observed_at_ms",
+            "observed_at_unix_ms",
+            "observed_at",
+            "status_transition",
+        ] {
+            fields.remove(name);
+        }
+        if kind == "transport.observed" {
+            fields.remove("last_success_at");
+        }
+    }
+    fields
+}
+
+fn stale_observation(kind: &str, fields: &Value, source_at: u128, now: u128) -> bool {
+    kind == "harness.observed"
+        && now.saturating_sub(
+            fields["observed_at_ms"]
+                .as_u64()
+                .map(u128::from)
+                .unwrap_or(source_at)
+                .min(source_at),
+        ) > 90_000
+}
+
 /// Current folds use the historical column contract and canonical tie breakers, without
 /// putting mutable values into signed graph envelopes.
 pub(super) fn current_sql(sql: &str) -> String {
@@ -315,6 +346,9 @@ fn current_transaction<T>(
     })
 }
 
+type LocalValue = (i64, String, String, Option<String>, u64);
+type ReceivedValue = (u64, String, i64, String, String, Option<String>);
+
 pub(super) fn append(
     graph: &GraphStore,
     input: &ClaimInput,
@@ -333,6 +367,7 @@ pub(super) fn append(
     connection
         .busy_timeout(std::time::Duration::ZERO)
         .map_err(internal)?;
+    let mut semantic_changed = false;
     let result = current_transaction(&mut connection, |tx| {
         // A bound driver announces starting before reconciliation records runtime.running.
         // This hint only permits mailbox startup to wait; it grants no delivery or ready authority.
@@ -381,11 +416,11 @@ pub(super) fn append(
         } else {
             String::new()
         };
-        let previous: Option<(i64, String)> = tx
+        let previous: Option<LocalValue> = tx
             .query_row(
-                "SELECT local_id,body FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3",
+                "SELECT local_id,body,origin,actor,source_at FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3",
                 params![input.subject, input.kind, slot],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()
             .map_err(internal)?;
@@ -417,7 +452,7 @@ pub(super) fn append(
                 .get("observed_since_ms")
                 .cloned()
                 .unwrap_or(json!(source_at));
-            if let Some((_, body)) = &previous {
+            if let Some((_, body, _, _, _)) = &previous {
                 let old: Value = serde_json::from_str(body).map_err(internal)?;
                 if old["fields"]["incarnation_id"]
                     == input
@@ -488,6 +523,17 @@ pub(super) fn append(
                 .fields
                 .insert("status_transition".into(), json!(transition));
         }
+        semantic_changed = previous
+            .as_ref()
+            .is_none_or(|(_, body, origin, actor, source_at)| {
+                let old: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                origin != &graph.origin
+                    || actor != &input.actor
+                    || semantic_fields(&input.kind, &old["fields"])
+                        != semantic_fields(&input.kind, &json!(input.fields))
+                    || stale_observation(&input.kind, &old["fields"], u128::from(*source_at), now)
+                        != stale_observation(&input.kind, &json!(input.fields), now, now)
+            });
         let (mut local, _) = insert_local_observation_tx(tx, &graph.origin, &input, now)?;
         let epoch: String = tx
             .query_row(
@@ -497,6 +543,7 @@ pub(super) fn append(
             )
             .map_err(internal)?;
         local.body["_source_epoch"] = json!(epoch);
+        local.body["_semantic_transition"] = json!(semantic_changed);
         let sequence = local_observation_position(&local).unwrap();
         local.id = format!(
             "{LOCAL_OBSERVATION_ID_PREFIX}{}/{epoch}/{sequence}",
@@ -512,42 +559,61 @@ pub(super) fn append(
         .map_err(internal)?;
         // Retire the old current-value retry slots and local history at the first modern sample.
         // Numeric usage series keep their slots and observations.
-        if input.kind == "harness.usage" {
+        let retired_slots = if input.kind == "harness.usage" {
             tx.execute(
                 "DELETE FROM local_latest_slots WHERE subject=?1 AND kind='harness.usage'
             AND json_extract(published_fields,'$.semantics')='context_occupancy'",
                 [&input.subject],
             )
-            .map_err(internal)?;
+            .map_err(internal)?
         } else {
             tx.execute(
                 "DELETE FROM local_latest_slots WHERE subject=?1 AND kind=?2",
                 params![input.subject, input.kind],
             )
-            .map_err(internal)?;
-        }
-        let retired: Option<i64> = tx
-            .query_row(
-                "SELECT MAX(id) FROM local_observations WHERE subject=?1 AND kind=?2 AND id!=?3
-         AND (?2!='harness.usage' OR json_extract(body,'$.fields.semantics')='context_occupancy')",
-                params![input.subject, input.kind, sequence],
-                |row| row.get(0),
+            .map_err(internal)?
+        };
+        // A legacy producer may have replaced the effective value since our last register.
+        // Carry that transition to receivers without making them scan numeric claim history.
+        if retired_slots != 0 && !semantic_changed {
+            semantic_changed = true;
+            local.body["_semantic_transition"] = json!(true);
+            tx.execute(
+                "UPDATE local_observations SET body=?1 WHERE id=?2",
+                params![
+                    canonical_json_text(&local.body).map_err(internal)?,
+                    sequence
+                ],
             )
             .map_err(internal)?;
-        if let Some(retired) = retired {
-            retire_feed_through(tx, retired)?;
         }
-        tx.execute(
-            "DELETE FROM local_observations WHERE subject=?1 AND kind=?2 AND id!=?3
+        // Only the first modern sample with a legacy slot retires legacy history.
+        // Replacements delete their single prior row below, without walking numeric usage.
+        if previous.is_none() && retired_slots != 0 {
+            let retired: Option<i64> = tx
+                .query_row(
+                    "SELECT MAX(id) FROM local_observations WHERE subject=?1 AND kind=?2 AND id!=?3
+         AND (?2!='harness.usage' OR json_extract(body,'$.fields.semantics')='context_occupancy')",
+                    params![input.subject, input.kind, sequence],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if let Some(retired) = retired {
+                retire_feed_through(tx, retired)?;
+            }
+            tx.execute(
+                "DELETE FROM local_observations WHERE subject=?1 AND kind=?2 AND id!=?3
         AND (?2!='harness.usage' OR json_extract(body,'$.fields.semantics')='context_occupancy')",
-            params![
-                input.subject,
-                input.kind,
-                local_observation_position(&local)
-            ],
-        )
-        .map_err(internal)?;
-        if let Some((old_id, _)) = previous {
+                params![
+                    input.subject,
+                    input.kind,
+                    local_observation_position(&local)
+                ],
+            )
+            .map_err(internal)?;
+        }
+        if let Some((old_id, _, _, _, _)) = previous {
+            retire_feed_through(tx, old_id)?;
             tx.execute("DELETE FROM local_observations WHERE id=?1", [old_id])
                 .map_err(internal)?;
         }
@@ -574,7 +640,9 @@ pub(super) fn append(
         Ok((local, true))
     })?;
     if result.1 {
-        graph.runtime.current_observation_committed(&input.kind);
+        graph
+            .runtime
+            .current_observation_committed(&input.kind, semantic_changed);
     }
     Ok(result)
 }
@@ -617,41 +685,10 @@ impl Store {
         )?)
     }
 
-    /// Local dial failures are replace-in-place hints. They never wait behind graph writes.
+    /// Refusals and peer errors are durable evidence and queue through the managed writer.
+    /// Only the accompanying replaceable transport observation may be dropped on contention.
     pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<bool> {
-        let now = now_ms();
-        let last_success = self.replication_peer_last_success(peer)?;
-        let observed = self
-            .own_transport_value(peer)?
-            .filter(|record| record.body["fields"]["status"] == "up")
-            .and_then(|record| record.body["fields"]["last_success_at"].as_u64())
-            .map(u128::from);
-        let recent = last_success
-            .or(observed)
-            .is_some_and(|at| now.saturating_sub(at) < PEER_UP_MS);
-        let status = if status == "down" { "unknown" } else { status };
-        let mut connection = Connection::open_with_flags(
-            &self.path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )?;
-        smallclaims::sqlite::observe(&mut connection);
-        connection.busy_timeout(std::time::Duration::ZERO)?;
-        let Ok(tx) = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        else {
-            return Ok(false);
-        };
-        if status == "refused" {
-            tx.execute("INSERT INTO replication_refusals(peer,reason,updated_at_unix_ms) VALUES(?1,?2,?3)
-                ON CONFLICT(peer) DO UPDATE SET reason=excluded.reason,updated_at_unix_ms=excluded.updated_at_unix_ms",
-                params![peer,error,now.to_string()])?;
-        } else {
-            tx.execute("INSERT INTO replication_peers(peer,status,last_error,updated_at_unix_ms) VALUES(?1,?2,?3,?4)
-                ON CONFLICT(peer) DO UPDATE SET status=CASE WHEN ?5 THEN replication_peers.status ELSE excluded.status END,
-                last_error=excluded.last_error,updated_at_unix_ms=excluded.updated_at_unix_ms",
-                params![peer,status,error,now.to_string(),recent])?;
-        }
-        tx.commit()?;
-        Ok(status == "refused" || !recent)
+        self.graph.record_peer_failure(peer, status, error)
     }
 
     /// Connectivity is a separate register for each observer, not replication inventory.
@@ -704,9 +741,11 @@ impl Store {
             if let Some(runtime) = runtime {
                 let body: Value = serde_json::from_str(&runtime)?;
                 let fields = body.get("fields").unwrap_or(&body);
-                if fields["status"] == "running"
-                    || (fields["incarnation_id"].as_str() == Some(request.incarnation.as_str())
-                        && !matches!(fields["status"].as_str(), None | Some("starting")))
+                // A predecessor may still be marked running. Only this incarnation's
+                // running/terminal evidence closes bootstrap; the API's double-checked
+                // kernel/PTY proof must establish any successor before it receives a retry.
+                if fields["incarnation_id"].as_str() == Some(request.incarnation.as_str())
+                    && !matches!(fields["status"].as_str(), None | Some("starting"))
                 {
                     return Ok(false);
                 }
@@ -791,8 +830,31 @@ impl Store {
         connection
             .busy_timeout(std::time::Duration::ZERO)
             .map_err(internal)?;
+        let mut semantic_changed = false;
         let changed = current_transaction(&mut connection, |tx| {
             let mut incarnation_bound = false;
+            if record.kind != "transport.observed" {
+                let owner: Option<String> = tx
+                    .query_row(
+                        "SELECT json_extract(member,'$.host') FROM desired
+                     WHERE subject=?1 AND kind='agent' AND member IS NOT NULL",
+                        [&record.subject],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(internal)?;
+                if owner.as_deref() != Some(record.origin.as_str()) {
+                    return Err(St3Error::new(
+                        "stale-harness-event-session",
+                        "current values require a declared seat on the publishing host",
+                    ));
+                }
+            } else if !record.subject.starts_with("host/") {
+                return Err(St3Error::new(
+                    "invalid-current-value",
+                    "transport values require a host subject",
+                ));
+            }
             if record.subject.starts_with("agent/") {
                 let runtime: Option<(String, String)> = tx
                     .query_row(
@@ -827,9 +889,9 @@ impl Store {
                     }
                 }
             }
-            let previous: Option<(u64, String, i64, String, String)> = tx.query_row(
-            "SELECT source_at,source_id,local_id,origin,body FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3",
-            params![record.subject,record.kind,slot], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))
+            let previous: Option<ReceivedValue> = tx.query_row(
+            "SELECT source_at,source_id,local_id,origin,body,actor FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3",
+            params![record.subject,record.kind,slot], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))
             .optional().map_err(internal)?;
             let source_sequence = |id: &str| {
                 id.rsplit('/')
@@ -837,38 +899,80 @@ impl Store {
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or_default()
             };
-            if previous.as_ref().is_some_and(|(at, id, _, origin, body)| {
-                if origin == &record.origin
-                    && id.starts_with(LOCAL_OBSERVATION_ID_PREFIX)
-                    && record.id.starts_with(LOCAL_OBSERVATION_ID_PREFIX)
-                {
-                    let previous: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-                    // A restored database may rewind its generation and counter. A newly running
-                    // incarnation, already validated against durable owner evidence above, cuts over.
-                    if incarnation_bound
-                        && previous["fields"]["incarnation_id"]
-                            != record.body["fields"]["incarnation_id"]
+            if previous
+                .as_ref()
+                .is_some_and(|(at, id, _, origin, body, _)| {
+                    if origin == &record.origin
+                        && id.starts_with(LOCAL_OBSERVATION_ID_PREFIX)
+                        && record.id.starts_with(LOCAL_OBSERVATION_ID_PREFIX)
                     {
-                        return false;
+                        let previous: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                        // A restored database may rewind its generation and counter. A newly running
+                        // incarnation, already validated against durable owner evidence above, cuts over.
+                        if incarnation_bound
+                            && previous["fields"]["incarnation_id"]
+                                != record.body["fields"]["incarnation_id"]
+                        {
+                            return false;
+                        }
+                        let epoch = |body: &Value| {
+                            body["_source_epoch"]
+                                .as_str()
+                                .and_then(|value| value.parse::<u128>().ok())
+                                .unwrap_or(0)
+                        };
+                        return (epoch(&previous), source_sequence(id))
+                            >= (epoch(&record.body), source_sequence(&record.id));
                     }
-                    let epoch = |body: &Value| {
-                        body["_source_epoch"]
-                            .as_str()
-                            .and_then(|value| value.parse::<u128>().ok())
-                            .unwrap_or(0)
-                    };
-                    return (epoch(&previous), source_sequence(id))
-                        >= (epoch(&record.body), source_sequence(&record.id));
-                }
-                (*at, source_sequence(id), id.as_str())
-                    >= (
-                        record.accepted_at_unix_ms as u64,
-                        source_sequence(&record.id),
-                        record.id.as_str(),
-                    )
-            }) {
+                    (*at, source_sequence(id), id.as_str())
+                        >= (
+                            record.accepted_at_unix_ms as u64,
+                            source_sequence(&record.id),
+                            record.id.as_str(),
+                        )
+                })
+            {
                 return Ok(false);
             }
+            // Existing keys are always replaceable. Bound new keys even if a trusted fleet
+            // member floods host names or declarations have accumulated since retirement.
+            if previous.is_none()
+                && tx
+                    .query_row("SELECT count(*) FROM latest_values", [], |row| {
+                        row.get::<_, u64>(0)
+                    })
+                    .map_err(internal)?
+                    >= 10_000
+            {
+                return Err(St3Error::new(
+                    "current-value-capacity",
+                    "current register capacity reached",
+                ));
+            }
+            semantic_changed =
+                previous
+                    .as_ref()
+                    .is_none_or(|(source_at, _, _, origin, body, actor)| {
+                        let old: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                        // Older senders lack semantic metadata; preserve their conservative
+                        // invalidation during the mixed-version window.
+                        record.body["_semantic_transition"] != false
+                            || origin != &record.origin
+                            || actor != &record.actor
+                            || semantic_fields(&record.kind, &old["fields"])
+                                != semantic_fields(&record.kind, &record.body["fields"])
+                            || stale_observation(
+                                &record.kind,
+                                &old["fields"],
+                                u128::from(*source_at),
+                                now_ms(),
+                            ) != stale_observation(
+                                &record.kind,
+                                &record.body["fields"],
+                                record.accepted_at_unix_ms,
+                                now_ms(),
+                            )
+                    });
             let input = ClaimInput {
                 subject: record.subject.clone(),
                 kind: record.kind.clone(),
@@ -880,7 +984,7 @@ impl Store {
             };
             let (local, _) =
                 insert_local_observation_tx(tx, &self.origin, &input, record.accepted_at_unix_ms)?;
-            if let Some((_, _, old_id, _, _)) = previous {
+            if let Some((_, _, old_id, _, _, _)) = previous {
                 retire_feed_through(tx, old_id)?;
                 tx.execute("DELETE FROM local_observations WHERE id=?1", [old_id])
                     .map_err(internal)?;
@@ -898,7 +1002,7 @@ impl Store {
         if changed {
             self.graph
                 .runtime
-                .current_observation_committed(&record.kind);
+                .current_observation_committed(&record.kind, semantic_changed);
         }
         Ok(changed)
     }
@@ -910,9 +1014,9 @@ mod tests {
 
     fn state(state: &str, incarnation: &str, at: u64) -> ClaimInput {
         ClaimInput {
-            subject: "agent/cedar".into(),
+            subject: "agent/example/cedar".into(),
             kind: "harness.observed".into(),
-            actor: Some("agent/cedar".into()),
+            actor: Some("agent/example/cedar".into()),
             fields: serde_json::from_value(json!({
                 "state":state, "driver":"codex", "incarnation_id":incarnation,
                 "observed_at_ms":at, "observed_since_ms":at,
@@ -922,6 +1026,196 @@ mod tests {
             expected_subject: None,
             idempotency_key: None,
         }
+    }
+
+    fn declare(store: &Store, owner: &str) {
+        let intent = crate::graph::parse_intent(
+            "version 2\nagent \"example/cedar\" { workspace \"/tmp\"; argv \"fixture\"; }",
+            owner,
+        )
+        .unwrap();
+        store
+            .apply_internal(&intent, "current-value-declaration")
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore = "whole-process SQLite counters: run this cost probe alone"]
+    fn context_register_cost_is_flat_with_twenty_thousand_numeric_rows() {
+        use smallclaims::sqlite::work;
+        let store = Store::open_memory("owner").unwrap();
+        let mut input = state("idle", "one", 1);
+        input.kind = "harness.usage".into();
+        input.fields = serde_json::from_value(json!({"driver":"codex", "incarnation_id":"one",
+            "semantics":"context_occupancy", "context_used_tokens":10}))
+        .unwrap();
+        let seed = |count: usize| {
+            let mut connection = store.connection.write();
+            let tx = connection.transaction().unwrap();
+            tx.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+                SELECT 0,'agent/example/cedar','harness.usage',?2,1 FROM n", params![count,
+                json!({"fields":{"semantics":"session_cumulative","total_tokens":1}}).to_string()]).unwrap();
+            tx.commit().unwrap();
+        };
+        append_legacy_graph_observation_fenced(&store.graph, &input, 1, None).unwrap();
+        seed(2_000);
+        append(&store.graph, &input, 2, None).unwrap();
+        let measure = |at| {
+            let before = work::total();
+            append(&store.graph, &input, at, None).unwrap();
+            work::total() - before
+        };
+        let small = measure(3);
+        seed(18_000);
+        let big = measure(4);
+        println!("context-cost small={small:?} big={big:?}");
+        assert_eq!(small.statements, big.statements);
+        assert!(big.vm_steps <= small.vm_steps + 100, "{small:?} -> {big:?}");
+        assert_eq!(small.fullscan_steps, big.fullscan_steps);
+        assert!(big.fullscan_steps <= 1, "only constant setup work may scan");
+        let connection = store.readers.get();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM local_observations WHERE
+            kind='harness.usage' AND json_extract(body,'$.fields.semantics')='session_cumulative'",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )
+                .unwrap(),
+            20_000
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM local_observations WHERE
+            kind='harness.usage' AND json_extract(body,'$.fields.semantics')='context_occupancy'",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn heartbeat_restamps_refresh_source_without_semantic_revision_or_history_growth() {
+        let store = Store::open_memory("owner").unwrap();
+        let peer = Store::open_memory("peer").unwrap();
+        declare(&peer, "owner");
+        let first = append(&store.graph, &state("working", "one", 10), 10, None)
+            .unwrap()
+            .0;
+        peer.receive_current_value(&first).unwrap();
+        let before = store
+            .graph
+            .runtime
+            .current_observation_revision("harness.observed");
+        let imported = peer
+            .graph
+            .runtime
+            .current_observation_revision("harness.observed");
+        let aggregate = store.graph.runtime.current_observation_revision("");
+        let second = append(&store.graph, &state("working", "one", 20), 20, None)
+            .unwrap()
+            .0;
+        assert_ne!(second.id, first.id);
+        assert_eq!(second.body["fields"]["observed_at_ms"], 20);
+        assert_eq!(second.body["fields"]["observed_since_ms"], 10);
+        assert_eq!(
+            store
+                .graph
+                .runtime
+                .current_observation_revision("harness.observed"),
+            before
+        );
+        assert!(store.graph.runtime.current_observation_revision("") > aggregate);
+        assert!(peer.receive_current_value(&second).unwrap());
+        assert_eq!(
+            peer.graph
+                .runtime
+                .current_observation_revision("harness.observed"),
+            imported
+        );
+        let third = append(&store.graph, &state("idle", "one", 30), 30, None)
+            .unwrap()
+            .0;
+        assert!(
+            store
+                .graph
+                .runtime
+                .current_observation_revision("harness.observed")
+                > before
+        );
+        assert!(peer.receive_current_value(&third).unwrap());
+        assert!(
+            peer.graph
+                .runtime
+                .current_observation_revision("harness.observed")
+                > imported
+        );
+        assert_eq!(
+            store
+                .readers
+                .get()
+                .query_row(
+                    "SELECT count(*) FROM local_observations
+            WHERE subject='agent/example/cedar' AND kind='harness.observed'",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn fleet_registers_require_a_declared_host_even_without_running_evidence_and_have_a_cap() {
+        let source = Store::open_memory("owner").unwrap();
+        let peer = Store::open_memory("peer").unwrap();
+        let record = source.append_claim(&state("idle", "one", 10)).unwrap();
+        assert_eq!(
+            peer.receive_current_value(&record).unwrap_err().code,
+            "stale-harness-event-session"
+        );
+        declare(&peer, "foreign");
+        assert!(peer.receive_current_value(&record).is_err());
+        // Restore the declaration without fabricating runtime.running.
+        peer.connection
+            .write()
+            .execute(
+                "UPDATE desired SET member=json_set(member,'$.host','owner')
+            WHERE subject='agent/example/cedar'",
+                [],
+            )
+            .unwrap();
+        assert!(peer.receive_current_value(&record).unwrap());
+        let mut undeclared = record.clone();
+        undeclared.subject = "agent/undeclared".into();
+        assert!(peer.receive_current_value(&undeclared).is_err());
+        peer.connection
+            .write()
+            .execute(
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<9999)
+            INSERT INTO latest_values SELECT 'host/cap-'||i,'transport.observed','owner','owner',1,
+            'cap/'||i,1,0,NULL,'{}' FROM n",
+                [],
+            )
+            .unwrap();
+        let mut transport = record.clone();
+        transport.subject = "host/new-peer".into();
+        transport.kind = "transport.observed".into();
+        transport.body = json!({"fields":{"status":"up"}});
+        assert_eq!(
+            peer.receive_current_value(&transport).unwrap_err().code,
+            "current-value-capacity"
+        );
+        let next = source.append_claim(&state("working", "one", 20)).unwrap();
+        assert!(
+            peer.receive_current_value(&next).unwrap(),
+            "the cap never blocks existing-key replacement"
+        );
     }
 
     #[test]
@@ -1121,9 +1415,9 @@ mod tests {
         store.append_claim(&runtime).unwrap();
         store.append_claim(&state("idle", "one", 10)).unwrap();
         let index = store.index().unwrap();
-        let old_revision = subject_current_revision(&store.readers.get(), "agent/cedar").unwrap();
+        let old_revision = subject_current_revision(&store.readers.get(), "agent/example/cedar").unwrap();
         let old = store
-            .status(Some("agent/cedar"))
+            .status(Some("agent/example/cedar"))
             .unwrap()
             .subjects
             .remove(0);
@@ -1131,20 +1425,20 @@ mod tests {
         store.refresh_current_caches().unwrap();
         // A reader pinned before the write finishes after the newer reader evicts its entry.
         store.keep_subject_status(
-            "agent/cedar",
+            "agent/example/cedar",
             index,
             SubjectStatusMode::Full,
             old_revision,
             &old,
             &None,
         );
-        let revision = subject_current_revision(&store.readers.get(), "agent/cedar").unwrap();
+        let revision = subject_current_revision(&store.readers.get(), "agent/example/cedar").unwrap();
         assert!(
             store
-                .kept_subject_status("agent/cedar", index, SubjectStatusMode::Full, revision)
+                .kept_subject_status("agent/example/cedar", index, SubjectStatusMode::Full, revision)
                 .is_none()
         );
-        let current = store.status(Some("agent/cedar")).unwrap();
+        let current = store.status(Some("agent/example/cedar")).unwrap();
         assert_eq!(
             current.subjects[0].harness.as_ref().unwrap().state,
             "working"
@@ -1183,7 +1477,7 @@ mod tests {
                 .unwrap(),
             None
         );
-        let selected = BTreeSet::from(["agent/cedar".to_owned(), "agent/birch".to_owned()]);
+        let selected = BTreeSet::from(["agent/example/cedar".to_owned(), "agent/birch".to_owned()]);
         store
             .cached_agent_resources_chunk(index, true, &selected, |changed| {
                 let (names, _) = changed.unwrap();
@@ -1205,7 +1499,7 @@ mod tests {
         let store = Store::open_memory("owner").unwrap();
         let index = store.index().unwrap();
         let items = vec![
-            json!({"id":"agent/cedar","name":"cedar","state":"idle"}),
+            json!({"id":"agent/example/cedar","name":"cedar","state":"idle"}),
             json!({"id":"agent/birch","name":"birch","state":"idle"}),
         ];
         store
@@ -1219,9 +1513,9 @@ mod tests {
         let next = store
             .cached_agent_resources(index, false, |changed| {
                 let (names, _) = changed.unwrap();
-                assert_eq!(names, &BTreeSet::from(["agent/cedar".to_owned()]));
+                assert_eq!(names, &BTreeSet::from(["agent/example/cedar".to_owned()]));
                 Ok(vec![
-                    json!({"id":"agent/cedar","name":"cedar","state":"working"}),
+                    json!({"id":"agent/example/cedar","name":"cedar","state":"working"}),
                 ])
             })
             .unwrap();
@@ -1299,7 +1593,7 @@ mod tests {
         let connection = store.readers.get();
         let query = harness_sql(
             &connection,
-            "agent/cedar",
+            "agent/example/cedar",
             &format!(
                 "{} LIMIT 1",
                 newest_claims_of_kind_query("claims.body", "harness.observed")
@@ -1309,7 +1603,7 @@ mod tests {
         let plan: Vec<String> = connection
             .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
             .unwrap()
-            .query_map(params!["agent/cedar", i64::MAX], |row| row.get(3))
+            .query_map(params!["agent/example/cedar", i64::MAX], |row| row.get(3))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -1364,7 +1658,7 @@ mod tests {
         );
         assert!(
             store
-                .claims_for("agent/cedar", Some("harness.observed"))
+                .claims_for("agent/example/cedar", Some("harness.observed"))
                 .unwrap()
                 .is_empty()
         );
@@ -1372,7 +1666,7 @@ mod tests {
             store.replication_inventory().unwrap().digest,
             inventory.digest
         );
-        let current = store.current_harness("agent/cedar").unwrap().unwrap();
+        let current = store.current_harness("agent/example/cedar").unwrap().unwrap();
         assert_eq!(current.state, "working");
         assert_eq!(current.incarnation_id, "one");
         assert!(current.observed_at_unix_ms >= u128::from(stamp));
@@ -1385,9 +1679,9 @@ mod tests {
         for incarnation in ["one", "two"] {
             store
                 .append_claim(&ClaimInput {
-                    subject: "agent/cedar".into(),
+                    subject: "agent/example/cedar".into(),
                     kind: "harness.usage".into(),
-                    actor: Some("agent/cedar".into()),
+                    actor: Some("agent/example/cedar".into()),
                     fields: serde_json::from_value(
                         json!({"driver":"codex","incarnation_id":incarnation,
                     "semantics":"context_occupancy","total_tokens":20}),
@@ -1399,7 +1693,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let numeric = ClaimInput { subject:"agent/cedar".into(),kind:"harness.usage".into(),actor:Some("agent/cedar".into()),
+        let numeric = ClaimInput { subject:"agent/example/cedar".into(),kind:"harness.usage".into(),actor:Some("agent/example/cedar".into()),
             fields:serde_json::from_value(json!({"driver":"codex","incarnation_id":"two","semantics":"session_cumulative","total_tokens":40})).unwrap(),
             evidence:Vec::new(),expected_subject:None,idempotency_key:None };
         store.append_claim(&numeric).unwrap();
@@ -1442,7 +1736,7 @@ mod tests {
         let store = Store::open_memory("owner").unwrap();
         store
             .append_claim(&ClaimInput {
-                subject: "agent/cedar".into(),
+                subject: "agent/example/cedar".into(),
                 kind: "runtime.observed".into(),
                 actor: None,
                 fields: serde_json::from_value(
@@ -1463,14 +1757,14 @@ mod tests {
         assert!(legacy.accepted_at_unix_ms > current.accepted_at_unix_ms);
         assert_eq!(
             store
-                .latest_claim("agent/cedar", Some("harness.observed"))
+                .latest_claim("agent/example/cedar", Some("harness.observed"))
                 .unwrap()
                 .unwrap()
                 .id,
             legacy.id
         );
         assert_eq!(
-            store.current_harness("agent/cedar").unwrap().unwrap().state,
+            store.current_harness("agent/example/cedar").unwrap().unwrap().state,
             "working"
         );
     }
@@ -1479,8 +1773,9 @@ mod tests {
     fn fleet_current_values_require_the_running_owner_and_incarnation() {
         let owner = Store::open_memory("owner").unwrap();
         let peer = Store::open_memory("peer").unwrap();
+        declare(&peer, "peer");
         peer.append_claim(&ClaimInput {
-            subject: "agent/cedar".into(),
+            subject: "agent/example/cedar".into(),
             kind: "runtime.observed".into(),
             actor: None,
             fields: serde_json::from_value(
@@ -1514,6 +1809,7 @@ mod tests {
     fn database_reset_starts_a_new_generation_without_accepting_old_replays() {
         let old = Store::open_memory("owner").unwrap();
         let peer = Store::open_memory("peer").unwrap();
+        declare(&peer, "owner");
         let stamp = now_ms() as u64;
         let mut latest = old.append_claim(&state("working", "one", stamp)).unwrap();
         for n in 1..20 {
@@ -1533,7 +1829,7 @@ mod tests {
         assert!(peer.receive_current_value(&fresh).unwrap());
         assert!(!peer.receive_current_value(&latest).unwrap());
         assert_eq!(
-            peer.latest_claim("agent/cedar", Some("harness.observed"))
+            peer.latest_claim("agent/example/cedar", Some("harness.observed"))
                 .unwrap()
                 .unwrap()
                 .body["fields"]["state"],
@@ -1545,6 +1841,7 @@ mod tests {
     fn workspace_registers_bind_to_the_running_host_without_a_native_incarnation() {
         let source = Store::open_memory("owner").unwrap();
         let peer = Store::open_memory("owner").unwrap();
+        declare(&peer, "owner");
         let mut runtime = state("idle", "one", 1);
         runtime.kind = "runtime.observed".into();
         runtime.fields =
@@ -1570,6 +1867,7 @@ mod tests {
     fn a_future_sender_clock_cannot_pin_a_current_register() {
         let source = Store::open_memory("owner").unwrap();
         let peer = Store::open_memory("peer").unwrap();
+        declare(&peer, "owner");
         let record = source.append_claim(&state("working", "one", 10)).unwrap();
         let mut future = record.clone();
         future.accepted_at_unix_ms = now_ms() + 3_600_000;
@@ -1584,8 +1882,9 @@ mod tests {
     fn restore_recovery_requires_a_new_durably_bound_incarnation() {
         let source = Store::open_memory("owner").unwrap();
         let peer = Store::open_memory("owner").unwrap();
+        declare(&peer, "owner");
         let runtime = |incarnation| ClaimInput {
-            subject: "agent/cedar".into(),
+            subject: "agent/example/cedar".into(),
             kind: "runtime.observed".into(),
             actor: None,
             fields: serde_json::from_value(
@@ -1627,12 +1926,95 @@ mod tests {
         assert!(peer.receive_current_value(&fresh).unwrap());
         assert!(peer.receive_current_value(&old).is_err());
         assert_eq!(
-            peer.latest_claim("agent/cedar", Some("harness.observed"))
+            peer.latest_claim("agent/example/cedar", Some("harness.observed"))
                 .unwrap()
                 .unwrap()
                 .body["fields"]["incarnation_id"],
             "two"
         );
+    }
+
+    #[test]
+    fn workspace_and_transport_restores_need_a_new_epoch_when_the_counter_rewinds() {
+        for kind in ["workspace.observed", "transport.observed"] {
+            let source = Store::open_memory("owner").unwrap();
+            let peer = Store::open_memory("peer").unwrap();
+            declare(&peer, "owner");
+            let mut input = state("idle", "one", 1);
+            input.kind = kind.into();
+            if kind == "workspace.observed" {
+                input.fields =
+                    serde_json::from_value(json!({"host":"owner","workspace":"/work/cedar"}))
+                        .unwrap();
+            } else {
+                input.subject = "host/peer".into();
+                input.actor = None;
+                input.fields =
+                    serde_json::from_value(json!({"status":"up","last_success_at":1})).unwrap();
+            }
+            let mut old = source.append_claim(&input).unwrap();
+            for _ in 0..20 {
+                old = source.append_claim(&input).unwrap();
+            }
+            assert!(peer.receive_current_value(&old).unwrap());
+            let restored = Store::open_memory("owner").unwrap();
+            restored
+                .connection
+                .write()
+                .execute(
+                    "UPDATE meta SET value=?1 WHERE key='current-value-epoch'",
+                    [old.body["_source_epoch"].as_str().unwrap()],
+                )
+                .unwrap();
+            let replay = restored.append_claim(&input).unwrap();
+            assert!(
+                !peer.receive_current_value(&replay).unwrap(),
+                "{kind}: reopening the old epoch cannot erase ordering"
+            );
+            restored
+                .connection
+                .write()
+                .execute("DELETE FROM meta WHERE key='current-value-epoch'", [])
+                .unwrap();
+            initialize_epoch(&restored.connection.write()).unwrap();
+            let fresh = restored.append_claim(&input).unwrap();
+            assert!(
+                peer.receive_current_value(&fresh).unwrap(),
+                "{kind}: the explicit restore epoch cuts over"
+            );
+            assert!(!peer.receive_current_value(&old).unwrap());
+        }
+    }
+
+    #[test]
+    fn peer_refusals_remain_durable_when_the_writer_is_contended() {
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(Store::open(&root.path().join("peer.sqlite"), "owner").unwrap());
+        let mut connection = Connection::open(&store.path).unwrap();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let other = store.clone();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            other.record_peer_failure("peer", "refused", "fixture refusal")
+        });
+        waiting.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        tx.rollback().unwrap();
+        assert!(worker.join().unwrap().unwrap());
+        let reason: String = store
+            .readers
+            .get()
+            .query_row(
+                "SELECT reason FROM replication_refusals WHERE peer='peer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "fixture refusal");
     }
 
     #[test]
@@ -1648,16 +2030,17 @@ mod tests {
             std::iter::once("")
                 .chain(CURRENT_VALUE_KINDS)
                 .map(|kind| store.graph.runtime.current_observation_revision(kind))
+                .chain(std::iter::once(store.smalltalk.current_harness_freshness.load(std::sync::atomic::Ordering::Acquire)))
                 .collect::<Vec<_>>()
         };
         let before = revisions();
         let mut connection = Connection::open(&path).unwrap();
         connection.busy_timeout(std::time::Duration::ZERO).unwrap();
         let error = current_transaction(&mut connection, |tx| {
-            tx.execute("UPDATE latest_values SET source_id='timed-out-source' WHERE subject='agent/cedar'", [])
+            tx.execute("UPDATE latest_values SET source_id='timed-out-source' WHERE subject='agent/example/cedar'", [])
                 .map_err(internal)?;
             tx.execute("INSERT INTO latest_values SELECT 'agent/pine',kind,slot,origin,source_at,
-                'timed-out-new-source',local_id,store_index,actor,body FROM latest_values WHERE subject='agent/cedar'", [])
+                'timed-out-new-source',local_id,store_index,actor,body FROM latest_values WHERE subject='agent/example/cedar'", [])
                 .map_err(internal)?;
             update_readiness(tx, &state("working", "two", now_ms() as u64))?;
             // The real progress handler interrupts this query at the unchanged 100ms budget.
@@ -1671,7 +2054,7 @@ mod tests {
         );
         let (source, incarnation, ready): (String, String, bool) = connection.query_row(
             "SELECT v.source_id,r.incarnation,r.ready FROM latest_values v JOIN latest_readiness r USING(subject)
-             WHERE v.subject='agent/cedar'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+             WHERE v.subject='agent/example/cedar'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
         assert_eq!(source, original.id);
         assert_eq!((incarnation.as_str(), ready), ("one", false));
         assert_eq!(
@@ -1723,7 +2106,7 @@ mod tests {
         drop(writer);
         assert!(
             store
-                .latest_claim("agent/cedar", Some("harness.observed"))
+                .latest_claim("agent/example/cedar", Some("harness.observed"))
                 .unwrap()
                 .is_none()
         );
@@ -1732,7 +2115,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .latest_claim("agent/cedar", Some("harness.observed"))
+                .latest_claim("agent/example/cedar", Some("harness.observed"))
                 .unwrap()
                 .unwrap()
                 .body["fields"]["state"],
@@ -1744,11 +2127,13 @@ mod tests {
     fn fleet_delivery_replaces_the_register_and_refuses_delayed_updates() {
         let owner = Store::open_memory("owner").unwrap();
         let peer = Store::open_memory("peer").unwrap();
+        declare(&peer, "owner");
+        let inventory=peer.replication_inventory().unwrap().digest;
         let first = owner
             .append_claim(&state("working", "one", now_ms() as u64))
             .unwrap();
         assert!(peer.receive_current_value(&first).unwrap());
-        assert!(peer.harness_was_ready("agent/cedar", "one").unwrap());
+        assert!(peer.harness_was_ready("agent/example/cedar", "one").unwrap());
         let mut second = owner
             .append_claim(&state("idle", "one", now_ms() as u64))
             .unwrap();
@@ -1758,13 +2143,13 @@ mod tests {
         assert!(!peer.receive_current_value(&first).unwrap());
         assert!(!peer.receive_current_value(&second).unwrap());
         assert_eq!(
-            peer.latest_claim("agent/cedar", Some("harness.observed"))
+            peer.latest_claim("agent/example/cedar", Some("harness.observed"))
                 .unwrap()
                 .unwrap()
                 .body["fields"]["state"],
             "idle"
         );
-        assert!(peer.replication_inventory().unwrap().envelopes.is_empty());
+        assert_eq!(peer.replication_inventory().unwrap().digest,inventory);
         assert_eq!(peer.local_observations_after(0, 100).unwrap().len(), 1);
     }
 }

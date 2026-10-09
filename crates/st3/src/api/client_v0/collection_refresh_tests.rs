@@ -196,12 +196,14 @@ async fn a_usage_commit_rereads_agents_and_leaves_missions_idle() {
 async fn local_and_received_status_registers_reread_agents_without_missions_or_work() {
     let root = tempfile::tempdir().unwrap();
     let state = super::tests::test_state_named(root.path(), "alder");
+    let intent=crate::graph::parse_intent("version 2\nagent \"fixture/roster\" { harness \"codex\" {} }","alder").unwrap();
+    state.store.apply_internal(&intent,"declared-current-receive-fixture").unwrap();
     let mut fixture = Fixture::open(state, false, None, &["missions", "agents", "work"]).await;
     for _ in 0..3 {
         assert_eq!(fixture.frame().await["kind"], "snapshot");
     }
     fixture.claim(
-        "agent/fixture-roster",
+        "agent/fixture/roster",
         "runtime.observed",
         json!({"status":"running", "incarnation_id":"one"}),
     );
@@ -209,7 +211,7 @@ async fn local_and_received_status_registers_reread_agents_without_missions_or_w
         assert_eq!(fixture.frame().await["kind"], "changes");
     }
     fixture.claim(
-        "agent/fixture-roster",
+        "agent/fixture/roster",
         "harness.observed",
         json!({"state":"working", "driver":"codex", "incarnation_id":"one"}),
     );
@@ -224,7 +226,7 @@ async fn local_and_received_status_registers_reread_agents_without_missions_or_w
     let source = Store::open_memory("alder").unwrap();
     let received = source
         .append_claim(&ClaimInput {
-            subject: "agent/fixture-roster".into(),
+            subject: "agent/fixture/roster".into(),
             kind: "harness.observed".into(),
             actor: None,
             fields: serde_json::from_value(
@@ -254,7 +256,7 @@ async fn local_and_received_status_registers_reread_agents_without_missions_or_w
     // Even without numeric usage, the first occupancy reading establishes a work usage
     // value. Its window must refresh, while mission cards still have no register input.
     fixture.claim(
-        "agent/fixture-roster",
+        "agent/fixture/roster",
         "harness.usage",
         json!({"semantics":"context_occupancy", "driver":"codex", "incarnation_id":"one",
             "context_used_tokens":12}),

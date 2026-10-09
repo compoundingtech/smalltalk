@@ -86,7 +86,8 @@ pub trait Runtime: Send + Sync {
 
     /// Called only after a current-observation transaction successfully commits. The hook
     /// must be non-blocking and do no SQL; immutable runtimes need no invalidation.
-    fn current_observation_committed(&self, _kind: &str) {}
+    /// A freshness-only restamp advances source identity but leaves semantic kind revisions alone.
+    fn current_observation_committed(&self, _kind: &str, _semantic_changed: bool) {}
 
     /// Check a replicated claim's kind and fields once the graph has verified its hash and batch.
     fn classify_replicated_claim(

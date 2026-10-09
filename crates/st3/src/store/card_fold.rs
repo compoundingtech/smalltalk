@@ -213,19 +213,37 @@ impl CardReads {
             }
         }
         let mut registers = connection.prepare_cached(
-            "SELECT subject,kind,body FROM latest_values
-             WHERE subject IN (SELECT value FROM json_each(?1))
-             AND kind='workspace.observed' ORDER BY source_at,source_id",
+            "SELECT subject,kind,body FROM latest_values v
+             WHERE subject IN (SELECT value FROM json_each(?1)) AND kind='workspace.observed'
+             AND source_at>=COALESCE((SELECT CAST(c.accepted_at_unix_ms AS INTEGER)
+                 FROM claims c INDEXED BY claims_subject_kind_accepted_index
+                 WHERE c.subject=v.subject AND c.kind=v.kind AND c.store_index<=?2
+                 ORDER BY length(c.accepted_at_unix_ms) DESC,c.accepted_at_unix_ms DESC LIMIT 1),0)
+             ORDER BY source_at,source_id",
         )?;
         for chunk in missing.chunks(CHUNK) {
-            for row in registers.query_map([json_list(chunk)?], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            for row in registers.query_map(params![json_list(chunk)?, self.index], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })? {
                 let (subject, kind, body) = row?;
                 if let Some(actual) = self.actual.get_mut(&subject) {
+                    let workspace: Value = serde_json::from_str(&body)?;
+                    let fields = workspace.get("fields").unwrap_or(&workspace);
+                    if actual
+                        .latest
+                        .as_ref()
+                        .and_then(|actual| actual["host"].as_str())
+                        .is_some_and(|host| fields["host"].as_str() != Some(host))
+                    {
+                        continue;
+                    }
                     actual.latest = fold_latest_values([
                         (String::new(), actual.latest.take().unwrap_or(Value::Null)),
-                        (kind, serde_json::from_str(&body)?),
+                        (kind, workspace),
                     ])?;
                 }
             }
@@ -804,5 +822,113 @@ impl Store {
                 .extend(chunk.iter().filter(|subject| members.contains(*subject)).cloned());
         }
         Ok(reads)
+    }
+}
+
+#[cfg(test)]
+mod current_workspace_tests {
+    use super::*;
+
+    fn input(kind: &str, fields: Value) -> ClaimInput {
+        ClaimInput {
+            subject: "agent/cedar".into(),
+            kind: kind.into(),
+            actor: None,
+            fields: serde_json::from_value(fields).unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        }
+    }
+
+    fn card_actual(store: &Store, index: u64) -> Option<Value> {
+        let connection = store.readers.get();
+        let mut cards = CardReads::new(index);
+        cards
+            .load_actual(&connection, &["agent/cedar".into()])
+            .unwrap();
+        cards.latest(&connection, "agent/cedar").unwrap()
+    }
+
+    #[test]
+    fn workspace_cards_and_actual_reads_preserve_mixed_version_shadowing_and_host_fences() {
+        let store = Store::open_memory("owner").unwrap();
+        store
+            .append_claim(&input(
+                "runtime.observed",
+                json!({"status":"running","host":"owner","incarnation_id":"one"}),
+            ))
+            .unwrap();
+        let modern = input(
+            "workspace.observed",
+            json!({"host":"owner","workspace":"/register"}),
+        );
+        latest_values::append(&store.graph, &modern, 1, None).unwrap();
+        let cut = store.index().unwrap();
+        let old = input(
+            "workspace.observed",
+            json!({"host":"owner","workspace":"/legacy"}),
+        );
+        append_legacy_graph_observation_fenced(&store.graph, &old, 2, None).unwrap();
+        let index = store.index().unwrap();
+        let connection = store.readers.get();
+        assert_eq!(
+            latest_actual_at(&connection, "agent/cedar", Some(index))
+                .unwrap()
+                .unwrap()["workspace"],
+            "/legacy"
+        );
+        assert_eq!(card_actual(&store, index).unwrap()["workspace"], "/legacy");
+        assert_eq!(
+            latest_actual_at(&connection, "agent/cedar", Some(cut))
+                .unwrap()
+                .unwrap()["workspace"],
+            "/register"
+        );
+        assert_eq!(card_actual(&store, cut).unwrap()["workspace"], "/register");
+        drop(connection);
+
+        let handoff = Store::open_memory("owner").unwrap();
+        handoff
+            .append_claim(&input(
+                "runtime.observed",
+                json!({"status":"running","host":"owner","incarnation_id":"one"}),
+            ))
+            .unwrap();
+        latest_values::append(&handoff.graph, &modern, now_ms(), None).unwrap();
+        handoff
+            .append_claim(&input(
+                "runtime.observed",
+                json!({"status":"running","host":"destination","incarnation_id":"two"}),
+            ))
+            .unwrap();
+        let index = handoff.index().unwrap();
+        let actual = handoff.latest_actual_value("agent/cedar").unwrap().unwrap();
+        let card = card_actual(&handoff, index).unwrap();
+        assert_eq!(actual["host"], "destination");
+        assert_eq!(card["host"], "destination");
+        assert!(actual.get("workspace").is_none());
+        assert!(card.get("workspace").is_none());
+    }
+
+    #[test]
+    fn a_newer_legacy_working_observation_wins_over_an_older_register() {
+        let store = Store::open_memory("owner").unwrap();
+        let idle = input(
+            "harness.observed",
+            json!({"state":"idle","driver":"codex","incarnation_id":"one"}),
+        );
+        latest_values::append(&store.graph, &idle, 1, None).unwrap();
+        let working = input(
+            "harness.observed",
+            json!({"state":"working","driver":"codex","incarnation_id":"one"}),
+        );
+        append_legacy_graph_observation_fenced(&store.graph, &working, 2, None).unwrap();
+        let connection = store.readers.get();
+        assert!(
+            agent_working_since_at(&connection, "agent/cedar", "one", store.index().unwrap())
+                .unwrap()
+                .is_some()
+        );
     }
 }

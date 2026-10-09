@@ -313,11 +313,13 @@ pub fn truncate_idle_wal(connection: &Connection) -> Result<bool> {
     Ok(busy == 0)
 }
 
-/// The store's only write connection, owned by one writer thread. Writes queue in front of it in
+/// The store's managed write connection, owned by one writer thread. Writes queue in front of it in
 /// foreground arrival order: a batched write runs on the writer thread with the others queued behind it, each
 /// in a savepoint of one transaction that commits once for all of them, and its caller hears back
 /// after that commit. `write` lends the connection itself to its caller until the guard drops,
-/// for writes that manage their own transactions. Nothing else ever takes SQLite's write lock.
+/// for writes that manage their own transactions. Applications may explicitly use separate
+/// zero-wait connections for replaceable observations; those can briefly contend with this
+/// writer, so callers must preserve their configured busy/deadline handling.
 pub struct WriterConnection {
     pub jobs: Mutex<Option<std::sync::mpsc::Sender<WriterJob>>>,
     pub thread: Mutex<Option<std::thread::JoinHandle<()>>>,

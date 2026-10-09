@@ -26,6 +26,10 @@ def fields(node, kind):
     if kind == "harness.observed":
         database = (node.root / "state/claims.sqlite3").as_uri() + "?mode=ro"
         with sqlite3.connect(database, uri=True) as connection:
+            if not connection.execute(
+                    "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='latest_values'").fetchone():
+                return [row["body"].get("fields", row["body"]) for row in trace(node, SUBJECT)
+                        if row.get("kind") == kind]
             rows = connection.execute(
                 "SELECT body FROM latest_values WHERE subject=? AND kind=?", (SUBJECT, kind))
             current = [json.loads(body)["fields"] for (body,) in rows]

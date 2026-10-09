@@ -2028,13 +2028,28 @@ async fn send_one(context: &Context, name: &str) -> Result<(), String> {
                 sequence: turn as u64 + 1,
                 claim,
             };
+            let current = kind == "harness.observed";
             let result = on_daemon(context, move |store| {
-                Ok(store.append_harness_event(&publication).map(drop))
+                Ok(if current {
+                    store.append_claim(&publication.claim).map(drop)
+                } else {
+                    store.append_harness_event(&publication).map(drop)
+                })
             })
             .await?;
-            // Nonzero-sequence events remain reliable even for categorical legacy kinds.
-            // Any failure here still fails the load budget; these are not current samples.
-            result.map_err(|error| error.message)
+            match result {
+                Err(error)
+                    if current
+                        && (error.code == "current-value-deadline"
+                            || error.code == "internal"
+                                && (error.message.contains("database is locked")
+                                    || error.message.contains("database table is locked"))) =>
+                {
+                    context.current_dropped.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                result => result.map_err(|error| error.message),
+            }
         }
         "seat mailbox page" => {
             get(format!(

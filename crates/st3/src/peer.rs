@@ -260,6 +260,7 @@ pub struct ClientRelay {
     fabric: Option<Fabric>,
     // Reuse Fabric listeners and reqwest connections; retain no publication bytes or retry jobs.
     current_connections: Arc<std::sync::Mutex<BTreeMap<(String, String), String>>>,
+    current_transport_ids: Arc<std::sync::Mutex<BTreeMap<String, String>>>,
     legacy: bool,
     /// When each owner last refused this node's reads as stale, for provenance.
     fence_conflicts:
@@ -284,6 +285,17 @@ pub struct ClientReadProvenance {
 impl ClientRelay {
     /// One bounded attempt per reachable peer, with no queue, replay or fallback to claims.
     pub(crate) async fn publish_current_value(&self, record: crate::model::ClaimRecord) {
+        if record.kind == "transport.observed" {
+            let mut published = self
+                .current_transport_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if published.get(&record.subject) == Some(&record.id) {
+                return;
+            }
+            // One attempt per fresh observer value, even if a receive repeats its source ID.
+            published.insert(record.subject.clone(), record.id.clone());
+        }
         let Ok(body) = serde_json::to_vec(&record) else {
             return;
         };
@@ -296,11 +308,7 @@ impl ClientRelay {
         else {
             return;
         };
-        let view = self
-            .links
-            .as_ref()
-            .and_then(|s| s.fleet_view().ok())
-            .unwrap_or_default();
+        let view = self.fleet_view();
         let targets = dial_targets(
             &view,
             &self.node,
@@ -317,10 +325,13 @@ impl ClientRelay {
             .filter(|(peer, _)| {
                 // A current sample never opens connections around the durable worker's
                 // offline/overload backoff. Drop it; recovery sends no saved current bytes.
-                let Some(store) = &self.links else { return true; };
-                if store.replication_worker(peer).is_some_and(|worker| {
-                    matches!(worker.phase.as_str(), "backoff" | "overload")
-                }) {
+                let Some(store) = &self.links else {
+                    return true;
+                };
+                if store
+                    .replication_worker(peer)
+                    .is_some_and(|worker| matches!(worker.phase.as_str(), "backoff" | "overload"))
+                {
                     return false;
                 }
                 // The worker briefly leaves backoff while checking a still-offline route.
@@ -337,35 +348,40 @@ impl ClientRelay {
                         Route::Fabric { node, protocol } => Some((node.clone(), protocol.clone())),
                         Route::Http(_) => None,
                     };
-                    let attempt = async {
-                        let url = match route {
-                            Route::Http(url) => url,
-                            Route::Fabric { node, protocol } => {
-                                let key = (node.clone(), protocol.clone());
-                                let cached = self
-                                    .current_connections
+                    let url = match route {
+                        Route::Http(url) => url,
+                        Route::Fabric { node, protocol } => {
+                            let key = (node.clone(), protocol.clone());
+                            let cached = self
+                                .current_connections
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get(&key)
+                                .cloned();
+                            if let Some(url) = cached {
+                                url
+                            } else {
+                                let Some(fabric) = &self.fabric else {
+                                    return;
+                                };
+                                let Ok(Ok(address)) = tokio::time::timeout(
+                                    Duration::from_secs(1),
+                                    fabric.dial(&node, &protocol),
+                                )
+                                .await
+                                else {
+                                    return;
+                                };
+                                let url = format!("http://{address}");
+                                self.current_connections
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .get(&key)
-                                    .cloned();
-                                if let Some(url) = cached {
-                                    url
-                                } else {
-                                    let Some(fabric) = &self.fabric else {
-                                        return false;
-                                    };
-                                    let Ok(address) = fabric.dial(&node, &protocol).await else {
-                                        return false;
-                                    };
-                                    let url = format!("http://{address}");
-                                    self.current_connections
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .insert(key, url.clone());
-                                    url
-                                }
+                                    .insert(key, url.clone());
+                                url
                             }
-                        };
+                        }
+                    };
+                    let attempt = async {
                         let response = self
                             .http
                             .post(format!("{}{CURRENT_VALUE_PATH}", url.trim_end_matches('/')))
@@ -376,13 +392,15 @@ impl ClientRelay {
                             .await;
                         match response {
                             Ok(response) => {
-                                let accepted = response.status().is_success();
-                                accepted && response.bytes().await.is_ok()
+                                // A protocol refusal (including old-peer 404 or busy 503)
+                                // proves the connection works. Only transport failure evicts it.
+                                response.bytes().await.is_ok()
                             }
                             Err(_) => false,
                         }
                     };
-                    // Fleet budget covers both network legs plus the receiver's 100 ms local hop.
+                    // A cold Fabric dial has its own one-second cap. The warm POST budget
+                    // covers both network legs plus the receiver's 100 ms local hop.
                     let accepted = tokio::time::timeout(Duration::from_millis(250), attempt)
                         .await
                         .unwrap_or(false);
@@ -563,6 +581,7 @@ impl ClientRelay {
             legacy: config.fleet.as_ref().is_none_or(|file| file.legacy_peers),
             observed: Arc::default(),
             current_connections: Arc::default(),
+            current_transport_ids: Arc::default(),
             membership: Arc::default(),
             fence_conflicts: Arc::default(),
             fabric: resolve_tool(
@@ -1809,22 +1828,109 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[tokio::test]
+    async fn current_receive_authentication_origin_and_backend_deadline_are_http_contracts() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("backend.sock");
+        let backend_socket = socket.clone();
+        let backend = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/v1/internal/current-value",
+                axum::routing::post(|| async {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(serde_json::json!({
+                            "code":"current-value-deadline",
+                                "message":"write expired", "details":{}
+                        })),
+                    )
+                }),
+            );
+            crate::api::serve_unix(&backend_socket, app).await.unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(socket.exists());
+        let auth = FleetAuth::test("fleet-test", &[7; 32]);
+        let state = PeerState::new(
+            MainBackend::new(socket),
+            "target".into(),
+            auth.clone(),
+            FleetContext::legacy(BTreeSet::from(["source".into()])),
+        );
+        let source = Store::open_memory("source").unwrap();
+        let record = source
+            .append_claim(&ClaimInput {
+                subject: "agent/cedar".into(),
+                kind: "harness.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(
+                    serde_json::json!({"state":"idle","incarnation_id":"one"}),
+                )
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let body = serde_json::to_vec(&record).unwrap();
+        for (signed, bytes, expected) in [
+            (false, body.clone(), StatusCode::UNAUTHORIZED),
+            (true, b"{bad".to_vec(), StatusCode::BAD_REQUEST),
+            (
+                true,
+                {
+                    let mut foreign = record.clone();
+                    foreign.origin = "foreign".into();
+                    serde_json::to_vec(&foreign).unwrap()
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (true, body, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(CURRENT_VALUE_PATH)
+                .body(Body::from(bytes.clone()))
+                .unwrap();
+            if signed {
+                *request.headers_mut() = auth
+                    .request_headers_for(CURRENT_VALUE_PATH, "source", &bytes)
+                    .unwrap();
+            }
+            let response = peer_router(state.clone(), smalltalk_routes())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        backend.abort();
+    }
+
+    #[tokio::test]
     async fn current_fleet_attempt_reuses_fabric_connection_and_bounds_the_whole_hop() {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         let root = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let delay = Arc::new(AtomicU64::new(120));
+        let status = Arc::new(AtomicU64::new(200));
         let app = axum::Router::new().route(
             CURRENT_VALUE_PATH,
             axum::routing::post({
-                let (calls, delay) = (calls.clone(), delay.clone());
+                let (calls, delay, status) = (calls.clone(), delay.clone(), status.clone());
                 move || {
-                    let (calls, delay) = (calls.clone(), delay.clone());
+                    let (calls, delay, status) = (calls.clone(), delay.clone(), status.clone());
                     async move {
                         calls.fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(Duration::from_millis(delay.load(Ordering::SeqCst)))
                             .await;
-                        axum::Json(serde_json::json!({"changed":true}))
+                        (
+                            StatusCode::from_u16(status.load(Ordering::SeqCst) as u16).unwrap(),
+                            axum::Json(serde_json::json!({"changed":true})),
+                        )
                     }
                 }
             }),
@@ -1859,7 +1965,7 @@ mod tests {
         })
         .unwrap()
         .unwrap();
-        relay.fabric = Some(Fabric::new(fabric));
+        relay.fabric = Some(Fabric::new(fabric.clone()));
         let source = Arc::new(Store::open_memory("owner").unwrap());
         relay = relay.with_links(source.clone());
         let record = source
@@ -1897,23 +2003,86 @@ mod tests {
         relay.publish_current_value(record.clone()).await;
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         assert_eq!(fs::read_to_string(&dial_log).unwrap().lines().count(), 2);
-        source.record_replication_worker("peer", smallclaims::replication::ReplicationWorkerStatus {
-            phase: "backoff".into(), last_attempt_at_unix_ms: u128::from(st_drivers::message::now_ms()),
-            next_retry_at_unix_ms: Some(u128::from(st_drivers::message::now_ms()) + 30_000),
-        });
+        source.record_replication_worker(
+            "peer",
+            smallclaims::replication::ReplicationWorkerStatus {
+                phase: "backoff".into(),
+                last_attempt_at_unix_ms: u128::from(st_drivers::message::now_ms()),
+                next_retry_at_unix_ms: Some(u128::from(st_drivers::message::now_ms()) + 30_000),
+            },
+        );
         relay.publish_current_value(record.clone()).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 4, "current hints respect offline backoff");
-        source.record_replication_worker("peer", smallclaims::replication::ReplicationWorkerStatus {
-            phase: "idle".into(), ..Default::default()
-        });
-        source.record_peer_failure("peer", "unknown", "offline route").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "current hints respect offline backoff"
+        );
+        source.record_replication_worker(
+            "peer",
+            smallclaims::replication::ReplicationWorkerStatus {
+                phase: "idle".into(),
+                ..Default::default()
+            },
+        );
+        source
+            .record_peer_failure("peer", "unknown", "offline route")
+            .unwrap();
         relay.publish_current_value(record.clone()).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 4, "checking an offline route does not open current probes");
-        source.connection.write().execute("UPDATE replication_peers SET last_error=NULL WHERE peer='peer'", []).unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "checking an offline route does not open current probes"
+        );
+        source
+            .connection
+            .write()
+            .execute(
+                "UPDATE replication_peers SET last_error=NULL WHERE peer='peer'",
+                [],
+            )
+            .unwrap();
         tokio::task::yield_now().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 4, "recovery does not replay a dropped hint");
-        relay.publish_current_value(record).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "recovery does not replay a dropped hint"
+        );
+        relay.publish_current_value(record.clone()).await;
         assert_eq!(calls.load(Ordering::SeqCst), 5);
+        for refused in [404, 503] {
+            status.store(refused, Ordering::SeqCst);
+            for _ in 0..2 {
+                relay.publish_current_value(record.clone()).await;
+            }
+            assert_eq!(relay.current_connections.lock().unwrap().len(), 1);
+            assert_eq!(
+                fs::read_to_string(&dial_log).unwrap().lines().count(),
+                2,
+                "old-peer and busy responses must not force a new dial"
+            );
+        }
+        status.store(200, Ordering::SeqCst);
+        relay.current_connections.lock().unwrap().clear();
+        fs::write(
+            &fabric,
+            format!(
+                "#!/bin/sh\nprintf 'dial\\n' >> '{}'\nsleep 0.4\nprintf '{}\\n'\n",
+                dial_log.display(),
+                address
+            ),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        relay.publish_current_value(record.clone()).await;
+        assert!(started.elapsed() >= Duration::from_millis(350));
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert_eq!(
+            relay.current_connections.lock().unwrap().len(),
+            1,
+            "a slow but bounded cold dial is cached"
+        );
+        relay.publish_current_value(record).await;
+        assert_eq!(fs::read_to_string(&dial_log).unwrap().lines().count(), 3);
         server.abort();
     }
 
