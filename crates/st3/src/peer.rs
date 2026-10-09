@@ -1133,8 +1133,10 @@ async fn receive_client_read(
                 cursor,
             } => {
                 anyhow::ensure!((1..=200).contains(&limit), "the timeline limit is invalid");
+                // A cursor carries its own page size. The relayed limit is a required field
+                // that a gateway fills with its default, so it only sizes a first page.
                 let value = client
-                    .timeline(&session_id, cursor.as_deref(), Some(limit))
+                    .timeline(&session_id, cursor.as_deref(), cursor.is_none().then_some(limit))
                     .await?
                     .value;
                 Ok(serde_json::to_value(value)?)

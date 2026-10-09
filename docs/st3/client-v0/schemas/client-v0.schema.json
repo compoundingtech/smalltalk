@@ -2522,7 +2522,8 @@
             "session_id": { "$ref": "#/$defs/Id" },
             "replace": { "type": "boolean" },
             "items": { "type": "array", "items": { "$ref": "#/$defs/TimelineEntry" } },
-            "has_more": { "type": "boolean" }
+            "has_more": { "type": "boolean" },
+            "older_cursor": { "type": "string", "description": "Replacement frames only, present whenever has_more is true: the timeline cursor (GET /v1/client/sessions/{id}/timeline?cursor=...) for the entries just before this frame's oldest entry." }
           }
         },
         {
