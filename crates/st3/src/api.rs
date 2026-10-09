@@ -17595,13 +17595,14 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         std::fs::write(&corrupt, format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\nbroken\n")).unwrap();
         assert!(launch("agent/invalid", "corrupt", "omp", Some(corrupt), false).await.is_err());
         assert_eq!(launch("agent/invalid", "two", "omp", Some(seed.clone()), false).await.unwrap(), Some(id.clone()), "invalid input must not consume the opportunity");
-        assert!(launch("agent/invalid", "three", "omp", Some(seed.clone()), false).await.unwrap_err().to_string().contains("first-native-launch-incomplete"));
+        assert_eq!(launch("agent/invalid", "three", "omp", Some(seed.clone()), false).await.unwrap(), None, "an unbound seeded receipt starts fresh even while seed remains declared");
 
         let (one, two) = tokio::join!(
             launch("agent/concurrent", "one", "omp", Some(seed.clone()), false),
             launch("agent/concurrent", "two", "omp", Some(seed.clone()), false)
         );
-        assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
+        let outcomes = [one.unwrap(), two.unwrap()];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_some()).count(), 1, "only the receipt winner launches seeded; the other launch proceeds fresh");
         let append = |seat: &str, kind: &str, fields: Value| {
             state.store.append_claim(&ClaimInput { subject: seat.into(), kind: kind.into(), actor: Some(seat.into()), fields: serde_json::from_value(fields).unwrap(), evidence: vec![], expected_subject: None, idempotency_key: None }).unwrap();
         };
@@ -17626,8 +17627,12 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         let notice = state.store.latest_claim("agent/invalid", Some("harness.diagnostic")).unwrap().unwrap();
         assert_eq!(notice.body["fields"]["code"], "first-native-launch-incomplete");
         assert_eq!(notice.body["fields"]["severity"], "warning");
-        let refusal = launch("agent/invalid", "still-declared", "omp", Some(invalid.clone()), false).await.unwrap_err();
-        assert!(refusal.to_string().contains("st agents acknowledge-seed"));
+        assert_eq!(launch("agent/invalid", "still-declared", "omp", Some(invalid.clone()), false).await.unwrap(), None, "even a missing still-declared seed is not validated or staged again");
+        let declared_notice = state.store.latest_claim("agent/invalid", Some("harness.diagnostic")).unwrap().unwrap();
+        assert_eq!(declared_notice.body["fields"]["code"], "first-native-launch-incomplete");
+        assert_eq!(declared_notice.body["fields"]["incarnation_id"], "still-declared");
+        assert!(declared_notice.body["fields"]["reason"].as_str().unwrap().contains("starting fresh"));
+        assert!(!declared_notice.body["fields"]["reason"].as_str().unwrap().contains("acknowledge-seed"), "launch notices do not prescribe recovery before starting");
         assert!(crate::native_seed::acknowledge(&client, "agent/fresh", "person/operator", "fresh needs no recovery").await.is_err());
         assert!(crate::native_seed::acknowledge(&client, "agent/invalid", "person/operator", " ").await.is_err());
         let acknowledgement = crate::native_seed::acknowledge(&client, "agent/invalid", "person/operator", "accept fresh after interrupted import").await.unwrap();
@@ -17635,7 +17640,8 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         assert_eq!(acknowledgement.actor.as_deref(), Some("person/operator"));
         assert_eq!(acknowledgement.body["fields"]["reason"], "accept fresh after interrupted import");
         assert_eq!(acknowledgement.body["evidence"][0], acknowledgement.body["fields"]["receipt"]);
-        assert_eq!(launch("agent/invalid", "recovered", "omp", Some(invalid.clone()), false).await.unwrap(), None, "acknowledgement allows fresh launch despite stale declaration without reseeding");
+        assert_eq!(launch("agent/invalid", "recovered", "omp", Some(invalid.clone()), false).await.unwrap(), None, "acknowledgement records acceptance without reseeding or changing fresh launch behavior");
+        assert_eq!(state.store.latest_claim("agent/invalid", Some("harness.diagnostic")).unwrap().unwrap().id, declared_notice.id, "acknowledgement suppresses later incomplete notices, not launches");
         append("agent/deliberately-fresh", "runtime.action.requested", json!({"action":"fresh-context"}));
         assert_eq!(launch("agent/deliberately-fresh", "one", "omp", Some(invalid.clone()), false).await.unwrap(), None);
         assert!(launch("agent/strict", "conflicting", "omp", Some(invalid), true).await.unwrap_err().to_string().contains("native seed cannot accompany resume environment"));

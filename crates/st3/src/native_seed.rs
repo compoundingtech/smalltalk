@@ -101,7 +101,6 @@ async fn existing_outcome(
     client: &crate::client::Client,
     subject: &str,
     incarnation: &str,
-    seed: Option<&Path>,
     record: &ClaimRecord,
 ) -> Result<Option<String>> {
     if matches!(serde_json::from_value::<Outcome>(record.body["fields"].clone())?, Outcome::Fresh) {
@@ -115,8 +114,7 @@ async fn existing_outcome(
         return Ok(None);
     }
     let reason = "first-native-launch-incomplete: the seeded attempt has no recorded native binding; \
-        never reseeding. Remove seed to launch fresh, or acknowledge with \
-        `st agents acknowledge-seed AGENT --reason REASON` to accept fresh launches without rearming seed.";
+        starting fresh without staging or reseeding.";
     let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
         subject: subject.into(),
         kind: "harness.diagnostic".into(),
@@ -133,7 +131,6 @@ async fn existing_outcome(
         idempotency_key: Some(format!("first-native-launch-incomplete:{}:{incarnation}", record.id)),
     }).await?;
     eprintln!("{reason}");
-    anyhow::ensure!(seed.is_none(), "{reason}");
     Ok(None)
 }
 
@@ -217,7 +214,7 @@ pub async fn first_launch(
         }
     }
     if let Some(record) = prior(client, subject).await? {
-        return existing_outcome(client, subject, incarnation, seed, &record).await;
+        return existing_outcome(client, subject, incarnation, &record).await;
     }
     let outcome = match seed.filter(|_| !deliberately_fresh) {
         Some(seed) => Outcome::Seeded {
@@ -228,12 +225,12 @@ pub async fn first_launch(
     let input = receipt(subject, incarnation, &outcome);
     match client.post::<_, ClaimRecord>("/v1/claims", &input).await {
         Ok(record) if record.body.pointer("/fields/invocation_id") != input.fields.get("invocation_id") => {
-            return existing_outcome(client, subject, incarnation, seed, &record).await;
+            return existing_outcome(client, subject, incarnation, &record).await;
         }
         Ok(_) => {}
         Err(error) => {
             if let Some(record) = prior(client, subject).await? {
-                return existing_outcome(client, subject, incarnation, seed, &record).await;
+                return existing_outcome(client, subject, incarnation, &record).await;
             }
             return Err(error);
         }

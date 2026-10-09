@@ -281,10 +281,11 @@ seats. Run it without `--print-kdl` only for an agent we agreed to start.
 
 `agents acknowledge-seed AGENT --reason REASON` is a recorded recovery mutation for an interrupted
 OMP seed attempt. Review help here; use only disposable state for the mutation. Check that the
-claim cites the original receipt and records the actor and reason, and that the next launch is
-fresh without rearming seed, even if the declaration still carries it. Without acknowledgement,
-removing seed also allows a fresh launch with a durable incomplete warning. A plain fresh seat
-never needs this recovery, including a restart before its first message.
+claim cites the original receipt and records the actor and reason. With or without acknowledgement,
+the next launch is fresh without rearming seed, even if the declaration still carries it.
+An unacknowledged attempt prints and records a durable incomplete warning; acknowledgement
+suppresses later warnings, never gates launch. A plain fresh seat never needs this recovery,
+including a restart before its first message.
 
 ### 8. `terminals` — inspect and attach without shell nesting
 

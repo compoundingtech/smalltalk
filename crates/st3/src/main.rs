@@ -2944,7 +2944,7 @@ enum AgentsCommand {
     Stop(AgentStopArgs),
     /// Restart a top-level or mission seat, preserving its declaration; wait for a new incarnation.
     Restart(AgentRestartArgs),
-    /// Accept fresh launches after an interrupted seed attempt; never rearm the seed.
+    /// Acknowledge an interrupted seed attempt and its warning; never gate launch or rearm seed.
     AcknowledgeSeed(AgentAcknowledgeSeedArgs),
     /// Retry a published owned-seat cutover with fresh desired and incarnation fences.
     Rollout(AgentRolloutArgs),

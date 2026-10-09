@@ -1364,8 +1364,9 @@ A `fresh` outcome never blocks later launches, including a restart before the fi
 or native binding; a later seed declaration is ignored and never rearms the opportunity.
 An unbound `seeded` outcome is explicitly incomplete: the driver records a durable
 `harness.diagnostic` warning with code `first-native-launch-incomplete` and prints the notice.
-With no seed declared it proceeds fresh. With a seed still declared it refuses, giving this
-supported recovery path before any refusal:
+It always proceeds fresh, whether seed is absent, still declared, or now points to an invalid
+file. It never validates, stages, or reseeds that declaration again. A person may acknowledge
+the incomplete attempt after inspecting it:
 
 ```sh
 st agents acknowledge-seed AGENT --reason "Accept fresh after inspecting the interrupted import" --as ACTOR
@@ -1373,9 +1374,8 @@ st agents acknowledge-seed AGENT --reason "Accept fresh after inspecting the int
 
 The actor may default to the configured person, as for other seat controls. The command records
 `custom.agent.first-native-launch-acknowledged` with the receipt as evidence; it never deletes the
-receipt, restores the first-launch opportunity, or reseeds. After acknowledgement the seat may
-launch fresh even while a stale seed declaration remains. Alternatively remove `seed` and
-republish to launch fresh while preserving the visible incomplete notice. Receipts, recovery
+receipt, restores the first-launch opportunity, or reseeds. Acknowledgement records acceptance
+and suppresses later incomplete notices; it is never required to permit a launch. Receipts,
 acknowledgements, notices, and native bindings survive checkpoint trim.
 
 A harness block cannot declare `prompt`. Parsing refuses it with `harness-prompt-removed`. Put the instruction in a step goal or send the seat a message.
