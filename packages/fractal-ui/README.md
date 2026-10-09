@@ -138,6 +138,8 @@ The composer preserves kit send, cancellation, byte-limit and token-history cont
 
 State and draft codecs use the workspace's single `effect@4.0.0-rc.118` runtime and the matching `@effect/atom-react@4.0.0-rc.118` binding. `react-aria@3.52.1` is declared explicitly for the separator and portal APIs already used by the kit. Performance counters and `RenderProfiler` stay internal rather than becoming package-root exports.
 
+The codecs use native `Schema.optional`, preserving both absent fields and explicitly present `undefined` fields from the original Effect 3 contract. `OptionalSnapshotFields` exercises the real pane-key parser and snapshot encode/read path, including form-only, view-only and undefined-ratio inputs.
+
 The exported legacy Folio, Relay and Orbit palettes also avoid green: `good` is the direction's 80% ink foreground; `added` is a non-green wash whose luminance difference from the panel is within 20% of the direction's removed wash. Run `pnpm --filter @smalltalk/fractal-ui test:palettes` to check all six direction/scheme combinations without a browser. The public names and palette-selection API are unchanged.
 
 ## Clean-room note

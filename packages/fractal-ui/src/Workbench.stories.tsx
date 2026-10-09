@@ -8,7 +8,7 @@ import type { DiffRevealRequest } from './assistant-ui/composition/DiffPanel'
 import type { WorkLogCall } from './assistant-ui/taste/work-log'
 import { AgentDragRow, DragToSplitFixture } from './assistant-ui/workbench/DragToSplitFixture'
 import { openAgentAtPath, type AgentPlacement } from './assistant-ui/workbench/agent-drag'
-import { findGroupPath, group, split, type WorkbenchLayout, type WorkbenchResources } from './assistant-ui/workbench/workbench-model'
+import { findGroupPath, group, split, parsePaneKey, type WorkbenchLayout, type WorkbenchResources } from './assistant-ui/workbench/workbench-model'
 import { readStoredLayout, storeLayout } from './assistant-ui/workbench/workbench-state'
 import { decidedAppearance, fixtureNow, onePaneLayout, twoPaneLayout, nestedLayout, useWorkbenchFixture } from './assistant-ui/workbench/workbench-fixtures'
 import { TerminalFixturePanel } from './assistant-ui/workbench/TerminalFixturePanel'
@@ -86,6 +86,22 @@ export const DragToSplitSingleGroup: Story = { render: args => <div {...stylex.p
 export const RendererOverride: Story = { render: function Render(args) {
   const fixture = useWorkbenchFixture()
   return <main {...stylex.props(styles.canvas, ...baselineTheme, args.scheme === 'light' && lightTheme)}><Workbench layout={group([{ uri: 'custom:editor' }])} resources={fixture.resources} scheme={args.scheme} workspaceId="kit-b-override" renderPane={() => <label {...stylex.props(styles.override)}>Host-owned editor<textarea aria-label="Host editor" defaultValue="An application-owned pane rendered through renderPane." /></label>} /></main>
+} }
+
+/** Effect 3 optional fields also permit an explicitly present undefined value. */
+export const OptionalSnapshotFields: Story = { args: { state: 'one' }, play: async () => {
+  const workspace = 'kit-b-optional-codec'
+  const layout: WorkbenchLayout = {
+    kind: 'split', split: 'right', ratio: undefined,
+    children: [group([parsePaneKey('agent:worker-1 form=default')]), group([parsePaneKey('agent:worker-2 view=secondary')])],
+  }
+  localStorage.removeItem(`workbench.${workspace}.snapshot`)
+  storeLayout(workspace, layout)
+  const snapshot = localStorage.getItem(`workbench.${workspace}.snapshot`)
+  await expect(snapshot).not.toBeNull()
+  await expect(JSON.parse(snapshot!)).toEqual(JSON.parse(JSON.stringify(layout)))
+  await expect(readStoredLayout(workspace, onePaneLayout)).toEqual(JSON.parse(JSON.stringify(layout)))
+  localStorage.removeItem(`workbench.${workspace}.snapshot`)
 } }
 
 /** Closing a nested pane promotes its neighbour without losing ratios or the exact host identity. */
