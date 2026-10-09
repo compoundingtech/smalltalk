@@ -30,18 +30,48 @@ function hue(rgb: Color): number {
   return ((maximum === red ? (green - blue) / chroma : maximum === green ? (blue - red) / chroma + 2 : (red - green) / chroma + 4) * 60 + 360) % 360
 }
 
-function declarationToken(element: Element, property: string): string | undefined {
-  let token: string | undefined
+function declarationTokens(element: Element, property: string): Set<string> {
+  const candidates = new Set<string>()
   const visit = (rules: CSSRuleList) => {
     for (const rule of rules) {
       if (rule instanceof CSSStyleRule && element.matches(rule.selectorText)) {
         const value = rule.style.getPropertyValue(property)
-        if (value !== '') token = value.match(/var\((--[^,)]+)/)?.[1]
+        for (const match of value.matchAll(/var\((--[^,)]+)/g)) candidates.add(match[1]!)
       } else if (rule instanceof CSSGroupingRule) visit(rule.cssRules)
     }
   }
   for (const sheet of document.styleSheets) visit(sheet.cssRules)
-  return token
+  return candidates
+}
+
+function sharedDeclarationToken(wash: HTMLElement, gutter: HTMLElement): string | undefined {
+  const candidates = new Set([...declarationTokens(wash, 'background-color'), ...declarationTokens(gutter, 'border-left-color')])
+  const originalWash = getComputedStyle(wash).backgroundColor
+  const originalGutter = getComputedStyle(gutter).borderLeftColor
+  const originalStyles = [wash, gutter].map(element => element.getAttribute('style'))
+  let shared: string | undefined
+  // Let the browser resolve layers, specificity and conditional rules. Exactly
+  // one candidate must cause both paints; every other candidate must cause neither.
+  for (const token of candidates) {
+    let washChanged: boolean
+    let gutterChanged: boolean
+    try {
+      wash.style.setProperty(token, 'rgb(1 2 3)', 'important')
+      gutter.style.setProperty(token, 'rgb(1 2 3)', 'important')
+      washChanged = getComputedStyle(wash).backgroundColor !== originalWash
+      gutterChanged = getComputedStyle(gutter).borderLeftColor !== originalGutter
+    } finally {
+      for (const [index, element] of [wash, gutter].entries()) {
+        const style = originalStyles[index]
+        if (style === null) element.removeAttribute('style')
+        else element.setAttribute('style', style!)
+      }
+      if (getComputedStyle(wash).backgroundColor !== originalWash || getComputedStyle(gutter).borderLeftColor !== originalGutter) throw new Error('Diff tint probe did not restore computed styles')
+    }
+    if (washChanged !== gutterChanged || (washChanged && shared !== undefined)) throw new Error('Added wash and gutter do not share a semantic token')
+    if (washChanged) shared = token
+  }
+  return shared
 }
 
 /** Also accepts the pre-token row markup, so the same assertion serves as a negative control. */
@@ -50,6 +80,9 @@ export function assertDiffTint(canvas: HTMLElement) {
   const added = rows.find(row => row.children[0]?.textContent?.trim().endsWith('+'))
   const removed = rows.find(row => row.children[0]?.textContent?.trim().endsWith('−'))
   if (!added || !removed) throw new Error('Diff tint requires an added and a removed row')
+  const washToken = sharedDeclarationToken(added, added.children[0]! as HTMLElement)
+  const gutterToken = washToken
+  if (washToken === undefined) throw new Error('Added wash and gutter do not share a semantic token')
   const addWash = color(getComputedStyle(added).backgroundColor)
   const deleteWash = color(getComputedStyle(removed).backgroundColor)
   const marker = color(getComputedStyle(added.children[0]!).borderLeftColor)
@@ -61,9 +94,6 @@ export function assertDiffTint(canvas: HTMLElement) {
   const addHue = hue(addComposite)
   if (chroma < 0.01) throw new Error('Added-row wash is neutral grey')
   if (addHue >= 90 && addHue <= 170) throw new Error('Added-row wash is green')
-  const washToken = declarationToken(added, 'background-color')
-  const gutterToken = declarationToken(added.children[0]!, 'border-left-color')
-  if (washToken === undefined || washToken !== gutterToken) throw new Error('Added wash and gutter do not share a semantic token')
   // Canvas unpremultiplication of a 9% wash can round by up to 6/255.
   if (addWash.slice(0, 3).some((channel, index) => Math.abs(channel - marker[index]!) > 6 / 255)) throw new Error('Added wash and gutter do not share addition ink')
   if (deleteDelta === 0 || Math.abs(addDelta / deleteDelta - 1) > 0.2) throw new Error(`Addition/deletion luminance delta mismatch: ${addDelta} / ${deleteDelta}`)

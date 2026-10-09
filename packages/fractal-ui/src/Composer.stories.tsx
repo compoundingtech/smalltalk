@@ -289,8 +289,8 @@ export const TargetTooltips: Story = {
     await expect(readout.closest('[data-testid="composer-footer"]')!.querySelectorAll('[title]')).toHaveLength(0)
     await userEvent.keyboard('{Escape}')
     await waitFor(() => expect(page.queryByRole('tooltip')).toBeNull())
-    for (const name of ['Select recipient', 'Select model']) {
-      const control = within(canvasElement.querySelector<HTMLElement>('[data-composer-frame="tooltip.K3"]')!).getByRole('button', { name })
+    for (const [name, value] of [['Select recipient', recipients[0].label], ['Select model', recipients[0].model]] as const) {
+      const control = within(canvasElement.querySelector<HTMLElement>('[data-composer-frame="tooltip.K3"]')!).getByRole('button', { name: `${name}: ${value}` })
       const label = control.querySelector('[data-composer-picker-label]')?.textContent
       await userEvent.hover(control)
       await waitFor(() => expect(page.getByRole('tooltip')).toHaveTextContent(label ?? ''))
@@ -339,7 +339,8 @@ export const MentionPopup: Story = {
     await userEvent.keyboard('src')
     await waitFor(() => expect(list.querySelectorAll('[role="group"]').length).toBeLessThan(groups.length))
     for (const row of list.querySelectorAll('[role="option"]')) await expect(row.textContent).toContain('src')
-    await userEvent.keyboard('{Backspace}{Backspace}{Backspace}{Enter}')
+    // Deleting text clears RAC's virtual focus; ArrowDown reactivates the first result.
+    await userEvent.keyboard('{Backspace}{Backspace}{Backspace}{ArrowDown}{Enter}')
     await waitFor(() => expect(field.querySelectorAll('[data-react-aria-token]')).toHaveLength(1))
     await expect(field.textContent).toContain(firstLabel)
   },
@@ -422,12 +423,12 @@ export const EffortSupported: Story = {
   args: { state: 'typing multi-line', effort: 'supported' },
   play: async ({ canvasElement }) => {
     const page = within(canvasElement.ownerDocument.body)
-    const picker = within(canvasElement).getByRole('button', { name: 'Select effort' })
+    const picker = within(canvasElement).getByRole('button', { name: 'Select effort: Medium' })
     await expect(picker).toHaveTextContent('Medium')
     await userEvent.click(picker)
     const high = await page.findByRole('menuitemradio', { name: 'High' })
     await expect(page.getByRole('menuitemradio', { name: 'Medium' })).toHaveAttribute('aria-checked', 'true')
-    await expect(page.getByText('Default')).toBeVisible()
+    await expect(within(page.getByRole('menu', { name: 'Message effort' })).getByText('Default')).toBeVisible()
     await expect(page.getByRole('menuitemcheckbox', { name: 'Keep for next messages' })).toHaveAttribute('aria-checked', 'false')
     // Frame budget: one choice commits the value subtree exactly once without dropping frames.
     const engine = developmentMeasurements?.createMeasurementEngine()
@@ -440,12 +441,14 @@ export const EffortSupported: Story = {
         await expect(measure.debugDelta['Renders.EffortValue']).toBe(1)
       } finally { engine.dispose() }
     }
+    await expect(picker).toHaveAccessibleName('Select effort: High')
     await expect(high).toHaveAttribute('aria-checked', 'true')
     await expect(page.getAllByRole('menuitemradio').filter(item => item.getAttribute('aria-checked') === 'true')).toHaveLength(1)
     await userEvent.keyboard('{Escape}')
     await userEvent.click(within(canvasElement).getByRole('button', { name: 'Send' }))
     await waitFor(() => expect(within(receiptLog(canvasElement)).getByText(/Effort: high/)).toBeVisible())
     await expect(picker).toHaveTextContent('Medium')
+    await expect(picker).toHaveAccessibleName('Select effort: Medium')
   },
 }
 export const EffortUnsupported: Story = {
@@ -463,7 +466,7 @@ export const EffortUnknown: Story = {
   beforeEach: clearDrafts,
   args: { state: 'typing multi-line', effort: 'unknown' },
   play: async ({ canvasElement }) => {
-    await expect(within(canvasElement).queryByRole('button', { name: 'Select effort' })).toBeNull()
+    await expect(within(canvasElement).queryByRole('button', { name: /^Select effort:/ })).toBeNull()
     await userEvent.click(within(canvasElement).getByRole('button', { name: 'Send' }))
     await waitFor(() => expect(receiptLog(canvasElement).children).toHaveLength(1))
     await expect(receiptLog(canvasElement).textContent).not.toContain('Effort:')
@@ -527,7 +530,7 @@ export const FooterWidthBudgetLight: Story = { ...FooterWidthBudget, args: { sch
 /** C1 grows from a pill into a slab once the draft wraps or breaks lines; C3 becomes a slab while focused. */
 export const LayoutShapes: Story = {
   beforeEach: clearDrafts,
-  render: args => <Surface scheme={args.scheme}><div {...stylex.props(styles.gallery)}>{(['C1', 'C2', 'C3'] as const).map(layout => <div key={layout} {...stylex.props(styles.narrow)}><ComposerFrame policy={{ ...decided, layout }} state="idle" effort={args.effort} frameId={`layout.${layout}`} /></div>)}</div></Surface>,
+  render: args => <Surface scheme={args.scheme}><div {...stylex.props(styles.gallery)}>{(['C1', 'C2', 'C3'] as const).map(layout => <div key={layout} {...stylex.props(styles.geometryLane(768))}><ComposerFrame policy={{ ...decided, layout }} state="idle" effort={args.effort} frameId={`layout.${layout}`} /></div>)}</div></Surface>,
   play: async ({ canvasElement }) => {
     const formOf = (layout: ComposerLayout) => canvasElement.querySelector<HTMLElement>(`[data-composer-frame="layout.${layout}"] form`)!
     await expect(getComputedStyle(formOf('C1')).flexDirection).toBe('row')
@@ -544,12 +547,14 @@ export const LayoutShapes: Story = {
 /** Direct kit consumer: changing a label re-measures the footer without changing the outer width. */
 function LabelResize({ scheme }: { readonly scheme: Scheme }) {
   const [source] = React.useState(() => createComposerFixture('idle'))
-  const [longLabel, setLongLabel] = React.useState(false)
-  const target = { ref: 'fixture:recipient', label: longLabel ? 'A considerably longer recipient label' : 'Me' }
+  const snapshot = React.useSyncExternalStore(source.subscribe, source.getSnapshot, source.getSnapshot)
+  const [target, setTarget] = React.useState<ComposerTarget>({ ref: 'fixture:recipient', label: 'Me' })
+  const [effort, setEffort] = React.useState<string>()
+  const [pinned, setPinned] = React.useState(false)
   return <Surface scheme={scheme}><div {...stylex.props(styles.narrow)}>
-    <Button onPress={() => setLongLabel(value => !value)} {...stylex.props(styles.button)}>Change recipient label</Button>
-    <EmbraceRuntimeProvider options={source.getSnapshot().options}>
-      <EmbraceComposer variant="C1" plainText toolbar={<EmbraceComposerToolbar target={target} recipients={[target]} models={[]} onTargetChange={() => {}} effort={{ control: fixtureEffortControls.unsupported, value: undefined, pinned: false, onChange: () => {}, onPinnedChange: () => {} }} />} />
+    <Button onPress={() => setTarget(previous => ({ ...previous, label: previous.label === 'Me' ? 'A considerably longer recipient label' : 'Me' }))} {...stylex.props(styles.button)}>Change recipient label</Button>
+    <EmbraceRuntimeProvider options={snapshot.options}>
+      <EmbraceComposer variant="C1" plainText toolbar={<EmbraceComposerToolbar target={target} recipients={[target]} models={[]} onTargetChange={setTarget} effort={{ control: fixtureEffortControls.unsupported, value: effort, pinned, onChange: setEffort, onPinnedChange: setPinned }} />} />
     </EmbraceRuntimeProvider>
   </div></Surface>
 }
@@ -571,12 +576,16 @@ export const KitLabelResize: Story = {
 function PlainAdapter({ scheme }: { readonly scheme: Scheme }) {
   const [sent, setSent] = React.useState<readonly string[]>([])
   const [running, setRunning] = React.useState(false)
+  const send = React.useCallback((text: string) => {
+    setSent(previous => [...previous, `Sent: ${text}`])
+    setRunning(true)
+  }, [])
   // The host owns run state; the native runtime mirrors it so Stop maps to a real cancel capability.
-  const options = React.useMemo<ConversationRuntimeOptions>(() => ({ messages: [], isRunning: running, onNew: async () => {}, onCancel: async () => setRunning(false) }), [running])
+  const options = React.useMemo<ConversationRuntimeOptions>(() => ({ messages: [], isRunning: running, onNew: async message => send(message.content.filter(part => part.type === 'text').map(part => part.text).join('\n')), onCancel: async () => setRunning(false) }), [running, send])
   return <Surface scheme={scheme}><div {...stylex.props(styles.lane)}>
     <EmbraceRuntimeProvider options={options}>
       <Composer agent="Review agent" folder="fractal-ui" branch="composer-cutover" draftKey="kit-composer.plain-adapter" running={running}
-        onSend={text => { setSent(previous => [...previous, `Sent: ${text}`]); setRunning(true) }}
+        onSend={send}
         onSteer={text => setSent(previous => [...previous, `Steered: ${text}`])}
         onStop={() => setRunning(false)} />
     </EmbraceRuntimeProvider>

@@ -51,13 +51,13 @@ export function DragToSplitFixture({ scheme = 'dark', groups = 2 }: { scheme?: '
     }
   }
   return (
-    <div data-testid="drag-workspace" data-layout={JSON.stringify(layout)} {...stylex.props(styles.root, ...(scheme === 'light' ? lightTheme : []))}>
+    <main aria-label="Drag-to-split workspace" data-testid="drag-workspace" data-layout={JSON.stringify(layout)} {...stylex.props(styles.root, ...(scheme === 'light' ? lightTheme : []))}>
       <div role="toolbar" aria-label="Open agent" {...stylex.props(styles.toolbar)}>
         <header {...stylex.props(styles.heading)}>Workspace</header>
         <AgentDragRow onOpen={open} />
       </div>
       <Workbench layout={layout} resources={resources} appearance={decidedAppearance} describePane={describePane} workspaceId={`drag-story-${groups}`} scheme={scheme} onLayoutChange={setLayout} focusedPaneKey={focused} onPaneSelect={setFocused} />
-    </div>
+    </main>
   )
 }
 
