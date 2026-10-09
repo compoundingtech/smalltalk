@@ -20,6 +20,7 @@ class ViewportController {
   private programmaticTop: number | undefined
   /** Pointers down somewhere on the page; the dock keeps its layout until all are released. */
   private readonly pressed = new Set<number>()
+  private pressedAnchor: { pointerId: number; element: HTMLElement; offset: number } | undefined
 
   readonly attachJump = (button: HTMLButtonElement | null) => {
     this.jumpButton = button
@@ -68,12 +69,23 @@ class ViewportController {
     this.lastTop = element.scrollTop
   }
 
+  /** Pin the pressed row, not the first visible row: insertion above must not move its action. */
+  readonly preservePress = () => {
+    const viewport = this.element
+    const anchor = this.pressedAnchor
+    if (viewport === null || anchor === undefined || !anchor.element.isConnected) return false
+    this.writeTop(viewport.scrollTop + anchor.element.getBoundingClientRect().top - viewport.getBoundingClientRect().top - anchor.offset)
+    return true
+  }
+
   readonly schedule = () => {
     if (this.frame !== undefined) return
     this.frame = requestAnimationFrame(() => {
       this.frame = undefined
       const element = this.element
       if (element === null) return
+      // The pressed row takes precedence over the reader's history anchor.
+      if (this.preservePress()) { this.lastWidth = element.clientWidth; return }
       if (this.following) this.writeTop(element.scrollHeight)
       else if (this.captureFrame === undefined && this.anchor?.element.isConnected) {
         this.writeTop(element.scrollTop + this.anchor.element.getBoundingClientRect().top - element.getBoundingClientRect().top - this.anchor.offset)
@@ -104,6 +116,7 @@ class ViewportController {
     this.lastWidth = element.clientWidth
     const manual = (event: Event) => {
       if (event instanceof KeyboardEvent && (navigationKeys[event.key] !== true || (event.target instanceof HTMLElement && event.target.closest('input,textarea,[contenteditable="true"]')))) return
+      if (event.type === 'wheel' || event.type === 'touchmove' || event.type === 'keydown') this.pressedAnchor = undefined
       this.following = false
       this.programmaticTop = undefined
       this.scheduleCapture()
@@ -118,6 +131,8 @@ class ViewportController {
       // Reflow is not a request to follow. Width changes preserve the reader's anchor.
       if (element.clientWidth !== this.lastWidth) { this.schedule(); return }
       if (Math.abs(element.scrollTop - this.lastTop) < geometryNumbers.scrollEndTolerance) return
+      // A real reader scroll (including scrollbar dragging) takes ownership until the next press.
+      this.pressedAnchor = undefined
       this.lastTop = element.scrollTop
       this.following = element.scrollHeight - element.clientHeight - element.scrollTop <= geometryNumbers.scrollEndTolerance
       if (this.following) {
@@ -129,18 +144,25 @@ class ViewportController {
     // Document-wide, so presses that start anywhere (a row action included) defer the reveal.
     const page = element.ownerDocument
     const view = page.defaultView
-    const press = (event: PointerEvent) => { this.pressed.add(event.pointerId) }
+    const press = (event: PointerEvent) => {
+      this.pressed.add(event.pointerId)
+      if (this.pressedAnchor !== undefined || !(event.target instanceof Element)) return
+      const row = event.target.closest<HTMLElement>(rowSelector)
+      if (row !== null && element.contains(row)) this.pressedAnchor = { pointerId: event.pointerId, element: row, offset: row.getBoundingClientRect().top - element.getBoundingClientRect().top }
+    }
     const release = (event: PointerEvent) => {
       this.pressed.delete(event.pointerId)
+      if (this.pressedAnchor?.pointerId === event.pointerId) this.pressedAnchor = undefined
       this.dock()
     }
     // A release the page never sees (the window blurs, the tab hides) must not latch the dock.
     const abandon = () => {
       this.pressed.clear()
+      this.pressedAnchor = undefined
       this.dock()
     }
     const hidden = () => { if (page.visibilityState === 'hidden') abandon() }
-    const observer = new ResizeObserver(this.schedule)
+    const observer = new ResizeObserver(() => { this.preservePress(); this.schedule() })
     observer.observe(element)
     if (element.firstElementChild !== null) observer.observe(element.firstElementChild)
     element.addEventListener('wheel', manual, { passive: true })
@@ -175,6 +197,7 @@ class ViewportController {
       page.removeEventListener('visibilitychange', hidden)
       view?.removeEventListener('blur', abandon)
       this.pressed.clear()
+      this.pressedAnchor = undefined
       this.element = null
     }
   }
@@ -208,6 +231,8 @@ export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({
     }
     previousItems.current = items
   }, [controller, items])
+  // Every layout commit can insert above a pressed row, including runtime adoption without new items.
+  React.useLayoutEffect(() => { controller.preservePress() })
   return <div {...stylex.props(styles.frame)}>
     <div {...props} ref={controller.attach}><div {...contentProps}>{children}</div></div>
     <Button ref={controller.attachJump} onPress={controller.jump} hidden {...stylex.props(styles.jump)}>New messages ↓</Button>
