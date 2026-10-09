@@ -1082,6 +1082,25 @@ completed event. Only an agent can be named. A person is reached through their o
 choice is recorded on the run's creation claim, so a later revision of the mission does not
 change who a running run reports to. A run with neither writes nothing extra and is never reported.
 
+A running run can be opted in, moved to another agent, or cleared without restarting it:
+
+```sh
+st missions report-to RUN --agent agent/ops/watcher --stalled-after 1h --as agent/ops/owner
+st missions report-to RUN --clear --as person/operator
+```
+
+Only a person or the agent that requested the run may change it, and only to an agent. Each
+call states the whole report, as `missions start --report-to` would: `--stalled-after` defaults
+to the mission's `stalled-after`, else 30 minutes, and the completed event is reported with
+`--report-completed` or when the mission asks for it. `--clear` reports the run to nobody, even
+when its mission names a reporter. The change is a `mission-run.report-to` claim on the run. Its
+latest one replaces what the creation claim recorded, and the creation claim itself is left
+alone, so declaring the run again as it was started is still a retry. A request that changes
+nothing writes nothing. The run reads it at its next evaluation. A stall is still measured from
+the run's last sign of life, so turning reports on for a run that is already quiet past its
+limit sends one `stalled` message, not one per pass. An event already reported to an earlier
+reporter is not sent again to a new one.
+
 The reporter gets one message from `daemon/runtime` for each of these events:
 
 | Event | When |
@@ -1106,7 +1125,7 @@ can contain anything a step printed.
 A reporter that is also assigned a step in the run is told like any other. A reporter that is
 not a running agent, because it is undeclared, stopped or retired, is not messaged. The run gets
 a `report-to` fault that says so, once, and st looks again only when the run is next evaluated,
-so nothing loops. The fault is closed when the reporter is told or the run ends.
+so nothing loops. The fault is closed when the reporter is told, the run's report is cleared, or the run ends.
 
 A nested run reports only if its own mission asks. A run that is terminated because the run above
 it ended is reported through the run above it.

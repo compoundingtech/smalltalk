@@ -27,7 +27,7 @@ use st3::model::{
     LaunchStartRequest, MessageLifecycleRequest, MessagePage, MessageSendReceipt,
     MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
     MissionResponse, MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest,
-    MissionRunView, MissionSpec, MissionState, OperationalRepairApplyRequest,
+    MissionRunReportRequest, MissionRunReportView, MissionRunView, MissionSpec, MissionState, OperationalRepairApplyRequest,
     OperationalRepairPlan, OperationalRepairResult, PersonAskRequest, PersonStepResponse,
     PlannerSpec, PlanningApprovalRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
     PlanningSessionView, ReplicaRecordView, ReplicationPeerStatus, ReplicationRepairRequest,
@@ -1757,6 +1757,11 @@ enum MissionViewCommand {
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
     Cancel(MissionCancelArgs),
+    /// Change who a running run tells when it fails, is cancelled or stalls, or clear it.
+    ///
+    /// Takes effect at the run's next evaluation. A stall is measured from the run's last sign
+    /// of life, so turning this on for a run that is already quiet reports it at most once.
+    ReportTo(MissionReportToArgs),
     /// Set a finished run's outcome to completed, failed, or cancelled, with a reason.
     Outcome(MissionOutcomeArgs),
     /// Retire a mission so it leaves the lists and cannot start; publishing it again brings it back.
@@ -1927,6 +1932,38 @@ struct MissionCancelArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
+}
+
+#[derive(Args)]
+#[command(group = clap::ArgGroup::new("reporter").required(true).args(["agent", "clear"]))]
+struct MissionReportToArgs {
+    /// Exact mission-run subject of a running run.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
+    mission_run: String,
+    /// The agent to tell, replacing whoever the run reports to now. A person is reached
+    /// through their own agent.
+    #[arg(long, value_name = "AGENT")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
+    agent: Option<String>,
+    /// How long the run may go without progress before it counts as stalled, such as `1h`.
+    /// Defaults to the mission's `stalled-after`, else 30 minutes.
+    #[arg(long, value_name = "DURATION", requires = "agent", conflicts_with = "clear")]
+    #[arg(value_parser = parse_stalled_after)]
+    stalled_after: Option<u64>,
+    /// Also tell the agent when the run completes.
+    #[arg(long, requires = "agent", conflicts_with = "clear")]
+    report_completed: bool,
+    /// Report this run to nobody, whatever its mission or start named.
+    #[arg(long)]
+    clear: bool,
+    /// A person, or the agent that requested the run.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: String,
+}
+
+fn parse_stalled_after(value: &str) -> Result<u64, String> {
+    st3::graph::parse_duration(value, true).map_err(|error| error.to_string())
 }
 
 #[derive(Args)]
@@ -5253,6 +5290,7 @@ fn guard_mutating_cli_actor(
             MissionViewCommand::Start(args) => Some(args.actor.as_str()),
             MissionViewCommand::Cancel(args) => Some(args.actor.as_str()),
             MissionViewCommand::Outcome(args) => Some(args.actor.as_str()),
+            MissionViewCommand::ReportTo(args) => Some(args.actor.as_str()),
             MissionViewCommand::Retire(args) => Some(args.actor.as_str()),
             MissionViewCommand::Release(args) | MissionViewCommand::CancelRequest(args) => {
                 Some(args.actor.as_str())
@@ -6717,6 +6755,9 @@ async fn run_mission_view(
         MissionViewCommand::Outcome(args) => {
             set_mission_run_outcome(client, args, json_output).await
         }
+        MissionViewCommand::ReportTo(args) => {
+            set_mission_run_report(client, args, json_output).await
+        }
         MissionViewCommand::Retire(args) => retire_mission(client, args, json_output).await,
         MissionViewCommand::Queued { agent } => {
             show_agent_queue(endpoint, &agent, json_output).await
@@ -7047,6 +7088,59 @@ async fn set_mission_run_outcome(
     } else {
         println!("{} is now {}", run.subject, run.status);
         Ok(())
+    }
+}
+
+async fn set_mission_run_report(
+    client: &Client,
+    args: MissionReportToArgs,
+    json_output: bool,
+) -> Result<()> {
+    let id = args
+        .mission_run
+        .strip_prefix("mission-run/")
+        .unwrap_or(&args.mission_run);
+    let subject = format!("mission-run/{id}");
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    let report: MissionRunReportView = client
+        .post(
+            &format!("/v1/mission-runs/{}/report-to", urlencoding::encode(&subject)),
+            &MissionRunReportRequest {
+                actor: args.actor,
+                report_to: args.agent,
+                stalled_after_ms: args.stalled_after,
+                report_completed: args.report_completed,
+                idempotency_key: format!("mission-report-to:{subject}:{nonce}"),
+            },
+        )
+        .await?;
+    if json_output {
+        return print_value(&report, true);
+    }
+    let unchanged = if report.changed { "" } else { " (unchanged)" };
+    match &report.report_to {
+        Some(agent) => println!(
+            "{} reports to {agent}: failed, cancelled, stalled after {}{}{unchanged}",
+            report.run,
+            whole_duration(report.stalled_after_ms.unwrap_or_default()),
+            if report.report_completed {
+                ", completed"
+            } else {
+                ""
+            },
+        ),
+        None => println!("{} reports to nobody{unchanged}", report.run),
+    }
+    Ok(())
+}
+
+/// `ms` in its largest whole unit: `90s`, `45m`, `2h`.
+fn whole_duration(ms: u64) -> String {
+    match ms {
+        ms if ms >= 3_600_000 && ms % 3_600_000 == 0 => format!("{}h", ms / 3_600_000),
+        ms if ms >= 60_000 && ms % 60_000 == 0 => format!("{}m", ms / 60_000),
+        ms if ms % 1_000 == 0 => format!("{}s", ms / 1_000),
+        ms => format!("{ms}ms"),
     }
 }
 
@@ -27898,6 +27992,55 @@ mod tests {
             st3::graph::parse_intent(&person, "node").unwrap_err().code,
             "invalid-report-to"
         );
+    }
+
+    #[test]
+    fn missions_report_to_names_an_agent_or_clears_and_options_need_an_agent() {
+        let parse = |extra: &[&str]| {
+            let mut words = vec!["st3", "missions", "report-to", "mission-run/release/demo/3"];
+            words.extend_from_slice(extra);
+            words.extend_from_slice(&["--as", "agent/ops/owner"]);
+            Cli::try_parse_from(words)
+        };
+        let Command::Missions {
+            command: MissionViewCommand::ReportTo(args),
+        } = parse(&[
+            "--agent",
+            "agent/ops/watcher",
+            "--stalled-after",
+            "1h",
+            "--report-completed",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("the report-to command did not parse");
+        };
+        assert_eq!(args.agent.as_deref(), Some("agent/ops/watcher"));
+        assert_eq!(args.stalled_after, Some(3_600_000));
+        assert!(args.report_completed);
+        assert!(!args.clear);
+        assert_eq!(whole_duration(3_600_000), "1h");
+        assert_eq!(whole_duration(45 * 60_000), "45m");
+        assert!(parse(&["--clear"]).is_ok());
+        for (extra, why) in [
+            (&[][..], "it names an agent or clears"),
+            (&["--agent", "agent/ops/watcher", "--clear"][..], "not both"),
+            (
+                &["--clear", "--stalled-after", "1h"][..],
+                "a limit needs an agent",
+            ),
+            (
+                &["--clear", "--report-completed"][..],
+                "completion needs an agent",
+            ),
+            (
+                &["--agent", "agent/ops/watcher", "--stalled-after", "0m"][..],
+                "a limit is positive",
+            ),
+        ] {
+            assert!(parse(extra).is_err(), "{why}");
+        }
     }
 
     #[test]
