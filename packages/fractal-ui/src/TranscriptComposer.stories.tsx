@@ -67,8 +67,32 @@ export const HostWidth: Story = { args: { readingColumn: false }, play: async ({
   await expect(Math.abs(composer.width - dock.width)).toBeLessThanOrEqual(0.5)
 } }
 
+const placeholderOptions = { messages: [], isRunning: false, onNew: async () => {} }
+const overridePlaceholder = 'Ask about this conversation'
+function PlaceholderStory({ scheme }: { scheme: Scheme }) {
+  return <Surface scheme={scheme}><div {...stylex.props(styles.placeholders)}>
+    {[undefined, overridePlaceholder].map(placeholder => <section key={placeholder ?? 'default'} data-testid={placeholder === undefined ? 'default-placeholder' : 'override-placeholder'}><EmbraceRuntimeProvider options={placeholderOptions}><EmbraceComposer variant="C1" placeholder={placeholder} /></EmbraceRuntimeProvider></section>)}
+  </div></Surface>
+}
+const keyboardText = /enter|shift|return|ctrl|cmd|⌘|⏎|↵|mod\s*\+/i
+/** Empty-field guidance never carries keyboard instructions; a host override replaces it, still describing the field. */
+export const Placeholder: Story = { render: args => <PlaceholderStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
+  for (const [testId, expected] of [['default-placeholder', undefined], ['override-placeholder', overridePlaceholder]] as const) {
+    const section = canvasElement.querySelector(`[data-testid="${testId}"]`)!
+    const guidance = await waitFor(() => { const found = section.querySelector<HTMLElement>('[data-testid="composer-placeholder"]'); if (found === null) throw new Error(`No guidance in ${testId}`); return found })
+    const input = section.querySelector('textarea')!
+    await expect(guidance).toBeVisible()
+    await expect(guidance.textContent, `${testId} guidance`).not.toMatch(keyboardText)
+    await expect(input.placeholder).toBe('')
+    await expect(input.getAttribute('aria-describedby')?.split(' ')).toContain(guidance.id)
+    if (expected !== undefined) await expect(guidance).toHaveTextContent(expected)
+  }
+} }
+export const PlaceholderLight: Story = { ...Placeholder, args: { scheme: 'light' } }
+
 const styles = stylex.create({
   root: { height: '100vh', width: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans },
   transcript: { flex: '1 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' },
   dock: { flexShrink: 0, paddingBlock: s.lg },
+  placeholders: { display: 'flex', flexDirection: 'column', gap: s.lg, padding: s.lg },
 })
