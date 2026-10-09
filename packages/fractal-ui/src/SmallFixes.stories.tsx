@@ -183,7 +183,8 @@ export const ComposerConnectionNoticeLight: Story = { ...ComposerConnectionNotic
 function DraftCauses({ scheme = 'dark' }: { scheme?: Scheme }) {
   const reject = React.useRef<((error: Error) => void) | undefined>(undefined)
   const [events, setEvents] = React.useState<readonly { cause: ComposerDraftCause; text: string }[]>([])
-  return <section {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><EmbraceRuntimeProvider options={{ messages: [], isRunning: false, onNew: () => { const pending = Promise.withResolvers<void>(); reject.current = pending.reject; return pending.promise } }}>
+  // The kit targets ES2022, whose Promise API requires an executor for externally settled work.
+  return <section {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><EmbraceRuntimeProvider options={{ messages: [], isRunning: false, onNew: () => new Promise<void>((_, fail) => { reject.current = fail }) }}>
     <EmbraceComposer variant="C1" onDraftChange={({ cause, text }) => setEvents(previous => [...previous, { cause, text }])} />
     <Button onPress={() => setEvents([])}>Clear event log</Button>
     <Button onPress={() => reject.current?.(new MessageNotSentError())}>Reject pending send</Button>
@@ -215,9 +216,7 @@ export const FailedSendPreservesNewerDraft: Story = { render: args => <DraftCaus
   await userEvent.type(input, 'Newer text')
   await userEvent.click(canvas.getByRole('button', { name: 'Clear event log' }))
   await userEvent.click(canvas.getByRole('button', { name: 'Reject pending send' }))
-  const settled = Promise.withResolvers<void>()
-  setTimeout(settled.resolve, 100)
-  await settled.promise
+  await new Promise<void>(resolve => setTimeout(resolve, 100))
   await expect(input).toHaveValue('Newer text')
   await expect(canvas.getByTestId('draft-events')).toHaveTextContent('[]')
 } }
