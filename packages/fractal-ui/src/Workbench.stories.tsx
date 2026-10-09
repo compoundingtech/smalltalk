@@ -159,7 +159,7 @@ export const KeyboardSplitPreservesHost: Story = { args: { state: 'one' }, play:
   const host = canvasElement.querySelector('[data-pane-key="agent:worker-1"]')!
   const editor = canvas.getByTestId('composer-input')
   await userEvent.type(editor, 'Preserve across split')
-  await userEvent.click(canvas.getByRole('button', { name: 'worker-2 actions', exact: true }))
+  await userEvent.click(canvas.getByRole('button', { name: 'worker-2 actions' }))
   await userEvent.click(within(document.body).getByRole('menuitem', { name: 'Open in split right' }))
   await settle()
   await expect(canvasElement.querySelector('[data-pane-key="agent:worker-1"]')).toBe(host)
@@ -170,10 +170,10 @@ export const KeyboardSplitPreservesHost: Story = { args: { state: 'one' }, play:
 export const HostToolReveal: Story = { args: { state: 'two' }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   await userEvent.click(canvas.getByRole('button', { name: 'Reset layout' }))
-  const file = canvas.getByRole('button', { name: 'sample/rows.ts', exact: true })
+  const file = canvas.getByRole('button', { name: 'sample/rows.ts' })
   await userEvent.click(file)
   await expect(file).toHaveAttribute('aria-expanded', 'false')
-  await userEvent.click(canvas.getByRole('button', { name: 'Read sample/rows.ts', exact: false }))
+  await userEvent.click(canvas.getByRole('button', { name: /^Read sample\/rows\.ts\b/ }))
   await userEvent.click(canvas.getByRole('button', { name: 'Open Read sample/rows.ts tool detail' }))
   await settle()
   await expect(file).toHaveAttribute('aria-expanded', 'true')
