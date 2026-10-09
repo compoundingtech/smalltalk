@@ -33,6 +33,9 @@ pub(crate) struct SummaryInputs {
     pub(crate) period: u128,
 }
 
+/// A selection windows read, and the inputs of its published row, if any.
+pub(crate) type SummarySelection = (Option<String>, Option<SummaryInputs>);
+
 #[derive(Default)]
 struct Selection {
     /// When a window last read it, in Unix ms.
@@ -95,10 +98,7 @@ impl Store {
 
     /// The selections windows read within `within_ms`, forgetting older ones, each with the
     /// inputs its row was computed from, and the generation to publish under.
-    pub(crate) fn summary_selections(
-        &self,
-        within_ms: u64,
-    ) -> (u64, Vec<(Option<String>, Option<SummaryInputs>)>) {
+    pub(crate) fn summary_selections(&self, within_ms: u64) -> (u64, Vec<SummarySelection>) {
         let list = &self.smalltalk.summary_list;
         let now = now_ms() as u64;
         let mut selections = list.selections.lock().unwrap_or_else(PoisonError::into_inner);
