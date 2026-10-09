@@ -118,6 +118,9 @@ mod accounts;
 mod adhoc_work;
 mod attention_snapshot;
 pub(crate) use attention_snapshot::native_prompt_gone_key;
+pub(crate) mod attention_list;
+pub(crate) mod owner_lists;
+pub(crate) mod summary_list;
 // Registration stays opt-in until the shared installer certifies every source family.
 #[cfg_attr(
     not(test),
