@@ -1,10 +1,10 @@
 {
   "version": 1,
   "state": "PLANNING_ONLY",
-  "candidate": "9512a6a758f55bb5f735397084c05c72f764aae4",
-  "tree": "ef4d8a055205ae230c84b806a42f2c338f7efb1c",
+  "candidate": "8824e14fe44086cd63e47595c10e0023097371bb",
+  "tree": "47fb98972cf18725a557f72993415aef321238dc",
   "bundle_prerequisite": "4f0e4787e2697196e154ffe3a1f75484b2ff85fc",
-  "bundle_sha256": "1c915b9858250dab1449247f457f9a712f3bf9fab17c527352d2c5658ac3a7e0",
+  "bundle_sha256": "db6c44bb3426ed496ee4e5dc9e451606a0fc4dd8206c6bca69985b2658887906",
   "authored_names": [
     "credit_starts_absent_expires_and_is_spent_once",
     "wake_caller_and_failed_advance_keep_the_original_counter_and_cap",
@@ -32,11 +32,21 @@
     "crates/smallclaims/Cargo.toml": "e5dca09e615d0ce75ec9528f0396b44c8b4a92557cb2f362cae1573edd6a2bfc",
     "crates/smallclaims/src/sync/worker.rs": "e211b839e18a6d7a090f8b6013eb852355c3a5db8c83ce240e43dca6ee025d95",
     "crates/smallclaims/src/sync/worker_retry.rs": "880bd6861210effceb45b501bcc4cceb09f1ccf2a601e2840149af870ac76620",
-    "crates/smallclaims/src/sync/worker_retry_tests.rs": "a7e47ed4c970135bedbf258e5ef351f443d576f6c3a0993be003d5ad2be5d823",
+    "crates/smallclaims/src/sync/worker_retry_tests.rs": "2b71266641948b07df15d52e9448480370caa6e8c8e8f9c0552111fcea4a9d0d",
     "flake.lock": "ddaabb242481705987b30aaed0825c29899c7bb94a7f046b6e3e8ebe0803acda",
-    "flake.nix": "fa55f9aaaead51dfe4b96d69fd6c04267c043fdc7001ec54ff99a347ba123532"
+    "flake.nix": "fa55f9aaaead51dfe4b96d69fd6c04267c043fdc7001ec54ff99a347ba123532",
+    "crates/smallclaims/src/sync/worker_tests.rs": "a9db13116f1595ffa13f8eb7cb21bb8e54e7fed1704ac673f25cce7b6e820820",
+    "crates/st3/tests/messaging_faults.rs": "337a0e7ba7dc9f3722ce131a11b04fa6fd8a0797e6a0e5f473a1b07bc7e98489",
+    "release-notes/advanced-retry-admission-telemetry.json": "1df16d079d54b7b2218ed947300a10cd659a5feae906a3df5b4827e427df8081",
+    "release-notes/advanced-retry-checkpoint-admission.json": "d21c3ce9b750626037e7a32a1807bac4dbfce065119a84ca1626f860795259cb",
+    "release-notes/advanced-retry-terminal-admission.json": "9a24461fcc57d1d4c01921a20302e34281d1e77b6a2cc2aa18fe7d2b77e46a59",
+    "release-notes/bounded-recent-peer-retry.json": "b92ea605e45ee6bfe48e9414a34aac7c696c61f269251e2f05c9df7e1e4c5393",
+    "scripts/ci-perf": "d5258ff0ad4ceaa37995320617f36c89979dd8fea251e3676fdb30315b2790e5",
+    "scripts/st3-messaging-faults-eval/run": "98c1d0185a9d9a3d2d4b3460f129d352f7ff2ca4f076b3f1be36917d8429da48"
   },
   "runner_class": "nscloud-ubuntu-24.04-amd64-8x16-with-features",
   "event_priority": "ordinary manual class 2 from existing linuxStageRunner",
-  "artifact_qualification": "No compiled archive held; one new hosted archive build only"
+  "artifact_qualification": "No compiled archive held; one new hosted archive build only",
+  "candidate_parent": "9512a6a758f55bb5f735397084c05c72f764aae4",
+  "source_manifest": "doc/fleet/smalltalk/merge-queue-flakes/2026-10-09/retry-cap-8824-manifest@c8e20cf2e6b323d7d8e991688f8127816d4a986f332586c72a7be6537a0bd4d5"
 }

@@ -116,7 +116,7 @@ export default githubWorkflow({
       "if": "always()",
       "uses": "actions/upload-artifact@v4",
       "with": {
-        "name": "retry-cap-9512-${{ github.run_id }}-attempt-${{ github.run_attempt }}",
+        "name": "retry-cap-8824-${{ github.run_id }}-attempt-${{ github.run_attempt }}",
         "path": "${{ runner.temp }}/retry-cap/\n!${{ runner.temp }}/retry-cap/candidate/\n!${{ runner.temp }}/retry-cap/inventory-extract/\n!${{ runner.temp }}/retry-cap/run-extract/",
         "retention-days": 7,
         "compression-level": 0,

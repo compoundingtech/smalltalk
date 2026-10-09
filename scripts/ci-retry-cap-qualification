@@ -72,7 +72,7 @@ def main():
     if args.action == 'prepare':
         out.mkdir(exist_ok=False)
         save(out / 'result.json', {'qualified': False, 'status': 'PREPARING', 'source': manifest['candidate']})
-        bundle = inputs / '9512.bundle'
+        bundle = inputs / '8824.bundle'
         verify.require(verify.digest(bundle) == manifest['bundle_sha256'], 'source bundle hash mismatch')
         verify.require(git(automation, 'rev-parse', 'HEAD') == os.environ['GITHUB_SHA'], 'automation checkout mismatch')
         phase(out, 'bundle-verify', ['git', 'bundle', 'verify', str(bundle)], automation)

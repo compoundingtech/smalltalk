@@ -119,7 +119,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: "retry-cap-9512-${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          name: "retry-cap-8824-${{ github.run_id }}-attempt-${{ github.run_attempt }}"
           path: |
             ${{ runner.temp }}/retry-cap/
             !${{ runner.temp }}/retry-cap/candidate/
