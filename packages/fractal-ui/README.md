@@ -118,6 +118,18 @@ The Markdown boundary renders CommonMark and GFM prose — emphasis, nested list
 
 `ErrorOverlayHost` defaults to one dismissible floating layer per surface; failures portal into the nearest host so deep banners do not clip or reflow history. Its optional `lane` mode renders notices in place instead. `Transcript` uses lane mode so run failures remain beside their work log without covering history; synchronization failures remain within that host. Escape inside the host dismisses the newest inline or floating banner without moving focus, and a new failure id reappears after a dismissal. Without a host, the work log retains its inline banner.
 
+### Gated workbench and composer
+
+The focused Workbench stories use W3/H1/P3/D2; Composer stories use C2/R3/M2/K1 while exercising the gated alternate states. They do not import the route's sidebar, details fixtures, exploration controls or runtime provider. Workbench thread resources provide the kit's `TranscriptProps` and `ConversationRuntimeOptions` directly: the host owns turns, run state, synchronization facts, observation times and tool actions. This is deliberately different from the route's combined `ConversationState` provider.
+
+Workbench pane identities survive layout changes through persistent pane slots. `ViewportStore` and `ViewportStoreContext` retain per-conversation scroll/follow/unread state when a thread pane is parked or moved; `Transcript.viewportKey` identifies the owning conversation. The minimal terminal boundary is host-supplied read-only lines/session facts for pane rendering and drag targets, not a terminal transport or emulator.
+
+`DiffPanel` accepts numeric or string widths, optional `onClose` and `landmarkContext`, current-turn and branch file lists, and an explicit `{ path, sequence }` reveal request. Missing file facts remain missing. The host interprets `onOpenTool` and drives controlled diff reveals; the kit never guesses a path from a tool's input. Its scope picker, line-wrap and whitespace controls remain keyboard accessible, with semantic-token React Aria portals owned by `ThemePortal`.
+
+The composer preserves kit send, cancellation, byte-limit and token-history contracts while adding adaptive pill/slab geometry, grouped mention/command popovers, effort selection, and the recipient/model toolbar. `ComposerSession` owns only device-local draft persistence and composer interaction policy; transports and runtime facts remain host-owned. Its tooltips retain the gated 150 ms delay and viewport-clamped, wrapping contents; Workbench/DiffPanel share the 350 ms Controls tooltip instead.
+
+State and draft codecs use the workspace's single `effect@4.0.0-rc.118` runtime and the matching `@effect/atom-react@4.0.0-rc.118` binding. `react-aria@3.52.1` is declared explicitly for the separator and portal APIs already used by the kit. Performance counters and `RenderProfiler` stay internal rather than becoming package-root exports.
+
 ## Clean-room note
 
 This kit was written fresh from behavior-only requirements. No existing design-system source, CSS, tokens, fonts, icons, logos, screenshots or microcopy was imported or consulted. Every palette value, spacing bias, type stack, corner scale and motion curve was chosen independently for this kit.

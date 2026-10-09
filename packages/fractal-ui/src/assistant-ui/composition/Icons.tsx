@@ -7,6 +7,7 @@ export type IconName =
   | 'chevron-right' | 'chevron-down' | 'chevrons-left' | 'panel' | 'drawer'
   | 'attach' | 'copy' | 'send' | 'stop' | 'check' | 'x' | 'alert'
   | 'spinner' | 'folder' | 'message' | 'dot'
+  | 'wrap' | 'whitespace' | 'pull-request' | 'stop-circle'
 
 const PATHS: Record<IconName, React.ReactNode> = {
   search: <><circle cx="7" cy="7" r="4.5" /><path d="M10.5 10.5 14 14" /></>,
@@ -31,6 +32,10 @@ const PATHS: Record<IconName, React.ReactNode> = {
   folder: <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.4 1.8h5A1.5 1.5 0 0 1 14 6.3v5.2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z" />,
   message: <path d="M2.5 4.5A2 2 0 0 1 4.5 2.5h7a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H7l-3 2.5v-2.5h-.5a2 2 0 0 1-1-2z" />,
   dot: <circle cx="8" cy="8" r="3" />,
+  wrap: <><path d="M2 3h12M2 7h9a3 3 0 0 1 0 6H7M9 11l-2 2 2 2M2 11h2" /></>,
+  whitespace: <><path d="M9 14V2h4M12 2v12M9 2H6a3 3 0 0 0 0 6h3" /><circle cx="3" cy="12" r=".6" fill="currentColor" /></>,
+  'pull-request': <><circle cx="4" cy="3" r="1.5" /><circle cx="4" cy="13" r="1.5" /><circle cx="12" cy="13" r="1.5" /><path d="M4 4.5v7M12 11.5V6a3 3 0 0 0-3-3H7M9 1 7 3l2 2" /></>,
+  'stop-circle': <><circle cx="8" cy="8" r="6" /><rect x="5" y="5" width="6" height="6" rx=".5" fill="currentColor" stroke="none" /></>,
 }
 
 /** One 16px stroke icon set; stroke inherits currentColor, fill none. */

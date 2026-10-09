@@ -11,6 +11,7 @@ const surfaceVarsTheme = stylex.createTheme(surfaceVars, {
   rowHover: '#131313',
   rowActive: '#1a1b1b',
   codeBg: '#111111',
+  terminal: '#111111',
   washSubtle: 'rgba(255, 255, 255, 0.02)',
   controlFill: 'rgba(255, 255, 255, 0.025)',
   scrim: 'rgba(0, 0, 0, 0.65)', transparent: 'transparent',
