@@ -135,6 +135,22 @@ describe('ConversationPane composition activation', () => {
     expect(opened[0]).toMatchObject({ id: 'read', kind: 'read', title: 'read', argsSummary: 'src/rows.ts' })
   })
 
+  it('shows native text-block tool output on the expanded row instead of No output', async () => {
+    // Native harness results arrive as content blocks, not a bare string (external_sessions.rs).
+    const output = 'export const rows = []\nexport const count = rows.length'
+    const blocks: ConversationItem = { _tag: 'ToolCall', id: 'read', callId: 'c1', name: 'read', input: { path: 'src/rows.ts' }, status: 'success', callSeen: true, at: at(1),
+      result: { content: [{ type: 'text', text: output }], isError: false, at: at(3) } }
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [scenario[0]!, blocks, ...scenario.slice(2, 5)], hasOlder: false, observation: { empty: false } } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+
+    const fold = container.querySelector<HTMLButtonElement>('[data-testid="work-log"] button')
+    await act(async () => { fold!.click() })
+    const log = container.querySelector('[data-testid="work-log"]')!
+    expect(log.querySelector('[data-tool-status="success"]')?.textContent).not.toContain('No output')
+    expect(log.querySelector('[data-testid="tool-detail-preview"]')?.textContent).toContain('export const rows = []')
+  })
+
   it('keeps optimistic send state visible on its prompt', async () => {
     const pending: ConversationItem = { _tag: 'Text', id: 'p2', role: 'user', text: 'And verify the fix.', attachments: [], streaming: false, at: at(10), sendState: { _tag: 'Pending' } }
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [...scenario, pending], hasOlder: false, observation: { empty: false } } }
