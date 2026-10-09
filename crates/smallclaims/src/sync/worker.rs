@@ -1941,6 +1941,21 @@ pub async fn fetch_checkpoint_manifest(
     checkpoint: &str,
     cut_unix_ms: u128,
 ) -> Result<CheckpointManifest> {
+    fetch_checkpoint_manifest_checked(http, peer, node, auth, fleet, checkpoint, cut_unix_ms, None)
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_checkpoint_manifest_checked(
+    http: &reqwest::Client,
+    peer: &PeerConfig,
+    node: &str,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    checkpoint: &str,
+    cut_unix_ms: u128,
+    submission: Option<RetrySubmission<'_>>,
+) -> Result<CheckpointManifest> {
     let mut manifest = CheckpointManifest {
         checkpoint: checkpoint.to_owned(),
         cut_unix_ms,
@@ -1953,7 +1968,9 @@ pub async fn fetch_checkpoint_manifest(
             cut_unix_ms,
             after,
         };
-        let page = fetch_checkpoint_manifest_page(http, peer, node, auth, fleet, &request).await?;
+        let page =
+            fetch_checkpoint_manifest_page(http, peer, node, auth, fleet, &request, submission)
+                .await?;
         after = manifest.append(page).map_err(anyhow::Error::msg)?;
         if after.is_none() {
             return Ok(manifest);
@@ -1961,6 +1978,7 @@ pub async fn fetch_checkpoint_manifest(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_checkpoint_manifest_page(
     http: &reqwest::Client,
     peer: &PeerConfig,
@@ -1968,20 +1986,23 @@ async fn fetch_checkpoint_manifest_page(
     auth: &FleetAuth,
     fleet: &FleetContext,
     request: &CheckpointManifestRequest,
+    submission: Option<RetrySubmission<'_>>,
 ) -> Result<CheckpointManifestPage> {
     let body = serde_json::to_vec(request)?;
     let request_digest = FleetAuth::body_digest(&body);
     let headers = auth.request_headers_for(CHECKPOINT_PATH, node, &body)?;
     let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), CHECKPOINT_PATH);
-    let response = http
-        .post(&endpoint)
-        .headers(headers)
-        .header("content-type", "application/json")
-        .header("accept-encoding", EXCHANGE_ENCODING)
-        .body(body)
-        .send()
-        .await
-        .with_context(|| format!("checkpoint request to peer {} failed", peer.name))?;
+    let response = retry_submit(submission, fleet, auth, &peer.url, || async {
+        http.post(&endpoint)
+            .headers(headers)
+            .header("content-type", "application/json")
+            .header("accept-encoding", EXCHANGE_ENCODING)
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("checkpoint request to peer {} failed", peer.name))
+    })
+    .await?;
     let status = response.status();
     let headers = response.headers().clone();
     let bytes = response.bytes().await?.to_vec();
@@ -2356,8 +2377,9 @@ async fn exchange_checked<B: Backend>(
                     fleet,
                     own_checkpoint.as_ref(),
                     advertised,
+                    submission,
                 )
-                .await
+                .await?
             }
             None => false,
         };
@@ -2383,7 +2405,7 @@ static ADOPTION_FAILURES: std::sync::LazyLock<
 /// A peer advertised a checkpoint this node has not applied. If the daemon needs exactly that
 /// checkpoint's manifest, fetch it from this peer and hand it over to adopt. The daemon checks
 /// the whole manifest against the certificate before it stores anything. Returns whether the
-/// node adopted it.
+/// node adopted it. Advanced admission refusal propagates without an adoption cooldown.
 #[allow(clippy::too_many_arguments)]
 async fn adopt_advertised_checkpoint<B: Backend>(
     http: &reqwest::Client,
@@ -2394,20 +2416,25 @@ async fn adopt_advertised_checkpoint<B: Backend>(
     fleet: &FleetContext,
     own: Option<&InventoryCheckpoint>,
     advertised: &InventoryCheckpoint,
-) -> bool {
+    submission: Option<RetrySubmission<'_>>,
+) -> Result<bool> {
     if own.is_some_and(|own| own == advertised || own.cut_unix_ms > advertised.cut_unix_ms) {
-        return false;
+        return Ok(false);
     }
     let need = match backend.checkpoint_need().await {
         Ok(Some(need)) => need,
-        Ok(None) => return false,
+        Ok(None) => return Ok(false),
         Err(error) => {
             eprintln!("st3: checkpoint need unavailable: {error:#}");
-            return false;
+            return Ok(false);
         }
     };
     if need.checkpoint != advertised.id || need.drop_digest != advertised.drop_digest {
-        return false;
+        return Ok(false);
+    }
+    // checkpoint_need may cross a process boundary. Revalidate before any page is sent.
+    if let Some(permission) = submission {
+        permission.check(fleet, auth, &peer.url)?;
     }
     let key = (node.to_owned(), need.drop_digest.clone());
     let retry_after = worker_interval(Duration::from_secs(10 * 60));
@@ -2417,10 +2444,10 @@ async fn adopt_advertised_checkpoint<B: Backend>(
         .get(&key)
         .is_some_and(|failed| failed.elapsed() < retry_after)
     {
-        return false;
+        return Ok(false);
     }
     let adopted = async {
-        let manifest = fetch_checkpoint_manifest(
+        let manifest = fetch_checkpoint_manifest_checked(
             http,
             peer,
             node,
@@ -2428,9 +2455,19 @@ async fn adopt_advertised_checkpoint<B: Backend>(
             fleet,
             &need.checkpoint,
             need.cut_unix_ms,
+            submission,
         )
         .await?;
-        backend.adopt_checkpoint(&manifest).await
+        if let Some(permission) = submission {
+            permission.check(fleet, auth, &peer.url)?;
+        }
+        let actions = backend.adopt_checkpoint(&manifest).await?;
+        if let Some(permission) = submission {
+            // Adoption may already have committed. Refusal cannot undo it, but must not
+            // report a successful advanced exchange and rearm its expired permission.
+            permission.check(fleet, auth, &peer.url)?;
+        }
+        Ok::<_, anyhow::Error>(actions)
     }
     .await;
     match adopted {
@@ -2442,9 +2479,17 @@ async fn adopt_advertised_checkpoint<B: Backend>(
                     peer.name
                 );
             }
-            !actions.is_empty()
+            Ok(!actions.is_empty())
         }
         Err(error) => {
+            if error.is::<RetryAdmissionInvalidated>() {
+                return Err(error);
+            }
+            if let Some(permission) = submission {
+                // A page may fail while admission expires. Refuse the advanced caller
+                // without poisoning ordinary adoption or rearming credit on false success.
+                permission.check(fleet, auth, &peer.url)?;
+            }
             eprintln!(
                 "st3: adopting {} from {} failed: {error:#}",
                 need.checkpoint, peer.name
@@ -2453,7 +2498,7 @@ async fn adopt_advertised_checkpoint<B: Backend>(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(key, tokio::time::Instant::now());
-            false
+            Ok(false)
         }
     }
 }

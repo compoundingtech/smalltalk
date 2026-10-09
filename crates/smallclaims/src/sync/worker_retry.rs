@@ -212,6 +212,16 @@ pub(super) fn retry_generation(
     .then(|| *fleet.view_changed.borrow())
 }
 
+/// Admission refusal is not a checkpoint failure and must not poison adoption cooldown.
+#[derive(Debug)]
+pub(super) struct RetryAdmissionInvalidated;
+impl std::fmt::Display for RetryAdmissionInvalidated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("advanced retry authority, route or lifetime changed")
+    }
+}
+impl std::error::Error for RetryAdmissionInvalidated {}
+
 /// Owned by one advanced exchange; cancellation drops it without restoring the credit.
 pub(super) struct RecoveryAdvance {
     pub(super) schedule: RetrySchedule,
@@ -237,19 +247,19 @@ impl RecoveryAdvance {
             (Some(before), Some(after)) => Arc::ptr_eq(before, after),
             _ => false,
         };
-        anyhow::ensure!(
-            Arc::ptr_eq(&self.view, &fleet.view)
-                && self.auth.fleet_id() == auth.fleet_id()
-                && Arc::ptr_eq(&self.auth.secret, &auth.secret)
-                && same_member
-                && !fleet.is_removed()
-                && *fleet.view_changed.borrow() == self.generation
-                && !routes.has_changed().unwrap_or(true)
-                && *routes.borrow() == self.routes
-                && self.url == url
-                && tokio::time::Instant::now() < self.expires,
-            "advanced retry authority, route or lifetime changed"
-        );
+        if !(Arc::ptr_eq(&self.view, &fleet.view)
+            && self.auth.fleet_id() == auth.fleet_id()
+            && Arc::ptr_eq(&self.auth.secret, &auth.secret)
+            && same_member
+            && !fleet.is_removed()
+            && *fleet.view_changed.borrow() == self.generation
+            && !routes.has_changed().unwrap_or(true)
+            && *routes.borrow() == self.routes
+            && self.url == url
+            && tokio::time::Instant::now() < self.expires)
+        {
+            return Err(RetryAdmissionInvalidated.into());
+        }
         Ok(())
     }
 }
