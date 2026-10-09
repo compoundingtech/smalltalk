@@ -79,7 +79,7 @@
       "context_used_tokens": 357240,
       "context_window_tokens": 1000000,
       "attribution": {
-        "agent_id": "agent/fleet/example/builder",
+        "agent_id": "agent/fleet/fixture-builder",
         "mission_run_id": null,
         "generation_id": null,
         "step_id": null
@@ -205,7 +205,7 @@
     "type": "content",
     "body": {
       "media_type": "text/plain",
-      "text": "<channel source=\"plugin:st-channel:st\" from=\"agent/fleet/example/reviewer\" messageId=\"message/00000000000000a1\" threadId=\"message/00000000000000a1\" identity=\"fleet/example/builder\">\n<smalltalk-message id=\"00000000000000a1\" from=\"agent/fleet/example/reviewer\" to=\"agent/fleet/example/builder\" subject=\"Your workspace is empty: clone first\" sha256=\"0000000000000000000000000000000000000000000000000000000000000000\" graph=\"message/00000000000000a1\">\nRun the clone command, then create a branch and work there.\n</smalltalk-message>\n</channel>"
+      "text": "<channel source=\"plugin:st-channel:st\" from=\"agent/fleet/fixture-reviewer\" messageId=\"message/00000000000000a1\" threadId=\"message/00000000000000a1\" identity=\"fleet/fixture-builder\">\n<smalltalk-message id=\"00000000000000a1\" from=\"agent/fleet/fixture-reviewer\" to=\"agent/fleet/fixture-builder\" subject=\"Your workspace is empty: clone first\" sha256=\"0000000000000000000000000000000000000000000000000000000000000000\" graph=\"message/00000000000000a1\">\nRun the clone command, then create a branch and work there.\n</smalltalk-message>\n</channel>"
     }
   },
   {

@@ -34,9 +34,9 @@
         "body": "Run the clone command, then create a branch and work there.",
         "delivered": false,
         "dictated": false,
-        "from": "fleet/example/reviewer",
+        "from": "fleet/fixture-reviewer",
         "subject": "Your workspace is empty: clone first",
-        "to": "fleet/example/builder"
+        "to": "fleet/fixture-builder"
       }
     },
     "id": "timeline-entry/noise-15#0"
