@@ -4,19 +4,7 @@ import { Button, Link, Tooltip, TooltipTrigger, VisuallyHidden } from 'react-ari
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import type { Components, ExtraProps } from 'react-markdown'
 import type { Root, RootContent as SyntaxNode } from 'hast'
-import { refractor } from 'refractor/core'
-import typescript from 'refractor/typescript'
-import tsx from 'refractor/tsx'
-import javascript from 'refractor/javascript'
-import json from 'refractor/json'
-import bash from 'refractor/bash'
-import diff from 'refractor/diff'
-import rust from 'refractor/rust'
-import nix from 'refractor/nix'
-import python from 'refractor/python'
-import yaml from 'refractor/yaml'
-import markdown from 'refractor/markdown'
-import css from 'refractor/css'
+import { refractor, type Syntax } from 'refractor/core'
 import remarkGfm from 'remark-gfm'
 import { surfaceVars as surface, textVars as textColor, borderVars as border, accentVars as accent, statusVars as status, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
 
@@ -56,6 +44,7 @@ export const Markdown = React.memo(function Markdown({ text, streaming = false, 
   const inherited = React.useContext(MarkdownImagePolicy)
   const references = React.useMemo(() => ({ resources, onOpenResource, renderInlineReference, resolveImage: resolveImage ?? inherited.resolveImage, onLoadImage: onLoadImage ?? inherited.onLoadImage }), [resources, onOpenResource, renderInlineReference, resolveImage, onLoadImage, inherited])
   const source = React.useMemo(() => streaming ? completeStreamingTail(text) : text, [text, streaming])
+  React.useEffect(scheduleGrammars, [])
   return <ReferenceContext.Provider value={references}><div data-testid="markdown" {...stylex.props(styles.markdown)}><ReactMarkdown skipHtml urlTransform={(url, key) => key === 'src' ? url : defaultUrlTransform(url)} remarkPlugins={REMARK_PLUGINS} rehypePlugins={streaming ? STREAMING_PLUGINS : undefined} components={MARKDOWN_COMPONENTS}>{source}</ReactMarkdown></div></ReferenceContext.Provider>
 })
 
@@ -110,12 +99,41 @@ function InlineCode({ children }: React.ComponentProps<'code'>) {
   return rendered === undefined ? <code {...stylex.props(styles.inlineCode)}>{children}</code> : rendered
 }
 
-// Eager, fixed package grammars: authored fences never trigger a module request.
-const grammars = { typescript, tsx, javascript, json, bash, diff, rust, nix, python, yaml, markdown, css }
-for (const grammar of Object.values(grammars)) refractor.register(grammar)
-const languageAliases: Readonly<Record<string, keyof typeof grammars>> = {
+// Fixed package grammar set, in its registration order. The whole set loads together, after module evaluation, on the first
+// rendered code fence or the first idle period after a Markdown mount, whichever comes first; no request depends on an authored language label.
+const grammarModules = {
+  typescript: () => import('refractor/typescript'), tsx: () => import('refractor/tsx'), javascript: () => import('refractor/javascript'),
+  json: () => import('refractor/json'), bash: () => import('refractor/bash'), diff: () => import('refractor/diff'), rust: () => import('refractor/rust'),
+  nix: () => import('refractor/nix'), python: () => import('refractor/python'), yaml: () => import('refractor/yaml'), markdown: () => import('refractor/markdown'), css: () => import('refractor/css'),
+} satisfies Record<string, () => Promise<{ default: Syntax }>>
+const languageAliases: Readonly<Record<string, keyof typeof grammarModules>> = {
   ts: 'typescript', js: 'javascript', sh: 'bash', shell: 'bash', shellscript: 'bash',
   rs: 'rust', py: 'python', yml: 'yaml', md: 'markdown',
+}
+let grammarsReady = false
+let grammarLoad: Promise<void> | undefined
+const grammarListeners = new Set<() => void>()
+function subscribeGrammars(listener: () => void) {
+  grammarListeners.add(listener)
+  return () => { grammarListeners.delete(listener) }
+}
+/** Idempotent. Registers the set in one batch, in eager order, so every language tokenizes as with eager registration. */
+function loadGrammars() {
+  if (grammarsReady || grammarLoad !== undefined) return
+  grammarLoad = Promise.all(Object.values(grammarModules).map(load => load())).then(modules => {
+    for (const module of modules) refractor.register(module.default)
+    grammarsReady = true
+    for (const listener of grammarListeners) listener()
+  }).catch(() => { grammarLoad = undefined }) // A failed chunk keeps plain source; a later fence or mount retries.
+}
+function scheduleGrammars() {
+  if (grammarsReady || grammarLoad !== undefined) return undefined
+  if (typeof requestIdleCallback !== 'function') {
+    const timer = setTimeout(loadGrammars, 0)
+    return () => clearTimeout(timer)
+  }
+  const idle = requestIdleCallback(loadGrammars)
+  return () => cancelIdleCallback(idle)
 }
 
 function SyntaxToken({ node }: { node: SyntaxNode }): React.ReactNode {
@@ -132,10 +150,14 @@ function SyntaxToken({ node }: { node: SyntaxNode }): React.ReactNode {
   )}>{node.children.map((child, index) => <SyntaxToken key={index} node={child} />)}</span>
 }
 
+/** Source renders as plain text at once; tokens replace it in the same box once the grammar set has registered. */
 export function HighlightedSource({ code, language }: { code: string; language: string }) {
   const normalized = language.toLowerCase()
   const canonical = Object.hasOwn(languageAliases, normalized) ? languageAliases[normalized]! : normalized
-  const nodes = React.useMemo(() => Object.hasOwn(grammars, canonical) ? refractor.highlight(code, canonical).children : undefined, [code, canonical])
+  const known = Object.hasOwn(grammarModules, canonical)
+  const ready = React.useSyncExternalStore(subscribeGrammars, () => grammarsReady, () => grammarsReady)
+  React.useEffect(() => { if (!ready) loadGrammars() }, [ready])
+  const nodes = React.useMemo(() => ready && known ? refractor.highlight(code, canonical).children : undefined, [code, canonical, known, ready])
   return nodes === undefined ? code : <>{nodes.map((node, index) => <SyntaxToken key={index} node={node} />)}</>
 }
 
