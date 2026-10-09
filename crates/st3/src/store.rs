@@ -36068,7 +36068,7 @@ mission "page-root" state="ready" {
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
-                idempotency_key: "page-root".into(),
+                idempotency_key: "page-root-run".into(),
             })
             .unwrap();
         // Invented rows isolate equal-time cursor order from admission scheduling.
