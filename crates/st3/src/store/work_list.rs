@@ -29,6 +29,17 @@ pub(crate) struct WorkRows {
     pub(crate) time_unix_ms: u128,
     /// The step that owned each seat a row shows, when that row was folded.
     pub(crate) seats: HashMap<String, String>,
+    /// The projection frontier at the fold, from [`Store::projection_frontier`].
+    pub(crate) frontier: u64,
+}
+
+/// What claims between two cuts changed in the work list.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct WorkChanges {
+    /// Steps whose row any of those claims can change.
+    pub(crate) steps: BTreeSet<String>,
+    /// Whether a seat's queue moved, which reorders that seat's windows with no row changing.
+    pub(crate) reorder: bool,
 }
 
 /// How the work list ranks a step's state: ready work first, ended work last.
@@ -62,18 +73,21 @@ impl WorkRows {
 impl Store {
     /// Which steps' work rows the claims after `after` through `through` can change, read in
     /// the caller's snapshot. A row reads its step, the run, generation and root run that own
-    /// it, the person asks that block it, and the seats it owns with their usage. A claim about
-    /// any other subject changes no row.
-    /// `seats` names the step each seat shown on a row belonged to when that row was folded.
+    /// it, revision proposals for that run, the person asks that block it, which their
+    /// requesters' declarations and runtime decide, and the seats it owns with their usage. A
+    /// claim about any other subject changes no row. `seats` names the step each seat shown on
+    /// a row belonged to when that row was folded.
     pub(crate) fn work_list_changes(
         &self,
         after: u64,
         through: u64,
         seats: &HashMap<String, String>,
-    ) -> Result<BTreeSet<String>> {
+    ) -> Result<WorkChanges> {
         let connection = self.readers.get();
         let mut steps = BTreeSet::new();
+        let mut reorder = false;
         let mut runs = BTreeSet::new();
+        let mut requesters = BTreeSet::new();
         let mut statement = connection.prepare_cached(
             "SELECT subject, kind, CASE WHEN kind LIKE 'work.person-%'
                     THEN json_extract(body,'$.fields.origin_step') END
@@ -106,6 +120,9 @@ impl Store {
                 if let Some(run) = owner.query_row([generation], |row| row.get::<_, String>(0)).optional()? {
                     runs.insert(run);
                 }
+            } else if let Some(proposal) = subject.strip_prefix("revision-proposal/") {
+                // A draining run shows only its held steps, with no claim on the run.
+                runs.extend(self.revision_proposal_run(proposal)?);
             } else if subject.starts_with("step-run/") {
                 steps.insert(subject);
                 // A person's answer to an ask unblocks the step that asked.
@@ -118,23 +135,19 @@ impl Store {
                 for step in owned.query_map([&subject], |row| row.get::<_, String>(0))? {
                     steps.insert(step?);
                 }
-                if kind == "intent.desired" {
-                    // A requester's declaration decides whether its asks still block steps.
-                    let mut asks = connection.prepare_cached(
-                        "SELECT subject, json_extract(body,'$.fields.origin_step') FROM claims
-                         WHERE kind='work.person-asked' AND actor=?1",
-                    )?;
-                    for ask in asks.query_map([&subject], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                    })? {
-                        let (ask, origin) = ask?;
-                        steps.insert(ask);
-                        steps.extend(origin);
-                    }
-                }
                 // A seat that left its step: that step's row no longer shows it.
                 steps.extend(seats.get(&subject).cloned());
+                if published_list::decides_asks(&kind) {
+                    requesters.insert(subject);
+                }
+                // A seat's queue order moves its ready work in its own windows.
+                reorder |= kind == crate::seat_queue::MOVED_CLAIM;
             }
+        }
+        // A requester's declaration and runtime decide whether its asks still block steps.
+        for (ask, origin) in self.asks_by_requesters(&requesters)? {
+            steps.insert(ask);
+            steps.extend(origin);
         }
         if !runs.is_empty() {
             let mut owned = connection.prepare_cached(
@@ -146,7 +159,7 @@ impl Store {
                 }
             }
         }
-        Ok(steps)
+        Ok(WorkChanges { steps, reorder })
     }
 
     /// The steps whose worker lease ended after `after` and by `through`: their rows show them

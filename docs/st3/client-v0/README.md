@@ -1645,7 +1645,9 @@ which can be older than the subscription by about a second plus one fold. A work
 `actor` filters the published list; its ready work follows the seat's queue order. A work row's
 `execution_elapsed_ms` counts to the list's time, the projection time of its cut. Before the
 first publication, and while a refresher fails three folds in a row or after it stops, windows
-fold on read and follow commits as before, until a fold publishes again. HTTP pages of
+fold on read and follow commits as before, until a fold publishes again. When projections are
+replaced without a claim (a replay, trim or heal), windows keep the newest rows, under their own
+cut, until the list's fold from nothing publishes. HTTP pages of
 `/v1/client/missions` and `/v1/client/work` are unchanged. A daemon started with
 `ST3_PUBLISHED_LISTS=off` folds each window on read instead.
 

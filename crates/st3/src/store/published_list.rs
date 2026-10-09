@@ -8,7 +8,7 @@
 //! failing or after it stops, the list is not served and readers fold on read.
 
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Rows a refresher published, coherent at one graph cut.
 pub(crate) struct Publication<R> {
@@ -33,6 +33,8 @@ pub(crate) struct PublishedList<R> {
     /// Set when the projections this list folds were replaced without a new claim, as a replay
     /// or a checkpoint trim does: the next refresh folds from nothing.
     forgotten: AtomicBool,
+    /// Rises with every forget, so a fold that began before one never publishes.
+    generation: AtomicU64,
     /// Folds from nothing or in chunks, by why: each refolded many rows, not a few.
     rebuilds: Mutex<BTreeMap<String, u64>>,
 }
@@ -46,6 +48,7 @@ impl<R> Default for PublishedList<R> {
             started: AtomicBool::new(false),
             serving: AtomicBool::new(false),
             forgotten: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
             rebuilds: Mutex::default(),
         }
     }
@@ -67,19 +70,27 @@ impl<R> PublishedList<R> {
     }
 
     /// The newest publication for the refresher itself to fold from, served or not, unless the
-    /// projections were replaced since: then it folds from nothing.
-    pub(crate) fn base(&self) -> Option<Arc<Publication<R>>> {
+    /// projections were replaced since: then it folds from nothing. With it, the generation
+    /// [`Self::publish`] must still see for the fold to publish.
+    pub(crate) fn base(&self) -> (Option<Arc<Publication<R>>>, u64) {
+        let generation = self.generation.load(Ordering::Acquire);
         if self.forgotten.swap(false, Ordering::AcqRel) {
-            return None;
+            return (None, generation);
         }
-        self.newest.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        (self.newest.lock().unwrap_or_else(PoisonError::into_inner).clone(), generation)
     }
 
-    /// Swap in a newer publication and serve it. Says whether the list was served before, so a
-    /// list served again is announced to its windows.
-    pub(crate) fn publish(&self, publication: Publication<R>) -> bool {
-        *self.newest.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(publication));
-        self.serving.swap(true, Ordering::AcqRel)
+    /// Swap in a newer publication and serve it, unless the projections were replaced after its
+    /// fold began (`generation` is stale): then it is dropped and `None` returned, and the next
+    /// fold starts from nothing. Otherwise says whether the list was served before, so a list
+    /// served again is announced to its windows.
+    pub(crate) fn publish(&self, publication: Publication<R>, generation: u64) -> Option<bool> {
+        let mut newest = self.newest.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        *newest = Some(Arc::new(publication));
+        Some(self.serving.swap(true, Ordering::AcqRel))
     }
 
     /// Stop serving the list, as when its refresher keeps failing or stops: readers fold on
@@ -88,11 +99,13 @@ impl<R> PublishedList<R> {
         self.serving.swap(false, Ordering::AcqRel)
     }
 
-    /// The projections were replaced without a new claim: stop serving rows folded from the
-    /// old ones, so readers fold on read, and fold from nothing at once. The next publication
-    /// serves the list again and announces it.
+    /// The projections were replaced without a new claim: fold from nothing at once, and drop
+    /// any fold already under way. Readers keep the newest rows, under their own cut, until the
+    /// fold from nothing publishes; replays come in bursts, and folding every window on read
+    /// meanwhile would cost more than rows a fold or two old.
     pub(crate) fn forget(&self) {
-        self.serving.store(false, Ordering::Release);
+        let _newest = self.newest.lock().unwrap_or_else(PoisonError::into_inner);
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.fold_from_nothing_next();
         self.wake.notify_one();
     }
@@ -113,6 +126,60 @@ impl<R> PublishedList<R> {
     }
 }
 
+/// Claim kinds about an agent that decide whether its person asks still block their steps:
+/// its declaration, and the runtime state and actions that tell whether it is retiring.
+pub(crate) fn decides_asks(kind: &str) -> bool {
+    kind == "intent.desired" || kind == "runtime.observed" || kind.starts_with("runtime.action.")
+}
+
+impl Store {
+    /// How far replicated claims are projected: claims after this index that arrived by
+    /// replication may still wait in the backlog, and a pass that projects them moves it on. A
+    /// list that folded past them before then reads their claims again once it moves.
+    pub(crate) fn projection_frontier(&self) -> Result<u64> {
+        let connection = self.readers.get();
+        let frontier = connection
+            .prepare_cached(
+                "SELECT COALESCE(MAX(last_good_store_index), 0) FROM projection_health
+                 WHERE aggregate='graph'",
+            )?
+            .query_row([], |row| row.get::<_, u64>(0))?;
+        Ok(frontier)
+    }
+
+    /// The person asks that `requesters` made, with the step each asked from, in one read for a
+    /// whole fold. Person asks are few; the kind index bounds the read to them.
+    pub(crate) fn asks_by_requesters(
+        &self,
+        requesters: &BTreeSet<String>,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        if requesters.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let asks = connection
+            .prepare_cached(
+                "SELECT subject, json_extract(body,'$.fields.origin_step') FROM claims
+                 WHERE kind='work.person-asked' AND actor IN (SELECT value FROM json_each(?1))",
+            )?
+            .query_map([serde_json::to_string(requesters)?], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(asks)
+    }
+
+    /// The run a revision proposal is for: its phase and timestamps change with the proposal.
+    pub(crate) fn revision_proposal_run(&self, proposal: &str) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        let run = connection
+            .prepare_cached("SELECT run_id FROM revision_proposals WHERE id=?1")?
+            .query_row([proposal], |row| row.get::<_, String>(0))
+            .optional()?;
+        Ok(run)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,32 +191,38 @@ mod tests {
     #[test]
     fn one_refresher_serves_its_publications_and_forgetting_folds_from_nothing_once() {
         let list = PublishedList::<Vec<u64>>::default();
-        assert!(list.newest().is_none() && list.base().is_none());
+        assert!(list.newest().is_none() && list.base().0.is_none());
         assert!(list.start().is_some());
         assert!(list.start().is_none(), "one refresher per list");
         assert!(list.newest().is_none(), "nothing served before the first publication");
-        assert!(!list.publish(publication(4)), "served for the first time");
+        let (_, generation) = list.base();
+        assert_eq!(list.publish(publication(4), generation), Some(false), "served for the first time");
         assert_eq!(list.newest().unwrap().cut, 4);
-        assert_eq!(list.base().unwrap().rows, vec![4]);
+        let (base, generation) = list.base();
+        assert_eq!(base.unwrap().rows, vec![4]);
         list.forget();
-        assert!(list.newest().is_none(), "readers fold on read until the list is folded again");
-        assert!(list.base().is_none(), "the next fold starts from nothing");
-        assert_eq!(list.base().unwrap().cut, 4, "only once");
-        assert!(!list.publish(publication(5)), "served again, so announced");
-        assert_eq!(list.newest().unwrap().cut, 5);
+        assert_eq!(list.newest().unwrap().cut, 4, "readers keep the newest rows meanwhile");
+        // A fold that began before the forget never publishes its rows.
+        assert_eq!(list.publish(publication(5), generation), None);
+        assert_eq!(list.newest().unwrap().cut, 4);
+        let (base, generation) = list.base();
+        assert!(base.is_none(), "the next fold starts from nothing");
+        assert_eq!(list.base().0.unwrap().cut, 4, "only once");
+        assert_eq!(list.publish(publication(6), generation), Some(true));
+        assert_eq!(list.newest().unwrap().cut, 6);
     }
 
     #[test]
     fn a_withdrawn_list_is_not_served_until_it_publishes_again() {
         let list = PublishedList::<Vec<u64>>::default();
         list.start();
-        list.publish(publication(4));
+        list.publish(publication(4), 0);
         assert!(list.withdraw());
         assert!(!list.withdraw(), "already withdrawn");
         assert!(list.newest().is_none(), "readers fold on read");
-        assert_eq!(list.base().unwrap().cut, 4, "the refresher still folds from it");
-        assert!(!list.publish(publication(5)), "served again, so announced");
-        assert!(list.publish(publication(6)));
+        assert_eq!(list.base().0.unwrap().cut, 4, "the refresher still folds from it");
+        assert_eq!(list.publish(publication(5), 0), Some(false), "served again, so announced");
+        assert_eq!(list.publish(publication(6), 0), Some(true));
         assert_eq!(list.newest().unwrap().cut, 6);
         list.note_rebuild("start");
         list.note_rebuild("start");

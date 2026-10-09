@@ -117,18 +117,17 @@ fn rows(publication: &Publication<MissionRows>) -> (Vec<String>, BTreeMap<String
     (publication.rows.order.clone(), cards)
 }
 
-/// Fold from `base`, check the publication against the oracle and a fold from nothing, and
-/// return it with whether any row changed.
 /// Fold the store's missions list as its refresher does, from its newest publication unless
-/// the projections were replaced since.
+/// the projections were replaced since, check the publication against the direct read and a
+/// fold from nothing, and return it with whether any row changed.
 fn fold(store: &Store) -> (Arc<Publication<MissionRows>>, bool) {
     let list = store.published_missions_list();
     list.start();
     let now = now_ms();
-    let base = list.base();
-    let changed = match fold_missions(store, base.as_deref(), now).unwrap() {
+    let (base, generation) = list.base();
+    let changed = match fold_missions(store, base.as_deref()).unwrap() {
         Some((publication, changed)) => {
-            list.publish(publication);
+            list.publish(publication, generation).expect("no projection replaced meanwhile");
             changed
         }
         None => false,
@@ -137,7 +136,7 @@ fn fold(store: &Store) -> (Arc<Publication<MissionRows>>, bool) {
     assert_eq!(publication.cut, store.index().unwrap(), "published at the current cut");
     let expected = oracle(store);
     assert_eq!(rows(&publication), expected, "the published rows are the direct fold's");
-    let (fresh, _) = fold_missions(store, None, now).unwrap().unwrap();
+    let (fresh, _) = fold_missions(store, None).unwrap().unwrap();
     assert_eq!(rows(&fresh), expected, "a fold from nothing agrees");
     // Every window a socket holds is the direct read's, including its bound and continuation.
     for limit in [1, 2, 200] {
@@ -264,6 +263,9 @@ fn published_missions_follow_replication_in_any_order_and_fold_from_nothing_afte
         target.receive_replication_exchange("cedar", FLEET, &permuted).unwrap();
         target.validate_replication_backlog().unwrap();
         target.apply_replication_repairs().unwrap();
+        // A fold between admission and projection reads the claims before their rows exist;
+        // the pass that projects them moves the frontier, and the next fold reads them again.
+        fold(&target);
         let projected = target.project_replication_backlog().unwrap();
         assert!(projected);
         let (publication, _) = fold(&target);
@@ -307,10 +309,10 @@ fn work_oracle(store: &Store, time: u128, actor: Option<&str>, limit: usize) -> 
 fn fold_work_checked(store: &Store) -> (Arc<Publication<WorkRows>>, bool) {
     let list = store.published_work_list();
     list.start();
-    let base = list.base();
-    let changed = match fold_work(store, base.as_deref(), now_ms()).unwrap() {
+    let (base, generation) = list.base();
+    let changed = match fold_work(store, base.as_deref()).unwrap() {
         Some((publication, changed)) => {
-            list.publish(publication);
+            list.publish(publication, generation).expect("no projection replaced meanwhile");
             changed
         }
         None => false,
@@ -319,7 +321,7 @@ fn fold_work_checked(store: &Store) -> (Arc<Publication<WorkRows>>, bool) {
     assert_eq!(publication.cut, store.index().unwrap(), "published at the current cut");
     let time = publication.rows.time_unix_ms;
     assert!(time >= store.projection_time_at(publication.cut).unwrap());
-    let (fresh, _) = fold_work(store, None, now_ms()).unwrap().unwrap();
+    let (fresh, _) = fold_work(store, None).unwrap().unwrap();
     for actor in ACTORS {
         for limit in [1, 2, 200] {
             let expected = work_oracle(store, time, actor, limit);
@@ -383,9 +385,27 @@ fn published_work_matches_the_direct_read_for_every_actor_as_time_passes() {
         })
         .unwrap();
     assert_eq!(store.index().unwrap(), before, "the renewal appended no claim");
-    mission(&store, "garden/after-renewal");
+    // Folded on its own, with no claim and no new cut.
     let (_, changed) = fold_work_checked(&store);
-    assert!(changed);
+    assert!(changed, "the quiet renewal moved the step's lease");
+
+    // The seat asks a person; the ask's step shows on the list, and its answer later moves it.
+    store
+        .ask_person(&crate::model::PersonAskRequest {
+            legacy_request: None,
+            person: "person/operator".into(),
+            title: "Which bed?".into(),
+            reason: "The plan names two beds.".into(),
+            actor: ash.clone(),
+            step: Some(plant.clone()),
+            new_run: None,
+            incarnation: Some(format!("{ash}-1")),
+            request: None,
+            idempotency_key: "ask-plant".into(),
+        })
+        .unwrap();
+    fold_work_checked(&store);
+    fold(&store);
 
     // The lease ends: once the list's time passes it, the step is ready again.
     let lease = store.next_lease_end(0).unwrap().expect("the claim holds a lease");
@@ -435,6 +455,7 @@ fn published_work_follows_replication_in_any_order_and_folds_from_nothing_after_
         target.receive_replication_exchange("cedar", FLEET, &permuted).unwrap();
         target.validate_replication_backlog().unwrap();
         target.apply_replication_repairs().unwrap();
+        fold_work_checked(&target);
         assert!(target.project_replication_backlog().unwrap());
         let (publication, _) = fold_work_checked(&target);
         assert!(publication.rows.rows.contains_key(&plant), "{reverse}");
@@ -451,4 +472,94 @@ fn published_work_follows_replication_in_any_order_and_folds_from_nothing_after_
     fold_work_checked(&store);
     // One fold from nothing for the trim, and the check's own.
     assert_eq!(store.published_work_list().rebuilds()["start"], before + 2, "the trim folds from nothing");
+}
+
+#[test]
+fn published_lists_follow_many_changes_and_a_revision_proposal() {
+    let _clock = Clock::at(start_time());
+    let store = Store::open_memory("cedar").unwrap();
+    mission(&store, "garden/alpha");
+    let alpha = start(&store, "garden/alpha", "alpha-1");
+    let (plant, ash) = step(&alpha, "plant");
+    store.set_step_state(&plant, "ready", None).unwrap();
+    store.set_step_state(&step(&alpha, "water").0, "ready", None).unwrap();
+    act(&store, &plant, &ash, "claim", "claim-plant");
+    fold(&store);
+    fold_work_checked(&store);
+
+    // More changed missions and steps than one snapshot refolds: chunks, then one cut.
+    for number in 0..FOLD_CHUNK + 3 {
+        let name = format!("garden/many-{number}");
+        mission(&store, &name);
+        let run = start(&store, &name, &format!("many-{number}"));
+        for path in ["plant", "water"] {
+            store.set_step_state(&step(&run, path).0, "ready", None).unwrap();
+        }
+    }
+    fold(&store);
+    fold_work_checked(&store);
+    assert_eq!(store.published_missions_list().rebuilds()["chunked: missions changed"], 1);
+    assert_eq!(store.published_work_list().rebuilds()["chunked: work changed"], 1);
+
+    // A revision proposal drains the run, then applies, with no claim on the run itself.
+    let source = r#"version 2
+mission "garden/alpha" state="ready" {
+  goal "Grow the garden in rows."
+  concurrent-runs max=4
+  step "plant" { assigned-to "agent/garden/ash" }
+  step "water" { assigned-to "agent/garden/birch" }
+}"#;
+    let intent = crate::graph::parse_intent(source, store.origin()).unwrap();
+    let preview = store
+        .mission(&intent, crate::model::IntentInput { kdl: source.into(), source_name: None })
+        .unwrap();
+    store.apply_as(&intent, &preview.subject_tokens, "publish-alpha-rows", Some("person/operator")).unwrap();
+    let proposal = store
+        .create_revision_proposal(
+            &alpha.id,
+            &intent.missions["garden/alpha"],
+            &format!("agent/{}/owner", alpha.id),
+            "grow in rows",
+            "proposal-create",
+        )
+        .unwrap();
+    fold(&store);
+    fold_work_checked(&store);
+    store
+        .approve_revision_proposal(
+            &proposal.id,
+            "person/reviewer",
+            proposal.preview_hash.as_deref().unwrap(),
+            "proposal-approve",
+        )
+        .unwrap();
+    fold(&store);
+    fold_work_checked(&store);
+}
+
+#[test]
+fn a_forgotten_list_keeps_its_rows_until_refolded_and_withdraws_its_view_too() {
+    let _clock = Clock::at(start_time());
+    let store = Store::open_memory("cedar").unwrap();
+    mission(&store, "garden/alpha");
+    fold(&store);
+    let list = store.published_missions_list();
+    let (_, generation) = list.base();
+    store.publish_collection_view("missions");
+    assert!(store.collection_view_published("missions"));
+    list.forget();
+    assert!(store.published_missions().is_some(), "readers keep the rows until the refold");
+    // A fold under way when the projections were replaced publishes nothing.
+    let (stale, _) = fold_missions(&store, store.published_missions().as_deref()).unwrap().unwrap_or_else(|| {
+        fold_missions(&store, None).unwrap().unwrap()
+    });
+    assert_eq!(list.publish(stale, generation), None);
+    // A refresher that then keeps failing withdraws the view, served list or not.
+    assert!(list.withdraw());
+    withdraw(&store, |store| store.published_missions_list(), "missions");
+    assert!(!store.collection_view_published("missions"));
+    assert!(store.published_missions().is_none());
+    // Its next fold, from nothing, serves the list again.
+    fold(&store);
+    assert!(store.published_missions().is_some());
 }

@@ -20,7 +20,7 @@ pub(crate) struct MissionKey {
 /// One publication of the current missions list.
 #[derive(Clone, Default)]
 pub(crate) struct MissionRows {
-    /// Every mission the store knows, shown or not, by its `mission/` ID.
+    /// Every shown mission's place in the list, by its `mission/` ID.
     pub(crate) keys: HashMap<String, MissionKey>,
     /// The shown missions, in list order.
     pub(crate) order: Vec<String>,
@@ -35,6 +35,8 @@ pub(crate) struct MissionRows {
     pub(crate) folded_at_unix_ms: u128,
     /// The first worker lease to end after the fold, if one does.
     pub(crate) next_lease_end_unix_ms: Option<u128>,
+    /// The projection frontier at the fold, from [`Store::projection_frontier`].
+    pub(crate) frontier: u64,
 }
 
 impl MissionRows {
@@ -210,13 +212,16 @@ impl Store {
 
     /// Which missions the claims after `after` through `through` can change, read in the
     /// caller's snapshot. A card reads its mission's definition and runs, those runs' current
-    /// steps and faults, the root runs those steps answer to, and the person asks that block
-    /// them; and which runs wait on a person. A claim about any other subject changes no card.
+    /// steps and faults, the root runs those steps answer to, revision proposals for those
+    /// runs, and the person asks that block them, which their requesters' declarations and
+    /// runtime decide; and which runs wait on a person. A claim about any other subject
+    /// changes no card.
     pub(crate) fn mission_list_changes(&self, after: u64, through: u64) -> Result<MissionChanges> {
         let connection = self.readers.get();
         let mut changes = MissionChanges::default();
         let mut runs = BTreeSet::new();
         let mut steps = BTreeSet::new();
+        let mut requesters = BTreeSet::new();
         let mut statement = connection.prepare_cached(
             "SELECT subject, kind, CASE WHEN kind LIKE 'work.person-%'
                     THEN json_extract(body,'$.fields.origin_step') END
@@ -252,24 +257,21 @@ impl Store {
                 if let Some(run) = owner.query_row([generation], |row| row.get::<_, String>(0)).optional()? {
                     runs.insert(run);
                 }
+            } else if let Some(proposal) = subject.strip_prefix("revision-proposal/") {
+                // A proposal drains, applies or releases its run with no claim on the run.
+                runs.extend(self.revision_proposal_run(proposal)?);
             } else if subject.starts_with("step-run/") {
                 steps.insert(subject);
                 // A person's answer to an ask unblocks the step that asked.
                 steps.extend(origin);
-            } else if subject.starts_with("agent/") && kind == "intent.desired" {
-                // A requester's declaration decides whether its asks still block their steps.
-                let mut asks = connection.prepare_cached(
-                    "SELECT subject, json_extract(body,'$.fields.origin_step') FROM claims
-                     WHERE kind='work.person-asked' AND actor=?1",
-                )?;
-                for ask in asks.query_map([&subject], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                })? {
-                    let (ask, origin) = ask?;
-                    steps.insert(ask);
-                    steps.extend(origin);
-                }
+            } else if subject.starts_with("agent/") && published_list::decides_asks(&kind) {
+                requesters.insert(subject);
             }
+        }
+        // A requester's declaration and runtime decide whether its asks still block steps.
+        for (ask, origin) in self.asks_by_requesters(&requesters)? {
+            steps.insert(ask);
+            steps.extend(origin);
         }
         if !steps.is_empty() {
             let mut owner = connection.prepare_cached("SELECT run_id FROM step_runs WHERE subject=?1")?;
@@ -288,6 +290,19 @@ impl Store {
             }
         }
         Ok(changes)
+    }
+
+    /// Every mission's `mission/` ID, defined or run, for a fold from nothing to read in chunks.
+    pub(crate) fn mission_list_ids(&self) -> Result<Vec<String>> {
+        let connection = self.readers.get();
+        let ids = connection
+            .prepare_cached(
+                "SELECT 'mission/' || mission_id FROM mission_definitions
+                 UNION SELECT 'mission/' || mission_id FROM mission_runs",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
     }
 
     /// The missions with a current step whose worker lease ended after `after` and by
