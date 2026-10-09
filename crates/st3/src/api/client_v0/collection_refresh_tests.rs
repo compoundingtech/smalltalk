@@ -467,6 +467,18 @@ async fn clients_hold_what_full_reads_give_through_replication_rollback_checkpoi
     signal_changed(&state);
     settle(&mut fixture, &mut held).await;
     assert_parity(&fixture, &session, &held, &requests, "changed").await;
+    // History a checkpoint drops: superseded harness states and old diagnostics.
+    for (n, harness) in ["working", "idle", "working", "idle"].into_iter().enumerate() {
+        claim(&state.store, "agent/alder.plain", "harness.observed", Some("agent/alder.plain"),
+            json!({"state":harness, "driver":"omp", "incarnation_id":"plain-1", "observed_at_ms":n}));
+    }
+    for n in 0..4 {
+        claim(&state.store, "daemon/alder", "daemon.diagnostic", None,
+            json!({"severity":"warning", "code":"slow-request", "reason":format!("slow {n}")}));
+    }
+    signal_changed(&state);
+    settle(&mut fixture, &mut held).await;
+    assert_parity(&fixture, &session, &held, &requests, "before the checkpoint").await;
     assert!(state.store.trim_checkpoint_for_test(client_now_ms() + 1_000) > 0, "the checkpoint drops history");
     state.store.forget_current_views();
     signal_changed(&state);
