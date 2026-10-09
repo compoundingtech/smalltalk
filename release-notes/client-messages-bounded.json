@@ -3,15 +3,15 @@
   "summary": "Seek bounded message pages through body-free temporal selectors",
   "replay": {
     "status": "none",
-    "detail": "Opening an older database transactionally backfills local message selector metadata from current message projections and retained canonical claims. Selector rebuild invalidates existing page cuts. No authoritative claim replay or body-copy inventory is introduced; ordinary pages fold only selected message bodies."
+    "detail": "Opening an older database backfills local message selector headers from current message projections and retained canonical claims in short, resumable chunks before readers are served. Starting a backfill invalidates existing page cuts. No authoritative claim replay or body-copy inventory is introduced; ordinary pages fold only selected message bodies."
   },
   "schema": {
     "status": "changed",
-    "detail": "Adds one local temporal header/pending table with fourteen ordered eligibility, reminder and retirement indexes, six source-change triggers and a metadata cut marker. Selectors retain only recipient, sender, canonical order, closed/reminder eligibility and cut intervals, never message bodies. Writes maintain changed selectors in their transaction; body-only changes avoid selector version churn. In isolated two-order 128-send/128-close bursts, selector maintenance added 0.476-0.603 ms send p95 and 0.482-0.720 ms close p95, with 50.05% additional send WAL and 77.62% additional close WAL. Existing cut-invalidation epoch and deletion/update/repair triggers remain. Earlier body version tables and their maintenance triggers are removed idempotently. Authoritative claims and claim formats are unchanged."
+    "detail": "Adds the local-only projection local_client_message_selectors_v1: one header/pending table with fourteen ordered eligibility, reminder and retirement indexes plus one partial pending-row index, six source-change triggers, a completed-cut metadata marker and a resumable backfill progress marker. Selectors retain only recipient, sender, canonical order, closed/reminder eligibility and cut intervals, never message bodies. Writes maintain changed selectors in their transaction; body-only changes add no selector version. In isolated two-order 128-send/128-close bursts through the real append path, selector maintenance changed send p95 by -0.094 and +0.996 ms and close p95 by +1.002 and +0.700 ms, with 50.5% additional send WAL and 75.1% additional close WAL. The existing cursor epoch table and its deletion/update/repair triggers remain. Earlier body version tables and their maintenance triggers are removed idempotently. The projection adds no subject, resource or claim vocabulary, so the schema registry digest, replication compatibility digest, authoritative claims and claim formats are unchanged; docs/st3/schema.md documents the local table."
   },
   "rules": {
     "status": "none",
-    "detail": "Checkpoint rules and shared projection digests are unchanged. Deletion or repair that destroys a retained message cut invalidates that traversal instead of returning a partial successful page."
+    "detail": "Checkpoint rules, the schema registry digest and shared projection digests are unchanged. Deletion or repair that destroys a retained message cut, or a selector backfill start, invalidates that traversal instead of returning a partial successful page."
   },
   "compatibility": {
     "status": "changed",
@@ -19,7 +19,7 @@
   },
   "downtime": {
     "status": "unknown",
-    "detail": "Initial selector backfill runs transactionally during Store open. On a fresh temporary copy of a checkpointed 118,390-claim, 9,712-message, 1.65-GiB database, open including backfill took 7.983 s, isolated header rebuild 2.679 s and populated reopen 23.418 ms; checkpointed database growth was 12.219 MiB and open WAL 13.041 MiB. These are API-only Store measurements, not live-daemon restart-to-API or rollout downtime proofs."
+    "detail": "Initial selector backfill runs at startup in bounded write transactions that record their progress, so an interrupted backfill resumes rather than restarting, and message pages are refused until it completes. On a fresh temporary copy of a checkpointed 118,390-claim, 9,712-message, 1.65-GiB database, the startup backfill took 4.673 s in 610 transactions; the longest transaction, including commit, took 18.579 ms. Store open including all startup work took 11.377 s, and a populated reopen took 17.490 ms with no backfill transaction. These are API-only Store measurements, not live-daemon restart-to-API or rollout downtime proofs."
   },
   "manual": {
     "status": "none",

@@ -844,6 +844,7 @@ impl Store {
             runtime.open_projections(&transaction, false)?;
             transaction.commit()?;
         }
+        runtime.finish_open_projections(&mut connection)?;
         let readers = ReadPool::new(path, false)?;
         Self::from_connection(
             connection,
@@ -879,6 +880,7 @@ impl Store {
             runtime.open_projections(&transaction, true)?;
             transaction.commit()?;
         }
+        runtime.finish_open_projections(&mut connection)?;
         let readers = ReadPool::new(&uri, true)?;
         Self::from_connection(connection, readers, origin, uri, true, runtime)
     }

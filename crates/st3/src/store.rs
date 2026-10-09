@@ -17130,6 +17130,7 @@ impl Store {
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('canonical_replay_settled', ?1)",
             [now_ms().to_string()],
         )?;
+        client_messages::flush(&transaction)?;
         transaction.commit()?;
         Ok(settled)
     }

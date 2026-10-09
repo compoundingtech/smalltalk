@@ -4,6 +4,11 @@ use super::*;
 #[cfg(test)]
 const TABLE: &str = "local_client_message_selectors_v1";
 const MARKER: &str = "client_message_selectors_v1_cut";
+const BACKFILL_MARKER: &str = "client_message_selectors_v1_backfill";
+// Leave ample room for SQLite's durable commit below the 100ms transaction target.
+const BACKFILL_SUBJECTS: usize = 16;
+const BACKFILL_CLEAR_ROWS: usize = 64;
+const BACKFILL_WORK_BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
 const SELECTOR_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS local_client_message_selectors_v1(
  subject TEXT NOT NULL,born_index INTEGER NOT NULL,retired_index INTEGER,
@@ -45,6 +50,8 @@ CREATE INDEX IF NOT EXISTS client_selector_recipient_reminder_winner ON local_cl
  WHERE born_index>=0 AND retired_index IS NULL AND recipient_current=1 AND reminder IS NOT NULL;
 CREATE INDEX IF NOT EXISTS client_selector_retirement ON local_client_message_selectors_v1(retired_at_unix_ms)
  WHERE retired_at_unix_ms IS NOT NULL;
+CREATE INDEX IF NOT EXISTS client_selector_pending ON local_client_message_selectors_v1(subject)
+ WHERE born_index=-1;
 CREATE TRIGGER IF NOT EXISTS client_selector_claim_insert AFTER INSERT ON claims WHEN NEW.subject LIKE 'message/%' BEGIN
  INSERT INTO local_client_message_selectors_v1(subject,born_index,dirty_flags) VALUES(NEW.subject,-1,CASE WHEN NEW.kind IN ('message.sent','message.closed','intent.desired') OR json_type(NEW.body,'$.fields.from') IS NOT NULL OR json_type(NEW.body,'$.fields.to') IS NOT NULL OR json_type(NEW.body,'$.fields.tags') IS NOT NULL OR json_type(NEW.body,'$.fields.status') IS NOT NULL OR (json_type(NEW.body,'$.fields') IS NULL AND (json_type(NEW.body,'$.from') IS NOT NULL OR json_type(NEW.body,'$.to') IS NOT NULL OR json_type(NEW.body,'$.tags') IS NOT NULL OR json_type(NEW.body,'$.status') IS NOT NULL)) THEN 1 ELSE 0 END)
  ON CONFLICT(subject,born_index) DO UPDATE SET dirty_flags=dirty_flags|excluded.dirty_flags;
@@ -91,7 +98,12 @@ CREATE TRIGGER IF NOT EXISTS client_selector_desired_delete AFTER DELETE ON desi
    SELECT 1 FROM local_client_message_selectors_v1 rival WHERE rival.born_index>=0 AND rival.retired_index IS NULL AND rival.closed=0 AND rival.mailbox=1
     AND rival.recipient=local_client_message_selectors_v1.recipient AND rival.reminder=local_client_message_selectors_v1.reminder AND (rival.version,rival.subject)>(local_client_message_selectors_v1.version,local_client_message_selectors_v1.subject))))
  WHERE born_index>=0 AND retired_index IS NULL AND
-  (subject=OLD.subject OR reminder=(SELECT reminder FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index=-1));
+  subject IN (
+   SELECT OLD.subject
+   UNION
+   SELECT subject FROM local_client_message_selectors_v1 INDEXED BY client_selector_reminder_candidates
+    WHERE born_index>=0 AND retired_index IS NULL AND closed=0
+     AND reminder=(SELECT reminder FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index=-1));
 END;
 "#;
 
@@ -257,50 +269,213 @@ fn record_cut(transaction: &Transaction<'_>,cut: u64) -> Result<()> {
     Ok(())
 }
 
-fn hydrate(transaction: &Transaction<'_>) -> Result<()> {
-    // All historical receipts are unavailable after a reset, never silently short.
-    transaction.execute("UPDATE local_client_message_cut_epoch SET epoch=epoch+1 WHERE id=1",[])?;
-    transaction.execute("DELETE FROM local_client_message_selectors_v1",[])?;
-    let cut=current_index_tx(transaction)?;
-    let now=u64::try_from(crate::api::client_now_ms())?;
-    let subjects=transaction.prepare_cached("SELECT subject FROM message_index WHERE created_index>0 ORDER BY subject")?
-        .query_map([],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut reminders=BTreeSet::new();
-    for subject in subjects {
-        if let Some(key)=first_key(transaction,&subject)? {
-            if let Some(value)=header(transaction,&subject,key)? {
-                if let Some(reminder)=&value.reminder { reminders.insert((reminder.clone(),value.recipient.clone())); }
-                put_header(transaction,&subject,&value,cut,now)?;
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BackfillStats {
+    pub(crate) transactions: usize,
+    pub(crate) subjects: usize,
+    pub(crate) max_subjects_per_transaction: usize,
+    pub(crate) longest_transaction: std::time::Duration,
+    pub(crate) total: std::time::Duration,
+}
+
+#[cfg(test)]
+impl BackfillStats {
+    pub(crate) fn benchmark_measurement(self) -> Value {
+        json!({
+            "transactions": self.transactions,
+            "subjects": self.subjects,
+            "max_subjects_per_transaction": self.max_subjects_per_transaction,
+            "longest_transaction_including_commit_ms": self.longest_transaction.as_secs_f64() * 1_000.0,
+            "total_ms": self.total.as_secs_f64() * 1_000.0,
+        })
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BackfillPhase {
+    Clear,
+    Headers,
+    Pending,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BackfillProgress {
+    cut: u64,
+    phase: BackfillPhase,
+    after: String,
+}
+
+fn save_progress(transaction: &Transaction<'_>, progress: &BackfillProgress) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![BACKFILL_MARKER, serde_json::to_string(progress)?],
+    )?;
+    Ok(())
+}
+
+fn begin_backfill(transaction: &Transaction<'_>) -> Result<BackfillProgress> {
+    // Invalidate old receipts once, atomically with making the projection unavailable.
+    // Clearing itself is bounded, including a rebuild with many retired headers.
+    transaction.execute("UPDATE local_client_message_cut_epoch SET epoch=epoch+1 WHERE id=1", [])?;
+    transaction.execute("DELETE FROM meta WHERE key=?1", [MARKER])?;
+    let progress = BackfillProgress {
+        cut: current_index_tx(transaction)?,
+        phase: BackfillPhase::Clear,
+        after: String::new(),
+    };
+    save_progress(transaction, &progress)?;
+    Ok(progress)
+}
+
+fn has_pending(connection: &Connection) -> Result<bool> {
+    Ok(connection.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM local_client_message_selectors_v1 WHERE born_index=-1)",
+    )?.query_row([], |row| row.get(0))?)
+}
+
+/// One restart-safe transaction. `None` means a populated reopen did no work.
+/// Progress, headers, reminder winners and pending removal always commit together.
+fn backfill_chunk(connection: &mut Connection, reset: bool) -> Result<Option<(usize, bool)>> {
+    let transaction = connection.transaction()?;
+    let saved: Option<String> = transaction.prepare_cached("SELECT value FROM meta WHERE key=?1")?
+        .query_row([BACKFILL_MARKER], |row| row.get(0)).optional()?;
+    let mut progress = if reset {
+        begin_backfill(&transaction)?
+    } else if let Some(saved) = saved {
+        serde_json::from_str(&saved)?
+    } else {
+        let seeded: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)", [MARKER], |row| row.get(0),
+        )?;
+        if !seeded {
+            begin_backfill(&transaction)?
+        } else if has_pending(&transaction)? {
+            // A populated store can also resume interrupted projection maintenance.
+            // Preserve its historical headers; only reconcile the trigger queue.
+            transaction.execute("DELETE FROM meta WHERE key=?1", [MARKER])?;
+            BackfillProgress { cut: current_index_tx(&transaction)?, phase: BackfillPhase::Pending, after: String::new() }
+        } else {
+            return Ok(None);
+        }
+    };
+    let mut processed = 0;
+    let mut complete = false;
+    match progress.phase {
+        BackfillPhase::Clear => {
+            let removed = transaction.execute(
+                "DELETE FROM local_client_message_selectors_v1 WHERE (subject,born_index) IN (
+                 SELECT subject,born_index FROM local_client_message_selectors_v1 ORDER BY subject,born_index LIMIT ?1)",
+                [BACKFILL_CLEAR_ROWS],
+            )?;
+            if removed < BACKFILL_CLEAR_ROWS {
+                progress.phase = BackfillPhase::Headers;
+            }
+        }
+        BackfillPhase::Headers => {
+            let subjects = transaction.prepare_cached(
+                "SELECT subject FROM message_index WHERE subject>?1 AND created_index>0 ORDER BY subject LIMIT ?2",
+            )?.query_map(params![progress.after, BACKFILL_SUBJECTS], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let started = std::time::Instant::now();
+            let now = u64::try_from(crate::api::client_now_ms())?;
+            for subject in &subjects {
+                if let Some(key) = first_key(&transaction, subject)? {
+                    if let Some(value) = header(&transaction, subject, key)? {
+                        put_header(&transaction, subject, &value, progress.cut, now)?;
+                        if let Some(reminder) = &value.reminder {
+                            reminder_winners(&transaction, reminder, None, progress.cut, now)?;
+                            reminder_winners(&transaction, reminder, Some(&value.recipient), progress.cut, now)?;
+                        }
+                    }
+                }
+                progress.after.clone_from(subject);
+                processed += 1;
+                if started.elapsed() >= BACKFILL_WORK_BUDGET { break; }
+            }
+            if processed == subjects.len() && subjects.len() < BACKFILL_SUBJECTS {
+                progress.phase = BackfillPhase::Pending;
+            }
+        }
+        BackfillPhase::Pending => {
+            processed = flush_pending(&transaction, BACKFILL_SUBJECTS, Some(BACKFILL_WORK_BUDGET), false)?;
+            if !has_pending(&transaction)? {
+                // Publication and removal of the resume marker are one atomic commit.
+                record_cut(&transaction, current_index_tx(&transaction)?)?;
+                transaction.execute("DELETE FROM meta WHERE key=?1", [BACKFILL_MARKER])?;
+                complete = true;
             }
         }
     }
-    let mut global=BTreeSet::new();
-    for (reminder,recipient) in reminders {
-        if global.insert(reminder.clone()) { reminder_winners(transaction,&reminder,None,cut,now)?; }
-        reminder_winners(transaction,&reminder,Some(&recipient),cut,now)?;
-    }
-    record_cut(transaction,cut)
+    if !complete { save_progress(&transaction, &progress)?; }
+    transaction.commit()?;
+    Ok(Some((processed, complete)))
 }
 
-pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
+fn open_chunks(connection: &mut Connection, mut reset: bool) -> Result<BackfillStats> {
     #[cfg(test)]
-    if !transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",[TABLE],|row|row.get::<_,bool>(0))? { return Ok(()); }
-    let seeded: bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",[MARKER],|row|row.get(0))?;
-    if !seeded { hydrate(transaction)?; }
-    flush(transaction)
+    if !connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)", [TABLE], |row| row.get::<_, bool>(0))? {
+        return Ok(BackfillStats::default());
+    }
+    let started = std::time::Instant::now();
+    let mut stats = BackfillStats::default();
+    loop {
+        let transaction_started = std::time::Instant::now();
+        let chunk = backfill_chunk(connection, reset)?;
+        let elapsed = transaction_started.elapsed(); // includes BEGIN and durable COMMIT
+        reset = false;
+        let Some((subjects, complete)) = chunk else { break; };
+        stats.transactions += 1;
+        stats.subjects += subjects;
+        stats.max_subjects_per_transaction = stats.max_subjects_per_transaction.max(subjects);
+        stats.longest_transaction = stats.longest_transaction.max(elapsed);
+        if complete { break; }
+    }
+    stats.total = started.elapsed();
+    if stats.transactions > 0 {
+        tracing::info!(
+            transactions = stats.transactions,
+            subjects = stats.subjects,
+            max_subjects_per_transaction = stats.max_subjects_per_transaction,
+            longest_transaction_ms = stats.longest_transaction.as_secs_f64() * 1_000.0,
+            total_ms = stats.total.as_secs_f64() * 1_000.0,
+            "message selector backfill complete",
+        );
+    }
+    Ok(stats)
+}
+
+pub(super) fn open(connection: &mut Connection) -> Result<BackfillStats> {
+    open_chunks(connection, false)
 }
 
 pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
     #[cfg(test)]
     if !transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",[TABLE],|row|row.get::<_,bool>(0))? { return Ok(()); }
-    let pending=transaction.prepare_cached("SELECT subject,dirty_flags,reminder,recipient FROM local_client_message_selectors_v1 WHERE born_index=-1")?
-        .query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,u8>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    // Startup/rebuild owns this queue until every header is available. Ordinary
+    // replay hooks must not publish an incomplete selector projection.
+    let ready: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)", [MARKER], |row| row.get(0))?;
+    if !ready { return Ok(()); }
+    flush_pending(transaction, usize::MAX, None, true)?;
+    #[cfg(test)]
+    if transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='local_client_message_versions')",[],|row|row.get::<_,bool>(0))? {
+        super::client_messages_version_benchmark::flush(transaction)?;
+    }
+    Ok(())
+}
+
+fn flush_pending(transaction: &Transaction<'_>, limit: usize, budget: Option<std::time::Duration>, publish: bool) -> Result<usize> {
+    let started = std::time::Instant::now();
+    let pending=transaction.prepare_cached("SELECT subject,dirty_flags,reminder,recipient FROM local_client_message_selectors_v1 WHERE born_index=-1 ORDER BY subject LIMIT ?1")?
+        .query_map([i64::try_from(limit).unwrap_or(i64::MAX)],|row|Ok((row.get::<_,String>(0)?,row.get::<_,u8>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut processed = 0;
     if !pending.is_empty() {
         let cut=current_index_tx(transaction)?;
         let now=u64::try_from(crate::api::client_now_ms())?;
         let mut changed=false;
         let mut reminders=BTreeSet::new();
         for (subject,flags,pending_reminder,pending_recipient) in pending {
+            processed += 1;
             let existing=current_header(transaction,&subject)?;
             let key=first_key(transaction,&subject)?;
             if flags==0 && existing.as_ref().is_some_and(|(_,value)|Some(&value.sent_key)==key.as_ref()) {
@@ -323,21 +498,20 @@ pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
             }
             if let Some(reminder)=pending_reminder { reminders.insert((reminder,pending_recipient)); }
             transaction.execute("DELETE FROM local_client_message_selectors_v1 WHERE subject=?1 AND born_index=-1",[&subject])?;
+            if budget.is_some_and(|budget| started.elapsed() >= budget) { break; }
         }
         let mut global=BTreeSet::new();
         for (reminder,recipient) in reminders {
             if global.insert(reminder.clone()) { reminder_winners(transaction,&reminder,None,cut,now)?; }
             reminder_winners(transaction,&reminder,Some(&recipient),cut,now)?;
         }
-        if changed { record_cut(transaction,cut)?; }
-        let expired=now.saturating_sub(u64::try_from(crate::api::CLIENT_PAGE_TTL_MS)?);
-        transaction.execute("DELETE FROM local_client_message_selectors_v1 WHERE retired_at_unix_ms IS NOT NULL AND retired_at_unix_ms<?1",[expired])?;
+        if publish {
+            if changed { record_cut(transaction,cut)?; }
+            let expired=now.saturating_sub(u64::try_from(crate::api::CLIENT_PAGE_TTL_MS)?);
+            transaction.execute("DELETE FROM local_client_message_selectors_v1 WHERE retired_at_unix_ms IS NOT NULL AND retired_at_unix_ms<?1",[expired])?;
+        }
     }
-    #[cfg(test)]
-    if transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='local_client_message_versions')",[],|row|row.get::<_,bool>(0))? {
-        super::client_messages_version_benchmark::flush(transaction)?;
-    }
-    Ok(())
+    Ok(processed)
 }
 
 fn page_sql(person: bool,actor: bool,history: bool,current: bool,after: bool) -> String {
@@ -377,9 +551,10 @@ impl Store {
 
     pub(crate) fn client_messages_page(&self,person: Option<&str>,actor: Option<&str>,history: bool,through: u64,after: Option<&(u128,String)>,limit: usize) -> Result<Vec<(MessageView,Value,bool)>> {
         let connection=self.readers.get();
+        let last_change: Option<String>=connection.prepare_cached("SELECT value FROM meta WHERE key=?1")?.query_row([MARKER],|row|row.get(0)).optional()?;
+        let last_change=last_change.ok_or_else(||anyhow::anyhow!("message selector backfill is incomplete"))?;
         let pending: bool=connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM local_client_message_selectors_v1 WHERE born_index=-1 AND dirty_flags!=4)")?.query_row([],|row|row.get(0))?;
         anyhow::ensure!(!pending,"message selector projection is not current");
-        let last_change: String=connection.prepare_cached("SELECT value FROM meta WHERE key=?1")?.query_row([MARKER],|row|row.get(0))?;
         let current=through>=last_change.parse::<u64>()?;
         let person=person.map(normalize_message_party);
         let actor=actor.filter(|actor|Some(*actor)!=person.as_deref());
@@ -413,17 +588,19 @@ FROM ends JOIN claims first ON first.id=ends.first_id JOIN claims last ON last.i
         if enabled { connection.execute_batch(SELECTOR_SCHEMA)?; } else {
             connection.execute_batch("DROP TRIGGER IF EXISTS client_selector_claim_insert;DROP TRIGGER IF EXISTS client_selector_claim_delete;DROP TRIGGER IF EXISTS client_selector_claim_update;DROP TRIGGER IF EXISTS client_selector_desired_insert;DROP TRIGGER IF EXISTS client_selector_desired_update;DROP TRIGGER IF EXISTS client_selector_desired_delete;DROP TABLE IF EXISTS local_client_message_selectors_v1;")?;
             connection.execute("DELETE FROM meta WHERE key=?1",[MARKER])?;
+            connection.execute("DELETE FROM meta WHERE key=?1",[BACKFILL_MARKER])?;
         }
         Ok(())
     }
 
     #[cfg(test)]
-    pub(crate) fn client_messages_selector_benchmark_rebuild(&self) -> Result<()> {
-        let mut connection=self.connection.write();
-        let transaction=connection.transaction()?;
-        hydrate(&transaction)?;
-        transaction.commit()?;
-        Ok(())
+    pub(crate) fn client_messages_selector_benchmark_rebuild(&self) -> Result<BackfillStats> {
+        open_chunks(&mut self.connection.write(), true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn client_messages_selector_benchmark_open_stats(&self) -> BackfillStats {
+        *self.smalltalk.client_message_backfill_stats.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     #[cfg(test)]
@@ -476,5 +653,179 @@ mod tests {
         send(&store,"message/new","agent/rival","+18446744073709551615");send(&store,"message/z-overflow","agent/rival","18446744073709551616");
         store.read_snapshot(|through| {let current=store.client_messages_page(Some("person/recipient"),Some("agent/filtered"),false,through,None,1)?;assert!(current.is_empty());
             let history=store.client_messages_page(Some("person/recipient"),Some("agent/filtered"),true,through,None,1)?;assert_eq!(history.len(),1);assert!(!history[0].2);Ok(())}).unwrap();
+    }
+
+    fn seed_backfill(store: &Store, count: usize) {
+        store.set_write_clock_at(1_800_000_000_000).unwrap();
+        for index in 0..count {
+            let from = if index.is_multiple_of(3) { "agent/filtered" } else { "agent/rival" };
+            let to = if index.is_multiple_of(2) { "person/recipient" } else { "person/other" };
+            let tags = if index.is_multiple_of(4) {
+                Vec::new()
+            } else {
+                vec![format!("reminder:group-{}", index / 8), format!("version:{index}")]
+            };
+            store.append_claim(&ClaimInput {
+                subject: format!("message/backfill-{index:04}"), kind: "message.sent".into(),
+                actor: Some(from.into()), fields: BTreeMap::from([
+                    ("from".into(), json!(from)), ("to".into(), json!(to)),
+                    ("content".into(), json!(format!("body {index}"))),
+                    ("status".into(), json!("sent")), ("tags".into(), json!(tags)),
+                ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+    }
+
+    fn paged_backfill_rows(store: &Store, person: Option<&str>, actor: Option<&str>, history: bool) -> Vec<Value> {
+        store.read_snapshot(|through| {
+            let mut after = None;
+            let mut result = Vec::new();
+            loop {
+                let mut rows = store.client_messages_page(person, actor, history, through, after.as_ref(), 5)?;
+                let more = rows.len() > 5;
+                rows.truncate(5);
+                for (message, metadata, current) in rows {
+                    after = Some((metadata["sent_at"].as_str().unwrap().parse::<u128>()?, message.subject.clone()));
+                    result.push(json!({"message": message, "metadata": metadata, "current": current}));
+                }
+                if !more { return Ok(result); }
+            }
+        }).unwrap()
+    }
+
+    fn backfill_progress(connection: &Connection) -> BackfillProgress {
+        let value: String = connection.query_row(
+            "SELECT value FROM meta WHERE key=?1", [BACKFILL_MARKER], |row| row.get(0),
+        ).unwrap();
+        serde_json::from_str(&value).unwrap()
+    }
+
+    #[test]
+    fn selector_backfill_resumes_each_phase_before_serving_complete_ordered_pages() {
+        let count = BACKFILL_CLEAR_ROWS + BACKFILL_SUBJECTS * 2 + 3;
+        for phase in ["clear", "headers", "pending"] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("resume.sqlite");
+            let store = Store::open(&path, "backfill-resume").unwrap();
+            seed_backfill(&store, count);
+            let cases = [
+                (None, None, true), (None, None, false),
+                (Some("person/recipient"), None, true), (Some("person/recipient"), None, false),
+                (None, Some("agent/filtered"), true), (None, Some("agent/filtered"), false),
+                (Some("person/recipient"), Some("agent/filtered"), false),
+            ];
+            let expected = cases.map(|(person, actor, history)| paged_backfill_rows(&store, person, actor, history));
+            let epoch = store.client_messages_cut_epoch().unwrap();
+            let cut = store.index().unwrap();
+            {
+                let mut connection = store.connection.write();
+                assert!(!backfill_chunk(&mut connection, true).unwrap().unwrap().1);
+                loop {
+                    let progress = backfill_progress(&connection);
+                    assert_eq!(progress.cut, cut);
+                    let reached = match (&progress.phase, phase) {
+                        (BackfillPhase::Clear, "clear") | (BackfillPhase::Pending, "pending") => true,
+                        (BackfillPhase::Headers, "headers") => !progress.after.is_empty(),
+                        _ => false,
+                    };
+                    if reached { break; }
+                    let (processed, complete) = backfill_chunk(&mut connection, false).unwrap().unwrap();
+                    assert!(processed <= BACKFILL_SUBJECTS);
+                    assert!(!complete, "must stop before final publication");
+                }
+                assert!(!connection.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)", [MARKER], |row| row.get::<_, bool>(0)).unwrap());
+            }
+            assert_eq!(store.client_messages_cut_epoch().unwrap(), epoch + 1);
+            assert!(store.read_snapshot(|through| store.client_messages_page(None, None, true, through, None, 5)).is_err(),
+                "a committed partial backfill cannot serve pages");
+            drop(store); // interruption: no in-memory progress survives
+            let reopened = Store::open(&path, "backfill-resume").unwrap();
+            let stats = reopened.client_messages_selector_benchmark_open_stats();
+            assert!(stats.transactions > 0);
+            assert!(stats.max_subjects_per_transaction <= BACKFILL_SUBJECTS);
+            assert_eq!(reopened.client_messages_cut_epoch().unwrap(), epoch + 1, "resume must not reset epoch");
+            assert_eq!(reopened.index().unwrap(), cut);
+            for ((person, actor, history), expected) in cases.into_iter().zip(expected) {
+                assert_eq!(paged_backfill_rows(&reopened, person, actor, history), expected, "{phase}");
+            }
+            assert!(!has_pending(&reopened.readers.get()).unwrap());
+            assert!(!reopened.readers.get().query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)", [BACKFILL_MARKER], |row| row.get::<_, bool>(0)).unwrap());
+            drop(reopened);
+            let populated = Store::open(&path, "backfill-resume").unwrap();
+            assert_eq!(populated.client_messages_selector_benchmark_open_stats().transactions, 0);
+            assert_eq!(populated.client_messages_cut_epoch().unwrap(), epoch + 1);
+        }
+    }
+
+    #[test]
+    fn selector_backfill_reconciles_edits_deletes_and_earlier_inserts_after_interruption() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("changes.sqlite");
+        let store = Store::open(&path, "backfill-changes").unwrap();
+        seed_backfill(&store, BACKFILL_SUBJECTS * 3);
+        {
+            let mut connection = store.connection.write();
+            backfill_chunk(&mut connection, true).unwrap();
+            while backfill_progress(&connection).after.as_str() < "message/backfill-0001" {
+                backfill_chunk(&mut connection, false).unwrap();
+            }
+            // Both subjects were already scanned. Their trigger queue must survive resume.
+            connection.execute(
+                "UPDATE claims SET body=json_set(body,'$.fields.from','agent/edited','$.fields.to','person/edited','$.fields.content','edited body','$.fields.tags',json('[\"reminder:edited\",\"version:18446744073709551615\"]')) WHERE subject='message/backfill-0000'",
+                [],
+            ).unwrap();
+            connection.execute("DELETE FROM claims WHERE subject='message/backfill-0001'", []).unwrap();
+        }
+        store.append_claim(&ClaimInput {
+            subject: "message/aaa-before-scan".into(), kind: "message.sent".into(),
+            actor: Some("agent/edited".into()), fields: BTreeMap::from([
+                ("from".into(), json!("agent/edited")), ("to".into(), json!("person/edited")),
+                ("content".into(), json!("inserted behind keyset")), ("status".into(), json!("sent")),
+                ("tags".into(), json!(["reminder:edited", "version:1"])),
+            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let cut = store.index().unwrap();
+        drop(store);
+        let reopened = Store::open(&path, "backfill-changes").unwrap();
+        assert_eq!(reopened.index().unwrap(), cut);
+        let rows = paged_backfill_rows(&reopened, None, None, true);
+        assert_eq!(rows.len(), BACKFILL_SUBJECTS * 3);
+        assert!(!rows.iter().any(|row| row["message"]["subject"] == "message/backfill-0001"));
+        let edited = rows.iter().find(|row| row["message"]["subject"] == "message/backfill-0000").unwrap();
+        assert_eq!(edited["message"]["content"], "edited body");
+        assert_eq!(edited["message"]["from"], "agent/edited");
+        assert_eq!(edited["message"]["to"], "person/edited");
+        assert_eq!(edited["current"], true);
+        let current = paged_backfill_rows(&reopened, Some("person/edited"), Some("agent/edited"), false);
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0]["message"]["subject"], "message/backfill-0000");
+        let indexed: usize = reopened.readers.get().query_row(
+            "SELECT COUNT(*) FROM local_client_message_selectors_v1 WHERE born_index>=0 AND retired_index IS NULL",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(indexed, BACKFILL_SUBJECTS * 3);
+        let expected = rows;
+        reopened.client_messages_selector_benchmark_rebuild().unwrap();
+        assert_eq!(paged_backfill_rows(&reopened, None, None, true), expected,
+            "resumed reconciliation must match a complete rebuild");
+    }
+
+    #[test]
+    fn graph_runtime_finishes_selector_backfill_before_exposing_readers() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("direct-runtime.sqlite");
+        let store = Store::open(&path, "direct-runtime").unwrap();
+        seed_backfill(&store, BACKFILL_SUBJECTS * 2);
+        backfill_chunk(&mut store.connection.write(), true).unwrap();
+        drop(store);
+        let graph = GraphStore::open(&path, "direct-runtime", runtime()).unwrap();
+        let reader = graph.readers.get();
+        assert!(reader.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)", [MARKER], |row| row.get::<_, bool>(0)).unwrap());
+        assert!(!reader.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)", [BACKFILL_MARKER], |row| row.get::<_, bool>(0)).unwrap());
+        let headers: usize = reader.query_row(
+            "SELECT COUNT(*) FROM local_client_message_selectors_v1 WHERE born_index>=0 AND retired_index IS NULL",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(headers, BACKFILL_SUBJECTS * 2);
     }
 }

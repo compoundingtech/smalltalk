@@ -2,8 +2,9 @@
 //!
 //! The graph knows claims, envelopes, batches, documents and blobs, but not what any claim kind
 //! means. A runtime knows its kinds: their schemas, the tables it projects them into, and which of
-//! them a checkpoint may drop. The store calls it at each of these seams, inside the store's own
-//! transactions, and never the other way around: the runtime may call the graph freely.
+//! them a checkpoint may drop. Projection mutations run inside the store's transactions;
+//! bounded startup work may commit its own chunks before readers are exposed.
+//! The runtime may call the graph freely.
 
 use anyhow::Result;
 use rusqlite::{Connection, Transaction};
@@ -65,6 +66,13 @@ pub trait Runtime: Send + Sync {
     /// Bring the runtime's projections up to date as the store opens: a store in shared memory
     /// is new, and a store on disk may need a replay after an upgrade.
     fn open_projections(&self, transaction: &Transaction<'_>, shared_memory: bool) -> Result<()>;
+
+    /// Finish startup work that needs bounded, independently committed transactions.
+    /// Called after `open_projections` commits and before readers or the store are exposed.
+    /// A failure must leave durable progress that the next open can resume.
+    fn finish_open_projections(&self, _connection: &mut Connection) -> Result<()> {
+        Ok(())
+    }
 
     /// The digest of the claim kinds and fields this build knows. Peers whose digests differ may
     /// project the same claims differently, so they compare their logs instead of their graphs.

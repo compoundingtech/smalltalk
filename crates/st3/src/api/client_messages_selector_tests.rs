@@ -68,6 +68,7 @@ fn distribution(samples: &mut [Duration]) -> Value {
     json!({"samples": samples.len(), "p50_ms": percentile(50), "p95_ms": percentile(95)})
 }
 
+
 fn seed_bulk(store: &Store, count: usize, closed: usize, metadata_per_message: usize) -> Value {
     assert!(closed <= count);
     store.client_messages_selector_benchmark_set_enabled(false).unwrap();
@@ -130,7 +131,7 @@ fn seed_bulk(store: &Store, count: usize, closed: usize, metadata_per_message: u
     let projection = start.elapsed();
     store.client_messages_selector_benchmark_set_enabled(true).unwrap();
     let start = Instant::now();
-    store.client_messages_selector_benchmark_rebuild().unwrap();
+    let backfill = store.client_messages_selector_benchmark_rebuild().unwrap();
     let selectors = start.elapsed();
     {
         let reader = store.readers.get();
@@ -159,6 +160,7 @@ fn seed_bulk(store: &Store, count: usize, closed: usize, metadata_per_message: u
     json!({"bulk_append_single_transaction_ms": append.as_secs_f64() * 1_000.0,
         "final_real_append_index_publication_ms": projection.as_secs_f64() * 1_000.0,
         "explicit_selector_header_backfill_ms": selectors.as_secs_f64() * 1_000.0,
+        "selector_backfill_transactions": backfill.benchmark_measurement(),
         "claims": count * (metadata_per_message + 1) + closed, "messages": count,
         "metadata_claims_per_message": metadata_per_message, "closed_messages": closed})
 }
@@ -402,6 +404,7 @@ fn benchmark_client_messages_selector_migration_copy() {
     let start = Instant::now();
     let store = Store::open(&path, "selector-migration-benchmark").unwrap();
     let migration = start.elapsed();
+    let startup_backfill = store.client_messages_selector_benchmark_open_stats();
     let live = storage(&path);
     let counts: (u64, u64) = store.readers.get().query_row(
         "SELECT (SELECT COUNT(*) FROM claims), (SELECT COUNT(*) FROM message_index)", [],
@@ -411,7 +414,7 @@ fn benchmark_client_messages_selector_migration_copy() {
     // startup migrations. Both costs and their WAL are reported, not conflated.
     store.client_messages_benchmark_prepare_io().unwrap();
     let start = Instant::now();
-    store.client_messages_selector_benchmark_rebuild().unwrap();
+    let rebuild_backfill = store.client_messages_selector_benchmark_rebuild().unwrap();
     let rebuild = start.elapsed();
     let rebuilt_live = storage(&path);
     store.client_messages_benchmark_checkpoint().unwrap();
@@ -425,15 +428,26 @@ fn benchmark_client_messages_selector_migration_copy() {
     let reopened = Store::open(&path, "selector-migration-benchmark").unwrap();
     let reopen = start.elapsed();
     assert_eq!(page(&reopened, case, cut, None).items, first.items, "backfill must remain complete across reopen");
+    let reopen_backfill = reopened.client_messages_selector_benchmark_open_stats();
+    assert_eq!(reopen_backfill.transactions, 0, "populated reopen must not reset or rehydrate");
     assert_eq!(offline_source_counts(&source), source_counts, "source copy remains read-only and unchanged");
     eprintln!("{}", json!({"benchmark": "client_messages_selector_migration", "source_copy": source,
         "claims": source_counts.0, "messages": source_counts.1,
         "open_including_backfill_ms": migration.as_secs_f64() * 1_000.0,
         "explicit_selector_header_rebuild_ms": rebuild.as_secs_f64() * 1_000.0,
+        "startup_selector_backfill": startup_backfill.benchmark_measurement(),
+        "explicit_selector_rebuild": rebuild_backfill.benchmark_measurement(),
+        "populated_reopen_selector_backfill": reopen_backfill.benchmark_measurement(),
         "populated_reopen_ms": reopen.as_secs_f64() * 1_000.0,
         "before_storage": before, "after_open_live_storage": live,
         "after_explicit_rebuild_live_storage": rebuilt_live, "checkpointed_storage": checkpointed,
         "source_open_flags": "READ_ONLY", "mutated_database": "fresh temporary copy only"}));
+    assert!(startup_backfill.subjects > 0,
+        "offline migration input must need selector backfill, not already contain a completed selector projection");
+    assert!(startup_backfill.longest_transaction < Duration::from_millis(100),
+        "startup selector transaction exceeded 100ms: {startup_backfill:?}");
+    assert!(rebuild_backfill.longest_transaction < Duration::from_millis(100),
+        "explicit selector rebuild transaction exceeded 100ms: {rebuild_backfill:?}");
 }
 
 #[test]
@@ -463,4 +477,183 @@ fn client_messages_selector_non_lifecycle_status_does_not_churn_headers() {
             assert_eq!(actual, expected, "{}", case.name);
         }
     }
+}
+
+fn all_selector_page_items(store: &Store, case: Case) -> Vec<Value> {
+    let cut = store.index().unwrap();
+    let mut after = None;
+    let mut items = Vec::new();
+    loop {
+        let next = page(store, case, cut, after.as_ref());
+        items.extend(next.items);
+        if !next.more { return items; }
+        assert!(next.key.is_some());
+        after = next.key;
+    }
+}
+
+fn assert_complete_selector_pages_match_oracle(store: &Store) {
+    for case in CASES.into_iter().chain([
+        Case { name: "edited_person_history", person: Some("person/edited"), actor: None, history: true },
+        Case { name: "edited_person_open", person: Some("person/edited"), actor: Some("agent/edited"), history: false },
+    ]) {
+        let expected = client_message_resources_at(store, case.person, case.history, case.actor,
+            BASE_TIME + 100_000).unwrap();
+        let actual = all_selector_page_items(store, case);
+        assert_eq!(actual, expected, "complete first/continuation page parity: {}", case.name);
+    }
+}
+
+#[test]
+fn client_messages_selector_claim_edits_and_deletes_match_fresh_canonical_pages() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("selector-mutations.sqlite");
+    let store = Store::open(&path, "selector-mutations").unwrap();
+    seed_bulk(&store, 48, 0, 0);
+    assert_complete_selector_pages_match_oracle(&store);
+    {
+        // Deliberate offline authority mutations exercise the real UPDATE/DELETE
+        // triggers, not append-only approximations of repairs or selector-row mocks.
+        let mut writer = store.connection.write();
+        let tx = writer.transaction().unwrap();
+        tx.execute(
+            "UPDATE claims SET body=json_set(body,'$.fields.from','agent/edited','$.fields.to','person/edited','$.fields.content','edited canonical content','$.fields.tags',json('[\"reminder:mutation\",\"version:18446744073709551615\"]')) WHERE subject=?1",
+            [subject(0)],
+        ).unwrap();
+        tx.execute(
+            "UPDATE claims SET body=json_set(body,'$.fields.to',?2,'$.fields.tags',json('[\"reminder:mutation\",\"version:1\"]')) WHERE subject=?1",
+            rusqlite::params![subject(3), PERSON],
+        ).unwrap();
+        tx.execute("UPDATE claims SET accepted_at_unix_ms=?2 WHERE subject=?1",
+            rusqlite::params![subject(7), (BASE_TIME + 999).to_string()]).unwrap();
+        tx.commit().unwrap();
+    }
+    drop(store);
+    let edited = Store::open(&path, "selector-mutations").unwrap();
+    assert_complete_selector_pages_match_oracle(&edited);
+    let header: (String, String, String, String, bool, bool) = edited.readers.get().query_row(
+        "SELECT sender,recipient,reminder,version,global_current,recipient_current FROM local_client_message_selectors_v1 WHERE subject=?1 AND born_index>=0 AND retired_index IS NULL",
+        [subject(0)], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+    ).unwrap();
+    assert_eq!(header, ("agent/edited".into(), "person/edited".into(), "mutation".into(),
+        "18446744073709551615".into(), true, true));
+    assert_eq!(page(&edited, CASES[1], edited.index().unwrap(), None).subjects[0], subject(7),
+        "accepted-time edit must move the header before tied arrivals");
+    {
+        let writer = edited.connection.write();
+        writer.execute("DELETE FROM claims WHERE subject=?1", [subject(0)]).unwrap();
+    }
+    drop(edited);
+    let deleted = Store::open(&path, "selector-mutations").unwrap();
+    assert_complete_selector_pages_match_oracle(&deleted);
+    assert_eq!(deleted.readers.get().query_row(
+        "SELECT COUNT(*) FROM local_client_message_selectors_v1 WHERE subject=?1 AND born_index>=0 AND retired_index IS NULL",
+        [subject(0)], |row| row.get::<_, usize>(0),
+    ).unwrap(), 0, "deleted authority must not leave a current selector header");
+    let promoted: (bool, bool) = deleted.readers.get().query_row(
+        "SELECT global_current,recipient_current FROM local_client_message_selectors_v1 WHERE subject=?1 AND born_index>=0 AND retired_index IS NULL",
+        [subject(3)], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(promoted, (true, true), "deleting a winner must promote the surviving reminder");
+}
+
+fn declared_selector_subject(index: usize) -> String {
+    format!("message/selector-declared-{index:05}")
+}
+
+fn apply_declared_selector_fixture(store: &Store, count: usize) {
+    let mut source = String::from(
+        "version 2\nagent \"selector-declared\" { workspace \"/tmp\"; command \"true\" }\n",
+    );
+    for index in 0..count {
+        let tags = match index {
+            0 | 1 => format!("tag \"reminder:declared-group\"; tag \"version:{index}\";"),
+            2 => String::from("tag \"reminder:unrelated-group\"; tag \"version:1\";"),
+            _ => String::new(),
+        };
+        source.push_str(&format!(
+            "message \"selector-declared-{index:05}\" {{ from \"requester\"; to \"selector-declared\"; content \"declared body {index}\"; {tags} }}\n",
+        ));
+    }
+    let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+    let mission = store.mission(&intent, crate::model::IntentInput {
+        kdl: source, source_name: None,
+    }).unwrap();
+    store.apply(&intent, &mission.subject_tokens, "selector-declared-fixture").unwrap();
+}
+
+#[test]
+fn client_messages_selector_desired_delete_seeks_only_subject_and_affected_reminder_group() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(&root.path().join("deletion-plan.sqlite"), "node").unwrap();
+    seed_bulk(&store, 64, 0, 0);
+    apply_declared_selector_fixture(&store, 4);
+    let writer = store.connection.write();
+    // Plan the actual trigger's affected-row predicate, substituting its OLD
+    // subject binding. Regressing to an unindexed OR must fail this evidence.
+    let trigger: String = writer.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='client_selector_desired_delete'",
+        [], |row| row.get(0),
+    ).unwrap();
+    let predicate = trigger.split_once(" WHERE born_index>=0 AND retired_index IS NULL AND")
+        .expect("desired-deletion trigger has a final affected-header predicate").1;
+    let predicate = predicate.trim().strip_suffix("END").unwrap().trim().trim_end_matches(';')
+        .replace("OLD.subject", "?1");
+    let sql = format!(
+        "SELECT subject FROM local_client_message_selectors_v1 WHERE born_index>=0 AND retired_index IS NULL AND {predicate}",
+    );
+    for (index, expected) in [
+        (1, vec![declared_selector_subject(0), declared_selector_subject(1)]),
+        (3, vec![declared_selector_subject(3)]),
+    ] {
+        let subject = declared_selector_subject(index);
+        assert_eq!(writer.execute("DELETE FROM desired WHERE subject=?1", [&subject]).unwrap(), 1);
+        let plan = writer.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap()
+            .query_map([&subject], |row| row.get::<_, String>(3)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert!(plan.iter().any(|step| step.contains("SEARCH local_client_message_selectors_v1 USING PRIMARY KEY")),
+            "deletion must seek affected subject headers: {plan:?}");
+        assert!(plan.iter().any(|step| step.contains("SEARCH") && step.contains("client_selector_reminder_candidates")),
+            "deletion must seek the affected reminder group: {plan:?}");
+        assert!(!plan.iter().any(|step| step.contains("SCAN local_client_message_selectors_v1")),
+            "deletion must not scan unrelated retained headers: {plan:?}");
+        let mut affected = writer.prepare(&sql).unwrap().query_map([&subject], |row| row.get::<_, String>(0))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        affected.sort();
+        assert_eq!(affected, expected);
+    }
+}
+
+#[test]
+fn client_messages_selector_canonical_settlement_replay_commits_usable_declared_pages() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(&root.path().join("settlement-replay.sqlite"), "node").unwrap();
+    store.set_write_clock_at(BASE_TIME).unwrap();
+    apply_declared_selector_fixture(&store, LIMIT + 3);
+    let cases = [
+        CASES[1], CASES[3],
+        Case { name: "declared_recipient_history", person: Some("agent/selector-declared"), actor: None, history: true },
+        Case { name: "declared_recipient_open", person: Some("agent/selector-declared"), actor: None, history: false },
+        Case { name: "declared_requester_history", person: Some("agent/selector-declared"), actor: Some("requester"), history: true },
+        Case { name: "declared_requester_open", person: Some("agent/selector-declared"), actor: Some("requester"), history: false },
+    ];
+    let expected = cases.map(|case| all_selector_page_items(&store, case));
+    assert_eq!(expected[0].len(), LIMIT + 3, "declared fixture must span continuation pages");
+    assert!(!expected[3].is_empty(), "declared fixture must route to its mailbox");
+    let epoch = store.client_messages_cut_epoch().unwrap();
+    store.connection.write().execute("DELETE FROM meta WHERE key='canonical_replay_settled'", []).unwrap();
+    assert!(store.settle_runs_for_canonical_replay().unwrap().is_empty());
+    assert!(store.client_messages_cut_epoch().unwrap() > epoch, "settlement must actually replay declarations");
+    assert!(!store.readers.get().query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_client_message_selectors_v1 WHERE born_index=-1)",
+        [], |row| row.get::<_, bool>(0),
+    ).unwrap(), "successful settlement must drain selector maintenance before commit");
+    for (case, expected) in cases.into_iter().zip(expected) {
+        let actual = all_selector_page_items(&store, case);
+        assert_eq!(actual, expected, "settlement changed canonical pages: {}", case.name);
+        assert_eq!(actual, client_message_resources_at(&store, case.person, case.history, case.actor,
+            BASE_TIME + 100_000).unwrap(), "settlement page/oracle parity: {}", case.name);
+    }
+    assert!(store.settle_runs_for_canonical_replay().unwrap().is_empty());
+    assert_complete_selector_pages_match_oracle(&store);
 }

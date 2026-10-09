@@ -225,6 +225,73 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+/// Local SQLite projection notes. They are documentation only: the projection is
+/// not part of the serialized registry, so it cannot change the registry digest.
+const LOCAL_MESSAGE_SELECTORS: &str = r#"
+## Local message selectors
+
+The client message list pages through `local_client_message_selectors_v1`, a SQLite projection kept only on the local node. It is derived from message claims and from the `desired` projection, so it is not part of this registry. It adds no subject family, resource kind, claim kind or claim field. The registry digest and the replication compatibility digest therefore stay unchanged. Nodes with and without this table exchange claims as before. The `_v1` suffix is the projection version: a layout change uses a new table name, never an edit to this one in place.
+
+### Table
+
+Each row is a body-free selector header. It holds the fields a page needs to pick and order messages, never message text, attachments or other body fields.
+
+| Column | Meaning |
+|---|---|
+| `subject`, `born_index` | Primary key. `born_index` is the store index at which this header version became current. `born_index = -1` marks a pending row that records which subjects a write transaction changed; it is never a page candidate. |
+| `retired_index`, `retired_at_unix_ms` | Store index and wall time at which a newer header version replaced this one. `NULL` means current. |
+| `sender`, `recipient` | Normalized message parties. |
+| `sent_key` | Page order key: the timestamp of the message's first canonical claim. |
+| `created_index` | Store index at which the message was first indexed. |
+| `mailbox`, `native_mailbox` | Whether the recipient's mailbox owns the message, and whether a native `message.sent` claim (rather than a declaration) established it. |
+| `closed`, `reminder`, `version` | Lifecycle and reminder-group fields used for eligibility. `version` is zero-padded so text order matches numeric order. |
+| `global_current`, `recipient_current` | Whether the message is eligible in the broad list and in the recipient's list. In a reminder group only the newest open version is eligible. |
+| `desired_mask` | Which of sender, recipient and tags came from the `desired` projection, so deleting that row clears exactly those fields. |
+| `dirty_flags` | Pending-row only: why the subject must be recomputed. |
+
+The table is `WITHOUT ROWID`.
+
+### Indexes
+
+The nine page indexes are partial on `born_index >= 0` and order by `sent_key DESC, subject`. A page is an ordered range seek followed by `LIMIT`, so its cost depends on the page size, not on the number of messages.
+
+| Index | Leading columns | Extra filter | Use |
+|---|---|---|---|
+| `client_selector_order` | `sent_key DESC` | none | Broad list including history and earlier cuts. |
+| `client_selector_sender` | `sender` | none | Sender filter including history and earlier cuts. |
+| `client_selector_recipient` | `recipient` | none | Recipient filter including history and earlier cuts. |
+| `client_selector_recipient_sender` | `recipient, sender` | none | Recipient and sender filter including history and earlier cuts. |
+| `client_selector_global_eligible` | `sent_key DESC` | current, `global_current = 1` | Current broad open list. |
+| `client_selector_sender_eligible` | `sender` | current, `global_current = 1` | Current open list by sender. |
+| `client_selector_recipient_global_eligible` | `recipient` | current, `global_current = 1` | Current open list addressed to an actor. |
+| `client_selector_recipient_eligible` | `recipient` | current, `recipient_current = 1` | Current open mailbox of a person or agent. |
+| `client_selector_recipient_sender_eligible` | `recipient, sender` | current, `recipient_current = 1` | Current open mailbox by sender. |
+| `client_selector_reminder_candidates` | `reminder, version DESC, subject DESC` | current, open | Picks the newest open version in a reminder group. |
+| `client_selector_recipient_reminder_candidates` | `recipient, reminder, version DESC, subject DESC` | current, open, mailbox | The same within one mailbox. |
+| `client_selector_reminder_winner` | `reminder, subject` | current, `global_current = 1`, reminder set | Finds the previous broad winner to demote. |
+| `client_selector_recipient_reminder_winner` | `recipient, reminder, subject` | current, `recipient_current = 1`, reminder set | Finds the previous mailbox winner to demote. |
+| `client_selector_retirement` | `retired_at_unix_ms` | retired rows | Prunes retired versions. |
+| `client_selector_pending` | `subject` | `born_index = -1` | Finds pending rows for flush, backfill chunks and the page guard without scanning headers. |
+
+"Current" means `retired_index IS NULL`. A page at an earlier cut `C` selects rows with `born_index <= C` and `retired_index` either `NULL` or greater than `C`.
+
+### Maintenance
+
+Triggers on `claims` (insert, update, delete) for `message/` subjects and on `desired` (insert, update, delete) add a pending row with the reason. Insert triggers mark only claims that can change a selector field: `message.sent`, `message.closed`, `intent.desired`, or a claim that sets `from`, `to`, `tags` or `status`. A body-only edit adds no new header version. Deleting a `desired` row immediately clears the fields it supplied (`desired_mask`) and recomputes eligibility for that subject and for the current open rows of its reminder group only, found through `client_selector_reminder_candidates`. A fresh page therefore never shows a removed declaration, even before the transaction's flush.
+
+Before a write transaction commits, including a canonical settlement transaction, the store folds each pending subject into a header. If the header changed, the store retires the current version at the commit's store index and inserts the new one. It also recomputes the winners of every reminder group the change touched. It then records the commit's store index in `meta` under `client_message_selectors_v1_cut` and deletes the pending rows. Retired versions are deleted once they are older than the page cursor lifetime. A cursor still in use can always find the header versions of its cut.
+
+Pages refuse to read while a non-deletion pending row exists. Each page reads its selector rows, its claim metadata and its message folds inside one SQLite snapshot. Only selected messages are folded.
+
+### Cursor epoch
+
+`local_client_message_cut_epoch` is a single-row counter. It is incremented when a message claim is updated or deleted, when a message `desired` row is deleted, when a message claim's replica record becomes `repaired`, and once when a selector backfill starts. Each issued page cursor records the epoch it was read under. A continuation that sees a different epoch in its snapshot fails with HTTP 410 `page-cursor-expired` instead of returning a partial page. The client then starts again from the first page. Appending a claim does not change the epoch: retained header versions keep earlier cuts readable.
+
+### Backfill
+
+A store that has no completed selector cut is backfilled at startup, after the other startup projections commit and before readers are served. Starting a rebuild increments the cursor epoch once and records the initial cut. The rebuild then runs in three phases of short write transactions. `clear` deletes old selector rows, at most 64 per transaction. `headers` writes headers in subject order, at most 16 subjects per transaction, and ends a transaction early once its header work passes a 10 ms budget. `pending` reconciles subjects that writes changed while the rebuild ran, in the same bounds. Each transaction records its progress in `meta` under `client_message_selectors_v1_backfill` as `{"cut": INITIAL_INDEX, "phase": "clear" | "headers" | "pending", "after": LAST_SUBJECT}`. A restart resumes from that point instead of starting again. A populated store opened with pending rows queued resumes at `pending`, keeping its headers and its epoch. The final transaction writes the completed cut `client_message_selectors_v1_cut` and deletes the progress marker together; pages are refused until then. Earlier local message body-version tables and their triggers are dropped when the store opens. No claim is rewritten.
+"#;
+
 impl Registry {
     pub fn digest(&self) -> String {
         let bytes = serde_json::to_vec(self).expect("the schema registry is serializable");
@@ -285,6 +352,7 @@ impl Registry {
         output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.\n");
         output.push_str("\n## Harness todo snapshots\n\n`harness.todo.observed` replaces the entire seat todo list. Session and incarnation identify its source; `observed_at` is source timestamp provenance, not an ordering clock. Keep the last snapshot until replaced, and expose stale provenance rather than presenting an old binding as current. Missing means unobserved; `phases: []`, zero totals and `truncated: false` means known empty.\n\nEach phase has `name` and `tasks`; each task has `content`, `status` (`pending`, `in_progress`, `completed`, `blocked`) and optional string `blocker`. The shared phase/task shape can also represent a future plan with one unnamed phase. Bounds are 16 phases, 100 tasks total, 128 UTF-8 bytes per phase name and 512 per content/blocker. Producers shorten at UTF-8 boundaries and omit trailing tasks/phases in source order to keep serialized claim fields within 64 KiB (including JSON escaping). Bound-driven shortening or omission sets `truncated`. `totals` contains nonnegative integer counts for all four statuses from the full source: counts equal the visible list when not truncated and cannot be less than visible counts when truncated. Unknown nested fields, invalid statuses, null blockers and oversized fields are rejected.\n");
         output.push_str("\nOMP's native `abandoned` tasks are omitted from phase tasks rather than relabeled as completed. Their enclosing phase is preserved when it fits. `totals.abandoned` counts these dropped tasks separately; it is optional on the wire and defaults to zero when absent. Totals for the four task statuses count the full source snapshot and exclude abandoned tasks from active progress. Dropping an abandoned task does not set `truncated`; that flag describes text/list/serialized-size bounds only. The OMP producer always emits the abandoned count and reserves 4 KiB of the serialized-fields budget for authenticated provenance.\n");
+        output.push_str(LOCAL_MESSAGE_SELECTORS);
         output
     }
 

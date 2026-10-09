@@ -16,6 +16,8 @@ pub struct SmalltalkRuntime {
     pub(crate) mailbox_wakes: std::sync::OnceLock<Arc<mailbox_wakes::Wakes>>,
     #[cfg(test)]
     pub(crate) work_extension_roots_rebuilt: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) client_message_backfill_stats: Mutex<client_messages::BackfillStats>,
     /// Simulate different build registries on isolated nodes in compatibility tests.
     #[cfg(test)]
     pub(crate) claim_registry: std::sync::OnceLock<st3_schema::Registry>,
@@ -219,7 +221,6 @@ impl Runtime for SmalltalkRuntime {
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
-            client_messages::open(transaction)?;
             return Ok(());
         }
         let upgraded: bool = transaction.query_row(
@@ -250,7 +251,17 @@ impl Runtime for SmalltalkRuntime {
             let _ = rebuilt;
         }
         migrate_occurrence_creation_projections_tx(transaction)?;
-        client_messages::open(transaction)?;
+        Ok(())
+    }
+
+    fn finish_open_projections(&self, connection: &mut Connection) -> Result<()> {
+        let stats = client_messages::open(connection)?;
+        #[cfg(test)]
+        {
+            *self.client_message_backfill_stats.lock().unwrap_or_else(PoisonError::into_inner) = stats;
+        }
+        #[cfg(not(test))]
+        let _ = stats;
         Ok(())
     }
 
