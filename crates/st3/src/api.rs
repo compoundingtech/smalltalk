@@ -5493,6 +5493,32 @@ pub fn start_native_session_discovery(state: &AppState) {
     crate::external_sessions::start_history_inventory(state.native_session_home.as_deref());
 }
 
+/// Recover and retry retained numeric stop accounting independently of accepted current
+/// posts and driver lifetimes. One reader batch visits at most 64 pending subjects per tick.
+pub fn start_stopped_usage_flush(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut after = String::new();
+        loop {
+            let store = state.store.clone();
+            let cursor = after.clone();
+            match blocking_action(move || store.flush_stopped_usage_batch(&cursor)).await {
+                Ok((next, changed)) => {
+                    after = next.unwrap_or_default();
+                    if changed {
+                        signal_visible_change(&state);
+                    }
+                }
+                Err(error) => {
+                    // Pending slots are durable; a writer failure never advances this batch.
+                    eprintln!("st3: retained accounting flush failed: {error:?}");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
 /// The shortest pause between two roster refreshes. A refresh also pauses as long as it took,
 /// so refreshing never takes more than about half a core however often readers ask. Reads
 /// never wait for it: this bounds how stale a served roster can be, about a second plus a fold.

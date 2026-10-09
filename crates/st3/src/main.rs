@@ -6115,6 +6115,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     st3::api::start_native_session_discovery(&state);
     // Nor does the first agents roster read fold every agent's card.
     st3::api::start_agent_roster(&state);
+    st3::api::start_stopped_usage_flush(&state);
     startup.phase("bind-listeners");
     let bound = std::sync::atomic::AtomicUsize::new(0);
     let ready = || {
@@ -18022,6 +18023,7 @@ async fn drive_st2_native(
         &agent_dir,
         &incarnation,
     )?;
+    observations.background_durable = true;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
@@ -18654,6 +18656,10 @@ struct NativeObservations {
     latest_attempted: BTreeMap<String, String>,
     admission_diagnostic: Option<String>,
     current_publisher: Option<current_harness_publisher::Publisher>,
+    durable_wake: bool,
+    background_durable: bool,
+    durable_only: bool,
+    durable_task: Option<tokio::task::JoinHandle<(Result<()>, Option<String>, bool)>>,
     pipe: Option<tokio::io::unix::AsyncFd<std::fs::File>>,
 }
 impl NativeObservations {
@@ -18697,12 +18703,17 @@ impl NativeObservations {
             latest_attempted: BTreeMap::new(),
             admission_diagnostic: None,
             current_publisher: None,
+            durable_wake: true,
+            background_durable: false,
+            durable_only: false,
+            durable_task: None,
             pipe,
         })
     }
     async fn recv(&mut self) -> Result<()> {
         if self.initial_wake {
             self.initial_wake = false;
+            self.durable_wake = true;
             return Ok(());
         }
         let Some(pipe) = &self.pipe else {
@@ -18716,7 +18727,10 @@ impl NativeObservations {
                 let mut bytes = [0; 256];
                 file.read(&mut bytes)
             }) {
-                Ok(Ok(count)) if count > 0 => return Ok(()),
+                Ok(Ok(count)) if count > 0 => {
+                    self.durable_wake = true;
+                    return Ok(());
+                }
                 Ok(Ok(_)) => anyhow::bail!("event wake pipe closed"),
                 Ok(Err(error)) => return Err(error.into()),
                 Err(_) => continue,
@@ -18732,11 +18746,27 @@ impl NativeObservations {
             if current_unix_ms()? >= u128::from(stamp.saturating_add(stale)) {
                 st_drivers::harness_events::expire_state(&self.dir, state)?;
                 self.evidence_deadline = None;
+                self.durable_wake = true;
                 self.retry_pending = true;
             }
         }
         Ok(())
     }
+    async fn finish_durable_task(&mut self, wait: bool) -> Result<()> {
+        if self
+            .durable_task
+            .as_ref()
+            .is_some_and(|task| wait || task.is_finished())
+        {
+            let task = self.durable_task.take().unwrap();
+            let (result, diagnostic, retry) = task.await?;
+            self.admission_diagnostic = diagnostic;
+            self.retry_pending = retry;
+            result?;
+        }
+        Ok(())
+    }
+
     async fn drain_live(
         &mut self,
         client: &Client,
@@ -18744,7 +18774,52 @@ impl NativeObservations {
         driver: &str,
         ready: &mut bool,
     ) -> Result<bool> {
-        self.drain_events(client, subject, driver, ready, true).await
+        if !self.background_durable {
+            return self
+                .drain_events(client, subject, driver, ready, true)
+                .await;
+        }
+        let terminal = self
+            .prepare_drain(client, subject, driver, ready, true)
+            .await?;
+        self.finish_durable_task(false).await?;
+        if self.enabled && self.durable_task.is_none() && (self.retry_pending || self.durable_wake)
+        {
+            // One ordered publisher owns the durable spool. HTTP waits cannot occupy the
+            // receive loop, and later acknowledgements cannot jump over an in-flight event.
+            let mut worker = Self {
+                dir: self.dir.clone(),
+                runtime: self.runtime.clone(),
+                enabled: self.enabled,
+                provider_incarnation: self.provider_incarnation.clone(),
+                evidence_deadline: None,
+                retry_pending: true,
+                initial_wake: false,
+                latest_attempted: BTreeMap::new(),
+                admission_diagnostic: self.admission_diagnostic.clone(),
+                current_publisher: None,
+                durable_wake: false,
+                background_durable: false,
+                durable_only: true,
+                durable_task: None,
+                pipe: None,
+            };
+            let (client, subject, driver) = (client.clone(), subject.to_owned(), driver.to_owned());
+            self.durable_wake = false;
+            self.durable_task = Some(tokio::spawn(async move {
+                let result = worker
+                    .drain_events(&client, &subject, &driver, &mut false, false)
+                    .await
+                    .map(|_| ());
+                (
+                    result,
+                    worker.admission_diagnostic.take(),
+                    worker.retry_pending,
+                )
+            }));
+        }
+        self.retry_pending |= self.durable_task.is_some();
+        Ok(terminal)
     }
 
     async fn publish_snapshots(
@@ -18909,12 +18984,14 @@ impl NativeObservations {
         driver: &str,
         ready: &mut bool,
     ) -> Result<()> {
+        // Provider completion is the barrier: finish the ordered publisher before exit.
+        self.finish_durable_task(true).await?;
         self.drain_events(client, subject, driver, ready, false)
             .await
             .map(|_| ())
     }
 
-    async fn drain_events(
+    async fn prepare_drain(
         &mut self,
         client: &Client,
         subject: &str,
@@ -18922,9 +18999,6 @@ impl NativeObservations {
         ready: &mut bool,
         wait_for_completion: bool,
     ) -> Result<bool> {
-        if !self.enabled {
-            return Ok(false);
-        }
         let terminal_pending = wait_for_completion
             && st_drivers::harness_events::read_runtime_state(&self.dir, &self.runtime)?
                 .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
@@ -18955,6 +19029,26 @@ impl NativeObservations {
                 *ready = true;
             }
         }
+        Ok(terminal_pending)
+    }
+
+    async fn drain_events(
+        &mut self,
+        client: &Client,
+        subject: &str,
+        driver: &str,
+        ready: &mut bool,
+        wait_for_completion: bool,
+    ) -> Result<bool> {
+        if !self.enabled {
+            return Ok(false);
+        }
+        let terminal_pending = if self.durable_only {
+            false
+        } else {
+            self.prepare_drain(client, subject, driver, ready, wait_for_completion)
+                .await?
+        };
         self.retry_pending = true;
         if self.provider_incarnation.is_some() && matches!(driver, "omp" | "opencode") {
             publish_admission_diagnostic(client, subject, &self.runtime, &self.dir,
@@ -18971,6 +19065,20 @@ impl NativeObservations {
                 st_drivers::harness_events::acknowledge(&self.dir, event.sequence)?;
                 continue;
             }
+            if !matches!(
+                event.kind.as_str(),
+                "harness-state-control"
+                    | "harness-context"
+                    | "harness-accounting"
+                    | "harness-timeline"
+            ) {
+                let _ = write_driver_log(
+                    subject,
+                    &format!("ignored unsupported harness event `{}`", event.kind),
+                );
+                st_drivers::harness_events::acknowledge(&self.dir, event.sequence)?;
+                continue;
+            }
             // Account binding is outbox metadata, not part of the producer's observation.
             // Preserve it separately for the accounting claim builders below.
             let account_ref = event.payload.as_object_mut()
@@ -18978,7 +19086,7 @@ impl NativeObservations {
             let publisher = ObservationClient {
                 client,
                 event: Some((
-                    &self.runtime,
+                    &event.runtime_incarnation,
                     event.sequence,
                     &self.dir,
                     account_ref.as_ref().and_then(Value::as_str),
@@ -18997,15 +19105,37 @@ impl NativeObservations {
                 ),
                 "unknown event driver"
             );
-            match event.kind.as_str() {
-                "harness-state-control" => {
-                    let observed = st_drivers::harness_state::read_raw_at(
-                        &raw, None, event.queued_at_ms,
-                    );
-                    if observed.reason.as_deref() == Some("providerCapacity") {
-                        publish_provider_capacity_diagnostic(client, subject,
-                            &event.runtime_incarnation, observed.since_ms,
-                            &format!("state-control:{}", event.sequence)).await?;
+            let publication: Result<()> = async {
+                match event.kind.as_str() {
+                    kind if kind == "harness-state-control"
+                        || matches!(kind, "harness-context" | "harness-accounting")
+                            && event.payload["accounting_stop"] == true =>
+                    {
+                        let state = event.payload.get("state_control").unwrap_or(&event.payload);
+                        let observed = st_drivers::harness_state::read_raw_at(
+                            &serde_json::to_vec(state)?,
+                            None,
+                            event.queued_at_ms,
+                        );
+                        if observed.reason.as_deref() == Some("providerCapacity") {
+                            publish_provider_capacity_diagnostic(
+                                client,
+                                subject,
+                                &event.runtime_incarnation,
+                                observed.since_ms,
+                                &format!("state-control:{}", event.sequence),
+                            )
+                            .await?;
+                        }
+                        let _: Value = client
+                            .post(
+                                "/v1/harness-events/usage-flush",
+                                &st3::harness_events::UsageFlush {
+                                    subject: subject.into(),
+                                    runtime_incarnation: event.runtime_incarnation.clone(),
+                                },
+                            )
+                            .await?;
                     }
                     let _: Value = client.post("/v1/harness-events/usage-flush",
                         &st3::harness_events::UsageFlush {
@@ -19061,25 +19191,37 @@ impl NativeObservations {
                         )
                         .await?;
                 }
-                other => anyhow::bail!("unsupported harness event `{other}`"),
+                Ok(())
             }
-            if matches!(event.kind.as_str(), "harness-accounting" | "harness-context" | "harness-timeline")
-                && st_drivers::harness_events::read_runtime_state(&self.dir, &event.runtime_incarnation)?
-                    .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
-                    .is_some_and(|state| !matches!(state["state"].as_str(), Some("active" | "working" | "child")))
-            {
-                // A final reading may reach the spool after its idle/ended control. Retain
-                // that reading's acknowledgement until its independent stop flush succeeds.
-                let _: Value = client.post("/v1/harness-events/usage-flush",
-                    &st3::harness_events::UsageFlush {
-                        subject: subject.into(), runtime_incarnation: event.runtime_incarnation.clone(),
-                    }).await?;
+            .await;
+            if let Err(error) = publication {
+                if st3::client::api_error_code(&error) == Some("stale-harness-event-session")
+                    || st3::client::is_missing_route(&error)
+                {
+                    let _ = write_driver_log(
+                        subject,
+                        &format!(
+                            "retired or unsupported accounting event {} acknowledged: {error:#}",
+                            event.sequence
+                        ),
+                    );
+                } else {
+                    return Err(error);
+                }
             }
             st_drivers::harness_events::acknowledge(&self.dir, event.sequence)?;
         }
         self.retry_pending = events.len() == 64;
         self.initial_wake = self.retry_pending;
         Ok(terminal_pending)
+    }
+}
+
+impl Drop for NativeObservations {
+    fn drop(&mut self) {
+        if let Some(task) = &self.durable_task {
+            task.abort();
+        }
     }
 }
 
@@ -19822,7 +19964,7 @@ async fn publish_harness_state(
     }
     st3::suspension::annotate_quiescence(&mut fields);
     let incarnation_key = work_incarnation_key(incarnation);
-    let _: ClaimRecord = client
+    let result: Result<ClaimRecord> = client
         .post(
             "/v1/claims",
             &ClaimInput {
@@ -19835,8 +19977,18 @@ async fn publish_harness_state(
                 idempotency_key: Some(format!("harness-state:{subject}:{incarnation_key}:{state}")),
             },
         )
-        .await?;
-    Ok(())
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if st3::client::current_publication_dropped(&error) => {
+            let _ = write_driver_log(
+                subject,
+                &format!("current {state} sample dropped: {error:#}"),
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// One pi-family message frame. The content is the shared `<smalltalk-message>` envelope that
@@ -21304,6 +21456,7 @@ async fn drive_codex_native(
         &agent_dir,
         &incarnation,
     )?;
+    observations.background_durable = true;
     if push_mailbox_enabled() {
         st_drivers::push_mailbox::register(&agent_dir);
     }
@@ -31144,6 +31297,222 @@ mission "review" state="ready" {
     }
 
     #[tokio::test]
+    async fn startup_drops_current_deadlines_and_busy_writers_but_preserves_fences() {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse as _, routing::post};
+        for refusal in ["deadline", "busy", "stale"] {
+            let app = Router::new().route(
+                "/v1/claims",
+                post(move || async move {
+                    if refusal == "deadline" {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    let (code, message) = if refusal == "stale" {
+                        ("stale-harness-event-session", "retired native incarnation")
+                    } else {
+                        ("internal", "database is locked")
+                    };
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(json!({"code":code,"message":message})),
+                    )
+                        .into_response()
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Client::new(st3::client::Endpoint::Http(format!(
+                "http://{}",
+                listener.local_addr().unwrap()
+            )));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let result = tokio::time::timeout(
+                Duration::from_millis(500),
+                publish_harness_state(
+                    &client,
+                    "agent/example/seat",
+                    "claude",
+                    "starting",
+                    Some("native-one"),
+                    None,
+                ),
+            )
+            .await
+            .expect("a dropped current sample must not delay driver startup");
+            if refusal == "stale" {
+                assert_eq!(
+                    st3::client::api_error_code(&result.unwrap_err()),
+                    Some("stale-harness-event-session")
+                );
+            } else {
+                result.unwrap();
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_stops_and_missing_flush_routes_do_not_block_successor_accounting() {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        use std::sync::{Arc, Mutex};
+        for missing_route in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
+            let control = json!({"harness":"claude", "accounting_stop":true, "state_control":{}});
+            let context = json!({"schema":"st.harness-context.v1", "agent":"example/seat",
+                "harness":"claude", "incarnation":"provider-b", "observedAtMs":st_drivers::message::now_ms(),
+                "sessionTotalTokens":456});
+            // An intermediate/retired stop must not hold a new runtime's accounting behind it.
+            let connection =
+                rusqlite::Connection::open(st_drivers::harness_events::database_path(root.path()))
+                    .unwrap();
+            connection.execute("INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES(?1,?2,?3,?4)",
+                rusqlite::params!["runtime-a", st_drivers::message::now_ms(), "harness-context", control.to_string()]).unwrap();
+            connection.execute("INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES(?1,?2,?3,?4)",
+                rusqlite::params!["runtime-b", st_drivers::message::now_ms(), "harness-context", context.to_string()]).unwrap();
+            connection.execute("UPDATE metadata SET value=(SELECT SUM(length(CAST(body AS BLOB))) FROM events) WHERE key='pending-bytes'", []).unwrap();
+            drop(connection);
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let store = Arc::new(Store::open_memory("amber").unwrap());
+            let mut app = Router::new().route("/v1/harness-events", post({
+                let observed = observed.clone(); let store = store.clone();
+                move |Json(event): Json<st3::harness_events::Publication>| {
+                    let observed = observed.clone(); let store = store.clone();
+                    async move {
+                        observed.lock().unwrap().push(event.runtime_incarnation);
+                        Json(json!({"api_version":"st3.v1", "value":store.append_claim(&event.claim).unwrap()}))
+                    }
+                }
+            }));
+            if !missing_route {
+                app = app.route(
+                    "/v1/harness-events/usage-flush",
+                    post(|| async {
+                        (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(
+                                json!({"code":"stale-harness-event-session", "message":"retired"}),
+                            ),
+                        )
+                    }),
+                );
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Client::new(st3::client::Endpoint::Http(format!(
+                "http://{}",
+                listener.local_addr().unwrap()
+            )));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut observations = NativeObservations::start(root.path(), "runtime-b").unwrap();
+            observations
+                .drain(&client, "agent/example/seat", "claude", &mut false)
+                .await
+                .unwrap();
+            assert!(
+                st_drivers::harness_events::pending(root.path(), 100)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(*observed.lock().unwrap(), ["runtime-b"]);
+            assert_eq!(
+                store
+                    .claims_for("agent/example/seat", Some("harness.usage"))
+                    .unwrap()[0]
+                    .body["fields"]["context_used_tokens"],
+                456
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_accounting_publisher_does_not_hold_the_receive_loop() {
+        use axum::{Router, routing::post};
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
+        let seq =
+            st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-a")
+                .unwrap();
+        let mut writer =
+            st_drivers::harness_state::Writer::new(root.path(), "example/seat", "claude", None)
+                .with_ownership("provider-a", seq);
+        writer
+            .observe(st_drivers::harness_state::Observation::new(
+                st_drivers::harness_state::Activity::Active,
+                st_drivers::harness_state::BlockedOn::None,
+                st_drivers::harness_state::InputBuffer::Unknown,
+            ))
+            .unwrap();
+        let mut context = st_drivers::harness_context::Writer::new_paths(
+            root.path(),
+            "example/seat",
+            st_drivers::harness_context::Harness::Claude,
+        )
+        .unwrap()
+        .with_session("provider-a");
+        context
+            .observe(st_drivers::harness_context::Reading {
+                session_total_tokens: Some(123),
+                ..Default::default()
+            })
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new().route(
+            "/v1/harness-events",
+            post({
+                let entered = entered.clone();
+                move || {
+                    let entered = entered.clone();
+                    async move {
+                        entered.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(st3::client::Endpoint::Http(format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut observations = NativeObservations::start(root.path(), "runtime-a").unwrap();
+        observations.current_publisher = current_harness_publisher::Publisher::start(
+            &client,
+            "agent/example/seat",
+            "claude",
+            root.path(),
+            "runtime-a",
+        )
+        .unwrap();
+        observations.background_durable = true;
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            observations.drain_live(&client, "agent/example/seat", "claude", &mut false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            observations.drain_live(&client, "agent/example/seat", "claude", &mut false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!observations.durable_task.as_ref().unwrap().is_finished());
+        assert_eq!(
+            st_drivers::harness_events::pending(root.path(), 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn stale_live_snapshot_with_independent_publisher_does_not_rearm_expiry() {
         let root = tempfile::tempdir().unwrap();
         st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
@@ -31156,8 +31525,13 @@ mission "review" state="ready" {
             st_drivers::harness_state::InputBuffer::Unknown)).unwrap();
         let mut state: Value = serde_json::from_slice(&st_drivers::harness_events::read_runtime_state(root.path(), "runtime-a").unwrap().unwrap()).unwrap();
         state["writtenAtMs"] = json!(1);
-        st_drivers::harness_events::write_snapshot(root.path(), "harness-state", &serde_json::to_vec(&state).unwrap()).unwrap();
-        let client = Client::unix(&root.path().join("absent.sock"));
+        st_drivers::harness_events::write_snapshot(
+            root.path(),
+            "harness-state",
+            &serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let client = Client::unix(root.path().join("absent.sock"));
         let mut observations = NativeObservations::start(root.path(), "runtime-a").unwrap();
         observations.current_publisher = current_harness_publisher::Publisher::start(
             &client, "agent/example/seat", "claude", root.path(), "runtime-a").unwrap();

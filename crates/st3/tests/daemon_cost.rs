@@ -870,7 +870,11 @@ const PROBES: &[Probe] = &[
     direct(
         "POST /v1/work/{action}/{*subject}",
         |store, fixture, attempt| {
-            let (agent, step, incarnation) = &fixture.subjects.held[0];
+            let (agent, step, incarnation) = (
+                &fixture.items["renew_agent"],
+                &fixture.items["renew_step"],
+                &fixture.items["renew_incarnation"],
+            );
             let request = st3::model::WorkRequest {
                 actor: Some(agent.clone()),
                 incarnation: Some(incarnation.clone()),
@@ -1904,6 +1908,44 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
 
     let mut costs = BTreeMap::new();
     for probe in PROBES {
+        if probe.route == "POST /v1/work/{action}/{*subject}" {
+            // Cached work leases can expire during earlier probes. Set up a fresh lease
+            // outside measurement; the measured renewal still must succeed.
+            let actor = "agent/bench/cost/renew";
+            let incarnation = "cost-renew-incarnation";
+            let intent = st3::parse_intent(
+                "version 2\nagent \"bench/cost/renew\" { workspace \"/tmp\"; command \"true\" }\n",
+                NODE,
+            )
+            .unwrap();
+            store.apply_internal(&intent, "cost-renew-seat").unwrap();
+            let work = store
+                .start_work(&st3::model::WorkStartRequest {
+                    actor: actor.into(),
+                    title: "Invented renewal cost task".into(),
+                    idempotency_key: "cost-renew-start".into(),
+                })
+                .unwrap();
+            store
+                .work_action(
+                    &work.subject,
+                    "claim",
+                    &st3::model::WorkRequest {
+                        actor: Some(actor.into()),
+                        incarnation: Some(incarnation.into()),
+                        summary: None,
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: "cost-renew-claim".into(),
+                    },
+                )
+                .unwrap();
+            fixture.items.insert("renew_agent", actor.into());
+            fixture.items.insert("renew_step", work.subject);
+            fixture
+                .items
+                .insert("renew_incarnation", incarnation.into());
+        }
         // Prepare immediately before the work writes so the extra person steps do not change
         // the generated read fixtures or their existing growth baselines.
         if probe.route == "POST /v1/work/start" {

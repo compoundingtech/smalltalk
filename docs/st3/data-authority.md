@@ -67,8 +67,16 @@ floor atomically with deleting its old feed row. This is a current snapshot/feed
 selected durable subscription wakes belong to graph-watch, rather than a telemetry replay log.
 
 Numeric `harness.usage` readings and account limits remain durable accounting facts for
-`st usage` and the 95% stop. Their existing first-reading, compaction/model-change, five-minute
-working cadence and stop flush remain in place. `context_occupancy` is exclusively a current
+`st usage` and the 95% stop. Their existing first-reading, compaction/model-change and five-minute working cadence remain
+in place. A durable additive `accounting_stop` marker in the existing `harness-context`
+spool envelope requests the native-only `/v1/harness-events/usage-flush` route independently
+of whether an idle current sample was accepted. Older drivers decode the marker as an empty
+context reading and consume it; new drivers acknowledge retired incarnations or an older
+daemon's missing flush route with a private log entry. Install matching release artifacts to
+obtain the independent stop guarantee during upgrades. One ordered spool publisher runs
+outside the driver's mail receive loop and completion waits for it before publishing exit.
+The daemon also recovers retained numeric work in indexed batches of at most 64 subjects,
+including adopted providers without a spool and daemon restarts. `context_occupancy` is exclusively a current
 value and never enters that flush. Messages, work ownership, runtime launch/stop proofs and
 replication inventories retain their durable contracts.
 
@@ -122,7 +130,7 @@ controls an exporter in its hooks. The legacy st2 product's exporter remains sep
 Fresh native seats retain the existing ordered timeline outbox in `st-harness-events.sqlite`
 for the subsequent owner-native conversation cutover. Activity, context occupancy and todo use
 the current-attempt path above without outbox events. Context producers retain numeric session
-usage and account-limit samples in separate `harness-accounting` events without occupancy fields;
+usage and account-limit samples in the existing `harness-context` envelope without occupancy fields;
 these durable facts keep the normal request timeout, prepared attribution and retry path, and
 publication fingerprints advance only after success. A source with accounting or timeline data
 retains a separate durable stop control; it flushes pending numeric usage through the native

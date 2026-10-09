@@ -168,11 +168,12 @@ mod tests {
         assert!(!drain.is_finished());
         let pending = st_drivers::harness_events::pending(root.path(), 100).unwrap();
         assert_eq!(pending.len(), 2);
-        assert_eq!(pending[0].kind, "harness-accounting");
+        assert_eq!(pending[0].kind, "harness-context");
         assert_eq!(
-            pending[1].kind, "harness-state-control",
+            pending[1].kind, "harness-context",
             "the reliable accounting stop stays queued independently of current status"
         );
+        assert_eq!(pending[1].payload["accounting_stop"], true);
         assert!(pending[0].payload.get("usedTokens").is_none());
         assert_eq!(pending[0].payload["sessionTotalTokens"], 123);
         drain.abort();

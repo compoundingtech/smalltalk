@@ -260,15 +260,25 @@ pub fn read_runtime_state(agent_dir: &Path, runtime: &str) -> Result<Option<Vec<
 pub fn read_bound_provider_state(agent_dir: &Path) -> Result<Option<(String, Vec<u8>)>> {
     let mut connection = open(agent_dir)?;
     let tx = connection.transaction()?;
-    let raw: Option<Vec<u8>> = tx.query_row(
-        "SELECT body FROM snapshots WHERE kind='harness-state'", [], |row| row.get(0),
-    ).optional()?;
-    let Some(raw) = raw else { return Ok(None); };
+    let raw: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT body FROM snapshots WHERE kind='harness-state'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
     let state: Value = serde_json::from_slice(&raw)?;
-    let token = state["incarnation"].as_str().filter(|token| !token.is_empty())
+    let token = state["incarnation"]
+        .as_str()
+        .filter(|token| !token.is_empty())
         .ok_or_else(|| anyhow::anyhow!("provider snapshot has no ownership token"))?;
     let runtime: String = tx.query_row(
-        "SELECT value FROM metadata WHERE key=?1", [format!("provider-runtime:{token}")], |row| row.get(0),
+        "SELECT value FROM metadata WHERE key=?1",
+        [format!("provider-runtime:{token}")],
+        |row| row.get(0),
     )?;
     Ok(Some((runtime, raw)))
 }
@@ -337,39 +347,81 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
         signal_wake(agent_dir);
         Ok(())
     })();
+    if kind == "harness-state" && current_result.is_err() {
+        return current_result;
+    }
     if kind == "harness-state"
-        && (!matches!(value["state"].as_str(), Some("active" | "working" | "child"))
-            || value["reason"] == "providerCapacity")
-        && !(value["state"] == "ended" && value["exit"].is_null() && value["reason"] == "superseded")
+        && (!matches!(
+            value["state"].as_str(),
+            Some("active" | "working" | "child")
+        ) || value["reason"] == "providerCapacity")
+        && !(value["state"] == "ended"
+            && value["exit"].is_null()
+            && value["reason"] == "superseded")
     {
-        // Stop accounting and diagnostics are durable obligations. They do not publish
-        // categorical state, and their commit/retry is independent of the current attempt.
+        // Stop accounting and diagnostics are durable obligations, without categorical
+        // publication. Read the guard before asking for the zero-wait writer.
         let obligation: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='accounting-fingerprint')
-                OR EXISTS(SELECT 1 FROM timeline)", [], |row| row.get(0),
+                OR EXISTS(SELECT 1 FROM timeline)",
+            [],
+            |row| row.get(0),
         )?;
         if !obligation && value["reason"] != "providerCapacity" {
             return current_result;
         }
-        connection.busy_timeout(Duration::from_secs(5))?;
-        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let accounting: Option<String> = tx.query_row(
-            "SELECT value FROM metadata WHERE key='accounting-fingerprint'", [], |row| row.get(0),
-        ).optional()?;
-        let timeline: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM timeline)", [], |row| row.get(0))?;
+        let accounting: Option<String> = connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key='accounting-fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let timeline: bool =
+            connection.query_row("SELECT EXISTS(SELECT 1 FROM timeline)", [], |row| {
+                row.get(0)
+            })?;
         let obligation = accounting.is_some() || timeline || value["reason"] == "providerCapacity";
         let fingerprint = serde_json::to_string(&serde_json::json!([
-            value["incarnation"], value["state"], value["reason"], value["sinceMs"],
-            value["exit"], value["harness"], accounting,
+            value["incarnation"],
+            value["state"],
+            value["reason"],
+            value["sinceMs"],
+            value["exit"],
+            value["harness"],
+            accounting,
         ]))?;
-        let previous: Option<String> = tx.query_row(
-            "SELECT value FROM metadata WHERE key='state-control-fingerprint'", [], |row| row.get(0),
-        ).optional()?;
+        let previous: Option<String> = connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key='state-control-fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() == Some(fingerprint.as_str()) {
+            return current_result;
+        }
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key='state-control-fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
         if obligation && previous.as_deref() != Some(fingerprint.as_str()) {
-            append_event(&tx, "harness-state-control", &value)?;
+            let control = serde_json::json!({
+                "schema": "st.harness-context.v1", "agent": value["agent"],
+                "harness": value["harness"], "incarnation": value["incarnation"],
+                "observedAtMs": value["writtenAtMs"], "writtenAtMs": value["writtenAtMs"],
+                "accounting_stop": true, "state_control": value,
+            });
+            // Older drivers already consume this kind and ignore the additive stop marker.
+            append_event(&tx, "harness-context", &control)?;
             tx.execute(
                 "INSERT INTO metadata(key,value) VALUES ('state-control-fingerprint',?1)
-                 ON CONFLICT(key) DO UPDATE SET value=excluded.value", [&fingerprint],
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [&fingerprint],
             )?;
             tx.commit()?;
             signal_wake(agent_dir);
@@ -410,7 +462,7 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
             )
             .optional()?;
         if previous.as_deref() != Some(fingerprint.as_str()) {
-            append_event(&tx, "harness-accounting", &accounting)?;
+            append_event(&tx, "harness-context", &accounting)?;
             tx.execute(
                 "INSERT INTO metadata(key,value) VALUES ('accounting-fingerprint',?1)
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -717,26 +769,71 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         enable(root.path(), "runtime-a").unwrap();
         let seq = claim(root.path(), "example/seat", "claude", "provider-a").unwrap();
-        let mut writer = Writer::new(root.path(), "example/seat", "claude", None).with_ownership("provider-a", seq);
-        writer.observe(Observation::new(Activity::Active, BlockedOn::None, InputBuffer::Unknown)).unwrap();
-        let mut context = crate::harness_context::Writer::new_paths(root.path(), "example/seat", crate::harness_context::Harness::Claude)
-            .unwrap().with_session("provider-a");
-        context.observe(crate::harness_context::Reading { session_total_tokens: Some(123), ..Default::default() }).unwrap();
+        let mut writer = Writer::new(root.path(), "example/seat", "claude", None)
+            .with_ownership("provider-a", seq);
+        writer
+            .observe(Observation::new(
+                Activity::Active,
+                BlockedOn::None,
+                InputBuffer::Unknown,
+            ))
+            .unwrap();
+        let mut context = crate::harness_context::Writer::new_paths(
+            root.path(),
+            "example/seat",
+            crate::harness_context::Harness::Claude,
+        )
+        .unwrap()
+        .with_session("provider-a");
+        context
+            .observe(crate::harness_context::Reading {
+                session_total_tokens: Some(123),
+                ..Default::default()
+            })
+            .unwrap();
         let accounting = pending(root.path(), 10).unwrap().remove(0);
         acknowledge(root.path(), accounting.sequence).unwrap();
-        open(root.path()).unwrap().execute("UPDATE metadata SET value=?1 WHERE key='pending-bytes'", [MAX_PENDING_BYTES]).unwrap();
+        open(root.path())
+            .unwrap()
+            .execute(
+                "UPDATE metadata SET value=?1 WHERE key='pending-bytes'",
+                [MAX_PENDING_BYTES],
+            )
+            .unwrap();
         let idle = || Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Unknown);
         assert!(writer.observe(idle()).is_err());
-        let snapshot: Value = serde_json::from_slice(&read_runtime_state(root.path(), "runtime-a").unwrap().unwrap()).unwrap();
-        assert_eq!(snapshot["state"], "idle", "the current sample commits independently of accounting backpressure");
-        open(root.path()).unwrap().execute("UPDATE metadata SET value=0 WHERE key='pending-bytes'", []).unwrap();
+        let snapshot: Value = serde_json::from_slice(
+            &read_runtime_state(root.path(), "runtime-a")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot["state"], "idle",
+            "the current sample commits independently of accounting backpressure"
+        );
+        open(root.path())
+            .unwrap()
+            .execute("UPDATE metadata SET value=0 WHERE key='pending-bytes'", [])
+            .unwrap();
         writer.observe(idle()).unwrap();
         writer.heartbeat().unwrap();
         let events = pending(root.path(), 10).unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, "harness-state-control");
+        assert_eq!(events[0].kind, "harness-context");
+        assert_eq!(events[0].payload["accounting_stop"], true);
+        // The baseline driver decodes this existing context kind before acknowledging it.
+        let old_reading = crate::harness_context::read_raw_at(
+            &serde_json::to_vec(&events[0].payload).unwrap(),
+            crate::message::now_ms(),
+        )
+        .unwrap();
+        assert_eq!(old_reading.session_total_tokens, None);
         enable(root.path(), "runtime-a").unwrap();
-        assert_eq!(pending(root.path(), 10).unwrap()[0].sequence, events[0].sequence);
+        assert_eq!(
+            pending(root.path(), 10).unwrap()[0].sequence,
+            events[0].sequence
+        );
     }
 
     #[test]

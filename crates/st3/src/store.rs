@@ -769,6 +769,8 @@ CREATE TABLE IF NOT EXISTS local_latest_slots (
     pending_local_id INTEGER,
     PRIMARY KEY (subject, kind, slot)
 );
+CREATE INDEX IF NOT EXISTS local_latest_pending_usage_index ON local_latest_slots(subject)
+WHERE kind='harness.usage' AND pending_local_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS revision_proposals (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES mission_runs(id),
@@ -17056,18 +17058,27 @@ impl Store {
         current_harness_fold_at(&connection, subject, None, true, true)
     }
     /// Flush retained numeric accounting at a provider stop independently of current status.
-    pub(crate) fn flush_bound_pending_usage(&self, subject: &str, incarnation: &str) -> Result<bool, St3Error> {
-        self.connection.batched(|tx| {
-            check_harness_event_runtime(tx, subject, Some(incarnation))?;
-            publish_pending_usage_tx(tx, &self.origin, subject, incarnation, now_ms())
-                .map(|claims| !claims.is_empty())
-        }).map_err(|e| St3Error::new("internal", e))?
+    pub(crate) fn flush_bound_pending_usage(
+        &self,
+        subject: &str,
+        incarnation: &str,
+    ) -> Result<bool, St3Error> {
+        // Preserve the native fence even when there is no pending slot, without a write.
+        check_harness_event_runtime(&self.readers.get(), subject, Some(incarnation))?;
+        if !self.has_pending_usage(subject, incarnation)? {
+            return Ok(false);
+        }
+        self.connection
+            .batched(|tx| {
+                check_harness_event_runtime(tx, subject, Some(incarnation))?;
+                publish_pending_usage_tx(tx, &self.origin, subject, incarnation, now_ms())
+                    .map(|claims| !claims.is_empty())
+            })
+            .map_err(|e| St3Error::new("internal", e))?
     }
 
-    /// Flush retained numeric accounting in store fixtures without a native peer.
-    pub fn flush_pending_usage(&self, subject: &str, incarnation: &str) -> Result<bool, St3Error> {
-        let connection = self.readers.get();
-        let pending: bool = connection.query_row(
+    fn has_pending_usage(&self, subject: &str, incarnation: &str) -> Result<bool, St3Error> {
+        self.readers.get().query_row(
             "SELECT EXISTS(SELECT 1 FROM local_latest_slots WHERE subject=?1 AND kind='harness.usage'
              AND (pending_local_id IS NOT NULL OR (
                 json_extract(published_fields,'$.semantics')='response_rollup'
@@ -17076,9 +17087,12 @@ impl Store {
                 AND EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='harness.session-file'
                     AND json_extract(body,'$.fields.incarnation_id')=?2
                     AND json_extract(body,'$.fields.harness')=json_extract(published_fields,'$.driver')))))",
-            params![subject, incarnation], |r| r.get(0)).map_err(internal)?;
-        drop(connection);
-        if !pending {
+            params![subject, incarnation], |r| r.get(0)).map_err(internal)
+    }
+
+    /// Flush retained numeric accounting, including providers without a native spool.
+    pub fn flush_pending_usage(&self, subject: &str, incarnation: &str) -> Result<bool, St3Error> {
+        if !self.has_pending_usage(subject, incarnation)? {
             return Ok(false);
         }
         self.connection
@@ -17087,6 +17101,42 @@ impl Store {
                     .map(|claims| !claims.is_empty())
             })
             .map_err(|e| St3Error::new("internal", e))?
+    }
+
+    /// Keyset batches visit only retained numeric work, including adopted providers.
+    /// Checking status here never appends or replays a categorical observation.
+    pub(crate) fn flush_stopped_usage_batch(
+        &self,
+        after: &str,
+    ) -> Result<(Option<String>, bool), St3Error> {
+        let subjects = {
+            let connection = self.readers.get();
+            let mut statement = connection.prepare_cached(
+                "SELECT DISTINCT subject FROM local_latest_slots INDEXED BY local_latest_pending_usage_index
+                 WHERE kind='harness.usage' AND pending_local_id IS NOT NULL AND subject>?1
+                 ORDER BY subject LIMIT 64").map_err(internal)?;
+            let rows = statement
+                .query_map([after], |row| row.get::<_, String>(0))
+                .map_err(internal)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(internal)?
+        };
+        let mut changed = false;
+        for subject in &subjects {
+            let harness = self.current_harness(subject).map_err(internal)?;
+            if harness
+                .as_ref()
+                .is_none_or(|harness| harness.state != "working")
+            {
+                changed |= self.flush_pending_usage(
+                    subject,
+                    harness
+                        .as_ref()
+                        .map_or("", |harness| harness.incarnation_id.as_str()),
+                )?;
+            }
+        }
+        Ok((subjects.last().cloned(), changed))
     }
 
     /// Positive attachment proof under the indexed current-incarnation diagnostic fence.
@@ -48707,6 +48757,63 @@ mission "nested-work" state="ready" {
             3
         );
         assert!(replica.local_observations_after(0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retained_accounting_without_a_spool_flushes_after_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("accounting.sqlite");
+        let subject = "agent/cedar";
+        {
+            let store = Store::open(&path, "node").unwrap();
+            let mut runtime = harness_state(subject, "working", 1);
+            runtime.kind = "runtime.observed".into();
+            runtime.fields = BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("incarnation_id".into(), json!("inc-1")),
+            ]);
+            store.append_claim(&runtime).unwrap();
+            store
+                .append_claim(&harness_state(subject, "working", now_ms() as u64))
+                .unwrap();
+            store
+                .append_latest_observation(
+                    &harness_usage(subject, "session_cumulative", 10, 0),
+                    now_ms(),
+                )
+                .unwrap();
+            store
+                .append_latest_observation(
+                    &harness_usage(subject, "session_cumulative", 20, 0),
+                    now_ms(),
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .claims_for(subject, Some("harness.usage"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(!store.flush_stopped_usage_batch("").unwrap().1);
+            store
+                .append_claim(&harness_state(subject, "idle", now_ms() as u64))
+                .unwrap();
+            // No native stop route and no accepted-status callback has performed the flush.
+            assert_eq!(
+                store
+                    .claims_for(subject, Some("harness.usage"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let store = Store::open(&path, "node").unwrap();
+        assert!(store.flush_stopped_usage_batch("").unwrap().1);
+        let claims = store.claims_for(subject, Some("harness.usage")).unwrap();
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[1].body["fields"]["context_used_tokens"], 20);
+        assert!(!store.flush_stopped_usage_batch("").unwrap().1);
     }
 
     #[test]

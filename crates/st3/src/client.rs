@@ -983,6 +983,26 @@ pub fn http_status(error: &anyhow::Error) -> Option<u16> {
         })
 }
 
+/// A current sample may be dropped on a deadline or unavailable writer. Protocol and
+/// ownership refusals remain errors; callers must never disguise a stale incarnation.
+pub fn current_publication_dropped(error: &anyhow::Error) -> bool {
+    daemon_unreachable(error).is_some()
+        || error
+            .chain()
+            .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+        || api_error_parts(error).is_some_and(|(status, code, message, _)| {
+            status == 503
+                || code == "internal"
+                    && [
+                        "database is locked",
+                        "database table is locked",
+                        "interrupted",
+                    ]
+                    .iter()
+                    .any(|reason| message.contains(reason))
+        })
+}
+
 /// The code of the API error that an API call failed with, if it failed with one.
 pub fn api_error_code(error: &anyhow::Error) -> Option<&str> {
     error
