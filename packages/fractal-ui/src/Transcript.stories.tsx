@@ -5,6 +5,7 @@ import { expect, fn, spyOn, userEvent, waitFor, within } from 'storybook/test'
 import { Transcript, type TranscriptAvailability, type TranscriptHistory, type TranscriptTurn } from './assistant-ui/composition/Transcript'
 import type { TranscriptEmptyState } from './assistant-ui/composition/TranscriptFeedback'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
+import { EmbraceComposer } from './assistant-ui/EmbraceComposer'
 import type { ConversationItem, SendState, TextItem } from './assistant-ui/embrace-data/model'
 import { workLogTurnFromItems, type WorkLogCall } from './assistant-ui/taste/work-log'
 import type { SyncStatus } from './assistant-ui/st3-views/sync-status'
@@ -156,14 +157,65 @@ export const SettledAnswerMeta: Story = { render: args => <AnswerMetadataStory s
   try { await userEvent.click(within(answers[0]!).getByRole('button', { name: 'Copy answer' })); await expect(copied).toBe(answer) }
   finally { if (original === undefined) delete (clipboard as unknown as Record<string, unknown>)['writeText']; else Object.defineProperty(clipboard, 'writeText', original) }
 } }
-export const Unavailable: Story = { args: { availability: { _tag: 'Unavailable', reason: 'This conversation is not available right now.', detail: 'Your other conversations and drafts are unaffected.' } }, play: async ({ canvasElement }) => {
-  const canvas = within(canvasElement)
-  await expect(canvas.getByTestId('transcript-unavailable')).toBeInTheDocument()
-  await expect(canvas.getByText('This conversation is not available right now.')).toBeInTheDocument()
-  await expect(canvas.getByText('Your other conversations and drafts are unaffected.')).toBeInTheDocument()
+const unavailableReason = 'This conversation is not available right now.'
+// Raw host diagnostics: never shown in the state itself, only behind "Show details".
+const unavailableDetail = 'subscription-limit: Subscription unavailable'
+const unavailable = (action?: { readonly label: string; readonly onPress: () => void }): TranscriptAvailability => ({ _tag: 'Unavailable', reason: unavailableReason, detail: unavailableDetail, ...(action === undefined ? {} : { action }) })
+/** One reason line, no raw error text, no sync line beside the state and exactly the host's recovery action. */
+async function expectUnavailableState(canvasElement: HTMLElement, action?: string) {
+  const state = await within(canvasElement).findByTestId('transcript-unavailable')
+  await expect(canvasElement.querySelector('[data-testid="sync-line"]')).toBeNull()
   await expect(canvasElement.querySelector('[data-testid="transcript-turn"]')).toBeNull()
+  await expect([...state.querySelectorAll('p')].filter(line => line.checkVisibility()).map(line => line.textContent)).toEqual([unavailableReason])
+  await expect(within(state).queryByText(unavailableDetail)?.checkVisibility() ?? false).toBe(false)
+  await expect(within(state).queryAllByRole('button').filter(button => button.textContent !== 'Show details').map(button => button.textContent)).toEqual(action === undefined ? [] : [action])
+  return state
+}
+async function tabTo(target: HTMLElement) {
+  for (let step = 0; step < 12 && document.activeElement !== target; step++) await userEvent.tab()
+  await expect(target).toHaveFocus()
+}
+export const Unavailable: Story = { args: { state: 'sync-failed', availability: unavailable() }, play: async ({ canvasElement }) => {
+  const state = await expectUnavailableState(canvasElement)
+  await userEvent.click(within(state).getByRole('button', { name: 'Show details' }))
+  await waitFor(() => expect(within(state).getByText(unavailableDetail).checkVisibility()).toBe(true))
 } }
 export const UnavailableLight: Story = { ...Unavailable, args: { ...Unavailable.args, scheme: 'light' } }
+const tryAgain = fn()
+export const UnavailableWithAction: Story = { args: { state: 'sync-failed', availability: unavailable({ label: 'Try again', onPress: tryAgain }) }, play: async ({ canvasElement }) => {
+  tryAgain.mockClear()
+  const state = await expectUnavailableState(canvasElement, 'Try again')
+  const action = within(state).getByRole('button', { name: 'Try again' })
+  await tabTo(action)
+  await userEvent.keyboard('{Enter}')
+  await expect(tryAgain).toHaveBeenCalledTimes(1)
+  await userEvent.click(action)
+  await expect(tryAgain).toHaveBeenCalledTimes(2)
+} }
+export const UnavailableWithActionLight: Story = { ...UnavailableWithAction, args: { ...UnavailableWithAction.args, scheme: 'light' } }
+const noMessages = { messages: [], isRunning: false, onNew: async () => {} }
+/** The host's composer stays a sibling of the unavailable Transcript in the thread column. */
+function UnavailableComposerStory({ scheme = 'dark' }: { scheme?: Scheme }) {
+  return <main data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><EmbraceRuntimeProvider options={noMessages}><section aria-label="Conversation" {...stylex.props(styles.thread)}>
+    <Transcript title="Row projection" turns={[]} sync={cases['sync-failed'].sync} now={now} observedAt={now - 8000} availability={unavailable({ label: 'Try again', onPress: tryAgain })} />
+    <div data-testid="host-composer" {...stylex.props(styles.composerDock)}><EmbraceComposer variant="C1" /></div>
+  </section></EmbraceRuntimeProvider></main>
+}
+export const UnavailableWithComposer: Story = { render: args => <UnavailableComposerStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
+  tryAgain.mockClear()
+  const state = await expectUnavailableState(canvasElement, 'Try again')
+  const dock = within(canvasElement).getByTestId('host-composer')
+  const input = within(dock).getByRole('textbox', { name: 'Message' })
+  await expect(input).toBeVisible()
+  await expect(input).toBeEnabled()
+  await expect(state.getBoundingClientRect().bottom).toBeLessThanOrEqual(dock.getBoundingClientRect().top + 0.5)
+  await expect(dock.getBoundingClientRect().bottom).toBeLessThanOrEqual(window.innerHeight + 0.5)
+  await expect(dock.getBoundingClientRect().height).toBeGreaterThan(0)
+  await tabTo(input)
+  await userEvent.keyboard('Still here')
+  await expect(input).toHaveValue('Still here')
+} }
+export const UnavailableWithComposerLight: Story = { ...UnavailableWithComposer, args: { scheme: 'light' } }
 const loadEarlier = fn()
 export const HasOlderWithLoad: Story = { args: { history: { _tag: 'HasOlder', onLoadEarlier: loadEarlier } }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
@@ -577,5 +629,6 @@ export const NoGreenAllStatesLight: Story = { ...NoGreenAllStates, args: { schem
 const styles = stylex.create({
   root: { height: '100vh', width: '100%', minWidth: 0, boxSizing: 'border-box', display: 'flex', flexDirection: 'column', backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans },
   frame: { flex: '1 1 0', minHeight: 0 }, cell: { height: '720px', display: 'flex', flexDirection: 'column' }, detail: { padding: s.lg, maxHeight: g.previewMax, overflow: 'auto', fontSize: t.metaSize },
+  thread: { flex: '1 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' }, composerDock: { flexShrink: 0, boxSizing: 'border-box', width: '100%', maxWidth: g.lane, marginInline: 'auto', padding: s.lg },
   all: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: s.lg, padding: s.lg, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans },
 })
