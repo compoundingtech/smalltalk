@@ -54,6 +54,18 @@ seat's terminal and Ctrl+\ detaches. Raw terminal keys belong to the harness whi
 attached. Use a choice or decision on Home for a person-only answer; do not leave
 questions solely in a harness terminal.
 
+## Showing the person an agent or a mission
+
+`st ui open agent/NAME` shows an agent's conversation in the terminal interface the person
+has open on this machine, in a new tab. `--split` puts it in a split on the right and
+`--split --below` below. `st ui open mission-run/NAME/RUN` opens the mission view, which stays
+open and follows the mission from step to step, so the person can watch it beside the
+conversation. The pane takes the person's focus unless they are typing a message or you add
+`--keep-focus`. Asking again for something already open shows it rather than opening it twice.
+The command says whether the pane opened, whether st has no such agent or mission, or that no
+terminal interface answered, in which case nothing was queued and nothing will open later.
+Tell the person in your reply what you opened and why; the pane is not a message.
+
 ## Missions and evidence
 
 A mission describes the outcome, constraints, steps and checks. Publication does

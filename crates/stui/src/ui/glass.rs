@@ -2820,6 +2820,82 @@ impl Ui {
         }
     }
 
+    /// Whether st's inventory holds what `pane` shows. A seat can ask for an agent it has only
+    /// just made, so a request waits for this rather than opening an empty pane.
+    pub(crate) fn inventory_has(&self, pane: &Pane) -> bool {
+        match pane {
+            Pane::Agent(Some(id)) => self.world.agents.items().iter().any(|a| &a.id == id),
+            Pane::Mission(Some(id)) => self.world.missions.items().iter().any(|m| &m.id == id),
+            Pane::Machine(Some(id)) => {
+                let name = id.trim_start_matches("machine/");
+                self.world.machines.items().iter().any(|m| m.name == name)
+            }
+            _ => false,
+        }
+    }
+
+    /// Show what a seat asked for with `st ui open`. The pane opens in a tab or a split and takes
+    /// the focus, unless the request keeps it or the person is typing a message: a pane never
+    /// pulls the cursor out from under a draft. A pane that is already open is not opened again.
+    pub(crate) fn open_requested(
+        &mut self,
+        pane: Pane,
+        place: requests::Place,
+        keep_focus: bool,
+        from: Option<&str>,
+    ) -> requests::Answer {
+        let title = self.pane_title(&pane);
+        let keep = keep_focus || self.editing;
+        let how = match place {
+            requests::Place::Tab => Open::Tab,
+            requests::Place::Right => Open::Right,
+            requests::Place::Below => Open::Below,
+        };
+        if self.glasses.is_none() {
+            // The classic layout has no tabs or splits: the list selects it.
+            if let Pane::Agent(Some(id)) | Pane::Mission(Some(id)) | Pane::Machine(Some(id)) = &pane
+                && !keep
+            {
+                let id = id.clone();
+                self.open(&id);
+            }
+        } else if !keep {
+            self.open_in_glass(pane, how);
+        } else if let Some(glasses) = self.glasses.as_mut() {
+            let key = pane.key();
+            let glass = glasses.glass_mut();
+            if glass.find(&key).is_none() {
+                let focus = glass.focus;
+                match how {
+                    Open::Right | Open::Below => {
+                        let side = if how == Open::Right { Side::Right } else { Side::Below };
+                        glass.layout.split(focus, side, Group::of(Tab::pane(&key)));
+                    }
+                    _ => {
+                        if let Some(group) = glass.layout.group_mut(focus) {
+                            group.tabs.push(Tab::pane(&key));
+                        }
+                    }
+                }
+                let id = glass.id.clone();
+                self.glass_changed(&id);
+            }
+        }
+        let who = from
+            .map(|from| {
+                self.world
+                    .agents
+                    .items()
+                    .iter()
+                    .find(|agent| agent.id == from)
+                    .map(|agent| agent.name.clone())
+                    .unwrap_or_else(|| from.rsplit('/').next().unwrap_or(from).to_owned())
+            })
+            .unwrap_or_else(|| "A seat".into());
+        self.flash(format!("{who} opened {title}"));
+        requests::Answer::Opened { focused: !keep }
+    }
+
     /// Show `pane` in this glass: where it already shows, else as `how` says. Home stays Home,
     /// so what opens from Home gets its own tab, and a Home item opens on Home itself.
     pub(crate) fn open_in_glass(&mut self, pane: Pane, how: Open) {
@@ -6528,6 +6604,100 @@ mod tests {
         assert!(!ui.editing);
         assert!(ui.terminal.is_none());
         assert!(subject.is_none());
+    }
+
+    fn others(ui: &Ui) -> (String, String) {
+        let agents = ui.world.agents.items();
+        (agents[1].id.clone(), agents[2].id.clone())
+    }
+
+    #[test]
+    fn a_seat_opens_an_agent_in_a_split_and_the_person_follows_it() {
+        let mut ui = glass();
+        let (one, _) = others(&ui);
+        let before = tabs(&ui);
+        let answer = ui.open_requested(
+            Pane::Agent(Some(one.clone())),
+            requests::Place::Right,
+            false,
+            Some("agent/st/assistant"),
+        );
+        assert_eq!(answer, requests::Answer::Opened { focused: true });
+        let after = tabs(&ui);
+        assert_eq!(after.2.len(), before.2.len() + 1);
+        assert_eq!(after.2.last().unwrap(), &vec![format!("agent:{one}")]);
+        assert_eq!(after.0, after.2.len() - 1, "the new split has the focus");
+        assert_eq!(ui.focus(), (1, Some(one.clone())));
+        assert_eq!(ui.live_conversations()[0], one);
+        assert!(ui.flash.as_ref().unwrap().0.contains("assistant opened"));
+    }
+
+    #[test]
+    fn keeping_focus_shows_the_pane_and_leaves_the_person_where_they_were() {
+        let mut ui = glass();
+        let (one, two) = others(&ui);
+        ui.open_in_glass(Pane::Agent(Some(one.clone())), Open::Tab);
+        let focused = (tabs(&ui).0, tabs(&ui).1, ui.focus());
+        let mission = Pane::Mission(Some("mission/fleet/release/weekly".into()));
+        for (pane, place) in [
+            (mission.clone(), requests::Place::Below),
+            (Pane::Agent(Some(two.clone())), requests::Place::Tab),
+        ] {
+            let answer = ui.open_requested(pane, place, true, None);
+            assert_eq!(answer, requests::Answer::Opened { focused: false });
+            assert_eq!((tabs(&ui).0, tabs(&ui).1, ui.focus()), focused, "focus did not move");
+        }
+        let panes = tabs(&ui).2;
+        assert!(panes.iter().any(|group| group == &vec![WEEKLY.to_owned()]), "{panes:?}");
+        assert!(panes[0].contains(&format!("agent:{two}")), "the tab joined the focused split");
+        assert!(ui.flash.as_ref().unwrap().0.starts_with("A seat opened"));
+    }
+
+    #[test]
+    fn a_pane_never_takes_the_cursor_from_a_message_being_typed() {
+        let mut ui = glass();
+        let (one, _) = others(&ui);
+        ui.open_in_glass(Pane::Agent(Some(one)), Open::Tab);
+        ui.editing = true;
+        let focus = tabs(&ui).0;
+        let answer = ui.open_requested(
+            Pane::Mission(Some("mission/fleet/release/weekly".into())),
+            requests::Place::Right,
+            false,
+            None,
+        );
+        assert_eq!(answer, requests::Answer::Opened { focused: false });
+        assert_eq!(tabs(&ui).0, focus);
+        assert!(ui.editing, "the draft is still being typed");
+    }
+
+    #[test]
+    fn asking_again_shows_the_open_pane_instead_of_opening_it_twice() {
+        let mut ui = glass();
+        let mission = Pane::Mission(Some("mission/fleet/release/weekly".into()));
+        let (one, _) = others(&ui);
+        ui.open_requested(mission.clone(), requests::Place::Right, false, None);
+        ui.open_requested(Pane::Agent(Some(one)), requests::Place::Right, false, None);
+        let count = tabs(&ui).2.iter().flatten().filter(|pane| *pane == WEEKLY).count();
+        assert_eq!(count, 1);
+        // The mission stays open in its split while the person works in the other.
+        let groups = tabs(&ui).2.len();
+        ui.open_requested(mission.clone(), requests::Place::Tab, false, None);
+        let (focus, _, panes) = tabs(&ui);
+        assert_eq!(panes.len(), groups);
+        assert_eq!(panes[focus], vec![WEEKLY.to_owned()], "asking again focuses it");
+        assert_eq!(panes.iter().flatten().filter(|pane| *pane == WEEKLY).count(), 1);
+    }
+
+    #[test]
+    fn the_inventory_decides_whether_a_subject_exists() {
+        let ui = glass();
+        let (one, _) = others(&ui);
+        assert!(ui.inventory_has(&Pane::Agent(Some(one))));
+        assert!(ui.inventory_has(&Pane::Mission(Some("mission/fleet/release/weekly".into()))));
+        assert!(!ui.inventory_has(&Pane::Agent(Some("agent/garden/not-yet".into()))));
+        assert!(!ui.inventory_has(&Pane::Mission(Some("mission/garden/gone".into()))));
+        assert!(!ui.inventory_has(&Pane::Home(None)));
     }
 
     #[test]

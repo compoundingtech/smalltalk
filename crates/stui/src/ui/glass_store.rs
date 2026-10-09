@@ -126,6 +126,12 @@ fn from_v1(old: StoredV1) -> Stored {
 
 /// Where this person's glasses live on this device.
 pub fn path(person: &str) -> Option<PathBuf> {
+    let (dir, key) = person_state(person)?;
+    Some(dir.join(format!("glasses-{key}.json")))
+}
+
+/// The directory stui keeps per-device state in, and a stable key for `person` within it.
+pub(crate) fn person_state(person: &str) -> Option<(PathBuf, String)> {
     if person.is_empty() {
         return None;
     }
@@ -139,11 +145,10 @@ pub fn path(person: &str) -> Option<PathBuf> {
     }
     let mut hasher = DefaultHasher::new();
     person.hash(&mut hasher);
-    Some(
-        base.join("st3")
-            .join("stui")
-            .join(format!("glasses-{:016x}.json", hasher.finish())),
-    )
+    Some((
+        base.join("st3").join("stui"),
+        format!("{:016x}", hasher.finish()),
+    ))
 }
 
 /// What the file holds; nothing when it is missing, unreadable, too big or open to others.

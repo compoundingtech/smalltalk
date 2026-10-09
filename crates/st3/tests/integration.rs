@@ -64,6 +64,7 @@ mod terminal_attach;
 mod terminal_binding;
 mod version;
 mod typed_keys;
+mod ui_open;
 
 #[test]
 fn every_test_file_is_built() {
