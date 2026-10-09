@@ -93,7 +93,7 @@ function ComposerFrame({ policy, state, effort, frameId, composerWidth }: { read
       {snapshot.offline && <Button onPress={source.reconnect} {...stylex.props(styles.button)}>Reconnect</Button>}
     </header>
     <div {...stylex.props(styles.frameBody, composerWidth !== undefined && styles.budgetFrameBody)}>
-      <ComposerSession draftKey={`fractal.composer.${frameId}.${state}.${effort}`} {...session} />
+      <ComposerSession draftKey={`kit-composer.${frameId}.${state}.${effort}`} {...session} />
       <div aria-label="Accepted fixture messages" role="log" {...stylex.props(styles.receipts)}>{snapshot.receipts.map((receipt, index) => {
         const serialized = receipt.message.runConfig?.custom?.embraceDraft as SerializedDraft | undefined
         return <article key={index} {...stylex.props(styles.receipt)}>
@@ -155,7 +155,7 @@ export const Geometry: StoryObj<ComposerArgs & { compareLayout?: boolean; compar
 const settle = () => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
 const textbox = (canvasElement: HTMLElement) => within(canvasElement).getByRole('textbox')
 const receiptLog = (canvasElement: HTMLElement) => within(canvasElement).getByRole('log', { name: 'Accepted fixture messages' })
-const clearDrafts = () => { for (const key of Object.keys(localStorage)) if (key.startsWith('fractal.composer.')) localStorage.removeItem(key) }
+const clearDrafts = () => { for (const key of Object.keys(localStorage)) if (key.startsWith('kit-composer.')) localStorage.removeItem(key) }
 /** RAC shows focus tooltips only in keyboard modality, so reach the control with real Tab presses. */
 const tabTo = async (element: HTMLElement) => {
   for (let step = 0; step < 12 && element.ownerDocument.activeElement !== element; step++) await userEvent.tab()
@@ -406,7 +406,7 @@ export const DurableDraft: Story = {
     await userEvent.keyboard('Keep this @')
     await page.findByRole('listbox', { name: 'Mention a subject' })
     await userEvent.keyboard('{Enter} across remounts')
-    await waitFor(() => expect(Object.keys(localStorage).some(key => key.startsWith('fractal.composer.durable') && localStorage.getItem(key)!.includes('across remounts'))).toBe(true), { timeout: 2000 })
+    await waitFor(() => expect(Object.keys(localStorage).some(key => key.startsWith('kit-composer.durable') && localStorage.getItem(key)!.includes('across remounts'))).toBe(true), { timeout: 2000 })
     await userEvent.click(within(canvasElement).getByRole('button', { name: 'Remount composer' }))
     await waitFor(() => expect(textbox(canvasElement).textContent).toContain('across remounts'))
     await expect(textbox(canvasElement).querySelectorAll('[data-react-aria-token]')).toHaveLength(1)
@@ -575,7 +575,7 @@ function PlainAdapter({ scheme }: { readonly scheme: Scheme }) {
   const options = React.useMemo<ConversationRuntimeOptions>(() => ({ messages: [], isRunning: running, onNew: async () => {}, onCancel: async () => setRunning(false) }), [running])
   return <Surface scheme={scheme}><div {...stylex.props(styles.lane)}>
     <EmbraceRuntimeProvider options={options}>
-      <Composer agent="Review agent" folder="fractal-ui" branch="composer-cutover" draftKey="fractal.composer.plain-adapter" running={running}
+      <Composer agent="Review agent" folder="fractal-ui" branch="composer-cutover" draftKey="kit-composer.plain-adapter" running={running}
         onSend={text => { setSent(previous => [...previous, `Sent: ${text}`]); setRunning(true) }}
         onSteer={text => setSent(previous => [...previous, `Steered: ${text}`])}
         onStop={() => setRunning(false)} />
@@ -584,7 +584,7 @@ function PlainAdapter({ scheme }: { readonly scheme: Scheme }) {
   </div></Surface>
 }
 export const PlainTextAdapter: Story = {
-  beforeEach: () => { try { sessionStorage.removeItem('composition.draft.fractal.composer.plain-adapter') } catch { /* Storage may be disabled. */ } },
+  beforeEach: () => { try { sessionStorage.removeItem('composition.draft.kit-composer.plain-adapter') } catch { /* Storage may be disabled. */ } },
   render: args => <PlainAdapter scheme={args.scheme} />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
