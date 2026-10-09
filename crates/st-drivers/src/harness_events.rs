@@ -1129,6 +1129,70 @@ mod tests {
     }
 
     #[test]
+    fn a_new_activity_waits_for_local_evidence_but_a_heartbeat_drops() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime-a").unwrap();
+        let seq = claim(root.path(), "example/seat", "claude", "provider-a").unwrap();
+        let mut writer = Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
+            .with_ownership("provider-a", seq);
+        writer
+            .observe(Observation::new(
+                Activity::Active,
+                BlockedOn::None,
+                InputBuffer::Unknown,
+            ))
+            .unwrap();
+        let mut connection = open(root.path()).unwrap();
+        let lock = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            writer.heartbeat().is_err(),
+            "heartbeat keeps zero-wait admission"
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let directory = root.path().to_path_buf();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            let mut writer = Writer::new(&directory, "example/seat", "claude", Some("pty".into()))
+                .with_ownership("provider-a", seq);
+            started_tx.send(()).unwrap();
+            let result = writer.observe(Observation::new(
+                Activity::Idle,
+                BlockedOn::None,
+                InputBuffer::Unknown,
+            ));
+            done_tx.send(result.is_ok()).unwrap();
+            result.unwrap();
+            writer.heartbeat().unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        lock.commit().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        observer.join().unwrap();
+        let snapshot: Value = serde_json::from_slice(
+            &read_runtime_state(root.path(), "runtime-a")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot["state"], "idle",
+            "the next heartbeat uses the new provider evidence"
+        );
+        assert!(
+            pending(root.path(), 100).unwrap().is_empty(),
+            "local evidence creates no current publication job"
+        );
+    }
+
+    #[test]
     fn current_snapshots_replace_without_publication_jobs() {
         let root = tempfile::tempdir().unwrap();
         enable(root.path(), "runtime-a").unwrap();

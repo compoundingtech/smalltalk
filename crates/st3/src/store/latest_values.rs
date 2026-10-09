@@ -239,6 +239,11 @@ pub(super) fn harness_sql(connection: &Connection, subject: &str, sql: &str) -> 
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static CURRENT_TRANSACTION_ELAPSED: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
 /// Only this fresh connection's progress deadline can interrupt a current transaction.
 /// Preserve ownership/protocol errors; do not infer interruption from an error's text.
 fn current_transaction<T>(
@@ -260,11 +265,27 @@ fn current_transaction<T>(
         }),
     );
     let result = (|| {
+        // A fresh SQLite connection loads and parses the database schema on its first
+        // table access. Do that before acquiring the write lock, under the same deadline.
+        // Preparing without stepping writes nothing and leaves no read transaction open.
+        drop(
+            connection
+                .prepare("SELECT local_id FROM latest_values LIMIT 0")
+                .map_err(internal)?,
+        );
+        #[cfg(test)]
+        let started = std::time::Instant::now();
         let tx = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(internal)?;
         let value = work(&tx)?;
         tx.commit().map_err(internal)?;
+        #[cfg(test)]
+        CURRENT_TRANSACTION_ELAPSED.with(|elapsed| {
+            if elapsed.get().is_some() {
+                elapsed.set(Some(started.elapsed()));
+            }
+        });
         Ok(value)
     })();
     connection.progress_handler(0, None::<fn() -> bool>);
@@ -887,6 +908,68 @@ mod tests {
             evidence: vec![],
             expected_subject: None,
             idempotency_key: None,
+        }
+    }
+
+    #[test]
+    #[ignore = "whole-process SQLite counters: run this cost probe alone"]
+    fn native_register_writer_cost() {
+        use smallclaims::sqlite::work;
+        for legacy in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Store::open(&root.path().join("cost.sqlite"), "owner").unwrap();
+            let mut runtime = state("idle", "one", 1);
+            runtime.kind = "runtime.observed".into();
+            runtime.fields = serde_json::from_value(
+                json!({"status":"running", "host":"owner", "incarnation_id":"one"}),
+            )
+            .unwrap();
+            store.append_claim(&runtime).unwrap();
+            let publish = |activity, at| {
+                let input = state(activity, "one", at);
+                if legacy {
+                    append_legacy_graph_observation_fenced(
+                        &store.graph,
+                        &input,
+                        u128::from(at),
+                        Some("one"),
+                    )
+                    .unwrap();
+                } else {
+                    append(&store.graph, &input, u128::from(at), Some("one")).unwrap();
+                }
+            };
+            publish("idle", 1);
+            for (name, transition) in [("heartbeat", false), ("transition", true)] {
+                for sample in 0..5 {
+                    let activity = if transition && sample % 2 == 0 {
+                        "working"
+                    } else {
+                        "idle"
+                    };
+                    CURRENT_TRANSACTION_ELAPSED.with(|elapsed| {
+                        elapsed.set((!legacy).then_some(std::time::Duration::ZERO))
+                    });
+                    let before = work::total();
+                    let started = std::time::Instant::now();
+                    publish(activity, 10 + sample + if transition { 100 } else { 0 });
+                    let elapsed = started.elapsed();
+                    let cost = work::total() - before;
+                    let transaction_us = CURRENT_TRANSACTION_ELAPSED
+                        .with(|elapsed| elapsed.take().map(|elapsed| elapsed.as_micros()));
+                    println!(
+                        "writer-cost legacy={legacy} kind={name} sample={sample} transaction_us={transaction_us:?} elapsed_us={} statements={} vm_steps={} fullscan_steps={} sorts={} autoindex_rows={}",
+                        elapsed.as_micros(),
+                        cost.statements,
+                        cost.vm_steps,
+                        cost.fullscan_steps,
+                        cost.sorts,
+                        cost.autoindex_rows
+                    );
+                    assert_eq!(cost.fullscan_steps, 0);
+                    assert!(cost.vm_steps > 0);
+                }
+            }
         }
     }
 

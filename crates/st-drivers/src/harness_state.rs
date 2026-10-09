@@ -517,7 +517,7 @@ impl Writer {
             written_at_ms,
             transitions,
         };
-        write_record(&self.path, &record)?;
+        write_observed_record(&self.path, &record)?;
         self.interrupted = false;
         Ok(true)
     }
@@ -753,6 +753,17 @@ fn read_record(path: &Path) -> Option<Record> {
         StoredRecord::Parsed(record) => Some(*record),
         StoredRecord::Absent | StoredRecord::Unreadable => None,
     }
+}
+
+fn write_observed_record(path: &Path, record: &Record) -> anyhow::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    if crate::harness_events::enabled(dir) {
+        // Preserve the provider's new evidence before its independent, lossy daemon POST.
+        // A dropped local transition would otherwise make every later heartbeat restamp
+        // the old state. Wait only before writer admission; no publication job is queued.
+        return crate::harness_events::write_ownership_snapshot(dir, &serde_json::to_vec(record)?);
+    }
+    write_record(path, record)
 }
 
 fn write_record(path: &Path, record: &Record) -> anyhow::Result<()> {

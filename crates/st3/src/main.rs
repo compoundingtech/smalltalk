@@ -18506,7 +18506,7 @@ async fn drive_st2_native(
                                 }).await?;
                                 loop_state.ready = true;
                             }
-                            publish_harness_activity(
+                            let activity = publish_harness_activity(
                                 &ObservationClient { client, event: None, source_account: None },
                                 subject,
                                 driver,
@@ -18519,7 +18519,8 @@ async fn drive_st2_native(
                                 &observed,
                                 &mut last_activity_fingerprint,
                             )
-                            .await?;
+                            .await;
+                            observations.finish_current_activity(subject, activity);
                             if observed.reason.as_deref() == Some("providerCapacity") {
                                 let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
                                     driver,
@@ -18985,6 +18986,15 @@ impl NativeObservations {
         }
     }
 
+    fn finish_current_activity(&mut self, subject: &str, result: Result<()>) {
+        if let Err(error) = result {
+            self.note_current_drop(
+                subject,
+                &format!("current activity sample dropped: {error:#}"),
+            );
+        }
+    }
+
     async fn publish_snapshots(
         &mut self,
         client: &Client,
@@ -19073,8 +19083,8 @@ impl NativeObservations {
                         {
                             *ready = true;
                         }
-                        if !claimed
-                            && let Err(error) = publish_harness_activity(
+                        if !claimed {
+                            let activity = publish_harness_activity(
                                 &publisher,
                                 subject,
                                 driver,
@@ -19089,9 +19099,8 @@ impl NativeObservations {
                                 &observed,
                                 &mut None,
                             )
-                            .await
-                        {
-                            self.note_current_drop(subject, &format!("current activity sample dropped: {error:#}"));
+                            .await;
+                            self.finish_current_activity(subject, activity);
                         }
                     }
                     "harness-context" => {
@@ -22096,7 +22105,7 @@ async fn drive_codex_native(
                         .then(|| st_drivers::harness_state::read(&harness_state_path, None))
                         .flatten()
                     {
-                        publish_harness_activity(
+                        let activity = publish_harness_activity(
                             &ObservationClient { client, event: None, source_account: None },
                             subject,
                             "codex",
@@ -22105,7 +22114,8 @@ async fn drive_codex_native(
                             &observed,
                             &mut last_activity_fingerprint,
                         )
-                        .await?;
+                        .await;
+                        observations.finish_current_activity(subject, activity);
                         let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
                             observed.since_ms,
                             observed.observed_at_ms,
@@ -31662,6 +31672,118 @@ mission "review" state="ready" {
                 .is_empty()
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_activity_drop_continues_numeric_publication_in_the_same_tick() {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+        use std::sync::Mutex;
+        for driver in ["claude", "codex"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut writer = st_drivers::harness_context::Writer::new_paths(
+                root.path(),
+                "example/seat",
+                st_drivers::harness_context::Harness::Claude,
+            )
+            .unwrap()
+            .with_session("provider-a");
+            writer
+                .observe(st_drivers::harness_context::Reading {
+                    used_tokens: Some(100),
+                    session_total_tokens: Some(123),
+                    ..Default::default()
+                })
+                .unwrap();
+            let context = st_drivers::harness_context::read(
+                &st_drivers::harness_context::harness_context_path(root.path()),
+            )
+            .unwrap();
+            let activity = st_drivers::harness_state::read_raw_at(
+                &serde_json::to_vec(&json!({"state":"idle", "driver":driver})).unwrap(),
+                None,
+                st_drivers::message::now_ms(),
+            );
+            let store = Arc::new(Store::open_memory("example").unwrap());
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let app = Router::new().route("/v1/claims", post({
+                let (store, captured) = (store.clone(), captured.clone());
+                move |Json(input): Json<ClaimInput>| {
+                    let (store, captured) = (store.clone(), captured.clone());
+                    async move {
+                        captured.lock().unwrap().push(input.kind.clone());
+                        if input.kind == "harness.observed" {
+                            StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            Json(json!({"api_version":"st3.v1", "value":store.append_claim(&input).unwrap()})).into_response()
+                        }
+                    }
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Client::new(Endpoint::Http(format!(
+                "http://{}",
+                listener.local_addr().unwrap()
+            )));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let publisher = ObservationClient {
+                client: &client,
+                event: None,
+                source_account: None,
+            };
+            let mut observations = NativeObservations::start(root.path(), "runtime-a").unwrap();
+            let mut fingerprint = None;
+            let mut usage = UsageFingerprints::default();
+            let tick: Result<()> = async {
+                let activity = publish_harness_activity(
+                    &publisher,
+                    "agent/example/seat",
+                    driver,
+                    "native",
+                    Some("runtime-a"),
+                    &activity,
+                    &mut fingerprint,
+                )
+                .await;
+                assert!(activity.is_err());
+                observations.finish_current_activity("agent/example/seat", activity);
+                publish_harness_usage(
+                    &publisher,
+                    "agent/example/seat",
+                    driver,
+                    "runtime-a",
+                    &context,
+                    &mut usage,
+                )
+                .await?;
+                Ok(())
+            }
+            .await;
+            tick.unwrap();
+            assert!(observations.current_warning.is_some());
+            let warning = observations.current_warning;
+            observations.finish_current_activity(
+                "agent/example/seat",
+                Err(anyhow::anyhow!("another dropped sample")),
+            );
+            assert_eq!(
+                observations.current_warning, warning,
+                "one shared throttle for current drops"
+            );
+            assert!(fingerprint.is_some(), "the dropped activity is not retried");
+            assert!(usage.numeric.is_some());
+            assert_eq!(
+                store
+                    .claims_for("agent/example/seat", Some("harness.usage"))
+                    .unwrap()[0]
+                    .body["fields"]["total_tokens"],
+                123
+            );
+            assert_eq!(
+                *captured.lock().unwrap(),
+                ["harness.observed", "harness.usage", "harness.usage"]
+            );
+            server.abort();
+        }
     }
 
     #[tokio::test]
