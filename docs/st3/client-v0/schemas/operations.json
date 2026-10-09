@@ -30,6 +30,7 @@
     { "id": "attention.get", "method": "GET", "path": "/v1/client/attention/{id}", "response": "Resource" },
     { "id": "messages.list", "method": "GET", "path": "/v1/client/messages", "response": "Page" },
     { "id": "messages.get", "method": "GET", "path": "/v1/client/messages/{id}", "response": "Resource" },
+    { "id": "message-body.get", "method": "GET", "path": "/v1/client/message-bodies/{id}", "response": "MessageBody", "scope": "read.projections" },
     { "id": "launches.list", "method": "GET", "path": "/v1/client/launches", "response": "Page" },
     { "id": "launches.get", "method": "GET", "path": "/v1/client/launches/{id}", "response": "Resource" },
     { "id": "launch-variants.list", "method": "GET", "path": "/v1/client/launches/{id}/variants", "response": "Page" },

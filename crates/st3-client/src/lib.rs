@@ -820,6 +820,10 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::BlobQuotaExceeded => {
             "too many images were uploaded recently; try again later".into()
         }
+        // Already worded for the person who sent, naming the limit and what to do.
+        ErrorCode::MessageTooLarge
+        | ErrorCode::MessageStoreFull
+        | ErrorCode::LongMessageSignatureUnsupported => message.to_owned(),
         ErrorCode::BlobNotFound => "this image is not stored on this machine".into(),
         ErrorCode::BlobExpired => {
             "this image was removed after its retention window; the message text remains".into()
@@ -1619,6 +1623,10 @@ impl Client {
     }
     pub async fn messages_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("messages", id).await
+    }
+    pub async fn message_body_get(&self, id: &str) -> Result<Envelope<MessageBody>, ClientError> {
+        self.get(&format!("/v1/client/message-bodies/{}", percent_encode(id)))
+            .await
     }
     pub async fn launches_list(
         &self,
@@ -3741,6 +3749,29 @@ mod tests {
                 details: Default::default(),
             }),
         )
+    }
+
+    #[test]
+    fn a_refused_long_message_reads_as_the_daemon_worded_it_with_its_limit() {
+        let text = "a message cannot be longer than 256 KiB; this one is 300 KiB.";
+        for code in [
+            ErrorCode::MessageTooLarge,
+            ErrorCode::MessageStoreFull,
+            ErrorCode::LongMessageSignatureUnsupported,
+        ] {
+            let error = api(code, text);
+            assert_eq!(error.plain(), text);
+            // A definite refusal: the person's text is kept and trying the same text again
+            // cannot succeed.
+            assert!(!error.is_transient());
+        }
+        // A daemon that predates the code answers `internal`, which the client does not
+        // reword into advice the person cannot follow.
+        assert!(
+            api(ErrorCode::Internal, "an inline message cannot exceed 4 KiB")
+                .plain()
+                .contains("4 KiB")
+        );
     }
 
     #[test]

@@ -61,18 +61,28 @@ st conversations send person/operator \
 has the original message: it derives the recipient and `in-reply-to`, and preserves or replaces the
 subject deliberately.
 
-## Bodies larger than 4 KiB
+## Long bodies
 
-Inline message content cannot exceed 4 KiB. Store a larger UTF-8 body as an immutable document,
-then send its exact `doc/NAME@HASH` reference as the body:
+A message body can be up to 256 KiB of UTF-8. Send it as the body, however long:
 
 ```sh
-document_ref="$(st documents put catalog-context.md --as doc/example/catalog-context)"
 st conversations send agent/example/worker \
   --from person/operator \
   --subject 'Catalog import context' \
-  --body "$document_ref"
+  --body "$(cat catalog-context.md)"
 ```
 
-One stored document can be at most 1 MiB. The receiver resolves the pinned reference; replacing the
-local file later cannot change the delivered bytes.
+Past 8 KiB, the message holds the first kilobyte as a preview and the whole text stays on the
+machine that sent it; other members ask that machine when they read it. `st conversations read`
+prints the whole text, and a seat is shown a preview with the instruction to read the rest. If the
+sending machine cannot be reached, the reader sees the preview and which machine has the rest. Over
+256 KiB the send is refused with `message-too-large`, and nothing is written: shorten the text or
+send it as several messages. [Long messages](../../docs/st3/long-messages.md) has the details.
+
+A pinned `doc/NAME@HASH` reference is still a valid body for a document of up to 1 MiB that
+already exists:
+
+```sh
+document_ref="$(st documents put catalog-context.md --as doc/example/catalog-context)"
+st conversations send agent/example/worker --from person/operator --body "$document_ref"
+```
