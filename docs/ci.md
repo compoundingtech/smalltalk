@@ -802,3 +802,45 @@ A passing retry is a flaky outcome in the nextest log. A queued Namespace job wi
 is infrastructure readiness, not a successful check; the merge queue keeps the entry waiting.
 
 During an outage, `CI_OUTAGE_FAST_QUEUE=on` skips optional Nix-cache saves and same-source build-snapshot publication on merge-group runs. Required checks, cache restores, the producer test archive, logs, cache coverage and PR/main cache publication continue. Set the variable back to `off` when Speed ends the outage; an unset variable also preserves normal publication. The temporary ruleset build concurrency is six; restore its prior value of two at outage end without changing the other ruleset fields.
+
+## Merge overflow and daily Namespace minutes
+
+CI-speed owns live CI variables and queue capacity. Start with `max_entries_to_build=3`,
+merge sizes 1–5 and a five-minute batch wait; live HEADGREEN remains the incident's
+existing strategy. The generated ruleset's normal ALLGREEN strategy is unchanged.
+Change only the build-count field when tuning the live ruleset. This is capacity
+configuration, not proof of CI p90 <20 minutes, runner wait <5 minutes or queue-to-merge
+p90 <45 minutes.
+
+With `CI_MERGE_CI1` unset/off, the picker admits an entire group to `ci1-merge`
+only when five distinct online idle merge workers are available and, after borrowing
+mixed workers, two general workers remain for PRs. Priority-only workers are excluded.
+Otherwise all group workload jobs use Namespace. Admission is a snapshot, not an
+atomic reservation across simultaneous pickers. Missing/invalid status also overflows.
+`CI_MERGE_CI1=on` retains the explicit forced-local switch for supported incidents.
+PR/fork/priority routing is unchanged. No job is migrated after it starts.
+
+`CI_MERGE_NAMESPACE_PROFILE` may name an existing, verified Linux profile; unset
+uses the existing 8x16 stage labels and Linux profile for supporting jobs, including
+KVM. Profile controls and run affinity remain inline. The initial live choice is
+unset: the shared `linux-x86-64` profile historically limited parallel runners, so
+funnelling all large stages into it can queue them despite workspace headroom.
+Three groups can request roughly 144–168 vCPU / 288–336 GiB during overlap on
+Namespace, below the held 320-vCPU / 640-GiB workspace limit, with capacity shared
+by PRs and other work. Actual starts/waits decide later tuning, not those upper
+bounds alone. A dedicated capped profile requires an actual administrator receipt;
+this PR does not claim one was provisioned.
+
+`Namespace usage` runs at 06:05 UTC on GitHub-hosted capacity and reports the previous
+UTC day's observed Namespace job execution minutes, split by event (merge_group,
+pull_request and other events). Cos can read the job summary and its 30-day JSON
+artifact for the morning cost check. `python3 scripts/ci-namespace-usage --date YYYY-MM-DD
+--output usage.json` also provides an on-demand report. It scans all retained workflow
+metadata, queries relevant jobs across all attempts, includes failed/cancelled execution,
+deduplicates job IDs and clips executions across midnight. The job identity must be
+an actual `nsc-runner-*`, rather than just a planned Namespace label. Queued jobs add
+no execution minutes. Missing timestamps, API failures or pagination limits fail
+visibly instead of declaring zero usage. Totals are operational execution minutes,
+not invoice dollars or billable unit minutes: provisioning before the first job step
+and deleted GitHub history are outside this method. Use Namespace's billing view
+for an invoice; the report preserves raw job IDs/timestamps for reconciliation.

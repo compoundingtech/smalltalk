@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Observed Namespace job execution minutes by UTC day, not invoice/billable minutes."""
+import argparse
+from datetime import datetime, timedelta, timezone
+import json
+import os
+from pathlib import Path
+import subprocess
+
+UTC = timezone.utc
+
+
+def timestamp(value):
+    return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(UTC)
+
+
+def summarize(jobs, start, end):
+    rows, unknown, seen = [], [], set()
+    for job in jobs:
+        if job['id'] in seen:
+            continue
+        seen.add(job['id'])
+        # Planned labels alone cannot establish that a queued job consumed compute.
+        name = job.get('runner_name') or ''
+        if not name.startswith('nsc-runner-'):
+            continue
+        if job.get('status') in ('queued', 'waiting'):
+            continue
+        starts = [timestamp(s['started_at']) for s in job.get('steps', []) if s.get('started_at')]
+        if not starts:
+            unknown.append(job['id'])
+            continue
+        first = min(starts)
+        terminal = job.get('completed_at')
+        if job.get('status') == 'completed' and not terminal:
+            unknown.append(job['id'])
+            continue
+        last = timestamp(terminal) if terminal else min(datetime.now(UTC), end)
+        if last < first:
+            raise ValueError(f"job {job['id']}: terminal before first step")
+        seconds = (min(last, end) - max(first, start)).total_seconds()
+        if seconds <= 0:
+            continue
+        rows.append(dict(id=job['id'], run_id=job['run_id'], run_attempt=job.get('run_attempt'),
+                         event=job['event'], name=job['name'], runner=name,
+                         labels=job.get('labels', []), conclusion=job.get('conclusion'),
+                         first_step=first.isoformat(), completed_at=terminal,
+                         seconds=seconds, execution_minutes=seconds / 60,
+                         url=job.get('html_url')))
+    totals = {}
+    for row in rows:
+        totals[row['event']] = totals.get(row['event'], 0) + row['execution_minutes']
+    return dict(jobs=rows, execution_minutes=sum(r['execution_minutes'] for r in rows),
+                minutes_by_event=totals, missing_execution_timestamp_job_ids=unknown)
+
+
+def api(path):
+    result = subprocess.run(['gh', 'api', path], capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError(f"GitHub API failed for {path}: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def pages(path, field):
+    for page in range(1, 1001):
+        response = api(f'{path}&page={page}')
+        entries = response[field]
+        yield from entries
+        if len(entries) < 100:
+            return
+    raise RuntimeError('usage pagination exceeded 1000 pages; refuse a complete total')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--date', default=(datetime.now(UTC) - timedelta(days=1)).date().isoformat())
+    parser.add_argument('--repo', default=os.environ.get('GITHUB_REPOSITORY', 'compoundingtech/smalltalk'))
+    parser.add_argument('--output', required=True)
+    args = parser.parse_args()
+    start = timestamp(args.date + 'T00:00:00Z')
+    end = start + timedelta(days=1)
+    # Include older queued runs and reruns; fetch every retained run's metadata,
+    # then only fetch jobs for runs that could overlap the reporting day.
+    jobs, relevant_runs, all_runs = [], 0, 0
+    for run in pages(f'repos/{args.repo}/actions/runs?per_page=100', 'workflow_runs'):
+        all_runs += 1
+        if timestamp(run['created_at']) >= end:
+            continue
+        if run['status'] == 'completed' and timestamp(run['updated_at']) < start:
+            continue
+        relevant_runs += 1
+        # filter=all includes cancelled/failing attempts, not only latest reruns.
+        for job in pages(f"repos/{args.repo}/actions/runs/{run['id']}/jobs?filter=all&per_page=100", 'jobs'):
+            jobs.append({**job, 'run_id': run['id'], 'event': run['event']})
+    report = summarize(jobs, start, end)
+    report.update(date=args.date, repository=args.repo, generated_at=datetime.now(UTC).isoformat(),
+                  retained_run_metadata_scanned=all_runs, relevant_runs=relevant_runs,
+                  method='UTC-clipped first job step to terminal; all retained runs and attempts; actual nsc-runner identity',
+                  limits='Observed execution minutes, not Namespace invoice/unit minutes. Provisioning before first step and deleted GitHub runs/logs are not observable. Incomplete timestamps refuse a complete report.')
+    Path(args.output).write_text(json.dumps(report, indent=2) + '\n')
+    summary = f"## Namespace execution minutes: {args.date} UTC\n\n"
+    summary += '| Event | Job minutes |\n| --- | ---: |\n'
+    summary += ''.join(f'| {event} | {minutes:.2f} |\n' for event, minutes in sorted(report['minutes_by_event'].items()))
+    summary += f"| Total observed | {report['execution_minutes']:.2f} |\n\n{report['limits']}\n"
+    print(summary)
+    if os.environ.get('GITHUB_STEP_SUMMARY'):
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+            out.write(summary)
+    if report['missing_execution_timestamp_job_ids']:
+        raise SystemExit('incomplete Namespace execution timestamps; see retained JSON, not a zero-usage day')
+
+
+if __name__ == '__main__':
+    main()
