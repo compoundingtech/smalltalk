@@ -771,7 +771,7 @@ impl Store {
                 let Some(view) = step(tx, &ask.subject)? else { continue };
                 if matches!(view.status.as_str(), "ready" | "pending") && !current(tx, &ask, now_ms())? {
                     let claim = append_claim_tx(tx, &self.origin, &ask.subject, "work.person-cancelled", Some("daemon/runtime"),
-                        &json!({"fields": {"attempt": view.attempt, "status": "cancelled", "summary": "the requester, origin or owning run ended", "key": format!("person-owner-ended:{}", ask.id)}}), &[ask.id.clone()], None)?;
+                        &json!({"fields": {"attempt": view.attempt, "status": "cancelled", "summary": "the requester, origin or owning run ended", "key": format!("person-owner-ended:{}", ask.id)}}), std::slice::from_ref(&ask.id), None)?;
                     project(tx, &claim).map_err(anyhow::Error::new)?;
                     if !is_update(&ask) {
                         self.tell_ask_ended(tx, &ask)?;
@@ -833,7 +833,7 @@ impl Store {
             append_claim_tx(tx, &self.origin, &message, "message.sent", Some("daemon/runtime"), &json!({"fields": {
                 "from": "daemon/runtime", "to": requester, "content": content, "status": "sent",
                 "title": format!("Ask cancelled: {title}"), "in_reply_to": null,
-                "tags": [format!("st3-ask-ended:{}", ask.subject)]}}), &[ask.id.clone()], None)?;
+                "tags": [format!("st3-ask-ended:{}", ask.subject)]}}), std::slice::from_ref(&ask.id), None)?;
         }
         if person.starts_with("person/") {
             let update = json!({"version": 1, "type": "update", "about": ask.subject});
