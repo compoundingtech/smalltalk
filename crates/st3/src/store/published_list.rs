@@ -38,8 +38,6 @@ pub(crate) struct PublishedList<R> {
     /// zero when none waits.
     requested_at: AtomicU64,
     overdue_warned: AtomicBool,
-    /// Rises with every publication, so a window that read an earlier one rereads.
-    revision: tokio::sync::watch::Sender<u64>,
     /// Folds from nothing, by why: each one refolded every row rather than the changed ones.
     rebuilds: Mutex<BTreeMap<String, u64>>,
 }
@@ -55,7 +53,6 @@ impl<R> Default for PublishedList<R> {
             forgotten: AtomicBool::new(false),
             requested_at: AtomicU64::new(0),
             overdue_warned: AtomicBool::new(false),
-            revision: tokio::sync::watch::Sender::new(0),
             rebuilds: Mutex::default(),
         }
     }
@@ -119,7 +116,6 @@ impl<R> PublishedList<R> {
             Ordering::Relaxed,
         );
         self.overdue_warned.store(false, Ordering::Release);
-        self.revision.send_modify(|revision| *revision += 1);
     }
 
     /// When the oldest unanswered request was made, for [`Self::publish`] to clear once the
@@ -142,12 +138,6 @@ impl<R> PublishedList<R> {
         }
     }
 
-    /// Wake the refresher for a commit. Unlike a read's request, a commit that changes no row
-    /// never makes the publication overdue.
-    pub(crate) fn notice_commit(&self) {
-        self.wake.notify_one();
-    }
-
     /// The projections were replaced without a new claim: fold from nothing, at once.
     pub(crate) fn forget(&self) {
         self.fold_from_nothing_next();
@@ -159,15 +149,12 @@ impl<R> PublishedList<R> {
         self.forgotten.store(true, Ordering::Release);
     }
 
-    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.revision.subscribe()
-    }
-
     /// Count one fold from nothing, by why.
     pub(crate) fn note_rebuild(&self, why: &str) {
         *self.rebuilds.lock().unwrap_or_else(PoisonError::into_inner).entry(why.to_owned()).or_default() += 1;
     }
 
+    #[cfg(test)]
     pub(crate) fn rebuilds(&self) -> BTreeMap<String, u64> {
         self.rebuilds.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
@@ -190,13 +177,11 @@ mod tests {
         assert!(list.start("missions").is_some());
         assert!(list.start("missions").is_none(), "one refresher per list");
         assert_eq!(list.name(), "missions");
-        let mut revisions = list.subscribe();
         list.request_refresh();
         let asked = list.pending_request();
         assert_ne!(asked, 0);
         list.publish(publication(4), asked);
         assert_eq!(list.pending_request(), 0);
-        assert!(revisions.has_changed().unwrap());
         assert_eq!(list.newest().unwrap().cut, 4);
         assert_eq!(list.base().unwrap().rows, vec![4]);
         list.forget();
@@ -213,7 +198,6 @@ mod tests {
         list.request_refresh();
         list.publish(publication(2), before);
         assert_ne!(list.pending_request(), 0, "asked after the fold began");
-        list.notice_commit();
         list.publish(publication(3), list.pending_request());
         assert_eq!(list.pending_request(), 0);
         list.note_rebuild("start");

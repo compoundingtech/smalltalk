@@ -538,7 +538,7 @@ pub(super) fn work_window(
                         && (view.assigned_to.as_deref() == Some(viewer.as_str())
                             || view.claimant.as_deref() == Some(viewer.as_str())
                             || (matches!(view.status.as_str(), "ready" | "blocked")
-                                && view.available_to.iter().any(|candidate| *candidate == viewer)))
+                                && view.available_to.contains(&viewer)))
                 })
                 .collect::<Vec<_>>();
             let order = store.seat_run_order(&seat)?;

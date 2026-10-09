@@ -1642,6 +1642,7 @@ struct HeldWindow {
     subscribed: Instant,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn roster_subscriber(
     client: st3_client::Client,
     subscriber: usize,
