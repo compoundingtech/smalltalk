@@ -12532,7 +12532,12 @@ async fn run_agents(
                                     .unwrap_or("the replacement exited before becoming ready")
                             );
                         }
-                        if let Some(fault) = agent.fault.as_deref() {
+                        // The old incarnation's fault is often why this restart was
+                        // requested. It cannot fail the accepted replacement operation.
+                        if let Some(fault) = agent.fault.as_deref().filter(|_| {
+                            agent.incarnation_id.as_deref()
+                                .is_some_and(|incarnation| incarnation != previous)
+                        }) {
                             anyhow::bail!("`{subject}` could not restart: {fault}");
                         }
                         if agent.state == "waiting"
@@ -12560,8 +12565,11 @@ async fn run_agents(
                     }
                     for event in page.items {
                         let fields = event.body.get("fields").unwrap_or(&event.body);
-                        if event.kind == "runtime.reconcile-decision"
-                            && matches!(fields["decision"].as_str(), Some("member-fault" | "raise"))
+                        if event.kind == "runtime.action.failed"
+                            && fields["action"] == "restart"
+                            && event.body["evidence"].as_array().is_some_and(|evidence| {
+                                evidence.iter().any(|id| id.as_str() == Some(request.id.as_str()))
+                            })
                         {
                             anyhow::bail!(
                                 "`{subject}` could not restart: {}; inspect it with `st agents show {subject}`",
