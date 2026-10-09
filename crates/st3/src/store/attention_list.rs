@@ -176,6 +176,7 @@ impl Store {
         }
         if changed {
             list.revision.send_modify(|revision| *revision += 1);
+            self.publish_collection_view("attention");
         }
     }
 

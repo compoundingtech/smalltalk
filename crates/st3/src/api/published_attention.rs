@@ -14,14 +14,18 @@ const ATTENTION_LIST_REFRESH_PAUSE: Duration = Duration::from_secs(1);
 /// clock. The same period collection windows used to reread attention on.
 const ATTENTION_LIST_CLOCK: Duration = Duration::from_secs(30);
 
-/// How long after a window last read the list the refresher keeps following commits. After
-/// that it waits for a window to ask; that window gets the newest publication meanwhile.
+/// How long after a window last read attention or a summary the refresher keeps folding
+/// attention for new commits. Their windows reread at least every clock period while they are
+/// open, so this passes only when none is. A window that opens later gets the newest list at
+/// once and wakes the refresher.
 const ATTENTION_LIST_IDLE: Duration = Duration::from_secs(600);
 
-/// Keep the attention list published off the request path. As the daemon starts it folds the
-/// list once; after that it refreshes when a commit lands, when the clock passes the list's
-/// period, or when a window asks. A refresh folds again only when something attention reads
-/// changed (see `Store::attention_list_delta`); otherwise it keeps the same rows.
+/// Keep attention, every person's glasses and arrangements, and the summary rows windows read
+/// published off the request path. As the daemon starts it folds them once; after that it
+/// refreshes, at most once a second, when a commit lands, a roster is published, the clock
+/// passes attention's period, or a window asks. A refresh folds attention again only when
+/// something attention reads changed (see `Store::attention_list_delta`) and reads again only
+/// the people whose glasses or arrangements changed; otherwise each view keeps its rows.
 pub fn start_attention_list(state: &AppState) {
     // An escape hatch while the published list is new: windows then fold attention as before.
     if std::env::var_os("ST3_ATTENTION_LIST").is_some_and(|value| value == "off") {
@@ -35,17 +39,21 @@ pub fn start_attention_list(state: &AppState) {
     let mut changed = state.event_notify.subscribe();
     let mut roster = state.store.subscribe_agent_roster();
     tokio::spawn(async move {
+        let idle = ATTENTION_LIST_IDLE.as_millis() as u64;
         loop {
             let started = tokio::time::Instant::now();
             let reader = store.clone();
             let summary_state = state.clone();
+            // Attention folds only while windows read it; the first fold always runs.
+            let attention = store.attention_list_read_within(idle)
+                || store.newest_attention_list().1.is_none();
             // One view at a time: attention, every person's glasses and arrangements, then the
             // summary rows windows read.
             // One view's failure leaves the others refreshing.
             let refreshed = tokio::task::spawn_blocking(move || {
                 [
                     ("attention", crate::performance::task("attention/refresh", || {
-                        refresh_attention_list(&reader)
+                        if attention { refresh_attention_list(&reader) } else { Ok(()) }
                     })),
                     ("glasses and arrangements", crate::performance::task("person-views/refresh", || {
                         refresh_owner_lists(&reader)
@@ -71,34 +79,22 @@ pub fn start_attention_list(state: &AppState) {
                 Err(error) => eprintln!("st3: published view refresh stopped: {error}"),
             }
             tokio::time::sleep(started.elapsed().max(ATTENTION_LIST_REFRESH_PAUSE)).await;
-            let idle = ATTENTION_LIST_IDLE.as_millis() as u64;
-            // Commits and clock ticks matter only while someone reads; a window's ask always does.
-            loop {
-                tokio::select! {
-                    () = wake.notified() => break,
-                    result = changed.changed() => {
-                        if result.is_err() {
-                            return;
-                        }
-                        if store.attention_list_read_within(idle) {
-                            break;
-                        }
-                    }
-                    // The summary counts working agents from the published roster.
-                    result = roster.changed() => {
-                        if result.is_err() {
-                            return;
-                        }
-                        if store.attention_list_read_within(idle) {
-                            break;
-                        }
-                    }
-                    () = tokio::time::sleep(ATTENTION_LIST_CLOCK) => {
-                        if store.attention_list_read_within(idle) {
-                            break;
-                        }
+            // A glasses or arrangements window rereads only when its view publishes, so every
+            // commit is weighed; with nothing changed that is a few indexed reads.
+            tokio::select! {
+                () = wake.notified() => {}
+                result = changed.changed() => {
+                    if result.is_err() {
+                        return;
                     }
                 }
+                // The summary counts working agents from the published roster.
+                result = roster.changed() => {
+                    if result.is_err() {
+                        return;
+                    }
+                }
+                () = tokio::time::sleep(ATTENTION_LIST_CLOCK) => {}
             }
         }
     });
@@ -161,7 +157,9 @@ pub(crate) fn refresh_attention_list(store: &Store) -> anyhow::Result<()> {
 /// snapshot, reading again only the people whose rows may have changed.
 pub(crate) fn refresh_owner_lists(store: &Store) -> anyhow::Result<()> {
     for view in OwnerView::ALL {
-        store.refresh_owner_list(view, client_now_ms())?;
+        if store.refresh_owner_list(view, client_now_ms())? {
+            store.publish_collection_view(view.collection());
+        }
     }
     Ok(())
 }
