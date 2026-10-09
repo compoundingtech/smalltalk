@@ -17621,7 +17621,8 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         assert!(launch("agent/fresh", "two", "omp", Some(seed.clone()), false).await.unwrap_err().to_string().contains("first-native-launch-incomplete"), "adding a seed after a failed fresh launch must never re-arm");
         append("agent/deliberately-fresh", "runtime.action.requested", json!({"action":"fresh-context"}));
         assert_eq!(launch("agent/deliberately-fresh", "one", "omp", Some(invalid.clone()), false).await.unwrap(), None);
-        assert_eq!(launch("agent/strict", "one", "omp", Some(invalid), true).await.unwrap(), None, "strict suspension selection takes precedence");
+        assert!(launch("agent/strict", "conflicting", "omp", Some(invalid), true).await.unwrap_err().to_string().contains("native seed cannot accompany resume environment"));
+        assert_eq!(launch("agent/strict", "one", "omp", None, true).await.unwrap(), None, "a rejected seed conflict must not consume the opportunity; strict resume proceeds without a seed");
         server.abort();
     }
 

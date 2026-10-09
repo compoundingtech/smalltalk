@@ -1343,14 +1343,19 @@ native transcript on its first native launch only. The transcript's filename and
 name the same UUID, every transcript line must be valid JSON, and the file must belong to the
 launch owner. The driver links only that transcript into its managed inventory, then atomically
 records a typed `seeded` outcome before spawning the provider. Missing or corrupt input records
-no outcome. Other harnesses do not accept `seed`; authored session selectors and resume
-environment cannot be combined with it.
+no outcome. Other harnesses do not accept `seed`; authored session selectors and effective resume
+or continuation environment cannot be combined with it. The driver rejects these conflicts
+before accessing the daemon, staging inventory, or recording a first-launch outcome.
 
 Every first native launch, including one without a seed or deliberately fresh, records one
 seat-scoped `seeded` or `fresh` outcome. Its identity does not depend on the declaration,
 transcript path, account, or harness. An existing native binding always wins. Later edits,
 restarts, fresh-context actions, account changes, and refused continuations never re-arm the
 opportunity. Strict suspension resume keeps its exact session selection.
+When reconciliation supplies an exact native resume or continuation, it omits the declaration's
+wrapper seed argument and preserves the native selection environment. This gives generated
+continuation precedence without allowing an explicit seed/environment combination at the driver
+boundary.
 
 If an outcome exists but the seat has never bound a native session, the next launch fails
 explicitly with `first-native-launch-incomplete`; it never silently reseeds. This includes a

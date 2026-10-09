@@ -27,19 +27,17 @@ fn receipt(subject: &str, incarnation: &str, outcome: &Outcome) -> ClaimInput {
     .expect("outcome is an object");
     fields.insert("agent".into(), subject.into());
     fields.insert("incarnation".into(), incarnation.into());
+    fields.insert("invocation_id".into(), uuid::Uuid::now_v7().to_string().into());
     ClaimInput {
         subject: marker(subject),
         kind: "custom.agent.first-native-launch".into(),
         actor: Some(subject.into()),
         fields,
         evidence: vec![],
-        expected_subject: Some(None),
-        // Different invocations cannot accept an idempotency replay as their own successful CAS.
-        idempotency_key: Some(format!(
-            "first-native-launch:{}:{}",
-            marker(subject),
-            uuid::Uuid::now_v7()
-        )),
+        expected_subject: None,
+        // One atomic operation key fences the seat; invocation_id distinguishes the winning
+        // receipt from a cached response returned to another provider attempt.
+        idempotency_key: Some(format!("first-native-launch:{}", marker(subject))),
     }
 }
 
@@ -51,6 +49,38 @@ async fn prior(client: &crate::client::Client, subject: &str) -> Result<bool> {
         ))
         .await?;
     Ok(!page.claims.is_empty())
+}
+
+/// Generated exact resume/continuation takes precedence over a declaration's seed. Omit the
+/// wrapper selector so the driver boundary never receives both opportunities together.
+pub fn omit_seed_for_native_resume(member: &mut crate::model::MemberSpec) {
+    if member.driver.as_deref() != Some("omp")
+        || ![
+            crate::suspension::RESUME_ENV,
+            crate::suspension::CONTINUE_ENV,
+            crate::suspension::CONTINUE_PATH_ENV,
+        ].iter().any(|variable| member.environment.contains_key(*variable))
+    {
+        return;
+    }
+    let crate::model::LaunchSpec::Argv(argv) = &mut member.launch else {
+        return;
+    };
+    // Skip scalar wrapper values: an initial message may literally be "--seed" or "--".
+    let mut index = 3;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--" => break,
+            "--seed" => {
+                argv.drain(index..index + 2);
+                return;
+            }
+            "--subject" | "--identity" | "--initial-message" | "--initial-message-id" => {
+                index += 2;
+            }
+            _ => index += 1,
+        }
+    }
 }
 
 /// Validate and stage before compare-and-create; only the winning invocation may spawn seeded.
@@ -65,6 +95,10 @@ pub async fn first_launch(
     strict_resume: bool,
 ) -> Result<Option<String>> {
     anyhow::ensure!(seed.is_none() || driver == "omp", "native seed is OMP-only");
+    anyhow::ensure!(
+        seed.is_none() || !strict_resume,
+        "native seed cannot accompany resume environment"
+    );
     let mut after = 0;
     let mut deliberately_fresh = strict_resume;
     loop {
@@ -104,16 +138,20 @@ pub async fn first_launch(
         },
         None => Outcome::Fresh,
     };
-    if let Err(error) = client
-        .post::<_, ClaimRecord>("/v1/claims", &receipt(subject, incarnation, &outcome))
-        .await
-    {
-        if prior(client, subject).await? {
-            anyhow::bail!(
-                "first-native-launch-incomplete: another invocation already recorded the first launch outcome; refusing to spawn"
-            );
+    let input = receipt(subject, incarnation, &outcome);
+    match client.post::<_, ClaimRecord>("/v1/claims", &input).await {
+        Ok(record) => anyhow::ensure!(
+            record.body.pointer("/fields/invocation_id") == input.fields.get("invocation_id"),
+            "first-native-launch-incomplete: another invocation already recorded the first launch outcome; refusing to spawn"
+        ),
+        Err(error) => {
+            if prior(client, subject).await? {
+                anyhow::bail!(
+                    "first-native-launch-incomplete: another invocation already recorded the first launch outcome; refusing to spawn"
+                );
+            }
+            return Err(error);
         }
-        return Err(error);
     }
     Ok(match outcome {
         Outcome::Fresh => None,
@@ -193,6 +231,35 @@ pub fn stage(seed: &Path, sessions: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_seed_generated_resume_omits_only_the_wrapper_seed() {
+        for message in ["--seed", "--"] {
+            let intent = crate::parse_intent(
+                &format!("version 2\nagent \"example\" {{ workspace \"/work\"; harness \"omp\" {{ seed \"/seed.jsonl\"; message {message:?} id=\"initial\"; args \"--\" \"--seed\" \"literal\"; }} }}"),
+                "node",
+            ).unwrap();
+            let original = intent.subjects.values().find_map(|subject| subject.member.as_ref()).unwrap();
+            let crate::model::LaunchSpec::Argv(original_argv) = &original.launch else {
+                panic!("typed launch expected");
+            };
+            let seed_index = original_argv.windows(2).position(|pair| pair == ["--seed", "/seed.jsonl"]).unwrap();
+            let mut expected = original_argv.clone();
+            expected.drain(seed_index..seed_index + 2);
+            for variable in [crate::suspension::RESUME_ENV, crate::suspension::CONTINUE_ENV, crate::suspension::CONTINUE_PATH_ENV] {
+                let mut member = original.clone();
+                member.environment.insert(variable.into(), "native".into());
+                omit_seed_for_native_resume(&mut member);
+                let crate::model::LaunchSpec::Argv(argv) = &member.launch else { unreachable!() };
+                assert_eq!(*argv, expected);
+                assert_eq!(member.environment[variable], "native");
+            }
+            let mut first_launch = original.clone();
+            omit_seed_for_native_resume(&mut first_launch);
+            assert_eq!(first_launch.launch, original.launch);
+        }
+    }
+
     #[test]
     fn native_seed_validates_before_staging_and_links_only_one_transcript() {
         let source = tempfile::tempdir().unwrap();
@@ -226,6 +293,20 @@ mod tests {
         );
     }
     #[test]
+    fn native_seed_one_seat_operation_cannot_record_a_second_outcome() {
+        let store = crate::store::Store::open_memory("node").unwrap();
+        let winner = receipt("agent/example", "one", &Outcome::Fresh);
+        let loser = receipt("agent/example", "one", &Outcome::Seeded { session_id: "native".into() });
+        let recorded = store.append_claim(&winner).unwrap();
+        if let Ok(replayed) = store.append_claim(&loser) {
+            assert_eq!(replayed.id, recorded.id);
+            assert_eq!(replayed.body.pointer("/fields/invocation_id"), winner.fields.get("invocation_id"));
+            assert_ne!(replayed.body.pointer("/fields/invocation_id"), loser.fields.get("invocation_id"));
+        }
+        assert_eq!(store.claims_for(&marker("agent/example"), Some("custom.agent.first-native-launch")).unwrap().len(), 1);
+    }
+
+    #[test]
     fn native_seed_receipt_identity_is_seat_scoped_and_outcome_is_typed() {
         let fresh = receipt("agent/example", "one", &Outcome::Fresh);
         let seeded = receipt(
@@ -236,8 +317,9 @@ mod tests {
             },
         );
         assert_eq!(fresh.subject, seeded.subject);
-        assert_eq!(fresh.expected_subject, Some(None));
-        assert_ne!(fresh.idempotency_key, seeded.idempotency_key);
+        assert_eq!(fresh.expected_subject, None);
+        assert_eq!(fresh.idempotency_key, seeded.idempotency_key);
+        assert_ne!(fresh.fields["invocation_id"], seeded.fields["invocation_id"]);
         assert_eq!(fresh.fields["outcome"], "fresh");
         assert_eq!(seeded.fields["outcome"], "seeded");
     }
