@@ -246,7 +246,11 @@ async fn collection_items_with_windows(
     let arrangement_window = collection == "arrangements";
     let mut admitted = collection != "agents";
     let (snapshot, mut items, mut has_more) = loop {
-        let roster_admission = if matches!(collection.as_str(), "agents" | "summary") && admitted {
+        // Summary reads the published roster once a refresher keeps one; only a store without
+        // one folds it here, behind the shared admission.
+        let roster_admission = if admitted && (collection == "agents"
+            || collection == "summary" && !state.store.agent_roster_refresher_running())
+        {
             Some(state.store.admit_agent_resources().await)
         } else {
             None
@@ -11234,6 +11238,34 @@ mission "queue-parity" state="ready" {
             Query(continue_query)).await.unwrap_err();
         assert_eq!(expired.code, "page-cursor-expired");
         assert_eq!(state.store.agent_resources_builds_for_test(), builds);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_summary_reads_the_publication_without_roster_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/summary-roster".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"summary-roster", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+        // A slow refresh holds the roster admission; summary must not queue behind it.
+        let _refresh = state.store.admit_agent_resources().await;
+        let request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe", "id":"summary", "collection":"summary",
+        })).unwrap();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let (_, items, _) = tokio::time::timeout(Duration::from_secs(2),
+            collection_items_with_windows(&state, &ClientSession::local(None).unwrap(), &request,
+                semaphore.acquire_owned().await.unwrap(),
+                collection_windows::Windows::attach(&state.store)))
+            .await.expect("summary must not wait for the roster admission").unwrap();
+        assert_eq!(items[0]["kind"], "summary");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -114,7 +114,16 @@ pub(super) fn native(
                 && (m["active"] == true || gates.contains(m["id"].as_str().unwrap_or_default()))
         })
         .count();
-    let mut agents = client_agent_resources_cached(store, false, snapshot.store_index)?;
+    // A daemon's reads never fold the roster: count from its newest publication.
+    let mut agents = if store.agent_roster_refresher_running() {
+        let Some((_, cards, _)) = store.published_agent_roster(snapshot.store_index, false) else {
+            store.request_agent_roster_refresh();
+            anyhow::bail!("the agents roster is still being prepared; retry shortly");
+        };
+        (*cards).clone()
+    } else {
+        client_agent_resources_cached(store, false, snapshot.store_index)?
+    };
     overlay_agent_resources(store, &mut agents, &client_timestamp(now))?;
     let working = agents.iter().filter(|agent| working(agent)).count();
     let machines = machine_summary_resources(state, snapshot, session)?;
