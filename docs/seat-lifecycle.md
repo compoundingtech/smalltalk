@@ -255,11 +255,11 @@ Ctrl+\\ detaches and leaves the agent running. `st terminals attach agent/builde
 again later, from any machine in the fleet. A terminal on another host is attached PTY to PTY over
 Fabric when that host runs `st terminals expose-fabric` and grants your machine the protocol it
 prints; no st daemon carries the bytes. Otherwise it goes through the client gateway as your
-person, the same path the apps use. `stui` on a machine with its own st daemon never uses the
-gateway for a terminal: a terminal on this host is its PTY session, one on another fleet host is
-attached over Fabric, and the daemon only says where it lives. When Fabric cannot reach the owner,
-stui says why in the terminal pane instead of relaying through a daemon. A paired device with no
-daemon of its own, such as the phone, keeps the gateway.
+person, the same path the apps use. `stui` on a machine with its own st daemon attaches a terminal on this host to its PTY session, and one
+on another fleet host over Fabric when Fabric reaches the owner; the daemon only says where it lives.
+When Fabric cannot reach the owner, stui goes through the client gateway and the terminal header
+says so with Fabric's reason. An owner that refuses the incarnation is never worked around. A paired
+device with no daemon of its own, such as the phone, uses the gateway.
 
 After creating a seat, st explains whether it is ready or still starting and prints the exact
 commands to attach, send it a message, inspect it, and stop it. These commands are also printed

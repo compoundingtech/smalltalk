@@ -705,10 +705,14 @@ pub fn run(context: Context) -> Result<()> {
                         ));
                     }
                     let (rows, columns) = ui.terminal_size.get();
+                    let route = direct.route.clone();
                     if let Some(view) = ui
                         .terminal_view_mut(&agent)
                         .filter(|view| view.native.is_none())
                     {
+                        // The route stays in the header, so the person can always see it.
+                        view.name = format!("{} · {route}", view.name);
+                        view.title = view.name.clone();
                         view.native = Some(super::pty::NativeTerminal::spawn(
                             direct.stream,
                             &direct.name,
@@ -718,6 +722,7 @@ pub fn run(context: Context) -> Result<()> {
                         ));
                         view.stale = None;
                     }
+                    ui.flash(format!("Attached · {route}"));
                 }
                 Fetched::Reattached { agent, outcome } => {
                     reattaching = false;
@@ -3198,6 +3203,8 @@ struct Direct {
     name: String,
     incarnation: String,
     stream: std::os::unix::net::UnixStream,
+    /// How it was reached, for the person: `local PTY`, `Fabric to HOST`, or `via the daemon (…)`.
+    route: String,
 }
 
 /// A direct stream to `subject`'s PTY session: st's raw terminal stream, fenced to the
@@ -3329,18 +3336,22 @@ async fn attach_terminal(
         },
     )
     .await?;
-    if let direct::Opened::Stream {
-        stream,
-        name,
-        incarnation,
-    } = opened
-    {
-        return Ok(Direct {
+    let route = match opened {
+        direct::Opened::Stream {
+            stream,
             name,
             incarnation,
-            stream,
-        });
-    }
+            route,
+        } => {
+            return Ok(Direct {
+                name,
+                incarnation,
+                stream,
+                route,
+            });
+        }
+        direct::Opened::UseGateway { route } => route,
+    };
     let attachment = client
         .raw_terminal_attachment(terminal, &incarnation, st3_client::RawTerminalMode::Attach)
         .await
@@ -3355,6 +3366,7 @@ async fn attach_terminal(
             name,
             incarnation,
             stream,
+            route,
         })
         .map_err(|error| error.to_string())
 }

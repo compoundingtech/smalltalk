@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "stui attaches a terminal on its own host to the local PTY session and one on another fleet host over Fabric, never through a daemon; fleet members no longer fall back to the client gateway for terminals",
+  "summary": "stui attaches a terminal on its own host to the local PTY session and one on another fleet host over Fabric when Fabric reaches the owner, otherwise through the daemon's client gateway as before, and shows which route each attach used",
   "replay": {
     "status": "none",
     "detail": "No replay, backfill, stored data or transcript change."
@@ -15,15 +15,15 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "stui on a machine with its own daemon no longer falls back to the client gateway for a terminal on another host: the owner must run st terminals expose-fabric and grant this machine st3/pty/FLEET_ID, or stui says Fabric did not reach it. Paired devices without a daemon keep the gateway. A newer stui against an older daemon on the same machine, one without the local-terminal route, treats a local terminal as remote and shows a Fabric error until that daemon restarts onto the new build, so restart the daemon before or with stui. Swift and TypeScript clients and the wire are unchanged."
+    "detail": "stui on a machine with its own daemon tries Fabric (st3/pty/FLEET_ID) for a terminal on another host and falls back to the client gateway when Fabric cannot reach the owner, as before; no host has to expose terminals before stui ships. An owner that refuses the incarnation is never worked around. Each attach names its route in the terminal header and a notice: local PTY, Fabric to HOST, or via the daemon with Fabric's reason. An owner Fabric could not reach is not tried again for a minute. A newer stui against an older daemon on the same machine, one without the local-terminal route, treats a local terminal as remote and goes through the gateway until that daemon restarts onto the new build. Swift and TypeScript clients and the wire are unchanged."
   },
   "downtime": {
     "status": "none",
     "detail": "Ordinary rolling deployment; no data conversion or extra startup work."
   },
   "manual": {
-    "status": "changed",
-    "detail": "Before this stui attaches a remote terminal, each fleet host runs st terminals expose-fabric and allows st3/pty/FLEET_ID for the other fleet hosts' Fabric peers, then fabric reload-peers. Restart the local daemon onto the same build as stui."
+    "status": "none",
+    "detail": "No manual action is required. A host that runs st terminals expose-fabric and grants st3/pty/FLEET_ID to the other fleet hosts' Fabric peers makes remote attaches faster; without it they use the gateway."
   },
   "recovery": {
     "status": "none",
