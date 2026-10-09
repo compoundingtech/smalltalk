@@ -12,6 +12,7 @@ import { spaceVars } from '../../../../packages/fractal-ui/src/assistant-ui/comp
 import { LiveAgentTodos } from '../conversation/todos/AgentTodos.tsx'
 import type { UxTelemetry } from '../telemetry/ux.ts'
 import type { ConversationPage, Feed } from '../data/source.ts'
+import type * as Atom from 'effect/reactivity/Atom'
 
 /** The follow owns content and the kit owns its presentation. The display-contents host
  * boundary observes asynchronous runtime adoption without inventing a kit commit hook.
@@ -23,6 +24,7 @@ export const ConversationPane = ({
   onOpenTool,
   ux,
   visible = true,
+  interest: shellInterest,
 }: {
   readonly agentRef: string
   /** Roster display name: the composition header and assistant sender captions. */
@@ -32,13 +34,14 @@ export const ConversationPane = ({
   readonly ux?: UxTelemetry
   /** A retained hidden pane keeps its DOM but releases visible follow demand (setVisible false). */
   readonly visible?: boolean
+  /** Already acquired by the shell before this module loaded; standalone panes acquire their own. */
+  readonly interest?: Atom.Atom<void>
 }) => {
   const source = useDataSource()
   const showSystemEvents = useAtomValue(systemEventsPreference)
-  // Visible demand is an effect: hiding unmounts the interest, whose finalizer marks the
-  // SDK follow invisible and therefore evictable, while the retained DOM stays mounted.
-  const interest = React.useMemo(() => source.conversationInterest?.(agentRef), [source, agentRef])
-  useFeedInterest({ interest, visible })
+  // The shell owns early demand; a standalone pane owns the same source interest itself.
+  const interest = React.useMemo(() => shellInterest ?? source.conversationInterest?.(agentRef), [shellInterest, source, agentRef])
+  useFeedInterest({ interest, visible: shellInterest === undefined && visible })
   const feed = useConversation(agentRef)
   const projectTranscript = React.useMemo(createConversationTranscript, [])
   const state = projectTranscript(feed, { agentName, showSystemEvents })

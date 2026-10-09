@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import * as ts from 'typescript'
 import type { ConversationItem } from '../conversation/model.ts'
 import type { ConversationPage, Feed } from '../data/source.ts'
 import type { FeedSyncObservation } from '../data/feedSync.ts'
@@ -196,7 +197,16 @@ describe('ConversationPane kit composition', () => {
   it('owns only the structural commit boundary, not transcript presentation', () => {
     const pane = readFileSync(new URL('./ConversationPane.tsx', import.meta.url), 'utf8')
     expect(pane).not.toMatch(/stylex\.props|className/)
-    expect(pane.match(/<[a-z][a-z\d]*(?:\s|>)/g)).toEqual(['<div ', '<div ', '<div '])
+    const tree = ts.createSourceFile('ConversationPane.tsx', pane, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+    const intrinsicElements: string[] = []
+    const visit = (node: ts.Node) => {
+      if ((ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) &&
+          ts.isIdentifier(node.tagName) && /^[a-z]/.test(node.tagName.text))
+        intrinsicElements.push(node.tagName.text)
+      ts.forEachChild(node, visit)
+    }
+    visit(tree)
+    expect(intrinsicElements).toEqual(['div', 'div', 'div'])
     expect(pane).toContain("style={{ display: 'contents' }}")
     const workspace = readFileSync(new URL('./LiveAgentWorkspace.tsx', import.meta.url), 'utf8')
     expect(workspace).toContain('createPortal(<WorkspaceBody current={current} rosterRefs={agents.map(agent => agent.ref)} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />, paneHost)')

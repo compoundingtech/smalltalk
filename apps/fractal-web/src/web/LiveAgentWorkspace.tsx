@@ -17,7 +17,7 @@ import { SidebarAgentRow, ThreadHeader, ResizableSplit, assistantDarkTheme, live
 import type { WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
 import { ViewportStore, ViewportStoreContext } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceScrollViewport.tsx'
 import { terminalSubjectForAgent } from '../data/projections.ts'
-import { useFleet, useSubjectList, useConnection, useNow } from '../data/react.tsx'
+import { useFleet, useSubjectList, useConnection, useNow, useFeedInterest, useDataSource } from '../data/react.tsx'
 import { persistedAtom } from '../state/persistence.ts'
 import { WorkbenchContextProvider, ResourcePanelProvider, MonitorDetailProvider, type OpenRequest } from '../shell/context.tsx'
 import type { ResourcePanelState } from '../shell/state.ts'
@@ -45,7 +45,15 @@ const prefetchConversationPane = () => {
   void request.catch(() => {})
 }
 
-class ConversationPaneLoadBoundary extends React.Component<React.ComponentProps<typeof ConversationPaneModule.ConversationPane>> {
+/** Acquire visible route demand outside Suspense so the socket read overlaps pane evaluation. */
+const ConversationPaneLoadBoundary = (props: React.ComponentProps<typeof ConversationPaneModule.ConversationPane>) => {
+  const source = useDataSource()
+  const interest = React.useMemo(() => source.conversationInterest?.(props.agentRef), [source, props.agentRef])
+  useFeedInterest({ interest, visible: props.visible ?? true })
+  return <ConversationPaneCodeBoundary {...props} interest={interest} />
+}
+
+class ConversationPaneCodeBoundary extends React.Component<React.ComponentProps<typeof ConversationPaneModule.ConversationPane>> {
   state: { readonly failed: boolean; readonly Pane: typeof ConversationPane } = {
     failed: false,
     Pane: prefetchedConversationPane ?? ConversationPane,

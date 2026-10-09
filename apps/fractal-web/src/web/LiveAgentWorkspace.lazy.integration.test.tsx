@@ -24,6 +24,8 @@ vi.mock('../data/react.tsx', () => ({
   useSubjectList: () => [],
   useConnection: () => ({ _tag: 'Waiting' }),
   useNow: () => 0,
+  useDataSource: () => ({}),
+  useFeedInterest: () => {},
 }))
 
 let workspace: typeof WorkspaceModule

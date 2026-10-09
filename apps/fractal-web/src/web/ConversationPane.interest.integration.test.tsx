@@ -1,14 +1,15 @@
 // @vitest-environment jsdom
 /**
- * The pane owns conversation demand: a cold mount on a route-named agent follows through the
- * real SDK and live source (scripted gateway, real socket commands), and switching agents
- * moves that demand with the keyed pane. Nothing here mocks the data hooks.
+ * The shell acquires route demand before pane code loads; standalone panes own their demand.
+ * Cold mounting and switching agents follow through the real SDK and live source
+ * (scripted gateway, real socket commands). Nothing here mocks the data hooks.
  */
 import type { Agent, CollectionCommand, CollectionFrame, CollectionSocket, Snapshot, TimelineEntry } from '@smalltalk/st3-client'
 import { webcrypto } from 'node:crypto'
 import { setTimeout as yieldIo } from 'node:timers/promises'
 import * as Native from '@smalltalk/st3-client/schema'
 import { flushSync } from 'react-dom'
+import type { ComponentProps } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // The kit compiles StyleX at build time; node tests stub only the CSS runtime, never data hooks.
@@ -278,6 +279,59 @@ const mountPane = (agentRef: string) => {
 const paneText = () => container.textContent ?? ''
 
 describe('ConversationPane conversation demand', () => {
+  it('follows before the pane import resolves, hands off one interest, and releases it on navigation and unmount', async () => {
+    window.history.replaceState(null, '', '/w/agent/route')
+    open(1)
+    const interest = live!.source.conversationInterest!('agent/route')
+    let handedInterest: typeof interest | undefined
+    let resolveImport!: () => void
+    const imported = new Promise<void>(resolve => { resolveImport = resolve })
+    vi.doMock('./ConversationPane.tsx', async () => {
+      await imported
+      return {
+        ConversationPane: (props: ComponentProps<typeof ConversationPane>) => {
+          handedInterest = props.interest
+          return <ConversationPane {...props} />
+        },
+      }
+    })
+    try {
+      root = createRoot(container)
+      flushSync(() => root!.render(
+        <DataSourceProvider source={live!.source} registry={live!.registry}><LiveAgentWorkspace /></DataSourceProvider>,
+      ))
+      await settle()
+      expect(container.querySelector('[aria-label="Loading conversation"]')).not.toBeNull()
+      expect(gateway!.subscribesFor('agent/route')).toBe(1)
+      resolveImport()
+      gateway!.conversationFrame('agent/route', [prompt(1, 'Early prompt'), entry(2, 'Early conversation')])
+      await until(() => paneText().includes('Early conversation'))
+      expect(handedInterest).toBe(interest)
+      expect(gateway!.subscribesFor('agent/route')).toBe(1)
+      flushSync(() => {
+        window.history.pushState(null, '', '/w/agent/other')
+        window.dispatchEvent(new PopStateEvent('popstate'))
+      })
+      await until(() => gateway!.subscribesFor('agent/other') === 1)
+      expect(gateway!.unsubscribedRefs()).toEqual(['agent/route'])
+      flushSync(() => root!.unmount())
+      root = undefined
+      // With one slot, this follow can only proceed if the unmounted shell released
+      // the last visible interest in the previous conversation.
+      const release = live!.registry.mount(live!.source.conversationInterest!('agent/final'))
+      try {
+        await until(() => gateway!.subscribesFor('agent/final') === 1)
+        expect(gateway!.unsubscribedRefs()).toEqual(['agent/route', 'agent/other'])
+      } finally {
+        release()
+      }
+    } finally {
+      resolveImport()
+      vi.doUnmock('./ConversationPane.tsx')
+      window.history.replaceState(null, '', '/')
+    }
+  })
+
   it('follows a cold route-named agent on mount, reaches Live and renders its message', async () => {
     open()
     expect(gateway!.subscribesFor('agent/route')).toBe(0)
