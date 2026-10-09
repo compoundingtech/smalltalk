@@ -122,6 +122,7 @@ const noWorkLogs: readonly WorkLogProjection[] = []
 export function EmbraceThread({ items: snapshot, workLogs, readingColumn = false, embrace = 'E1', tools = 'rows', senders = 'S2', composer = 'C1', history, targetLabel, disabledReason, threadList, toolbar, composerProps, onCommit, onRetrySend, resolveImage, onLoadImage, emptyState, style }: EmbraceThreadProps) {
   const imageOptions = React.useMemo(() => ({ resolveImage, onLoadImage }), [resolveImage, onLoadImage])
   const messages = useAuiState(state => state.thread.messages)
+  const isRunning = useAuiState(state => state.thread.isRunning)
   // The adapter commits after React renders its new input snapshot. Use the
   // runtime's committed identities and source references so RAC never measures
   // a temporarily missing message as a zero-height row, and branches stay aligned.
@@ -148,8 +149,8 @@ export function EmbraceThread({ items: snapshot, workLogs, readingColumn = false
     : <>{row.liveWork ? <WorkLogV1 key={row.liveWork.id} turn={row.liveWork.turn} /> : null}{row.toolItems ? <EmbraceToolRun forceExpanded={workLogs !== undefined} items={row.toolItems} renderItem={item => renderMessage(row.indices.find(index => items[index]!.id === item.id)!)} /> : renderMessage(row.indices[0]!)}</>
   const renderRow = (row: TranscriptRow) => readingColumn ? <div data-testid="transcript-reading-column" {...stylex.props(readingColumnStyles.column)}>{renderRowContent(row)}</div> : renderRowContent(row)
   const transcript = embrace === 'E3'
-    ? <EmbraceScrollViewport items={rows} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.viewport)}>{rows.map(row => <React.Fragment key={row.id}>{renderRow(row)}</React.Fragment>)}</EmbraceScrollViewport>
-    : <EmbraceVirtualConversation items={rows} renderItem={renderRow} />
+    ? <EmbraceScrollViewport items={rows} isRunning={isRunning} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={-1} {...stylex.props(styles.viewport)}>{rows.map(row => <React.Fragment key={row.id}>{renderRow(row)}</React.Fragment>)}</EmbraceScrollViewport>
+    : <EmbraceVirtualConversation items={rows} isRunning={isRunning} renderItem={renderRow} />
   return <MarkdownImagePolicy.Provider value={imageOptions}><EmbraceToolVariantContext.Provider value={tools}>
     <EmbraceToolRegistrations />
     <ThreadPrimitive.Root {...stylex.props(styles.root, readingColumn && styles.readingRoot, style)}>

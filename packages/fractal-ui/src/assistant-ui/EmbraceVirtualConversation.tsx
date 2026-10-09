@@ -1,7 +1,6 @@
 import * as stylex from '@stylexjs/stylex'
 import * as React from 'react'
 import {
-  Button,
   ButtonContext,
   GridList,
   GridListItem,
@@ -10,7 +9,8 @@ import {
 } from 'react-aria-components'
 
 import { ScrollController } from './embrace-virtual/ScrollController'
-import type { FollowState } from './embrace-virtual/FollowController'
+import { FollowAffordance } from './embrace-virtual/FollowAffordance'
+import { ViewportStoreContext } from './EmbraceScrollViewport'
 import { accentTokens, tokens } from './embrace-tokens.stylex'
 
 export interface EmbraceVirtualConversationProps<T extends { readonly id: string }> {
@@ -21,12 +21,13 @@ export interface EmbraceVirtualConversationProps<T extends { readonly id: string
   readonly style?: React.CSSProperties
   /** Source transcript's initial estimate; measured heights remain authoritative. */
   readonly estimatedRowHeight?: number
-  /** Changing conversations opens at the live edge. */
+  /** Conversation identity; an enclosing ViewportStore restores in-app reading positions. */
   readonly anchorKey?: string
   /** A changed own-send key resumes following. */
   readonly scrollToBottomKey?: string
-  /** @deprecated Accepted during the host migration; conversation opens no longer restore old anchors. */
+  /** @deprecated Local-storage restoration is removed; use the surface's in-memory ViewportStoreContext. */
   readonly persistAnchor?: boolean
+  readonly isRunning?: boolean
 }
 
 /**
@@ -47,17 +48,24 @@ function VirtualConversationBody<T extends { readonly id: string }>({
   style,
   estimatedRowHeight = 160,
   scrollToBottomKey,
+  anchorKey,
+  isRunning = false,
 }: EmbraceVirtualConversationProps<T>) {
+  const store = React.useContext(ViewportStoreContext)
   // Keep the actual instance so the source controller reads public row geometry.
   const [layout] = React.useState(() => new ListLayout())
-  const [followState, setFollowState] = React.useState<FollowState>({ _tag: 'Attached' })
-  const [scroll] = React.useState(() => new ScrollController({ layout, onStateChange: setFollowState }))
+  const [jumpVisible, setJumpVisible] = React.useState(false)
+  const [scroll] = React.useState(() => new ScrollController({ layout, saved: anchorKey === undefined ? undefined : store?.get(anchorKey), onVisibilityChange: setJumpVisible }))
   const previousCommand = React.useRef(scrollToBottomKey)
   React.useLayoutEffect(() => {
+    scroll.setRunning(isRunning)
     if (scrollToBottomKey !== undefined && scrollToBottomKey !== previousCommand.current) scroll.jump()
     previousCommand.current = scrollToBottomKey
-  }, [scroll, scrollToBottomKey])
+  }, [scroll, scrollToBottomKey, isRunning])
   React.useLayoutEffect(() => scroll.afterRowsChange(items), [scroll, items])
+  React.useLayoutEffect(() => () => {
+    if (anchorKey !== undefined) store?.save(anchorKey, scroll.released())
+  }, [scroll, anchorKey, store])
   const layoutOptions = React.useMemo(() => ({ estimatedRowHeight }), [estimatedRowHeight])
   const indexById = React.useMemo(() => {
     const indices = new Map<string, number>()
@@ -89,14 +97,8 @@ function VirtualConversationBody<T extends { readonly id: string }>({
           {renderRow}
         </GridList>
       </Virtualizer>
-      <span role="status" aria-live="polite" {...stylex.props(styles.announcement)}>{followState._tag === 'Detached' ? 'Reading earlier messages. Jump to latest is available.' : ''}</span>
-      {followState._tag === 'Detached' ? (
-        <div {...stylex.props(styles.jump)}>
-          <Button onPress={scroll.jump} {...stylex.props(styles.jumpButton)}>
-            New messages ↓
-          </Button>
-        </div>
-      ) : null}
+      <span role="status" aria-live="polite" {...stylex.props(styles.announcement)}>{jumpVisible ? 'Reading earlier messages. Scroll to end is available.' : ''}</span>
+      {jumpVisible ? <FollowAffordance hidden={false} onPress={scroll.activate} /> : null}
     </div>
   )
 }
@@ -147,20 +149,4 @@ const styles = stylex.create({
     minWidth: 0,
   },
   announcement: { position: 'absolute', width: 1, height: 1, overflow: 'hidden', clipPath: 'inset(50%)', whiteSpace: 'nowrap' },
-  jump: { flexShrink: 0, marginBlock: '12px', alignSelf: 'center' },
-  jumpButton: {
-    minHeight: '28px',
-    paddingInline: '12px',
-    borderWidth: 1,
-    borderStyle: 'solid',
-    borderColor: tokens.line,
-    borderRadius: '4px',
-    backgroundColor: { default: tokens.panel, ':hover': tokens.selection },
-    color: tokens.ink,
-    fontFamily: 'inherit',
-    fontSize: '12px',
-    cursor: 'pointer',
-    outlineColor: accentTokens.accent,
-    ':focus-visible': { outlineWidth: 2, outlineStyle: 'solid', outlineOffset: 2 },
-  },
 })

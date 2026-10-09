@@ -70,7 +70,7 @@ async function ready(canvasElement: HTMLElement) {
   const viewport = await waitFor(() => { const found = canvasElement.querySelector<HTMLElement>('[data-testid="transcript-scroll"]'); if (found === null || found.querySelectorAll('[data-testid="transcript-turn"]').length < initialTurns.length) throw new Error('History not committed'); return found })
   await waitFor(() => expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeLessThanOrEqual(2))
   const canvas = within(canvasElement)
-  return { viewport, canvas, jump: canvas.getByText('New messages ↓'), retries: canvas.getByTestId('retry-count') }
+  return { viewport, canvas, jump: canvas.getByText('Scroll to end'), retries: canvas.getByTestId('retry-count') }
 }
 /** A mouse press by coordinates: the release lands on whatever is under the pointer after `during`, and the click goes to the common ancestor, as in a browser. */
 async function pressAcross(target: HTMLElement, during: () => Promise<void>) {
@@ -124,7 +124,7 @@ export const SameRowsScrolledUp: Story = { play: async ({ canvasElement }) => {
   await readerScrollsUp(viewport)
   await userEvent.click(canvas.getByRole('button', { name: 'Republish snapshot' }))
   await settleFrames()
-  await expect(jump, 'detached reader needs the jump action').toBeVisible()
+  await waitFor(() => expect(jump, 'detached reader needs the jump action').toBeVisible())
   // A republished snapshot or append does not create a second action.
   await userEvent.click(canvas.getByRole('button', { name: 'Append agent reply' }))
   await waitFor(() => expect(jump).toBeVisible())
@@ -225,7 +225,7 @@ export const DetachedInsertAbovePressedRow: Story = { play: async ({ canvasEleme
   viewport.dispatchEvent(new WheelEvent('wheel', { deltaY: -viewport.scrollHeight }))
   viewport.scrollTop += row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - viewport.clientHeight / 2
   await settleFrames()
-  await expect(jump).toBeVisible()
+  await waitFor(() => expect(jump).toBeVisible())
   const top = row.getBoundingClientRect().top
   await pressAcross(retry, async () => {
     await settleFrames()

@@ -1,51 +1,75 @@
 import type { ListLayout } from 'react-aria-components'
-import { FollowController, type FollowState } from './FollowController'
+import type { ViewportState } from '../EmbraceScrollViewport'
+import { FollowController } from './FollowController'
+import { captureReadingAnchor, resolveReadingAnchor, type ReadingAnchor } from './ReadingAnchor'
 
 type Row = { readonly id: string }
-type ReadingPosition = { readonly key: string; readonly offset: number }
 
-/** RAC geometry adapter; follow transitions are owned by the same controller as the DOM lane. */
+/** RAC geometry adapter; follow intent, visibility and motion are shared with the measured lane. */
 export class ScrollController {
   private element: HTMLDivElement | null = null
-  private anchor: ReadingPosition | undefined
+  private anchor: ReadingAnchor | undefined
+  private pending: ViewportState | undefined
+  private lastTop = 0
   private frame: number | undefined
   private rowKeys = new Set<string>()
   private readonly follow: FollowController
 
   constructor(private readonly options: {
     readonly layout: ListLayout<unknown>
-    readonly onStateChange: (state: FollowState) => void
+    readonly saved?: ViewportState
+    readonly onVisibilityChange: (visible: boolean) => void
   }) {
     this.follow = new FollowController({
-      onStateChange: state => {
-        if (state._tag === 'Attached') this.anchor = undefined
-        this.options.onStateChange(state)
+      onStateChange: () => {
+        if (this.follow.attached) this.anchor = undefined
+        if (this.element !== null) this.element.dataset.followState = this.follow.attached ? 'attached' : 'detached'
       },
+      onVisibilityChange: () => this.options.onVisibilityChange(this.follow.showJump),
       onUserIntent: () => {
         if (this.frame !== undefined) cancelAnimationFrame(this.frame)
         this.frame = undefined
-        this.captureAnchor()
+        this.pending = undefined
+        if (this.element !== null) this.anchor = captureReadingAnchor(this.element)
       },
-      onUserScroll: () => { if (!this.follow.attached) this.captureAnchor() },
+      onUserScroll: () => {
+        if (this.element === null) return
+        this.lastTop = this.element.scrollTop
+        if (!this.follow.attached) this.anchor = captureReadingAnchor(this.element)
+      },
       schedule: () => this.schedule(),
     })
+    if (options.saved !== undefined && !options.saved.following) { this.pending = options.saved; this.follow.read() }
   }
 
+  readonly setRunning = (running: boolean) => this.follow.setRunning(running)
+  readonly released = (): ViewportState => ({
+    top: this.element?.scrollTop ?? this.lastTop, following: this.follow.attached, unread: this.follow.showJump,
+    anchor: this.anchor === undefined ? undefined : { rowId: this.anchor.rowId, text: this.anchor.text, offset: this.anchor.offset },
+  })
   readonly jump = () => {
     this.anchor = undefined
+    this.pending = undefined
     this.follow.jump()
+  }
+  readonly activate = () => {
+    this.anchor = undefined
+    this.pending = undefined
+    this.follow.jump(true)
   }
 
   /** React 19 cleans up the ref when the actual RAC scroll element unmounts. */
   readonly attach = (element: HTMLDivElement | null) => {
     if (element === null) return
     this.element = element
+    element.dataset.followState = this.follow.attached ? 'attached' : 'detached'
     const detach = this.follow.attach(element)
     const observer = new ResizeObserver(() => this.schedule())
     observer.observe(element)
     if (element.firstElementChild !== null) observer.observe(element.firstElementChild)
     this.schedule()
     return () => {
+      this.lastTop = element.scrollTop
       detach()
       observer.disconnect()
       if (this.frame !== undefined) cancelAnimationFrame(this.frame)
@@ -54,38 +78,35 @@ export class ScrollController {
     }
   }
 
-  private captureAnchor() {
-    const element = this.element
-    if (element === null) return
-    const top = element.getBoundingClientRect().top
-    let nearest: HTMLElement | undefined
-    let nearestTop = Infinity
-    for (const candidate of element.querySelectorAll<HTMLElement>('[data-embrace-entry-id]')) {
-      const rect = candidate.getBoundingClientRect()
-      if (rect.bottom > top && rect.top < nearestTop) {
-        nearest = candidate
-        nearestTop = rect.top
-      }
-    }
-    const key = nearest?.dataset['embraceEntryId']
-    if (key !== undefined) this.anchor = { key, offset: nearestTop - top }
-  }
-
   private schedule() {
     if (this.frame !== undefined) return
     this.frame = requestAnimationFrame(() => {
       this.frame = undefined
       const element = this.element
       if (element === null) return
-      if (this.follow.attached) element.scrollTop = element.scrollHeight
-      else if (this.anchor !== undefined && this.rowKeys.has(this.anchor.key)) {
-        const info = this.options.layout.getLayoutInfo(this.anchor.key)
-        if (info === null) return
-        element.scrollTop = info.rect.y - this.anchor.offset
-        const row = element.querySelector<HTMLElement>(`[data-embrace-entry-id="${CSS.escape(this.anchor.key)}"]`)
-        if (row !== null) element.scrollTop += row.getBoundingClientRect().top - element.getBoundingClientRect().top - this.anchor.offset
+      if (!this.follow.attached) {
+        const saved = this.pending?.anchor ?? this.anchor
+        if (saved !== undefined && this.rowKeys.has(saved.rowId)) {
+          const info = this.options.layout.getLayoutInfo(saved.rowId)
+          if (info === null) return
+          const connected = this.anchor?.element.isConnected === true ? this.anchor : undefined
+          if (connected === undefined) element.scrollTop = info.rect.y - saved.offset
+          const anchor = connected ?? resolveReadingAnchor(element, saved)
+          if (anchor !== undefined) {
+            element.scrollTop += anchor.element.getBoundingClientRect().top - element.getBoundingClientRect().top - anchor.offset
+            this.anchor = anchor
+            this.pending = undefined
+          }
+          this.follow.markWrite(element.scrollTop)
+        } else if (this.pending !== undefined && this.pending.anchor === undefined) {
+          element.scrollTop = this.pending.top
+          this.follow.markWrite(element.scrollTop)
+          this.anchor = captureReadingAnchor(element)
+          this.pending = undefined
+        }
       }
-      this.follow.markWrite(element.scrollTop)
+      this.follow.pin(element)
+      this.lastTop = element.scrollTop
     })
   }
 

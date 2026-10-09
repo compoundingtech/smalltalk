@@ -84,7 +84,7 @@ export interface WorkbenchProps {
   onRatioCommit?: (path: LayoutPath, ratio: number) => void
   /** Terminal sessions are opened in the caller's bottom drawer, not a new split; a ref selects that exact session. */
   onOpenTerminal?: (ref?: string) => void
-  /** @deprecated Accepted during the host migration; conversation opens always start at the live edge. */
+  /** In-memory per-conversation reading positions; defaults to one this Workbench owns and clears on unmount. */
   viewportStore?: ViewportStore
 }
 
