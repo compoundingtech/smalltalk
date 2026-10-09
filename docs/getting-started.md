@@ -38,25 +38,50 @@ The default is ad-hoc signing, which can require renewed OS approvals after an u
 Native installer and Darwin archive tests run in CI; clean-machine real-app, launchd
 and TCC permission setup remain a separate manual rehearsal.
 
-## 2. Answer the first-run questions
+## 2. Answer the first-run screen
 
-Choose your person name and a persistent machine name. `ada` and `studio` are invented
-examples; use your own names. Names use lowercase letters, digits, hyphens and
-underscores, and the machine name `local` is reserved. Setup merges these names into
-`~/.config/st3/config.toml` without replacing unrelated settings.
+In a terminal, `st setup` (and the first plain `st`) shows one screen instead of asking
+questions one at a time. It says in a few lines what Smalltalk is and that your first
+agent runs on your own Claude or Codex account and uses its usage. Then it lists
+everything to choose:
 
-Keep the default background-service option to run agents after closing the terminal.
-Setup installs a user service and starts the daemon. If a user service manager is
-unavailable, it explains the detached-daemon fallback; that fallback does not survive
-a reboot. On Linux, if lingering cannot be enabled automatically, setup prints the
-`loginctl` command needed to keep the user service running after logout. On macOS,
-follow the permission instructions in [daemon details](#daemon-details).
+- **Your name and this machine's name.** `ada` and `studio` are invented examples; use
+  your own. Names use lowercase letters, digits, hyphens and underscores, and the
+  machine name `local` is reserved. Setup merges them into `~/.config/st3/config.toml`
+  without replacing unrelated settings.
+- **Start st when I log in**, ticked. This installs a user service (no administrator
+  rights) and the screen says where it goes and how to remove it. On Linux, **Keep
+  running after I log out** appears when lingering is off and can be turned on for you.
+  If a user service manager is unavailable, setup explains the detached-daemon fallback;
+  it does not survive a reboot. On macOS, follow the permission instructions in
+  [daemon details](#daemon-details).
+- **Every supported agent**: Claude Code, Codex, OpenCode, Pi and Omp. Those found on the
+  daemon's login PATH are ticked and you can untick them. Each row keeps four facts
+  apart: whether its program was found, whether it is selected, whether st's integration
+  is ready, and whether you are signed in (or that setup cannot tell). Each row says what
+  setup does for it and the exact local paths it touches. An agent that is not installed
+  says how to get it; install it, then press `r` to look again.
+- **Let Codex work without asking**, only when Codex is found, with the two levels it can
+  offer (workspace only, or full access). The choice is saved as `codex_access` in the
+  config (`ask`, `workspace` or `full`).
 
-Setup checks for Claude Code, Codex, OpenCode, Pi and Omp on the daemon's login PATH.
-It asks you to choose only when several are available. Install and sign in to a
-supported harness using its own instructions. An installed executable does not prove
-that its account is logged in. With no supported harness, setup creates no Assistant or
-onboarding run and still opens the interface. After installing one, make the command available in this shell and run:
+One consent line sits above the two buttons: *Set up st for the selected agents, adding
+its local integrations and required workspace configuration?* **Set up** does it for
+every ticked agent at once; **Skip for now** sets up st itself and no agent. Signing in,
+trusting a folder and choosing a permission mode are never part of that consent. Each
+agent ends **ready**, **needs you to sign in**, or **failed**, with the whole error on
+screen, and one agent's failure never undoes another's setup. If an agent has not
+finished its own first launch (Claude's theme and sign-in, a Codex or OpenCode login),
+setup hands you the terminal for it and carries on when you leave it. **Retry** runs only
+the rows that did not finish. The first agent that is ready starts the Assistant while the
+screen is still up.
+
+Pipes, `--yes` and anything that is not a terminal keep the line-mode setup: flags
+supply the answers and nothing is asked. `st setup --help` lists them.
+
+An installed program does not prove that its account is signed in. With no supported
+agent, setup starts no onboarding run and still opens the interface. After installing
+one, make the command available in this shell and run:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"

@@ -37,6 +37,15 @@ attaches the agent's terminal and `Ctrl+\` leaves it. A drag selects text in one
 it on release. Scrolling to the top of a conversation loads the page before it. Home cards show
 their own keys; `y` confirms what a card asks, and Enter never does.
 
+A seat can ask the interface to show something with `st ui open agent/NAME` (also `mission/NAME`,
+`mission-run/NAME/RUN` and `machine/NAME`), `--split` and `--below` for a split, `--keep-focus` to leave
+the person where they are. The command writes a small file into the configured person's private state
+directory (`st3/stui/requests-KEY`) and waits for a terminal interface of that person on the same machine
+to answer: opened, not found, or nobody answered, when nothing is left queued. A pane never takes the
+focus from a message being typed, and a subject st has not listed yet is waited for a few seconds, so an
+agent made a moment ago can be opened. A paired device does not read the directory. The
+mission view stays on its mission from step to step; between steps its card says what is up next.
+
 The [terminal tab input reference](../../docs/stui-terminal-tab.md) records the measured
 input modes, query replies, and remaining gaps, including the headless PTY probe.
 

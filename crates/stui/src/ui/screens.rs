@@ -2078,14 +2078,16 @@ fn what_you_can_do(
     let (title, color) = match mission.word {
         Word::Stalled | Word::Failed => ("what you can do", theme::FAULT),
         Word::Unstaffed => ("what you can do", theme::WAITING),
-        Word::Queued => ("nothing for you to do", theme::OVERLAY1),
+        // Between two steps the run is moving: say what is next, not that the person has no part.
+        Word::Queued => ("up next", theme::OVERLAY1),
         _ => return,
     };
     card.blank();
     if mission.word == Word::Queued {
         let note = stuck
             .and_then(|step| step.note.clone())
-            .unwrap_or_else(|| "It is waiting its turn.".into());
+            .or_else(|| stuck.map(|step| format!("{} is next.", step.name)))
+            .unwrap_or_else(|| "The next step is waiting its turn.".into());
         card.wrap(&text::inline(&note, theme::text()), inner);
         card.blank();
         card.wrap(

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Let a seat ask the person's open terminal UI to show an agent, a mission or a machine in a tab or a split, and fix the mission view's between-steps card.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay, projection rebuild or store recovery changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, columns, indexes, triggers or schema transitions."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or coordinated fleet-upgrade changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "New command st ui open SUBJECT [--split] [--below] [--keep-focus] [--wait SECONDS]. It writes a small private file under the configured person's per-device state directory (st3/stui/requests-KEY) and waits for a terminal UI of that person on the same machine to answer. Nothing goes through the daemon, the graph or the wire, so existing daemons, phones and terminal UIs are unaffected and a paired-device terminal UI ignores requests. Plain st ui flags are unchanged; options cannot be mixed with the new subcommand. The mission view's card for a run waiting its turn between steps is now titled up next instead of nothing for you to do."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon lifecycle changes or additional service restart requirement."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step or persisted-state migration. Requests older than ten minutes and uncollected answers are deleted by the terminal UI that reads the directory."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Removing the requests-KEY directory discards pending requests; nothing else reads it."
+  }
+}

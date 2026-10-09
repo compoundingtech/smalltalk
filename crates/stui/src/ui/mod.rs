@@ -15,6 +15,7 @@ pub mod conversation;
 pub mod demo;
 mod direct;
 pub mod doc;
+pub mod checklist;
 mod edit;
 mod glass;
 mod hover;
@@ -31,6 +32,7 @@ pub mod live;
 pub mod pane;
 mod prefs;
 mod pty;
+pub mod requests;
 pub mod screens;
 pub mod text;
 pub mod theme;
@@ -6138,6 +6140,18 @@ mod tests {
         edit_text(&mut lines, key(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(lines, "first");
         assert!(!edit_text(&mut lines, key(KeyCode::Up, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn a_mission_between_steps_says_what_is_next_not_that_the_person_has_no_part() {
+        let mut ui = Ui::new(demo::world());
+        ui.open("mission/fleet/rekey");
+        let shown = frame(&ui, 140, 50).join("\n").to_lowercase();
+        assert!(shown.contains("up next"), "{shown}");
+        assert!(
+            !shown.contains("nothing for you to do"),
+            "a run that is moving never says that:\n{shown}"
+        );
     }
 
     fn frame(ui: &Ui, width: u16, height: u16) -> Vec<String> {
