@@ -23,7 +23,7 @@
   },
   "manual": {
     "status": "changed",
-    "detail": "Upgrade all peers to receive current values. After restoring an older database, restart its native producers with fresh runtime incarnations before resuming current publication. Install matching driver and daemon release artifacts to obtain the independent stop-flush guarantee; during mixed versions the old accounting publication behavior remains, and skipped stop markers or missing routes are logged. Existing seats remain running during the operator-managed upgrade."
+    "detail": "Upgrade all peers to receive current values. After restoring an older database, restart its native producers with fresh runtime incarnations before resuming current publication. Install matching driver and daemon release artifacts to obtain the independent stop-flush guarantee; during mixed versions the old accounting publication behavior remains, and skipped stop markers or missing routes are logged. Existing seats remain running during the operator-managed upgrade. Daemon and driver upgrades may occur in either order; mixed-version publication follows the compatibility behavior above."
   },
   "recovery": {
     "status": "changed",

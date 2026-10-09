@@ -50,12 +50,12 @@ SELECT source_id AS id, origin, source_at AS replica_sequence, NULL AS actor,
     '' AS idempotency_key, CAST(source_at AS TEXT) AS accepted_at_unix_ms FROM latest_values;
 "#;
 
-/// Discover positive subjects before looking up their declaration. Do not correlate a
-/// whole-fleet declaration scan with the history/register UNION. Legacy observations use
-/// exactly the current_claims shadow rule; diagnostics remain durable auth evidence and
-/// the final harness fold still checks restoration, readiness, incarnation and ownership.
+/// Positive registers use their partial index. Legacy evidence is probed by each live
+/// agent's subject, so retired subjects and repeated history cannot add request work.
+/// An indexed existence probe skips the live-fleet pass when no legacy positive evidence
+/// exists. Keep the current-claim shadow rule; the final fold checks runtime and ownership.
 pub(super) const LOGIN_CANDIDATES_SQL: &str = "
-WITH candidates AS (
+WITH candidates(subject) AS (
     SELECT subject FROM latest_values INDEXED BY latest_values_harness_login_candidate_index
     WHERE (kind='harness.observed' AND (
         json_type(body, '$.fields.provider_auth')='false'
@@ -66,8 +66,20 @@ WITH candidates AS (
         OR (kind='harness.diagnostic'
             AND json_extract(body, '$.fields.code')='provider-auth-expired')
     UNION
-    SELECT subject FROM main.claims INDEXED BY claims_harness_login_candidate_index
-    WHERE ((kind='harness.observed' AND (
+    SELECT desired.subject
+    FROM (SELECT 1 FROM main.claims INDEXED BY claims_harness_login_candidate_index
+          WHERE ((kind='harness.observed' AND (
+              json_type(body, '$.fields.provider_auth')='false'
+              OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                  THEN '$.reason' ELSE '$.fields.reason' END)='providerAuth'
+              OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                  THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
+          OR (kind='harness.diagnostic'
+              AND json_extract(body, '$.fields.code')='provider-auth-expired')) LIMIT 1) AS legacy_present
+    CROSS JOIN desired
+    WHERE desired.kind='agent'
+      AND EXISTS (SELECT 1 FROM main.claims INDEXED BY claims_harness_login_candidate_index
+          WHERE claims.subject=desired.subject AND ((kind='harness.observed' AND (
         json_type(body, '$.fields.provider_auth')='false'
         OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
             THEN '$.reason' ELSE '$.fields.reason' END)='providerAuth'
@@ -78,12 +90,13 @@ WITH candidates AS (
         AND (kind='harness.diagnostic' OR NOT EXISTS (
             SELECT 1 FROM latest_values v
             WHERE v.subject=claims.subject AND v.kind=claims.kind
-                AND v.source_at>=CAST(claims.accepted_at_unix_ms AS INTEGER)))
+                AND v.source_at>=CAST(claims.accepted_at_unix_ms AS INTEGER))))
 )
 SELECT desired.subject, desired.kind, desired.body, desired.member,
        desired.owner_run, desired.owner_generation, desired.owner_step
 FROM candidates CROSS JOIN desired
-WHERE desired.subject=candidates.subject AND desired.kind='agent' ORDER BY desired.subject";
+WHERE desired.subject=candidates.subject AND desired.kind='agent'
+ORDER BY desired.subject";
 
 /// A database generation fences sequence numbers after a reset. Ordinary reopen retains it.
 /// Generation birth uses the owner clock; restore/reset requires that clock to move forward.

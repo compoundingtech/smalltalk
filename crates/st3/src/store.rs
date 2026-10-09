@@ -55202,6 +55202,101 @@ message "human-attention" {
     }
 
     #[test]
+    fn login_candidate_sql_is_bounded_by_live_fleet_despite_orphan_history() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"login\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+            workspace.path().display().to_string(),
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "legacy-login-cost")
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.login".into(),
+                kind: "harness.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(
+                    json!({"state":"idle", "incarnation_id":"current", "provider_auth":false}),
+                )
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let mut costs = Vec::new();
+        let mut previous_size = 0;
+        for size in [364, 4096] {
+            for n in previous_size..size {
+                for sample in 0..2 {
+                    store.append_claim(&ClaimInput {
+                    subject:format!("agent/retired-{n}"),
+                    kind:"harness.diagnostic".into(), actor:None,
+                    fields:serde_json::from_value(json!({"code":"provider-auth-expired", "incarnation_id":"retired", "driver":"claude"})).unwrap(),
+                    evidence:vec![], expected_subject:None, idempotency_key:Some(format!("old-login-{n}-{sample}")),
+                }).unwrap();
+                }
+            }
+            previous_size = size;
+            let connection = store.readers.get();
+            let plan = connection
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    latest_values::LOGIN_CANDIDATES_SQL
+                ))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|step| step.contains("SEARCH")
+                    && step.contains("claims_harness_login_candidate_index")
+                    && step.contains("subject=?")),
+                "legacy evidence must be sought by declared subject: {plan:?}"
+            );
+
+            let mut statement = connection
+                .prepare_cached(latest_values::LOGIN_CANDIDATES_SQL)
+                .unwrap();
+            statement.reset_status(rusqlite::StatementStatus::VmStep);
+            statement.reset_status(rusqlite::StatementStatus::FullscanStep);
+            let candidates = statement
+                .query_map([], desired_from_row)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].subject, "agent/node.login");
+            costs.push((
+                statement.get_status(rusqlite::StatementStatus::VmStep),
+                statement.get_status(rusqlite::StatementStatus::FullscanStep),
+            ));
+        }
+        println!("login candidate cost at 364 and 4096 orphan subjects: {costs:?}");
+        assert!(
+            costs[1].0 <= costs[0].0 + 100,
+            "a fixed live fleet must not walk orphan subjects or their historical evidence: {costs:?}"
+        );
+        assert_eq!(
+            costs[0].1, costs[1].1,
+            "history must not add full-scan work"
+        );
+    }
+
+    #[test]
     fn harness_projection_is_bound_to_the_current_runtime_epoch() {
         let store = Store::open_memory("node").unwrap();
         let subject = "agent/node.worker";
