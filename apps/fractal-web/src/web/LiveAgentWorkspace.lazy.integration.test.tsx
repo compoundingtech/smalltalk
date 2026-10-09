@@ -10,6 +10,7 @@ import type * as WorkspaceModule from './LiveAgentWorkspace.tsx'
 import type * as FallbackModule from './ConversationPaneFallback.tsx'
 import type { UxTelemetry } from '../telemetry/ux.ts'
 import type { Feed, Fleet } from '../data/source.ts'
+import type { FeedSyncObservation } from '../data/feedSync.ts'
 
 vi.mock('@stylexjs/stylex', () => ({
   create: (styles: unknown) => styles,
@@ -34,12 +35,15 @@ vi.mock('./ConversationPaneFallback.tsx', async importOriginal => {
 })
 // Keep the shell and retained-pane implementation real; the import is deliberately held
 // pending, and no backend is needed to prove when its code is requested.
+let gatewayObservation: FeedSyncObservation | undefined
+const reconnect = vi.fn()
 vi.mock('../data/react.tsx', () => ({
   useFleet: () => rosterFeed,
   useSubjectList: () => [],
-  useConnection: () => ({ _tag: 'Waiting' }),
+  useConnection: () => ({ _tag: 'Live' }),
   useNow: () => 0,
-  useDataSource: () => ({}),
+  useGatewaySync: () => gatewayObservation,
+  useDataSource: () => ({ gateway: 'alpha.example', reconnect }),
   useFeedInterest: () => {},
 }))
 
@@ -57,6 +61,8 @@ const paintTasks: (() => void)[] = []
 beforeEach(async () => {
   vi.resetModules()
   requested.mockClear()
+  gatewayObservation = { status: { _tag: 'Live', since: 0 }, observedAt: 0 }
+  reconnect.mockClear()
   mountCount = 0
   fallbackRenders = 0
   rosterFeed = { _tag: 'Waiting' }
@@ -131,6 +137,30 @@ const renderShell = async (ux?: UxTelemetry) => {
   </RegistryContext.Provider>))
 }
 
+
+describe('gateway footer honesty', () => {
+  it('uses the sync wording rather than a raw Live tag', async () => {
+    await renderShell()
+    const footer = container.querySelector('footer')
+    expect(footer?.textContent).toContain('alpha.example')
+    expect(footer?.textContent).not.toContain('Live')
+  })
+
+  it('places one explicit reconnect action next to the countdown', async () => {
+    gatewayObservation = {
+      status: { _tag: 'Stale', reason: { _tag: 'Reconnecting', attempt: 2, nextAt: 3000, issue: 'Private diagnostic' } },
+      observedAt: -2000,
+    }
+    await renderShell()
+    const footer = container.querySelector('footer')
+    expect(footer?.textContent).toContain('Reconnecting in 3s · attempt 2')
+    expect(footer?.textContent).not.toContain('Private diagnostic')
+    const button = [...(footer?.querySelectorAll('button') ?? [])].find(button => button.textContent === 'Reconnect now')
+    expect(button).toBeDefined()
+    await act(async () => button?.click())
+    expect(reconnect).toHaveBeenCalledTimes(1)
+  })
+})
 describe('conversation import boundary', () => {
   it('reserves non-interactive roster rows while waiting and keeps the honest wait notice', async () => {
     await renderShell()

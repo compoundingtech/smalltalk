@@ -10,7 +10,7 @@ import * as React from 'react'
 import { createPortal } from 'react-dom'
 import * as Aria from 'react-aria-components'
 import * as stylex from '@stylexjs/stylex'
-import { useAtom } from '@effect/atom-react'
+import { useAtom, useAtomValue } from '@effect/atom-react'
 import { Schema } from 'effect'
 import * as Atom from 'effect/reactivity/Atom'
 import { SidebarAgentRow, ThreadHeader, ResizableSplit, assistantDarkTheme, liveComposerDarkTheme, liveAccentTheme, compositionLightTheme } from '@smalltalk/fractal-ui/assistant-ui/shell'
@@ -22,6 +22,8 @@ import { persistedAtom } from '../state/persistence.ts'
 import { WorkbenchContextProvider, ResourcePanelProvider, MonitorDetailProvider, type OpenRequest } from '../shell/context.tsx'
 import type { ResourcePanelState } from '../shell/state.ts'
 import { afterNextPaint, type UxTelemetry } from '../telemetry/ux.ts'
+import { syncLine } from '../../../../packages/fractal-ui/src/assistant-ui/st3-views/sync-line.ts'
+import { useGatewaySync } from '../data/react.tsx'
 
 // A static import would evaluate the kit Transcript/Markdown/refractor before the shell paints.
 // Demand and speculative prefetch share one in-flight request; rejection releases it for retry.
@@ -184,7 +186,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
     setPanes((rows) => (rows.some((row) => `${row.ref}:${row.presentation ?? 'detail'}` === id) ? rows : [...rows, { ref: request.ref, ...(request.presentation === undefined ? {} : { presentation: request.presentation }) }]))
     navigate(current, id)
   }
-  const stale = fleet._tag === 'Observed' && fleet.freshness === 'stale'
+  const stale = fleet._tag === 'Observed' && (fleet.freshness === 'stale' || connection._tag !== 'Live')
   const headerRow = agent === undefined ? undefined : sidebarRow({ agent, stale, now })
   const filtered = agents.filter((row) => `${row.name} ${row.ref} ${row.host}`.toLowerCase().includes(search.toLowerCase()))
   const byRef = React.useMemo(() => new Map(subjects.map((subject) => [subject.ref, subject])), [subjects])
@@ -249,7 +251,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                       <Aria.Button onPress={() => open({ ref: 'monitor/quota', presentation: 'detail' })} {...stylex.props(styles.textButton)}>
                         Usage
                       </Aria.Button>
-                      <span {...stylex.props(styles.connection)}>{connection._tag}</span>
+                      <GatewayConnectionStatus />
                     </footer>
                   </>
                 )}
@@ -301,6 +303,27 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
     </WorkbenchContextProvider>
     {paneHost === null ? null : createPortal(<WorkspaceBody current={current} rosterRefs={agents.map(agent => agent.ref)} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />, paneHost)}
   </>)
+}
+
+const assumedOnline = Atom.make({ _tag: 'Online' } as const)
+/** Decoded gateway sync, never the socket's raw lifecycle tag. */
+const GatewayConnectionStatus = () => {
+  const source = useDataSource()
+  const network = useAtomValue(source.network ?? assumedOnline)
+  const observation = useGatewaySync()
+  const now = useNow()
+  if (observation === undefined) return null
+  const line = syncLine({
+    ...observation, label: 'connection', gateway: source.gateway, now,
+    socket: observation.status._tag !== 'Failed',
+  })
+  const reconnecting = observation.status._tag === 'Stale' && observation.status.reason._tag === 'Reconnecting'
+  return <>
+    <span role="status" {...stylex.props(styles.connection)}>{network._tag === 'Offline' ? 'You are offline' : line?.text}</span>
+    {(reconnecting || network._tag === 'Offline') && source.reconnect !== undefined
+      ? <Aria.Button onPress={source.reconnect} {...stylex.props(styles.textButton)}>Reconnect now</Aria.Button>
+      : null}
+  </>
 }
 
 /** The three most recently opened panes stay mounted in a stable DOM order; hidden ones skip
