@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "stui attaches a terminal on its own host to the local PTY session and one on another fleet host over Fabric, never through a daemon; a lost live stream is offline only when st also fails a fresh request",
+  "summary": "stui attaches a terminal on its own host to the local PTY session and one on another fleet host over Fabric, never through a daemon; fleet members no longer fall back to the client gateway for terminals",
   "replay": {
     "status": "none",
     "detail": "No replay, backfill, stored data or transcript change."
@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "stui on a machine with its own daemon no longer falls back to the client gateway for a terminal on another host: the owner must run st terminals expose-fabric and grant this machine st3/pty/FLEET_ID, or stui says Fabric did not reach it. Paired devices without a daemon keep the gateway. The feed gains a Degraded update; Swift and TypeScript clients are unchanged."
+    "detail": "stui on a machine with its own daemon no longer falls back to the client gateway for a terminal on another host: the owner must run st terminals expose-fabric and grant this machine st3/pty/FLEET_ID, or stui says Fabric did not reach it. Paired devices without a daemon keep the gateway. A newer stui against an older daemon on the same machine, one without the local-terminal route, treats a local terminal as remote and shows a Fabric error until that daemon restarts onto the new build, so restart the daemon before or with stui. Swift and TypeScript clients and the wire are unchanged."
   },
   "downtime": {
     "status": "none",
@@ -23,10 +23,10 @@
   },
   "manual": {
     "status": "changed",
-    "detail": "Before stui with this change attaches a remote terminal, each fleet host runs st terminals expose-fabric and allows st3/pty/FLEET_ID for the other fleet hosts' Fabric peers, then fabric reload-peers."
+    "detail": "Before this stui attaches a remote terminal, each fleet host runs st terminals expose-fabric and allows st3/pty/FLEET_ID for the other fleet hosts' Fabric peers, then fabric reload-peers. Restart the local daemon onto the same build as stui."
   },
   "recovery": {
     "status": "none",
-    "detail": "No recovery, durable payload or initialization changes. stui writes a bounded connection.log under its state directory."
+    "detail": "No recovery, durable payload or initialization changes."
   }
 }
