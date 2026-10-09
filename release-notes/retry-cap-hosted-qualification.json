@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "Add a dispatch-only frozen retry-cap implementation checkpoint",
+  "summary": "Add a dispatch-only archive-reuse retry-cap checkpoint",
   "replay": {
     "status": "none",
     "detail": "Qualification automation only; no runtime, durable data, contract, deployment or quarantine change."
@@ -27,6 +27,6 @@
   },
   "manual": {
     "status": "changed",
-    "detail": "After a new separately recorded finite authorization, publish the reviewed 8824 automation branch and dispatch Performance with retry_cap_qualification=true and its new assignment reference once. The prior 9512 assignment is consumed and remains NOT QUALIFIED. The ordinary load job is suppressed only for the new authorized dispatch."
+    "detail": "After a NEW finite authorization, publish the reviewed archive-only qualification branch and dispatch Performance once with its exact assignment. Reuse held artifact11646589320/archive d248492e only; no Cargo fetch or archive build. Prior9512/8824 failures and branches remain unchanged. Both fresh extraction destinations must exist before consumers. Ordinary perf-load is suppressed only for the explicit qualification dispatch."
   }
 }

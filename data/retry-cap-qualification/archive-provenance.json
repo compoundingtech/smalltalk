@@ -1,0 +1,190 @@
+{
+  "state": "PLANNING_ONLY_ARCHIVE_REUSE_NOT_QUALIFIED",
+  "source_run": 37995908877,
+  "source_attempt": 1,
+  "source_job": 114041822608,
+  "source_runner": "nsc-runner-9s96ka99de69s",
+  "source_automation": "78d004e43092b421f3551ce9d5fdfffb2d810fbb",
+  "source_automation_tree": "7eb72df49c6fe9ccef9693aa80921489e1bd65d4",
+  "candidate": "8824e14fe44086cd63e47595c10e0023097371bb",
+  "candidate_tree": "47fb98972cf18725a557f72993415aef321238dc",
+  "artifact": {
+    "id": 11646589320,
+    "name": "retry-cap-8824-37995908877-attempt-1",
+    "sha256": "67f05984ad1bd3cf2d5a1b8561b21d1121c9f0849e788c4fd574c92bf97690b7",
+    "bytes": 13731874,
+    "repository": "compoundingtech/smalltalk",
+    "expires_at": "2026-10-16T21:55:39Z"
+  },
+  "archive": {
+    "name": "retry-cap.tar.zst",
+    "bytes": 13693131,
+    "sha256": "d248492e97ebf9776704320ee4e4105417feb83eb9861f789533720c55e4e8ca"
+  },
+  "input_manifest_sha256": "9ae8958a3a7ad3152fba30be8ce3603124a267f9907f386c1c7b97edd97872d9",
+  "bundle_sha256": "db6c44bb3426ed496ee4e5dc9e451606a0fc4dd8206c6bca69985b2658887906",
+  "source_entries": {
+    "build.phase.json": {
+      "bytes": 534,
+      "sha256": "bec0e282afb881f763606d1a1bc49139edfe38dbbe86b156c2b7109ddfa3e246"
+    },
+    "build.stderr": {
+      "bytes": 5691,
+      "sha256": "5701a1d1446136d8cee6b4f9aedc7a90b0c6c31bbe8e039a8c4ec51681444679"
+    },
+    "build.stdout": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "bundle-import.phase.json": {
+      "bytes": 400,
+      "sha256": "c8c3ac759adb0534775c92583c5451cb6ac4fc95e292d1cfab8ba79845221f5e"
+    },
+    "bundle-import.stderr": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "bundle-import.stdout": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "bundle-verify.phase.json": {
+      "bytes": 357,
+      "sha256": "cc655f1bac81f55d5afb7146d395dea50b686530ad472fb9fb98d0ebf3f28e42"
+    },
+    "bundle-verify.stderr": {
+      "bytes": 87,
+      "sha256": "8da7086339421a2ce59fa953942a200f3e36970d91597dc6043c6a5c26707f46"
+    },
+    "bundle-verify.stdout": {
+      "bytes": 236,
+      "sha256": "8081f890e10e8c45e5117a79237b3d3eadd7f56ed6dd17da9b41eb8346795cda"
+    },
+    "candidate-checkout.phase.json": {
+      "bytes": 385,
+      "sha256": "cf1cf8ddc55dd46105cfa6a83b8540b269dffb88281323cfddfa234f757c8859"
+    },
+    "candidate-checkout.stderr": {
+      "bytes": 45,
+      "sha256": "075b6625dd06cbbaef732f023857b6e4e47d8dc9cc86d5bc0b9e319846e1292a"
+    },
+    "candidate-checkout.stdout": {
+      "bytes": 91,
+      "sha256": "1312baa3374a533d8e15032348ad1a1eddce544d011b6989743679cdd0d7579f"
+    },
+    "dependencies.phase.json": {
+      "bytes": 284,
+      "sha256": "1134e1e43be729ce1b6a08f58163c0c56bbad6b36b5794deae422340ec8bae9c"
+    },
+    "dependencies.stderr": {
+      "bytes": 20159,
+      "sha256": "01527843b84c33d8ad536a464af0e9dcb36e56d94e1fce320fd4401b681bd408"
+    },
+    "dependencies.stdout": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "inventory.phase.json": {
+      "bytes": 610,
+      "sha256": "f7cc9c36f5284c54cd1b943aefdc3e2e8bc9fc082419721abc78fb0a3da5030d"
+    },
+    "inventory.stderr": {
+      "bytes": 250,
+      "sha256": "ff0d4925445b3d8b93a636b3f0c1c37faf4b047e521265532d650f3923d6c12f"
+    },
+    "inventory.stdout": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "prepared.json": {
+      "bytes": 2579,
+      "sha256": "99d5773339cc3bcb72ab52d1dbe2fd044490a4b8d067b2b4e11f98b655bff35c"
+    },
+    "result.json": {
+      "bytes": 215,
+      "sha256": "e0927278088506b8f7b4234692332b53d2454969c53b497dd0594f4df77d7dbe"
+    },
+    "retry-cap.tar.zst": {
+      "bytes": 13693131,
+      "sha256": "d248492e97ebf9776704320ee4e4105417feb83eb9861f789533720c55e4e8ca"
+    },
+    "tool-cargo.phase.json": {
+      "bytes": 265,
+      "sha256": "f632acace0d8434d58159bb360b1c7652372dad6c22af6479e39ad3539781836"
+    },
+    "tool-cargo.stderr": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tool-cargo.stdout": {
+      "bytes": 36,
+      "sha256": "f4f564f8936fa8eb53bca8bbe50666489252bbcbeaae0cb0dd54682444697e52"
+    },
+    "tool-nextest.phase.json": {
+      "bytes": 287,
+      "sha256": "bc22329a1ed6d84f6ae1d70ce912c3f7618ad4f251bd1875e28f6a2930ab0e8d"
+    },
+    "tool-nextest.stderr": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tool-nextest.stdout": {
+      "bytes": 70,
+      "sha256": "568cc4ba9e98b89bc61d57df27bba1a23a70216fc29c0c64728da64cad3e6181"
+    },
+    "tool-rustc.phase.json": {
+      "bytes": 266,
+      "sha256": "dedbbbddd3b9682f3ddbfa46b2707b9e8d46dbdbdb652cc585a5fa84ca2602e6"
+    },
+    "tool-rustc.stderr": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tool-rustc.stdout": {
+      "bytes": 226,
+      "sha256": "46cc810aa745de519ba10b3e2653f3bf13ca57523e7aa9c1af86cc0269c495c1"
+    },
+    "tools.json": {
+      "bytes": 1632,
+      "sha256": "6818925efc4f861087b05bee665f5487a0a24810e42e54e73571eb57513a7e4b"
+    }
+  },
+  "tools": {
+    "cargo": "cargo 1.97.0 (c980f4866 2026-06-30)\n",
+    "executables": {
+      "cargo": {
+        "path": "/nix/store/l7v00m55rb130bhql2kr74pq8sdpl41c-cargo-1.97.0/bin/cargo",
+        "resolved": "/nix/store/l7v00m55rb130bhql2kr74pq8sdpl41c-cargo-1.97.0/bin/cargo",
+        "sha256": "b31e3eda0df1fb89088609d5681d8ee244ee86015b3d6e5eb45a2d1b1e6e86cc"
+      },
+      "cargo-nextest": {
+        "path": "/nix/store/cpfrbx4hcxrlyy9zlxy5iiv74lfn6q33-cargo-nextest-0.9.140/bin/cargo-nextest",
+        "resolved": "/nix/store/cpfrbx4hcxrlyy9zlxy5iiv74lfn6q33-cargo-nextest-0.9.140/bin/cargo-nextest",
+        "sha256": "e72d08393aa77ea6add2cfe0e18821216f1336a098fd3ae6e5aecf9007606f41"
+      },
+      "rustc": {
+        "path": "/nix/store/h6c2mbpmxih3mfadhvl6jzf090n419yv-rustc-wrapper-1.97.0/bin/rustc",
+        "resolved": "/nix/store/h6c2mbpmxih3mfadhvl6jzf090n419yv-rustc-wrapper-1.97.0/bin/rustc",
+        "sha256": "7343b7d54653fac1841f92c0a15f85317fa3377f00a0205edb2d5209bd91985e"
+      }
+    },
+    "nextest": "cargo-nextest 0.9.140\nrelease: 0.9.140\nhost: x86_64-unknown-linux-gnu\n",
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07) (built from a source tarball)\nbinary: rustc\ncommit-hash: 2d8144b7880597b6e6d3dfd63a9a9efae3f533d3\ncommit-date: 2026-07-07\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.0\nLLVM version: 21.1.8\n",
+    "selected_environment": {
+      "CARGO_BUILD_JOBS": null,
+      "CARGO_HOME": "/home/runner/work/_temp/cargo-home",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0",
+      "RUSTC_WRAPPER": "/nix/store/4mq034km3nq89nl3nwa5rcfsgn1vzspk-ci-rustc-wrapper/bin/ci-rustc-wrapper"
+    }
+  },
+  "terminal": "doc/fleet/smalltalk/ci-speed/2026-10-09/retry-cap-hosted-terminal-8824@771a5c636fa690a137012b9075f16d4c965fcb58b542bd8b7d7bd60cd0ae7132",
+  "limit": "One future hosted archive-only transfer/inventory/13 controls; no Cargo fetch/compile/archive build; NOT execution authorization",
+  "transfer_method": "Exact retained artifact ZIP embedded in qualification-only Git inputs; no artifact API download, new secret or dependency fetch",
+  "metadata_sha256": {
+    "source-run.json": "4ce95c3be418f64f9a14cef545a8132d50d35ba07790c0ab4eb7e07689ee07c4",
+    "source-job.json": "dbc8085d3eb2a2a97104f9e6124fa05a2790fc307b3ce4929ccef8dfabe3dc57",
+    "source-artifact-api.json": "7b893ed1532aea8e21ed300c957a4f27091abf0657c984bb7ceb1382b8720cb1"
+  }
+}

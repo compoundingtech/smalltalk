@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Pure path/argv stand-ins only. No archive, Cargo, subprocess or candidate execution."""
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+loader = importlib.machinery.SourceFileLoader('consumer', str(Path(__file__).with_name('ci-retry-cap-qualification')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+c = importlib.util.module_from_spec(spec)
+loader.exec_module(c)
+
+
+class ConsumerPreconditions(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.archive = self.root / 'stand-in.tar.zst'
+        self.source = self.root / 'source-stand-in'
+        self.overlay = self.root / 'report-stand-in.toml'
+        self.filter = 'package(=smallclaims) & kind(lib) & (test(=stand_in_only))'
+
+    def test_missing_destinations_refuse_before_command_or_process(self):
+        with patch.object(c.subprocess, 'Popen', side_effect=AssertionError('no process allowed')):
+            for action in ['inventory', 'controls']:
+                with self.subTest(action=action), self.assertRaisesRegex(ValueError, 'must exist'):
+                    c.consumer_command(action, self.archive, self.root / 'absent', self.source, self.overlay, self.filter)
+
+    def test_both_directories_created_before_their_consumer_and_exact_argv(self):
+        calls = []
+
+        def stand_in(out, name, argv, cwd):
+            destination = Path(argv[argv.index('--extract-to') + 1])
+            self.assertTrue(destination.is_dir())
+            self.assertFalse(destination.is_symlink())
+            self.assertEqual(list(destination.iterdir()), [])
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(cwd, self.source)
+            calls.append((name, argv))
+
+        with patch.object(c.subprocess, 'Popen', side_effect=AssertionError('no process allowed')):
+            inventory = c.run_consumer(self.root, 'inventory', self.archive, self.source, phase_runner=stand_in)
+            # A prior extraction cannot serve as the next consumer's fresh destination.
+            (inventory / 'stand-in-receipt').write_text('not an archive or binary')
+            controls = c.run_consumer(self.root, 'controls', self.archive, self.source, self.overlay, self.filter, phase_runner=stand_in)
+        self.assertNotEqual(inventory, controls)
+        self.assertEqual([name for name, _ in calls], ['inventory', 'controls'])
+        self.assertEqual(calls[0][1], ['cargo', 'nextest', 'list', '--archive-file', str(self.archive), '--extract-to', str(inventory), '--workspace-remap', str(self.source), '--profile', 'ci', '--color', 'never', '--message-format', 'json'])
+        self.assertEqual(calls[1][1], ['cargo', 'nextest', 'run', '--archive-file', str(self.archive), '--extract-to', str(controls), '--workspace-remap', str(self.source), '--config-file', str(self.overlay), '--profile', 'ci', '--retries', '0', '--test-threads', '1', '--no-fail-fast', '--status-level', 'pass', '--final-status-level', 'fail', '--success-output', 'immediate', '--failure-output', 'immediate', '--color', 'never', '-E', self.filter])
+        self.assertEqual(len(calls), 2)
+
+    def test_stale_destination_refuses_without_cleanup_or_invocation(self):
+        for action, name in [('inventory', 'inventory-extract'), ('controls', 'run-extract')]:
+            destination = self.root / name
+            destination.mkdir()
+            marker = destination / 'preserve'
+            marker.write_text('stale stand-in')
+            with self.subTest(action=action), self.assertRaises(FileExistsError):
+                c.run_consumer(self.root, action, self.archive, self.source, self.overlay, self.filter, phase_runner=lambda *a: self.fail('must not invoke'))
+            self.assertEqual(marker.read_text(), 'stale stand-in')
+
+    def test_existing_empty_destination_is_not_reused(self):
+        (self.root / 'inventory-extract').mkdir()
+        with self.assertRaises(FileExistsError):
+            c.run_consumer(self.root, 'inventory', self.archive, self.source, phase_runner=lambda *a: self.fail('must not invoke'))
+
+    def test_nonempty_file_and_symlink_destinations_refuse(self):
+        directory = self.root / 'occupied'
+        directory.mkdir()
+        (directory / 'stand-in').write_text('occupied')
+        file = self.root / 'file'
+        file.write_text('file')
+        empty = self.root / 'empty'
+        empty.mkdir()
+        link = self.root / 'link'
+        link.symlink_to(empty)
+        for destination in [directory, file, link]:
+            with self.subTest(path=destination), self.assertRaises(ValueError):
+                c.consumer_command('inventory', self.archive, destination, self.source)
+
+    def test_unknown_action_and_missing_selection_refuse(self):
+        destination = self.root / 'empty'
+        destination.mkdir()
+        for action in ['build', 'archive', 'fetch']:
+            with self.subTest(action=action), self.assertRaises(ValueError):
+                c.consumer_command(action, self.archive, destination, self.source)
+        for overlay, expression in [(None, self.filter), (self.overlay, None), (self.overlay, '')]:
+            with self.subTest(overlay=overlay, expression=expression), self.assertRaises(ValueError):
+                c.consumer_command('controls', self.archive, destination, self.source, overlay, expression)
+
+    def test_real_phase_failure_stops_at_first_consumer(self):
+        calls = []
+
+        def failure(out, name, argv, cwd):
+            calls.append(name)
+            raise SystemExit(96)
+
+        with self.assertRaises(SystemExit) as error:
+            c.run_consumer(self.root, 'inventory', self.archive, self.source, phase_runner=failure)
+        self.assertEqual(error.exception.code, 96)
+        self.assertEqual(calls, ['inventory'])
+        self.assertFalse((self.root / 'run-extract').exists())
+
+
+if __name__ == '__main__':
+    unittest.main()

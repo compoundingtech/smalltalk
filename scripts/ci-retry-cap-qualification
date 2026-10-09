@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Proposed dispatch-only orchestrator. Never run from planning/local shells."""
+"""Proposed hosted archive-only consumers. Never run from planning/local shells."""
 import argparse
 import importlib.util
 import importlib.machinery
@@ -10,6 +10,8 @@ import platform
 import shutil
 import subprocess
 import sys
+import stat
+import zipfile
 import time
 import tomllib
 
@@ -57,9 +59,88 @@ def phase(out, name, command, cwd):
     return receipt
 
 
+def transfer_artifact(automation, inputs, out, manifest, prepared):
+    started = time.monotonic_ns()
+    provenance = verify.read_json(inputs / 'archive-provenance.json')
+    verify.require(provenance['candidate'] == manifest['candidate'] and provenance['candidate_tree'] == manifest['tree'], 'archive candidate mismatch')
+    verify.require(verify.digest(inputs / 'manifest.json') == provenance['input_manifest_sha256'], 'archive input manifest mismatch')
+    verify.require(verify.digest(inputs / '8824.bundle') == provenance['bundle_sha256'], 'archive source bundle mismatch')
+    metadata = {}
+    for name, expected in provenance['metadata_sha256'].items():
+        verify.require(verify.digest(inputs / name) == expected, 'source metadata hash mismatch: ' + name)
+        metadata[name] = verify.read_json(inputs / name)
+    run, job, artifact = (metadata[name] for name in ['source-run.json', 'source-job.json', 'source-artifact-api.json'])
+    verify.require(run['id'] == provenance['source_run'] and run['run_attempt'] == provenance['source_attempt'] and run['head_sha'] == provenance['source_automation'], 'source run mismatch')
+    verify.require(job['id'] == provenance['source_job'] and job['run_id'] == run['id'] and job['run_attempt'] == run['run_attempt'] and job['head_sha'] == run['head_sha'] and job['runner_name'] == provenance['source_runner'], 'source job mismatch')
+    verify.require(run['conclusion'] == 'failure' and job['conclusion'] == 'failure', 'original negative outcome changed')
+    pin = provenance['artifact']
+    verify.require(artifact['id'] == pin['id'] and artifact['name'] == pin['name'] and artifact['size_in_bytes'] == pin['bytes'] and artifact['digest'] == 'sha256:' + pin['sha256'], 'source artifact mismatch')
+    verify.require(artifact['workflow_run']['id'] == run['id'] and artifact['workflow_run']['head_sha'] == run['head_sha'], 'source artifact/run mismatch')
+    blob = inputs / 'source-artifact.zip'
+    verify.require(blob.stat().st_size == pin['bytes'] and verify.digest(blob) == pin['sha256'], 'transferred ZIP hash/size mismatch')
+    # Only the exact pinned 31 receipt/archive files can leave the ZIP. No binary is run here.
+    destination = out / 'source-artifact'
+    destination.mkdir(mode=0o700, exist_ok=False)
+    with zipfile.ZipFile(blob) as z:
+        infos = z.infolist()
+        names = [info.filename for info in infos]
+        expected = provenance['source_entries']
+        verify.require(len(names) == len(set(names)) and set(names) == set(expected), 'source ZIP entry set mismatch')
+        for info in infos:
+            name = Path(info.filename)
+            verify.require(not name.is_absolute() and '..' not in name.parts and len(name.parts) == 1 and not info.is_dir() and not stat.S_ISLNK(info.external_attr >> 16), 'unsafe source ZIP path/type')
+            record = expected[info.filename]
+            verify.require(info.file_size == record['bytes'], 'source ZIP entry size mismatch')
+            target = destination / name
+            with z.open(info) as src, target.open('xb') as dst:
+                shutil.copyfileobj(src, dst)
+            verify.require(verify.digest(target) == record['sha256'], 'source ZIP entry digest mismatch: ' + info.filename)
+    original = verify.read_json(destination / 'prepared.json')
+    verify.require(original['candidate'] == manifest['candidate'] and original['tree'] == manifest['tree'] and original['automation_sha'] == provenance['source_automation'] and original['automation_tree'] == provenance['source_automation_tree'], 'old prepared source mismatch')
+    verify.require(original['run'] == str(run['id']) and original['attempt'] == str(run['run_attempt']) and original['job'] == 'retry-cap-implementation' and original['runner_name'] == job['runner_name'], 'old prepared job mismatch')
+    verify.require(original['manifest_sha256'] == provenance['input_manifest_sha256'] and original['bundle_sha256'] == provenance['bundle_sha256'], 'old prepared input mismatch')
+    build = verify.read_json(destination / 'build.phase.json')
+    command = ['cargo', 'nextest', 'archive', '-p', 'smallclaims', '--lib', '--features', 'test-support', '--locked', '--offline', '--profile', 'ci', '--color', 'never', '--archive-file', str(Path(original['source']).parent / 'retry-cap.tar.zst')]
+    verify.require(build['exit_code'] == 0 and build['status'] == 'TERMINAL' and build['argv'] == command and build['cwd'] == original['source'], 'held build is not the pinned successful archive build')
+    verify.require(verify.read_json(destination / 'tools.json') == provenance['tools'], 'old tool evidence mismatch')
+    negative = verify.read_json(destination / 'result.json')
+    verify.require(negative['qualified'] is False and negative['error'] == '96', 'old negative result changed')
+    archive = destination / provenance['archive']['name']
+    verify.require(archive.stat().st_size == provenance['archive']['bytes'] and verify.digest(archive) == provenance['archive']['sha256'], 'archive digest/size mismatch')
+    receipt = {'verified': True, 'status': 'TERMINAL', 'started_monotonic_ns': started, 'ended_monotonic_ns': time.monotonic_ns(),
+        'transfer': 'embedded exact retained ZIP via qualification Git checkout; no API retrieval',
+        'artifact_id': pin['id'], 'artifact_sha256': pin['sha256'], 'archive_sha256': provenance['archive']['sha256'],
+        'archive': str(archive), 'source_run': run['id'], 'source_job': job['id'], 'source_automation': run['head_sha'],
+        'candidate': manifest['candidate'], 'candidate_tree': manifest['tree'], 'new_run': prepared['run'], 'new_automation': prepared['automation_sha'],
+        'provenance_sha256': verify.digest(inputs / 'archive-provenance.json'), 'zip_sha256': verify.digest(blob)}
+    save(out / 'archive-transfer.json', receipt)
+    print('Verified original negative receipts and successful archive input; no compiler or network invoked.', flush=True)
+
+
+def consumer_command(action, archive, destination, source, overlay=None, filter_expression=None):
+    verify.require(destination.is_dir() and not destination.is_symlink() and not any(destination.iterdir()), 'consumer destination must exist and be empty/private')
+    verify.require(action in ['inventory', 'controls'], 'unsupported archive consumer')
+    command = ['cargo', 'nextest', 'list' if action == 'inventory' else 'run', '--archive-file', str(archive),
+        '--extract-to', str(destination), '--workspace-remap', str(source)]
+    if action == 'inventory':
+        return command + ['--profile', 'ci', '--color', 'never', '--message-format', 'json']
+    verify.require(overlay is not None and filter_expression, 'exact reporting config and named selection required')
+    return command + ['--config-file', str(overlay), '--profile', 'ci', '--retries', '0', '--test-threads', '1',
+        '--no-fail-fast', '--status-level', 'pass', '--final-status-level', 'fail', '--success-output', 'immediate',
+        '--failure-output', 'immediate', '--color', 'never', '-E', filter_expression]
+
+
+def run_consumer(out, action, archive, source, overlay=None, filter_expression=None, phase_runner=None):
+    destination = out / ('inventory-extract' if action == 'inventory' else 'run-extract')
+    destination.mkdir(mode=0o700, exist_ok=False)
+    command = consumer_command(action, archive, destination, source, overlay, filter_expression)
+    (phase if phase_runner is None else phase_runner)(out, action, command, source)
+    return destination
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['prepare', 'execute'])
+    parser.add_argument('action', choices=['prepare', 'transfer', 'execute'])
     parser.add_argument('--out', required=True, type=Path)
     args = parser.parse_args()
     verify.require(os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch', 'hosted manual event required')
@@ -95,7 +176,14 @@ def main():
     verify.require(prepared['automation_sha'] == os.environ['GITHUB_SHA'], 'automation changed')
     source = Path(prepared['source'])
     source_check(source, manifest)
+    verify.require(prepared['run'] == os.environ['GITHUB_RUN_ID'] and prepared['attempt'] == os.environ['GITHUB_RUN_ATTEMPT'], 'prepared consumer run changed')
     try:
+        if args.action == 'transfer':
+            transfer_artifact(automation, inputs, out, manifest, prepared)
+            return
+        provenance = verify.read_json(inputs / 'archive-provenance.json')
+        transfer = verify.read_json(out / 'archive-transfer.json')
+        verify.require(transfer['verified'] is True and transfer['new_run'] == prepared['run'] and transfer['new_automation'] == prepared['automation_sha'] and transfer['provenance_sha256'] == verify.digest(inputs / 'archive-provenance.json'), 'archive transfer is not verified for this consumer')
         tools = {}
         for name, command in [('rustc', ['rustc', '-vV']), ('cargo', ['cargo', '-V']), ('nextest', ['cargo', 'nextest', '--version'])]:
             phase(out, 'tool-' + name, command, source)
@@ -108,15 +196,17 @@ def main():
         tools['selected_environment'] = {key: os.environ.get(key) for key in ['RUSTC_WRAPPER', 'CARGO_HOME',
             'CARGO_BUILD_JOBS', 'CARGO_PROFILE_DEV_DEBUG', 'CARGO_PROFILE_TEST_DEBUG', 'CARGO_INCREMENTAL']}
         save(out / 'tools.json', tools)
-        # Normal locked dependency fetch is not a compile or test. The archive build is offline.
-        phase(out, 'dependencies', ['cargo', 'fetch', '--locked'], source)
-        archive = out / 'retry-cap.tar.zst'
-        phase(out, 'build', ['cargo', 'nextest', 'archive', '-p', 'smallclaims', '--lib', '--features', 'test-support',
-            '--locked', '--offline', '--profile', 'ci', '--color', 'never', '--archive-file', str(archive)], source)
+        expected_tools = provenance['tools']
+        for name in ['cargo', 'rustc', 'nextest']:
+            verify.require(tools[name] == expected_tools[name], 'tool version differs from held archive build: ' + name)
+        for name in ['cargo', 'rustc', 'cargo-nextest']:
+            verify.require(tools['executables'][name] == expected_tools['executables'][name], 'tool path/hash differs from held archive build: ' + name)
+        for key in ['CARGO_BUILD_JOBS', 'CARGO_PROFILE_DEV_DEBUG', 'CARGO_PROFILE_TEST_DEBUG', 'CARGO_INCREMENTAL', 'RUSTC_WRAPPER']:
+            verify.require(tools['selected_environment'][key] == expected_tools['selected_environment'][key], 'ordinary environment differs: ' + key)
+        archive = out / 'source-artifact' / provenance['archive']['name']
         archive_hash = verify.digest(archive)
-        extracted = out / 'inventory-extract'
-        phase(out, 'inventory', ['cargo', 'nextest', 'list', '--archive-file', str(archive), '--extract-to', str(extracted),
-            '--workspace-remap', str(source), '--profile', 'ci', '--color', 'never', '--message-format', 'json'], source)
+        verify.require(archive_hash == provenance['archive']['sha256'] and archive.stat().st_size == provenance['archive']['bytes'], 'held archive changed after transfer')
+        extracted = run_consumer(out, 'inventory', archive, source)
         selected = verify.inventory(verify.read_json(out / 'inventory.stdout'), manifest, extracted)
         metadata = verify.read_json(extracted / 'target/nextest/cargo-metadata.json')
         nodes = [node for node in metadata['resolve']['nodes'] if node['id'] == selected['package_id']]
@@ -138,11 +228,7 @@ def main():
         verify.require(parsed == original, 'report-only config altered policy')
         junit = out / 'nextest-store/ci/retry-cap-attempt1.xml'
         verify.require(not junit.exists(), 'stale JUnit file')
-        run_extracted = out / 'run-extract'
-        phase(out, 'controls', ['cargo', 'nextest', 'run', '--archive-file', str(archive), '--extract-to', str(run_extracted),
-            '--workspace-remap', str(source), '--config-file', str(overlay), '--profile', 'ci', '--retries', '0',
-            '--test-threads', '1', '--no-fail-fast', '--status-level', 'pass', '--final-status-level', 'fail',
-            '--success-output', 'immediate', '--failure-output', 'immediate', '--color', 'never', '-E', selected['filter']], source)
+        run_extracted = run_consumer(out, 'controls', archive, source, overlay, selected['filter'])
         relative_binary = Path(selected['binary_path']).relative_to(extracted)
         verify.require(verify.digest(run_extracted / relative_binary) == selected['binary_sha256'], 'execution binary changed')
         verify.require(verify.digest(archive) == archive_hash, 'archive changed')
@@ -150,7 +236,8 @@ def main():
         raw = (out / 'controls.stderr').read_text() + '\n' + (out / 'controls.stdout').read_text()
         verdict = verify.results(junit.read_text(), raw, selected, 0)
         verdict.update(source=manifest['candidate'], tree=manifest['tree'], archive_sha256=archive_hash,
-                       junit_sha256=verify.digest(junit), config_sha256=verify.digest(overlay), status='TERMINAL')
+                       junit_sha256=verify.digest(junit), config_sha256=verify.digest(overlay), status='TERMINAL',
+                       build_source_run=provenance['source_run'], build_source_job=provenance['source_job'], consumer_run=prepared['run'], consumer_automation=prepared['automation_sha'])
         save(out / 'result.json', verdict)
         print('Exactly 13 named initial PASS results verified; no retries.', flush=True)
     except BaseException as error:
