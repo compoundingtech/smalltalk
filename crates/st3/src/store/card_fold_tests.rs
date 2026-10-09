@@ -155,9 +155,10 @@ fn assert_card_reads_parity_with(
     }
 }
 
+// Replication/checkpoint corpus: retain authentic legacy graph claims in this fixture.
 fn append(store: &Store, subject: &str, kind: &str, actor: Option<&str>, fields: Value) {
     store
-        .append_claim(&ClaimInput {
+        .append_legacy_claim(&ClaimInput {
             subject: subject.into(),
             kind: kind.into(),
             actor: actor.map(str::to_owned),
