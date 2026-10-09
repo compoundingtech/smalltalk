@@ -121,13 +121,21 @@ fn spawn<R: Send + Sync + 'static>(
                         // The next fold starts from nothing again.
                         list.fold_from_nothing_next();
                     }
-                    if let Some((publication, changed)) = folded? {
-                        // A fold that began before projections were replaced publishes nothing;
-                        // the next one folds from nothing.
-                        if let Some(served) = list.publish(publication, generation) {
-                            // Windows reread only when a row changed, or the list is served
-                            // again; an advanced cut alone shows them nothing new.
-                            if changed || !served {
+                    match folded? {
+                        Some((publication, changed)) => {
+                            // A fold that began before projections were replaced publishes
+                            // nothing; the next one folds from nothing.
+                            if let Some(served) = list.publish(publication, generation) {
+                                // Windows reread only when a row changed, or the list is served
+                                // again; an advanced cut alone shows them nothing new.
+                                if changed || !served {
+                                    reader.publish_collection_view(name);
+                                }
+                            }
+                        }
+                        // Nothing new: a withdrawn list's rows are current again.
+                        None => {
+                            if list.serve_again(generation) {
                                 reader.publish_collection_view(name);
                             }
                         }
@@ -144,6 +152,8 @@ fn spawn<R: Send + Sync + 'static>(
                 }
                 Err(error) => {
                     eprintln!("st3: {name} refresh stopped: {error}");
+                    // The fold may have taken a forget with it: fold from nothing next.
+                    list(&store).fold_from_nothing_next();
                     true
                 }
             };

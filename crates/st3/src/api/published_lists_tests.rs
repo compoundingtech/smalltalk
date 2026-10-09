@@ -357,6 +357,21 @@ fn published_work_matches_the_direct_read_for_every_actor_as_time_passes() {
     let (_, changed) = fold_work_checked(&store);
     assert!(!changed, "nothing changed");
 
+    // A seat's queue moves: no row changes, but the seat's windows reorder.
+    store
+        .move_seat_queue_run(&crate::model::SeatQueueMoveRequest {
+            agent: "agent/garden/ash".into(),
+            run: beta.id.clone(),
+            placement: "top".into(),
+            anchor: None,
+            reason: Some("beta first".into()),
+            actor: "person/operator".into(),
+            idempotency_key: "move-beta".into(),
+        })
+        .unwrap();
+    let (_, changed) = fold_work_checked(&store);
+    assert!(changed, "the moved queue reorders ash's windows");
+
     // A claim starts the step's execution time, which grows with the list's time while
     // unrelated claims move the cut.
     let (plant, ash) = step(&alpha, "plant");
@@ -372,6 +387,7 @@ fn published_work_matches_the_direct_read_for_every_actor_as_time_passes() {
     fold_work_checked(&store);
 
     // A quiet renewal moves the lease with no claim; the next fold still shows it.
+    fold(&store);
     clock.set(started + 4 * 60_000);
     let before = store.index().unwrap();
     store
@@ -511,6 +527,23 @@ mission "garden/proposed" state="ready" revisions="human-only" revision-reviewer
     fold(&store);
     fold_work_checked(&store);
     let rows = proposed("Plant in rows.", "publish-proposed-rows");
+    // A proposal cancelled before review releases the run.
+    let cancelled = store
+        .create_revision_proposal(
+            &run.id,
+            &rows,
+            &format!("agent/{}/owner", run.id),
+            "try rows",
+            "proposal-cancelled",
+        )
+        .unwrap();
+    fold(&store);
+    fold_work_checked(&store);
+    store
+        .cancel_revision_proposal(&cancelled.id, &format!("agent/{}/owner", run.id), Some("not yet"), "proposal-cancel")
+        .unwrap();
+    fold(&store);
+    fold_work_checked(&store);
     let proposal = store
         .create_revision_proposal(
             &run.id,
@@ -559,4 +592,29 @@ fn a_forgotten_list_keeps_its_rows_until_refolded_and_withdraws_its_view_too() {
     // Its next fold, from nothing, serves the list again.
     fold(&store);
     assert!(store.published_missions().is_some());
+}
+
+#[test]
+fn a_refresher_that_ends_withdraws_its_list_and_view() {
+    let _clock = Clock::at(start_time());
+    let store = Arc::new(Store::open_memory("cedar").unwrap());
+    mission(&store, "garden/alpha");
+    fold(&store);
+    store.publish_collection_view("missions");
+    let guard = Withdraw { store: Arc::clone(&store), list: |store| store.published_missions_list(), name: "missions" };
+    drop(guard);
+    assert!(store.published_missions().is_none());
+    assert!(!store.collection_view_published("missions"));
+}
+
+#[test]
+fn a_fold_reads_claims_from_the_frontier_it_saw_and_rebuilds_past_too_many() {
+    // No replication pass since the base: read from the base's cut.
+    assert_eq!(claims_from(500, 100, 520, 100), Some(500));
+    // A pass moved the frontier: read again from where the base saw it.
+    assert_eq!(claims_from(500, 100, 520, 520), Some(100));
+    // Too many claims to read in one snapshot: fold from nothing.
+    assert_eq!(claims_from(500, 500, 500 + FOLD_CLAIMS, 500), Some(500));
+    assert_eq!(claims_from(500, 500, 501 + FOLD_CLAIMS, 500), None);
+    assert_eq!(claims_from(20_000, 0, 20_010, 20_010), None, "a frontier that first appears");
 }

@@ -114,7 +114,7 @@ fn system_mission(id: &str) -> bool {
 }
 
 /// Each mission's key columns. With `?1` a JSON array of mission IDs, only those missions.
-fn mission_keys_sql(selected: bool) -> String {
+pub(crate) fn mission_keys_sql(selected: bool) -> String {
     let filter = if selected {
         "WHERE mission_id IN (SELECT value FROM json_each(?1))"
     } else {
@@ -226,11 +226,8 @@ impl Store {
         let mut steps = BTreeSet::new();
         let mut requesters = BTreeSet::new();
         let mut every_ask = false;
-        let mut statement = connection.prepare_cached(
-            "SELECT subject, kind, CASE WHEN kind LIKE 'work.person-%'
-                    THEN json_extract(body,'$.fields.origin_step') END
-             FROM claims WHERE store_index>?1 AND store_index<=?2",
-        )?;
+        let mut tree_roots = BTreeSet::new();
+        let mut statement = connection.prepare_cached(published_list::CLAIMS_SINCE)?;
         let claims = statement
             .query_map(params![after, through], |row| {
                 Ok((
@@ -247,9 +244,9 @@ impl Store {
             } else if let Some(run) = subject.strip_prefix("mission-run/") {
                 runs.insert(run.to_owned());
                 // A run's state ends the steps of the runs under it, and decides whether asks
-                // in them are current: refold its whole run tree.
+                // in them are current: refold the runs under it too.
                 if matches!(kind.as_str(), "mission-run.state" | "mission-run.created") {
-                    runs.extend(self.runs_in_tree(run)?);
+                    tree_roots.insert(run.to_owned());
                 }
             } else if let Some(generation) = subject.strip_prefix("run-generation/") {
                 let mut owner = connection
@@ -276,6 +273,9 @@ impl Store {
                 requesters.insert(subject);
             }
         }
+        runs.extend(self.runs_under(&tree_roots)?);
+        // A step that asked decides whether its asks are current, as when it leaves waiting.
+        steps.extend(self.asks_from_steps(&steps)?);
         // A requester's declaration and runtime decide whether its asks still block steps, and
         // whether its runs wait on a person.
         let mut asks = self.asks_by_requesters(&requesters)?;

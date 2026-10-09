@@ -36,6 +36,14 @@ pub(crate) struct WorkRows {
     pub(crate) frontier: u64,
 }
 
+/// Every leased step's lease end, by the lease index.
+pub(crate) const WORK_LEASES: &str = "SELECT subject, CAST(lease_expires_at_unix_ms AS INTEGER) FROM step_runs
+ INDEXED BY step_runs_lease_index
+ WHERE lease_owner IS NOT NULL AND lease_expires_at_unix_ms IS NOT NULL";
+/// The earliest claim about step `?1` accepted after `?2`, by the subject index.
+pub(crate) const NEXT_CLAIM_AFTER: &str = "SELECT MIN(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims
+ WHERE subject=?1 AND CAST(accepted_at_unix_ms AS INTEGER)>?2";
+
 /// What claims between two cuts changed in the work list.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct WorkChanges {
@@ -92,11 +100,8 @@ impl Store {
         let mut runs = BTreeSet::new();
         let mut requesters = BTreeSet::new();
         let mut every_ask = false;
-        let mut statement = connection.prepare_cached(
-            "SELECT subject, kind, CASE WHEN kind LIKE 'work.person-%'
-                    THEN json_extract(body,'$.fields.origin_step') END
-             FROM claims WHERE store_index>?1 AND store_index<=?2",
-        )?;
+        let mut tree_roots = BTreeSet::new();
+        let mut statement = connection.prepare_cached(published_list::CLAIMS_SINCE)?;
         let claims = statement
             .query_map(params![after, through], |row| {
                 Ok((
@@ -110,9 +115,9 @@ impl Store {
             if let Some(run) = subject.strip_prefix("mission-run/") {
                 runs.insert(run.to_owned());
                 // A run's state ends the steps of the runs under it, and decides whether asks
-                // in them are current: refold its whole run tree.
+                // in them are current: refold the runs under it too.
                 if matches!(kind.as_str(), "mission-run.state" | "mission-run.created") {
-                    runs.extend(self.runs_in_tree(run)?);
+                    tree_roots.insert(run.to_owned());
                 }
             } else if let Some(generation) = subject.strip_prefix("run-generation/") {
                 let mut owner = connection
@@ -152,6 +157,10 @@ impl Store {
                 reorder |= kind == crate::seat_queue::MOVED_CLAIM;
             }
         }
+        runs.extend(self.runs_under(&tree_roots)?);
+        // A step that asked decides whether its asks are current, as when it leaves waiting.
+        let asked = self.asks_from_steps(&steps)?;
+        steps.extend(asked);
         // A requester's declaration and runtime decide whether its asks still block steps.
         let asks = if every_ask { self.every_ask()? } else { self.asks_by_requesters(&requesters)? };
         for (ask, origin) in asks {
@@ -207,11 +216,7 @@ impl Store {
     /// Every step that holds a worker lease, with the lease's end: few, by the lease index.
     pub(crate) fn work_leases(&self) -> Result<HashMap<String, u128>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(
-            "SELECT subject, CAST(lease_expires_at_unix_ms AS INTEGER) FROM step_runs
-             INDEXED BY step_runs_lease_index
-             WHERE lease_owner IS NOT NULL AND lease_expires_at_unix_ms IS NOT NULL",
-        )?;
+        let mut statement = connection.prepare_cached(WORK_LEASES)?;
         let leases = statement
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.max(0) as u128)))?
             .collect::<rusqlite::Result<HashMap<_, _>>>()?;
@@ -223,10 +228,7 @@ impl Store {
     pub(crate) fn next_claim_after(&self, subject: &str, time: u128) -> Result<Option<u128>> {
         let connection = self.readers.get();
         let next = connection
-            .prepare_cached(
-                "SELECT MIN(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims
-                 WHERE subject=?1 AND CAST(accepted_at_unix_ms AS INTEGER)>?2",
-            )?
+            .prepare_cached(NEXT_CLAIM_AFTER)?
             .query_row(params![subject, time.min(i64::MAX as u128) as i64], |row| row.get::<_, Option<i64>>(0))?;
         Ok(next.map(|next| next.max(0) as u128))
     }
@@ -250,6 +252,43 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_published_lists_reads_search_their_indexes_and_scan_no_table() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.readers.get();
+        for (name, sql) in [
+            ("claims since", published_list::CLAIMS_SINCE.to_owned()),
+            ("asks by requesters", published_list::ASKS_BY_REQUESTERS.to_owned()),
+            ("ask origin", published_list::ASK_ORIGIN_AND_RUN.to_owned()),
+            ("asks from steps", published_list::ASKS_FROM_STEPS.to_owned()),
+            ("run steps", published_list::RUN_STEPS.to_owned()),
+            ("child runs", published_list::CHILD_RUNS.to_owned()),
+            ("work leases", WORK_LEASES.to_owned()),
+            ("next claim", NEXT_CLAIM_AFTER.to_owned()),
+            ("selected work", selected_work_at_snapshot_query(false)),
+            ("selected mission keys", super::super::mission_list::mission_keys_sql(true)),
+        ] {
+            let mut statement = connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let parameters = statement.parameter_count();
+            let plan = statement
+                .query_map(rusqlite::params_from_iter(std::iter::repeat_n("[]", parameters)), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            for line in &plan {
+                for table in ["claims", "step_runs", "mission_runs", "mission_definitions"] {
+                    assert!(
+                        !line.starts_with(&format!("SCAN {table}")),
+                        "{name} scans {table}:\n{}",
+                        plan.join("\n")
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn work_sorts_by_state_then_readiness_path_and_subject() {

@@ -73,11 +73,23 @@ impl<R> PublishedList<R> {
     /// projections were replaced since: then it folds from nothing. With it, the generation
     /// [`Self::publish`] must still see for the fold to publish.
     pub(crate) fn base(&self) -> (Option<Arc<Publication<R>>>, u64) {
+        // Under the lock a forget takes, so the flag and the generation are read together.
+        let newest = self.newest.lock().unwrap_or_else(PoisonError::into_inner);
         let generation = self.generation.load(Ordering::Acquire);
         if self.forgotten.swap(false, Ordering::AcqRel) {
             return (None, generation);
         }
-        (self.newest.lock().unwrap_or_else(PoisonError::into_inner).clone(), generation)
+        (newest.clone(), generation)
+    }
+
+    /// Serve the newest publication again, as a withdrawn list whose next fold finds nothing
+    /// new must, unless the projections were replaced since `generation`. Says whether it did.
+    pub(crate) fn serve_again(&self, generation: u64) -> bool {
+        let newest = self.newest.lock().unwrap_or_else(PoisonError::into_inner);
+        if newest.is_none() || self.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        !self.serving.swap(true, Ordering::AcqRel)
     }
 
     /// Swap in a newer publication and serve it, unless the projections were replaced after its
@@ -126,6 +138,25 @@ impl<R> PublishedList<R> {
     }
 }
 
+/// The claims after `?1` through `?2`, by store index, with the step a person-work claim names.
+pub(crate) const CLAIMS_SINCE: &str = "SELECT subject, kind, CASE WHEN kind LIKE 'work.person-%'
+        THEN json_extract(body,'$.fields.origin_step') END
+ FROM claims WHERE store_index>?1 AND store_index<=?2";
+/// The person asks the requesters in `?1`, a JSON array, made, by the kind index.
+pub(crate) const ASKS_BY_REQUESTERS: &str = "SELECT subject, json_extract(body,'$.fields.origin_step') FROM claims
+ WHERE kind='work.person-asked' AND actor IN (SELECT value FROM json_each(?1))";
+/// The ask on step `?1`, by the subject index.
+pub(crate) const ASK_ORIGIN_AND_RUN: &str = "SELECT json_extract(body,'$.fields.origin_step'), json_extract(body,'$.fields.run')
+ FROM claims WHERE subject=?1 AND kind='work.person-asked' LIMIT 1";
+/// A run's steps, by the run index.
+pub(crate) const RUN_STEPS: &str = "SELECT subject FROM step_runs INDEXED BY step_runs_run_index WHERE run_id=?1";
+/// The runs a step started, by the parent-step index.
+pub(crate) const CHILD_RUNS: &str =
+    "SELECT id FROM mission_runs WHERE parent_step_run=?1 AND parent_step_run IS NOT NULL";
+/// Person asks whose origin step is one of `?1`, a JSON array, by the kind index.
+pub(crate) const ASKS_FROM_STEPS: &str = "SELECT subject FROM claims
+ WHERE kind='work.person-asked' AND json_extract(body,'$.fields.origin_step') IN (SELECT value FROM json_each(?1))";
+
 /// Claim kinds about an agent that decide whether its person asks still block their steps:
 /// its declaration, and the runtime state and actions that tell whether it is retiring.
 pub(crate) fn decides_asks(kind: &str) -> bool {
@@ -158,10 +189,7 @@ impl Store {
         }
         let connection = self.readers.get();
         let asks = connection
-            .prepare_cached(
-                "SELECT subject, json_extract(body,'$.fields.origin_step') FROM claims
-                 WHERE kind='work.person-asked' AND actor IN (SELECT value FROM json_each(?1))",
-            )?
+            .prepare_cached(ASKS_BY_REQUESTERS)?
             .query_map([serde_json::to_string(requesters)?], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })?
@@ -174,10 +202,7 @@ impl Store {
     pub(crate) fn ask_origin_and_run(&self, ask: &str) -> Result<(Option<String>, Option<String>)> {
         let connection = self.readers.get();
         let found = connection
-            .prepare_cached(
-                "SELECT json_extract(body,'$.fields.origin_step'), json_extract(body,'$.fields.run')
-                 FROM claims WHERE subject=?1 AND kind='work.person-asked' LIMIT 1",
-            )?
+            .prepare_cached(ASK_ORIGIN_AND_RUN)?
             .query_row([ask], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)))
             .optional()?;
         Ok(found.unwrap_or_default())
@@ -197,18 +222,43 @@ impl Store {
         Ok(asks)
     }
 
-    /// Every run in the same run tree as `run`: a run's state ends the steps of the runs under
-    /// it, and an ask's currency walks the runs above its step.
-    pub(crate) fn runs_in_tree(&self, run: &str) -> Result<Vec<String>> {
+    /// `runs` and every run under them, through the steps that started each child run: a
+    /// run's state ends the steps of the runs under it, and decides whether asks in them are
+    /// current. Walks the run and parent-step indexes, never the whole table.
+    pub(crate) fn runs_under(&self, runs: &BTreeSet<String>) -> Result<BTreeSet<String>> {
         let connection = self.readers.get();
-        let runs = connection
-            .prepare_cached(
-                "SELECT id FROM mission_runs
-                 WHERE root_run_id=(SELECT root_run_id FROM mission_runs WHERE id=?1)",
-            )?
-            .query_map([run], |row| row.get::<_, String>(0))?
+        let mut steps_of = connection.prepare_cached(RUN_STEPS)?;
+        let mut children_of = connection.prepare_cached(CHILD_RUNS)?;
+        let mut found = BTreeSet::new();
+        let mut queue = runs.iter().cloned().collect::<Vec<_>>();
+        while let Some(run) = queue.pop() {
+            if !found.insert(run.clone()) {
+                continue;
+            }
+            let steps = steps_of
+                .query_map([&run], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for step in steps {
+                for child in children_of.query_map([&step], |row| row.get::<_, String>(0))? {
+                    queue.push(child?);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The person asks that asked from any of `steps`: a change to the step that asked, as
+    /// when it leaves waiting on a person, decides whether its asks are still current.
+    pub(crate) fn asks_from_steps(&self, steps: &BTreeSet<String>) -> Result<Vec<String>> {
+        if steps.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let asks = connection
+            .prepare_cached(ASKS_FROM_STEPS)?
+            .query_map([serde_json::to_string(steps)?], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(runs)
+        Ok(asks)
     }
 
     /// The run a revision proposal is for: its phase and timestamps change with the proposal.
@@ -266,6 +316,14 @@ mod tests {
         assert_eq!(list.publish(publication(5), 0), Some(false), "served again, so announced");
         assert_eq!(list.publish(publication(6), 0), Some(true));
         assert_eq!(list.newest().unwrap().cut, 6);
+        // A fold that finds nothing new serves the withdrawn rows again, once.
+        list.withdraw();
+        assert!(list.serve_again(0));
+        assert!(!list.serve_again(0), "already served");
+        assert_eq!(list.newest().unwrap().cut, 6);
+        list.withdraw();
+        list.forget();
+        assert!(!list.serve_again(0), "not after the projections were replaced");
         list.note_rebuild("start");
         list.note_rebuild("start");
         assert_eq!(list.rebuilds(), BTreeMap::from([("start".to_owned(), 2)]));
