@@ -205,7 +205,8 @@ impl Store {
     }
 
     /// People read again by refreshes of `view`, and full reads of everyone.
-    pub fn owner_list_reads(&self, view: OwnerView) -> (u64, u64) {
+    #[cfg(test)]
+    pub(crate) fn owner_list_reads(&self, view: OwnerView) -> (u64, u64) {
         let list = view.list(self);
         (
             list.people_read.load(AtomicOrdering::Relaxed),
