@@ -267,6 +267,9 @@ async fn assistant_status(client: &Client) -> Result<Option<crate::model::Subjec
 }
 
 fn workspace() -> Result<PathBuf> {
+    if let Some(instance) = crate::instance::current() {
+        return Ok(instance.agents_dir().join("st-expert"));
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -436,7 +439,10 @@ mod tests {
             );
             match *harness {
                 "claude" => assert!(source.contains("--dangerously-skip-permissions")),
-                "codex" => assert!(source.contains("--dangerously-bypass-approvals-and-sandbox")),
+                "codex" => {
+                    assert!(source.contains("--approve-for-me"));
+                    assert!(!source.contains("--dangerously-bypass"));
+                }
                 _ => {}
             }
         }

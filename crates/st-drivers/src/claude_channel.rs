@@ -238,6 +238,13 @@ pub fn status_st3() -> Result<()> {
 }
 
 pub fn uninstall_st3(keep_policy: bool) -> Result<()> {
+    remove_st3_channel(keep_policy)?;
+    println!("uninstalled");
+    Ok(())
+}
+
+/// Unregister st's Claude plugin and marketplace and delete the marketplace files, saying nothing.
+pub fn remove_st3_channel(keep_policy: bool) -> Result<()> {
     let marketplace = st3_marketplace_root()?;
     let owns_marketplace = st3_marketplace_registration()?
         .is_some_and(|entry| marketplace_entry_matches(&entry, &marketplace));
@@ -266,7 +273,6 @@ pub fn uninstall_st3(keep_policy: bool) -> Result<()> {
     if !keep_policy && policy.exists() {
         remove_st3_policy_with_elevation(&policy)?;
     }
-    println!("uninstalled");
     Ok(())
 }
 
@@ -300,7 +306,7 @@ fn marketplace_root() -> Result<PathBuf> {
     Ok(data_home()?.join("st2/claude-channel/marketplace"))
 }
 
-fn st3_marketplace_root() -> Result<PathBuf> {
+pub fn st3_marketplace_root() -> Result<PathBuf> {
     Ok(data_home()?.join("st/plugins/claude/marketplace"))
 }
 

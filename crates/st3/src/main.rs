@@ -79,6 +79,11 @@ use presentation::{
 struct Cli {
     #[arg(long, global = true)]
     endpoint: Option<String>,
+    /// Run a second, fully separate st on this machine: its own state, config, sockets, node
+    /// name, service names and harness accounts, all under ~/.st-instance/NAME. Same as the
+    /// ST_INSTANCE environment variable.
+    #[arg(long, global = true, env = "ST_INSTANCE", value_name = "NAME")]
+    instance: Option<String>,
     #[arg(long, global = true, hide = true)]
     catalog: Option<PathBuf>,
     #[arg(long, global = true)]
@@ -1308,6 +1313,7 @@ async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
         .map(Path::to_path_buf)
         .context("the state directory has no parent")?;
     let data_dir = data_home.join("st3");
+    let instance = st3::instance::current();
     let manifest: Option<Value> = fs::read(data_dir.join("install.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
@@ -1335,14 +1341,43 @@ async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
     if !args.keep_binaries {
         paths.extend(binaries.iter().cloned());
     }
+    // What the default install writes outside its own directories: st's Claude plugin
+    // marketplace, and the copies of the st skill that seats install into harness directories.
+    let skill_copies = st3::skill::untouched_installs();
+    let plugin_files = st_drivers::claude_channel::st3_marketplace_root()
+        .ok()
+        .and_then(|root| root.ancestors().nth(2).map(Path::to_path_buf))
+        .filter(|root| root.ends_with("st/plugins") && root.exists());
+    paths.extend(skill_copies.iter().cloned());
+    paths.extend(plugin_files);
+    if let Some(instance) = &instance {
+        // An instance owns exactly one directory, and every path above lies inside it. Removing
+        // that directory is the whole uninstall, and nothing outside it is listed or touched.
+        let root = instance.root().to_path_buf();
+        anyhow::ensure!(
+            paths.iter().all(|path| path.starts_with(&root)),
+            "the instance would remove a path outside {}: {:?}",
+            root.display(),
+            paths.iter().filter(|path| !path.starts_with(&root)).collect::<Vec<_>>()
+        );
+        paths = vec![root];
+    }
     paths.sort();
     paths.dedup();
     if args.dry_run {
         for path in &paths {
             println!("remove\t{}", path.display());
         }
-        println!("remove\tthe st3 user services, if installed");
-        if manifest.is_none() && !args.keep_binaries {
+        if let Some(instance) = &instance {
+            println!(
+                "remove\tthe user services of instance {}, if installed",
+                instance.name()
+            );
+        } else {
+            println!("remove\tthe st3 user services, if installed");
+            println!("remove\tst's Claude plugin and marketplace registration, if installed");
+        }
+        if instance.is_none() && manifest.is_none() && !args.keep_binaries {
             println!(
                 "keep\tthe st3 executables: no release install manifest; remove them the way you installed them"
             );
@@ -1384,6 +1419,17 @@ async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
     {
         anyhow::bail!("stop st3 up and st3 replication-worker, then run st uninstall --yes again");
     }
+    if instance.is_none()
+        && let Err(error) = st_drivers::claude_channel::remove_st3_channel(true)
+        // No `claude` on this machine means there is no plugin registration to remove.
+        && !error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        })
+    {
+        eprintln!("could not unregister st's Claude plugin: {error:#}");
+    }
     for path in &paths {
         let result = if path.is_dir() {
             fs::remove_dir_all(path)
@@ -1394,6 +1440,13 @@ async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             eprintln!("could not remove {}: {error}", path.display());
+        }
+    }
+    if let Some(instance) = &instance {
+        // The directory that holds instances goes with the last one; `remove_dir` leaves it alone
+        // while another instance, or anything else, is inside.
+        if let Some(parent) = instance.root().parent() {
+            let _ = fs::remove_dir(parent);
         }
     }
     let remaining = paths
@@ -4503,7 +4556,7 @@ struct FeedbackReviewArgs {
 
 #[derive(Args)]
 struct DriverArgs {
-    #[arg(value_parser = ["claude", "claude-mcp", "codex", "pi", "pi-channel", "omp", "omp-channel", "opencode", "exec"])]
+    #[arg(value_parser = ["claude", "claude-mcp", "codex", "codex-bridge", "pi", "pi-channel", "omp", "omp-channel", "opencode", "exec"])]
     driver: String,
     #[arg(long, env = "ST_AGENT")]
     subject: Option<String>,
@@ -4649,6 +4702,17 @@ fn main() -> ExitCode {
     // A recorder link starts st3 as `git` or `gh`. It must not build the async runtime.
     if let Some(program) = st3::recorder::invoked_program() {
         st3::recorder::run(program);
+    }
+    // An instance changes where every path resolves, so it comes before anything reads one.
+    let instance_arguments = std::env::args_os().collect::<Vec<_>>();
+    let instance_name = st3::instance::requested(&instance_arguments)
+        .or_else(|| std::env::var(st3::instance::ENV).ok().filter(|name| !name.is_empty()));
+    if let Some(name) = instance_name {
+        // SAFETY: no other thread exists yet; the async runtime starts after this returns.
+        if let Err(error) = unsafe { st3::instance::activate(&name) } {
+            eprintln!("st: --instance {name}: {error:#}");
+            return ExitCode::from(2);
+        }
     }
     // A shell stub from `st completions` calls back with `COMPLETE=<shell>` on each TAB. Answer
     // before any config, runtime, or daemon work; this exits when the variable is set.
@@ -17666,6 +17730,26 @@ fn parse_publication_actor(actor: &str) -> std::result::Result<String, String> {
 }
 
 async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -> Result<()> {
+    if args.driver == "codex-bridge" {
+        anyhow::ensure!(
+            args.argv.is_empty(),
+            "the Codex tool bridge takes no provider argv"
+        );
+        let subject = args
+            .subject
+            .as_deref()
+            .filter(|subject| !subject.trim().is_empty())
+            .context("the Codex tool bridge needs the seat it acts for")?;
+        // Calls go back through this same executable, so the bridge follows a deploy.
+        let executable = match std::env::var("ST3_BIN") {
+            Ok(path) if !path.trim().is_empty() => path,
+            _ => std::env::current_exe()
+                .context("locating the st executable")?
+                .to_string_lossy()
+                .into_owned(),
+        };
+        return st_drivers::codex_bridge::run(subject, &executable);
+    }
     if args.driver == "claude-mcp" {
         anyhow::ensure!(
             args.argv.is_empty(),

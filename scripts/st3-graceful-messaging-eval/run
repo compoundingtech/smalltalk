@@ -42,7 +42,7 @@ harness_block() {
       printf '  harness "claude" {\n    model "%s"\n    args "--permission-mode" "bypassPermissions"\n  }\n' "$model" ;;
     codex)
       model=${GM_MODEL_CODEX:-gpt-6-luna}
-      printf '  harness "codex" {\n    model "%s"\n    effort "low"\n    args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"\n  }\n' "$model" ;;
+      printf '  harness "codex" {\n    model "%s"\n    effort "low"\n    args "--dangerously-bypass-approvals-and-sandbox"\n  }\n' "$model" ;;
     omp)
       model=${GM_MODEL_OMP:-openai-codex/gpt-5.6-luna}
       printf '  harness "omp" {\n    model "%s"\n    effort "low"\n  }\n' "$model" ;;

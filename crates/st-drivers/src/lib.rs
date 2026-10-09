@@ -26,6 +26,7 @@ pub mod claude_channel;
 pub mod claude_mcp;
 pub mod claude_session;
 pub mod codex_app_server;
+pub mod codex_bridge;
 pub mod context;
 pub mod contracts;
 pub mod delivery_ledger;

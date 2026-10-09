@@ -705,7 +705,7 @@ async fn onboarding_publication_is_graph_decided_and_preserves_stopped_assistant
     assert!(
         serde_json::to_string(assistant)
             .unwrap()
-            .contains("--dangerously-bypass-approvals-and-sandbox")
+            .contains("--approve-for-me")
     );
     let published = serde_json::to_string(assistant).unwrap();
     assert!(published.contains("Smalltalk Assistant"), "{published}");

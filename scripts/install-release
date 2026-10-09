@@ -2,16 +2,28 @@
 # Install an extracted Smalltalk release without restarting any service.
 set -Eeuo pipefail
 source_dir=$(cd "$(dirname "$0")" && pwd)/bin
-bin_dir="${ST_MACOS_BIN_DIR:-$HOME/.local/bin}"
+bin_dir=""
+instance="${ST_INSTANCE:-}"
 quiet=false
 while (($#)); do
   case $1 in
     --bin-dir) bin_dir=${2:?--bin-dir needs a directory}; shift 2 ;;
+    --instance) instance=${2:?--instance needs a name}; shift 2 ;;
     --quiet) quiet=true; shift ;;
-    -h | --help) echo 'Usage: ./install.sh [--bin-dir DIRECTORY] [--quiet]'; exit 0 ;;
+    -h | --help) echo 'Usage: ./install.sh [--bin-dir DIRECTORY] [--instance NAME] [--quiet]'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
+if [[ -n $instance ]]; then
+  [[ ${#instance} -le 24 && $instance =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || {
+    echo "install: an instance name is lowercase letters, digits and single hyphens, at most 24 characters" >&2
+    exit 2
+  }
+  export ST_INSTANCE=$instance
+  # A named instance installs below its own directory unless told otherwise.
+  [[ -n $bin_dir ]] || bin_dir=${ST_MACOS_BIN_DIR:-$HOME/.st-instance/$instance/bin}
+fi
+bin_dir=${bin_dir:-${ST_MACOS_BIN_DIR:-$HOME/.local/bin}}
 binaries=(st3 pty)
 for binary in "${binaries[@]}"; do
   [[ -f $source_dir/$binary && -x $source_dir/$binary ]] || {
@@ -101,7 +113,9 @@ import os
 from pathlib import Path
 import sys
 app = os.environ.get('ST_MACOS_APP_PATH')
-print(Path(app).expanduser().absolute() if app else Path(sys.argv[1]) / 'Applications/SmallTalk.app')
+instance = os.environ.get('ST_INSTANCE')
+default = Path(sys.argv[1]) / ('.st-instance/' + instance + '/app/SmallTalk.app' if instance else 'Applications/SmallTalk.app')
+print(Path(app).expanduser().absolute() if app else default)
 PY
 )
   macos_lock="$(dirname "$macos_app")/.${macos_app##*/}.archive-install.lock"
@@ -111,6 +125,7 @@ PY
   mkdir "$macos_lock"
   macos_locked=true
   macos_state="$macos_home/.local/state/st3/macos-installs"
+  [[ -z ${ST_INSTANCE:-} ]] || macos_state="$macos_home/.st-instance/$ST_INSTANCE/state/st3/macos-installs"
   mkdir -p "$macos_state"
   # Retain this job just as the helper's default installation does. It holds the
   # signed previous app, command links and launchd files for the existing restore API.

@@ -398,10 +398,17 @@ fn machine_default(hostname: &str) -> String {
     #[cfg(target_os = "macos")]
     let hostname = hostname.as_str();
     let name = slug(hostname);
-    if name.is_empty() || name == "local" || name == "localhost" {
-        "studio".into()
+    let name = if name.is_empty() || name == "local" || name == "localhost" {
+        "studio".to_owned()
     } else {
         name
+    };
+    // An instance is a second machine to any fleet it joins, so its name always says so.
+    match crate::instance::current() {
+        Some(instance) if !name.ends_with(&format!("-{}", instance.name())) => {
+            instance.node_name(&name)
+        }
+        _ => name,
     }
 }
 
@@ -541,16 +548,24 @@ fn find_pty(executable: &Path) -> Result<PathBuf> {
 }
 
 fn install_binaries(executable: &Path) -> Result<PathBuf> {
+    // An instance installs its own copies below its directory; sharing the default install's
+    // executables would let an instance's uninstall, or an upgrade, reach the default install.
+    let instance = crate::instance::current();
     // Keep managed installations (including the signed macOS app bundle) in place.
-    if let Ok(environment) = crate::environment::snapshot()
+    if instance.is_none()
+        && let Ok(environment) = crate::environment::snapshot()
         && st_runtime::resolve_executable("st", &environment)
             .ok()
             .is_some_and(|st| same_file(&st, executable))
     {
         return Ok(executable.into());
     }
-    let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
-    let bin = home.join(".local/bin");
+    let bin = match &instance {
+        Some(instance) => instance.bin_dir(),
+        None => {
+            PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".local/bin")
+        }
+    };
     // Locate pty before changing any installed file.
     let pty = find_pty(executable)?;
     fs::create_dir_all(&bin)?;
@@ -593,6 +608,14 @@ fn record_installed_binaries(bin: &Path) -> Result<()> {
 }
 
 fn check_login_path(executable: &Path) {
+    if let Some(instance) = crate::instance::current() {
+        println!(
+            "Instance `{0}`: run {1} with `--instance {0}`, or `export ST_INSTANCE={0}` in a shell. Your login PATH is unchanged.",
+            instance.name(),
+            executable.display()
+        );
+        return;
+    }
     match crate::environment::snapshot() {
         Ok(environment) => {
             if st_runtime::resolve_executable("st", &environment)
@@ -623,6 +646,14 @@ async fn daemon_ready(config: &Config) -> bool {
 
 #[cfg(target_os = "linux")]
 fn try_linger() {
+    // Lingering belongs to the whole user account, not to one instance: an instance neither
+    // enables it nor, on uninstall, disables what the default install may rely on.
+    if crate::instance::current().is_some() {
+        println!(
+            "This instance runs while you are logged in. Lingering is account-wide, so it was left alone."
+        );
+        return;
+    }
     let user = std::env::var("USER").ok().filter(|user| !user.is_empty());
     // Never allow a polkit/password conversation to open in setup.
     let mut command = Command::new("loginctl");

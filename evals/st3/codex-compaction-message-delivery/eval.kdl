@@ -9,7 +9,7 @@ mission "eval/codex-compaction-message-delivery" state="ready" timeout="25m" {
     harness "codex" {
       model "gpt-6-sol"
       effort "medium"
-      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+      args "--dangerously-bypass-approvals-and-sandbox"
     }
     restart "never"
   }

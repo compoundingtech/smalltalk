@@ -1180,10 +1180,7 @@ fn parse_planning_session_declaration(
                 harness_body.nodes_mut().push(string_node("effort", effort));
             }
             let arguments: &[&str] = match creation.planner.provider.as_str() {
-                "codex" => &[
-                    "--dangerously-bypass-approvals-and-sandbox",
-                    "--dangerously-bypass-hook-trust",
-                ],
+                "codex" => &["--dangerously-bypass-approvals-and-sandbox"],
                 "claude" => &["--permission-mode", "bypassPermissions"],
                 _ => &[],
             };

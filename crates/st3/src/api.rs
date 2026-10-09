@@ -8536,10 +8536,7 @@ async fn start_planning_session(
         planner_config.provider
     );
     let arguments = match planner_config.provider.as_str() {
-        "codex" => vec![
-            "--dangerously-bypass-approvals-and-sandbox".into(),
-            "--dangerously-bypass-hook-trust".into(),
-        ],
+        "codex" => vec!["--dangerously-bypass-approvals-and-sandbox".into()],
         "claude" => vec!["--permission-mode".into(), "bypassPermissions".into()],
         _ => Vec::new(),
     };
@@ -20364,7 +20361,7 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
             &planner_launch,
             crate::model::LaunchSpec::Argv(arguments)
                 if arguments.iter().any(|argument| argument == "--dangerously-bypass-approvals-and-sandbox")
-                    && arguments.iter().any(|argument| argument == "--dangerously-bypass-hook-trust")
+                    && !arguments.iter().any(|argument| argument == "--dangerously-bypass-hook-trust")
         ));
         assert!(store.mission_spec("planned/work", None).unwrap().is_none());
         assert!(store.active_mission_runs().unwrap().is_empty());

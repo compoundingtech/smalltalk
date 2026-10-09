@@ -220,6 +220,52 @@ class Installer(unittest.TestCase):
                          [str(m.binaries(m.fixed(self.home))['st3']), 'daemon', '--socket', 'keep.sock'])
         self.assertTrue(list((self.home / '.local/state/st3/macos-installs').glob('*.lock')))
 
+    def test_a_named_instance_installs_beside_the_default_without_touching_it(self):
+        agents = self.home / 'Library/LaunchAgents'
+        agents.mkdir(parents=True)
+        default_service = agents / 'com.compoundingtech.st3.plist'
+        default_replication = agents / 'com.compoundingtech.st3.replication.plist'
+        for path in (default_service, default_replication):
+            path.write_bytes(plistlib.dumps({'ProgramArguments': ['default-st3', 'up', '--socket', 'keep.sock']}))
+        default_bin = self.home / '.local/bin'
+        default_bin.mkdir(parents=True)
+        (default_bin / 'st3').write_bytes(b'default executable')
+        before = {p: p.read_bytes() for p in (default_service, default_replication, default_bin / 'st3')}
+        instance = self.home / '.st-instance/try'
+        labels = ['com.compoundingtech.st3.instance.try', 'com.compoundingtech.st3.instance.try.replication']
+        for label in labels:
+            (agents / (label + '.plist')).write_bytes(plistlib.dumps({'ProgramArguments': ['old', 'up']}))
+        argv = ['install-macos', '--from', str(self.source), '--home', str(self.home), '--job', str(self.job),
+                '--identifier', 'com.compoundingtech.smalltalk.instance.try']
+        with patch.object(m, 'INSTANCE', 'try'), patch.object(m, 'SERVICES', labels), \
+                patch.object(sys, 'argv', argv), \
+                patch.object(Path, 'home', side_effect=AssertionError('must not use real user home')), \
+                patch.object(m, 'command', side_effect=self.command), \
+                patch.object(m, 'exchange', side_effect=self.exchange), \
+                contextlib.redirect_stdout(io.StringIO()):
+            m.main()
+            app, commands, state = m.fixed(self.home), m.bin_dir(self.home), m.state_root(self.home)
+        self.assertEqual(app, instance / 'app/SmallTalk.app')
+        self.assertEqual(commands, instance / 'bin')
+        self.assertEqual(state, instance / 'state/st3/macos-installs')
+        self.assertTrue(app.is_dir())
+        self.assertTrue(list(state.glob('*.lock')))
+        self.assertFalse((self.home / 'Applications').exists())
+        self.assertFalse((self.home / '.local/state').exists())
+        for label in labels:
+            program = plistlib.loads((agents / (label + '.plist')).read_bytes())['ProgramArguments'][0]
+            self.assertEqual(program, str(app / 'Contents/MacOS/st3'))
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content, path)
+        self.assertEqual(sorted(p.name for p in default_bin.iterdir()), ['st3'])
+
+    def test_an_invalid_instance_name_is_refused_before_anything_is_chosen(self):
+        for bad in ['Try', 'a b', '../x', '-a', 'a--b', 'x' * 25]:
+            result = subprocess.run([sys.executable, str(Path(__file__).with_name('install-macos.py')), '--help'],
+                                    env={**os.environ, 'ST_INSTANCE': bad}, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, bad)
+            self.assertIn('invalid instance name', result.stderr + result.stdout)
+
     def test_both_wrappers_delegate_macos_tools_without_replacing_the_links(self):
         repo = Path(__file__).resolve().parent.parent
         fakebin = self.home / 'fakebin'; fakebin.mkdir()

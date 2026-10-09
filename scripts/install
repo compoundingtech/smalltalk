@@ -2,22 +2,37 @@
 # Install st3 and its tools from one source build. `st` is always a symlink to the installed `st3`,
 # never a separate build, so the two names cannot drift apart.
 #
-# usage: scripts/install [--bin-dir DIR] [--from DIR]
+# usage: scripts/install [--bin-dir DIR] [--from DIR] [--instance NAME]
 #
 #   --bin-dir DIR  install destination (default: $HOME/.local/bin)
 #   --from DIR     install already-built binaries from DIR instead of running cargo
+#   --instance NAME  install a second, separate copy below ~/.st-instance/NAME (its own
+#                  command directory, macOS app, bundle identifier and launchd services)
 set -Eeuo pipefail
 
-bin_dir="${ST_MACOS_BIN_DIR:-$HOME/.local/bin}"
+bin_dir=""
+instance="${ST_INSTANCE:-}"
 from=""
 while (($#)); do
   case $1 in
     --bin-dir) bin_dir=${2:?--bin-dir needs a directory}; shift 2 ;;
+    --instance) instance=${2:?--instance needs a name}; shift 2 ;;
     --from) from=${2:?--from needs a directory}; shift 2 ;;
-    -h | --help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "install: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ -n $instance ]]; then
+  [[ ${#instance} -le 24 && $instance =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || {
+    echo "install: an instance name is lowercase letters, digits and single hyphens, at most 24 characters" >&2
+    exit 2
+  }
+  export ST_INSTANCE=$instance
+  # A named instance installs below its own directory unless told otherwise.
+  [[ -n $bin_dir ]] || bin_dir=${ST_MACOS_BIN_DIR:-$HOME/.st-instance/$instance/bin}
+fi
+bin_dir=${bin_dir:-${ST_MACOS_BIN_DIR:-$HOME/.local/bin}}
 
 binaries=(st3 st3-migrate)
 

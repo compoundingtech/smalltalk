@@ -3,17 +3,29 @@
 set -eu
 base=${ST_INSTALL_RELEASE_BASE_URL:-https://github.com/compoundingtech/smalltalk/releases}
 tag=
-bin_dir=${HOME:?HOME is required}/.local/bin
+: "${HOME:?HOME is required}"
+bin_dir=
+instance=${ST_INSTANCE:-}
 run=true
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --tag) tag=${2:?--tag needs a release tag}; shift 2 ;;
         --bin-dir) bin_dir=${2:?--bin-dir needs a directory}; shift 2 ;;
+        --instance) instance=${2:?--instance needs a name}; shift 2 ;;
         --no-run) run=false; shift ;;
-        -h|--help) printf 'Usage: install.sh [--tag TAG] [--bin-dir DIRECTORY] [--no-run]\n'; exit 0 ;;
+        -h|--help) printf 'Usage: install.sh [--tag TAG] [--bin-dir DIRECTORY] [--instance NAME] [--no-run]\n'; exit 0 ;;
         *) printf 'install: unknown option: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
+if [ -n "$instance" ]; then
+    case "$instance" in
+        *[!a-z0-9-]*|-*|*-|*--*) printf 'install: an instance name is lowercase letters, digits and single hyphens\n' >&2; exit 2 ;;
+    esac
+    [ "${#instance}" -le 24 ] || { printf 'install: an instance name is at most 24 characters\n' >&2; exit 2; }
+    export ST_INSTANCE=$instance
+    [ -n "$bin_dir" ] || bin_dir=$HOME/.st-instance/$instance/bin
+fi
+bin_dir=${bin_dir:-$HOME/.local/bin}
 case "$(uname -s):$(uname -m)" in
     Linux:x86_64) target=x86_64-unknown-linux-gnu ;;
     Darwin:arm64) target=aarch64-apple-darwin ;;

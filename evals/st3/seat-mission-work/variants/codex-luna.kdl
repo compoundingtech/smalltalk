@@ -8,7 +8,7 @@ agent "eval/seat-mission-work/worker" {
   harness "codex" {
     model "gpt-6-luna"
     effort "medium"
-    args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    args "--dangerously-bypass-approvals-and-sandbox"
   }
 }
 

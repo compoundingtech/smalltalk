@@ -3040,6 +3040,7 @@ fn run_controlled_owned(
     required_incarnation: Option<String>,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
+    let codex_argv = adapt_to_installed_codex(codex_argv, diagnostics)?;
     delivery.model = declared_codex_model(&codex_argv[1..]);
     let socket_path = socket_path(catalog_root, &identity)?;
     let socket_dir = socket_path
@@ -3077,6 +3078,11 @@ fn run_controlled_owned(
         .mode(0o600)
         .open(state_dir.join("app-server.log"))?;
     let mut server_args = prepared.server_args;
+    for override_value in
+        st_bridge_overrides(std::env::var("ST_AGENT").ok().as_deref(), &codex_argv[1..])
+    {
+        insert_app_server_config_override(&mut server_args, override_value)?;
+    }
     if resume_thread.is_some() && authored_bypasses_hook_trust(&codex_argv[1..])? {
         let hook_cwd = controlled_hook_cwd(&codex_argv[1..])?;
         if let Some(projection) = preflight_hook_trust(
@@ -4482,6 +4488,88 @@ fn hook_trust_projection_from_response(
         count: state.len(),
         override_value: format!("hooks.state={}", toml::Value::Table(state)),
     }))
+}
+
+/// First Codex release with `--approve-for-me`.
+const APPROVE_FOR_ME_SINCE: (u32, u32) = (0, 147);
+/// First Codex release with `--dangerously-bypass-hook-trust`.
+const HOOK_TRUST_FLAG_SINCE: (u32, u32) = (0, 131);
+
+/// The launch flags an older Codex needs in place of `--approve-for-me`.
+///
+/// `st agents new` declares `--approve-for-me`. A Codex older than 0.147 rejects it and would not
+/// start, so such a seat gets the full-access flags it ran with before (plus the hook-trust flag
+/// from 0.131, which earlier releases do not know). `None` leaves the arguments as declared.
+fn legacy_permission_flags(version: (u32, u32)) -> Option<Vec<&'static str>> {
+    if version >= APPROVE_FOR_ME_SINCE {
+        return None;
+    }
+    let mut flags = vec!["--dangerously-bypass-approvals-and-sandbox"];
+    if version >= HOOK_TRUST_FLAG_SINCE {
+        flags.push("--dangerously-bypass-hook-trust");
+    }
+    Some(flags)
+}
+
+fn adapt_to_installed_codex(
+    mut codex_argv: Vec<String>,
+    diagnostics: &mut WrapperDiagnostics,
+) -> Result<Vec<String>> {
+    let boundary = interactive_root_prefix_end(&codex_argv[1..])? + 1;
+    let Some(position) = codex_argv[1..boundary]
+        .iter()
+        .position(|argument| argument == "--approve-for-me")
+        .map(|position| position + 1)
+    else {
+        return Ok(codex_argv);
+    };
+    let printed = std::process::Command::new(&codex_argv[0])
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    let release = printed
+        .as_deref()
+        .and_then(|printed| crate::harness_version::find_release(printed, "codex"))
+        .map(|(_, release)| release);
+    // An unreadable version keeps the declared flags: current Codex is the common case, and a
+    // release too old to start fails loudly rather than silently widening a seat's access.
+    let Some(release) = release else {
+        return Ok(codex_argv);
+    };
+    let Some(legacy) = legacy_permission_flags(release.series()) else {
+        return Ok(codex_argv);
+    };
+    diagnostics.record(
+        "approveForMeUnsupported",
+        json!({ "codexVersion": format!("{}.{}.{}", release.major, release.minor, release.patch), "replacedWith": legacy }),
+    )?;
+    codex_argv.splice(position..=position, legacy.into_iter().map(str::to_owned));
+    Ok(codex_argv)
+}
+
+/// The st tool bridge for this seat, unless the declaration configures its own `st` server or
+/// this is not an st3 seat. Hand-run Codex sessions never get it: the seat identity comes from
+/// the environment st set for this launch.
+fn st_bridge_overrides(subject: Option<&str>, authored_args: &[String]) -> Vec<String> {
+    let Some(subject) = subject
+        .filter(|subject| subject.starts_with("agent/") && subject.len() > "agent/".len())
+    else {
+        return Vec::new();
+    };
+    if crate::codex_bridge::is_authored(authored_args) {
+        return Vec::new();
+    }
+    let executable = match std::env::var("ST3_BIN") {
+        Ok(path) if !path.trim().is_empty() => path,
+        _ => match std::env::current_exe() {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(_) => return Vec::new(),
+        },
+    };
+    crate::codex_bridge::app_server_overrides(&executable, &subject)
 }
 
 fn insert_app_server_config_override(

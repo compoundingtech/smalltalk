@@ -71,4 +71,26 @@ if bash "$install" --from "$work/two" --bin-dir "$work/fresh" 2> /dev/null; then
 fi
 check "$work/fresh" 1
 
+# A named instance installs below its own directory and leaves the default bin directory alone.
+mkdir -p "$work/home/.local/bin"
+printf 'default\n' > "$work/home/.local/bin/st3"
+HOME="$work/home" bash "$install" --from "$work/one" --instance try > /dev/null
+check "$work/home/.st-instance/try/bin" 1
+[[ $(cat "$work/home/.local/bin/st3") == default ]] || fail "an instance install replaced the default st3"
+[[ $(ls "$work/home/.local/bin") == st3 ]] || fail "an instance install added files to the default bin directory"
+# The environment variable names the instance too, and an explicit --bin-dir still wins.
+build "$work/three" 3
+HOME="$work/home" ST_INSTANCE=other bash "$install" --from "$work/three" > /dev/null
+check "$work/home/.st-instance/other/bin" 3
+HOME="$work/home" bash "$install" --from "$work/one" --instance third --bin-dir "$work/chosen" > /dev/null
+check "$work/chosen" 1
+[[ ! -e $work/home/.st-instance/third ]] || fail "an explicit --bin-dir still created the instance bin directory"
+# Names that are not plain are refused before anything is written.
+for bad in Try a_b ../x -a a--b abcdefghijklmnopqrstuvwxy; do
+  if HOME="$work/home" bash "$install" --from "$work/one" --instance "$bad" 2> /dev/null; then
+    fail "instance name '$bad' was accepted"
+  fi
+done
+[[ $(ls "$work/home/.st-instance" | sort | tr '\n' ' ') == "other try " ]] || fail "a refused name left a directory"
+
 echo 'install tests passed'
