@@ -17,6 +17,8 @@
  * not retry ambiguous delivery. Daemon refusals retain the complete error envelope and HTTP
  * status, separately from transport failures. `snapshot` reads fresh capabilities over HTTP,
  * bypassing cached discovery so the composer's fence refresh is authoritative.
+ * `arrangementActions` exposes the same fresh snapshot/refusal contract as an HTTP-only
+ * `submitAction` port, so Sidebar edits do not open a second collections socket.
  *
  * Tracing (`trace.ts`, `firstFrame.ts`): SDK HTTP calls run under their own `st3.*` span (a child
  * of `parentSpan`) whose `traceparent` they carry; socket opens carry the caller's `traceContext`.
@@ -346,6 +348,35 @@ const actionFailure = (cause: unknown): ActionFailure =>
         message: cause.response.message,
       })
     : new ActionTransportFailure({ cause, message: errorMessage(cause) })
+
+/** HTTP-only arrangement actions; sharing this port never opens another collections socket. */
+export interface ArrangementActionPort {
+  readonly snapshot: Effect.Effect<string, ActionFailure>
+  readonly submitAction: (request: ActionOf<'arrangement.edit'>) => Effect.Effect<typeof ActionResult.Type, ActionFailure>
+}
+
+export const arrangementActions = (client: Pick<St3Client, 'capabilities' | 'arrangementEdit'>): ArrangementActionPort => ({
+  snapshot: Effect.tryPromise({
+    try: () => client.capabilities(),
+    catch: actionFailure,
+  }).pipe(
+    Effect.flatMap((envelope) => Effect.try({
+      try: () => decodeSnapshot(envelope.snapshot).id,
+      catch: actionFailure,
+    })),
+    Effect.withSpan('st3.snapshot'),
+  ),
+  submitAction: Effect.fn('st3.arrangement.edit')((request: ActionOf<'arrangement.edit'>) =>
+    Effect.tryPromise({
+      try: () => client.arrangementEdit(request),
+      catch: actionFailure,
+    }).pipe(
+      Effect.flatMap((envelope) => Effect.try({
+        try: () => decodeActionResult(envelope.value),
+        catch: actionFailure,
+      })),
+    )),
+})
 
 const unrecognized = (raw: unknown): UnrecognizedEntry | undefined => {
   if (typeof raw !== 'object' || raw === null) return undefined
