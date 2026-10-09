@@ -2944,6 +2944,8 @@ enum AgentsCommand {
     Stop(AgentStopArgs),
     /// Restart a top-level or mission seat, preserving its declaration; wait for a new incarnation.
     Restart(AgentRestartArgs),
+    /// Accept fresh launches after an interrupted seed attempt; never rearm the seed.
+    AcknowledgeSeed(AgentAcknowledgeSeedArgs),
     /// Retry a published owned-seat cutover with fresh desired and incarnation fences.
     Rollout(AgentRolloutArgs),
     /// Stop a quiet seat at a clean boundary, keeping its native session to resume.
@@ -2961,6 +2963,17 @@ enum AgentsCommand {
     Queue(AgentQueueArgs),
     /// Inspect, set, or release a Codex/OpenCode delivery hold; the provider keeps running.
     Hold(AgentHoldArgs),
+}
+
+#[derive(Args)]
+struct AgentAcknowledgeSeedArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
+    subject: String,
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    reason: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
+    #[arg(long = "as")]
+    actor: Option<String>,
 }
 
 #[derive(Args)]
@@ -5320,6 +5333,9 @@ fn guard_mutating_cli_actor(
             AgentsCommand::Rollout(args) => Some(args.actor.as_str()),
             AgentsCommand::Suspend(args) => Some(args.actor.as_str()),
             AgentsCommand::Resume(args) => Some(args.actor.as_str()),
+            AgentsCommand::AcknowledgeSeed(args) => Some(args.actor.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("a harness seed acknowledgement needs explicit --as {own}")
+            })?),
             AgentsCommand::Hold(args) if args.duration.is_some() || args.release => Some(args.actor.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("a harness delivery hold needs explicit --as {own}")
             })?),
@@ -12490,6 +12506,14 @@ async fn run_agents(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        AgentsCommand::AcknowledgeSeed(args) => {
+            let actor = args.actor.as_deref().or(configured_person)
+                .context("st agents acknowledge-seed needs --as ACTOR or a configured person")?;
+            let claim = st3::native_seed::acknowledge(
+                &cli_client(endpoint), &normalize_agent_subject(&args.subject), actor, &args.reason,
+            ).await?;
+            print_value(&claim, json_output)
+        }
         AgentsCommand::Hold(args) => {
             let client = cli_client(endpoint);
             let subject = seat_subject(&args.subject);
@@ -13600,6 +13624,7 @@ async fn run_agent_inspection(
         | AgentsCommand::Stop(_)
         | AgentsCommand::Rollout(_)
         | AgentsCommand::Restart(_)
+        | AgentsCommand::AcknowledgeSeed(_)
         | AgentsCommand::Suspend(_)
         | AgentsCommand::Resume(_)
         | AgentsCommand::Rename(_)
@@ -17341,6 +17366,22 @@ fn parse_publication_actor(actor: &str) -> std::result::Result<String, String> {
 #[cfg(test)]
 mod native_seed_driver_tests {
     use super::*;
+
+    #[test]
+    fn seed_recovery_uses_agent_control_cli_and_requires_reason() {
+        let cli = Cli::try_parse_from([
+            "st", "agents", "acknowledge-seed", "example",
+            "--reason", "accept fresh", "--as", "person/operator",
+        ]).unwrap();
+        let Command::Agents { command: AgentsCommand::AcknowledgeSeed(args) } = cli.command else {
+            panic!("agent seed acknowledgement expected");
+        };
+        assert_eq!(args.subject, "example");
+        assert_eq!(args.reason, "accept fresh");
+        assert_eq!(args.actor.as_deref(), Some("person/operator"));
+        assert!(Cli::try_parse_from(["st", "agents", "acknowledge-seed", "example"]).is_err());
+        assert!(Cli::try_parse_from(["st", "agents", "acknowledge-seed", "example", "--reason", ""]).is_err());
+    }
 
     #[test]
     fn rejects_effective_resume_environment_before_receipt() {

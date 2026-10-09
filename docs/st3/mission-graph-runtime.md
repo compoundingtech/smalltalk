@@ -1341,8 +1341,11 @@ keep it a literal message.
 An OMP harness can declare `seed "/absolute/path/time_UUID.jsonl"` to migrate an owner-local
 native transcript on its first native launch only. The transcript's filename and header must
 name the same UUID, every transcript line must be valid JSON, and the file must belong to the
-launch owner. The driver links only that transcript into its managed inventory, then atomically
-records a typed `seeded` outcome before spawning the provider. Missing or corrupt input records
+launch owner. Validation is bounded to 8 MiB per line and 64 MiB total, with typed
+`SeedValidationLimitError` refusals before consuming the opportunity. The driver copies only
+that transcript into a seat-private managed inventory, then atomically records a typed `seeded`
+outcome before spawning the provider. Different seats never share a mutable transcript, and a
+repeat staging attempt never overwrites a provider's existing copy. Missing or corrupt input records
 no outcome. Other harnesses do not accept `seed`; authored session selectors and effective resume
 or continuation environment cannot be combined with it. The driver rejects these conflicts
 before accessing the daemon, staging inventory, or recording a first-launch outcome.
@@ -1357,11 +1360,23 @@ wrapper seed argument and preserves the native selection environment. This gives
 continuation precedence without allowing an explicit seed/environment combination at the driver
 boundary.
 
-If an outcome exists but the seat has never bound a native session, the next launch fails
-explicitly with `first-native-launch-incomplete`; it never silently reseeds. This includes a
-crash after the receipt but before provider spawn and a provider failure before binding.
-Recover by inspecting the interrupted launch and its managed transcript; do not delete the
-durable outcome to request an automatic retry.
+A `fresh` outcome never blocks later launches, including a restart before the first message
+or native binding; a later seed declaration is ignored and never rearms the opportunity.
+An unbound `seeded` outcome is explicitly incomplete: the driver records a durable
+`harness.diagnostic` warning with code `first-native-launch-incomplete` and prints the notice.
+With no seed declared it proceeds fresh. With a seed still declared it refuses, giving this
+supported recovery path before any refusal:
+
+```sh
+st agents acknowledge-seed AGENT --reason "Accept fresh after inspecting the interrupted import" --as ACTOR
+```
+
+The actor may default to the configured person, as for other seat controls. The command records
+`custom.agent.first-native-launch-acknowledged` with the receipt as evidence; it never deletes the
+receipt, restores the first-launch opportunity, or reseeds. After acknowledgement the seat may
+launch fresh even while a stale seed declaration remains. Alternatively remove `seed` and
+republish to launch fresh while preserving the visible incomplete notice. Receipts, recovery
+acknowledgements, notices, and native bindings survive checkpoint trim.
 
 A harness block cannot declare `prompt`. Parsing refuses it with `harness-prompt-removed`. Put the instruction in a step goal or send the seat a message.
 

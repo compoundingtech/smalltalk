@@ -557,6 +557,114 @@ fn a_usage_trim_keeps_lifetime_usage_and_the_proof_guards_it() {
 }
 
 #[test]
+fn first_native_launch_receipt_binding_and_acknowledgement_survive_checkpoint_trim() {
+    use sha2::Digest as _;
+
+    let store = Store::open_memory("alder").unwrap();
+    let marker = format!(
+        "custom/agent/first-native-launch-{}",
+        hex::encode(sha2::Sha256::digest(AGENT.as_bytes()))
+    );
+    let receipt = store
+        .append_claim(&input(
+            &marker,
+            "custom.agent.first-native-launch",
+            Some(AGENT),
+            json!({
+                "agent": AGENT, "incarnation": "inc-1", "invocation_id": "first-invocation",
+                "outcome": "seeded", "session_id": "native-example"
+            }),
+            "first-native-launch",
+        ))
+        .unwrap();
+    let mut acknowledgement_input = input(
+        &marker,
+        "custom.agent.first-native-launch-acknowledged",
+        Some(AGENT),
+        json!({"agent": AGENT, "receipt": receipt.id, "reason": "recover incomplete launch"}),
+        "first-native-launch-acknowledged",
+    );
+    acknowledgement_input.evidence.push(receipt.id.clone());
+    let acknowledgement = store.append_claim(&acknowledgement_input).unwrap();
+    let binding = store
+        .append_claim(&input(
+            AGENT,
+            "harness.session-file",
+            Some(AGENT),
+            json!({"harness": "omp", "incarnation_id": "inc-2", "session_id": "native-example"}),
+            "native-binding",
+        ))
+        .unwrap();
+    let notice = store
+        .append_claim(&input(
+            AGENT,
+            "harness.diagnostic",
+            Some(AGENT),
+            json!({"code": "first-native-launch-incomplete", "reason": "native binding was missing", "severity": "warning", "status": "incomplete"}),
+            "first-native-launch-notice",
+        ))
+        .unwrap();
+    // Later envelopes ensure retention is not an accident of the newest-envelope guard.
+    let observations = [1, 2, 3].map(|count| {
+        store
+            .append_claim(&input(
+                "observer/example",
+                "observer.observed",
+                None,
+                json!({"status": "ok", "revision": count.to_string()}),
+                &format!("checkpoint-observation-{count}"),
+            ))
+            .unwrap()
+    });
+    let cut = now_ms() + 1_000;
+    let scratch = tempfile::tempdir().unwrap();
+    let (plan, proof) = store.plan_checkpoint(cut, scratch.path()).unwrap();
+    assert!(proof.passed, "{proof:?}");
+    let gone = dropped(&plan);
+    assert!(gone.contains(&observations[0].id), "{plan:?}");
+    assert!(gone.contains(&observations[1].id), "{plan:?}");
+    for claim in [&receipt, &acknowledgement, &binding, &notice] {
+        assert!(
+            super::checkpoint_rules::slot_of(claim).is_none(),
+            "{} must remain protected by the default no-drop rule",
+            claim.kind
+        );
+        assert!(!gone.contains(&claim.id), "{plan:?}");
+    }
+    {
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        record_checkpoint_tombstones_tx(
+            &transaction,
+            &checkpoint_name(cut),
+            &plan.envelopes,
+            &plan.claims,
+        )
+        .unwrap();
+        delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
+        transaction.commit().unwrap();
+    }
+    for claim in [&receipt, &acknowledgement, &binding, &notice] {
+        let retained = store.claims_for(&claim.subject, Some(&claim.kind)).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].id, claim.id);
+        assert_eq!(retained[0].body, claim.body);
+    }
+    let retained = store
+        .claims_for("observer/example", Some("observer.observed"))
+        .unwrap();
+    assert_eq!(retained.len(), 1, "the real trim must remove old observations");
+    assert_eq!(retained[0].id, observations[2].id);
+    assert_eq!(
+        crate::suspension::continue_session(&store, AGENT, "omp", None, None)
+            .unwrap()
+            .unwrap()
+            .0,
+        "native-example"
+    );
+}
+
+#[test]
 fn harness_rule_keeps_every_position_a_reader_reads() {
     let mut sealed = Sealed::default();
     let agent = "agent/alder.worker";
