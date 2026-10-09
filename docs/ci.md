@@ -834,7 +834,9 @@ this PR does not claim one was provisioned.
 `Namespace usage` runs at 06:05 UTC on GitHub-hosted capacity and reports the previous
 UTC day's observed Namespace job execution minutes, split by event (merge_group,
 pull_request and other events). Cos can read the job summary and its 30-day JSON
-artifact for the morning cost check. `python3 scripts/ci-namespace-usage --date YYYY-MM-DD
+artifact for the morning cost check. The report has a 30-minute timeout: the first
+read-only full-history API invocation exceeded 15 minutes. This budget does not
+prove a fixed completion time as retained history grows. `python3 scripts/ci-namespace-usage --date YYYY-MM-DD
 --output usage.json` also provides an on-demand report. It scans all retained workflow
 metadata, queries relevant jobs across all attempts, includes failed/cancelled execution,
 deduplicates job IDs and clips executions across midnight. The job identity must be

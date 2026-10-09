@@ -10,7 +10,7 @@ export default githubWorkflow(auditCaches({
     usage: {
       name: 'Previous UTC day execution minutes',
       'runs-on': 'ubuntu-latest',
-      'timeout-minutes': 15,
+      'timeout-minutes': 30,
       steps: [
         { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
         { name: 'Report Namespace usage', env: { GH_TOKEN: '${{ github.token }}' }, run: 'python3 scripts/ci-namespace-usage --output namespace-usage.json' },
