@@ -140,7 +140,7 @@ State and draft codecs use the workspace's single `effect@4.0.0-rc.118` runtime 
 
 The codecs use native `Schema.optional`, preserving both absent fields and explicitly present `undefined` fields from the original Effect 3 contract. `OptionalSnapshotFields` exercises the real pane-key parser and snapshot encode/read path, including form-only, view-only and undefined-ratio inputs.
 
-The `Geometry` story is a non-interacting fixture for the reusable composer and its layout/running/target/mention matrices. It lets the source geometry assertions measure the same native composer before story play actions mutate its state; it does not ship the route's Explore controls or application chrome.
+The `Geometry` story is a non-interacting fixture for the reusable composer and its layout/running/target/mention matrices. It lets the source geometry assertions measure the same native composer before story play actions mutate its state. Its plain 768px host lane preserves the composer/body width and footer/popover containment assertions without shipping the route's Explore controls, conversation or application chrome.
 
 The exported legacy Folio, Relay and Orbit palettes also avoid green: `good` is the direction's 80% ink foreground; `added` is a non-green wash whose luminance difference from the panel is within 20% of the direction's removed wash. Run `pnpm --filter @smalltalk/fractal-ui test:palettes` to check all six direction/scheme combinations without a browser. The public names and palette-selection API are unchanged.
 
