@@ -170,7 +170,7 @@ const sameFeed = <T,>(
 ): boolean => {
   if (a._tag !== b._tag) return false
   if (a._tag === 'Observed' && b._tag === 'Observed')
-    return a.freshness === b.freshness && a.error === b.error && equal(a.value, b.value)
+    return a.freshness === b.freshness && a.coverage?._tag === b.coverage?._tag && a.error === b.error && equal(a.value, b.value)
   if (a._tag === 'Unavailable' && b._tag === 'Unavailable')
     return a.reason === b.reason && a.detail === b.detail
   return a._tag === 'Waiting' && b._tag === 'Waiting'

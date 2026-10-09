@@ -218,6 +218,7 @@ export const liveSource = ({
   const retain = <A, TSpec extends FollowSpec>({
     resolve,
     follow,
+    initialRead,
     keepAlive = true,
     onCommit,
     explicitInterest = false,
@@ -229,6 +230,8 @@ export const liveSource = ({
       readonly st3: St3['Service']
       readonly spec: TSpec
     }) => Stream.Stream<FollowEvent<A>>
+    /** A cheap published page races the live follow; it never gates subscribe or replaces live data. */
+    readonly initialRead?: (st3: St3['Service']) => Effect.Effect<{ readonly value: A; readonly hasMore: boolean }, AttachFailure>
     readonly keepAlive?: boolean
     readonly onCommit?: (value: A) => void
     readonly explicitInterest?: boolean
@@ -303,6 +306,7 @@ export const liveSource = ({
       const previous = previousFiber
       spec = undefined
       let freshnessFiber: Fiber.Fiber<void, unknown> | undefined
+      let initialReadFiber: Fiber.Fiber<void> | undefined
       const fiber = runtime.runFork(
         Effect.gen(function* () {
           // Release the old socket slot before binding the replacement owner.
@@ -323,6 +327,30 @@ export const liveSource = ({
           const boundSpec = yield* resolving
           spec = boundSpec
           const key = followKey(boundSpec)
+          if (initialRead !== undefined && latest._tag === 'Waiting') {
+            initialReadFiber = runtime.runFork(initialRead(st3).pipe(
+              Effect.tap(({ value, hasMore }) => Effect.sync(() => {
+                if (!active || readRejection !== undefined || terminalFailure || latest._tag !== 'Waiting') return
+                // HTTP is last-published evidence, not proof that the live subscription is ready.
+                latest = {
+                  ...observed({ value, freshness: 'stale' }),
+                  ...(hasMore ? { coverage: { _tag: 'Partial' as const } } : {}),
+                }
+                syncLatest = observeFeedSync(syncLatest, value, Date.now())
+                ingest.accept({ key: commit, value: commit })
+              })),
+              Effect.catch((error) => Effect.sync(() => {
+                if (!active || readRejection !== undefined) return
+                // Cold/failed publications leave the real follow in charge of recovery.
+                // An explicit authority refusal must not resurrect rows from a later frame.
+                if (error.code !== 'forbidden' && error.status !== 401 && error.status !== 403) return
+                terminalFailure = true
+                deny(error.message)
+                fiber.interruptUnsafe()
+              })),
+              Effect.asVoid,
+            ))
+          }
           freshnessFiber = runtime.runFork(
             Effect.gen(function* () {
               freshnessConsumers += 1
@@ -412,6 +440,7 @@ export const liveSource = ({
               (freshnessFiber === undefined ? Effect.void : Fiber.interrupt(freshnessFiber)).pipe(
                 Effect.andThen(
                   Effect.sync(() => {
+                    initialReadFiber?.interruptUnsafe()
                     if (!active) return
                     ended = true
                     // Interest can return between SDK eviction and this finalizer. Its
@@ -511,6 +540,7 @@ export const liveSource = ({
 
   const agentsRetained = retain<readonly Agent[], Extract<FollowSpec, { _tag: 'Window' }>>({
     resolve: () => Effect.succeed({ _tag: 'Window', collection: 'agents', limit: 100 }),
+    initialRead: (st3) => st3.readAgents,
     follow: ({ st3, spec }) =>
       st3.followWindow(spec).pipe(
         Stream.map((event) =>

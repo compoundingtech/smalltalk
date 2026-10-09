@@ -53,6 +53,8 @@ export type Feed<A> =
       readonly _tag: 'Observed'
       readonly value: A
       readonly freshness: 'live' | 'stale'
+      /** Explicitly bounded published evidence; absence makes no completeness claim. */
+      readonly coverage?: { readonly _tag: 'Partial' }
       /** A newer transcript read failed; these are still the last trusted rows, not a repair. */
       readonly error?: {
         readonly reason: 'ungranted' | 'unsupported' | 'failed'

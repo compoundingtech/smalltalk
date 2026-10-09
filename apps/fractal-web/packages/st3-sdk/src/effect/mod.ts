@@ -43,10 +43,12 @@ import {
 import {
   ActionResult,
   type Capabilities,
+  type Agent,
   Capabilities as CapabilitiesCodec,
   decodeUnknownSync,
   Resource,
   Runtime,
+  Page,
   TerminalScreen,
   TimelineEntry,
   Snapshot,
@@ -282,6 +284,8 @@ export class St3 extends Context.Service<
     /** A fresh HTTP snapshot, never the generated client's cached discovery snapshot. */
     readonly snapshot: Effect.Effect<string, ActionFailure>
     readonly messageSend: (request: MessageSendInput) => Effect.Effect<ActionResult, ActionFailure>
+    /** One bounded published roster page, without the daemon's fresh-read wait. */
+    readonly readAgents: Effect.Effect<{ readonly value: readonly Agent[]; readonly hasMore: boolean }, AttachFailure>
     readonly followWindow: (
       spec: Extract<FollowSpec, { _tag: 'Window' }>,
     ) => Stream.Stream<FollowEvent<WindowValue>>
@@ -537,6 +541,8 @@ const make = (options: St3Options) =>
     })
     /** Opens once the advertised budget (if derived) is fixed; guards double settlement. */
     const budgetKnown = yield* Deferred.make<void, never>()
+    // Reuse the channel's discovery request before the generated agents getter checks limits.
+    const firstProbe = yield* Deferred.make<void, AttachFailure>()
     let budgetSettled = false
     const settleBudget = () => {
       if (budgetSettled) return
@@ -574,19 +580,18 @@ const make = (options: St3Options) =>
       parentSpan: options.parentSpan,
       commandTraceContext: () => outbound,
       ...(options.onDiagnostics === undefined ? {} : { onDiagnostics: options.onDiagnostics }),
-      ...(options.conversationSlots === 'advertised'
-        ? {
-            onCapabilities: (envelope: AdvertisedEnvelope) => {
-              acceptBudget(advertisedSubscriptionLimit(envelope))
-            },
-            onProbeFailure: () => {
-              // A refused or unavailable first probe still releases every admission waiter.
-              // Permanent rejection is reported by the channel to each follow, not hidden
-              // behind this conservative 8/4 fallback.
-              if (!budgetSettled) acceptBudget(8)
-            },
-          }
-        : {}),
+      onCapabilities: (envelope: AdvertisedEnvelope) => {
+        Effect.runFork(Deferred.succeed(firstProbe, undefined))
+        if (options.conversationSlots === 'advertised')
+          acceptBudget(advertisedSubscriptionLimit(envelope))
+      },
+      onProbeFailure: () => {
+        Effect.runFork(Deferred.fail(firstProbe, new AttachFailure({ message: 'Roster discovery is unavailable.' })))
+        // A refused or unavailable first probe still releases every admission waiter.
+        // Permanent rejection is reported by the channel to each follow, not hidden
+        // behind this conservative 8/4 fallback.
+        if (!budgetSettled) acceptBudget(8)
+      },
       onSubscribeSent: ({ id, wire }) => {
         options.onSubscribeSent?.(wire)
         fresheners.get(id)?.({ _tag: 'SubscribeSent' })
@@ -1048,6 +1053,27 @@ const make = (options: St3Options) =>
           })),
         ),
       gatewaySyncStatus: SubscriptionRef.changes(channel.syncStatus).pipe(Stream.changes),
+      readAgents: Deferred.await(firstProbe).pipe(Effect.andThen(sdkRequest('st3.agents.read', (traced) =>
+        Effect.tryPromise({
+          // Omitting fresh=true serves the existing publication instead of waiting for a fold.
+          try: () => traced.agentsList({ limit: 100 }),
+          catch: (error) => new AttachFailure({
+            ...(error instanceof ClientError ? { code: error.response.code, status: error.status } : {}),
+            message: errorMessage(error),
+          }),
+        }).pipe(
+          Effect.flatMap((envelope) => Effect.try({
+            try: () => {
+              const page = decodeUnknownSync(Page)(envelope.value)
+              return {
+                value: page.items.filter((row): row is Agent => row.kind === 'agent'),
+                hasMore: page.page.has_more,
+              }
+            },
+            catch: (error) => new AttachFailure({ message: errorMessage(error) }),
+          })),
+        ),
+      ))),
       capabilities: sdkRequest('st3.capabilities', (traced) =>
         Effect.tryPromise({
           try: () => traced.discover(),

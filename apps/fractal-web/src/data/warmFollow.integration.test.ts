@@ -65,9 +65,32 @@ class Gateway {
   collectionsV1 = false
   onUnsubscribe: (() => void) | undefined
   denyReads = false
+  publishedRoster: Agent[] | undefined
+  publishedHasMore = false
+  rosterFailure: 403 | 503 | undefined
+  rosterGate: Promise<void> | undefined
+  readonly requests: URL[] = []
 
   readonly fetch: typeof fetch = async (input) => {
-    const path = new URL(String(input)).pathname
+    const url = new URL(String(input))
+    const path = url.pathname
+    this.requests.push(url)
+    if (path === '/v1/client/agents' && this.rosterFailure !== undefined) {
+      await this.rosterGate
+      return new Response(JSON.stringify({
+        api_version: 'st3.client.v0', error_version: 'st3.client.error.v0',
+        code: this.rosterFailure === 403 ? 'forbidden' : 'unavailable',
+        message: 'Publication unavailable', retryable: this.rosterFailure === 503,
+        request_id: 'request/roster', details: {},
+      }), { status: this.rosterFailure, headers: { 'content-type': 'application/json' } })
+    }
+    if (path === '/v1/client/agents' && this.publishedRoster !== undefined) {
+      await this.rosterGate
+      return new Response(JSON.stringify({ api_version: 'st3.client.v0', snapshot, value: {
+        kind: 'page', collection: 'agents', filters: {}, items: this.publishedRoster,
+        page: { limit: 100, has_more: this.publishedHasMore, next_cursor: this.publishedHasMore ? 'cursor/roster' : null },
+      } }), { headers: { 'content-type': 'application/json' } })
+    }
     if (path !== '/v1/client/capabilities') throw new Error(`Unexpected request ${path}`)
     if (this.denyReads) return new Response(JSON.stringify({
       api_version: 'st3.client.v0', error_version: 'st3.client.error.v0',
@@ -269,6 +292,131 @@ const summarize = (values: number[]) => ({
 })
 
 describe('warm conversation switching at the data layer', () => {
+  it('paints the published roster before any collection snapshot without asking for fresh=true', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8 })
+    gateway.publishedRoster = [agent]
+    const release = live.registry.mount(live.source.agents)
+    try {
+      await drain()
+      await drain()
+      await drain()
+      const feed = live.registry.get(live.source.agents)
+      expect(gateway.requests.filter(url => url.pathname === '/v1/client/agents')).toHaveLength(1)
+      expect(gateway.requests.filter(url => url.pathname === '/v1/client/capabilities')).toHaveLength(1)
+      expect(gateway.requests.find(url => url.pathname === '/v1/client/agents')?.search).toBe('?limit=100')
+      expect(feed).toMatchObject({ _tag: 'Observed', freshness: 'stale', value: [{ id: agent.id }] })
+      gateway.fleet([{ ...agent, name: 'Live roster' }])
+      await until(() => {
+        const current = live.registry.get(live.source.agents)
+        return current._tag === 'Observed' && current.freshness === 'live' && current.value[0]?.name === 'Live roster'
+      })
+    } finally { release(); await live.dispose() }
+  })
+
+  it('keeps waiting for live data when no roster publication exists yet', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8 })
+    gateway.rosterFailure = 503
+    const release = live.registry.mount(live.source.agents)
+    try {
+      await drain()
+      await drain()
+      await drain()
+      expect(live.registry.get(live.source.agents)).toEqual({ _tag: 'Waiting' })
+      gateway.fleet([agent])
+      await until(() => live.registry.get(live.source.agents)._tag === 'Observed')
+    } finally { release(); await live.dispose() }
+  })
+
+  it('does not resurrect roster rows after the HTTP publication denies read access', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8 })
+    let releaseRead: () => void = () => {}
+    gateway.rosterGate = new Promise<void>(resolve => { releaseRead = resolve })
+    gateway.rosterFailure = 403
+    const release = live.registry.mount(live.source.agents)
+    try {
+      await until(() => gateway.commands.some(command => command.kind === 'subscribe' && command.collection === 'agents'))
+      releaseRead()
+      await until(() => live.registry.get(live.source.agents)._tag === 'Unavailable')
+      gateway.fleet([agent])
+      await drain()
+      await drain()
+      expect(live.registry.get(live.source.agents)).toMatchObject({ _tag: 'Unavailable', reason: 'ungranted' })
+    } finally { releaseRead(); release(); await live.dispose() }
+  })
+
+  it('discloses a partial published page until the live roster arrives', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8 })
+    gateway.publishedRoster = [agent]
+    gateway.publishedHasMore = true
+    const release = live.registry.mount(live.source.agents)
+    try {
+      await until(() => live.registry.get(live.source.agents)._tag === 'Observed')
+      expect(live.registry.get(live.source.agents)).toMatchObject({ _tag: 'Observed', freshness: 'stale', coverage: { _tag: 'Partial' } })
+      expect(gateway.requests.filter(url => url.pathname === '/v1/client/agents')).toHaveLength(1)
+      gateway.fleet([agent])
+      await until(() => {
+        const feed = live.registry.get(live.source.agents)
+        return feed._tag === 'Observed' && feed.freshness === 'live'
+      })
+      expect(live.registry.get(live.source.agents)).not.toHaveProperty('coverage')
+    } finally { release(); await live.dispose() }
+  })
+
+  it('clears a live-first roster when the pending HTTP read later refuses access', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8 })
+    let releaseRead: () => void = () => {}
+    gateway.rosterGate = new Promise<void>(resolve => { releaseRead = resolve })
+    gateway.rosterFailure = 403
+    const release = live.registry.mount(live.source.agents)
+    try {
+      await until(() => gateway.commands.some(command => command.kind === 'subscribe' && command.collection === 'agents'))
+      gateway.fleet([agent])
+      await until(() => live.registry.get(live.source.agents)._tag === 'Observed')
+      releaseRead()
+      await until(() => live.registry.get(live.source.agents)._tag === 'Unavailable')
+      gateway.fleet([agent])
+      await drain()
+      await drain()
+      expect(live.registry.get(live.source.agents)).toMatchObject({ _tag: 'Unavailable', reason: 'ungranted' })
+    } finally { releaseRead(); release(); await live.dispose() }
+  })
+
+  it('does not replace a live roster with a late older HTTP publication', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8 })
+    gateway.publishedRoster = [agent]
+    let releaseRead: () => void = () => {}
+    gateway.rosterGate = new Promise<void>(resolve => { releaseRead = resolve })
+    const release = live.registry.mount(live.source.agents)
+    try {
+      await until(() => gateway.commands.some(command => command.kind === 'subscribe' && command.collection === 'agents'))
+      gateway.fleet([{ ...agent, name: 'Newer roster' }])
+      await until(() => {
+        const feed = live.registry.get(live.source.agents)
+        return feed._tag === 'Observed' && feed.value[0]?.name === 'Newer roster'
+      })
+      releaseRead()
+      await drain()
+      await drain()
+      expect(live.registry.get(live.source.agents)).toMatchObject({ _tag: 'Observed', freshness: 'live', value: [{ name: 'Newer roster' }] })
+    } finally { releaseRead(); release(); await live.dispose() }
+  })
+
+  it('reveals an evicted cached transcript synchronously while its new read is still pending', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8, conversationSlots: 1 })
+    try {
+      await viewConversation(live, gateway, 'agent/cached', snapshotRows(3))
+      await viewConversation(live, gateway, 'agent/other', snapshotRows(2))
+      const before = gateway.subscribesFor('agent/cached')
+      live.selectConversation('agent/cached')
+      const feed = live.registry.get(live.source.conversation('agent/cached'))
+      expect(feed).toMatchObject({ _tag: 'Observed', freshness: 'stale' })
+      expect(items(feed)).toHaveLength(3)
+      // No await or gateway response occurs between selection and this cached read.
+      expect(gateway.subscribesFor('agent/cached')).toBe(before)
+      await until(() => gateway.subscribesFor('agent/cached') === before + 1)
+    } finally { await live.dispose() }
+  })
+
   it('records warm switch-back and fresh switch data-layer latency against a scripted gateway', async () => {
     const iterations = 25
     const conversationCount = 200

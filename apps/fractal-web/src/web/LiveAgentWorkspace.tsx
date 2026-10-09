@@ -239,7 +239,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                       </p>
                     ) : stale ? (
                       <p role="status" {...stylex.props(styles.notice)}>
-                        Last observed roster · live updates pending
+                        {fleet.coverage?._tag === 'Partial' ? 'Showing a partial roster · live updates pending' : 'Last observed roster · live updates pending'}
                       </p>
                     ) : null}
                     <footer {...stylex.props(styles.footer)}>

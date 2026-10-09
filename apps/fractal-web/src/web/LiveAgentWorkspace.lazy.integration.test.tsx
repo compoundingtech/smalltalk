@@ -156,6 +156,16 @@ describe('conversation import boundary', () => {
     expect(container.textContent).not.toContain('not-for-display')
   })
 
+  it('discloses partial published roster coverage without disguising it as an empty roster', async () => {
+    rosterFeed = { _tag: 'Observed', freshness: 'stale', coverage: { _tag: 'Partial' }, value: { agents: [], hosts: [] } }
+    await renderShell()
+    expect(container.textContent).toContain('Showing a partial roster · live updates pending')
+    expect(container.querySelector('[data-wf-roster-skeleton]')).toBeNull()
+    rosterFeed = { _tag: 'Observed', freshness: 'live', value: { agents: [], hosts: [] } }
+    await renderShell()
+    expect(container.textContent).not.toContain('Showing a partial roster')
+  })
+
   it('does not evaluate pane code when the shell module is imported', () => {
     expect(requested).not.toHaveBeenCalled()
   })
