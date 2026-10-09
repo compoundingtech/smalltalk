@@ -15,16 +15,30 @@ def timestamp(value):
 
 
 def summarize(jobs, start, end):
-    rows, unknown, seen = [], [], set()
+    rows, unknown, ambiguous, seen = [], [], [], set()
     for job in jobs:
         if job['id'] in seen:
             continue
         seen.add(job['id'])
-        # Planned labels alone cannot establish that a queued job consumed compute.
-        name = job.get('runner_name') or ''
-        if not name.startswith('nsc-runner-'):
+        # A skipped/queued job did not execute. A planned label cannot prove its
+        # actual runner; preserve executed Namespace candidates with unknown identity.
+        if job.get('status') in ('queued', 'waiting') or job.get('conclusion') == 'skipped':
             continue
-        if job.get('status') in ('queued', 'waiting'):
+        name = job.get('runner_name') or ''
+        planned = any(label.startswith(('namespace-profile-', 'nscloud-'))
+                      for label in job.get('labels', []))
+        known_local = name.startswith(('ci1-', 'hetz2-ci-', 'GitHub Actions '))
+        if not name.startswith('nsc-runner-'):
+            if planned and not known_local:
+                # Only flag this day's possible execution, not unrelated old attempts.
+                firsts = [timestamp(step['started_at']) for step in job.get('steps', [])
+                          if step.get('started_at')]
+                terminal = job.get('completed_at')
+                if firsts and terminal:
+                    if min(firsts) >= end or timestamp(terminal) <= start:
+                        continue
+                ambiguous.append(dict(id=job['id'], runner_name=job.get('runner_name'),
+                                      reason='Namespace planned; actual runner identity missing or unrecognized'))
             continue
         starts = [timestamp(s['started_at']) for s in job.get('steps', []) if s.get('started_at')]
         if not starts:
@@ -51,7 +65,18 @@ def summarize(jobs, start, end):
     for row in rows:
         totals[row['event']] = totals.get(row['event'], 0) + row['execution_minutes']
     return dict(jobs=rows, execution_minutes=sum(r['execution_minutes'] for r in rows),
-                minutes_by_event=totals, missing_execution_timestamp_job_ids=unknown)
+                minutes_by_event=totals, missing_execution_timestamp_job_ids=unknown,
+                ambiguous_runner_identity_jobs=ambiguous,
+                complete=not (unknown or ambiguous))
+
+
+def render(report):
+    qualifier = "COMPLETE RETAINED EVIDENCE" if report["complete"] else "PARTIAL LOWER BOUND"
+    summary = f"## Namespace execution minutes: {report['date']} UTC — {qualifier}\n\n"
+    summary += '| Event | Job minutes |\n| --- | ---: |\n'
+    summary += ''.join(f'| {event} | {minutes:.2f} |\n' for event, minutes in sorted(report['minutes_by_event'].items()))
+    summary += f"| Total observed ({qualifier}) | {report['execution_minutes']:.2f} |\n\n{report['limits']}\n"
+    return summary
 
 
 def api(path):
@@ -98,16 +123,13 @@ def main():
                   method='UTC-clipped first job step to terminal; all retained runs and attempts; actual nsc-runner identity',
                   limits='Observed execution minutes, not Namespace invoice/unit minutes. Provisioning before first step and deleted GitHub runs/logs are not observable. Incomplete timestamps refuse a complete report.')
     Path(args.output).write_text(json.dumps(report, indent=2) + '\n')
-    summary = f"## Namespace execution minutes: {args.date} UTC\n\n"
-    summary += '| Event | Job minutes |\n| --- | ---: |\n'
-    summary += ''.join(f'| {event} | {minutes:.2f} |\n' for event, minutes in sorted(report['minutes_by_event'].items()))
-    summary += f"| Total observed | {report['execution_minutes']:.2f} |\n\n{report['limits']}\n"
+    summary = render(report)
     print(summary)
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
             out.write(summary)
-    if report['missing_execution_timestamp_job_ids']:
-        raise SystemExit('incomplete Namespace execution timestamps; see retained JSON, not a zero-usage day')
+    if not report['complete']:
+        raise SystemExit('partial Namespace evidence: unknown runner identity or execution timestamps; see retained JSON')
 
 
 if __name__ == '__main__':

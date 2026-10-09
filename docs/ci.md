@@ -696,7 +696,7 @@ queue it again. The merge train (`st lanes join smalltalk`) is retired.
 The ruleset (`.github/repo-settings.json`, generated from `repo-settings.json.genie.ts`, applied
 by an administrator and never by CI) requires the five checks from GitHub Actions with an empty
 bypass list, keeps the pull-request, deletion and force-push protections, and configures the queue:
-merge method MERGE, up to five entries build at once (see [Measured concurrency](#measured-concurrency)),
+merge method MERGE, a proposed three entries build at once (see [Merge overflow and daily Namespace minutes](#merge-overflow-and-daily-namespace-minutes)),
 up to five merge together, and a check that
 never reports fails its entry after 60 minutes. Repository settings enable native auto-merge and
 branch deletion after merge. Check the live settings against the file with `gh-check-settings`:
@@ -729,7 +729,7 @@ The TypeScript client job follows generator freshness and reuses its runner slot
 PR runs also start `perf-cost`, taking their initial peak to 56 vCPUs and 112 GiB. Main upkeep
 runs that check separately; its cache-fill jobs normally finish after their lookup-only probes.
 Five complete merge-queue groups need 240 vCPUs and 480 GiB, within the Linux pool limit;
-`max_entries_to_build` remains 5 in both the generated and live main rulesets.
+`max_entries_to_build` was 5 at this historical measurement; current capacity policy appears in [Merge overflow and daily Namespace minutes](#merge-overflow-and-daily-namespace-minutes).
 PRs, main pushes and other workloads share that capacity; Namespace queues jobs until resources
 are available. The `linux-gate` aggregate starts after the four stage jobs finish, so it does
 not add to the initial peak. macOS uses its own pool.
@@ -801,7 +801,7 @@ even on failure. Inspect each stage's log and timing, the selected suite and che
 A passing retry is a flaky outcome in the nextest log. A queued Namespace job with no runner
 is infrastructure readiness, not a successful check; the merge queue keeps the entry waiting.
 
-During an outage, `CI_OUTAGE_FAST_QUEUE=on` skips optional Nix-cache saves and same-source build-snapshot publication on merge-group runs. Required checks, cache restores, the producer test archive, logs, cache coverage and PR/main cache publication continue. Set the variable back to `off` when Speed ends the outage; an unset variable also preserves normal publication. The temporary ruleset build concurrency is six; restore its prior value of two at outage end without changing the other ruleset fields.
+During an outage, `CI_OUTAGE_FAST_QUEUE=on` skips optional Nix-cache saves and same-source build-snapshot publication on merge-group runs. Required checks, cache restores, the producer test archive, logs, cache coverage and PR/main cache publication continue. Set the variable back to `off` when Speed ends the outage; an unset variable also preserves normal publication. The earlier six-build incident guidance and automatic restore-to-two instruction are superseded by CI-speed-owned capacity tuning. The current source proposes three with Namespace overflow; the initial live trial returned to two after a measured PR wait exceeded five minutes. Preserve all other live ruleset fields when changing admission.
 
 ## Merge overflow and daily Namespace minutes
 
@@ -839,8 +839,10 @@ artifact for the morning cost check. `python3 scripts/ci-namespace-usage --date 
 metadata, queries relevant jobs across all attempts, includes failed/cancelled execution,
 deduplicates job IDs and clips executions across midnight. The job identity must be
 an actual `nsc-runner-*`, rather than just a planned Namespace label. Queued jobs add
-no execution minutes. Missing timestamps, API failures or pagination limits fail
-visibly instead of declaring zero usage. Totals are operational execution minutes,
+no execution minutes. Missing/ambiguous Namespace runner identity or timestamps makes summary/JSON totals
+explicit partial lower bounds and fails the report. Queued/skipped jobs and known
+local/GitHub-hosted execution remain distinct. API failures or pagination limits fail
+visibly instead of declaring zero usage. Pagination is not an atomic history snapshot. Totals are operational execution minutes,
 not invoice dollars or billable unit minutes: provisioning before the first job step
 and deleted GitHub history are outside this method. Use Namespace's billing view
 for an invoice; the report preserves raw job IDs/timestamps for reconciliation.

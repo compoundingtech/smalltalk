@@ -23,6 +23,24 @@ missing_terminal = {**jobs[0], 'id': 6, 'completed_at': None}
 r = m['summarize']([local, queued, missing, missing_terminal], start, end)
 assert r['execution_minutes'] == 0 and r['missing_execution_timestamp_job_ids'] == [5, 6]
 assert m['summarize']([jobs[0]], end, end + timedelta(days=1))['execution_minutes'] == 0
+# Speed's exact counterexample must not become a complete zero-usage day.
+unknown_identity = {**jobs[0], 'id': 7, 'runner_name': None,
+                    'steps': [dict(started_at='2026-10-08T12:00:00Z')],
+                    'completed_at': '2026-10-08T12:10:00Z'}
+renamed = {**unknown_identity, 'id': 8, 'runner_name': 'unrecognized-cloud-worker'}
+r = m['summarize']([unknown_identity, renamed], start, end)
+assert r['execution_minutes'] == 0 and not r['complete']
+assert [job['id'] for job in r['ambiguous_runner_identity_jobs']] == [7, 8]
+r.update(date='2026-10-08', limits='not invoice minutes')
+assert 'PARTIAL LOWER BOUND' in m['render'](r)
+assert 'Total observed (PARTIAL LOWER BOUND)' in m['render'](r)
+for name in ('ci1-1', 'hetz2-ci-merge-2', 'GitHub Actions 1234'):
+    assert m['summarize']([{**unknown_identity, 'runner_name': name}], start, end)['complete']
+for change in ({'status': 'queued'}, {'conclusion': 'skipped'}):
+    assert m['summarize']([{**unknown_identity, **change}], start, end)['complete']
+assert not m['summarize']([missing], start, end)['complete']
+assert m['summarize']([{**jobs[0], 'runner_name': None}], end, end + timedelta(days=1))['complete']
+print('passed: executed Namespace identity ambiguity fails complete status; local/hosted/queued/skipped remain distinct; partial summaries')
 responses = iter([{'jobs': [dict(id=i) for i in range(100)]}, {'jobs': [dict(id=100)]}])
 m['pages'].__globals__['api'] = lambda _: next(responses)
 assert len(list(m['pages']('example?per_page=100', 'jobs'))) == 101
