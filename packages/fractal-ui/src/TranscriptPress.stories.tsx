@@ -189,6 +189,8 @@ export const InsertAbovePressedRow: Story = { play: async ({ canvasElement }) =>
   const height = viewport.scrollHeight
   await expect(viewport.scrollTop).toBeGreaterThan(viewport.clientHeight * 3)
   await pressAcross(retry, async () => {
+    // Let pointerdown's history capture settle before inserting between that anchor and the pressed row.
+    await settleFrames()
     canvas.getByRole('button', { name: 'Insert reply above failed send' }).click()
     await waitFor(() => expect(viewport.scrollHeight - height).toBeGreaterThan(80))
     await settleFrames()
@@ -197,8 +199,11 @@ export const InsertAbovePressedRow: Story = { play: async ({ canvasElement }) =>
     await expect(jump).not.toBeVisible()
   })
   await waitFor(() => expect(retries).toHaveTextContent('1'))
+  await expect(Math.abs(row.getBoundingClientRect().top - top), 'pressed row snapped on release').toBeLessThanOrEqual(1)
+  await waitFor(() => expect(jump).toBeVisible())
   await settleFrames()
   await expect(retries).toHaveTextContent('1')
+  await expect(Math.abs(row.getBoundingClientRect().top - top), 'history anchor undid compensation after the dock settled').toBeLessThanOrEqual(1)
 } }
 export const InsertAbovePressedRowLight: Story = { ...InsertAbovePressedRow, args: { scheme: 'light' } }
 
