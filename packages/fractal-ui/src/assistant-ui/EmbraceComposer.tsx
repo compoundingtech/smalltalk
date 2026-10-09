@@ -327,6 +327,7 @@ export function EmbraceComposer(props: EmbraceComposerProps) {
   const stacked = props.variant === 'C2' || wrapped || cramped || runtimeText.includes('\n')
   const composerProps = {
     ...props,
+    onSendDraft: props.onRequestSubmit === undefined ? props.onSendDraft : undefined,
     onRequestSubmit: (modified: boolean) => {
       cause.current = 'submit-reset'
       try {
