@@ -85,6 +85,9 @@ echo "paid onboarding eval: harness=$harness runs=${#plan[@]} (cap $max_runs) ou
 mkdir -p "$out"
 
 now_ms() { date +%s%N | cut -c1-13; }
+# The login directory is shared with real work: setup must not register a plugin marketplace from
+# the throwaway home inside it, so Claude seats use the inline development channel.
+harness_args=(); [ "$harness" = claude ] && harness_args=(--claude-channel false)
 trouble='(rate.?limit|usage limit|limit reached|quota|not logged in|please log in|/login|log in to|authentication|unauthori[sz]ed|invalid api key)'
 
 stop_throwaway() { # kill the daemon this run started: the st3 whose environment holds our HOME
@@ -107,7 +110,7 @@ for variant in "${plan[@]}"; do
   echo "== run $ran/${#plan[@]}: $variant (throwaway $root)"
   started="$(now_ms)"; skip_ms=none; verdict=""
   st setup --person "${person#person/}" --node evalbox --yes --install false --service false \
-    --start true --harness "$harness" >"$out/$variant.setup.log" 2>&1 || verdict="setup failed"
+    --start true --harness "$harness" "${harness_args[@]}" >"$out/$variant.setup.log" 2>&1 || verdict="setup failed"
   deadline=$(( $(date +%s) + overall_s ))
   while [ -z "$verdict" ] && [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 5
