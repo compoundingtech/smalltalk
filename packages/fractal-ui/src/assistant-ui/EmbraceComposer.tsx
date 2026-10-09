@@ -14,8 +14,28 @@ import {
   type Draft, type DraftToken, type MentionToken, type SerializedDraft, type SlashCommand,
 } from './embrace-composer/draft'
 
+export interface ComposerDraftSnapshot {
+  readonly text: string
+  /** Monotonic within this mounted composer; capture before starting an asynchronous storage read. */
+  readonly revision: number
+  readonly savedAt: number
+}
+export interface ComposerDraftRestore {
+  readonly text: string
+  readonly savedAt: number
+  readonly expectedRevision: number
+}
+export interface EmbraceComposerHandle {
+  getDraft(): ComposerDraftSnapshot
+  /** Returns false without changing the field when a newer edit or restore has won. */
+  restoreDraft(draft: ComposerDraftRestore): boolean
+}
+
 export interface EmbraceComposerProps {
   readonly variant: 'C1' | 'C2' | 'C3'
+  readonly ref?: React.Ref<EmbraceComposerHandle>
+  /** Browser-local storage is host-owned; called for runtime text changes, including send clears. */
+  readonly onDraftChange?: (draft: ComposerDraftSnapshot) => void
   /** Text-only capability, independent of the selected layout variant. */
   readonly plainText?: boolean
   /** Host opt-in: bound the composer to the shared reading column beside the transcript. */
@@ -149,6 +169,37 @@ const groupPreviewLimit = 4
 
 /** Requires the same assistant-ui thread/runtime provider as the transcript. */
 export function EmbraceComposer(props: EmbraceComposerProps) {
+  const aui = useAui()
+  const readText = () => (aui.composer.__internal_getRuntime?.().getState() ?? aui.composer.getState()).text
+  const draftSnapshot = React.useRef<ComposerDraftSnapshot>({ text: readText(), revision: 0, savedAt: readText() === '' ? 0 : Date.now() })
+  const draftChange = React.useRef(props.onDraftChange)
+  draftChange.current = props.onDraftChange
+  const observeDraft = () => {
+    const next = readText()
+    const previous = draftSnapshot.current
+    if (next !== previous.text) {
+      draftSnapshot.current = { text: next, revision: previous.revision + 1, savedAt: Math.max(Date.now(), previous.savedAt + 1) }
+      draftChange.current?.(draftSnapshot.current)
+    }
+    return draftSnapshot.current
+  }
+  React.useImperativeHandle(props.ref, () => ({
+    getDraft: observeDraft,
+    restoreDraft: ({ text: next, savedAt, expectedRevision }) => {
+      const current = observeDraft()
+      if (expectedRevision !== current.revision || savedAt <= current.savedAt) return false
+      // Claim the revision before publishing: synchronous subscribers cannot replay an older restore.
+      draftSnapshot.current = { text: next, revision: current.revision + 1, savedAt }
+      aui.composer.setText(next)
+      draftChange.current?.(draftSnapshot.current)
+      return true
+    },
+  }))
+  React.useLayoutEffect(() => {
+    if (props.ref === undefined && props.onDraftChange === undefined) return
+    observeDraft()
+    return aui.subscribe(observeDraft)
+  }, [aui, props.ref, props.onDraftChange])
   const runtimeText = useAuiState(state => state.composer.text)
   const root = React.useRef<HTMLDivElement>(null)
   const [wrapped, setWrapped] = React.useState(false)

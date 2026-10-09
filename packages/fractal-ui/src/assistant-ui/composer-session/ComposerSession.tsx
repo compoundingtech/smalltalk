@@ -75,7 +75,7 @@ function ComposerSessionBody({ draftKey, layout, runningBehavior, mentions, targ
   const initialTarget = React.useRef(target)
   React.useLayoutEffect(() => {
     const composer = aui.composer()
-    composer.setText(saved.text)
+    if (composerStateNow().text === '') composer.setText(saved.text)
     const runConfig = composerStateNow().runConfig
     composer.setRunConfig({ ...runConfig, custom: { ...runConfig.custom, explorerTarget: initialTarget.current } })
     if (initialImage !== undefined) void composer.addAttachment(initialImage)

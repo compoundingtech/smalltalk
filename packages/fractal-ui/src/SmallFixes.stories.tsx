@@ -8,6 +8,7 @@ import { ThinkingEntry } from './assistant-ui/composition/ThinkingEntry'
 import { Transcript } from './assistant-ui/composition/Transcript'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
 import { Input, CommandMenu } from './kit'
+import { EmbraceComposer, type EmbraceComposerHandle } from './assistant-ui/EmbraceComposer'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
 import { surfaceVars as surface, textVars as ink, spaceVars as s, typeVars as t } from './assistant-ui/composition-tokens.stylex'
@@ -84,3 +85,37 @@ export const SearchFieldContrast: Story = { render: args => <SearchContrast {...
   }
 } }
 export const SearchFieldContrastLight: Story = { ...SearchFieldContrast, args: { scheme: 'light' } }
+
+function DraftRestore({ scheme = 'dark' }: { scheme?: Scheme }) {
+  const composer = React.useRef<EmbraceComposerHandle>(null)
+  const [result, setResult] = React.useState('')
+  const [revision, setRevision] = React.useState(0)
+  return <section {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><EmbraceRuntimeProvider options={{ messages: [], isRunning: false, onNew: async () => {} }}>
+    <Button onPress={() => setRevision(composer.current!.getDraft().revision)}>Start storage read</Button>
+    <Button onPress={() => setResult(composer.current?.restoreDraft({ text: 'Saved browser-local draft', savedAt: 1, expectedRevision: revision }) ? 'Applied' : 'Kept newer draft')}>Finish storage read</Button>
+    <EmbraceComposer ref={composer} variant="C1" onDraftChange={draft => setResult(`Revision ${draft.revision}`)} />
+    <output data-testid="draft-result">{result}</output>
+  </EmbraceRuntimeProvider></section>
+}
+export const RestoreEmptyDraft: Story = { render: args => <DraftRestore {...args} />, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  await userEvent.click(canvas.getByRole('button', { name: 'Start storage read' }))
+  await userEvent.click(canvas.getByRole('button', { name: 'Finish storage read' }))
+  await expect(canvas.getByRole('textbox', { name: 'Message' })).toHaveValue('Saved browser-local draft')
+  await expect(canvas.getByTestId('draft-result')).toHaveTextContent('Applied')
+} }
+export const RestoreEmptyDraftLight: Story = { ...RestoreEmptyDraft, args: { scheme: 'light' } }
+export const PreserveNewerDraft: Story = { render: args => <DraftRestore {...args} />, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  await userEvent.click(canvas.getByRole('button', { name: 'Start storage read' }))
+  const input = canvas.getByRole('textbox', { name: 'Message' })
+  await userEvent.type(input, 'Newer user text')
+  await userEvent.click(canvas.getByRole('button', { name: 'Finish storage read' }))
+  await expect(input).toHaveValue('Newer user text')
+  await expect(canvas.getByTestId('draft-result')).toHaveTextContent('Kept newer draft')
+  // Returning to empty still counts as a newer edit; stale text must not reappear.
+  await userEvent.clear(input)
+  await userEvent.click(canvas.getByRole('button', { name: 'Finish storage read' }))
+  await expect(input).toHaveValue('')
+} }
+export const PreserveNewerDraftLight: Story = { ...PreserveNewerDraft, args: { scheme: 'light' } }
