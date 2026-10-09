@@ -36075,18 +36075,46 @@ mission "page-root" state="ready" {
         // They share a valid revision but have no steps, so hydration stays inexpensive.
         let connection = store.connection.write();
         for index in 0..51 {
+            let id = format!("page-child-{index:03}");
+            let generation = format!("page-generation-{index:03}");
             connection
                 .execute(
                     "INSERT INTO mission_runs
-                     SELECT ?1,mission_id,initial_revision,current_generation_id,root_revision,
+                     SELECT ?1,mission_id,initial_revision,?2,root_revision,
                             root_run_id,parent_step_run,workspace,requester,inputs,mode,status,
                             phase,created_at_unix_ms,updated_at_unix_ms
-                     FROM mission_runs WHERE id=?2",
-                    params![format!("page-child-{index:03}"), root.id],
+                     FROM mission_runs WHERE id=?3",
+                    params![id, generation, root.id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO run_generations
+                     SELECT ?1,?2,revision,NULL,status,actor,reason,
+                            created_at_unix_ms,updated_at_unix_ms
+                     FROM run_generations
+                     WHERE id=(SELECT current_generation_id FROM mission_runs WHERE id=?3)",
+                    params![generation, id, root.id],
                 )
                 .unwrap();
         }
         drop(connection);
+        store
+            .connection
+            .write()
+            .execute(
+                "INSERT INTO mission_runs
+                 SELECT 'page-other',mission_id,initial_revision,current_generation_id,
+                        root_revision,'another-root',parent_step_run,workspace,requester,inputs,
+                        mode,status,phase,created_at_unix_ms,updated_at_unix_ms
+                 FROM mission_runs WHERE id=?1",
+                [&root.id],
+            )
+            .unwrap();
+        assert!(store
+            .mission_runs_for_root_page(&root.subject, Some("page-other"), 50)
+            .unwrap()
+            .is_none());
         let expected = store.mission_runs_for_root(&root.subject).unwrap();
         let (first, cursor) = store
             .mission_runs_for_root_page(&root.subject, None, 50)
