@@ -28,6 +28,7 @@ jobs:
       ci1: ${{ steps.pick.outputs.ci1 }}
       ci1_secondary: ${{ steps.pick.outputs.ci1_secondary }}
       ci1_mail: ${{ steps.pick.outputs.ci1_mail }}
+      merge_ci1: ${{ steps.pick.outputs.merge_ci1 }}
     steps:
       - name: Keep reserved primary lanes and use idle general runners for tests and canaries
         id: pick
@@ -38,6 +39,7 @@ jobs:
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           OWNER: ${{ github.repository_owner }}
+          MERGE_LOCAL_ONLY: ${{ vars.CI_MERGE_CI1 }}
           NEED: ${{ vars.CI1_MIN_IDLE || '1' }}
         run: |
           primary_label=
@@ -58,6 +60,29 @@ jobs:
             primary ci1-priority
             echo "priority PR: reserved ci1-priority capacity"
             printf 'Runner: **ci1** (ci1-priority, ahead of ordinary PRs)\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$EVENT" = merge_group ] && [ "$MERGE_LOCAL_ONLY" != on ]; then
+            # Choose once for the whole group. Five simultaneous workload jobs fit locally
+            # only if two general workers remain; priority-only workers are never borrowed.
+            # This is an admission snapshot, not an atomic runner reservation.
+            [ -n "$GH_TOKEN" ] || namespace "merge overflow: no runner status token"
+            if ! runners=$(timeout 20s gh api --paginate --slurp "orgs/$OWNER/actions/runners?per_page=100" 2>/dev/null); then
+              namespace "merge overflow: runner status unavailable"
+            fi
+            if ! capacity=$(jq -er '
+              [.[].runners[] | select(.status == "online" and .busy == false)] | unique_by(.id) |
+              def has($label): any(.labels[]; .name == $label);
+              ([.[] | select(has("ci1-merge") and (has("ci1-priority") | not))]) as $merge |
+              ([.[] | select(has("ci1") and (has("ci1-priority") | not))] | length) as $general |
+              ([$merge[] | select(has("ci1") | not)] | length) as $dedicated |
+              if ($merge | length) >= 5 and ($general - ([0, 5 - $dedicated] | max)) >= 2
+              then "local" else "namespace" end' <<< "$runners"); then
+              namespace "merge overflow: invalid runner status"
+            fi
+            [ "$capacity" = local ] || namespace "merge overflow: retain two PR slots or wait for local capacity"
+            printf 'merge_ci1=["ci1-merge"]\n' >> "$GITHUB_OUTPUT"
+            printf 'Merge group: **ci1** (five idle workers, two general PR slots retained)\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           if [ "$EVENT" = merge_group ]; then
             # Merge groups never borrow the PR priority lane: it can have PR work ahead of them.
@@ -268,7 +293,7 @@ jobs:
       CI_CACHE_DEV_SHELL: genie
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["namespace-profile-linux-x86-64;job.priority={1};github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.merge_ci1) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["namespace-profile-linux-x86-64;job.priority={1};github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -325,7 +350,7 @@ jobs:
         run: python3 scripts/ci-fractal-web-licenses-test && python3 scripts/ci-fractal-web-licenses --check-lockfile
       - name: Check runner selection and generated files
         shell: bash
-        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && python3 scripts/ci-fractal-web-test && genie --check'"
+        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/ci-namespace-usage-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && python3 scripts/ci-fractal-web-test && genie --check'"
       - name: Save Nix outputs
         if: success() && env.CI_LOCAL_CACHES != '1' && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')
         run: bash scripts/ci-nix-cache save
@@ -374,7 +399,7 @@ jobs:
     name: typescript-client
     needs: [pick-runner, genie-freshness]
     if: ${{ !cancelled() && needs.genie-freshness.result == 'success' }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["namespace-profile-linux-x86-64;job.priority={1};github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.merge_ci1) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["namespace-profile-linux-x86-64;job.priority={1};github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 10
     defaults:
       run:
@@ -417,7 +442,7 @@ jobs:
     name: linux-test-build
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.ci1 || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.merge_ci1) || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 120
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -561,7 +586,7 @@ jobs:
     name: linux-tests
     needs: [pick-runner, linux-test-build]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.ci1 || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.merge_ci1) || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -679,7 +704,7 @@ jobs:
     name: linux-tests-shard-2
     needs: [pick-runner, linux-test-build]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.ci1_secondary || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.merge_ci1) || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1_secondary) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -794,7 +819,7 @@ jobs:
     name: linux-clippy
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.merge_ci1) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -929,7 +954,7 @@ jobs:
     name: linux-fleet-compat
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.merge_ci1) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -1061,7 +1086,7 @@ jobs:
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   mail-redelivery-canaries:
     name: mail-redelivery-canaries
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.ci1_mail || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.merge_ci1) || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1_mail) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -1407,7 +1432,7 @@ jobs:
     name: isolation-vm
     needs: [pick-runner, linux-test-build]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["namespace-profile-linux-x86-64;job.priority={1};github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.merge_ci1) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["namespace-profile-linux-x86-64;job.priority={1};github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 60
     defaults:
       run:

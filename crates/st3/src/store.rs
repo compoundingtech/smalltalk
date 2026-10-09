@@ -154,6 +154,7 @@ pub mod agent_view;
 mod conversation_reads;
 mod usage_period;
 mod runtime;
+pub(crate) mod published_views;
 #[cfg(test)]
 mod tombstones_tests;
 pub use runtime::SmalltalkRuntime;
@@ -11576,6 +11577,31 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn forget_current_views(&self) {
         self.smalltalk.forget_views();
+    }
+
+    /// Append a claim in a write transaction that then rolls back, as a failed write does.
+    #[cfg(test)]
+    pub(crate) fn roll_back_claim_for_test(&self, input: &ClaimInput) {
+        let mut writer = self.connection.write();
+        let transaction = writer.transaction().unwrap();
+        append_claim_tx(&transaction, &self.origin, &input.subject, &input.kind,
+            input.actor.as_deref(), &json!({"fields": input.fields}), &input.evidence, None)
+            .unwrap();
+        transaction.rollback().unwrap();
+    }
+
+    /// Drop the history an agreed checkpoint at `cut` would drop on this node.
+    #[cfg(test)]
+    pub(crate) fn trim_checkpoint_for_test(&self, cut: u128) -> usize {
+        let plan = plan_drops(&self.checkpoint_sealed_set(cut).unwrap());
+        let mut writer = self.connection.write();
+        let transaction = writer.transaction().unwrap();
+        use smallclaims::store::checkpoint::{checkpoint_name, delete_dropped_rows_tx, record_checkpoint_tombstones_tx};
+        record_checkpoint_tombstones_tx(&transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims)
+            .unwrap();
+        delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
+        transaction.commit().unwrap();
+        plan.claims.len()
     }
 
     /// Only fields consumed by agent cards, retaining the full reducer's membership,

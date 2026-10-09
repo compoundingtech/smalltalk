@@ -39,8 +39,9 @@ export const linuxActionlintConfig = {
  * overflow between runner labels, so the `pick-runner` job asks the
  * GitHub API how many ci1 runners are idle before the other jobs start, and their `runs-on` reads its
  * output. Trusted PRs labelled `ci-priority` use the reserved `ci1-priority` lane.
- * Merge-queue runs always use the reserved `ci1-merge` label and wait for that pool,
- * instead of moving to a busy Namespace pool when a reserved runner is occupied.
+ * Merge groups use the local pool only when five workers are idle and two general
+ * workers remain for PRs; otherwise the whole group uses Namespace. Explicit
+ * CI_MERGE_CI1=on retains the incident's forced-local override.
  *
  * Off unless the repository variable `CI1_RUNNERS` is `on`: then `pick-runner` is skipped, its output
  * is empty and every workload job runs on Namespace. A pull request from a fork never runs on
@@ -62,6 +63,7 @@ export const pickRunnerJob = {
     ci1: '${{ steps.pick.outputs.ci1 }}',
     ci1_secondary: '${{ steps.pick.outputs.ci1_secondary }}',
     ci1_mail: '${{ steps.pick.outputs.ci1_mail }}',
+    merge_ci1: '${{ steps.pick.outputs.merge_ci1 }}',
   },
   steps: [
     {
@@ -75,6 +77,7 @@ export const pickRunnerJob = {
         HEAD_REPOSITORY: '${{ github.event.pull_request.head.repo.full_name }}',
         PR_LABELS: '${{ toJSON(github.event.pull_request.labels.*.name) }}',
         OWNER: '${{ github.repository_owner }}',
+        MERGE_LOCAL_ONLY: '${{ vars.CI_MERGE_CI1 }}',
         NEED: `\${{ vars.CI1_MIN_IDLE || '${ci1MinIdle}' }}`,
       },
       run: `primary_label=
@@ -95,6 +98,29 @@ if [ "$EVENT" = pull_request ] && jq -e 'index("ci-priority") != null' <<< "$PR_
   primary ci1-priority
   echo "priority PR: reserved ci1-priority capacity"
   printf 'Runner: **ci1** (ci1-priority, ahead of ordinary PRs)\\n' >> "$GITHUB_STEP_SUMMARY"
+fi
+if [ "$EVENT" = merge_group ] && [ "$MERGE_LOCAL_ONLY" != on ]; then
+  # Choose once for the whole group. Five simultaneous workload jobs fit locally
+  # only if two general workers remain; priority-only workers are never borrowed.
+  # This is an admission snapshot, not an atomic runner reservation.
+  [ -n "$GH_TOKEN" ] || namespace "merge overflow: no runner status token"
+  if ! runners=$(timeout 20s gh api --paginate --slurp "orgs/$OWNER/actions/runners?per_page=100" 2>/dev/null); then
+    namespace "merge overflow: runner status unavailable"
+  fi
+  if ! capacity=$(jq -er '
+    [.[].runners[] | select(.status == "online" and .busy == false)] | unique_by(.id) |
+    def has($label): any(.labels[]; .name == $label);
+    ([.[] | select(has("ci1-merge") and (has("ci1-priority") | not))]) as $merge |
+    ([.[] | select(has("ci1") and (has("ci1-priority") | not))] | length) as $general |
+    ([$merge[] | select(has("ci1") | not)] | length) as $dedicated |
+    if ($merge | length) >= 5 and ($general - ([0, 5 - $dedicated] | max)) >= 2
+    then "local" else "namespace" end' <<< "$runners"); then
+    namespace "merge overflow: invalid runner status"
+  fi
+  [ "$capacity" = local ] || namespace "merge overflow: retain two PR slots or wait for local capacity"
+  printf 'merge_ci1=["ci1-merge"]\\n' >> "$GITHUB_OUTPUT"
+  printf 'Merge group: **ci1** (five idle workers, two general PR slots retained)\\n' >> "$GITHUB_STEP_SUMMARY"
+  exit 0
 fi
 if [ "$EVENT" = merge_group ]; then
   # Merge groups never borrow the PR priority lane: it can have PR work ahead of them.
@@ -138,11 +164,11 @@ done`,
   ],
 } as const
 
-// Enable only after Ops confirms the dedicated ci1 pool is provisioned. This
-// override comes before the general-slot picker so every merge job uses the reserve.
-const mergeCi1Labels = `github.event_name == 'merge_group' && vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]'`
+// Merge routing applies to the whole group. The explicit local override is retained;
+// otherwise the picker may admit a local group only with room left for PR checks.
+const mergeCi1Labels = `github.event_name == 'merge_group' && (vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.merge_ci1)`
 const pickedOr = (namespaceLabels: string, output = 'ci1') =>
-  `\${{ fromJSON(${mergeCi1Labels} || needs.${pickRunnerJobId}.outputs.${output} || ${namespaceLabels}) }}`
+  `\${{ fromJSON(${mergeCi1Labels} || (github.event_name != 'merge_group' && needs.${pickRunnerJobId}.outputs.${output}) || ${namespaceLabels}) }}`
 
 // Keep run affinity within each event class. Merge groups take the first Namespace
 // queue class; optional/manual and PR work retain the same second class.
