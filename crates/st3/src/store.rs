@@ -20,6 +20,9 @@ mod github_workflow_failures;
 pub(crate) mod message_subscriptions;
 mod rollouts;
 mod seat_status;
+mod card_fold;
+#[cfg(test)]
+mod card_fold_tests;
 #[cfg(test)]
 mod roster_controls;
 pub(crate) mod step_labels;
@@ -982,7 +985,10 @@ fn subject_head_at(connection: &Connection, subject: &str, store_index: u64) -> 
 
 /// Whether a current view at `store_index` leaves out runtime `subject`: exactly when its
 /// reduction there would place it in history. `owners` says whether a declared runtime's owning
-/// run and generation may decide it; the snapshot reduction reads them from their claims.
+/// run and generation may decide it; the snapshot reduction reads them from their claims. The
+/// roster reads many runtimes at once ([`Store::runtime_view_entries`]); this one-runtime read
+/// is what its parity tests compare it with.
+#[cfg(test)]
 fn runtime_view_entry(
     connection: &Connection,
     subject: &str,
@@ -990,12 +996,6 @@ fn runtime_view_entry(
     owners: bool,
 ) -> Result<ViewEntry> {
     let head = subject_head_at(connection, subject, store_index)?;
-    let entry = |history| ViewEntry {
-        head,
-        history,
-        declared: false,
-        owners: Vec::new(),
-    };
     // A folded status can be live only when some claim carries a live status, and a declaration
     // is one of these claims, so a runtime with none of them is stopped or undeclared: history.
     let candidate = connection
@@ -1004,21 +1004,54 @@ fn runtime_view_entry(
                            WHERE subject=?1 AND store_index<=?2 AND {CURRENT_VIEW_CLAIM})"
         ))?
         .query_row(params![subject, store_index], |row| row.get::<_, bool>(0))?;
+    runtime_view_entry_from(
+        connection,
+        subject,
+        store_index,
+        owners,
+        head,
+        candidate,
+        &mut || desired_row_at(connection, subject, Some(store_index)),
+        &mut |of| latest_actual_at(connection, of, Some(store_index)),
+        &mut |owner| subject_head_at(connection, owner, store_index),
+    )
+}
+
+/// [`runtime_view_entry`] from a runtime's head and whether it has a current-view claim. Its
+/// declaration, the actual states of it and its owners, and its owners' heads are read through
+/// the closures, only as the answer needs them.
+#[allow(clippy::too_many_arguments)]
+fn runtime_view_entry_from(
+    connection: &Connection,
+    subject: &str,
+    store_index: u64,
+    owners: bool,
+    head: u64,
+    candidate: bool,
+    desired: &mut dyn FnMut() -> Result<Option<DesiredRow>>,
+    actual: &mut dyn FnMut(&str) -> Result<Option<Value>>,
+    owner_head: &mut dyn FnMut(&str) -> Result<u64>,
+) -> Result<ViewEntry> {
+    let entry = |history| ViewEntry {
+        head,
+        history,
+        declared: false,
+        owners: Vec::new(),
+    };
     if !candidate {
         return Ok(entry(true));
     }
-    let status = |connection: &Connection| -> Result<Option<String>> {
-        Ok(latest_actual_at(connection, subject, Some(store_index))?
+    let status = |actual: Option<Value>| -> Option<String> {
+        actual
             .as_ref()
             .and_then(|value| value.get("fields").unwrap_or(value).get("status"))
             .and_then(Value::as_str)
-            .map(str::to_owned))
+            .map(str::to_owned)
     };
     let stopped = |status: Option<&str>| matches!(status, Some("stopped" | "absent" | "exited"));
-    let desired = desired_row_at(connection, subject, Some(store_index))?;
-    let Some(desired) = desired else {
+    let Some(desired) = desired()? else {
         // Undeclared: current only while its status is live.
-        let status = status(connection)?;
+        let status = status(actual(subject)?);
         return Ok(entry(status.is_none() || stopped(status.as_deref())));
     };
     if !owners {
@@ -1036,10 +1069,11 @@ fn runtime_view_entry(
         desired.owner_generation.as_deref(),
         None,
         Some(store_index),
+        actual,
     )?;
     // A stop declaration leaves a stopped runtime in history; no other declaration reads status.
     let history = annotation.layer != "current"
-        || (desired.kind == "stop" && stopped(status(connection)?.as_deref()));
+        || (desired.kind == "stop" && stopped(status(actual(subject)?).as_deref()));
     let owners = desired
         .owner_run
         .iter()
@@ -1048,7 +1082,7 @@ fn runtime_view_entry(
         .collect::<Vec<_>>();
     let mut head = head;
     for owner in &owners {
-        head = head.max(subject_head_at(connection, owner, store_index)?);
+        head = head.max(owner_head(owner)?);
     }
     Ok(ViewEntry {
         head,
@@ -1188,7 +1222,8 @@ fn subject_status_at_with_mode(
                 Vec::new()
             } else {
                 connection.prepare_cached(&canonical_sql(
-                    "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2
+                    "SELECT id FROM claims INDEXED BY claims_subject_accepted_index
+                     WHERE subject=?1 AND store_index<=?2
                      ORDER BY CANONICAL_DESC(claims) LIMIT 1",
                 ))?.query_row(params![subject, at_index.unwrap_or(i64::MAX as u64)], |row| row.get::<_, String>(0))
                     .optional()?.into_iter().collect()
@@ -1196,19 +1231,70 @@ fn subject_status_at_with_mode(
             (None, claims, Vec::new())
         }
     };
+    if owner_filter.is_some_and(|run| {
+        desired.as_ref().and_then(|row| row.owner_run.as_deref()) != Some(run)
+    }) {
+        return Ok(None);
+    }
+    let unknown_claim = has_unknown_claim_at(connection, subject, at_index)?;
+    let inputs = SubjectStatusInputs {
+        desired,
+        member,
+        actual,
+        actual_source: (actual_claim, actual_origin, actual_origin_conflict),
+        harness,
+        claims,
+        conflicts,
+        unknown_claim,
+    };
+    assemble_subject_status(
+        connection, subject, at_index, inputs,
+        &mut |owner| latest_actual_at(connection, owner, at_index),
+    ).map(Some)
+}
+
+/// What one subject's status reduction reads at a snapshot: read for one subject by
+/// [`subject_status_at_with_mode`], or for many at once by the agent card fold.
+struct SubjectStatusInputs {
+    desired: Option<DesiredRow>,
+    member: Option<crate::model::MemberSpec>,
+    actual: Option<Value>,
+    /// The selected actual claim, its origin, and whether rival origins leave it indeterminate.
+    actual_source: (Option<String>, Option<String>, bool),
+    harness: Option<crate::model::CurrentHarnessView>,
+    claims: Vec<String>,
+    conflicts: Vec<String>,
+    unknown_claim: Option<String>,
+}
+
+/// The status and planned action [`SubjectStatusInputs`] reduce to. A snapshot's owning run
+/// and generation states are read through `owner_actual`.
+fn assemble_subject_status(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    inputs: SubjectStatusInputs,
+    owner_actual: &mut dyn FnMut(&str) -> Result<Option<Value>>,
+) -> Result<(SubjectStatus, Option<PlannedAction>)> {
+    let SubjectStatusInputs {
+        desired,
+        member,
+        actual,
+        actual_source: (actual_claim, actual_origin, actual_origin_conflict),
+        harness,
+        claims,
+        conflicts,
+        unknown_claim,
+    } = inputs;
     let kind = desired.as_ref().map(|row| row.kind.clone());
     let owner_run = desired.as_ref().and_then(|row| row.owner_run.clone());
     let owner_generation = desired
         .as_ref()
         .and_then(|row| row.owner_generation.clone());
-    if owner_filter.is_some_and(|run| owner_run.as_deref() != Some(run)) {
-        return Ok(None);
-    }
     let status = actual
         .as_ref()
         .and_then(|value| value.get("status"))
         .and_then(Value::as_str);
-    let unknown_claim = has_unknown_claim_at(connection, subject, at_index)?;
     let reachability = if unknown_claim.is_some() || actual_origin_conflict {
         "indeterminate".to_owned()
     } else {
@@ -1249,6 +1335,7 @@ fn subject_status_at_with_mode(
         owner_generation.as_deref(),
         actual.as_ref(),
         at_index,
+        owner_actual,
     )?;
     let action = (projection.layer == "current")
         .then_some(gap.as_ref())
@@ -1284,7 +1371,7 @@ fn subject_status_at_with_mode(
         .as_ref()
         .map(crate::graph::agent_under)
         .unwrap_or_default();
-    Ok(Some((
+    Ok((
         SubjectStatus {
             subject: subject.to_owned(),
             kind,
@@ -1305,7 +1392,7 @@ fn subject_status_at_with_mode(
             projection,
         },
         action,
-    )))
+    ))
 }
 
 /// A step as a person reads it in a list: which mission, which step, and what it is for.
@@ -11012,60 +11099,74 @@ impl Store {
         &self, connection: &Connection, subject: &str, store_index: u64,
         newest: bool, mode: SubjectStatusMode,
     ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
-        {
-            let cache = self
-                .smalltalk
-                .subject_cache
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let entries = match mode {
-                SubjectStatusMode::Full => &cache.statuses,
-                SubjectStatusMode::AgentCard => &cache.card_statuses,
-            };
-            if let Some(entry) = entries.get(subject)
-                .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
-            {
-                return Ok((entry.status.clone(), entry.action.clone()));
-            }
+        if let Some(kept) = self.kept_subject_status(subject, store_index, mode) {
+            return Ok(kept);
         }
         let (status, action) = subject_status_at_with_mode(connection, subject, Some(store_index), None, mode)?
             .expect("a reduction without an owner filter always has a status");
         if newest {
-            let mut cache = self
-                .smalltalk
-                .subject_cache
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            // Keep it only if no later snapshot was applied meanwhile.
-            if cache.through == store_index {
-                let owners = status
-                    .owner_run
-                    .iter()
-                    .chain(status.projection.owner_generation.iter())
-                    .cloned()
-                    .collect();
-                let entries = match mode {
-                    SubjectStatusMode::Full => &mut cache.statuses,
-                    SubjectStatusMode::AgentCard => &mut cache.card_statuses,
-                };
-                // At capacity, a cold summary remains correct and uncached. Invalidation
-                // frees slots; no growing history map or full-status cache warming is needed.
-                if matches!(mode, SubjectStatusMode::AgentCard)
-                    && entries.len() >= AGENT_CARD_STATUS_LIMIT && !entries.contains_key(subject) {
-                    return Ok((status, action));
-                }
-                entries.insert(
-                    subject.to_owned(),
-                    StatusEntry {
-                        read_at: store_index,
-                        owners,
-                        status: status.clone(),
-                        action: action.clone(),
-                    },
-                );
-            }
+            self.keep_subject_status(subject, store_index, mode, &status, &action);
         }
         Ok((status, action))
+    }
+
+    /// `subject`'s kept status reduction, if one holds at `store_index`.
+    fn kept_subject_status(
+        &self, subject: &str, store_index: u64, mode: SubjectStatusMode,
+    ) -> Option<(SubjectStatus, Option<PlannedAction>)> {
+        let cache = self
+            .smalltalk
+            .subject_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let entries = match mode {
+            SubjectStatusMode::Full => &cache.statuses,
+            SubjectStatusMode::AgentCard => &cache.card_statuses,
+        };
+        entries.get(subject)
+            .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
+            .map(|entry| (entry.status.clone(), entry.action.clone()))
+    }
+
+    /// Keep a reduction read at the newest applied snapshot, `store_index`.
+    fn keep_subject_status(
+        &self, subject: &str, store_index: u64, mode: SubjectStatusMode,
+        status: &SubjectStatus, action: &Option<PlannedAction>,
+    ) {
+        let mut cache = self
+            .smalltalk
+            .subject_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Keep it only if no later snapshot was applied meanwhile.
+        if cache.through != store_index {
+            return;
+        }
+        let owners = status
+            .owner_run
+            .iter()
+            .chain(status.projection.owner_generation.iter())
+            .cloned()
+            .collect();
+        let entries = match mode {
+            SubjectStatusMode::Full => &mut cache.statuses,
+            SubjectStatusMode::AgentCard => &mut cache.card_statuses,
+        };
+        // At capacity, a cold summary remains correct and uncached. Invalidation
+        // frees slots; no growing history map or full-status cache warming is needed.
+        if matches!(mode, SubjectStatusMode::AgentCard)
+            && entries.len() >= AGENT_CARD_STATUS_LIMIT && !entries.contains_key(subject) {
+            return;
+        }
+        entries.insert(
+            subject.to_owned(),
+            StatusEntry {
+                read_at: store_index,
+                owners,
+                status: status.clone(),
+                action: action.clone(),
+            },
+        );
     }
 
     /// Of `subjects`, those a current view can show at `store_index`. A runtime that nothing
@@ -11081,41 +11182,66 @@ impl Store {
         store_index: u64,
         owners: bool,
     ) -> Result<BTreeSet<String>> {
+        let mut reads = card_fold::CardReads::new(store_index);
+        self.current_view_candidates_with(connection, subjects, store_index, owners, &mut reads)
+    }
+
+    /// [`Self::current_view_candidates`], reading the runtimes it has no answer for a chunk at
+    /// a time into `reads`.
+    fn current_view_candidates_with(
+        &self,
+        connection: &Connection,
+        subjects: BTreeSet<String>,
+        store_index: u64,
+        owners: bool,
+        reads: &mut card_fold::CardReads,
+    ) -> Result<BTreeSet<String>> {
         let newest = self.advance_subject_cache(connection, store_index)?;
         let mut candidates = BTreeSet::new();
-        for subject in subjects {
-            if !runtime_subject(&subject) {
-                candidates.insert(subject);
-                continue;
-            }
-            // Without the owner checks, only an answer that used no declaration applies.
-            let known = self
+        let mut unknown = Vec::new();
+        {
+            let cache = self
                 .smalltalk
                 .subject_cache
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .views
-                .get(&subject)
-                .filter(|entry| entry.head <= store_index && (owners || !entry.declared))
-                .map(|entry| entry.history);
-            let history = match known {
-                Some(history) => history,
-                None => {
-                    let entry = runtime_view_entry(connection, &subject, store_index, owners)?;
-                    let history = entry.history;
-                    if newest && owners {
-                        let mut cache = self
-                            .smalltalk
-                            .subject_cache
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner);
-                        if cache.through == store_index {
-                            cache.views.insert(subject.clone(), entry);
-                        }
-                    }
-                    history
+                .unwrap_or_else(PoisonError::into_inner);
+            for subject in subjects {
+                if !runtime_subject(&subject) {
+                    candidates.insert(subject);
+                    continue;
                 }
-            };
+                // Without the owner checks, only an answer that used no declaration applies.
+                let known = cache
+                    .views
+                    .get(&subject)
+                    .filter(|entry| entry.head <= store_index && (owners || !entry.declared))
+                    .map(|entry| entry.history);
+                match known {
+                    Some(false) => {
+                        candidates.insert(subject);
+                    }
+                    Some(true) => {}
+                    None => unknown.push(subject),
+                }
+            }
+        }
+        let mut entries =
+            self.runtime_view_entries(connection, &unknown, store_index, owners, reads)?;
+        for subject in unknown {
+            let entry = entries
+                .remove(&subject)
+                .expect("every runtime read has a view entry");
+            let history = entry.history;
+            if newest && owners {
+                let mut cache = self
+                    .smalltalk
+                    .subject_cache
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if cache.through == store_index {
+                    cache.views.insert(subject.clone(), entry);
+                }
+            }
             if !history {
                 candidates.insert(subject);
             }
@@ -11146,15 +11272,32 @@ impl Store {
                 .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<BTreeSet<_>>>()?,
         };
+        // The view and status passes share what they read of each subject.
+        let mut reads = card_fold::CardReads::new(index);
         let names = if history { names } else {
-            self.current_view_candidates(&connection, names, index, true)?
+            self.current_view_candidates_with(&connection, names, index, true, &mut reads)?
         };
         let newest = self.advance_subject_cache(&connection, index)?;
+        let mode = SubjectStatusMode::AgentCard;
+        let mut kept = HashMap::new();
+        let mut missing = Vec::new();
+        for name in &names {
+            match self.kept_subject_status(name, index, mode) {
+                Some((status, _)) => {
+                    kept.insert(name.clone(), status);
+                }
+                None => missing.push(name.clone()),
+            }
+        }
+        for (name, (status, action)) in self.agent_card_statuses(&connection, &missing, index, &mut reads)? {
+            if newest {
+                self.keep_subject_status(&name, index, mode, &status, &action);
+            }
+            kept.insert(name, status);
+        }
         let mut subjects = Vec::with_capacity(names.len());
         for name in names {
-            let (status, _) = self.cached_subject_status_with_mode(
-                &connection, &name, index, newest, SubjectStatusMode::AgentCard,
-            )?;
+            let status = kept.remove(&name).expect("every name has a status");
             if history || status.projection.layer == "current" {
                 subjects.push(status);
             }
@@ -18623,6 +18766,12 @@ fn desired_row_at(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    select_desired_row(rows)
+}
+
+/// The selected declaration of a subject's `(id, body, predecessors)` declaration claims in
+/// canonical order: the highest revision among the leaves no later declaration replaced.
+fn select_desired_row(rows: Vec<(String, String, String)>) -> Result<Option<DesiredRow>> {
     let referenced = rows
         .iter()
         .flat_map(|(_, _, predecessors)| {
@@ -20564,9 +20713,11 @@ fn has_unknown_claim_at(
     let kinds = statement
         .query_map(params![subject, through], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(kinds
-        .into_iter()
-        .find(|kind| !known_replicated_claim_kind(kind)))
+    Ok(first_unknown_kind(kinds))
+}
+
+fn first_unknown_kind(kinds: impl IntoIterator<Item = String>) -> Option<String> {
+    kinds.into_iter().find(|kind| !known_replicated_claim_kind(kind))
 }
 
 fn validate_message_transition(
@@ -21266,14 +21417,30 @@ fn selected_actual_source_at(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let Some((selected_id, selected_origin, rivals)) = select_actual_source(&rows, desired_host)
+    else {
+        return Ok((None, None, false));
+    };
+    // Another host's observation conflicts unless the selected claim descends from it. Only then
+    // does the walk need the subject's whole causal history, harness reports included.
+    let rivals = rivals.iter().map(String::as_str).collect::<Vec<_>>();
+    let runtime_conflict = !rivals.is_empty()
+        && !subject_descends_from_all(connection, subject, at_index, &selected_id, &rivals)?;
+    Ok((Some(selected_id), Some(selected_origin), runtime_conflict))
+}
+
+/// The selected actual-state claim of `(id, kind, origin, runtime body)` rows in canonical
+/// order, its origin, and the rival observations it must descend from to hold alone.
+fn select_actual_source(
+    rows: &[(String, String, String, Value)],
+    desired_host: Option<&str>,
+) -> Option<(String, String, Vec<String>)> {
     let selected = rows
         .iter()
         .rev()
         .find(|(_, kind, _, _)| kind == "runtime.observed")
         .or_else(|| rows.last());
-    let Some((selected_id, _, selected_origin, selected_body)) = selected else {
-        return Ok((None, None, false));
-    };
+    let (selected_id, _, selected_origin, selected_body) = selected?;
     // An origin's newer runtime observation supersedes its older observations. In particular,
     // its stop must retire its earlier running claim even when the new owner's intent follows
     // the desired-state branch rather than descending from that runtime branch.
@@ -21295,17 +21462,9 @@ fn selected_actual_source_at(
                     body,
                 )
         })
-        .map(|(id, _, _, _)| id.as_str())
+        .map(|(id, _, _, _)| id.clone())
         .collect::<Vec<_>>();
-    // Another host's observation conflicts unless the selected claim descends from it. Only then
-    // does the walk need the subject's whole causal history, harness reports included.
-    let runtime_conflict = !rivals.is_empty()
-        && !subject_descends_from_all(connection, subject, at_index, selected_id, &rivals)?;
-    Ok((
-        Some(selected_id.clone()),
-        Some(selected_origin.clone()),
-        runtime_conflict,
-    ))
+    Some((selected_id.clone(), selected_origin.clone(), rivals))
 }
 
 /// Whether claim `descendant` of `subject` descends from every claim of `ancestors`, walking the
@@ -21411,7 +21570,15 @@ fn latest_actual_at(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    if rows.is_empty() {
+    fold_latest_actual(rows)
+}
+
+/// A subject's actual state from its actual-state claims, `(kind, body)` in canonical order.
+fn fold_latest_actual(
+    rows: impl IntoIterator<Item = (String, String)>,
+) -> Result<Option<Value>> {
+    let mut rows = rows.into_iter().peekable();
+    if rows.peek().is_none() {
         return Ok(None);
     }
     let mut merged = serde_json::Map::new();
@@ -24310,6 +24477,8 @@ fn repair_impossible_run_tx(
     Ok(claim_ids)
 }
 
+/// A subject's operational annotation. At a snapshot, its owning run's and generation's states
+/// are read through `owner_actual`.
 #[allow(clippy::too_many_arguments)]
 fn operational_annotation(
     connection: &Connection,
@@ -24320,6 +24489,7 @@ fn operational_annotation(
     owner_generation: Option<&str>,
     actual: Option<&Value>,
     at_index: Option<u64>,
+    owner_actual: &mut dyn FnMut(&str) -> Result<Option<Value>>,
 ) -> Result<OperationalAnnotation> {
     let fields = actual.map(|value| value.get("fields").unwrap_or(value));
     let status = fields
@@ -24343,7 +24513,7 @@ fn operational_annotation(
 
     if let Some(owner_run) = owner_run {
         let (run_status, current_generation, mode) = if at_index.is_some() {
-            let owner = latest_actual_at(connection, owner_run, at_index)?;
+            let owner = owner_actual(owner_run)?;
             let fields = owner
                 .as_ref()
                 .map(|value| value.get("fields").unwrap_or(value));
@@ -24383,7 +24553,7 @@ fn operational_annotation(
         }
         if let Some(owner_generation) = owner_generation {
             let generation_status = if at_index.is_some() {
-                let generation = latest_actual_at(connection, owner_generation, at_index)?;
+                let generation = owner_actual(owner_generation)?;
                 generation
                     .as_ref()
                     .map(|value| value.get("fields").unwrap_or(value))
