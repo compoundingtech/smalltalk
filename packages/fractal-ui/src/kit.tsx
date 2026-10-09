@@ -1,5 +1,9 @@
 import * as React from 'react'
 import * as Aria from 'react-aria-components'
+import * as stylex from '@stylexjs/stylex'
+import { surfaceVars as surface, textVars as ink, borderVars as border, accentVars as accent, geometryVars as g, radiusVars as r, spaceVars as s, typeVars as t } from './assistant-ui/composition-tokens.stylex'
+import { baselineTheme } from './assistant-ui/neutral-theme'
+import { lightTheme } from './assistant-ui/composition-theme'
 
 export type Direction = 'folio' | 'relay' | 'orbit'
 export type Scheme = 'light' | 'dark'
@@ -8,7 +12,8 @@ export type Tone = 'neutral' | 'good' | 'warning' | 'danger'
 export interface Theme { direction: Direction; scheme: Scheme; density: Density }
 
 export function ThemeRoot({ direction, scheme, density, children, className = '' }: Theme & { children: React.ReactNode; className?: string }) {
-  return <div data-workshop data-direction={direction} data-scheme={scheme} data-density={density} className={`bg-canvas text-ink font-sans text-chrome ${className}`}>{children}</div>
+  const theme = stylex.props(...baselineTheme, scheme === 'light' && lightTheme)
+  return <div data-workshop data-direction={direction} data-scheme={scheme} data-density={density} {...theme} className={`bg-canvas text-ink font-sans text-chrome ${className} ${theme.className}`}>{children}</div>
 }
 
 /* Icons — original inline strokes, no icon-font or asset dependencies. */
@@ -86,10 +91,14 @@ export function EmptyState({ title, hint, action }: { title: string; hint: strin
 
 /* Input / Toggle / Checkbox — form controls. */
 export function Input({ label, value, onChange, placeholder, autoFocusKey = '/', clearKey = 'Escape' }: { label: string; value: string; onChange: (value: string) => void; placeholder?: string; autoFocusKey?: string | null; clearKey?: string | null }) {
-  return <Aria.TextField aria-label={label} value={value} onChange={onChange} className="flex w-full min-h-control items-center gap-2 rounded-control border border-line bg-panel px-3 focus-within:border-accent transition-colors">
-    {({ isRequired }) => <><Aria.Input placeholder={placeholder} onKeyDown={event => { if (clearKey && value !== '' && event.key === clearKey) { event.preventDefault(); onChange('') } }} className="w-full bg-transparent text-ink outline-none placeholder:text-muted" />{value === '' && autoFocusKey ? <Kbd>{autoFocusKey}</Kbd> : <Button aria-label={`Clear ${label.toLowerCase()}`} square size="sm" variant="quiet" onPress={() => onChange('')}><XCircleIcon /></Button>}{isRequired ? null : null}</>}
+  return <Aria.TextField aria-label={label} value={value} onChange={onChange} {...stylex.props(searchStyles.field)}>
+    {({ isRequired }) => <><Aria.Input placeholder={placeholder} onKeyDown={event => { if (clearKey && value !== '' && event.key === clearKey) { event.preventDefault(); onChange('') } }} {...stylex.props(searchStyles.input)} />{value === '' && autoFocusKey ? <Kbd>{autoFocusKey}</Kbd> : <Button aria-label={`Clear ${label.toLowerCase()}`} square size="sm" variant="quiet" onPress={() => onChange('')}><XCircleIcon /></Button>}{isRequired ? null : null}</>}
   </Aria.TextField>
 }
+const searchStyles = stylex.create({
+  field: { display: 'flex', width: '100%', minHeight: g.controlLg, alignItems: 'center', gap: s.md, borderRadius: r.control, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.controlBorder, backgroundColor: surface.raised, color: ink.fg, paddingInline: s.lg, ':focus-within': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
+  input: { width: '100%', minWidth: 0, borderWidth: 0, backgroundColor: surface.transparent, color: ink.fg, fontFamily: t.fontSans, fontSize: t.uiSize, outline: 'none', '::placeholder': { color: ink.fgMuted, opacity: 1 } },
+})
 export function Toggle({ label, isSelected, onChange }: { label: string; isSelected: boolean; onChange: (selected: boolean) => void }) {
   return <Aria.Switch aria-label={label} isSelected={isSelected} onChange={onChange} className="inline-flex cursor-pointer items-center gap-2.5 text-[12px]">
     <span className={`relative inline-flex h-4.5 w-8 shrink-0 items-center rounded-full border transition-colors duration-[var(--motion-duration)] ${isSelected ? 'bg-accent border-accent' : 'bg-recess border-line'}`}><span aria-hidden="true" className={`absolute size-3 rounded-full bg-panel border transition-[left] duration-[var(--motion-duration)] ${isSelected ? 'left-[calc(100%-16px)] border-accent' : 'left-0.5 border-line'}`} /></span>
@@ -179,9 +188,9 @@ export function CommandMenu({ groups, placeholder = 'Type a command…', emptyHi
   // Autocomplete keeps DOM focus in the input while arrows/Enter drive the list (virtual focus).
   return <div className="overflow-hidden rounded-panel border border-line bg-panel">
     <Aria.Autocomplete inputValue={query} onInputChange={setQuery}>
-      <Aria.SearchField aria-label="Find a command" className="flex items-center gap-2 border-b border-line px-3 py-2.5">
+      <Aria.SearchField aria-label="Find a command" {...stylex.props(searchStyles.field)}>
         <span aria-hidden="true" className="text-accent"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="6.8" cy="6.8" r="4.6" /><path d="M10.4 10.4 14 14" /></svg></span>
-        <Aria.Input placeholder={placeholder} className="w-full bg-transparent text-ink outline-none placeholder:text-muted" />
+        <Aria.Input placeholder={placeholder} {...stylex.props(searchStyles.input)} />
         {query !== '' ? <Button aria-label="Clear command search" square size="sm" variant="quiet" onPress={() => setQuery('')}><XCircleIcon /></Button> : <Kbd>/</Kbd>}
       </Aria.SearchField>
       <Aria.ListBox aria-label="Commands" onAction={key => { const item = groups.flatMap(group => group.items).find(candidate => candidate.id === key); item?.onSelect?.(); setStatus(item ? `Ran: ${item.label}` : ''); onAction?.(key) }} renderEmptyState={() => <p className="px-4 py-5 text-[12px] text-muted">{emptyHint}</p>} className="max-h-[min(28rem,60vh)] overflow-auto p-2">

@@ -7,6 +7,7 @@ import { WorkLogV1 } from './assistant-ui/taste/WorkLogV1'
 import { ThinkingEntry } from './assistant-ui/composition/ThinkingEntry'
 import { Transcript } from './assistant-ui/composition/Transcript'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
+import { Input, CommandMenu } from './kit'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
 import { surfaceVars as surface, textVars as ink, spaceVars as s, typeVars as t } from './assistant-ui/composition-tokens.stylex'
@@ -58,3 +59,28 @@ export const SingleLoadingLabel: Story = { render: args => <LoadingConversation 
   await expect(within(placeholder).getByTestId('sync-line')).toHaveAttribute('data-sync-visible', 'true')
 } }
 export const SingleLoadingLabelLight: Story = { ...SingleLoadingLabel, args: { scheme: 'light' } }
+
+function SearchContrast({ scheme = 'dark' }: { scheme?: Scheme }) {
+  const [value, setValue] = React.useState('')
+  return <section {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><Input label="Search agents" value={value} onChange={setValue} placeholder="Search agents…" /><CommandMenu groups={[]} placeholder="Search commands…" /></section>
+}
+function contrast(a: string, b: string) {
+  const luminance = (value: string) => {
+    const channels = value.match(/[\d.]+/g)!.slice(0, 3).map(channel => { const n = Number(channel) / 255; return n <= 0.04045 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4 })
+    return channels[0]! * 0.2126 + channels[1]! * 0.7152 + channels[2]! * 0.0722
+  }
+  const x = luminance(a), y = luminance(b)
+  return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05)
+}
+export const SearchFieldContrast: Story = { render: args => <SearchContrast {...args} />, play: async ({ canvasElement }) => {
+  const fields = canvasElement.querySelectorAll('input')
+  await expect(fields).toHaveLength(2)
+  for (const field of fields) {
+    const root = field.parentElement!
+    const background = getComputedStyle(root).backgroundColor
+    await expect(contrast(getComputedStyle(root).borderTopColor, background)).toBeGreaterThanOrEqual(3)
+    await expect(contrast(getComputedStyle(field).color, background)).toBeGreaterThanOrEqual(4.5)
+    await expect(contrast(getComputedStyle(field, '::placeholder').color, background)).toBeGreaterThanOrEqual(4.5)
+  }
+} }
+export const SearchFieldContrastLight: Story = { ...SearchFieldContrast, args: { scheme: 'light' } }

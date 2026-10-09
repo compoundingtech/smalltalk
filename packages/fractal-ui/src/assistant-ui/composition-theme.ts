@@ -30,7 +30,7 @@ const borderVarsTheme = stylex.createTheme(borderVars, {
   border: '#e4e4e7',
   borderStrong: '#d4d4d8',
   glassBorder: 'rgba(0, 0, 0, 0.06)',
-  controlBorder: 'rgba(0, 0, 0, 0.1)',
+  controlBorder: '#777777',
   focusBorder: 'rgba(0, 0, 0, 0.12)',
 })
 
@@ -70,7 +70,7 @@ const colorTheme = stylex.createTheme(colorVars, {
   rowHover: '#f4f4f5', rowActive: '#ebebeb',
   washSubtle: 'rgba(0, 0, 0, 0.02)',
   controlFill: 'rgba(0, 0, 0, 0.025)',
-  controlBorder: 'rgba(0, 0, 0, 0.1)',
+  controlBorder: '#777777',
   focusBorder: 'rgba(0, 0, 0, 0.12)',
   dangerMuted: 'rgba(220, 38, 38, 0.4)',
   scrollThumb: 'rgba(0, 0, 0, 0.15)',

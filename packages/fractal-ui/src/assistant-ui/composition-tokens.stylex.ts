@@ -27,7 +27,7 @@ export const borderVars = stylex.defineVars({
   border: 'rgba(255, 255, 255, 0.06)',
   borderStrong: 'rgba(255, 255, 255, 0.08)',
   glassBorder: 'rgba(255, 255, 255, 0.05)',
-  controlBorder: 'rgba(255, 255, 255, 0.025)',
+  controlBorder: '#818181',
   focusBorder: 'rgba(255, 255, 255, 0.08)',
 })
 
@@ -183,7 +183,7 @@ export const colorVars = stylex.defineVars({
   codeBg: '#111111',
   washSubtle: 'rgba(255, 255, 255, 0.02)',
   controlFill: 'rgba(255, 255, 255, 0.025)',
-  controlBorder: 'rgba(255, 255, 255, 0.025)',
+  controlBorder: '#818181',
   focusBorder: 'rgba(255, 255, 255, 0.08)',
   dangerMuted: 'rgba(251, 65, 74, 0.4)',
   scrollThumb: 'rgba(255, 255, 255, 0.08)',

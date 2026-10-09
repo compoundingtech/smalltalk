@@ -29,7 +29,7 @@ const borderVarsTheme = stylex.createTheme(borderVars, {
   border: 'rgba(255, 255, 255, 0.06)',
   borderStrong: 'rgba(255, 255, 255, 0.08)',
   glassBorder: 'rgba(255, 255, 255, 0.05)',
-  controlBorder: 'rgba(255, 255, 255, 0.025)',
+  controlBorder: '#818181',
   focusBorder: 'rgba(255, 255, 255, 0.08)',
 })
 
