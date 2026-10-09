@@ -618,3 +618,64 @@ fn a_fold_reads_claims_from_the_frontier_it_saw_and_rebuilds_past_too_many() {
     assert_eq!(claims_from(500, 500, 501 + FOLD_CLAIMS, 500), None);
     assert_eq!(claims_from(20_000, 0, 20_010, 20_010), None, "a frontier that first appears");
 }
+
+#[test]
+fn published_lists_follow_a_nested_run_tree() {
+    let _clock = Clock::at(start_time());
+    let store = Store::open_memory("cedar").unwrap();
+    for name in ["garden/parent", "garden/child"] {
+        mission(&store, name);
+    }
+    let child_of = |parent: &crate::model::MissionRunView, key: &str| {
+        let (starter, _) = step(parent, "plant");
+        store
+            .create_child_mission_run(
+                &MissionRunRequest {
+                    mission: "garden/child".into(),
+                    revision: None,
+                    workspace: "/work/garden".into(),
+                    requester: Some("person/operator".into()),
+                    mode: None,
+                    inputs: BTreeMap::new(),
+                    idempotency_key: key.into(),
+                },
+                parent,
+                &starter,
+                None,
+            )
+            .unwrap()
+    };
+    let ready = |run: &crate::model::MissionRunView| {
+        for path in ["plant", "water"] {
+            store.set_step_state(&step(run, path).0, "ready", None).unwrap();
+        }
+    };
+    // Root, child and grandchild: three levels of one tree, and a second tree beside it.
+    let root = start(&store, "garden/parent", "root-1");
+    let child = child_of(&root, "child-1");
+    let grandchild = child_of(&child, "grandchild-1");
+    let other = start(&store, "garden/parent", "root-2");
+    let other_child = child_of(&other, "child-2");
+    for run in [&root, &child, &grandchild, &other, &other_child] {
+        ready(run);
+    }
+    fold(&store);
+    fold_work_checked(&store);
+
+    // A child's state ends its own and its child's steps; the root's rows stay.
+    store.set_mission_run_state(&child.id, "cancelled", "terminal", Some("child done")).unwrap();
+    fold(&store);
+    let (work, _) = fold_work_checked(&store);
+    for run in [&child, &grandchild] {
+        assert!(run.steps.iter().all(|step| !work.rows.rows.contains_key(&step.subject)));
+    }
+    assert!(root.steps.iter().all(|step| work.rows.rows.contains_key(&step.subject)));
+
+    // A root's state ends the steps of every run under it.
+    store.set_mission_run_state(&other.id, "cancelled", "terminal", Some("tree done")).unwrap();
+    fold(&store);
+    let (work, _) = fold_work_checked(&store);
+    for run in [&other, &other_child] {
+        assert!(run.steps.iter().all(|step| !work.rows.rows.contains_key(&step.subject)));
+    }
+}
