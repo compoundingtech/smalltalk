@@ -347,16 +347,34 @@ mod tests {
         .unwrap();
         let client = Client::unix_as(&socket, person);
         let started = Instant::now();
-        let envelope = client.runtimes_get(&runtime).await.unwrap();
-        let read = started.elapsed();
-        let st3_client::Resource::Runtime(found) = envelope.value else {
-            panic!("not a runtime")
+        // stui's own feed already holds an agent's incarnation and host, so a real attach reads
+        // no runtime. With STUI_PROBE_INCARNATION and STUI_PROBE_OWNER (from `st agents show
+        // AGENT --json`: value.incarnation_id, value.host_id) the probe does the same; without
+        // them it makes the runtime read, which a busy daemon can take seconds to answer.
+        let (name, incarnation, owner, terminal) = match (
+            std::env::var("STUI_PROBE_INCARNATION"),
+            std::env::var("STUI_PROBE_OWNER"),
+        ) {
+            (Ok(incarnation), Ok(owner)) => (
+                runtime.trim_start_matches("runtime/").to_owned(),
+                incarnation,
+                owner,
+                format!("terminal/{subject}"),
+            ),
+            _ => {
+                let envelope = client.runtimes_get(&runtime).await.unwrap();
+                let st3_client::Resource::Runtime(found) = envelope.value else {
+                    panic!("not a runtime")
+                };
+                (
+                    found.runtime_id.clone(),
+                    found.incarnation_id.clone().expect("running incarnation"),
+                    found.owner_host_id.clone(),
+                    found.terminal_id.clone().expect("a terminal"),
+                )
+            }
         };
-        let (name, incarnation, owner) = (
-            found.runtime_id.clone(),
-            found.incarnation_id.clone().expect("running incarnation"),
-            found.owner_host_id.clone(),
-        );
+        let read = started.elapsed();
         let opened_at = Instant::now();
         let opened = open(
             &client,
@@ -395,7 +413,6 @@ mod tests {
             started.elapsed()
         );
         // The same seat through the client gateway, as stui attached before: the daemon relays.
-        let terminal = found.terminal_id.clone().expect("a terminal");
         let gateway = Instant::now();
         let mut relayed = client
             .raw_terminal_peek(&terminal, &incarnation)
