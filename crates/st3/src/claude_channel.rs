@@ -591,7 +591,8 @@ fn request(line: &str, initialized: &mut bool) -> Result<Option<Value>> {
     let result = match request["method"].as_str() {
         Some("initialize") => {
             json!({"protocolVersion":"2025-03-26","capabilities":{"experimental":{"claude/channel":{}}},
-            "serverInfo":{"name":"st","version":env!("CARGO_PKG_VERSION")}})
+            "serverInfo":{"name":"st","version":env!("CARGO_PKG_VERSION")},
+            "instructions":st_drivers::ding::CHANNEL_INSTRUCTIONS})
         }
         Some("notifications/initialized") => {
             *initialized = true;
@@ -623,6 +624,16 @@ mod tests {
         assert_eq!(
             initialize["result"]["capabilities"]["experimental"]["claude/channel"],
             json!({})
+        );
+        assert_eq!(
+            initialize["result"]["instructions"],
+            st_drivers::ding::CHANNEL_INSTRUCTIONS
+        );
+        assert!(
+            initialize["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("people have no inbox, so do not reply with st")
         );
         let tools = request(
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
