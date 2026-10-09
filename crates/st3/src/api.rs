@@ -947,6 +947,7 @@ async fn response_envelope_unbounded(
     let started = Instant::now();
     let request_method = request.method().clone();
     let request_path = request.uri().path().to_owned();
+    let request_query = request.uri().query().map(str::to_owned);
     let request_route = request
         .extensions()
         .get::<axum::extract::MatchedPath>()
@@ -1081,6 +1082,7 @@ async fn response_envelope_unbounded(
             &request_method,
             &request_route,
             &request_path,
+            request_query.as_deref(),
             &caller,
             started,
         );
@@ -1159,6 +1161,7 @@ async fn response_envelope_unbounded(
         &request_method,
         &request_route,
         &request_path,
+        request_query.as_deref(),
         &caller,
         started,
     );
@@ -1183,6 +1186,7 @@ fn record_request_latency(
     method: &axum::http::Method,
     route: &str,
     path: &str,
+    query: Option<&str>,
     caller: &str,
     started: Instant,
 ) {
@@ -1191,7 +1195,7 @@ fn record_request_latency(
     request_latency()
         .lock()
         .unwrap()
-        .record(method, route, path, elapsed);
+        .record(method, route, path, query, elapsed);
     if elapsed < Duration::from_secs(1) {
         return;
     }
@@ -4511,11 +4515,7 @@ async fn wait_for_agent_roster(store: &Arc<Store>, history: bool) {
             }).await {
                 return;
             }
-            if history {
-                store.request_agent_roster_history();
-            } else {
-                store.request_agent_roster_refresh();
-            }
+            store.request_fresh_agent_roster(history);
             if publications.changed().await.is_err() {
                 return;
             }
@@ -5508,10 +5508,15 @@ pub fn start_native_session_discovery(state: &AppState) {
 /// The shortest pause between two roster refreshes. A refresh also pauses as long as it took,
 /// so refreshing never takes more than about half a core however often readers ask. Reads
 /// never wait for it: this bounds how stale a served roster can be, about a second plus a fold.
+/// A read waiting for a fresh roster cuts it short to the refresh's own length.
 const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_secs(1);
 
+/// The shortest pause a read waiting for a fresh roster can cut the refresher's pause to, so
+/// that a very cheap fold cannot turn fresh reads into many refreshes a second.
+const AGENT_ROSTER_FRESH_PAUSE: Duration = Duration::from_millis(100);
+
 /// How long a read asking for a fresh roster waits for one at or after its own cut: long enough
-/// for the refresher's pause and one fold.
+/// for the refresher to finish a fold, pause as long, and fold again.
 const AGENT_ROSTER_READ_WAIT: Duration = Duration::from_secs(2);
 
 /// Keep the complete agents roster published off the request path. As the daemon starts it
@@ -5570,7 +5575,15 @@ pub fn start_agent_roster(state: &AppState) {
             if first {
                 continue;
             }
-            tokio::time::sleep(started.elapsed().max(AGENT_ROSTER_REFRESH_PAUSE)).await;
+            // Pause as long as the refresh took, so refreshing stays under about half a core
+            // however often readers ask, and at least the minimum pause unless a reader waits
+            // for a fresh roster: that read then waits for one fold, not the rest of the pause.
+            let pause = started.elapsed().max(AGENT_ROSTER_FRESH_PAUSE);
+            tokio::time::sleep(pause).await;
+            tokio::select! {
+                () = tokio::time::sleep(AGENT_ROSTER_REFRESH_PAUSE.saturating_sub(pause)) => {}
+                () = store.fresh_agent_roster_wanted() => {}
+            }
             wake.notified().await;
         }
     });
@@ -16077,6 +16090,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             &axum::http::Method::GET,
             "/v1/client/agents",
             "/v1/client/agents",
+            None,
             "stui",
             Instant::now() - Duration::from_secs(2),
         );
