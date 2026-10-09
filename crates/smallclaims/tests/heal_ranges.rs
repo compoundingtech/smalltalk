@@ -339,7 +339,7 @@ fn opening_a_populated_store_builds_identity_indexes_without_rewriting_claims() 
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     let (_, _, plan) = rows(&connection, &new_rows());
     assert!(
         plan.contains("USING COVERING INDEX claims_batch_claim_id"),

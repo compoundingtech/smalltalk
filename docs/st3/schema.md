@@ -4,6 +4,8 @@ This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
 Digest: `36c1ac93a1df8efdcd4bb87ab29016f9c6831f60e025062f06378b1af0295fc4`
+Storage version: `18`
+Storage digest: `7cc0f8564a9011f61e6455adaa51debd711e348b485bb7f48b334fab37d35108`
 
 ## Subject families
 
@@ -218,3 +220,33 @@ A `durable` claim is a fact in the replicated claim log. A `local` claim is an o
 Each phase has `name` and `tasks`; each task has `content`, `status` (`pending`, `in_progress`, `completed`, `blocked`) and optional string `blocker`. The shared phase/task shape can also represent a future plan with one unnamed phase. Bounds are 16 phases, 100 tasks total, 128 UTF-8 bytes per phase name and 512 per content/blocker. Producers shorten at UTF-8 boundaries and omit trailing tasks/phases in source order to keep serialized claim fields within 64 KiB (including JSON escaping). Bound-driven shortening or omission sets `truncated`. `totals` contains nonnegative integer counts for all four statuses from the full source: counts equal the visible list when not truncated and cannot be less than visible counts when truncated. Unknown nested fields, invalid statuses, null blockers and oversized fields are rejected.
 
 OMP's native `abandoned` tasks are omitted from phase tasks rather than relabeled as completed. Their enclosing phase is preserved when it fits. `totals.abandoned` counts these dropped tasks separately; it is optional on the wire and defaults to zero when absent. Totals for the four task statuses count the full source snapshot and exclude abandoned tasks from active progress. Dropping an abandoned task does not set `truncated`; that flag describes text/list/serialized-size bounds only. The OMP producer always emits the abandoned count and reserves 4 KiB of the serialized-fields budget for authenticated provenance.
+
+## Local checkpoint capture storage
+
+SQLite `user_version` is 18. This additive upgrade creates one persistent mutation fence and idempotent triggers; it does not rewrite claim bodies, rebuild projections, or force replay. The local storage digest is separate from the claim/wire registry digest, which remains unchanged.
+
+```sql
+CREATE TABLE IF NOT EXISTS checkpoint_capture_epoch (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    value INTEGER NOT NULL,
+    envelope_frontier INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO checkpoint_capture_epoch(id, value, envelope_frontier) VALUES (1, 0, 0);
+```
+
+At the start of each capture attempt, one short writer transaction chooses the sealed envelope rowid, advances `envelope_frontier` with `MAX(envelope_frontier, seal_rowid)`, and reads `SELECT value FROM checkpoint_capture_epoch WHERE id=1`. Every metadata, body, protection, and tombstone page reads and checks that value in its own short snapshot. A mismatch discards the entire attempt rather than returning a mixed set. The frontier only grows, including across reconnects and concurrent captures; advancing it does not itself increment the epoch.
+
+| Captured source | Mutations that increment the epoch |
+|---|---|
+| `claims`, `batches`, `replica_records`, `replica_envelopes` | Every UPDATE and DELETE, including canonical-key, admission, repair-state, body, and rowid changes. |
+| `desired`, `mission_definitions`, `mission_revisions`, `documents` | Every INSERT, UPDATE, and DELETE; these tables protect claims independently of the sealed envelope prefix. Projection rebuilds and direct desired deletion are included. |
+| `checkpoint_claims`, `checkpoint_envelopes` | Every INSERT, UPDATE, and DELETE; trims, manifest adoption, and exact tombstone replacement are included. |
+| `claims` INSERT | Repair receipts (`record.repaired`, `repair.applied`), bodies belonging to an envelope at/below the frontier, and bodies backfilled for an already captured record. |
+| `replica_records` INSERT | Records in an envelope at/below the frontier, repaired/replacement records, and copies naming a claim already present in the captured envelope prefix (which may change its canonical wire position). Pending-envelope admission is included. |
+| `replica_envelopes` INSERT | Rows at/below the frontier, including explicit rowid backfill. |
+| `batches` INSERT | Backfill of a batch already named by a claim, which can change captured canonical keys. |
+| Core identity collisions on INSERT | BEFORE INSERT fences on all four core tables cover REPLACE even when SQLite recursive triggers are disabled; ignored duplicate inserts may conservatively invalidate. |
+
+Ordinary new batches, claims, envelopes, and records strictly beyond the frontier do not invalidate capture when they neither change protection nor name a captured claim. Capture does not read envelope signatures/holds, projection-health rows, peer/cursor state, blob bytes, operation caches, or checkpoint status as metadata, so mutations confined to those tables need no capture fence. Blob-backed document bindings and operation identity in claim bodies/tombstones are covered by their captured tables. Any future captured source must extend the trigger audit before pages may read it.
+
+Triggers persist in the database and increment the epoch in the mutation's own transaction on every connection, without connection-local hooks or SQL functions. Rollback rolls back the increment too. Reopening initializes neither value again and does not reset a prior frontier. Upgrade requires the normal process restart, not a history migration; its restart duration has not been measured. Older binaries reject storage version 18. Binary rollback requires restoring a pre-upgrade database snapshot; otherwise roll forward. No replicated claim, checkpoint rule, wire protocol, or response shape changes.

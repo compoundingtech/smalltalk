@@ -15,6 +15,47 @@ use sha2::{Digest as _, Sha256};
 
 pub const SCHEMA_NAME: &str = "st3.v1";
 
+/// Local SQLite compatibility is separate from the replicated claim vocabulary.
+pub const STORAGE_VERSION: u32 = 18;
+pub const LOCAL_STORAGE_SCHEMA: &str = r#"## Local checkpoint capture storage
+
+SQLite `user_version` is 18. This additive upgrade creates one persistent mutation fence and idempotent triggers; it does not rewrite claim bodies, rebuild projections, or force replay. The local storage digest is separate from the claim/wire registry digest, which remains unchanged.
+
+```sql
+CREATE TABLE IF NOT EXISTS checkpoint_capture_epoch (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    value INTEGER NOT NULL,
+    envelope_frontier INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO checkpoint_capture_epoch(id, value, envelope_frontier) VALUES (1, 0, 0);
+```
+
+At the start of each capture attempt, one short writer transaction chooses the sealed envelope rowid, advances `envelope_frontier` with `MAX(envelope_frontier, seal_rowid)`, and reads `SELECT value FROM checkpoint_capture_epoch WHERE id=1`. Every metadata, body, protection, and tombstone page reads and checks that value in its own short snapshot. A mismatch discards the entire attempt rather than returning a mixed set. The frontier only grows, including across reconnects and concurrent captures; advancing it does not itself increment the epoch.
+
+| Captured source | Mutations that increment the epoch |
+|---|---|
+| `claims`, `batches`, `replica_records`, `replica_envelopes` | Every UPDATE and DELETE, including canonical-key, admission, repair-state, body, and rowid changes. |
+| `desired`, `mission_definitions`, `mission_revisions`, `documents` | Every INSERT, UPDATE, and DELETE; these tables protect claims independently of the sealed envelope prefix. Projection rebuilds and direct desired deletion are included. |
+| `checkpoint_claims`, `checkpoint_envelopes` | Every INSERT, UPDATE, and DELETE; trims, manifest adoption, and exact tombstone replacement are included. |
+| `claims` INSERT | Repair receipts (`record.repaired`, `repair.applied`), bodies belonging to an envelope at/below the frontier, and bodies backfilled for an already captured record. |
+| `replica_records` INSERT | Records in an envelope at/below the frontier, repaired/replacement records, and copies naming a claim already present in the captured envelope prefix (which may change its canonical wire position). Pending-envelope admission is included. |
+| `replica_envelopes` INSERT | Rows at/below the frontier, including explicit rowid backfill. |
+| `batches` INSERT | Backfill of a batch already named by a claim, which can change captured canonical keys. |
+| Core identity collisions on INSERT | BEFORE INSERT fences on all four core tables cover REPLACE even when SQLite recursive triggers are disabled; ignored duplicate inserts may conservatively invalidate. |
+
+Ordinary new batches, claims, envelopes, and records strictly beyond the frontier do not invalidate capture when they neither change protection nor name a captured claim. Capture does not read envelope signatures/holds, projection-health rows, peer/cursor state, blob bytes, operation caches, or checkpoint status as metadata, so mutations confined to those tables need no capture fence. Blob-backed document bindings and operation identity in claim bodies/tombstones are covered by their captured tables. Any future captured source must extend the trigger audit before pages may read it.
+
+Triggers persist in the database and increment the epoch in the mutation's own transaction on every connection, without connection-local hooks or SQL functions. Rollback rolls back the increment too. Reopening initializes neither value again and does not reset a prior frontier. Upgrade requires the normal process restart, not a history migration; its restart duration has not been measured. Older binaries reject storage version 18. Binary rollback requires restoring a pre-upgrade database snapshot; otherwise roll forward. No replicated claim, checkpoint rule, wire protocol, or response shape changes.
+"#;
+
+pub fn storage_digest() -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"st3-local-storage-v1\0");
+    digest.update(STORAGE_VERSION.to_be_bytes());
+    digest.update(LOCAL_STORAGE_SCHEMA.as_bytes());
+    hex::encode(digest.finalize())
+}
+
 pub const HARNESS_TODO_MAX_PHASES: usize = 16;
 pub const HARNESS_TODO_MAX_TASKS: usize = 100;
 pub const HARNESS_TODO_MAX_PHASE_BYTES: usize = 128;
@@ -233,9 +274,11 @@ impl Registry {
 
     pub fn markdown(&self) -> String {
         let mut output = format!(
-            "# st3 schema registry\n\nThis file is generated from `st3-schema`.\n\nSchema: `{}`\nDigest: `{}`\n\n",
+            "# st3 schema registry\n\nThis file is generated from `st3-schema`.\n\nSchema: `{}`\nDigest: `{}`\nStorage version: `{}`\nStorage digest: `{}`\n\n",
             self.name,
-            self.digest()
+            self.digest(),
+            STORAGE_VERSION,
+            storage_digest()
         );
         output.push_str("## Subject families\n\n| Family | Pattern | Client writable | Description |\n|---|---|---:|---|\n");
         for spec in self.subjects.values() {
@@ -285,6 +328,8 @@ impl Registry {
         output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.\n");
         output.push_str("\n## Harness todo snapshots\n\n`harness.todo.observed` replaces the entire seat todo list. Session and incarnation identify its source; `observed_at` is source timestamp provenance, not an ordering clock. Keep the last snapshot until replaced, and expose stale provenance rather than presenting an old binding as current. Missing means unobserved; `phases: []`, zero totals and `truncated: false` means known empty.\n\nEach phase has `name` and `tasks`; each task has `content`, `status` (`pending`, `in_progress`, `completed`, `blocked`) and optional string `blocker`. The shared phase/task shape can also represent a future plan with one unnamed phase. Bounds are 16 phases, 100 tasks total, 128 UTF-8 bytes per phase name and 512 per content/blocker. Producers shorten at UTF-8 boundaries and omit trailing tasks/phases in source order to keep serialized claim fields within 64 KiB (including JSON escaping). Bound-driven shortening or omission sets `truncated`. `totals` contains nonnegative integer counts for all four statuses from the full source: counts equal the visible list when not truncated and cannot be less than visible counts when truncated. Unknown nested fields, invalid statuses, null blockers and oversized fields are rejected.\n");
         output.push_str("\nOMP's native `abandoned` tasks are omitted from phase tasks rather than relabeled as completed. Their enclosing phase is preserved when it fits. `totals.abandoned` counts these dropped tasks separately; it is optional on the wire and defaults to zero when absent. Totals for the four task statuses count the full source snapshot and exclude abandoned tasks from active progress. Dropping an abandoned task does not set `truncated`; that flag describes text/list/serialized-size bounds only. The OMP producer always emits the abandoned count and reserves 4 KiB of the serialized-fields budget for authenticated provenance.\n");
+        output.push('\n');
+        output.push_str(LOCAL_STORAGE_SCHEMA);
         output
     }
 

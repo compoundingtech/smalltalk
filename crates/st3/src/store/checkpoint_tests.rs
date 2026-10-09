@@ -344,8 +344,8 @@ fn limits_keep_source_observations_even_when_the_same_seat_publishes_again() {
 
 #[test]
 fn a_sealed_set_read_in_pages_is_the_same_set_whatever_the_page() {
-    // Pages bound each query within one consistent capture snapshot. The set must not depend
-    // on how the pages fall: one row to a page, a few, and one page for everything.
+    // Epoch checks keep the capture coherent across bounded page snapshots. The set must not
+    // depend on how the pages fall: one row to a page, a few, or the maximum bounded page.
     let store = Store::open_memory("alder").unwrap();
     store
         .append_claim_outcome(&input(
@@ -593,7 +593,7 @@ fn a_usage_trim_keeps_lifetime_usage_and_the_proof_guards_it() {
 }
 
 #[test]
-fn sealed_capture_keeps_one_snapshot_when_trim_commits_between_metadata_and_bodies() {
+fn sealed_capture_restarts_when_trim_commits_between_metadata_and_bodies() {
     use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc};
     struct Pause {
         fired: AtomicBool,
@@ -621,7 +621,7 @@ fn sealed_capture_keeps_one_snapshot_when_trim_commits_between_metadata_and_bodi
         0
     }
     let scratch = tempfile::tempdir().unwrap();
-    // WAL lets the trim commit while the capture still holds its read snapshot.
+    // WAL lets the trim commit while one bounded body page holds its read snapshot.
     let store = Arc::new(Store::open(&scratch.path().join("claims.sqlite3"), "alder").unwrap());
     store.append_claim(&input(
         AGENT, "harness.observed", Some(AGENT),
@@ -678,14 +678,72 @@ fn sealed_capture_keeps_one_snapshot_when_trim_commits_between_metadata_and_bodi
             rusqlite::ffi::sqlite3_trace_v2(connection.handle(), 0, None, std::ptr::null_mut());
         }
     }
-    let captured = captured.expect("a concurrent trim must not invalidate queued body reads");
-    assert_eq!(format!("{:?}", captured.claims), format!("{:?}", expected.claims));
-    assert_eq!(SealedIdentities::of(&captured), SealedIdentities::of(&expected));
+    let captured = captured.expect("capture must restart after a concurrent trim");
+    let current = store.checkpoint_sealed_set(cut).unwrap();
+    assert_eq!(format!("{:?}", captured.claims), format!("{:?}", current.claims));
+    assert_eq!(SealedIdentities::of(&captured), SealedIdentities::of(&current));
+    assert!(captured.claims.len() < expected.claims.len(), "capture must not return the stale bodies");
     assert_eq!(
         store.claims_for(AGENT, Some("harness.usage")).unwrap().len(),
         1,
         "the trim really committed while capture was paused"
     );
+}
+
+#[test]
+fn sealed_capture_fails_closed_after_three_consecutive_invalidations() {
+    use std::cell::Cell;
+    struct Mutate {
+        connection: rusqlite::Connection,
+        changes: Cell<usize>,
+    }
+    unsafe extern "C" fn invalidate_page(
+        _: std::ffi::c_uint,
+        context: *mut std::ffi::c_void,
+        statement: *mut std::ffi::c_void,
+        _: *mut std::ffi::c_void,
+    ) -> std::ffi::c_int {
+        let mutation = unsafe { &*context.cast::<Mutate>() };
+        let sql = unsafe {
+            std::ffi::CStr::from_ptr(rusqlite::ffi::sqlite3_sql(statement.cast()))
+        };
+        if sql.to_bytes() == b"SELECT value FROM checkpoint_capture_epoch WHERE id=1" {
+            mutation.connection.execute(
+                "UPDATE checkpoint_capture_epoch SET value=value+1 WHERE id=1", [],
+            ).unwrap();
+            mutation.changes.set(mutation.changes.get() + 1);
+        }
+        0
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join("claims.sqlite3");
+    let store = Store::open(&path, "alder").unwrap();
+    store.append_claim(&input(
+        AGENT, "harness.observed", Some(AGENT),
+        json!({"state":"idle", "incarnation_id":"one"}), "harness",
+    )).unwrap();
+    let cut = now_ms() + 1_000;
+    store.checkpoint_sealed_set(cut).unwrap();
+    let mutation = Mutate {
+        connection: rusqlite::Connection::open(&path).unwrap(),
+        changes: Cell::new(0),
+    };
+    for connection in store.readers.idle.lock().unwrap().iter() {
+        unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(
+                connection.handle(), rusqlite::ffi::SQLITE_TRACE_STMT as u32,
+                Some(invalidate_page), (&raw const mutation).cast_mut().cast(),
+            );
+        }
+    }
+    let captured = store.checkpoint_sealed_set_paged(cut, None, 1, 1);
+    for connection in store.readers.idle.lock().unwrap().iter() {
+        unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(connection.handle(), 0, None, std::ptr::null_mut());
+        }
+    }
+    assert!(captured.unwrap_err().to_string().contains("after 3 attempts"));
+    assert!(mutation.changes.get() >= 3);
 }
 
 #[test]
@@ -1800,7 +1858,7 @@ fn an_observed_item_keeps_its_latest_state_and_every_version_still_read_by_id() 
 }
 
 #[test]
-fn checkpoint_reads_of_sealed_batches_do_not_wait_for_the_writer() {
+fn checkpoint_identity_reads_of_sealed_batches_do_not_wait_for_the_writer() {
     let store = Arc::new(Store::open_memory("checkpoint-writer-test").unwrap());
     store
         .append_claim(&input(
@@ -1818,22 +1876,19 @@ fn checkpoint_reads_of_sealed_batches_do_not_wait_for_the_writer() {
     let (sent, received) = std::sync::mpsc::channel();
     let reader = store.clone();
     let task = std::thread::spawn(move || {
-        let result = reader
-            .checkpoint_sealed_identities(cut, None)
-            .and_then(|identities| {
-                reader
-                    .checkpoint_sealed_set_through(cut, None)
-                    .map(|sealed| (identities.digest, sealed_digest(&sealed)))
-            });
+        let result = reader.checkpoint_sealed_identities(cut, None);
         sent.send(result).unwrap();
     });
     let result = received.recv_timeout(std::time::Duration::from_secs(2));
     drop(writer);
     task.join().unwrap();
-    let (identities, sealed) = result
-        .expect("an already sealed checkpoint must not take the writer")
+    let identities = result
+        .expect("an already sealed identity read must not take the writer")
         .unwrap();
-    assert_eq!(identities, sealed);
+    // Full capture takes a brief writer transaction to advance the persisted frontier,
+    // then releases it before reading any pages.
+    let sealed = store.checkpoint_sealed_set_through(cut, None).unwrap();
+    assert_eq!(identities.digest, sealed_digest(&sealed));
 }
 
 #[test]

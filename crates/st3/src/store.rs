@@ -139,6 +139,8 @@ mod checkpoint_agreement_tests;
 #[cfg(test)]
 mod checkpoint_tests;
 #[cfg(test)]
+mod checkpoint_capture_epoch_tests;
+#[cfg(test)]
 mod convergence;
 #[cfg(test)]
 mod document_index_tests;
@@ -1660,6 +1662,7 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
         || version == 15
         || version == 16
         || version == 17
+        || version == 18
     {
         return Ok(());
     }
@@ -44077,7 +44080,7 @@ version 2
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
         assert_eq!(planner_column, 1);
     }
 
@@ -46143,8 +46146,15 @@ version 2
             ))
             .unwrap();
         let before_dry_run = store.index().unwrap();
+        let capture_epoch =
+            smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap();
         let repair = store.operational_repair_plan().unwrap();
         assert_eq!(store.index().unwrap(), before_dry_run);
+        assert_eq!(
+            smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap(),
+            capture_epoch,
+            "planning a repair must not invalidate checkpoint capture"
+        );
         assert_eq!(repair.status, "changes");
         assert!(repair.items.iter().any(|item| {
             item.class == "terminal-descendants"
@@ -46155,9 +46165,20 @@ version 2
         let applied = store.apply_operational_repair(&repair.token).unwrap();
         assert!(applied.applied >= 1);
         assert!(!applied.already_applied);
+        let repaired_epoch =
+            smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap();
+        assert!(
+            repaired_epoch > capture_epoch,
+            "committing an operational repair must invalidate checkpoint capture"
+        );
         let duplicate = store.apply_operational_repair(&repair.token).unwrap();
         assert_eq!(duplicate.applied, 0);
         assert!(duplicate.already_applied);
+        assert_eq!(
+            smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap(),
+            repaired_epoch,
+            "an already-applied repair must not invalidate checkpoint capture"
+        );
         assert_eq!(store.operational_repair_plan().unwrap().status, "clean");
         let history = store.work(None, true).unwrap();
         let nested = history
