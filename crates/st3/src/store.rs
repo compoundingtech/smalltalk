@@ -3196,7 +3196,7 @@ impl Store {
 
     /// Ask the refresher, if one runs, for a roster at the newest cut on behalf of a reader that
     /// waits for it: a refresher pausing between refreshes stops pausing once it has paused as
-    /// long as its last refresh took.
+    /// long as its last refresh took, and at least a tenth of a second.
     pub(crate) fn request_fresh_agent_roster(&self, history: bool) {
         if self.smalltalk.agent_roster_refresh.get().is_none() {
             return;

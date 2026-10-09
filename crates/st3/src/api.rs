@@ -5487,6 +5487,10 @@ pub fn start_native_session_discovery(state: &AppState) {
 /// A read waiting for a fresh roster cuts it short to the refresh's own length.
 const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_secs(1);
 
+/// The shortest pause a read waiting for a fresh roster can cut the refresher's pause to, so
+/// that a very cheap fold cannot turn fresh reads into many refreshes a second.
+const AGENT_ROSTER_FRESH_PAUSE: Duration = Duration::from_millis(100);
+
 /// How long a read asking for a fresh roster waits for one at or after its own cut: long enough
 /// for the refresher to finish a fold, pause as long, and fold again.
 const AGENT_ROSTER_READ_WAIT: Duration = Duration::from_secs(2);
@@ -5550,10 +5554,10 @@ pub fn start_agent_roster(state: &AppState) {
             // Pause as long as the refresh took, so refreshing stays under about half a core
             // however often readers ask, and at least the minimum pause unless a reader waits
             // for a fresh roster: that read then waits for one fold, not the rest of the pause.
-            let took = started.elapsed();
-            tokio::time::sleep(took).await;
+            let pause = started.elapsed().max(AGENT_ROSTER_FRESH_PAUSE);
+            tokio::time::sleep(pause).await;
             tokio::select! {
-                () = tokio::time::sleep(AGENT_ROSTER_REFRESH_PAUSE.saturating_sub(took)) => {}
+                () = tokio::time::sleep(AGENT_ROSTER_REFRESH_PAUSE.saturating_sub(pause)) => {}
                 () = store.fresh_agent_roster_wanted() => {}
             }
             wake.notified().await;
