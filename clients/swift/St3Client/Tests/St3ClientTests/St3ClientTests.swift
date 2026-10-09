@@ -199,9 +199,14 @@ final class St3ClientTests: XCTestCase {
             let encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(entry)) as? [String: Any])
             let originalBody = try XCTUnwrap(item["body"] as? [String: Any])
             let encodedBody = try XCTUnwrap(encoded["body"] as? [String: Any])
-            // Codable may omit explicitly nullable nils; every supplied non-null value and
-            // every absent field must survive the known-body round trip.
-            for (key, original) in originalBody where !(original is NSNull) && key != "attribution" {
+            // The existing Swift usage model does not expose cache_write_tokens or turn_id.
+            // Their wire preservation is tested by the Rust relay and TypeScript consumers;
+            // this check covers values this installed Swift model actually represents.
+            let unmodeled: Set<String>
+            if case .usage = entry.body { unmodeled = ["cache_write_tokens", "turn_id"] }
+            else { unmodeled = [] }
+            // Codable may omit explicitly nullable nils, without inventing absent fields.
+            for (key, original) in originalBody where !(original is NSNull) && key != "attribution" && !unmodeled.contains(key) {
                 XCTAssertEqual(encodedBody[key] as? NSObject, original as? NSObject, key)
             }
             for key in encodedBody.keys {
