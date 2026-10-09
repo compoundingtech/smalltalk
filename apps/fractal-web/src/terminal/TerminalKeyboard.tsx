@@ -6,10 +6,12 @@ import React from 'react'
 import { FocusScope, useKeyboard } from 'react-aria'
 import { Button } from 'react-aria-components'
 
+import { Modal, ModalDialog, ModalHeader, ModalTitle } from '../ui-compat/components.tsx'
 import { scale, tokens } from '../ui-compat/tokens.stylex.ts'
 
 import type { BrowserTerminalKey, TerminalKeyEncoder } from './ghosttyKeyboard.ts'
 import type { TerminalInputPort, TerminalInputState } from './orderedTerminalInput.ts'
+import { isBulkText, normalizePaste, pasteConfirmBytes, pasteMaxBytes } from './terminalInputWire.ts'
 
 const absent = Atom.make<TerminalInputState>({
   _tag: 'Closed',
@@ -42,6 +44,9 @@ export const TerminalKeyboard = ({
   const composing = React.useRef(false)
   const committed = React.useRef<string | undefined>(undefined)
   const [notice, setNotice] = React.useState<string | undefined>(undefined)
+  // A large paste waits here, already encoded for the modes it was pasted under.
+  const [heldPaste, setHeldPaste] = React.useState<Uint8Array | undefined>(undefined)
+  const confirming = React.useRef(false)
   const id = React.useId()
   const disabledReason =
     unavailableReason ??
@@ -75,6 +80,67 @@ export const TerminalKeyboard = ({
     // Port rejections may carry transport text; the lifecycle state already states the fixed reason.
     void port.send(bytes).catch(() => setNotice('Terminal input could not be sent. No keystrokes were replayed.'))
   }
+  const paste = (text: string) => {
+    if (encoder === undefined) return
+    const bytes = encoder.paste({ text: normalizePaste(text), modes })
+    if (bytes.length > pasteMaxBytes) {
+      setNotice(`This paste is larger than ${pasteMaxBytes / 1024} KB. Nothing was sent.`)
+      return
+    }
+    if (bytes.length <= pasteConfirmBytes) {
+      send(bytes)
+      return
+    }
+    confirming.current = true
+    setHeldPaste(bytes)
+  }
+  const settlePaste = (confirmed: boolean) => {
+    const bytes = heldPaste
+    confirming.current = false
+    setHeldPaste(undefined)
+    if (confirmed && bytes !== undefined) send(bytes)
+  }
+  /**
+   * One admission policy for every text source that is not a key press: a short single line goes
+   * straight to the terminal; anything with a line break or control character, or longer, takes
+   * the paste path with its bracketing, confirmation and cap.
+   */
+  const admit = (text: string) => {
+    if (!ready || encoder === undefined || text === '') return
+    if (isBulkText(text)) paste(text)
+    else send(encoder.text(text))
+  }
+  // React's onBeforeInput is synthesized from other events; the native event carries inputType.
+  const beforeInput = React.useEffectEvent((event: InputEvent) => {
+    if (event.inputType === 'insertFromDrop') {
+      rejectDrop(event)
+      return
+    }
+    if (event.isComposing || composing.current) return
+    if (event.inputType !== 'insertText' && event.inputType !== 'insertFromComposition') return
+    event.preventDefault()
+    if (event.data === committed.current) {
+      committed.current = undefined
+      return
+    }
+    committed.current = undefined
+    if (event.data !== null) admit(event.data)
+  })
+  const rejectDrop = React.useEffectEvent((event: Event) => {
+    event.preventDefault()
+    setNotice('Dropped text is not sent to the terminal. Paste it instead.')
+  })
+  const fieldRef = React.useCallback((node: HTMLTextAreaElement | null) => {
+    if (node === null) return
+    const onBeforeInput = (event: InputEvent) => beforeInput(event)
+    const onDrop = (event: DragEvent) => rejectDrop(event)
+    node.addEventListener('beforeinput', onBeforeInput)
+    node.addEventListener('drop', onDrop)
+    return () => {
+      node.removeEventListener('beforeinput', onBeforeInput)
+      node.removeEventListener('drop', onDrop)
+    }
+  }, [])
   const { keyboardProps } = useKeyboard({
     isDisabled: !ready,
     onKeyDown: (event) => {
@@ -164,9 +230,10 @@ export const TerminalKeyboard = ({
           </Button>
         )}
       </div>
-      <FocusScope key={ready ? 'entered' : 'idle'} contain={ready} restoreFocus autoFocus={ready}>
+      <FocusScope key={ready ? 'entered' : 'idle'} contain={ready && heldPaste === undefined} restoreFocus autoFocus={ready}>
         <textarea
           {...keyboardProps}
+          ref={fieldRef}
           id={id}
           aria-describedby={`${id}-status`}
           disabled={!ready}
@@ -179,7 +246,8 @@ export const TerminalKeyboard = ({
             ready ? 'Type into the terminal; Ctrl-\\ leaves input' : 'Terminal input unavailable'
           }
           onBlur={() => {
-            if (ready) port?.close()
+            // The paste confirmation takes focus without leaving input.
+            if (ready && !confirming.current) port?.close()
           }}
           onCompositionStart={() => {
             composing.current = true
@@ -189,20 +257,7 @@ export const TerminalKeyboard = ({
             composing.current = false
             committed.current = event.data
             event.currentTarget.value = ''
-            if (encoder !== undefined) send(encoder.text(event.data))
-          }}
-          onBeforeInput={(event) => {
-            const native = event.nativeEvent
-            if (!(native instanceof InputEvent) || native.isComposing || composing.current) return
-            if (native.inputType !== 'insertText' && native.inputType !== 'insertFromComposition')
-              return
-            event.preventDefault()
-            if (native.data === committed.current) {
-              committed.current = undefined
-              return
-            }
-            committed.current = undefined
-            if (native.data !== null && encoder !== undefined) send(encoder.text(native.data))
+            admit(event.data)
           }}
           onInput={(event) => {
             if (!composing.current) event.currentTarget.value = ''
@@ -210,7 +265,7 @@ export const TerminalKeyboard = ({
           onPaste={(event) => {
             if (!ready || encoder === undefined || composing.current) return
             event.preventDefault()
-            send(encoder.paste({ text: event.clipboardData.getData('text/plain'), modes }))
+            paste(event.clipboardData.getData('text/plain'))
           }}
         />
       </FocusScope>
@@ -219,7 +274,7 @@ export const TerminalKeyboard = ({
           (state._tag === 'Opening'
             ? 'Opening ordered input…'
             : state._tag === 'Closed'
-              ? `${state.reason}${state.uncertain ? '. Delivery is uncertain; no bytes were replayed.' : ''}${onNewSession === undefined ? ' Reopen this terminal to create a new input session.' : ''}`
+              ? `${state.reason}${onNewSession === undefined ? ' Reopen this terminal to create a new input session.' : ''}`
               : state._tag === 'Ready'
                 ? `${state.pending > 0 ? `${state.pending} batch awaiting transport acknowledgement. ` : ''}Native Ghostty keys; mode-aware paste. Ctrl-\\ leaves input.`
                 : 'Enable input explicitly. Reconnecting never replays prior keystrokes.')}
@@ -229,6 +284,29 @@ export const TerminalKeyboard = ({
           {notice}
         </p>
       )}
+      <Modal
+        isOpen={heldPaste !== undefined}
+        onOpenChange={(open) => {
+          if (!open) settlePaste(false)
+        }}
+      >
+        <ModalDialog aria-label="Confirm terminal paste">
+          <ModalHeader>
+            <ModalTitle>Paste into the terminal?</ModalTitle>
+          </ModalHeader>
+          <p {...stylex.props(styles.confirmText)}>
+            {`This paste is ${Math.ceil((heldPaste?.length ?? 0) / 1024)} KB. The terminal receives it as typed input.`}
+          </p>
+          <div {...stylex.props(styles.header)}>
+            <Button onPress={() => settlePaste(false)} {...stylex.props(styles.button)}>
+              Cancel
+            </Button>
+            <Button onPress={() => settlePaste(true)} {...stylex.props(styles.button)}>
+              Paste
+            </Button>
+          </div>
+        </ModalDialog>
+      </Modal>
     </div>
   )
 }
@@ -278,4 +356,5 @@ const styles = stylex.create({
   },
   status: { margin: 0, marginTop: scale.space1, color: tokens['--ds-gray-900'], lineHeight: 1.5 },
   error: { margin: 0, marginTop: scale.space1, color: tokens['--ds-red-900'] },
+  confirmText: { margin: 0, marginBlock: scale.space2, lineHeight: 1.5 },
 })

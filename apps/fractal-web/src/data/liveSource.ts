@@ -28,6 +28,7 @@ import { instrumentFetch } from '../telemetry/transport.ts'
 import type { UxTelemetry } from '../telemetry/ux.ts'
 import { getDebug } from '../telemetry/measurement/index.ts'
 import { unavailableTerminalHistory } from '../terminal/historySource.ts'
+import { gatewayTerminalInput } from '../terminal/terminal-input-port.ts'
 import { gatewayTerminalResize } from '../terminal/terminal-resize-port.ts'
 import { gatewayAttachments, gatewayMessageSend } from './attachmentPort.ts'
 import { gatewayContentSearch } from './contentSearchPort.ts'
@@ -941,6 +942,21 @@ export const liveSource = ({
         if (feed._tag === 'Unavailable' && feed.retryable === true) retainTerminal(ref).retry()
       },
       terminalResize: gatewayTerminalResize(client),
+      // Grants gate arming in the view and every post; the gateway still refuses a revoked grant.
+      terminalInput: gatewayTerminalInput({
+        // Same configuration as `client`; the session's transport admits each post at the fetch.
+        connect: (fetchImpl) => new St3Client({ baseUrl, fetchImpl }),
+        transport: fetch,
+        snapshot: async () => {
+          const current = await messageSnapshot()
+          return current._tag === 'Success' ? current.value : undefined
+        },
+        liveScreen: (ref) => {
+          const feed = registry.get(terminal(ref))
+          return feed._tag === 'Observed' && feed.freshness === 'live' ? feed.value : undefined
+        },
+        granted: () => registry.get(grants).terminalInput === 'granted',
+      }),
       terminalHistory: unavailableTerminalHistory,
       events: Atom.make(
         unavailable({

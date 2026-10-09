@@ -8,6 +8,7 @@ import type { UnobservedFeed } from '../data/FeedState.tsx'
 import {
   useDataSource,
   useFeedInterest,
+  useGrants,
   useTerminal,
   useTerminalConnected,
 } from '../data/react.tsx'
@@ -43,6 +44,7 @@ export const TerminalDetail = React.memo(
       visible: visibility === 'visible',
     })
     const terminal = useTerminal(address.ref)
+    const grants = useGrants()
     if (terminal._tag !== 'Observed')
       return (
         <div {...stylex.props(styles.unobserved)}>
@@ -60,9 +62,11 @@ export const TerminalDetail = React.memo(
         ? 'The terminal is disconnected or stale. Resize is paused until a live screen returns.'
         : undefined
     const inputReason =
-      visibility !== 'visible' || terminal.freshness === 'stale' || connected === false
-        ? 'Input is paused while this terminal is hidden, disconnected or stale. Re-enter explicitly when a live screen returns.'
-        : undefined
+      grants.terminalInput !== 'granted'
+        ? 'This device is not allowed to type into terminals.'
+        : visibility !== 'visible' || terminal.freshness === 'stale' || connected === false
+          ? 'Input is paused while this terminal is hidden, disconnected or stale. Re-enter explicitly when a live screen returns.'
+          : undefined
     return (
       <div {...stylex.props(styles.root)}>
         {terminal.freshness === 'stale' && (

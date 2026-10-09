@@ -265,7 +265,7 @@ export interface DataSource {
   readonly terminalResize?: TerminalResizePort
   /** Retained owner scrollback, with its own independently granted availability. */
   readonly terminalHistory?: TerminalHistoryFactory
-  /** Admitted local-owner ordered socket sessions; absent until the generated producer publishes them. */
+  /** Ordered input sessions bound to one terminal incarnation; absent when the source cannot type. */
   readonly terminalInput?: TerminalInputPortFactory
   /** Keyed by subject ref (PR, CI run, mission, pty …). */
   readonly envelope: (ref: string) => Atom.Atom<Feed<SubjectEnvelope>>
