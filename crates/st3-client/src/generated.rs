@@ -1598,6 +1598,15 @@ pub struct Summary {
     pub working_agents: u64,
     pub active_missions: u64,
     pub machines: SummaryMachines,
+    /// The published agents roster the agent counts came from, when the daemon prepares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents_as_of: Option<SummaryAgentsAsOf>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SummaryAgentsAsOf {
+    pub store_index: u64,
+    pub published_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

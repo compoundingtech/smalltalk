@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Say which published agents roster the summary's agent counts came from",
+  "replay": {"status": "none", "detail": "No claim replay or stored history changes."},
+  "schema": {"status": "none", "detail": "No database schema, version or stored data changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."},
+  "compatibility": {"status": "changed", "detail": "The summary resource gains an optional agents_as_of object (store_index, published_at) naming the published agents roster its working-agent and machine counts came from. It is outside the revision, and kept while the counts are unchanged. The Rust, Swift and TypeScript clients model it; older clients ignore it."},
+  "downtime": {"status": "none", "detail": "No additional service interruption or startup migration is required."},
+  "manual": {"status": "none", "detail": "No action is required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes."}
+}
