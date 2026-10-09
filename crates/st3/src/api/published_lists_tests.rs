@@ -123,12 +123,12 @@ fn rows(publication: &Publication<MissionRows>) -> (Vec<String>, BTreeMap<String
 /// the projections were replaced since.
 fn fold(store: &Store) -> (Arc<Publication<MissionRows>>, bool) {
     let list = store.published_missions_list();
-    list.start("missions");
+    list.start();
     let now = now_ms();
     let base = list.base();
     let changed = match fold_missions(store, base.as_deref(), now).unwrap() {
         Some((publication, changed)) => {
-            list.publish(publication, 0);
+            list.publish(publication);
             changed
         }
         None => false,
@@ -306,11 +306,11 @@ fn work_oracle(store: &Store, time: u128, actor: Option<&str>, limit: usize) -> 
 /// projections were replaced since.
 fn fold_work_checked(store: &Store) -> (Arc<Publication<WorkRows>>, bool) {
     let list = store.published_work_list();
-    list.start("work");
+    list.start();
     let base = list.base();
     let changed = match fold_work(store, base.as_deref(), now_ms()).unwrap() {
         Some((publication, changed)) => {
-            list.publish(publication, 0);
+            list.publish(publication);
             changed
         }
         None => false,

@@ -21,6 +21,30 @@ const FOLD_CHUNK: usize = 100;
 /// How many rounds of chunks a fold tries before it keeps the previous publication.
 const FOLD_ROUNDS: usize = 3;
 
+/// How many folds in a row may fail before the refresher stops serving its list.
+const FAILURES_BEFORE_WITHDRAWING: usize = 3;
+
+/// Stop serving a list: readers fold on read and its windows follow commits again.
+fn withdraw<R>(store: &Store, list: fn(&Store) -> &PublishedList<R>, name: &'static str) {
+    if list(store).withdraw() {
+        eprintln!("st3: WARN the {name} list is no longer published; windows fold on read until it is");
+        store.withdraw_collection_view(name);
+    }
+}
+
+/// Withdraws its list when the refresher task ends, by any path.
+struct Withdraw<R: 'static> {
+    store: Arc<Store>,
+    list: fn(&Store) -> &PublishedList<R>,
+    name: &'static str,
+}
+
+impl<R> Drop for Withdraw<R> {
+    fn drop(&mut self) {
+        withdraw(&self.store, self.list, self.name);
+    }
+}
+
 /// Grace periods and checkpoint waits move runs in and out of waiting on a person without a
 /// claim, so the missions list rereads them at least this often.
 const ATTENTION_REREAD_MS: u128 = 30_000;
@@ -67,20 +91,22 @@ fn spawn<R: Send + Sync + 'static>(
     label: &'static str,
     fold: Fold<R>,
 ) {
-    let Some(wake) = list(&store).start(name) else {
+    let Some(wake) = list(&store).start() else {
         return;
     };
     tokio::spawn(async move {
         // The writer's callback only wakes this task; it never reads.
         let commits = Arc::clone(&wake);
         let _observer = store.observe_commits(move |_| commits.notify_one());
+        // Should this task ever stop, windows fold on read and follow commits again.
+        let _withdraw = Withdraw { store: Arc::clone(&store), list, name };
+        let mut failures = 0;
         loop {
             let started = tokio::time::Instant::now();
             let reader = store.clone();
             let folded = tokio::task::spawn_blocking(move || {
                 crate::profile::task(label, || {
                     let list = list(&reader);
-                    let asked = list.pending_request();
                     let base = list.base();
                     let folded = fold(&reader, base.as_deref(), now_ms());
                     if base.is_none() && folded.is_err() {
@@ -88,10 +114,10 @@ fn spawn<R: Send + Sync + 'static>(
                         list.fold_from_nothing_next();
                     }
                     if let Some((publication, changed)) = folded? {
-                        list.publish(publication, asked);
-                        // Windows reread only when a row changed; an advanced cut alone
-                        // shows them nothing new.
-                        if changed {
+                        let served = list.publish(publication);
+                        // Windows reread only when a row changed, or the list is served
+                        // again; an advanced cut alone shows them nothing new.
+                        if changed || !served {
                             reader.publish_collection_view(name);
                         }
                     }
@@ -99,10 +125,22 @@ fn spawn<R: Send + Sync + 'static>(
                 })
             })
             .await;
-            match folded {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => eprintln!("st3: {name} refresh failed: {error:#}"),
-                Err(error) => eprintln!("st3: {name} refresh stopped: {error}"),
+            let failed = match folded {
+                Ok(Ok(())) => false,
+                Ok(Err(error)) => {
+                    eprintln!("st3: {name} refresh failed: {error:#}");
+                    true
+                }
+                Err(error) => {
+                    eprintln!("st3: {name} refresh stopped: {error}");
+                    true
+                }
+            };
+            failures = if failed { failures + 1 } else { 0 };
+            // A refresher that keeps failing stops serving rows it cannot keep current: its
+            // windows fold on read and follow commits until a fold publishes again.
+            if failures == FAILURES_BEFORE_WITHDRAWING {
+                withdraw(&store, list, name);
             }
             tokio::time::sleep(started.elapsed().max(REFRESH_PAUSE)).await;
             let deadline = list(&store).newest().and_then(|newest| newest.valid_until_unix_ms);
@@ -318,16 +356,6 @@ fn valid_until(rows: &MissionRows, now: u128) -> u128 {
     let attention = rows.attention_read_at_unix_ms.saturating_add(ATTENTION_REREAD_MS);
     let lease = rows.next_lease_end_unix_ms.filter(|end| *end > now);
     [rows.visible_until(), Some(attention), lease].into_iter().flatten().min().unwrap_or(attention)
-}
-
-/// A window read while a refresher runs but has published nothing yet: retry shortly.
-pub(super) fn not_ready(collection: &str) -> ApiError {
-    ApiError {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        code: format!("{collection}-not-ready"),
-        message: format!("the {collection} list is still being prepared; retry shortly"),
-        details: Box::default(),
-    }
 }
 
 /// A current missions window from a publication: its first `limit` cards, bounded as a page

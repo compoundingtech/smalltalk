@@ -427,33 +427,21 @@ async fn collection_items_with_windows(
                 } else {
                     None
                 };
-                // A missions window serves the newest published list under that list's own
-                // cut, and never folds the missions it shows.
-                let published_missions = if collection == "missions"
-                    && store.published_missions_list().running()
-                {
-                    let Some(publication) = store.published_missions() else {
-                        store.published_missions_list().request_refresh();
-                        return Ok(Err(super::published_lists::not_ready("missions")));
-                    };
-                    published = Some(publication.cut);
-                    published_at = Some(publication.published_at_unix_ms);
-                    Some(publication)
-                } else {
-                    None
-                };
+                // While a refresher serves the missions list, a missions window serves its newest
+                // publication under that list's own cut and never folds the missions it shows.
+                // Before the first publication, or while the refresher is failing, it folds on
+                // read as without one.
+                let published_missions = (collection == "missions")
+                    .then(|| store.published_missions())
+                    .flatten();
                 // So does a work window, filtering the published list for its actor.
-                let published_work = if collection == "work" && store.published_work_list().running() {
-                    let Some(publication) = store.published_work() else {
-                        store.published_work_list().request_refresh();
-                        return Ok(Err(super::published_lists::not_ready("work")));
-                    };
-                    published = Some(publication.cut);
-                    published_at = Some(publication.published_at_unix_ms);
-                    Some(publication)
-                } else {
-                    None
-                };
+                let published_work = (collection == "work").then(|| store.published_work()).flatten();
+                let list_cut = published_missions.as_ref().map(|list| (list.cut, list.published_at_unix_ms))
+                    .or_else(|| published_work.as_ref().map(|list| (list.cut, list.published_at_unix_ms)));
+                if let Some((cut, at)) = list_cut {
+                    published = Some(cut);
+                    published_at = Some(at);
+                }
                 let snapshot = match published_at {
                     Some(at) => super::roster_snapshot(&state, published.unwrap_or(index), at),
                     None => client_snapshot_at(&state, index),

@@ -4,13 +4,11 @@
 //!
 //! [`PublishedList`] holds the newest publication and the refresher's wake. The refresher loop is
 //! `api::published_lists::spawn`; each collection supplies how to fold its rows, from nothing or
-//! from the previous publication.
+//! from the previous publication. Until the first publication, and while the refresher keeps
+//! failing or after it stops, the list is not served and readers fold on read.
 
 use super::*;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-/// How long a refresh request may go unanswered before reads say the publication is overdue.
-const OVERDUE_MS: u64 = 30_000;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Rows a refresher published, coherent at one graph cut.
 pub(crate) struct Publication<R> {
@@ -26,19 +24,16 @@ pub(crate) struct Publication<R> {
 }
 
 pub(crate) struct PublishedList<R> {
-    /// The collection's name, as windows and logs call it, once a refresher starts.
-    name: std::sync::OnceLock<&'static str>,
     newest: Mutex<Option<Arc<Publication<R>>>>,
     wake: Arc<tokio::sync::Notify>,
-    running: AtomicBool,
+    /// Whether a refresher was started; there is at most one.
+    started: AtomicBool,
+    /// Whether readers may serve the newest publication.
+    serving: AtomicBool,
     /// Set when the projections this list folds were replaced without a new claim, as a replay
     /// or a checkpoint trim does: the next refresh folds from nothing.
     forgotten: AtomicBool,
-    /// When the oldest refresh request no publication has answered yet was made, in Unix ms;
-    /// zero when none waits.
-    requested_at: AtomicU64,
-    overdue_warned: AtomicBool,
-    /// Folds from nothing, by why: each one refolded every row rather than the changed ones.
+    /// Folds from nothing or in chunks, by why: each refolded many rows, not a few.
     rebuilds: Mutex<BTreeMap<String, u64>>,
 }
 
@@ -46,59 +41,33 @@ pub(crate) struct PublishedList<R> {
 impl<R> Default for PublishedList<R> {
     fn default() -> Self {
         Self {
-            name: std::sync::OnceLock::new(),
             newest: Mutex::new(None),
             wake: Arc::default(),
-            running: AtomicBool::new(false),
+            started: AtomicBool::new(false),
+            serving: AtomicBool::new(false),
             forgotten: AtomicBool::new(false),
-            requested_at: AtomicU64::new(0),
-            overdue_warned: AtomicBool::new(false),
             rebuilds: Mutex::default(),
         }
     }
 }
 
 impl<R> PublishedList<R> {
-    pub(crate) fn name(&self) -> &'static str {
-        self.name.get().copied().unwrap_or("collection")
+    /// Register the one refresher, and return its wake. `None` when one is already registered.
+    pub(crate) fn start(&self) -> Option<Arc<tokio::sync::Notify>> {
+        (!self.started.swap(true, Ordering::AcqRel)).then(|| Arc::clone(&self.wake))
     }
 
-    /// Register the one refresher of the collection `name`, and return its wake. `None` when
-    /// one is already registered.
-    pub(crate) fn start(&self, name: &'static str) -> Option<Arc<tokio::sync::Notify>> {
-        if self.running.swap(true, Ordering::AcqRel) {
-            return None;
-        }
-        let _ = self.name.set(name);
-        Some(Arc::clone(&self.wake))
-    }
-
-    /// Whether a refresher keeps this list published, so readers must never fold it.
-    pub(crate) fn running(&self) -> bool {
-        self.running.load(Ordering::Acquire)
-    }
-
-    /// The newest publication, while a refresher keeps one. Says once when a refresh has gone
-    /// unanswered so long that the refresher must be slow, failing or stopped; the rows still
-    /// carry their own cut and publication time.
+    /// The newest publication, while the refresher keeps the list served. Its rows carry their
+    /// own cut and publication time.
     pub(crate) fn newest(&self) -> Option<Arc<Publication<R>>> {
-        if !self.running() {
+        if !self.serving.load(Ordering::Acquire) {
             return None;
-        }
-        let requested = self.requested_at.load(Ordering::Acquire);
-        let waited = (now_ms() as u64).saturating_sub(requested);
-        if requested != 0 && waited > OVERDUE_MS && !self.overdue_warned.swap(true, Ordering::AcqRel) {
-            eprintln!(
-                "st3: WARN a {} refresh asked for {} s ago is still unanswered; serving the newest published rows",
-                self.name(),
-                waited / 1000
-            );
         }
         self.newest.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    /// The newest publication for the refresher itself to fold from, unless the projections
-    /// were replaced since: then it folds from nothing.
+    /// The newest publication for the refresher itself to fold from, served or not, unless the
+    /// projections were replaced since: then it folds from nothing.
     pub(crate) fn base(&self) -> Option<Arc<Publication<R>>> {
         if self.forgotten.swap(false, Ordering::AcqRel) {
             return None;
@@ -106,36 +75,17 @@ impl<R> PublishedList<R> {
         self.newest.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    /// Swap in a newer publication and answer the requests made before its fold began.
-    pub(crate) fn publish(&self, publication: Publication<R>, requested_before: u64) {
+    /// Swap in a newer publication and serve it. Says whether the list was served before, so a
+    /// list served again is announced to its windows.
+    pub(crate) fn publish(&self, publication: Publication<R>) -> bool {
         *self.newest.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(publication));
-        let _ = self.requested_at.compare_exchange(
-            requested_before,
-            0,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
-        self.overdue_warned.store(false, Ordering::Release);
+        self.serving.swap(true, Ordering::AcqRel)
     }
 
-    /// When the oldest unanswered request was made, for [`Self::publish`] to clear once the
-    /// fold that began after it publishes.
-    pub(crate) fn pending_request(&self) -> u64 {
-        self.requested_at.load(Ordering::Acquire)
-    }
-
-    /// Ask the refresher, if one runs, for a publication at the newest cut. Requests made
-    /// while it folds coalesce into one more refresh.
-    pub(crate) fn request_refresh(&self) {
-        if self.running() {
-            let _ = self.requested_at.compare_exchange(
-                0,
-                now_ms() as u64,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
-            self.wake.notify_one();
-        }
+    /// Stop serving the list, as when its refresher keeps failing or stops: readers fold on
+    /// read until a fold publishes again. Says whether it was served.
+    pub(crate) fn withdraw(&self) -> bool {
+        self.serving.swap(false, Ordering::AcqRel)
     }
 
     /// The projections were replaced without a new claim: fold from nothing, at once.
@@ -149,7 +99,7 @@ impl<R> PublishedList<R> {
         self.forgotten.store(true, Ordering::Release);
     }
 
-    /// Count one fold from nothing, by why.
+    /// Count one fold of many rows, by why.
     pub(crate) fn note_rebuild(&self, why: &str) {
         *self.rebuilds.lock().unwrap_or_else(PoisonError::into_inner).entry(why.to_owned()).or_default() += 1;
     }
@@ -169,19 +119,13 @@ mod tests {
     }
 
     #[test]
-    fn only_a_running_refresher_publishes_and_forgetting_folds_from_nothing_once() {
+    fn one_refresher_serves_its_publications_and_forgetting_folds_from_nothing_once() {
         let list = PublishedList::<Vec<u64>>::default();
-        assert!(list.newest().is_none() && !list.running());
-        list.request_refresh();
-        assert_eq!(list.pending_request(), 0, "no refresher, no request to answer");
-        assert!(list.start("missions").is_some());
-        assert!(list.start("missions").is_none(), "one refresher per list");
-        assert_eq!(list.name(), "missions");
-        list.request_refresh();
-        let asked = list.pending_request();
-        assert_ne!(asked, 0);
-        list.publish(publication(4), asked);
-        assert_eq!(list.pending_request(), 0);
+        assert!(list.newest().is_none() && list.base().is_none());
+        assert!(list.start().is_some());
+        assert!(list.start().is_none(), "one refresher per list");
+        assert!(list.newest().is_none(), "nothing served before the first publication");
+        assert!(!list.publish(publication(4)), "served for the first time");
         assert_eq!(list.newest().unwrap().cut, 4);
         assert_eq!(list.base().unwrap().rows, vec![4]);
         list.forget();
@@ -191,15 +135,17 @@ mod tests {
     }
 
     #[test]
-    fn a_request_made_during_a_fold_stays_pending_after_it_publishes() {
+    fn a_withdrawn_list_is_not_served_until_it_publishes_again() {
         let list = PublishedList::<Vec<u64>>::default();
-        list.start("work");
-        let before = list.pending_request();
-        list.request_refresh();
-        list.publish(publication(2), before);
-        assert_ne!(list.pending_request(), 0, "asked after the fold began");
-        list.publish(publication(3), list.pending_request());
-        assert_eq!(list.pending_request(), 0);
+        list.start();
+        list.publish(publication(4));
+        assert!(list.withdraw());
+        assert!(!list.withdraw(), "already withdrawn");
+        assert!(list.newest().is_none(), "readers fold on read");
+        assert_eq!(list.base().unwrap().cut, 4, "the refresher still folds from it");
+        assert!(!list.publish(publication(5)), "served again, so announced");
+        assert!(list.publish(publication(6)));
+        assert_eq!(list.newest().unwrap().cut, 6);
         list.note_rebuild("start");
         list.note_rebuild("start");
         assert_eq!(list.rebuilds(), BTreeMap::from([("start".to_owned(), 2)]));
