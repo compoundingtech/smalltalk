@@ -1343,18 +1343,15 @@ fn observe_payload(
             payload
                 .get("session_id")
                 .and_then(serde_json::Value::as_str),
-        ) {
-            if !native_id.is_empty() {
-                let transcript_path = payload
-                    .get("transcript_path")
-                    .and_then(serde_json::Value::as_str);
-                if let Err(error) =
-                    write_native_session_binding(agent_dir, incarnation, native_id, transcript_path)
-                {
-                    tracing::warn!(
-                        "st claude-observe: native session binding write failed: {error:#}"
-                    );
-                }
+        ) && !native_id.is_empty()
+        {
+            let transcript_path = payload
+                .get("transcript_path")
+                .and_then(serde_json::Value::as_str);
+            if let Err(error) =
+                write_native_session_binding(agent_dir, incarnation, native_id, transcript_path)
+            {
+                tracing::warn!("st claude-observe: native session binding write failed: {error:#}");
             }
         }
     }
@@ -2128,7 +2125,7 @@ mod tests {
             root.path(),
             "wrapper-current",
             "native-current",
-            Some("/home/ada/.claude-accounts/second/projects/-work/native-current.jsonl"),
+            Some("/srv/accounts/second/projects/-work/native-current.jsonl"),
         )
         .unwrap();
         let binding: serde_json::Value = serde_json::from_slice(
@@ -2137,7 +2134,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             binding["transcript_path"],
-            "/home/ada/.claude-accounts/second/projects/-work/native-current.jsonl"
+            "/srv/accounts/second/projects/-work/native-current.jsonl"
         );
         write_native_session_binding(root.path(), "wrapper-current", "native-current", Some("rel.jsonl"))
             .unwrap();
