@@ -456,7 +456,7 @@ const semanticItems: readonly ConversationItem[] = [
   { _tag: 'Usage', id: 'semantic/usage', semantics: 'response', inputTokens: 123, outputTokens: 45, at },
   { _tag: 'ToolCall', id: 'semantic/read', callId: 'semantic/read', name: 'read', input: { path: 'src/semantic.ts' }, status: 'success', result: { content: 'export const semantic = true', mediaType: 'text/plain', isError: false, at }, callSeen: true, at },
   { _tag: 'Reasoning', id: 'semantic/reasoning', text: 'Reasoning content retained.', streaming: false, at },
-  { _tag: 'Text', id: 'semantic/answer', role: 'assistant', text: 'Assistant content retained.', attachments: [], streaming: false, at },
+  { _tag: 'Text', id: 'semantic/answer', role: 'assistant', text: 'Assistant content retained.\n\n```ts\nexport const retainedContent = "The transcript keeps the prompt, tool output, reasoning, semantic entries and the later answer visible in their original order.";\n```', attachments: [], streaming: false, at },
 ]
 const semanticData: TranscriptStoryData = {
   sync: { _tag: 'Live', since: now },
@@ -489,13 +489,31 @@ export const SemanticItems: Story = { render: args => <main {...stylex.props(sty
   for (const id of ['message', 'subagent', 'untitled']) {
     await expect(lane.querySelector(`[data-item-id="semantic/${id}"]`)).toHaveAttribute('data-testid', 'agent-message')
   }
-  await expect(within(lane.querySelector('[data-item-id="semantic/message"]') as HTMLElement).getByRole('heading', { name: 'Host' })).toBeVisible()
+  const host = within(lane.querySelector('[data-item-id="semantic/message"]') as HTMLElement).getByTestId('message-sender')
+  await expect(host).toHaveTextContent('Host')
+  await expect(host).toBeVisible()
+  await expect(host.tagName).toBe('P')
   const subagent = lane.querySelector('[data-item-id="semantic/subagent"]') as HTMLElement
-  await expect(within(subagent).getByRole('heading', { name: 'Review delegate' })).toBeVisible()
+  const delegate = within(subagent).getByTestId('message-sender')
+  await expect(delegate).toHaveTextContent('Review delegate')
+  await expect(delegate).toBeVisible()
+  await expect(delegate.tagName).toBe('P')
   await expect(subagent.querySelector('strong')).toHaveTextContent('message')
   await expect(subagent).toBeVisible()
   await expect(subagent).toHaveTextContent('Subagent message retained.')
   await expect(within(subagent).queryByText('Row reviewer')).not.toBeInTheDocument()
+  const code = canvas.getByTestId('markdown-code')
+  await expect(code).toHaveAttribute('tabindex', '0')
+  await expect(code).toHaveAccessibleName('Code, ts')
+  await expect(code.scrollWidth).toBeGreaterThan(code.clientWidth)
+  within(code.closest<HTMLElement>('[data-testid="markdown-code-block"]')!).getByRole('button', { name: 'Copy code' }).focus()
+  await userEvent.tab()
+  await expect(code).toHaveFocus()
+  const focus = getComputedStyle(code)
+  await expect(focus.outlineStyle).toBe('solid')
+  await expect(parseFloat(focus.outlineWidth)).toBeGreaterThan(0)
+  await expect(focus.outlineColor).not.toBe('rgba(0, 0, 0, 0)')
+  await expect(parseFloat(focus.outlineOffset)).toBeLessThan(0)
 } }
 export const SemanticItemsLight: Story = { ...SemanticItems, args: { scheme: 'light' } }
 export const ReadableEmpty: Story = { args: { state: 'empty', emptyState: { title: 'No messages in this conversation', body: 'Send a message to start working with the agent.' } }, play: async ({ canvasElement }) => {
