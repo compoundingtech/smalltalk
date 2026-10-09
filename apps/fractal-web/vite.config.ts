@@ -34,5 +34,24 @@ export default defineConfig({
   ],
   server: { strictPort: true, host: '127.0.0.1', allowedHosts: (process.env.WF_ALLOWED_HOSTS ?? '127.0.0.1,localhost').split(',') },
   resolve: { dedupe: ['effect', 'react', 'react-dom'] },
-  build: { outDir: '../../dist/web', emptyOutDir: true },
+  build: {
+    outDir: '../../dist/web',
+    emptyOutDir: true,
+    rolldownOptions: {
+      preserveEntrySignatures: false,
+      output: {
+        strictExecutionOrder: true,
+        codeSplitting: {
+          // Capture only matched modules: pulling their dependencies into a shared group
+          // can promote conversation-only code into the shell's eager import graph.
+          includeDependenciesRecursively: false,
+          groups: [
+            { name: 'react', test: /node_modules[\\/](?:react|react-dom|scheduler)[\\/]/, entriesAware: true },
+            { name: 'effect', test: /node_modules[\\/](?:effect|@effect[\\/]atom-react)[\\/]/, entriesAware: true },
+            { name: 'aria', test: /node_modules[\\/](?:react-aria|react-aria-components|react-stately|@react-aria|@react-stately|@internationalized)[\\/]/, entriesAware: true },
+          ],
+        },
+      },
+    },
+  },
 })
