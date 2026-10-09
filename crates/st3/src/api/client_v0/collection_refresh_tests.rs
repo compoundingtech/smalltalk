@@ -16,20 +16,8 @@ impl Fixture {
     /// A socket whose reads are counted. `real` reads the store's own windows; otherwise each
     /// read returns one row naming how many reads that subscription has had, and the
     /// subscription named `fail` fails its first read.
-    async fn open(
-        state: AppState,
-        real: bool,
-        fail: Option<&'static str>,
-        collections: &[&str],
-    ) -> Self {
-        Self::open_as(
-            state,
-            ClientSession::local(None).unwrap(),
-            real,
-            fail,
-            collections,
-        )
-        .await
+    async fn open(state: AppState, real: bool, fail: Option<&'static str>, collections: &[&str]) -> Self {
+        Self::open_as(state, ClientSession::local(None).unwrap(), real, fail, collections).await
     }
 
     async fn open_as(
@@ -70,9 +58,7 @@ impl Fixture {
                                     }
                                     let _permit = permit;
                                     if fail == Some(request.id.as_str()) && count == 1 {
-                                        return Err(ApiError::internal(
-                                            "injected first read failure",
-                                        ));
+                                        return Err(ApiError::internal("injected first read failure"));
                                     }
                                     Ok((
                                         new_client_snapshot(&state),
@@ -92,12 +78,7 @@ impl Fixture {
         let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
             .await
             .unwrap();
-        let mut fixture = Self {
-            state,
-            reads,
-            socket,
-            server,
-        };
+        let mut fixture = Self { state, reads, socket, server };
         for collection in collections {
             fixture.subscribe(collection, collection).await;
         }
@@ -105,15 +86,11 @@ impl Fixture {
     }
 
     async fn subscribe(&mut self, id: &str, collection: &str) {
-        self.send(json!({"kind":"subscribe","id":id,"collection":collection,"limit":200}))
-            .await;
+        self.send(json!({"kind":"subscribe","id":id,"collection":collection,"limit":200})).await;
     }
 
     async fn send(&mut self, command: Value) {
-        self.socket
-            .send(Message::Text(command.to_string().into()))
-            .await
-            .unwrap();
+        self.socket.send(Message::Text(command.to_string().into())).await.unwrap();
     }
 
     async fn frame(&mut self) -> Value {
@@ -132,8 +109,7 @@ impl Fixture {
 
     /// No frame arrives for longer than a paced reread can take.
     async fn quiet(&mut self) {
-        let until =
-            tokio::time::Instant::now() + COLLECTION_REREAD_INTERVAL + Duration::from_millis(500);
+        let until = tokio::time::Instant::now() + COLLECTION_REREAD_INTERVAL + Duration::from_millis(500);
         while let Ok(message) = tokio::time::timeout_at(until, self.socket.next()).await {
             if let Message::Text(text) = message.unwrap().unwrap() {
                 panic!("unexpected frame: {text}");
@@ -169,10 +145,7 @@ impl Drop for Fixture {
 }
 
 fn counts(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
-    pairs
-        .iter()
-        .map(|(id, count)| ((*id).to_owned(), *count))
-        .collect()
+    pairs.iter().map(|(id, count)| ((*id).to_owned(), *count)).collect()
 }
 
 #[tokio::test]
@@ -188,10 +161,7 @@ async fn a_retry_reads_only_the_failed_subscription() {
     assert_eq!(initial["missions"]["kind"], "snapshot");
     assert_eq!(initial["agents"]["kind"], "resync");
     let recovered = fixture.frame().await;
-    assert_eq!(
-        (recovered["id"].as_str(), recovered["kind"].as_str()),
-        (Some("agents"), Some("snapshot"))
-    );
+    assert_eq!((recovered["id"].as_str(), recovered["kind"].as_str()), (Some("agents"), Some("snapshot")));
     assert_eq!(fixture.counts(), counts(&[("agents", 2), ("missions", 1)]));
 }
 
@@ -204,33 +174,19 @@ async fn a_usage_commit_rereads_agents_and_leaves_missions_idle() {
         assert_eq!(fixture.frame().await["kind"], "snapshot");
     }
     // Establish the socket's revision baseline with a commit both windows show.
-    fixture.claim(
-        "agent/fixture-roster",
-        "runtime.observed",
-        json!({"status":"running"}),
-    );
+    fixture.claim("agent/fixture-roster", "runtime.observed", json!({"status":"running"}));
     for _ in 0..2 {
         assert_eq!(fixture.frame().await["kind"], "changes");
     }
-    fixture.claim(
-        "agent/fixture-roster",
-        "harness.usage",
-        json!({"driver":"codex",
-        "semantics":"response", "incarnation_id":"fixture-one", "input_tokens":12}),
-    );
+    fixture.claim("agent/fixture-roster", "harness.usage", json!({"driver":"codex",
+        "semantics":"response", "incarnation_id":"fixture-one", "input_tokens":12}));
     let changed = fixture.frame().await;
-    assert_eq!(
-        (changed["id"].as_str(), changed["kind"].as_str()),
-        (Some("agents"), Some("changes"))
-    );
+    assert_eq!((changed["id"].as_str(), changed["kind"].as_str()), (Some("agents"), Some("changes")));
     fixture.quiet().await;
     assert_eq!(fixture.counts(), counts(&[("agents", 3), ("missions", 2)]));
     // A commit no window shows reads nothing and sends nothing.
-    fixture.claim(
-        "daemon/fixture",
-        "daemon.diagnostic",
-        json!({"code":"fixture", "severity":"error", "reason":"unrelated"}),
-    );
+    fixture.claim("daemon/fixture", "daemon.diagnostic",
+        json!({"code":"fixture", "severity":"error", "reason":"unrelated"}));
     fixture.quiet().await;
     assert_eq!(fixture.counts(), counts(&[("agents", 3), ("missions", 2)]));
 }
@@ -246,24 +202,14 @@ async fn a_published_view_rereads_when_it_publishes_and_not_on_commits() {
     // A refresher now keeps work published: its window rereads that publication alone.
     state.store.publish_collection_view("work");
     let published = fixture.frame().await;
-    assert_eq!(
-        (published["id"].as_str(), published["kind"].as_str()),
-        (Some("work"), Some("changes"))
-    );
+    assert_eq!((published["id"].as_str(), published["kind"].as_str()), (Some("work"), Some("changes")));
     fixture.quiet().await;
     assert_eq!(fixture.counts(), counts(&[("missions", 1), ("work", 2)]));
     // A commit both collections show rereads missions, which still follows commits, and not
     // work, whose refresher publishes it.
-    fixture.claim(
-        "agent/fixture-roster",
-        "runtime.observed",
-        json!({"status":"running"}),
-    );
+    fixture.claim("agent/fixture-roster", "runtime.observed", json!({"status":"running"}));
     let changed = fixture.frame().await;
-    assert_eq!(
-        (changed["id"].as_str(), changed["kind"].as_str()),
-        (Some("missions"), Some("changes"))
-    );
+    assert_eq!((changed["id"].as_str(), changed["kind"].as_str()), (Some("missions"), Some("changes")));
     fixture.quiet().await;
     assert_eq!(fixture.counts(), counts(&[("missions", 2), ("work", 2)]));
     // Each later publication rereads work once more.
@@ -276,19 +222,12 @@ async fn a_published_view_rereads_when_it_publishes_and_not_on_commits() {
     assert_eq!(fixture.frame().await["id"], "work");
     fixture.quiet().await;
     assert_eq!(fixture.counts(), counts(&[("missions", 2), ("work", 4)]));
-    fixture.claim(
-        "agent/fixture-roster",
-        "runtime.observed",
-        json!({"status":"stopped"}),
-    );
+    fixture.claim("agent/fixture-roster", "runtime.observed", json!({"status":"stopped"}));
     let mut changed = BTreeSet::new();
     for _ in 0..2 {
         changed.insert(fixture.frame().await["id"].as_str().unwrap().to_owned());
     }
-    assert_eq!(
-        changed,
-        BTreeSet::from(["missions".to_owned(), "work".to_owned()])
-    );
+    assert_eq!(changed, BTreeSet::from(["missions".to_owned(), "work".to_owned()]));
     fixture.quiet().await;
     assert_eq!(fixture.counts(), counts(&[("missions", 3), ("work", 5)]));
 }
@@ -421,31 +360,19 @@ impl Held {
 fn apply(held: &mut BTreeMap<String, Held>, frame: &Value) {
     let id = frame["id"].as_str().unwrap().to_owned();
     let window = held.entry(id).or_default();
-    let ids = |value: &Value| {
-        value
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|id| id.as_str().unwrap().to_owned())
-            .collect::<Vec<_>>()
-    };
+    let ids = |value: &Value| value.as_array().unwrap().iter()
+        .map(|id| id.as_str().unwrap().to_owned()).collect::<Vec<_>>();
     match frame["kind"].as_str().unwrap() {
         "snapshot" => {
-            window.rows = frame["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|item| (item["id"].as_str().unwrap().to_owned(), item.clone()))
-                .collect();
+            window.rows = frame["items"].as_array().unwrap().iter()
+                .map(|item| (item["id"].as_str().unwrap().to_owned(), item.clone())).collect();
         }
         "changes" => {
             for removed in ids(&frame["removes"]) {
                 window.rows.remove(&removed);
             }
             for item in frame["upserts"].as_array().unwrap() {
-                window
-                    .rows
-                    .insert(item["id"].as_str().unwrap().to_owned(), item.clone());
+                window.rows.insert(item["id"].as_str().unwrap().to_owned(), item.clone());
             }
         }
         // A temporary read failure keeps the rows the client holds; the window is read again.
@@ -465,11 +392,8 @@ fn apply(held: &mut BTreeMap<String, Held>, frame: &Value) {
 /// cut, so every held window has caught up with the store.
 async fn settle(fixture: &mut Fixture, held: &mut BTreeMap<String, Held>) {
     loop {
-        match tokio::time::timeout(
-            COLLECTION_REREAD_INTERVAL + Duration::from_millis(700),
-            fixture.socket.next(),
-        )
-        .await
+        match tokio::time::timeout(COLLECTION_REREAD_INTERVAL + Duration::from_millis(700),
+            fixture.socket.next()).await
         {
             Ok(message) => {
                 // Protocol pings carry no frame.
@@ -479,12 +403,7 @@ async fn settle(fixture: &mut Fixture, held: &mut BTreeMap<String, Held>) {
             }
             Err(_) => {
                 let index = fixture.state.store.index().unwrap();
-                if fixture
-                    .state
-                    .store
-                    .agent_roster_current(index, false)
-                    .unwrap()
-                {
+                if fixture.state.store.agent_roster_current(index, false).unwrap() {
                     return;
                 }
                 fixture.state.store.request_agent_roster_refresh();
@@ -494,29 +413,16 @@ async fn settle(fixture: &mut Fixture, held: &mut BTreeMap<String, Held>) {
 }
 
 /// Every held window is what a full read of its subscription gives now.
-async fn assert_parity(
-    fixture: &Fixture,
-    session: &ClientSession,
-    held: &BTreeMap<String, Held>,
-    requests: &[Value],
-    step: &str,
-) {
+async fn assert_parity(fixture: &Fixture, session: &ClientSession, held: &BTreeMap<String, Held>,
+    requests: &[Value], step: &str)
+{
     for request in requests {
         let request: CollectionSubscribe = serde_json::from_value(request.clone()).unwrap();
-        let permit = Arc::new(tokio::sync::Semaphore::new(1))
-            .acquire_owned()
-            .await
-            .unwrap();
+        let permit = Arc::new(tokio::sync::Semaphore::new(1)).acquire_owned().await.unwrap();
         let (_, items, has_more) = collection_items(&fixture.state, session, &request, permit)
-            .await
-            .unwrap();
+            .await.unwrap();
         let window = &held[&request.id];
-        assert_eq!(
-            window.items(),
-            items,
-            "{step}: window {} differs from a full read",
-            request.id
-        );
+        assert_eq!(window.items(), items, "{step}: window {} differs from a full read", request.id);
         assert_eq!(window.has_more, has_more, "{step}: window {}", request.id);
     }
 }
@@ -524,92 +430,46 @@ async fn assert_parity(
 fn custom_review_kind(store: &Store) {
     let manifest = serde_json::from_str(include_str!(
         "../../../../../examples/st3/custom-review.json"
-    ))
-    .unwrap();
-    store
-        .register_custom_kind(&crate::store::custom::RegistrationRequest {
-            manifest,
-            actor: "agent/garden/seed".into(),
-        })
-        .unwrap();
+    )).unwrap();
+    store.register_custom_kind(&crate::store::custom::RegistrationRequest {
+        manifest,
+        actor: "agent/garden/seed".into(),
+    }).unwrap();
 }
 
 fn claim(store: &Store, subject: &str, kind: &str, actor: Option<&str>, fields: Value) {
-    store
-        .append_claim(&ClaimInput {
-            subject: subject.into(),
-            kind: kind.into(),
-            actor: actor.map(str::to_owned),
-            fields: serde_json::from_value(fields).unwrap(),
-            evidence: vec![],
-            expected_subject: None,
-            idempotency_key: None,
-        })
-        .unwrap();
+    store.append_legacy_claim(&ClaimInput {
+        subject: subject.into(), kind: kind.into(), actor: actor.map(str::to_owned),
+        fields: serde_json::from_value(fields).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
 }
 
 /// Seats, a mission run with a step and review requests for two people.
 fn orchard(store: &Store) {
     custom_review_kind(store);
-    for (subject, incarnation) in [
-        ("agent/alder.plain", "plain-1"),
-        ("agent/alder.quiet", "quiet-1"),
-    ] {
-        claim(
-            store,
-            subject,
-            "runtime.observed",
-            Some(subject),
-            json!({"status":"running", "runtime_id":subject, "incarnation_id":incarnation}),
-        );
+    for (subject, incarnation) in [("agent/alder.plain", "plain-1"), ("agent/alder.quiet", "quiet-1")] {
+        claim(store, subject, "runtime.observed", Some(subject),
+            json!({"status":"running", "runtime_id":subject, "incarnation_id":incarnation}));
     }
-    claim(
-        store,
-        "agent/alder.plain",
-        "harness.observed",
-        Some("agent/alder.plain"),
-        json!({"state":"working", "driver":"omp", "incarnation_id":"plain-1"}),
-    );
+    claim(store, "agent/alder.plain", "harness.observed", Some("agent/alder.plain"),
+        json!({"state":"working", "driver":"omp", "incarnation_id":"plain-1"}));
     let source = r#"version 2
 mission "orchard-crew" state="ready" {
   goal "Keep the orchard's windows honest."
   step "prune" { agentless; goal "Prune." }
 }"#;
     let intent = crate::graph::parse_intent(source, "alder").unwrap();
-    let planned = store
-        .mission(
-            &intent,
-            crate::model::IntentInput {
-                kdl: source.into(),
-                source_name: None,
-            },
-        )
-        .unwrap();
-    store
-        .apply(&intent, &planned.subject_tokens, "orchard-crew")
-        .unwrap();
-    store
-        .create_mission_run(&crate::model::MissionRunRequest {
-            mission: "orchard-crew".into(),
-            revision: None,
-            workspace: "/tmp".into(),
-            requester: Some("person/avery".into()),
-            mode: Some("run".into()),
-            inputs: BTreeMap::new(),
-            idempotency_key: "orchard-crew-run".into(),
-        })
-        .unwrap();
-    for (subject, person) in [
-        ("custom/garden/review/v1/orchard-avery", "person/avery"),
-        ("custom/garden/review/v1/orchard-robin", "person/robin"),
-    ] {
-        claim(
-            store,
-            subject,
-            "custom.garden.review.v1.requested",
-            Some("agent/garden/seed"),
-            json!({"title":"Choose a seed", "detail":"Keep or discard", "recipient":person}),
-        );
+    let planned = store.mission(&intent, crate::model::IntentInput { kdl: source.into(), source_name: None }).unwrap();
+    store.apply(&intent, &planned.subject_tokens, "orchard-crew").unwrap();
+    store.create_mission_run(&crate::model::MissionRunRequest {
+        mission: "orchard-crew".into(), revision: None, workspace: "/tmp".into(),
+        requester: Some("person/avery".into()), mode: Some("run".into()),
+        inputs: BTreeMap::new(), idempotency_key: "orchard-crew-run".into(),
+    }).unwrap();
+    for (subject, person) in [("custom/garden/review/v1/orchard-avery", "person/avery"), ("custom/garden/review/v1/orchard-robin", "person/robin")] {
+        claim(store, subject, "custom.garden.review.v1.requested", Some("agent/garden/seed"),
+            json!({"title":"Choose a seed", "detail":"Keep or discard", "recipient":person}));
     }
 }
 
@@ -638,56 +498,27 @@ async fn clients_hold_what_full_reads_give_through_replication_rollback_checkpoi
     let mut held = BTreeMap::new();
     settle(&mut fixture, &mut held).await;
     assert_parity(&fixture, &session, &held, &requests, "seeded").await;
-    assert!(
-        held["avery"]
-            .order
-            .iter()
-            .all(|id| !held["robin"].order.contains(id))
-    );
+    assert!(held["avery"].order.iter().all(|id| !held["robin"].order.contains(id)));
     assert!(!held["avery"].order.is_empty() && !held["robin"].order.is_empty());
 
     // Another host's claims, delivered in reverse envelope order and then again.
     let birch = Store::open_memory("birch").unwrap();
-    claim(
-        &birch,
-        "agent/birch.solo",
-        "runtime.observed",
-        Some("agent/birch.solo"),
-        json!({"status":"running", "runtime_id":"agent/birch.solo", "incarnation_id":"solo-1"}),
-    );
-    claim(
-        &birch,
-        "agent/birch.solo",
-        "harness.observed",
-        Some("agent/birch.solo"),
-        json!({"state":"idle", "driver":"omp", "incarnation_id":"solo-1"}),
-    );
-    claim(
-        &birch,
-        "agent/alder.plain",
-        "runtime.observed",
-        Some("agent/alder.plain"),
-        json!({"status":"running", "runtime_id":"agent/alder.plain", "incarnation_id":"plain-birch"}),
-    );
+    claim(&birch, "agent/birch.solo", "runtime.observed", Some("agent/birch.solo"),
+        json!({"status":"running", "runtime_id":"agent/birch.solo", "incarnation_id":"solo-1"}));
+    claim(&birch, "agent/birch.solo", "harness.observed", Some("agent/birch.solo"),
+        json!({"state":"idle", "driver":"omp", "incarnation_id":"solo-1"}));
+    claim(&birch, "agent/alder.plain", "runtime.observed", Some("agent/alder.plain"),
+        json!({"status":"running", "runtime_id":"agent/alder.plain", "incarnation_id":"plain-birch"}));
     for store in [&birch, &*state.store] {
         store.bind_fleet("fleet/orchard").unwrap();
     }
     let mut exchange = birch
-        .export_replication_exchange(
-            "fleet/orchard",
-            &smallclaims::replication::ReplicationInventory::default(),
-        )
+        .export_replication_exchange("fleet/orchard", &smallclaims::replication::ReplicationInventory::default())
         .unwrap();
-    assert!(
-        exchange.envelopes.len() >= 3,
-        "a meaningful envelope permutation"
-    );
+    assert!(exchange.envelopes.len() >= 3, "a meaningful envelope permutation");
     exchange.envelopes.reverse();
     for _ in 0..2 {
-        state
-            .store
-            .receive_replication_exchange("birch", "fleet/orchard", &exchange)
-            .unwrap();
+        state.store.receive_replication_exchange("birch", "fleet/orchard", &exchange).unwrap();
         state.store.validate_replication_backlog().unwrap();
         state.store.apply_replication_repairs().unwrap();
         state.store.project_replication_backlog().unwrap();
@@ -695,25 +526,16 @@ async fn clients_hold_what_full_reads_give_through_replication_rollback_checkpoi
         settle(&mut fixture, &mut held).await;
         assert_parity(&fixture, &session, &held, &requests, "replicated").await;
     }
-    assert!(
-        held["agents"]
-            .order
-            .iter()
-            .any(|id| id == "agent/birch.solo")
-    );
+    assert!(held["agents"].order.iter().any(|id| id == "agent/birch.solo"));
 
     // A write that rolls back changes nothing a client holds.
     let before = held.clone();
     state.store.roll_back_claim_for_test(&ClaimInput {
-        subject: "agent/alder.quiet".into(),
-        kind: "runtime.observed".into(),
+        subject: "agent/alder.quiet".into(), kind: "runtime.observed".into(),
         actor: Some("agent/alder.quiet".into()),
         fields: serde_json::from_value(json!({"status":"stopped",
-            "runtime_id":"agent/alder.quiet", "incarnation_id":"quiet-1"}))
-        .unwrap(),
-        evidence: vec![],
-        expected_subject: None,
-        idempotency_key: None,
+            "runtime_id":"agent/alder.quiet", "incarnation_id":"quiet-1"})).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
     });
     signal_changed(&state);
     settle(&mut fixture, &mut held).await;
@@ -721,62 +543,26 @@ async fn clients_hold_what_full_reads_give_through_replication_rollback_checkpoi
     assert_parity(&fixture, &session, &held, &requests, "rolled back").await;
 
     // Ordinary changes, then a checkpoint that trims the history behind them.
-    claim(
-        &state.store,
-        "agent/alder.plain",
-        "harness.observed",
-        Some("agent/alder.plain"),
-        json!({"state":"idle", "driver":"omp", "incarnation_id":"plain-1"}),
-    );
-    claim(
-        &state.store,
-        "agent/alder.quiet",
-        "runtime.observed",
-        Some("agent/alder.quiet"),
-        json!({"status":"stopped", "runtime_id":"agent/alder.quiet", "incarnation_id":"quiet-1"}),
-    );
+    claim(&state.store, "agent/alder.plain", "harness.observed", Some("agent/alder.plain"),
+        json!({"state":"idle", "driver":"omp", "incarnation_id":"plain-1"}));
+    claim(&state.store, "agent/alder.quiet", "runtime.observed", Some("agent/alder.quiet"),
+        json!({"status":"stopped", "runtime_id":"agent/alder.quiet", "incarnation_id":"quiet-1"}));
     signal_changed(&state);
     settle(&mut fixture, &mut held).await;
     assert_parity(&fixture, &session, &held, &requests, "changed").await;
     // History a checkpoint drops: superseded harness states and old diagnostics.
-    for (n, harness) in ["working", "idle", "working", "idle"]
-        .into_iter()
-        .enumerate()
-    {
-        claim(
-            &state.store,
-            "agent/alder.plain",
-            "harness.observed",
-            Some("agent/alder.plain"),
-            json!({"state":harness, "driver":"omp", "incarnation_id":"plain-1", "observed_at_ms":n}),
-        );
+    for (n, harness) in ["working", "idle", "working", "idle"].into_iter().enumerate() {
+        claim(&state.store, "agent/alder.plain", "harness.observed", Some("agent/alder.plain"),
+            json!({"state":harness, "driver":"omp", "incarnation_id":"plain-1", "observed_at_ms":n}));
     }
     for n in 0..4 {
-        claim(
-            &state.store,
-            "daemon/alder",
-            "daemon.diagnostic",
-            None,
-            json!({"severity":"warning", "code":"slow-request", "reason":format!("slow {n}")}),
-        );
+        claim(&state.store, "daemon/alder", "daemon.diagnostic", None,
+            json!({"severity":"warning", "code":"slow-request", "reason":format!("slow {n}")}));
     }
     signal_changed(&state);
     settle(&mut fixture, &mut held).await;
-    assert_parity(
-        &fixture,
-        &session,
-        &held,
-        &requests,
-        "before the checkpoint",
-    )
-    .await;
-    assert!(
-        state
-            .store
-            .trim_checkpoint_for_test(client_now_ms() + 1_000)
-            > 0,
-        "the checkpoint drops history"
-    );
+    assert_parity(&fixture, &session, &held, &requests, "before the checkpoint").await;
+    assert!(state.store.trim_checkpoint_for_test(client_now_ms() + 1_000) > 0, "the checkpoint drops history");
     state.store.forget_current_views();
     signal_changed(&state);
     settle(&mut fixture, &mut held).await;
@@ -794,10 +580,7 @@ async fn clients_hold_what_full_reads_give_through_replication_rollback_checkpoi
     let mut reconnected = BTreeMap::new();
     settle(&mut fixture, &mut reconnected).await;
     assert_parity(&fixture, &session, &reconnected, &requests, "reopened").await;
-    assert_eq!(
-        reconnected.keys().collect::<Vec<_>>(),
-        before.keys().collect::<Vec<_>>()
-    );
+    assert_eq!(reconnected.keys().collect::<Vec<_>>(), before.keys().collect::<Vec<_>>());
     for (id, window) in &reconnected {
         assert_eq!(window.order, before[id].order, "{id} after reopen");
     }
@@ -805,8 +588,7 @@ async fn clients_hold_what_full_reads_give_through_replication_rollback_checkpoi
     // A person's session sees only that person's attention, and cannot select another's.
     let avery = ClientSession::local(Some("person/avery")).unwrap();
     let mut own = Fixture::open_as(reopened.clone(), avery.clone(), true, None, &[]).await;
-    own.send(json!({"kind":"subscribe","id":"mine","collection":"attention","limit":200}))
-        .await;
+    own.send(json!({"kind":"subscribe","id":"mine","collection":"attention","limit":200})).await;
     own.send(json!({"kind":"subscribe","id":"theirs","collection":"attention","person":"person/robin","limit":200})).await;
     let mut frames = BTreeMap::new();
     for _ in 0..2 {
@@ -817,12 +599,6 @@ async fn clients_hold_what_full_reads_give_through_replication_rollback_checkpoi
     let mut mine = BTreeMap::new();
     apply(&mut mine, &frames["mine"]);
     assert_eq!(mine["mine"].order, reconnected["avery"].order);
-    assert_parity(
-        &own,
-        &avery,
-        &mine,
-        &[json!({"kind":"subscribe","id":"mine","collection":"attention","limit":200})],
-        "person",
-    )
-    .await;
+    assert_parity(&own, &avery, &mine,
+        &[json!({"kind":"subscribe","id":"mine","collection":"attention","limit":200})], "person").await;
 }

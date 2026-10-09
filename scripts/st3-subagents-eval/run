@@ -316,9 +316,20 @@ def old_settings_capture(node, seat, checks):
     expect(not seat.claims(), "missing hooks nevertheless published a child")
     expect(not (ledger_path.parent / ".harness-subagents-published").exists(),
            "an empty publisher unexpectedly wrote its open/closed map")
-    parent = node.api("/v1/client/agents/" + seat.subject) or {}
-    expect(parent.get("harness_state") == "idle" and not parent.get("subagents"),
-           f"old-settings parent projection: {parent}")
+    # The hook must have recorded idle locally. Current publication gets one attempt per
+    # source revision; a dropped Stop sample is replaced by the provider's fresh heartbeat
+    # (30 s), rather than replayed. Wait for that publication as the other controls do.
+    local_state = json.loads((ledger_path.parent / "harness-state").read_text())
+    expect(local_state.get("state") == "idle", f"old-settings local state: {local_state}")
+    parent = None
+    def idle_parent():
+        nonlocal parent
+        parent = node.api("/v1/client/agents/" + seat.subject) or {}
+        return parent if parent.get("harness_state") == "idle" and not parent.get("subagents") else None
+    try:
+        parent = until(idle_parent, 45, "old-settings parent never became idle")
+    except Failure as error:
+        fail(f"{error}; last projection: {parent}; local state: {local_state}")
     seat.control("finish", id="legacy-child", responses=[{"output": 1}])
     seat.applied()
     time.sleep(2)

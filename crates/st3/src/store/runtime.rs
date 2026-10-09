@@ -4,6 +4,13 @@
 
 use super::*;
 
+/// Only the subject's durable claims and workspace register affect its actual-state fold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActualCacheKey {
+    pub(crate) durable: u64,
+    pub(crate) workspace: Option<String>,
+}
+
 /// smalltalk's half of the store. The graph holds it as its runtime, and `Store` keeps it beside
 /// the graph for the caches its reads use.
 #[derive(Default)]
@@ -21,7 +28,7 @@ pub struct SmalltalkRuntime {
     pub(crate) claim_registry: std::sync::OnceLock<st3_schema::Registry>,
     pub(crate) conversation_owner_generation: std::sync::atomic::AtomicU64,
     pub(crate) conversation_owners: Mutex<VecDeque<(u64, Arc<conversation_reads::Owners>)>>,
-    pub(crate) actual_cache: Mutex<HashMap<String, (u64, Option<Value>)>>,
+    pub(crate) actual_cache: Mutex<HashMap<String, (ActualCacheKey, Option<Value>)>>,
     /// Immutable placement ancestry, keyed by the selected declaration claim.
     pub(crate) placement_cache: Mutex<HashMap<String, Option<Arc<crate::placement::Fence>>>>,
     /// Per-subject status reductions and current-view answers, until their claims change.

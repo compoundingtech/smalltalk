@@ -16858,12 +16858,20 @@ impl Store {
     pub fn latest_actual_value(&self, subject: &str) -> Result<Option<Value>> {
         smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
-        // The actual state folds only this subject's append-only claims, so the subject's newest
-        // claim identifies it. A write elsewhere in the graph must not make every reconcile pass
-        // re-read and re-parse the history of every stopped runtime.
-        let newest: u64 = connection
-            .prepare_cached("SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1")?
-            .query_row([subject], |row| row.get(0))?;
+        // Actual state also folds the workspace register. Track its source revision beside
+        // the durable frontier; neither unrelated writes nor harness heartbeats invalidate it.
+        let newest = connection
+            .prepare_cached(
+                "SELECT COALESCE(MAX(store_index), 0),
+                (SELECT source_id FROM latest_values WHERE subject=?1 AND kind='workspace.observed')
+             FROM claims WHERE subject=?1",
+            )?
+            .query_row([subject], |row| {
+                Ok(runtime::ActualCacheKey {
+                    durable: row.get(0)?,
+                    workspace: row.get(1)?,
+                })
+            })?;
         if let Some((_, value)) = self
             .smalltalk
             .actual_cache
@@ -38944,7 +38952,7 @@ version 2
                 .get(subject)
                 .cloned()
         };
-        assert_eq!(cached(&store).unwrap().0, stopped.store_index);
+        assert_eq!(cached(&store).unwrap().0.durable, stopped.store_index);
 
         // Other subjects' writes leave a stopped runtime's folded state valid.
         observe("agent/run/other", "running");
@@ -38961,7 +38969,7 @@ version 2
             store.latest_actual_value(subject).unwrap().unwrap()["status"],
             "running"
         );
-        assert_eq!(cached(&store).unwrap().0, running.store_index);
+        assert_eq!(cached(&store).unwrap().0.durable, running.store_index);
     }
 
     #[test]

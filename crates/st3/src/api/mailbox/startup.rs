@@ -390,14 +390,19 @@ mod tests {
             harness_events::enable(&agent_dir, &fence.incarnation).unwrap();
             let sequence =
                 harness_state::claim(&agent_dir, "eval.worker", "opencode", "provider").unwrap();
-            harness_state::Writer::new(&agent_dir, "eval.worker", "opencode", None)
-                .with_ownership("provider", sequence)
-                .observe(harness_state::Observation::new(
-                    harness_state::Activity::Idle,
-                    harness_state::BlockedOn::None,
-                    harness_state::InputBuffer::Empty,
-                ))
-                .unwrap();
+            harness_state::Writer::new(
+                &agent_dir,
+                "eval.worker",
+                "opencode",
+                Some("eval.worker".into()),
+            )
+            .with_ownership("provider", sequence)
+            .observe(harness_state::Observation::new(
+                harness_state::Activity::Idle,
+                harness_state::BlockedOn::None,
+                harness_state::InputBuffer::Empty,
+            ))
+            .unwrap();
             let claim = |kind: &str, fields: Value| crate::model::ClaimInput {
                 subject: fence.subject.clone(),
                 kind: kind.into(),
