@@ -57,6 +57,7 @@ struct CollectionSubscription {
     previous: BTreeMap<String, Value>,
     order: Vec<String>,
     has_more: bool,
+    membership: Option<st3_schema::ordered_membership::State>,
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
@@ -125,9 +126,11 @@ async fn collection_items(
     session: &ClientSession,
     request: &CollectionSubscribe,
     read_permit: tokio::sync::OwnedSemaphorePermit,
-) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+) -> Result<CollectionRead, ApiError> {
     collection_items_with_windows(state, session, request, read_permit, None).await
 }
+
+type CollectionRead = (ClientSnapshot, Vec<Value>, bool, Option<st3_schema::ordered_membership::State>);
 
 async fn collection_items_with_windows(
     state: &AppState,
@@ -135,7 +138,7 @@ async fn collection_items_with_windows(
     request: &CollectionSubscribe,
     read_permit: tokio::sync::OwnedSemaphorePermit,
     windows: Option<Arc<collection_windows::Windows>>,
-) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+) -> Result<CollectionRead, ApiError> {
     if !matches!(
         request.collection.as_str(),
         "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements" | "ordered-memberships"
@@ -219,7 +222,7 @@ async fn collection_items_with_windows(
     let custom_forms = session.custom_forms;
     let arrangement_window = matches!(collection.as_str(), "arrangements" | "ordered-memberships");
     let mut admitted = collection != "agents";
-    let (snapshot, mut items, mut has_more) = loop {
+    let (snapshot, mut items, mut has_more, membership) = loop {
         let roster_admission = if collection == "agents" && admitted {
             Some(state.store.admit_agent_resources().await)
         } else {
@@ -288,7 +291,7 @@ async fn collection_items_with_windows(
                             ids.truncate(limit);
                             let mut items = mission_list_cards_at(&store, &ids, now)?;
                             has_more |= bound_mission_cards(&mut items)?;
-                            return Ok((items, has_more));
+                            return Ok((items, has_more, None));
                         }
                         "glasses" => store.glasses(
                             person.as_deref().expect("authenticated glass owner"),
@@ -330,16 +333,23 @@ async fn collection_items_with_windows(
                     // Agent status/availability depends on live local delivery presence; overlay and
                     // filter it on every read, after reusing the immutable graph-derived rows.
                     if collection == "agents" {
-                        return Ok((items, false));
+                        return Ok((items, false, None));
                     }
                     if let Some(status) = &status {
                         items.retain(|item| item["state"].as_str() == Some(status.as_str()));
                     }
                     let has_more = items.len() > limit;
                     items.truncate(limit);
-                    Ok((items, has_more))
+                    let membership = if collection == "ordered-memberships" {
+                        Some(store.ordered_membership_state(
+                            subject.as_deref().expect("selected arrangement subject"),
+                        )?)
+                    } else {
+                        None
+                    };
+                    Ok((items, has_more, membership))
                 };
-                let (mut items, mut has_more) = match &windows {
+                let (mut items, mut has_more, membership) = match &windows {
                     Some(windows) => windows.read(
                         &state,
                         &current,
@@ -362,7 +372,7 @@ async fn collection_items_with_windows(
                     has_more = items.len() > limit;
                     items.truncate(limit);
                 }
-                Ok(Ok(Some((snapshot, items, has_more))))
+                Ok(Ok(Some((snapshot, items, has_more, membership))))
             })
         });
         Ok((result?, read_permit, admission))
@@ -379,7 +389,7 @@ async fn collection_items_with_windows(
         has_more |= end < items.len();
         items.truncate(end);
     }
-    Ok((snapshot, items, has_more))
+    Ok((snapshot, items, has_more, membership))
 }
 
 fn collection_window_label(collection: &str) -> &'static str {
@@ -428,10 +438,10 @@ enum Refreshed {
 async fn deliver_collection(
     socket: &mut WebSocket,
     subscription: &mut CollectionSubscription,
-    read: Result<(ClientSnapshot, Vec<Value>, bool), ApiError>,
+    read: Result<CollectionRead, ApiError>,
 ) -> Refreshed {
     let request = &subscription.request;
-    let (snapshot, items, has_more) = match read {
+    let (snapshot, items, has_more, membership) = match read {
         Ok(read) => read,
         Err(error) => {
             let retryable = client_error_retryable(error.status, Some(&error.code));
@@ -461,7 +471,11 @@ async fn deliver_collection(
         .filter_map(|item| Some((item["id"].as_str()?.to_owned(), item.clone())))
         .collect();
     let sent = if !subscription.delivered {
-        send_collection(socket, json!({"kind":"snapshot", "id":request.id, "collection":request.collection, "snapshot":snapshot, "items":items, "order":order, "has_more":has_more})).await
+        let mut frame = json!({"kind":"snapshot", "id":request.id, "collection":request.collection, "snapshot":snapshot, "items":items, "order":order, "has_more":has_more});
+        if let Some(membership) = membership {
+            frame["membership"] = json!({"container":request.subject, "live_count":membership.live_count, "changed_index":membership.changed_index});
+        }
+        send_collection(socket, frame).await
     } else {
         let upserts = current
             .iter()
@@ -478,10 +492,15 @@ async fn deliver_collection(
             && removes.is_empty()
             && order == subscription.order
             && has_more == subscription.has_more
+            && membership == subscription.membership
         {
             true
         } else {
-            send_collection(socket, json!({"kind":"changes", "id":request.id, "collection":request.collection, "snapshot":snapshot, "upserts":upserts, "removes":removes, "order":order, "has_more":has_more})).await
+            let mut frame = json!({"kind":"changes", "id":request.id, "collection":request.collection, "snapshot":snapshot, "upserts":upserts, "removes":removes, "order":order, "has_more":has_more});
+            if let Some(membership) = membership {
+                frame["membership"] = json!({"container":request.subject, "live_count":membership.live_count, "changed_index":membership.changed_index});
+            }
+            send_collection(socket, frame).await
         }
     };
     if !sent {
@@ -491,6 +510,7 @@ async fn deliver_collection(
     subscription.previous = current;
     subscription.order = order;
     subscription.has_more = has_more;
+    subscription.membership = membership;
     Refreshed::Current
 }
 
@@ -831,7 +851,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     read: F,
 ) where
     F: Fn(AppState, ClientSession, CollectionSubscribe, tokio::sync::OwnedSemaphorePermit) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
+    Fut: Future<Output = Result<CollectionRead, ApiError>> + Send,
 {
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
@@ -943,7 +963,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         }
                         refresh.push(request.id.clone());
                         generation += 1;
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, generation, reading: None, dirty: false, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, generation, reading: None, dirty: false, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false, membership: None });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
@@ -10183,12 +10203,12 @@ mod tests {
         let session = ClientSession::local(None).unwrap();
         let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
         let windows = collection_windows::Windows::attach(&state.store);
-        let (_, expected, _) = collection_items_with_windows(&state, &session, &request,
+        let (_, expected, _, _) = collection_items_with_windows(&state, &session, &request,
             semaphore.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
         let builds = state.store.agent_resources_builds_for_test();
         let _cold_builder = state.store.admit_agent_resources().await;
         let start = std::time::Instant::now();
-        let (_, actual, _) = tokio::time::timeout(std::time::Duration::from_secs(1),
+        let (_, actual, _, _) = tokio::time::timeout(std::time::Duration::from_secs(1),
             collection_items_with_windows(&state, &session, &request,
                 semaphore.acquire_owned().await.unwrap(), windows)).await
             .expect("warm WS roster must not wait for a cold builder").unwrap();
@@ -10231,7 +10251,7 @@ mod tests {
             }
             let mut expected = None;
             for reader in readers {
-                let (snapshot, items, has_more) = reader.await.unwrap();
+                let (snapshot, items, has_more, _) = reader.await.unwrap();
                 assert_eq!(snapshot.store_index, state.store.index().unwrap());
                 assert!(!has_more);
                 assert_eq!(items.len(), 1);

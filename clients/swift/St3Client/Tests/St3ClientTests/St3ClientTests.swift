@@ -17,6 +17,34 @@ final class St3ClientTests: XCTestCase {
         XCTAssertNil(page.items[0].position.bucket)
         XCTAssertEqual(page.items[0].id, page.items[0].member)
         XCTAssertEqual(try JSONSerialization.jsonObject(with: JSONEncoder().encode(page)) as? NSDictionary, fixture["page"] as? NSDictionary)
+        let first = try JSONDecoder().decode(OrderedMembershipCollectionFrame.self, from: bytes("snapshot_frame"))
+        let state = try XCTUnwrap(first.membership)
+        XCTAssertEqual(state, OrderedMembershipState(container: "arrangement/person/ada/019a0000-0000-7000-8000-000000000001", liveCount: 2, changedIndex: 1842))
+        let snapshotFrame = try XCTUnwrap(fixture["snapshot_frame"] as? [String: Any])
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: JSONEncoder().encode(state)) as? NSDictionary, snapshotFrame["membership"] as? NSDictionary)
+        let changed = try JSONDecoder().decode(OrderedMembershipCollectionFrame.self, from: bytes("changes_frame"))
+        let changedState = try XCTUnwrap(changed.membership)
+        // An edit outside the window repeats the window; only the container's state moves.
+        let outside = try JSONDecoder().decode(OrderedMembershipCollectionFrame.self, from: bytes("outside_window_changes_frame"))
+        let outsideState = try XCTUnwrap(outside.membership)
+        XCTAssertEqual(outside.upserts?.isEmpty, true)
+        XCTAssertEqual(outside.removes?.isEmpty, true)
+        XCTAssertEqual(outside.order, changed.order)
+        XCTAssertEqual(outside.hasMore, changed.hasMore)
+        XCTAssertEqual(outsideState.liveCount, changedState.liveCount)
+        XCTAssertGreaterThan(outsideState.changedIndex, changedState.changedIndex)
+        for key in ["snapshot_frame", "changes_frame"] {
+            var missing = try XCTUnwrap(fixture[key] as? [String: Any])
+            missing["membership"] = nil
+            XCTAssertThrowsError(try JSONDecoder().decode(OrderedMembershipCollectionFrame.self, from: JSONSerialization.data(withJSONObject: missing)))
+            var partial = try XCTUnwrap(fixture[key] as? [String: Any])
+            var membership = try XCTUnwrap(partial["membership"] as? [String: Any])
+            membership["changed_index"] = nil
+            partial["membership"] = membership
+            XCTAssertThrowsError(try JSONDecoder().decode(OrderedMembershipCollectionFrame.self, from: JSONSerialization.data(withJSONObject: partial)))
+        }
+        let resync = try JSONDecoder().decode(OrderedMembershipCollectionFrame.self, from: Data(#"{"kind":"resync","id":"sidebar"}"#.utf8))
+        XCTAssertNil(resync.membership)
         let body = try JSONDecoder().decode(ArrangementBody.self, from: bytes("body"))
         guard case .v2 = body else { return XCTFail("Expected version 2") }
         var invalid = try XCTUnwrap(fixture["body"] as? [String: Any])

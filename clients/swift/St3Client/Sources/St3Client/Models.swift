@@ -726,16 +726,45 @@ public struct ArrangementMembershipEditParameters: Codable, Sendable {
     public init(subject: String, owner: String, operations: [OrderedMembershipOperation]) { self.subject = subject; self.owner = owner; self.operations = operations }
 }
 public struct OrderedMembership: Codable, Sendable, Identifiable { public let id, container, member, revision: String; public let position: OrderedMembershipPosition }
+/// The whole container's membership state, carried by every `ordered-memberships` window frame
+/// so a held window observes edits outside its rows. `changedIndex` is an opaque, host-local,
+/// monotonic invalidation frontier scoped by the frame's `snapshot.hostID`; it is neither a
+/// canonical revision nor a count of global history and never compares across hosts.
+public struct OrderedMembershipState: Codable, Sendable, Equatable {
+    public let container: String
+    public let liveCount, changedIndex: UInt64
+    public init(container: String, liveCount: UInt64, changedIndex: UInt64) { self.container = container; self.liveCount = liveCount; self.changedIndex = changedIndex }
+    enum CodingKeys: String, CodingKey { case container, liveCount = "live_count", changedIndex = "changed_index" }
+}
 public struct OrderedMembershipPage: Codable, Sendable { public let kind, collection: String; public let filters: [String: String]; public let items: [OrderedMembership]; public let page: PageInfo; public let sync: SyncNotice?; public let replicated: ReplicatedNotice? }
+/// One `ordered-memberships` socket frame. `snapshot` and `changes` frames always carry
+/// `membership`; decoding refuses one without it.
 public struct OrderedMembershipCollectionFrame: Codable, Sendable {
     public let kind: String
     public let id: String?
     public let snapshot: Snapshot?
+    public let membership: OrderedMembershipState?
     public let items, upserts: [OrderedMembership]?
     public let removes, order: [String]?
     public let hasMore: Bool?
     public let code, message: String?
-    enum CodingKeys: String, CodingKey { case kind, id, snapshot, items, upserts, removes, order, code, message, hasMore = "has_more" }
+    enum CodingKeys: String, CodingKey { case kind, id, snapshot, membership, items, upserts, removes, order, code, message, hasMore = "has_more" }
+    public init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try box.decode(String.self, forKey: .kind)
+        id = try box.decodeIfPresent(String.self, forKey: .id)
+        snapshot = try box.decodeIfPresent(Snapshot.self, forKey: .snapshot)
+        membership = kind == "snapshot" || kind == "changes"
+            ? try box.decode(OrderedMembershipState.self, forKey: .membership)
+            : try box.decodeIfPresent(OrderedMembershipState.self, forKey: .membership)
+        items = try box.decodeIfPresent([OrderedMembership].self, forKey: .items)
+        upserts = try box.decodeIfPresent([OrderedMembership].self, forKey: .upserts)
+        removes = try box.decodeIfPresent([String].self, forKey: .removes)
+        order = try box.decodeIfPresent([String].self, forKey: .order)
+        hasMore = try box.decodeIfPresent(Bool.self, forKey: .hasMore)
+        code = try box.decodeIfPresent(String.self, forKey: .code)
+        message = try box.decodeIfPresent(String.self, forKey: .message)
+    }
 }
 public enum ArrangementOperation: Codable, Sendable {
     case create(name: String), rename(name: String)

@@ -33,6 +33,7 @@ struct Cached {
     valid_until_unix_ms: Option<u128>,
     items: Vec<Value>,
     has_more: bool,
+    membership: Option<st3_schema::ordered_membership::State>,
 }
 
 #[derive(Default)]
@@ -302,8 +303,8 @@ impl Windows {
         session: &ClientSession,
         request: &CollectionSubscribe,
         fence: ReadFence,
-        compute: impl FnOnce() -> anyhow::Result<(Vec<Value>, bool)>,
-    ) -> anyhow::Result<(Vec<Value>, bool)> {
+        compute: impl FnOnce() -> anyhow::Result<(Vec<Value>, bool, Option<st3_schema::ordered_membership::State>)>,
+    ) -> anyhow::Result<(Vec<Value>, bool, Option<st3_schema::ordered_membership::State>)> {
         let ReadFence {
             index,
             now,
@@ -353,9 +354,9 @@ impl Windows {
             && cached.period == period
             && cached.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
         {
-            return Ok((cached.items.clone(), cached.has_more));
+            return Ok((cached.items.clone(), cached.has_more, cached.membership));
         }
-        let (items, has_more) = compute()?;
+        let (items, has_more, membership) = compute()?;
         let valid_until_unix_ms = if request.collection == "agents" {
             state.store.agent_roster_valid_until(index)
         } else {
@@ -369,6 +370,7 @@ impl Windows {
                 valid_until_unix_ms,
                 items: items.clone(),
                 has_more,
+                membership,
             })
         });
         *prepared
@@ -376,7 +378,7 @@ impl Windows {
             .cached
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = cached;
-        Ok((items, has_more))
+        Ok((items, has_more, membership))
     }
 
     #[cfg(test)]
@@ -417,8 +419,8 @@ mod tests {
         state.store.read_snapshot(|index| {
             windows.read(state, session, request, ReadFence { index, now, commits, prepared }, || {
                 let n = count.fetch_add(1, Ordering::SeqCst);
-                Ok((vec![json!({"id":format!("row/{n}"), "authority":session.authority_actor})], false))
-            }).map(|(rows, _)| rows)
+                Ok((vec![json!({"id":format!("row/{n}"), "authority":session.authority_actor})], false, None))
+            }).map(|(rows, _, _)| rows)
         }).unwrap()
     }
 
@@ -457,6 +459,7 @@ mod tests {
         *cached = Some(Arc::new(Cached {
             revision: held.revision, period: held.period, valid_until_unix_ms: Some(200),
             items: held.items.clone(), has_more: held.has_more,
+            membership: held.membership,
         }));
         drop(cached);
         assert_eq!(read(&windows, &state, &session, &agents, 199, &count), first);
@@ -503,7 +506,7 @@ mod tests {
                             builds.fetch_add(1, Ordering::SeqCst);
                             entered.send(()).unwrap();
                             held.recv().unwrap();
-                            Ok((vec![json!({"id":"shared"})], false))
+                            Ok((vec![json!({"id":"shared"})], false, None))
                         },
                     )
                 })
@@ -779,7 +782,7 @@ mod tests {
                         },
                         || {
                             count.fetch_add(1, Ordering::SeqCst);
-                            Ok((vec![json!({"id":"old-snapshot"})], false))
+                            Ok((vec![json!({"id":"old-snapshot"})], false, None))
                         },
                     )?
                     .0;

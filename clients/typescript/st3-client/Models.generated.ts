@@ -610,6 +610,7 @@ export type CollectionFrame = ({
   id: string;
   items: Array<OrderedMembership>;
   kind: "snapshot";
+  membership: OrderedMembershipState;
   order: Array<Id>;
   snapshot: Snapshot;
 } | {
@@ -617,6 +618,7 @@ export type CollectionFrame = ({
   has_more: boolean;
   id: string;
   kind: "changes";
+  membership: OrderedMembershipState;
   order: Array<Id>;
   removes: Array<Id>;
   snapshot: Snapshot;
@@ -1249,6 +1251,12 @@ export type OrderedMembershipPage = {
 export type OrderedMembershipPosition = {
   bucket: string | null;
   key: ArrangementKey;
+};
+
+export type OrderedMembershipState = {
+  changed_index: number;
+  container: ArrangementId;
+  live_count: number;
 };
 
 export type OwnedSet = ResourceHeader & {

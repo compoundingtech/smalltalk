@@ -81,6 +81,7 @@
     "OrderedMembershipOperation": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["op", "member", "bucket", "key"], "properties": {"op": {"const": "place"}, "member": {"$ref": "#/$defs/ArrangementSubject"}, "bucket": {"type": ["string", "null"]}, "key": {"$ref": "#/$defs/ArrangementKey"}}}, {"type": "object", "additionalProperties": false, "required": ["op", "member"], "properties": {"op": {"const": "remove"}, "member": {"$ref": "#/$defs/ArrangementSubject"}}}]},
     "ArrangementMembershipEditParameters": {"type": "object", "additionalProperties": false, "required": ["subject", "owner", "operations"], "properties": {"subject": {"$ref": "#/$defs/ArrangementId"}, "owner": {"$ref": "#/$defs/ArrangementPerson"}, "operations": {"type": "array", "minItems": 1, "maxItems": 1024, "items": {"$ref": "#/$defs/OrderedMembershipOperation"}}}},
     "OrderedMembership": {"type": "object", "additionalProperties": false, "required": ["id", "container", "member", "position", "revision"], "properties": {"id": {"$ref": "#/$defs/ArrangementSubject"}, "container": {"$ref": "#/$defs/ArrangementId"}, "member": {"$ref": "#/$defs/ArrangementSubject"}, "position": {"$ref": "#/$defs/OrderedMembershipPosition"}, "revision": {"$ref": "#/$defs/Revision"}}},
+    "OrderedMembershipState": {"description": "Always-observable state of a whole membership container, not only the held window. `live_count` counts live members; `changed_index` is an opaque host-local monotonic invalidation frontier scoped by `snapshot.host_id`: a larger value on the same host means the container may have changed. It is not a canonical revision, a count of global history, or comparable across hosts.", "type": "object", "additionalProperties": false, "required": ["container", "live_count", "changed_index"], "properties": {"container": {"$ref": "#/$defs/ArrangementId"}, "live_count": {"type": "integer", "minimum": 0}, "changed_index": {"type": "integer", "minimum": 0}}},
     "OrderedMembershipPage": {"type": "object", "additionalProperties": false, "required": ["kind", "collection", "filters", "items", "page"], "properties": {"kind": {"const": "page"}, "collection": {"const": "ordered-memberships"}, "filters": {"type": "object", "additionalProperties": {"type": "string"}}, "items": {"type": "array", "items": {"$ref": "#/$defs/OrderedMembership"}}, "page": {"$ref": "#/$defs/PageInfo"}, "sync": {"$ref": "#/$defs/SyncNotice"}, "replicated": {"$ref": "#/$defs/ReplicatedNotice"}}},
     "Id": { "x-st-ref": "*", "description": "Subject reference `family/rest`.", "type": "string", "pattern": "^[a-z][a-z0-9-]*/[^\\s]+$" },
     "Timestamp": { "x-st-codec": "timestamp", "description": "RFC 3339 UTC instant; servers emit millisecond precision with `Z`.", "examples": ["2026-10-01T10:00:00.000Z"], "type": "string", "format": "date-time" },
@@ -2500,12 +2501,13 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind", "id", "collection", "snapshot", "items", "order", "has_more"],
+          "required": ["kind", "id", "collection", "snapshot", "membership", "items", "order", "has_more"],
           "properties": {
             "kind": { "const": "snapshot" },
             "id": { "type": "string" },
             "collection": { "const": "ordered-memberships" },
             "snapshot": { "$ref": "#/$defs/Snapshot" },
+            "membership": { "$ref": "#/$defs/OrderedMembershipState" },
             "items": { "type": "array", "items": { "$ref": "#/$defs/OrderedMembership" } },
             "order": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "has_more": { "type": "boolean" }
@@ -2514,12 +2516,13 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind", "id", "collection", "snapshot", "upserts", "removes", "order", "has_more"],
+          "required": ["kind", "id", "collection", "snapshot", "membership", "upserts", "removes", "order", "has_more"],
           "properties": {
             "kind": { "const": "changes" },
             "id": { "type": "string" },
             "collection": { "const": "ordered-memberships" },
             "snapshot": { "$ref": "#/$defs/Snapshot" },
+            "membership": { "$ref": "#/$defs/OrderedMembershipState" },
             "upserts": { "type": "array", "items": { "$ref": "#/$defs/OrderedMembership" } },
             "removes": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "order": { "type": "array", "items": { "$ref": "#/$defs/Id" } },

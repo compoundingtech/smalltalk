@@ -1600,6 +1600,17 @@ page, action and subscription helpers. V1 membership reads/actions refuse rather
 pretending legacy placements are an empty v2 collection. No new checkpoint rule drops
 hidden pairs, absent winners or their lifecycle dependencies.
 
+Every membership `snapshot` and `changes` frame also carries a required
+`membership: {container, live_count, changed_index}` describing the whole container, not
+only the held window. `live_count` counts live members. `changed_index` is an opaque,
+host-local, monotonic invalidation frontier scoped by the frame's `snapshot.host_id`: when
+it moves, the container may have changed, possibly outside the window, and a consumer that needs the
+complete set rereads it. A `changes` frame may therefore repeat the window's rows, order and
+`has_more` while reporting new state. `changed_index` is not a canonical revision, a count of
+global history or a winner; it never compares across hosts and stays out of shared digests and
+checkpoint answers. A frame without `membership`, or with any of its fields missing, is
+refused. Resource collection frames carry no membership state.
+
 ## Agent and plain-shell creation
 
 `agent.create` takes `name`, `harness` (`claude`, `codex`, `omp`, `pi`, `opencode`), optional `host`,

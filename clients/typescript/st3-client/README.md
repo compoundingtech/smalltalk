@@ -20,8 +20,12 @@ subject and follows lifecycle-aware held-window changes. Existing v1 placements 
 implicitly migrated.
 Narrow collection frames by `collection === "ordered-memberships"` before passing them to
 `applyWindow` with a `CollectionWindow<OrderedMembership>`; those rows expose the member and
-position directly. Other collections keep resource windows. Rich-schema decoding validates
-membership frames and response envelopes, including empty pages, as disjoint variants.
+position directly, and the window keeps the frame's required `membership` state for the whole
+container, replacing it even when a `changes` frame leaves rows and order alone.
+`membership.changed_index` is an opaque host-local invalidation frontier scoped by
+`snapshot.host_id`, not a canonical revision or cross-host value. Other collections keep
+resource windows without membership state. Rich-schema decoding validates membership frames
+and response envelopes, including empty pages, as disjoint variants.
 
 Run the client checks from the repository root with Node 24 or newer:
 

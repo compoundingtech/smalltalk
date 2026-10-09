@@ -3038,6 +3038,16 @@ pub struct OrderedMembership {
     pub position: OrderedMembershipPosition,
     pub revision: String,
 }
+/// The whole container's membership state, carried by every `ordered-memberships` window
+/// frame so a held window observes edits outside its rows. `changed_index` is an opaque,
+/// host-local, monotonic invalidation frontier scoped by the frame's `snapshot.host_id`; it is
+/// neither a canonical revision nor a count of global history and never compares across hosts.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OrderedMembershipState {
+    pub container: String,
+    pub live_count: u64,
+    pub changed_index: u64,
+}
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct OrderedMembershipPage {
     pub kind: String,

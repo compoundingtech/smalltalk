@@ -1256,6 +1256,15 @@ export const OrderedMembership = /*#__PURE__*/ (() => Schema.Struct({
 export type OrderedMembership = typeof OrderedMembership.Type
 export type OrderedMembershipEncoded = typeof OrderedMembership.Encoded
 
+/** Always-observable state of a whole membership container, not only the held window. `live_count` counts live members; `changed_index` is an opaque host-local monotonic invalidation frontier scoped by `snapshot.host_id`: a larger value on the same host means the container may have changed. It is not a canonical revision, a count of global history, or comparable across hosts. */
+export const OrderedMembershipState = /*#__PURE__*/ (() => Schema.Struct({
+  "changed_index": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "container": ArrangementId,
+  "live_count": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "OrderedMembershipState", description: "Always-observable state of a whole membership container, not only the held window. `live_count` counts live members; `changed_index` is an opaque host-local monotonic invalidation frontier scoped by `snapshot.host_id`: a larger value on the same host means the container may have changed. It is not a canonical revision, a count of global history, or comparable across hosts." }))()
+export type OrderedMembershipState = typeof OrderedMembershipState.Type
+export type OrderedMembershipStateEncoded = typeof OrderedMembershipState.Encoded
+
 export const Device = /*#__PURE__*/ (() => Schema.Struct({
   "expires_at": Timestamp,
   "id": Id,
@@ -2227,8 +2236,8 @@ export type TimelineEntryEncoded = typeof TimelineEntry.Encoded
 export const CollectionFrame = /*#__PURE__*/ (() => Schema.Union([
   Schema.Struct({ "collection": ResourceCollectionName, "has_more": Schema.Boolean, "id": Schema.String, "items": Schema.Array(Resource), "kind": Schema.Literal("snapshot"), "order": Schema.Array(Id), "snapshot": Snapshot }),
   Schema.Struct({ "collection": ResourceCollectionName, "has_more": Schema.Boolean, "id": Schema.String, "kind": Schema.Literal("changes"), "order": Schema.Array(Id), "removes": Schema.Array(Id), "snapshot": Snapshot, "upserts": Schema.Array(Resource) }),
-  Schema.Struct({ "collection": Schema.Literal("ordered-memberships"), "has_more": Schema.Boolean, "id": Schema.String, "items": Schema.Array(OrderedMembership), "kind": Schema.Literal("snapshot"), "order": Schema.Array(Id), "snapshot": Snapshot }),
-  Schema.Struct({ "collection": Schema.Literal("ordered-memberships"), "has_more": Schema.Boolean, "id": Schema.String, "kind": Schema.Literal("changes"), "order": Schema.Array(Id), "removes": Schema.Array(Id), "snapshot": Snapshot, "upserts": Schema.Array(OrderedMembership) }),
+  Schema.Struct({ "collection": Schema.Literal("ordered-memberships"), "has_more": Schema.Boolean, "id": Schema.String, "items": Schema.Array(OrderedMembership), "kind": Schema.Literal("snapshot"), "membership": OrderedMembershipState, "order": Schema.Array(Id), "snapshot": Snapshot }),
+  Schema.Struct({ "collection": Schema.Literal("ordered-memberships"), "has_more": Schema.Boolean, "id": Schema.String, "kind": Schema.Literal("changes"), "membership": OrderedMembershipState, "order": Schema.Array(Id), "removes": Schema.Array(Id), "snapshot": Snapshot, "upserts": Schema.Array(OrderedMembership) }),
   Schema.Struct({ "collection": Schema.Literal("terminal"), "id": Schema.String, "kind": Schema.Literal("screen"), "snapshot": Snapshot, "value": TerminalScreen }),
   Schema.Struct({ "collection": Schema.Literal("conversation"), "has_more": optionalKey(Schema.Boolean), "id": Schema.String, "items": Schema.Array(TimelineEntry), "kind": Schema.Literal("conversation"), "replace": Schema.Boolean, "session_id": Id }),
   Schema.Struct({ "code": optionalKey(Schema.String), "collection": optionalKey(Schema.String), "id": Schema.String, "kind": Schema.Literal("resync"), "message": optionalKey(Schema.String), "retryable": optionalKey(Schema.Boolean) }),
