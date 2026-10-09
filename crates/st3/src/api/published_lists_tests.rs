@@ -394,8 +394,8 @@ fn published_work_matches_the_direct_read_for_every_actor_as_time_passes() {
     let (_, changed) = fold_work_checked(&store);
     assert!(changed);
 
-    // Another seat claims and submits; a cancelled run's work leaves the list.
-    let (water, birch) = step(&beta, "water");
+    // Another seat claims and submits its next work; a cancelled run's work leaves the list.
+    let (water, birch) = step(&alpha, "water");
     act(&store, &water, &birch, "claim", "claim-water");
     act(&store, &water, &birch, "submit", "submit-water");
     fold_work_checked(&store);
