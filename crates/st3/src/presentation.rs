@@ -1724,7 +1724,12 @@ mod tests {
             Some("step-run/demo-generation/release"),
             vec![step("step-run/child-generation/publish", "publish", "ready")],
         );
-        let rendered = render_mission_run_page(&root, &[child.clone()], OutputStyle::plain(), 3_000);
+        let rendered = render_mission_run_page(
+            &root,
+            std::slice::from_ref(&child),
+            OutputStyle::plain(),
+            3_000,
+        );
         assert!(rendered.contains("RUN       mission-run/demo/run"));
         assert!(rendered.contains("PARENT    step-run/demo-generation/release"));
         assert!(rendered.contains("RUN       mission-run/demo/child"));
