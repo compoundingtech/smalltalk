@@ -24,7 +24,8 @@ async function interact(action: () => void | Promise<unknown>) {
   finally { restoreConfig(); environment.IS_REACT_ACT_ENVIRONMENT = previous }
 }
 const withAct = <Args extends unknown[],>(action: (...args: Args) => Promise<unknown>) => (...args: Args) => interact(() => action(...args))
-const userEvent = { click: withAct(events.click), keyboard: withAct(events.keyboard), type: withAct(events.type), clear: withAct(events.clear), tab: withAct(events.tab), hover: withAct(events.hover), unhover: withAct(events.unhover) }
+// Focus/hover transitions keep DOM's per-event boundaries; only collection-changing interactions need an outer async act.
+const userEvent = { click: withAct(events.click), keyboard: withAct(events.keyboard), type: withAct(events.type), clear: withAct(events.clear), tab: events.tab, hover: events.hover, unhover: events.unhover }
 
 type Control = 'none' | 'perform' | 'disabled' | 'help' | 'tooltip' | 'platform' | 'composition'
 function Discovery() {
