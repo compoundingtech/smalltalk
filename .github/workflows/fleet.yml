@@ -663,6 +663,9 @@ jobs:
       - name: Prove both shards cover every selected test
         shell: bash
         run: nix develop -c python3 scripts/ci-test-partitions
+      - name: Run eight doctor correctness controls without retries
+        shell: bash
+        run: nix develop -c python3 scripts/ci-doctor-correctness
       - name: Run nextest
         shell: bash
         run: nix develop -c bash scripts/ci-linux tests
