@@ -437,18 +437,23 @@ async fn collection_items_with_windows(
                         "attention" => Some(published_attention_rows(
                             &store, index, person.as_deref(), limit.saturating_add(1),
                         )),
-                        "summary" => Some(match store.published_summary(person.as_deref()) {
-                            Some((cut, at, row)) => {
-                                if cut < index {
-                                    store.request_attention_list_refresh();
+                        "summary" => {
+                            use crate::store::summary_list::PublishedSummary;
+                            match store.published_summary(person.as_deref()) {
+                                PublishedSummary::Row(cut, at, row) => {
+                                    if cut < index {
+                                        store.request_attention_list_refresh();
+                                    }
+                                    Some(Some((cut, at, vec![row])))
                                 }
-                                Some((cut, at, vec![row]))
+                                PublishedSummary::Pending => {
+                                    store.request_attention_list_refresh();
+                                    Some(None)
+                                }
+                                // A selection it does not serve: this window reads its own.
+                                PublishedSummary::Unserved => None,
                             }
-                            None => {
-                                store.request_attention_list_refresh();
-                                None
-                            }
-                        }),
+                        }
                         "glasses" => Some(published_owner_rows(
                             &store, OwnerView::Glasses, index,
                             person.as_deref().expect("authenticated glass owner"),

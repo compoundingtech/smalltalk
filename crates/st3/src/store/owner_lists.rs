@@ -34,13 +34,23 @@ impl OwnerView {
     fn owners(self, connection: &Connection) -> Result<BTreeSet<String>> {
         match self {
             Self::Glasses => {
+                // The current heads name every person with a glass, plus the subjects whose
+                // heads are not flushed yet: no read of glass history.
                 let mut statement = connection.prepare_cached(
-                    "SELECT DISTINCT subject FROM claims WHERE kind IN ('glass.upserted','glass.deleted')",
+                    "SELECT DISTINCT person FROM glass_heads
+                     UNION SELECT claims.subject FROM local_glass_head_pending
+                         JOIN claims ON claims.id=local_glass_head_pending.claim_id
+                     UNION SELECT subject FROM local_glass_head_dirty",
                 )?;
-                let subjects = statement
+                let names = statement
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(subjects.iter().filter_map(|subject| glass_owner(subject)).collect())
+                Ok(names
+                    .iter()
+                    .filter_map(|name| {
+                        if name.starts_with("glass/") { glass_owner(name) } else { Some(name.clone()) }
+                    })
+                    .collect())
             }
             Self::Arrangements => {
                 let mut statement =
@@ -152,14 +162,32 @@ impl Store {
             let projection = self.attention_projection_frontier()?;
             let connection = self.readers.get();
             let (mut owners, people) = match &previous {
-                Some(previous) if previous.projection == projection && previous.cut <= index => {
-                    if previous.cut == index {
-                        return Ok(false);
+                Some(previous) if previous.cut <= index => {
+                    // Deferred replication projection catching up under the same claims rereads
+                    // only the people its projected claims name.
+                    let projected = match (&previous.projection, &projection) {
+                        (before, now) if before == now => Some(BTreeSet::new()),
+                        (Some((status, after)), Some((now_status, through)))
+                            if status == now_status && after <= through =>
+                        {
+                            Some(view.changed_owners(&connection, *after, *through)?)
+                        }
+                        _ => None,
+                    };
+                    match projected {
+                        Some(projected) => {
+                            if previous.cut == index && previous.projection == projection {
+                                return Ok(false);
+                            }
+                            let mut people = view.changed_owners(&connection, previous.cut, index)?;
+                            people.extend(projected);
+                            ((*previous.owners).clone(), people)
+                        }
+                        None => {
+                            list.full_reads.fetch_add(1, AtomicOrdering::Relaxed);
+                            (HashMap::new(), view.owners(&connection)?)
+                        }
                     }
-                    (
-                        (*previous.owners).clone(),
-                        view.changed_owners(&connection, previous.cut, index)?,
-                    )
                 }
                 _ => {
                     list.full_reads.fetch_add(1, AtomicOrdering::Relaxed);

@@ -198,39 +198,60 @@ pub(super) fn retain_timestamp(items: &mut [Value], previous: &BTreeMap<String, 
     }
 }
 
-/// Publish the summary row of every selection a window read within `idle_ms`, all at one cut
-/// in one snapshot, computed as a window would compute it. Windows then serve these rows and
-/// never compute a summary themselves; each selection costs one computation per refresh, however
-/// many windows show it. Returns whether any selection's counts changed.
+/// How often a published summary row is computed again with nothing else changed: delivery
+/// staleness, machine recency and mission deadlines read the clock.
+const PUBLISHED_PERIOD_MS: u128 = 30_000;
+
+/// Publish the summary row of every selection a window read within `idle_ms`, each computed as
+/// a window would compute it, in its own short snapshot. Windows then serve these rows and never
+/// compute a summary themselves; each selection costs one computation per change, however many
+/// windows show it. A selection whose inputs (cut, attention, roster, clock period) are unchanged
+/// is not computed again. A selection that fails is not published, and its windows read for
+/// themselves; the others are unaffected. Returns whether any selection's counts changed.
 pub(in crate::api) fn refresh_published(state: &AppState, idle_ms: u64) -> anyhow::Result<bool> {
     let (generation, selections) = state.store.summary_selections(idle_ms);
-    if selections.is_empty() {
-        return Ok(false);
-    }
-    let now = client_now_ms();
-    let publication = state.store.read_snapshot(|index| {
-        let snapshot = client_snapshot_at(state, index);
-        let mut rows = std::collections::HashMap::new();
-        for person in selections {
-            // The selection alone decides the counts; a session's terminal grants change none.
-            let session = ClientSession::local(person.as_deref())
-                .map_err(|error| anyhow::anyhow!(error.message))?;
+    let attention = state.store.attention_list_revision();
+    let roster = *state.store.subscribe_agent_roster().borrow();
+    let mut changed = false;
+    for (person, before) in selections {
+        let computed = state.store.read_snapshot(|index| {
+            let now = client_now_ms();
+            let inputs = crate::store::summary_list::SummaryInputs {
+                cut: index,
+                attention,
+                roster,
+                period: now / PUBLISHED_PERIOD_MS,
+            };
+            if before.as_ref() == Some(&inputs) {
+                return Ok(None);
+            }
+            // The selection alone decides the counts: a read-only local session passes any
+            // selected person through, and its terminal grants change no count.
+            let session = ClientSession::local(None).map_err(|error| anyhow::anyhow!(error.message))?;
             let request: CollectionSubscribe = serde_json::from_value(json!({
                 "kind":"subscribe", "id":"summary", "collection":"summary", "limit":1, "person":person,
             }))?;
+            let snapshot = client_snapshot_at(state, index);
             let row = native(state, &session, &request, &snapshot, now, None, None)?
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("a summary computes one row"))?;
-            rows.insert(person, row);
-        }
-        Ok(crate::store::summary_list::SummaryPublication {
-            cut: index,
-            published_at_unix_ms: client_now_ms(),
-            rows,
-        })
-    })?;
-    let changed = state.store.publish_summary(generation, publication);
+            Ok(Some(crate::store::summary_list::SummaryRow {
+                cut: index,
+                published_at_unix_ms: client_now_ms(),
+                row,
+                inputs,
+            }))
+        });
+        changed |= match computed {
+            Ok(None) => false,
+            Ok(Some(row)) => state.store.publish_summary_row(generation, &person, Some(row)),
+            Err(error) => {
+                eprintln!("st3: the summary of {person:?} failed; its windows read it themselves: {error:#}");
+                state.store.publish_summary_row(generation, &person, None)
+            }
+        };
+    }
     if changed {
         state.store.publish_collection_view("summary");
     }

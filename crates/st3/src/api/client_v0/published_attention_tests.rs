@@ -127,8 +127,16 @@ async fn summary_window(
     state: &AppState,
     session: &ClientSession,
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+    summary_window_for(state, session, None).await
+}
+
+async fn summary_window_for(
+    state: &AppState,
+    session: &ClientSession,
+    person: Option<&str>,
+) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     let request: CollectionSubscribe = serde_json::from_value(json!({
-        "kind":"subscribe", "id":"top-bar", "collection":"summary", "limit":1,
+        "kind":"subscribe", "id":"top-bar", "collection":"summary", "limit":1, "person":person,
     }))
     .unwrap();
     let permit = Arc::new(tokio::sync::Semaphore::new(1)).acquire_owned().await.unwrap();
@@ -137,8 +145,12 @@ async fn summary_window(
 
 /// The counts a summary window computes for itself at the current cut.
 fn computed_summary(state: &AppState, session: &ClientSession) -> Value {
+    computed_summary_for(state, session, None)
+}
+
+fn computed_summary_for(state: &AppState, session: &ClientSession, person: Option<&str>) -> Value {
     let request: CollectionSubscribe = serde_json::from_value(json!({
-        "kind":"subscribe", "id":"top-bar", "collection":"summary", "limit":1,
+        "kind":"subscribe", "id":"top-bar", "collection":"summary", "limit":1, "person":person,
     }))
     .unwrap();
     state
@@ -198,4 +210,37 @@ async fn summary_windows_serve_the_published_row_of_their_selection() {
     let (_, items, _) = summary_window(&state, &ada).await.unwrap();
     assert_eq!(items[0]["needs_you"], 2);
     assert_eq!(counts(&items[0]), counts(&computed_summary(&state, &ada)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn odd_and_surplus_summary_selections_never_stop_the_others() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::test_state_named(root.path(), "summary-selections");
+    custom(&state, "custom/garden/review/v1/ada-one", "person/ada");
+    state.store.start_attention_list_refresher().unwrap();
+    let agent = ClientSession::local(Some("agent/garden/seed")).unwrap();
+    let counts = |row: &Value| {
+        json!([row["person_id"], row["needs_you"], row["working_agents"],
+            row["active_missions"], row["machines"], row["revision"]])
+    };
+    // An agent may select any name; one that is no person still publishes, beside the others.
+    for person in ["not-a-person", "person/ada"] {
+        assert!(summary_window_for(&state, &agent, Some(person)).await.is_err());
+    }
+    summary::refresh_published(&state, 60_000).unwrap();
+    for person in ["not-a-person", "person/ada"] {
+        let (snapshot, items, _) = summary_window_for(&state, &agent, Some(person)).await.unwrap();
+        assert!(snapshot.published_at.is_some(), "{person} is published");
+        assert_eq!(counts(&items[0]), counts(&computed_summary_for(&state, &agent, Some(person))));
+    }
+    // Unchanged inputs compute nothing again.
+    assert!(!summary::refresh_published(&state, 60_000).unwrap());
+    // Past the selections it keeps, a window reads its own summary at once.
+    for number in 0..64 {
+        let _ = state.store.published_summary(Some(&format!("person/{number}")));
+    }
+    let surplus = "person/robin";
+    let (snapshot, items, _) = summary_window_for(&state, &agent, Some(surplus)).await.unwrap();
+    assert!(snapshot.published_at.is_none(), "read by the window itself");
+    assert_eq!(counts(&items[0]), counts(&computed_summary_for(&state, &agent, Some(surplus))));
 }
