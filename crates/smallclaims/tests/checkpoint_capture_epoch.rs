@@ -58,6 +58,70 @@ fn capture_prefix(store: &Store) -> (i64, i64) {
 }
 
 #[test]
+fn capture_delete_predicates_seek_claim_relationships_without_scanning_the_frontier() {
+    let store = Store::open_memory("writer", Arc::new(Plain)).unwrap();
+    let connection = store.readers.get();
+    for table in ["claims", "replica_records", "batches"] {
+        let trigger: String = connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [format!("{table}_checkpoint_capture_DELETE")], |row| row.get(0),
+        ).unwrap();
+        let (_, predicate) = trigger.split_once(" WHEN ").unwrap();
+        let (predicate, _) = predicate.rsplit_once(" BEGIN").unwrap();
+        let plan: Vec<String> = connection.prepare(&format!(
+            "EXPLAIN QUERY PLAN SELECT ({predicate}) FROM {table} AS OLD WHERE OLD.rowid=1"
+        )).unwrap().query_map([], |row| row.get(3)).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains("replica_envelopes_batch (batch_id=")),
+            "{table} must seek batch membership: {plan:?}",
+        );
+        assert!(
+            plan.iter().any(|step| step.contains("replica_records_claim (claim_id=")),
+            "{table} must seek record membership: {plan:?}",
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("SCAN envelopes")
+                || step.contains("SCAN records")
+                || step.contains("INTEGER PRIMARY KEY (rowid<?)")),
+            "{table} must not scan the envelope frontier per mutation: {plan:?}",
+        );
+    }
+}
+
+#[test]
+fn guard_version_two_upgrades_indexed_predicates_and_preserves_active_bounds() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("claims.sqlite3");
+    let store = Store::open(&path, "writer", Arc::new(Plain)).unwrap();
+    append(&store, "captured");
+    store.seal_local_batches().unwrap();
+    let (frontier, before) = capture_prefix(&store);
+    store.connection.write().execute_batch(
+        "UPDATE checkpoint_capture_epoch SET trigger_version=2 WHERE id=1;
+         DROP TRIGGER claims_checkpoint_capture_DELETE;
+         CREATE TRIGGER claims_checkpoint_capture_DELETE AFTER DELETE ON claims BEGIN
+             UPDATE checkpoint_capture_epoch SET value=value+1 WHERE id=1;
+         END;",
+    ).unwrap();
+    drop(store);
+    let upgraded = Store::open(&path, "writer", Arc::new(Plain)).unwrap();
+    let bounds: (i64, i64, i64, i64) = upgraded.readers.get().query_row(
+        "SELECT value,envelope_frontier,cut_unix_ms,trigger_version FROM checkpoint_capture_epoch WHERE id=1",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap();
+    assert_eq!(bounds, (before + 1, frontier, CUT, 3));
+    let trigger: String = upgraded.readers.get().query_row(
+        "SELECT sql FROM sqlite_master WHERE name='claims_checkpoint_capture_DELETE'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert!(trigger.contains("CROSS JOIN replica_envelopes"), "old predicates survived: {trigger}");
+    drop(upgraded);
+    let reopened = Store::open(&path, "writer", Arc::new(Plain)).unwrap();
+    assert_eq!(epoch(&reopened), before + 1, "ordinary reopen repeated the guard migration");
+}
+
+#[test]
 fn ordinary_append_does_not_invalidate_the_captured_prefix() {
     let store = Store::open_memory("writer", Arc::new(Plain)).unwrap();
     append(&store, "captured");
@@ -671,7 +735,7 @@ fn old_version18_trigger_upgrade_preserves_frontier_and_atomically_advances_epoc
         "SELECT value,envelope_frontier,cut_unix_ms,trigger_version FROM checkpoint_capture_epoch WHERE id=1",
         [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     ).unwrap();
-    assert_eq!(bounds, (42, frontier, 0, 2));
+    assert_eq!(bounds, (42, frontier, 0, 3));
     upgraded.connection.write().execute("UPDATE claims SET body=body||' '", []).unwrap();
     assert_eq!(epoch(&upgraded), 42, "legacy default cut zero must remain inactive");
     capture_prefix(&upgraded);
@@ -684,7 +748,7 @@ fn old_version18_trigger_upgrade_preserves_frontier_and_atomically_advances_epoc
         "SELECT value,envelope_frontier,cut_unix_ms,trigger_version FROM checkpoint_capture_epoch WHERE id=1",
         [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     ).unwrap();
-    assert_eq!(bounds, (before, frontier, CUT, 2), "reopen rewrote the guard");
+    assert_eq!(bounds, (before, frontier, CUT, 3), "reopen rewrote the guard");
 }
 
 #[test]

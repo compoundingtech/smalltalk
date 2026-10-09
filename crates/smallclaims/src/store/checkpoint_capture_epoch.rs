@@ -1,7 +1,7 @@
 //! Persistent, cut-aware invalidation across independent checkpoint page snapshots.
 use super::*;
 
-const TRIGGER_VERSION: i64 = 2;
+const TRIGGER_VERSION: i64 = 3;
 const GUARD: &str = "checkpoint_capture_epoch WHERE id=1";
 const TABLES: &[&str] = &[
     "claims",
@@ -91,15 +91,19 @@ fn record_envelope_relevant(alias: &str) -> String {
 }
 
 fn claim_envelope_relevant(id: &str, batch: &str) -> String {
+    // Seek each relationship independently. Combining batch membership and record
+    // membership under one envelope-side OR scans the entire frontier for every
+    // deleted claim during trim. CROSS JOIN keeps record membership driven by the
+    // claim-id index before the exact envelope-identity lookup.
+    let envelope = envelope_relevant("envelopes");
     format!(
-        "EXISTS(SELECT 1 FROM replica_envelopes AS envelopes
-         WHERE (envelopes.batch_id={batch}
-           OR EXISTS(SELECT 1 FROM replica_records AS records
-             WHERE records.claim_id={id} AND records.writer=envelopes.writer
-               AND records.sequence=envelopes.sequence
-               AND records.envelope_hash=envelopes.envelope_hash))
-           AND {})",
-        envelope_relevant("envelopes")
+        "(EXISTS(SELECT 1 FROM replica_envelopes AS envelopes
+          WHERE envelopes.batch_id={batch} AND {envelope})
+          OR EXISTS(SELECT 1 FROM replica_records AS records
+            CROSS JOIN replica_envelopes AS envelopes
+              ON envelopes.writer=records.writer AND envelopes.sequence=records.sequence
+                AND envelopes.envelope_hash=records.envelope_hash
+            WHERE records.claim_id={id} AND {envelope}))"
     )
 }
 

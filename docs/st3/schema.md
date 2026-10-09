@@ -5,7 +5,7 @@ This file is generated from `st3-schema`.
 Schema: `st3.v1`
 Digest: `75a909dc601e114d62edf7c6a01ee228b7ffa527cbce9e9f1ed2bbf161a6a925`
 Storage version: `18`
-Storage digest: `f7b1563a07f0cccca7a6f8d6057302c7c78d0b94bda0eb60164643b782db825b`
+Storage digest: `d11a3e5db57db0a0bd6a9b27474cdd93958a401b3a6482b62aea3595530dbcef`
 
 ## Subject families
 
@@ -224,7 +224,7 @@ OMP's native `abandoned` tasks are omitted from phase tasks rather than relabele
 
 ## Local checkpoint capture storage
 
-SQLite `user_version` is 18. The local checkpoint guard uses trigger version 2, independently of the unchanged claim/wire registry digest. Initialization adds the singleton, any missing guard columns, and its mutation triggers; it does not scan history, rewrite claim bodies, rebuild projections, or force replay.
+SQLite `user_version` is 18. The local checkpoint guard uses trigger version 3, independently of the unchanged claim/wire registry digest. Initialization adds the singleton, any missing guard columns, and its mutation triggers; it does not scan history, rewrite claim bodies, rebuild projections, or force replay.
 
 ```sql
 CREATE TABLE IF NOT EXISTS checkpoint_capture_epoch (
@@ -241,6 +241,8 @@ Before the first page, a short read snapshot chooses the sealed envelope rowid a
 
 An envelope is relevant when its rowid is at/below the registered frontier and its accepted time is below the registered cut. A protected or canonical-order target additionally requires the claim's own accepted time below the cut. Mutations audit both OLD and NEW identities and references. These retained highwaters can conservatively invalidate a smaller later capture, but ordinary above-cut history does not invalidate it merely because that history is already within the row frontier.
 
+Claim-to-envelope relevance seeks batch membership through `replica_envelopes_batch` and record membership through `replica_records_claim`, then performs an exact envelope-identity lookup. The two relationships use separate EXISTS branches; record membership is driven from records with CROSS JOIN, not from the envelope frontier. Mutation work therefore depends on the target's relationships rather than unrelated retained history. Guard version 3 replaces version 2's envelope-side OR predicate, which scanned the frontier for each deleted claim during trim, without changing invalidation semantics or adding indexes.
+
 | Captured source | Mutations that increment the epoch |
 |---|---|
 | `claims` | Relevant envelope-associated body, identity, canonical-key and membership changes, body backfills, and deletions. Late claims in a relevant envelope remain exclusion witnesses: changing their accepted time, identity or batch, or deleting them, can change whether that envelope qualifies. |
@@ -254,6 +256,6 @@ An envelope is relevant when its rowid is at/below the registered frontier and i
 
 Capture does not read envelope signatures/holds, projection-health rows, peer/cursor state, blob bytes, operation caches, or checkpoint status as metadata, so mutations confined to those tables need no capture fence. Blob-backed document bindings and operation identity in claim bodies/tombstones are covered by their captured tables. Any future captured source must extend the trigger audit before pages may read it. Accepted-time parsing remains a prerequisite owned by #2106, not a separate compatibility change here.
 
-Triggers persist and increment the epoch in the mutation's own transaction on every connection, without connection-local hooks or SQL functions. Rollback rolls back the increment too. A trigger-version migration atomically drops/recreates the old predicates, increments `value`, and stores `trigger_version=2`; captures using the old guard must restart. Earlier version-18 PR-head stores receive `cut_unix_ms` and `trigger_version` columns with default zero while preserving their epoch and frontier. Ordinary reopens preserve all bounds and do not repeat the migration.
+Triggers persist and increment the epoch in the mutation's own transaction on every connection, without connection-local hooks or SQL functions. Rollback rolls back the increment too. A trigger-version migration atomically drops/recreates the old predicates, increments `value`, and stores `trigger_version=3`; captures using the old guard must restart. Earlier version-18 PR-head stores receive `cut_unix_ms` and `trigger_version` columns with default zero while preserving their epoch and frontier. Version-2 stores retain their active cut/frontier through the version-3 predicate migration. Ordinary reopens preserve all bounds and do not repeat the migration.
 
-Upgrade requires the normal process restart, not a history migration; its restart duration has not been measured. Stable older binaries reject storage version 18. Earlier version-18 PR-head binaries using guard version 1 cannot safely operate the cut-aware version-2 schema and must not run concurrently or be used for binary rollback. Their copied stores can migrate forward only. Binary rollback requires restoring a pre-upgrade database snapshot; otherwise roll forward. No replicated claim, checkpoint rule, wire protocol, or response shape changes.
+Upgrade requires the normal process restart, not a history migration; its restart duration has not been measured. Stable older binaries reject storage version 18. Earlier version-18 PR-head binaries are not rollback targets: guard version 1 cannot safely operate the cut-aware schema, and guard version 2 rejects trigger version 3 on open. Their copied stores can migrate forward only. Binary rollback requires restoring a pre-upgrade database snapshot; otherwise roll forward. No replicated claim, checkpoint rule, wire protocol, or response shape changes.

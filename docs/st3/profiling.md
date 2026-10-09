@@ -141,6 +141,10 @@ claims still invalidate it. The WAL is released between pages rather than pinned
 and the full body pass. The default and maximum capture page sizes are 64 envelopes/records.
 The compact metadata pass strictly decodes claim acceptance timestamps before envelope exclusion;
 malformed, negative or overflowing values return an error rather than silently counting as early.
+Capture mutation guards seek batch and record membership through their existing indexes, then
+look up the exact envelope identity. They do not scan the retained envelope frontier for each
+deleted claim during trim. Guard trigger version 3 replaces the earlier envelope-side OR
+predicate atomically while preserving the cut/frontier and invalidation rules.
 Mission-run and planning replay retain the canonical list of IDs and load one claim body at a
 time. Base replay uses a temporary ID order and bounded body pages. Both close their ordering
 or body statements before projection savepoints.
