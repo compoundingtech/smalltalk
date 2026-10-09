@@ -3,7 +3,7 @@ import { API_VERSION } from './Models.generated.ts';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
-    Arrangement, ArrangementId, ArrangementPage,
+    Arrangement, ArrangementId, ArrangementPage, OrderedMembership, OrderedMembershipPage, OrderedMembershipState,
     PublicationDefinition, SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationContentChunk, ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
@@ -66,7 +66,8 @@ export type CollectionStream = {
     /** Hold a window of up to `limit` (1–200) current items. A held ID is replaced. */
     subscribeGlasses(id: string): void;
     subscribeArrangements(id: string, person: string, limit?: number, subject?: ArrangementId): void;
-    subscribe(id: string, collection: Exclude<CollectionName, 'arrangements'>, limit?: number, filters?: CollectionFilters): void;
+    subscribeOrderedMemberships(id: string, person: string, subject: ArrangementId, limit?: number): void;
+    subscribe(id: string, collection: Exclude<CollectionName, 'arrangements' | 'ordered-memberships'>, limit?: number, filters?: CollectionFilters): void;
     /** Follow a terminal with the incarnation and single-use capability `terminal.attach` returned. */
     subscribeTerminal(id: string, terminal: string, incarnation: string | null | undefined, capability: string): void;
     /** Follow the conversation of an agent or a session. */
@@ -74,19 +75,34 @@ export type CollectionStream = {
     unsubscribe(id: string): void;
     close(): void;
 };
-/** A window's rows in display order, as `applyWindow` keeps them. */
-export type CollectionWindow = { items: Resource[]; hasMore: boolean; snapshot: Snapshot };
+/** A window's rows in display order, as `applyWindow` keeps them: resources, or the
+ * `ordered-memberships` rows of an `OrderedMembershipFrame`. A membership window also holds the
+ * whole container's latest `membership` state, which moves on edits outside its rows too.
+ * `membership.changed_index` is an opaque host-local invalidation frontier scoped by
+ * `snapshot.host_id`: not a canonical revision, and never comparable across hosts. */
+export type CollectionWindow<TItem extends { id: string } = Resource> = { items: TItem[]; hasMore: boolean; snapshot: Snapshot }
+    & ([TItem] extends [OrderedMembership] ? { membership: OrderedMembershipState } : unknown);
+/** A `snapshot` or `changes` frame of an `ordered-memberships` subscription. */
+export type OrderedMembershipFrame = Extract<CollectionFrame, { collection: 'ordered-memberships' }>;
+/** Every frame except an `ordered-memberships` window's: its windows hold resources. */
+export type ResourceCollectionFrame = Exclude<CollectionFrame, OrderedMembershipFrame>;
 
 /** Apply one `snapshot` or `changes` frame to a window: removals and upserts first, then the
- * frame's complete order. A `changes` frame without an earlier snapshot has nothing to apply to. */
-export function applyWindow(window: CollectionWindow | undefined, frame: CollectionFrame): CollectionWindow | undefined {
+ * frame's complete order. A `changes` frame without an earlier snapshot has nothing to apply to.
+ * Membership frames keep membership windows; narrow on `frame.collection` to pick one. A
+ * membership `changes` frame that leaves rows, order, and `hasMore` alone still replaces the
+ * window's `membership` state. */
+export function applyWindow(window: CollectionWindow<OrderedMembership> | undefined, frame: OrderedMembershipFrame): CollectionWindow<OrderedMembership> | undefined;
+export function applyWindow(window: CollectionWindow | undefined, frame: ResourceCollectionFrame): CollectionWindow | undefined;
+export function applyWindow(window: CollectionWindow<{ id: string }> | undefined, frame: CollectionFrame): CollectionWindow<{ id: string }> | CollectionWindow<OrderedMembership> | undefined {
     if (frame.kind !== 'snapshot' && frame.kind !== 'changes') return window;
     if (frame.kind === 'changes' && !window) return undefined;
-    const rows = new Map<string, Resource>(frame.kind === 'snapshot' ? [] : window!.items.map(item => [item.id, item]));
+    const rows = new Map<string, { id: string }>(frame.kind === 'snapshot' ? [] : window!.items.map(item => [item.id, item]));
     if (frame.kind === 'changes') for (const id of frame.removes) rows.delete(id);
     for (const item of frame.kind === 'snapshot' ? frame.items : frame.upserts) rows.set(item.id, item);
     const items = frame.order.flatMap(id => rows.get(id) ?? []);
-    return { items, hasMore: frame.has_more, snapshot: frame.snapshot };
+    const next = { items, hasMore: frame.has_more, snapshot: frame.snapshot };
+    return frame.collection === 'ordered-memberships' ? { ...next, membership: frame.membership } : next;
 }
 
 function defaultTerminalSocket(url: string, protocols: string[], headers: Record<string, string>): TerminalSocket {
@@ -324,6 +340,7 @@ export class St3Client {
         return {
             subscribeGlasses: id => send({kind: 'subscribe', id, collection: 'glasses', limit: 100}),
             subscribeArrangements: (id, person, limit = 100, subject) => send({kind: 'subscribe', id, collection: 'arrangements', person, limit, ...(subject === undefined ? {} : {subject})}),
+            subscribeOrderedMemberships: (id, person, subject, limit = 100) => send({kind: 'subscribe', id, collection: 'ordered-memberships', person, subject, limit}),
             subscribe: (id, collection, limit, filters = {}) => send({ kind: 'subscribe', id, collection, ...(limit === undefined ? {} : { limit }), ...filters }),
             subscribeTerminal: (id, terminal, incarnation, capability) => send({ kind: 'subscribe', id, collection: 'terminal', terminal, incarnation, capability }),
             subscribeConversation: (id, conversation) => send({ kind: 'subscribe', id, collection: 'conversation', conversation }),
@@ -404,6 +421,7 @@ export class St3Client {
     async terminalScreen(id: string): Promise<EnvelopeOf<TerminalScreen>> { return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/screen`); }
     async arrangementsList(person: string, options: PageOptions = {}): Promise<EnvelopeOf<ArrangementPage>> { return this.get('/v1/client/arrangements' + query({ person, ...options })); }
     async arrangementsGet(personName: string, uuid: string): Promise<EnvelopeOf<Arrangement>> { return this.get(`/v1/client/arrangements/${encodeURIComponent(personName)}/${encodeURIComponent(uuid)}`); }
+    async arrangementsMemberships(personName: string, uuid: string, person: string, options: PageOptions = {}): Promise<EnvelopeOf<OrderedMembershipPage>> { return this.get(`/v1/client/arrangements/${encodeURIComponent(personName)}/${encodeURIComponent(uuid)}/memberships` + query({ person, ...options })); }
     async glassesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/glasses' + query(options)); }
     async glassesGet(id: string): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(routedId(id))}`); }
     async agentCreate(input: Omit<ActionOf<'agent.create'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.create' } as ActionOf<'agent.create'>); }
@@ -413,6 +431,7 @@ export class St3Client {
     async agentStop(input: Omit<ActionOf<'agent.stop'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.stop' } as ActionOf<'agent.stop'>); }
     async agentSuspend(input: Omit<ActionOf<'agent.suspend'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.suspend' } as ActionOf<'agent.suspend'>); }
     async arrangementEdit(input: Omit<ActionOf<'arrangement.edit'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'arrangement.edit' } as ActionOf<'arrangement.edit'>); }
+    async arrangementMembershipEdit(input: Omit<ActionOf<'arrangement.membership.edit'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'arrangement.membership.edit' } as ActionOf<'arrangement.membership.edit'>); }
     async attentionResolve(input: Omit<ActionOf<'attention.resolve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'attention.resolve' } as ActionOf<'attention.resolve'>); }
     async customReply(input: Omit<ActionOf<'custom.reply'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'custom.reply' } as ActionOf<'custom.reply'>); }
     async laneApprove(input: Omit<ActionOf<'lane.approve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.approve' } as ActionOf<'lane.approve'>); }

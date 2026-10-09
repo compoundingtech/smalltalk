@@ -150,7 +150,8 @@ impl Runtime for SmalltalkRuntime {
         custom::create_schema(connection)?;
         agent_messages::create_schema(connection)?;
         glass_heads::create_schema(connection)?;
-        limits::create_limits_schema(connection)
+        limits::create_limits_schema(connection)?;
+        ordered_membership::create_schema(connection)
     }
 
     fn open_projections(&self, transaction: &Transaction<'_>, shared_memory: bool) -> Result<()> {
@@ -161,6 +162,7 @@ impl Runtime for SmalltalkRuntime {
         arrangements::open(transaction)?;
         limits::open_limits(transaction)?;
         resource_references::open(transaction, shared_memory)?;
+        ordered_membership::open(transaction)?;
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
@@ -224,7 +226,24 @@ impl Runtime for SmalltalkRuntime {
         repaired: &str,
         replacement: &str,
     ) -> Result<()> {
-        select_desired_repair_tx(transaction, repaired, replacement)
+        select_desired_repair_tx(transaction, repaired, replacement)?;
+        let original: Option<(String, String)> = transaction.query_row(
+            "SELECT subject,kind FROM claims WHERE id=?1",
+            [repaired], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let Some((subject, kind)) = original else { return Ok(()); };
+        if matches!(kind.as_str(), "arrangement.edited" | "ordered-membership.edited") {
+            // Repair retracts every operation in the original, including pairs omitted
+            // by its replacement and the arrangement's shared revision. Reuse the same
+            // unrepaired-authority reducer as restart/checkpoint instead of partial undo.
+            arrangements::rebuild(transaction)?;
+            ordered_membership::rebuild(transaction)?;
+            arrangements::repair_frontier(transaction, &subject)?;
+            ordered_membership::repair_frontier(transaction, &subject)?;
+        } else {
+            ordered_membership::member_repaired(transaction, &subject)?;
+        }
+        Ok(())
     }
 
     fn append_claim_tx(
@@ -277,6 +296,7 @@ impl Runtime for SmalltalkRuntime {
         glass_heads::flush(transaction).map_err(internal)?;
         agent_messages::flush(transaction).map_err(internal)?;
         limits::flush_limits(transaction).map_err(internal)?;
+        ordered_membership::flush(transaction).map_err(internal)?;
         reapply_local_work_lease_renewals_tx(transaction)
     }
 
@@ -352,7 +372,7 @@ impl Runtime for SmalltalkRuntime {
 
 /// The version of smalltalk's shared projection layout, beside the claim vocabulary. Nodes whose
 /// layouts differ keep exchanging claim authority but do not compare projection maps.
-const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.declared-resource-edges.v5";
+const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.ordered-membership.v1";
 
 /// The replication `schema_digest`: the claim vocabulary digest and the shared projection layout.
 pub(crate) fn compatibility_digest(registry_digest: &str) -> String {

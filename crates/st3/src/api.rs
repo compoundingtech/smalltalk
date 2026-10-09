@@ -461,6 +461,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/client/arrangements/{person_name}/{uuid}",
             get(client_v0::arrangements::get),
         )
+        .route(
+            "/v1/client/arrangements/{person_name}/{uuid}/memberships",
+            get(client_v0::arrangements::memberships),
+        )
         .route("/v1/client/glasses", get(client_v0::glasses_list))
         .route(
             "/v1/client/glasses/{id}",
@@ -1295,6 +1299,11 @@ fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
         | "invalid-arrangement-subject" | "invalid-arrangement-action"
         | "invalid-arrangement-operations" | "invalid-arrangement-folder"
         | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference"
+        | "invalid-arrangement-version" | "invalid-arrangement-body"
+        | "unsupported-membership-container" | "membership-owner-forbidden"
+        | "invalid-membership-member" | "invalid-membership-bucket"
+        | "invalid-membership-key" | "invalid-membership-operations"
+        | "membership-edit-too-large"
     )) { return false; }
     matches!(
         code,
@@ -1342,6 +1351,15 @@ fn client_error_code(code: Option<&str>) -> String {
         | "invalid-arrangement-name"
         | "invalid-arrangement-key"
         | "invalid-subject-reference"
+        | "invalid-arrangement-version"
+        | "invalid-arrangement-body"
+        | "unsupported-membership-container"
+        | "membership-owner-forbidden"
+        | "invalid-membership-member"
+        | "invalid-membership-bucket"
+        | "invalid-membership-key"
+        | "invalid-membership-operations"
+        | "membership-edit-too-large"
         | "stale-fence"
         | "timeline-history-incomplete"
         | "cursor-gap"

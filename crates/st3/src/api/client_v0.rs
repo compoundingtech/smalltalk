@@ -57,6 +57,7 @@ struct CollectionSubscription {
     previous: BTreeMap<String, Value>,
     order: Vec<String>,
     has_more: bool,
+    membership: Option<st3_schema::ordered_membership::State>,
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
@@ -81,6 +82,11 @@ fn collection_ignores(collection: &str, kind: &str) -> bool {
     if collection == "arrangements" {
         return !kind.starts_with("arrangement.")
             && !matches!(kind, "custom.client.pairing-completed" | "custom.client.pairing-revoked");
+    }
+    // The projection's revision includes container edits and registry-selected member
+    // lifecycle changes; do not duplicate that registry with a list of claim kinds here.
+    if collection == "ordered-memberships" {
+        return !matches!(kind, "custom.client.pairing-completed" | "custom.client.pairing-revoked");
     }
     matches!(kind, "daemon.diagnostic" | "transport.observed" | "workspace.observed")
         || (kind == "harness.usage" && collection != "agents")
@@ -120,9 +126,11 @@ async fn collection_items(
     session: &ClientSession,
     request: &CollectionSubscribe,
     read_permit: tokio::sync::OwnedSemaphorePermit,
-) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+) -> Result<CollectionRead, ApiError> {
     collection_items_with_windows(state, session, request, read_permit, None).await
 }
+
+type CollectionRead = (ClientSnapshot, Vec<Value>, bool, Option<st3_schema::ordered_membership::State>);
 
 async fn collection_items_with_windows(
     state: &AppState,
@@ -130,20 +138,23 @@ async fn collection_items_with_windows(
     request: &CollectionSubscribe,
     read_permit: tokio::sync::OwnedSemaphorePermit,
     windows: Option<Arc<collection_windows::Windows>>,
-) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+) -> Result<CollectionRead, ApiError> {
     if !matches!(
         request.collection.as_str(),
-        "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements"
+        "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements" | "ordered-memberships"
     ) {
         return Err(validation("unknown collection subscription"));
     }
     if request.status.is_some() && request.collection != "agents" {
         return Err(validation("status filters are supported for agents only"));
     }
-    if request.subject.is_some() && request.collection != "arrangements" {
+    if request.subject.is_some() && !matches!(request.collection.as_str(), "arrangements" | "ordered-memberships") {
         return Err(validation(
-            "subject filters are supported for arrangements only",
+            "subject filters are supported for arrangements and ordered memberships only",
         ));
+    }
+    if request.collection == "ordered-memberships" && request.subject.is_none() {
+        return Err(validation("ordered memberships require an arrangement subject"));
     }
     let limit = request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS);
     if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
@@ -154,7 +165,7 @@ async fn collection_items_with_windows(
             return Err(validation("glasses select the session person"));
         }
         Some(glass_person(session, false)?)
-    } else if request.collection == "arrangements" {
+    } else if matches!(request.collection.as_str(), "arrangements" | "ordered-memberships") {
         if request.actor.is_some() {
             return Err(validation(
                 "arrangements select an explicit person, not an actor",
@@ -209,9 +220,9 @@ async fn collection_items_with_windows(
     let status = request.status.clone();
     let collection = request.collection.clone();
     let custom_forms = session.custom_forms;
-    let arrangement_window = collection == "arrangements";
+    let arrangement_window = matches!(collection.as_str(), "arrangements" | "ordered-memberships");
     let mut admitted = collection != "agents";
-    let (snapshot, mut items, mut has_more) = loop {
+    let (snapshot, mut items, mut has_more, membership) = loop {
         let roster_admission = if collection == "agents" && admitted {
             Some(state.store.admit_agent_resources().await)
         } else {
@@ -248,7 +259,7 @@ async fn collection_items_with_windows(
                     require_scope(&current, "read.projections")?;
                     let person = match collection.as_str() {
                         "glasses" => Some(glass_person(&current, false)?),
-                        "arrangements" => Some(arrangements::person(
+                        "arrangements" | "ordered-memberships" => Some(arrangements::person(
                             &current,
                             request.person.as_deref(),
                             false,
@@ -280,7 +291,7 @@ async fn collection_items_with_windows(
                             ids.truncate(limit);
                             let mut items = mission_list_cards_at(&store, &ids, now)?;
                             has_more |= bound_mission_cards(&mut items)?;
-                            return Ok((items, has_more));
+                            return Ok((items, has_more, None));
                         }
                         "glasses" => store.glasses(
                             person.as_deref().expect("authenticated glass owner"),
@@ -296,6 +307,12 @@ async fn collection_items_with_windows(
                                 )?
                             }
                         }
+                        "ordered-memberships" => store.ordered_memberships(
+                            subject.as_deref().expect("selected arrangement subject"),
+                            index,
+                            None,
+                            limit.saturating_add(1),
+                        )?,
                         "attention" => {
                             client_attention_resources_at(&store, person.as_deref(), false, now)?
                         }
@@ -316,16 +333,23 @@ async fn collection_items_with_windows(
                     // Agent status/availability depends on live local delivery presence; overlay and
                     // filter it on every read, after reusing the immutable graph-derived rows.
                     if collection == "agents" {
-                        return Ok((items, false));
+                        return Ok((items, false, None));
                     }
                     if let Some(status) = &status {
                         items.retain(|item| item["state"].as_str() == Some(status.as_str()));
                     }
                     let has_more = items.len() > limit;
                     items.truncate(limit);
-                    Ok((items, has_more))
+                    let membership = if collection == "ordered-memberships" {
+                        Some(store.ordered_membership_state(
+                            subject.as_deref().expect("selected arrangement subject"),
+                        )?)
+                    } else {
+                        None
+                    };
+                    Ok((items, has_more, membership))
                 };
-                let (mut items, mut has_more) = match &windows {
+                let (mut items, mut has_more, membership) = match &windows {
                     Some(windows) => windows.read(
                         &state,
                         &current,
@@ -348,7 +372,7 @@ async fn collection_items_with_windows(
                     has_more = items.len() > limit;
                     items.truncate(limit);
                 }
-                Ok(Ok(Some((snapshot, items, has_more))))
+                Ok(Ok(Some((snapshot, items, has_more, membership))))
             })
         });
         Ok((result?, read_permit, admission))
@@ -365,7 +389,7 @@ async fn collection_items_with_windows(
         has_more |= end < items.len();
         items.truncate(end);
     }
-    Ok((snapshot, items, has_more))
+    Ok((snapshot, items, has_more, membership))
 }
 
 fn collection_window_label(collection: &str) -> &'static str {
@@ -376,6 +400,7 @@ fn collection_window_label(collection: &str) -> &'static str {
         "work" => "stream collection/work",
         "glasses" => "stream collection/glasses",
         "arrangements" => "stream collection/arrangements",
+        "ordered-memberships" => "stream collection/ordered-memberships",
         _ => "stream collection/invalid",
     }
 }
@@ -413,10 +438,10 @@ enum Refreshed {
 async fn deliver_collection(
     socket: &mut WebSocket,
     subscription: &mut CollectionSubscription,
-    read: Result<(ClientSnapshot, Vec<Value>, bool), ApiError>,
+    read: Result<CollectionRead, ApiError>,
 ) -> Refreshed {
     let request = &subscription.request;
-    let (snapshot, items, has_more) = match read {
+    let (snapshot, items, has_more, membership) = match read {
         Ok(read) => read,
         Err(error) => {
             let retryable = client_error_retryable(error.status, Some(&error.code));
@@ -446,7 +471,11 @@ async fn deliver_collection(
         .filter_map(|item| Some((item["id"].as_str()?.to_owned(), item.clone())))
         .collect();
     let sent = if !subscription.delivered {
-        send_collection(socket, json!({"kind":"snapshot", "id":request.id, "collection":request.collection, "snapshot":snapshot, "items":items, "order":order, "has_more":has_more})).await
+        let mut frame = json!({"kind":"snapshot", "id":request.id, "collection":request.collection, "snapshot":snapshot, "items":items, "order":order, "has_more":has_more});
+        if let Some(membership) = membership {
+            frame["membership"] = json!({"container":request.subject, "live_count":membership.live_count, "changed_index":membership.changed_index});
+        }
+        send_collection(socket, frame).await
     } else {
         let upserts = current
             .iter()
@@ -463,10 +492,15 @@ async fn deliver_collection(
             && removes.is_empty()
             && order == subscription.order
             && has_more == subscription.has_more
+            && membership == subscription.membership
         {
             true
         } else {
-            send_collection(socket, json!({"kind":"changes", "id":request.id, "collection":request.collection, "snapshot":snapshot, "upserts":upserts, "removes":removes, "order":order, "has_more":has_more})).await
+            let mut frame = json!({"kind":"changes", "id":request.id, "collection":request.collection, "snapshot":snapshot, "upserts":upserts, "removes":removes, "order":order, "has_more":has_more});
+            if let Some(membership) = membership {
+                frame["membership"] = json!({"container":request.subject, "live_count":membership.live_count, "changed_index":membership.changed_index});
+            }
+            send_collection(socket, frame).await
         }
     };
     if !sent {
@@ -476,6 +510,7 @@ async fn deliver_collection(
     subscription.previous = current;
     subscription.order = order;
     subscription.has_more = has_more;
+    subscription.membership = membership;
     Refreshed::Current
 }
 
@@ -816,13 +851,13 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     read: F,
 ) where
     F: Fn(AppState, ClientSession, CollectionSubscribe, tokio::sync::OwnedSemaphorePermit) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
+    Fut: Future<Output = Result<CollectionRead, ApiError>> + Send,
 {
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
     let mut changed = state.event_notify.subscribe();
     let windows = collection_windows::Windows::attach(&state.store);
-    let mut window_revisions = [0; 6];
+    let mut window_revisions = [0; 7];
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
     let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
     let mut conversations = ConversationFollowers::default();
@@ -928,7 +963,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         }
                         refresh.push(request.id.clone());
                         generation += 1;
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, generation, reading: None, dirty: false, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, generation, reading: None, dirty: false, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false, membership: None });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
@@ -970,7 +1005,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                     let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims);
                     let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses") && state.store.glasses_changed(weighed, index).unwrap_or(true);
                     let arrangements_changed = subscriptions.values().any(|s| s.request.collection == "arrangements") && state.store.arrangements_changed(weighed, index).unwrap_or(true);
-                    reread_due |= glasses_changed || arrangements_changed || match claims {
+                    let memberships_changed = subscriptions.values().any(|s| s.request.collection == "ordered-memberships") && state.store.ordered_memberships_changed(weighed, index).unwrap_or(true);
+                    reread_due |= glasses_changed || arrangements_changed || memberships_changed || match claims {
                         Err(_) => true,
                         Ok(claims) => claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
                             claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
@@ -1418,6 +1454,7 @@ const LIMITED_PAIRING_SCOPES: &[&str] = &[
 ];
 const ACTIONS: &[&str] = &[
     "arrangement.edit",
+    "arrangement.membership.edit",
     "attention.resolve",
     "review.approve",
     "review.reject",
@@ -1475,6 +1512,7 @@ const ACTIONS: &[&str] = &[
 const AVAILABLE_ACTIONS: &[&str] = &[
     "custom.reply",
     "arrangement.edit",
+    "arrangement.membership.edit",
     "review.approve",
     "review.reject",
     "review.request-changes",
@@ -1642,7 +1680,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
-    capabilities.push(json!({"id":"arrangements", "version":1, "state":if session.allows("read.arrangements") && acting_party(session) { "granted" } else { "ungranted" }}));
+    capabilities.push(json!({"id":"arrangements", "version":2, "state":if session.allows("read.arrangements") && acting_party(session) { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
@@ -9733,7 +9771,7 @@ pub(super) async fn action(
     }
     let mut reconciled_attachment = None;
     let mut checked_fence = request.fence.clone();
-    if request.action_type == "arrangement.edit" {
+    if matches!(request.action_type.as_str(), "arrangement.edit" | "arrangement.membership.edit") {
         // Layout revisions merge; fenced retirement and graph/launch identity revisions
         // are checked in the writer transaction. Attention episodes and external filesystem
         // sessions retain projected preflight checks (external state is outside SQLite).
@@ -9800,10 +9838,10 @@ pub(super) async fn action(
     } else {
         None
     };
-    let arrangement_claim = if request.action_type == "arrangement.edit" {
-        Some(arrangements::edit(&state, &session, &request).await?)
-    } else {
-        None
+    let arrangement_claim = match request.action_type.as_str() {
+        "arrangement.edit" => Some(arrangements::edit(&state, &session, &request).await?),
+        "arrangement.membership.edit" => Some(arrangements::edit_memberships(&state, &session, &request).await?),
+        _ => None,
     };
     let affected = if let Some(attachment) = &terminal_attachment {
         vec![
@@ -9823,7 +9861,7 @@ pub(super) async fn action(
         result["terminal_attachment"] = attachment;
     }
     if let Some(claim) = arrangement_claim {
-        result["arrangement_revision"] = json!(claim.id);
+        result[if request.action_type == "arrangement.membership.edit" { "membership_revision" } else { "arrangement_revision" }] = json!(claim.id);
     }
     let mut persisted_result = result.clone();
     persisted_result
@@ -10164,12 +10202,12 @@ mod tests {
         let session = ClientSession::local(None).unwrap();
         let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
         let windows = collection_windows::Windows::attach(&state.store);
-        let (_, expected, _) = collection_items_with_windows(&state, &session, &request,
+        let (_, expected, _, _) = collection_items_with_windows(&state, &session, &request,
             semaphore.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
         let builds = state.store.agent_resources_builds_for_test();
         let _cold_builder = state.store.admit_agent_resources().await;
         let start = std::time::Instant::now();
-        let (_, actual, _) = tokio::time::timeout(std::time::Duration::from_secs(1),
+        let (_, actual, _, _) = tokio::time::timeout(std::time::Duration::from_secs(1),
             collection_items_with_windows(&state, &session, &request,
                 semaphore.acquire_owned().await.unwrap(), windows)).await
             .expect("warm WS roster must not wait for a cold builder").unwrap();
@@ -10212,7 +10250,7 @@ mod tests {
             }
             let mut expected = None;
             for reader in readers {
-                let (snapshot, items, has_more) = reader.await.unwrap();
+                let (snapshot, items, has_more, _) = reader.await.unwrap();
                 assert_eq!(snapshot.store_index, state.store.index().unwrap());
                 assert!(!has_more);
                 assert_eq!(items.len(), 1);

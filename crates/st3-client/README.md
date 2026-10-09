@@ -17,6 +17,26 @@ parameters, and manually paired action discriminators are private implementation
 Mutation callers pass the latest response snapshot and exact resource fences. `ClientError::Api`
 preserves stable error codes such as `stale-fence`, `runtime-not-local`, and `cursor-gap`.
 
+Ordered membership uses `arrangement_membership_edit` with shared `OrderedMembershipOperation`
+place/remove values; root is an explicit `bucket: None`. Create a new folder-only arrangement
+with `ArrangementEditParameters.version: Some(2)`; absent version retains v1 creation.
+`ArrangementBody` decodes the explicit v1/v2 union and rejects unsupported versions.
+`arrangements_memberships(person_name, uuid, person, cursor, limit)` returns a typed,
+snapshot-bound `OrderedMembershipPage`. `subscribe_ordered_memberships` requires the
+arrangement subject and owning person; lifecycle changes update the held window.
+Membership frames arrive as `CollectionEvent::MembershipSnapshot` and `MembershipChanges`,
+with typed `OrderedMembership` rows rather than graph `Resource` values. Both carry a
+required `membership: OrderedMembershipState` for the whole container; a `MembershipChanges`
+with an unchanged window still reports new state after edits outside it. `changed_index` is an
+opaque host-local invalidation frontier scoped by `snapshot.host_id`, not a canonical revision
+or cross-host value. Decoding a place
+operation requires the bucket field; an omitted bucket is not normalized into a root move.
+Existing v1 placements are not migrated or editable through membership actions. Version 2 and
+membership surfaces require the `arrangements` capability at version 2. Refusals use typed
+codes including `unsupported-membership-container`, `invalid-membership-*`, and
+`invalid-arrangement-version`; a store-index change expires membership page cursors
+(`page-cursor-expired`).
+
 ## Raw PTY connectors
 
 `raw_terminal_attachment(terminal_id, runtime_incarnation, RawTerminalMode::Attach)` acquires

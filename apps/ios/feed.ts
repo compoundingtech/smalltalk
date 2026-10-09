@@ -244,8 +244,10 @@ export class Feed {
   }
 
   private frame(frame: CollectionFrame): void {
+    // The app holds no ordered-membership window; its windows hold resources.
     const id = 'id' in frame ? frame.id : undefined;
     if ((frame.kind === 'snapshot' || frame.kind === 'changes') && frame.id === GLASSES) {
+      if (frame.collection === 'ordered-memberships') return;
       const follow = this.glasses;
       if (!follow) return;
       const next = applyWindow(follow.window, frame);
@@ -255,6 +257,7 @@ export class Feed {
       follow.handlers.onIssue('');
       follow.handlers.onGlasses(next.items.filter(item => item.kind === 'glass') as Glass[]);
     } else if (frame.kind === 'snapshot' || frame.kind === 'changes') {
+      if (frame.collection === 'ordered-memberships') return;
       if (!(frame.id in FEED_WINDOWS)) return;
       const name = frame.id as FeedWindow;
       const next = applyWindow(this.windows[name], frame);

@@ -27,7 +27,9 @@ use smallclaims::store::checkpoint_agreement::*;
 /// Version 11 includes arrangement tables in the graph proof and rebuilds them during replay.
 /// Version 12 ages out the sekrets claims written before they became local observations.
 /// Version 13 retains status transitions selected by the reader after filtering stamped heartbeats.
-pub const RULES_VERSION: u32 = 13;
+/// Version 14 covers ordered membership heads, live ordering, counters and lifecycle dependencies;
+/// it adds no drop rule and retains absent/hidden membership winners.
+pub const RULES_VERSION: u32 = 14;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -90,8 +92,8 @@ sekret.refused slot=subject keep=newest min-age-before-cut=5d
 sekret.changed slot=subject keep=newest min-age-before-cut=5d
 sealed=every-admitted-claim-of-an-envelope-before-the-cut-but-repaired-originals
 proof=the-sealed-claims-and-the-blobs-they-reference
-graph=shared-projection-tables-including-arrangements-and-arrangement_registers-even-when-empty
-replay=clear-arrangements-and-arrangement_registers,rebuild-from-sealed-arrangement-claims
+graph=shared-projection-tables-including-arrangements,arrangement_registers,ordered-membership-raw/live/counts/lifecycle-and-shared-reverse-edges-even-when-empty
+replay=clear-arrangements,arrangement_registers-and-ordered-membership-projections,rebuild-from-retained-claims
 guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,mission-run-input,shared-operation,writer-newest-envelope,whole-envelope
 witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
 carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";
@@ -700,8 +702,14 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
 }
 
 /// Tables projected from claims, children before the tables their foreign keys name.
-pub(crate) const PROJECTION_TABLES: [&str; 23] = [
+pub(crate) const PROJECTION_TABLES: [&str; 29] = [
     "operations",
+    "ordered_membership_live",
+    "ordered_membership_heads",
+    "ordered_membership_counts",
+    "ordered_membership_lifecycle",
+    "local_ordered_membership_pending",
+    "declared_resource_edges",
     "arrangement_registers",
     "arrangements",
     "resource_observations",
@@ -754,6 +762,7 @@ pub(crate) fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
     resources::rebuild(transaction)?;
     glass_heads::rebuild(transaction)?;
     arrangements::rebuild(transaction)?;
+    ordered_membership::rebuild(transaction)?;
     Ok(())
 }
 
@@ -785,6 +794,7 @@ fn subject_answers_inner(connection: &Connection, subject: &str, cut: u128, sour
         let person = st3_schema::arrangements::owner(subject).map_err(anyhow::Error::new)?;
         answers.insert("arrangements".into(), json!(super::arrangements::arrangements_at(connection, person, i64::MAX as u64)?));
         answers.insert("arrangement".into(), json!(super::arrangements::arrangement_at(connection, subject, i64::MAX as u64)?));
+        answers.insert("ordered_membership".into(), super::ordered_membership::witness(connection, subject)?);
     }
     answers.insert(
         "actual".into(),

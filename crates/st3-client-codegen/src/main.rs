@@ -196,6 +196,10 @@ fn rust_operation_methods(
         let id = read["id"].as_str().context("read id")?;
         let path = read["path"].as_str().context("read path")?;
         let method = action_method(id);
+        if id == "arrangements.memberships" {
+            writeln!(out, "    pub async fn arrangements_memberships(&self, person_name: &str, uuid: &str, person: &str, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<OrderedMembershipPage>, ClientError> {{ let mut path = format!(\"/v1/client/arrangements/{{}}/{{}}/memberships?person={{}}\", percent_encode(person_name), percent_encode(uuid), percent_encode(person)); if let Some(cursor) = cursor {{ path.push_str(&format!(\"&cursor={{}}\", percent_encode(cursor))); }} if let Some(limit) = limit {{ path.push_str(&format!(\"&limit={{limit}}\")); }} self.get(&path).await }}")?;
+            continue;
+        }
         if id == "arrangements.list" {
             writeln!(out, "    pub async fn arrangements_list(&self, person: &str, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<ArrangementPage>, ClientError> {{ let mut path = format!(\"/v1/client/arrangements?person={{}}\", percent_encode(person)); if let Some(cursor) = cursor {{ path.push_str(&format!(\"&cursor={{}}\", percent_encode(cursor))); }} if let Some(limit) = limit {{ path.push_str(&format!(\"&limit={{limit}}\")); }} self.get(&path).await }}")?;
             continue;
@@ -352,6 +356,10 @@ fn swift_operation_methods(
         let id = read["id"].as_str().context("read id")?;
         let path = read["path"].as_str().context("read path")?;
         let method = lower_camel(&pascal(id));
+        if id == "arrangements.memberships" {
+            writeln!(out, "    public func arrangementsMemberships(personName: String, uuid: String, person: String, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<OrderedMembershipPage> {{ var query: [URLQueryItem] = [.init(name: \"person\", value: person)]; if let cursor {{ query.append(.init(name: \"cursor\", value: cursor)) }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/arrangements/\\(Self.routedSessionID(personName))/\\(Self.routedSessionID(uuid))/memberships\", query: query) }}")?;
+            continue;
+        }
         if id == "arrangements.list" {
             writeln!(out, "    public func arrangementsList(person: String, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ArrangementPage> {{ var query: [URLQueryItem] = [.init(name: \"person\", value: person)]; if let cursor {{ query.append(.init(name: \"cursor\", value: cursor)) }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/arrangements\", query: query) }}")?;
             continue;
@@ -701,8 +709,47 @@ fn validate_surfaces(
         "PersonAnswerInput",
         "PersonAnswer",
         "PersonAnswerRecord",
+        "ArrangementMembershipEditParameters",
+        "OrderedMembership",
+        "OrderedMembershipPage",
+        "OrderedMembershipState",
     ] {
         validate_model(schema, definition, definition, definition, rust, swift)?;
+    }
+    // Membership window frames decode by hand into typed events; every schema field of an
+    // `ordered-memberships` snapshot/changes branch must reach the Rust and Swift frames.
+    let swift_frame = struct_block(swift, "public struct OrderedMembershipCollectionFrame:")?;
+    for branch in schema["$defs"]["CollectionFrame"]["oneOf"]
+        .as_array()
+        .context("CollectionFrame.oneOf")?
+        .iter()
+        .filter(|branch| branch["properties"]["collection"]["const"] == "ordered-memberships")
+    {
+        let (variant, kind) = match branch["properties"]["kind"]["const"].as_str() {
+            Some("snapshot") => ("MembershipSnapshot", "snapshot"),
+            Some("changes") => ("MembershipChanges", "changes"),
+            other => bail!("ordered-memberships frame has unexpected kind {other:?}"),
+        };
+        let start = rust_client
+            .find(&format!("    {variant} {{"))
+            .with_context(|| format!("Rust CollectionEvent has no `{variant}`"))?;
+        let rust_variant = &rust_client[start..];
+        let rust_variant = &rust_variant[..rust_variant.find("\n    },").unwrap_or(rust_variant.len())];
+        for property in branch["properties"]
+            .as_object()
+            .context("ordered-memberships frame properties")?
+            .keys()
+            .filter(|name| !matches!(name.as_str(), "kind" | "collection"))
+        {
+            if !rust_variant.contains(&format!("        {property}:"))
+                || !rust_client.contains(&format!("(&frame, \"{property}\")"))
+            {
+                bail!("Rust `{variant}` does not decode `{kind}` frame field `{property}`");
+            }
+            if !swift_frame.contains(&lower_camel_snake(property)) {
+                bail!("Swift `OrderedMembershipCollectionFrame` does not model `{property}`");
+            }
+        }
     }
     for token in [
         "pub async fn pairing_begin",
@@ -1175,6 +1222,10 @@ fn typescript_operation_methods(
         } else {
             path.to_owned()
         };
+        if id == "arrangements.memberships" {
+            writeln!(out, "    async arrangementsMemberships(personName: string, uuid: string, person: string, options: PageOptions = {{}}): Promise<EnvelopeOf<OrderedMembershipPage>> {{ return this.get(`/v1/client/arrangements/${{encodeURIComponent(personName)}}/${{encodeURIComponent(uuid)}}/memberships` + query({{ person, ...options }})); }}")?;
+            continue;
+        }
         if id == "arrangements.list" {
             writeln!(out, "    async arrangementsList(person: string, options: PageOptions = {{}}): Promise<EnvelopeOf<ArrangementPage>> {{ return this.get('/v1/client/arrangements' + query({{ person, ...options }})); }}")?;
             continue;

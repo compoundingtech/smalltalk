@@ -2,6 +2,68 @@ import XCTest
 @testable import St3Client
 
 final class St3ClientTests: XCTestCase {
+    func testOrderedMembershipContractAndVersionedBodies() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let data = try Data(contentsOf: root.appendingPathComponent("fixtures/clients/ordered-memberships-v2.json"))
+        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        func bytes(_ key: String) throws -> Data { try JSONSerialization.data(withJSONObject: XCTUnwrap(fixture[key])) }
+        let parameters = try JSONDecoder().decode(ArrangementMembershipEditParameters.self,
+            from: JSONSerialization.data(withJSONObject: XCTUnwrap((fixture["edit"] as? [String: Any])?["parameters"])))
+        let request = try ActionRequest.arrangementMembershipEdit(id: "action/membership-edit",
+            idempotencyKey: "membership-edit-ada-0001", fence: Fence(snapshotID: "snapshot/host-a/1842/2fc9", subjectRevisions: [:]), parameters: parameters)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? NSDictionary, fixture["edit"] as? NSDictionary)
+        let page = try JSONDecoder().decode(OrderedMembershipPage.self, from: bytes("page"))
+        XCTAssertNil(page.items[0].position.bucket)
+        XCTAssertEqual(page.items[0].id, page.items[0].member)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: JSONEncoder().encode(page)) as? NSDictionary, fixture["page"] as? NSDictionary)
+        let first = try JSONDecoder().decode(OrderedMembershipCollectionFrame.self, from: bytes("snapshot_frame"))
+        let state = try XCTUnwrap(first.membership)
+        XCTAssertEqual(state, OrderedMembershipState(container: "arrangement/person/ada/019a0000-0000-7000-8000-000000000001", liveCount: 2, changedIndex: 1842))
+        let snapshotFrame = try XCTUnwrap(fixture["snapshot_frame"] as? [String: Any])
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: JSONEncoder().encode(state)) as? NSDictionary, snapshotFrame["membership"] as? NSDictionary)
+        let changed = try JSONDecoder().decode(OrderedMembershipCollectionFrame.self, from: bytes("changes_frame"))
+        let changedState = try XCTUnwrap(changed.membership)
+        // An edit outside the window repeats the window; only the container's state moves.
+        let outside = try JSONDecoder().decode(OrderedMembershipCollectionFrame.self, from: bytes("outside_window_changes_frame"))
+        let outsideState = try XCTUnwrap(outside.membership)
+        XCTAssertEqual(outside.upserts?.isEmpty, true)
+        XCTAssertEqual(outside.removes?.isEmpty, true)
+        XCTAssertEqual(outside.order, changed.order)
+        XCTAssertEqual(outside.hasMore, changed.hasMore)
+        XCTAssertEqual(outsideState.liveCount, changedState.liveCount)
+        XCTAssertGreaterThan(outsideState.changedIndex, changedState.changedIndex)
+        for key in ["snapshot_frame", "changes_frame"] {
+            var missing = try XCTUnwrap(fixture[key] as? [String: Any])
+            missing["membership"] = nil
+            XCTAssertThrowsError(try JSONDecoder().decode(OrderedMembershipCollectionFrame.self, from: JSONSerialization.data(withJSONObject: missing)))
+            var partial = try XCTUnwrap(fixture[key] as? [String: Any])
+            var membership = try XCTUnwrap(partial["membership"] as? [String: Any])
+            membership["changed_index"] = nil
+            partial["membership"] = membership
+            XCTAssertThrowsError(try JSONDecoder().decode(OrderedMembershipCollectionFrame.self, from: JSONSerialization.data(withJSONObject: partial)))
+        }
+        let resync = try JSONDecoder().decode(OrderedMembershipCollectionFrame.self, from: Data(#"{"kind":"resync","id":"sidebar"}"#.utf8))
+        XCTAssertNil(resync.membership)
+        let body = try JSONDecoder().decode(ArrangementBody.self, from: bytes("body"))
+        guard case .v2 = body else { return XCTFail("Expected version 2") }
+        var invalid = try XCTUnwrap(fixture["body"] as? [String: Any])
+        invalid["version"] = 3
+        XCTAssertThrowsError(try JSONDecoder().decode(ArrangementBody.self, from: JSONSerialization.data(withJSONObject: invalid)))
+        invalid["version"] = 2; invalid["placements"] = [:] as [String: String]
+        XCTAssertThrowsError(try JSONDecoder().decode(ArrangementBody.self, from: JSONSerialization.data(withJSONObject: invalid)))
+        let legacyData = try Data(contentsOf: root.appendingPathComponent("fixtures/clients/arrangements-v1.json"))
+        let legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: legacyData) as? [String: Any])
+        let resource = try XCTUnwrap(legacy["resource"] as? [String: Any])
+        let v1 = try JSONDecoder().decode(ArrangementBody.self, from: JSONSerialization.data(withJSONObject: XCTUnwrap(resource["body"])))
+        guard case .v1 = v1 else { return XCTFail("Expected version 1") }
+        for raw in ["unsupported-membership-container", "membership-owner-forbidden", "invalid-membership-member", "invalid-membership-bucket",
+                    "invalid-membership-key", "invalid-membership-operations", "invalid-arrangement-version", "invalid-arrangement-body", "membership-edit-too-large"] {
+            let code = try JSONDecoder().decode(ErrorCode.self, from: Data("\"\(raw)\"".utf8))
+            if case .unknown = code { XCTFail("\(raw) decoded as unknown") }
+            XCTAssertEqual(String(decoding: try JSONEncoder().encode(code), as: UTF8.self), "\"\(raw)\"")
+        }
+    }
     func testCreationActionFixtures() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }

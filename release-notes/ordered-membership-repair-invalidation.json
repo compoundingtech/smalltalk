@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Invalidate ordered membership windows and lifecycle dependencies when claims are repaired",
+  "replay": {"status": "changed", "detail": "Layout repairs now advance local invalidation frontiers after rebuilding arrangement and membership authority, including when the last arrangement or count row disappears. Repairs of referenced retained-claim members explicitly refresh their selected lifecycle revision from unrepaired authority in the repair transaction. Rebuild and heal preserve the local repair watermarks while shared digests and checkpoint witnesses exclude them."},
+  "schema": {"status": "changed", "detail": "Adds local_arrangement_repair_index and local_ordered_membership_repair_index bookkeeping keys to the existing local meta table. No table, index, numeric database schema version or shared projection layout changes."},
+  "rules": {"status": "none", "detail": "Checkpoint rules remain version 14 with the same digest and retention policy. The correction makes incremental member lifecycle dependencies agree with the already-defined unrepaired-authority replay witness; it introduces no drop rule."},
+  "compatibility": {"status": "none", "detail": "No client wire models, capability versions, pairing scopes or generated APIs change. Existing arrangement and membership pages and held windows now reject or refresh repaired-away revisions/rows rather than retaining stale contents."},
+  "downtime": {"status": "none", "detail": "No additional startup migration or full graph replay is introduced. The local watermark advances during existing repair transactions; retained-member repair uses the existing reverse index and transactional lifecycle fanout."},
+  "manual": {"status": "none", "detail": "No new manual repair or declaration migration step is required. This PR remains only the primitive portion of issue #1298; canonical-winner-preserving v1 placement migration and exclusive reader/writer cutover require the follow-up stacked PR."},
+  "recovery": {"status": "none", "detail": "No new rollback or recovery procedure is introduced. Shared authority remains retained claim history; the added local watermark is not a projection digest or checkpoint input. The earlier primitive upgrade fragment's backup and roll-forward guidance still applies."}
+}

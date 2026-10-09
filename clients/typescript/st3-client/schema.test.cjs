@@ -284,3 +284,71 @@ test('normalized conversation fallbacks and open block payloads survive schema r
     const decoded = Rich.decodeUnknownSync(Rich.TimelineBlock, 'strict')(block);
     assert.deepEqual(Schema.encodeSync(Rich.TimelineBlock)(decoded), block);
 });
+
+test('ordered membership root/place/remove/page and strict versioned bodies round trip', async () => {
+    const [{ Schema, Option }, Rich] = await modules;
+    const fixture = require('../../../fixtures/clients/ordered-memberships-v2.json');
+    const roundTrip = (schema, value) => Schema.encodeSync(schema)(Rich.decodeUnknownSync(schema, 'strict')(value));
+    const operation = Rich.decodeUnknownSync(Rich.OrderedMembershipOperation, 'strict')(fixture.edit.parameters.operations[0]);
+    assert(Option.isNone(operation.bucket));
+    assert.deepEqual(roundTrip(Rich.OrderedMembershipOperation, fixture.edit.parameters.operations[0]), fixture.edit.parameters.operations[0]);
+    assert.deepEqual(roundTrip(Rich.OrderedMembershipOperation, fixture.edit.parameters.operations[1]), fixture.edit.parameters.operations[1]);
+    assert.deepEqual(roundTrip(Rich.OrderedMembershipPage, fixture.page), {
+        ...fixture.page,
+        page: { ...fixture.page.page, next_cursor: null, cursor_expires_at: null },
+    });
+    assert.deepEqual(roundTrip(Rich.ActionRequest, fixture.edit), fixture.edit);
+    assert.deepEqual(roundTrip(Rich.CollectionCommand, fixture.subscribe), fixture.subscribe);
+    assert.throws(() => roundTrip(Rich.CollectionCommand, { ...fixture.subscribe, subject: undefined }));
+    assert.deepEqual(roundTrip(Rich.ArrangementBody, fixture.body), fixture.body);
+    const legacy = require('../../../fixtures/clients/arrangements-v1.json');
+    assert.deepEqual(roundTrip(Rich.ArrangementBody, legacy.resource.body), legacy.resource.body);
+    assert.throws(() => roundTrip(Rich.ArrangementBody, { ...fixture.body, version: 3 }));
+    assert.throws(() => roundTrip(Rich.ArrangementBody, { ...fixture.body, placements: {} }));
+    for (const code of ['unsupported-membership-container', 'membership-owner-forbidden', 'invalid-membership-member', 'invalid-membership-bucket', 'invalid-membership-key', 'invalid-membership-operations', 'membership-edit-too-large', 'invalid-arrangement-version', 'invalid-arrangement-body']) {
+        assert.equal(roundTrip(Rich.ErrorCode, code), code);
+    }
+});
+
+test('ordered membership frames and envelopes decode only as membership variants', async () => {
+    const [{ Schema, Option }, Rich] = await modules;
+    const fixture = require('../../../fixtures/clients/ordered-memberships-v2.json');
+    const decode = (schema, value) => Rich.decodeUnknownSync(schema, 'strict')(value);
+    const snapshot = decode(Rich.CollectionFrame, fixture.snapshot_frame);
+    assert.equal(snapshot.items[1].member, 'mission/m1');
+    assert(Option.isNone(snapshot.items[0].position.bucket));
+    assert.equal(Option.getOrThrow(snapshot.items[1].position.bucket), '019a0000-0000-7000-8000-000000000010');
+    assert.equal(Schema.encodeSync(Rich.CollectionFrame)(snapshot).items[0].position.bucket, null);
+    const changes = decode(Rich.CollectionFrame, fixture.changes_frame);
+    assert.deepEqual(changes.removes, ['agent/ada/worker']);
+    assert.equal(changes.upserts[0].position.key, 'Zz');
+    assert.deepEqual(snapshot.membership, fixture.snapshot_frame.membership);
+    assert.deepEqual(Schema.encodeSync(Rich.CollectionFrame)(snapshot).membership, fixture.snapshot_frame.membership);
+    assert.deepEqual(Schema.encodeSync(Rich.OrderedMembershipState)(decode(Rich.OrderedMembershipState, fixture.changes_frame.membership)), fixture.changes_frame.membership);
+    const outside = decode(Rich.CollectionFrame, fixture.outside_window_changes_frame);
+    assert.deepEqual([outside.upserts, outside.removes, outside.order, outside.has_more], [[], [], changes.order, changes.has_more]);
+    assert(outside.membership.changed_index > changes.membership.changed_index);
+    for (const frame of [fixture.snapshot_frame, fixture.changes_frame]) {
+        const { membership, ...missingState } = frame;
+        assert.throws(() => decode(Rich.CollectionFrame, missingState));
+        for (const field of ['container', 'live_count', 'changed_index']) {
+            const { [field]: _, ...partial } = membership;
+            assert.throws(() => decode(Rich.CollectionFrame, { ...frame, membership: partial }));
+        }
+        assert.throws(() => decode(Rich.CollectionFrame, { ...frame, membership: { ...membership, live_count: -1 } }));
+        assert.throws(() => decode(Rich.CollectionFrame, { ...frame, membership: { ...membership, extra: true } }));
+    }
+    const { membership: _state, ...resourceShape } = fixture.snapshot_frame;
+    const empty = { ...fixture.snapshot_frame, items: [], order: [] };
+    assert.equal(decode(Rich.CollectionFrame, empty).collection, 'ordered-memberships');
+    assert.equal(decode(Rich.CollectionFrame, { ...resourceShape, items: [], order: [], collection: 'agents' }).collection, 'agents');
+    assert.throws(() => decode(Rich.CollectionFrame, { ...empty, collection: 'agents' }));
+    assert.throws(() => decode(Rich.CollectionFrame, { ...fixture.snapshot_frame, collection: 'agents' }));
+    const missingBucket = structuredClone(fixture.changes_frame);
+    delete missingBucket.upserts[0].position.bucket;
+    assert.throws(() => decode(Rich.CollectionFrame, missingBucket));
+    assert.equal(decode(Rich.Envelope, fixture.envelope).value.collection, 'ordered-memberships');
+    assert.equal(decode(Rich.Envelope, { ...fixture.envelope, value: fixture.page }).value.items[0].member, 'agent/ada/worker');
+    assert.equal(decode(Rich.Envelope, { ...fixture.envelope, value: { ...fixture.envelope.value, collection: 'agents' } }).value.collection, 'agents');
+    assert.throws(() => decode(Rich.Page, fixture.envelope.value));
+});

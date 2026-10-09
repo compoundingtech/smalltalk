@@ -522,3 +522,79 @@ fn a_kind_this_client_does_not_know_reads_as_unknown_and_the_page_still_reads() 
         .is_err()
     );
 }
+
+#[test]
+fn ordered_membership_contract_preserves_root_remove_and_versioned_bodies() {
+    let value: serde_json::Value = serde_json::from_str(include_str!("../../../fixtures/clients/ordered-memberships-v2.json")).unwrap();
+    let parameters: ArrangementMembershipEditParameters = serde_json::from_value(value["edit"]["parameters"].clone()).unwrap();
+    assert!(matches!(&parameters.operations[0], OrderedMembershipOperation::Place { bucket: None, .. }));
+    assert!(matches!(&parameters.operations[1], OrderedMembershipOperation::Remove { .. }));
+    let fence: Fence = serde_json::from_value(value["edit"]["fence"].clone()).unwrap();
+    let serialized_fence = serde_json::to_value(&fence).unwrap();
+    let request = ActionRequest::arrangement_membership_edit(
+        "action/membership-edit", "membership-edit-ada-0001",
+        fence, parameters,
+    ).unwrap();
+    let mut expected = value["edit"].clone();
+    expected["fence"] = serialized_fence;
+    assert_eq!(serde_json::to_value(request).unwrap(), expected);
+    let page: OrderedMembershipPage = serde_json::from_value(value["page"].clone()).unwrap();
+    assert_eq!(page.items[0].id, page.items[0].member);
+    assert!(page.items[0].position.bucket.is_none());
+    let mut expected_page = value["page"].clone();
+    expected_page["page"]["next_cursor"] = serde_json::Value::Null;
+    expected_page["page"]["cursor_expires_at"] = serde_json::Value::Null;
+    assert_eq!(serde_json::to_value(page).unwrap(), expected_page);
+    let body: ArrangementBody = serde_json::from_value(value["body"].clone()).unwrap();
+    assert_eq!(serde_json::to_value(body).unwrap(), value["body"]);
+    let legacy: serde_json::Value = serde_json::from_str(include_str!("../../../fixtures/clients/arrangements-v1.json")).unwrap();
+    let body: ArrangementBody = serde_json::from_value(legacy["resource"]["body"].clone()).unwrap();
+    assert_eq!(serde_json::to_value(body).unwrap(), legacy["resource"]["body"]);
+    let mut invalid = value["body"].clone();
+    invalid["version"] = serde_json::json!(3);
+    assert!(serde_json::from_value::<ArrangementBody>(invalid).is_err());
+    let mut invalid = value["body"].clone();
+    invalid["placements"] = serde_json::json!({});
+    assert!(serde_json::from_value::<ArrangementBody>(invalid).is_err());
+    let parameters: ArrangementEditParameters = serde_json::from_value(legacy["edit"]["parameters"].clone()).unwrap();
+    assert_eq!(parameters.version, None);
+    assert_eq!(serde_json::to_value(parameters).unwrap(), legacy["edit"]["parameters"]);
+    for (raw, code) in [
+        ("unsupported-membership-container", ErrorCode::UnsupportedMembershipContainer),
+        ("membership-owner-forbidden", ErrorCode::MembershipOwnerForbidden),
+        ("invalid-membership-member", ErrorCode::InvalidMembershipMember),
+        ("invalid-membership-bucket", ErrorCode::InvalidMembershipBucket),
+        ("invalid-membership-key", ErrorCode::InvalidMembershipKey),
+        ("invalid-membership-operations", ErrorCode::InvalidMembershipOperations),
+        ("invalid-arrangement-version", ErrorCode::InvalidArrangementVersion),
+        ("invalid-arrangement-body", ErrorCode::InvalidArrangementBody),
+        ("membership-edit-too-large", ErrorCode::MembershipEditTooLarge),
+    ] {
+        assert_eq!(serde_json::from_value::<ErrorCode>(serde_json::json!(raw)).unwrap(), code);
+        assert_eq!(serde_json::to_value(code).unwrap(), raw);
+    }
+}
+
+#[test]
+fn ordered_membership_envelopes_decode_and_missing_buckets_fail_before_a_request_exists() {
+    let value: serde_json::Value = serde_json::from_str(include_str!("../../../fixtures/clients/ordered-memberships-v2.json")).unwrap();
+    let envelope: Envelope<OrderedMembershipPage> = serde_json::from_value(value["envelope"].clone()).unwrap();
+    assert_eq!(envelope.value.collection, "ordered-memberships");
+    assert!(envelope.value.items.is_empty());
+    let mut expected_page = value["envelope"]["value"].clone();
+    expected_page["page"]["next_cursor"] = serde_json::Value::Null;
+    expected_page["page"]["cursor_expires_at"] = serde_json::Value::Null;
+    assert_eq!(serde_json::to_value(&envelope.value).unwrap(), expected_page);
+    // A missing bucket is not the root: neither the edit nor a read row decodes without it.
+    let mut missing = value["edit"]["parameters"].clone();
+    missing["operations"][0].as_object_mut().unwrap().remove("bucket");
+    let error = serde_json::from_value::<ArrangementMembershipEditParameters>(missing).unwrap_err();
+    assert!(error.to_string().contains("missing field `bucket`"), "{error}");
+    let mut row = value["page"]["items"][0].clone();
+    row["position"].as_object_mut().unwrap().remove("bucket");
+    assert!(serde_json::from_value::<OrderedMembership>(row).is_err());
+    let mut explicit_root = value["page"]["items"][0].clone();
+    explicit_root["position"]["bucket"] = serde_json::Value::Null;
+    let decoded: OrderedMembership = serde_json::from_value(explicit_root).unwrap();
+    assert_eq!(decoded.position.bucket, None);
+}

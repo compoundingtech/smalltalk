@@ -62,6 +62,15 @@ pub enum ErrorCode {
     InvalidArrangementFolder,
     InvalidArrangementName,
     InvalidArrangementKey,
+    InvalidArrangementVersion,
+    InvalidArrangementBody,
+    UnsupportedMembershipContainer,
+    MembershipOwnerForbidden,
+    InvalidMembershipMember,
+    InvalidMembershipBucket,
+    InvalidMembershipKey,
+    InvalidMembershipOperations,
+    MembershipEditTooLarge,
     InvalidSubjectReference,
     ValidationFailed,
     IdempotencyConflict,
@@ -2195,6 +2204,8 @@ pub enum ActionType {
     CustomReply,
     #[serde(rename = "arrangement.edit")]
     ArrangementEdit,
+    #[serde(rename = "arrangement.membership.edit")]
+    ArrangementMembershipEdit,
     #[serde(rename = "attention.resolve")]
     AttentionResolve,
     #[serde(rename = "review.approve")]
@@ -2426,6 +2437,20 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::ArrangementEdit,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn arrangement_membership_edit(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: ArrangementMembershipEditParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::ArrangementMembershipEdit,
             idempotency_key,
             fence,
             &parameters,
@@ -3466,6 +3491,8 @@ pub struct ActionResult {
     pub terminal_attachment: Option<TerminalAttachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arrangement_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -3755,12 +3782,14 @@ pub struct ArrangementEditParameters {
     pub subject: String,
     pub owner: String,
     pub operations: Vec<ArrangementOperation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u8>,
 }
 pub type ArrangementRegister<T> = st3_schema::arrangements::Register<T>;
 pub type ArrangementPosition = st3_schema::arrangements::Position;
 pub type ArrangementPlacement = st3_schema::arrangements::Placement;
 pub type ArrangementFolder = st3_schema::arrangements::Folder;
-pub type ArrangementBody = st3_schema::arrangements::Body;
+pub type ArrangementBody = st3_schema::arrangements::VersionedBody;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ArrangementResolved {
     pub parents: std::collections::BTreeMap<String, Option<String>>,
@@ -3783,6 +3812,46 @@ pub struct ArrangementPage {
     #[serde(default)]
     pub filters: BTreeMap<String, String>,
     pub items: Vec<Arrangement>,
+    pub page: PageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncNotice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicated: Option<ReplicatedNotice>,
+}
+
+pub type OrderedMembershipOperation = st3_schema::ordered_membership::Operation;
+pub type OrderedMembershipPosition = st3_schema::ordered_membership::Position;
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArrangementMembershipEditParameters {
+    pub subject: String,
+    pub owner: String,
+    pub operations: Vec<OrderedMembershipOperation>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct OrderedMembership {
+    pub id: String,
+    pub container: String,
+    pub member: String,
+    pub position: OrderedMembershipPosition,
+    pub revision: String,
+}
+/// The whole container's membership state, carried by every `ordered-memberships` window
+/// frame so a held window observes edits outside its rows. `changed_index` is an opaque,
+/// host-local, monotonic invalidation frontier scoped by the frame's `snapshot.host_id`; it is
+/// neither a canonical revision nor a count of global history and never compares across hosts.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OrderedMembershipState {
+    pub container: String,
+    pub live_count: u64,
+    pub changed_index: u64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct OrderedMembershipPage {
+    pub kind: String,
+    pub collection: String,
+    #[serde(default)]
+    pub filters: BTreeMap<String, String>,
+    pub items: Vec<OrderedMembership>,
     pub page: PageInfo,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncNotice>,

@@ -42,6 +42,9 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case arrangementCycle, arrangementBodyTooLarge, arrangementOwnerForbidden
     case invalidArrangementSubject, invalidArrangementAction, invalidArrangementOperations
     case invalidArrangementFolder, invalidArrangementName, invalidArrangementKey, invalidSubjectReference
+    case invalidArrangementVersion, invalidArrangementBody
+    case unsupportedMembershipContainer, membershipOwnerForbidden, invalidMembershipMember
+    case invalidMembershipBucket, invalidMembershipKey, invalidMembershipOperations, membershipEditTooLarge
     case staleFence, cursorGap, pageCursorExpired, rateLimited
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete, conversationContentInvalidated, transcriptUnavailable
@@ -64,6 +67,11 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "invalid-arrangement-operations": .invalidArrangementOperations; case "invalid-arrangement-folder": .invalidArrangementFolder
         case "invalid-arrangement-name": .invalidArrangementName; case "invalid-arrangement-key": .invalidArrangementKey
         case "invalid-subject-reference": .invalidSubjectReference
+        case "invalid-arrangement-version": .invalidArrangementVersion; case "invalid-arrangement-body": .invalidArrangementBody
+        case "unsupported-membership-container": .unsupportedMembershipContainer; case "membership-owner-forbidden": .membershipOwnerForbidden
+        case "invalid-membership-member": .invalidMembershipMember; case "invalid-membership-bucket": .invalidMembershipBucket
+        case "invalid-membership-key": .invalidMembershipKey; case "invalid-membership-operations": .invalidMembershipOperations
+        case "membership-edit-too-large": .membershipEditTooLarge
         case "cursor-gap": .cursorGap; case "page-cursor-expired": .pageCursorExpired
         case "rate-limited": .rateLimited; case "runtime-not-local": .runtimeNotLocal
         case "timeline-history-incomplete": .timelineHistoryIncomplete
@@ -90,6 +98,11 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .invalidArrangementOperations: "invalid-arrangement-operations"; case .invalidArrangementFolder: "invalid-arrangement-folder"
         case .invalidArrangementName: "invalid-arrangement-name"; case .invalidArrangementKey: "invalid-arrangement-key"
         case .invalidSubjectReference: "invalid-subject-reference"
+        case .invalidArrangementVersion: "invalid-arrangement-version"; case .invalidArrangementBody: "invalid-arrangement-body"
+        case .unsupportedMembershipContainer: "unsupported-membership-container"; case .membershipOwnerForbidden: "membership-owner-forbidden"
+        case .invalidMembershipMember: "invalid-membership-member"; case .invalidMembershipBucket: "invalid-membership-bucket"
+        case .invalidMembershipKey: "invalid-membership-key"; case .invalidMembershipOperations: "invalid-membership-operations"
+        case .membershipEditTooLarge: "membership-edit-too-large"
         case .cursorGap: "cursor-gap"; case .pageCursorExpired: "page-cursor-expired"
         case .rateLimited: "rate-limited"; case .runtimeNotLocal: "runtime-not-local"
         case .timelineHistoryIncomplete: "timeline-history-incomplete"
@@ -498,7 +511,7 @@ public enum TerminalInputMode: String, Codable, Sendable { case line, raw, key }
 public struct TerminalInputParameters: Codable, Sendable { public var terminalID: String; public var mode: TerminalInputMode; public var value: String; public init(terminalID: String, mode: TerminalInputMode, value: String) { self.terminalID = terminalID; self.mode = mode; self.value = value }; enum CodingKeys: String, CodingKey { case terminalID = "terminal_id", mode, value } }
 public struct TerminalResizeParameters: Codable, Sendable { public var terminalID: String; public var rows: UInt16; public var columns: UInt16; public init(terminalID: String, rows: UInt16, columns: UInt16) { self.terminalID = terminalID; self.rows = rows; self.columns = columns }; enum CodingKeys: String, CodingKey { case terminalID = "terminal_id", rows, columns } }
 public struct TerminalAttachment: Codable, Sendable { public let attachmentID: String; public let terminalID: String; public let runtimeIncarnation: String; public let ownerHostID: String; public let streamURL: String; public let streamCapability: String?; public let state: String; public let expiresAt: String; public let reusable: Bool?; public let ttlS: UInt64?; public let retryHint: String?; enum CodingKeys: String, CodingKey { case attachmentID = "attachment_id", terminalID = "terminal_id", runtimeIncarnation = "runtime_incarnation", ownerHostID = "owner_host_id", streamURL = "stream_url", streamCapability = "stream_capability", state, expiresAt = "expires_at", reusable, ttlS = "ttl_s", retryHint = "retry_hint" } }
-public struct ActionResult: Codable, Sendable { public let kind: String; public let actionID: String; public let operationID: String; public let status: String; public let affectedIDs: [String]; public let snapshotID: String; public let terminalAttachment: TerminalAttachment?; public let arrangementRevision: String?; enum CodingKeys: String, CodingKey { case kind, actionID = "action_id", operationID = "operation_id", status, affectedIDs = "affected_ids", snapshotID = "snapshot_id", terminalAttachment = "terminal_attachment", arrangementRevision = "arrangement_revision" } }
+public struct ActionResult: Codable, Sendable { public let kind: String; public let actionID: String; public let operationID: String; public let status: String; public let affectedIDs: [String]; public let snapshotID: String; public let terminalAttachment: TerminalAttachment?; public let arrangementRevision: String?; public let membershipRevision: String?; enum CodingKeys: String, CodingKey { case kind, actionID = "action_id", operationID = "operation_id", status, affectedIDs = "affected_ids", snapshotID = "snapshot_id", terminalAttachment = "terminal_attachment", arrangementRevision = "arrangement_revision", membershipRevision = "membership_revision" } }
 
 public struct PairingBegin: Codable, Sendable { public let apiVersion: String; public let deviceName: String; public let personID: String; public let fullControl: Bool?; public let scopes: [String]?; public init(apiVersion: String, deviceName: String, personID: String, fullControl: Bool? = nil, scopes: [String]? = nil) { self.apiVersion = apiVersion; self.deviceName = deviceName; self.personID = personID; self.fullControl = fullControl; self.scopes = scopes }; enum CodingKeys: String, CodingKey { case apiVersion = "api_version", deviceName = "device_name", personID = "person_id", fullControl = "full_control", scopes } }
 public struct PairingChallenge: Codable, Sendable { public let kind: String; public let pairingID: String; public let code: String; public let expiresAt: String; public let personRootFingerprint: String?; enum CodingKeys: String, CodingKey { case kind, pairingID = "pairing_id", code, expiresAt = "expires_at", personRootFingerprint = "person_root_fingerprint" } }
@@ -590,7 +603,23 @@ public struct ArrangementRegister<Value: Codable & Sendable>: Codable, Sendable 
 public struct ArrangementPosition: Codable, Sendable { public let parent: String?; public let key: String }
 public struct ArrangementPlacement: Codable, Sendable { public let folder: String?; public let key: String }
 public struct ArrangementFolder: Codable, Sendable { public let name: ArrangementRegister<String>; public let position: ArrangementRegister<ArrangementPosition>; public let tombstone: ArrangementRegister<Bool>? }
-public struct ArrangementBody: Codable, Sendable { public let version: UInt; public let name: ArrangementRegister<String>; public let folders: [String: ArrangementFolder]; public let placements: [String: ArrangementRegister<ArrangementPlacement>] }
+public struct ArrangementBodyV1: Codable, Sendable { public let version: UInt8; public let name: ArrangementRegister<String>; public let folders: [String: ArrangementFolder]; public let placements: [String: ArrangementRegister<ArrangementPlacement>] }
+public struct ArrangementBodyV2: Codable, Sendable { public let version: UInt8; public let name: ArrangementRegister<String>; public let folders: [String: ArrangementFolder] }
+public enum ArrangementBody: Codable, Sendable {
+    case v1(ArrangementBodyV1), v2(ArrangementBodyV2)
+    enum CodingKeys: String, CodingKey { case version, placements }
+    public init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        switch try box.decode(UInt8.self, forKey: .version) {
+        case 1: self = .v1(try ArrangementBodyV1(from: decoder))
+        case 2:
+            guard !box.contains(.placements) else { throw DecodingError.dataCorruptedError(forKey: .placements, in: box, debugDescription: "Version 2 arrangements cannot contain placements") }
+            self = .v2(try ArrangementBodyV2(from: decoder))
+        default: throw DecodingError.dataCorruptedError(forKey: .version, in: box, debugDescription: "Unsupported arrangement version")
+        }
+    }
+    public func encode(to encoder: Encoder) throws { switch self { case .v1(let body): try body.encode(to: encoder); case .v2(let body): try body.encode(to: encoder) } }
+}
 public struct ArrangementResolved: Codable, Sendable { public let parents: [String: String?]; public let folders: [String: String?] }
 public struct ArrangementResource: Codable, Sendable, Identifiable {
     public let id, kind, owner, revision, updatedAt: String
@@ -604,7 +633,84 @@ public struct ArrangementPage: Codable, Sendable { public let kind, collection: 
 public struct ArrangementEditParameters: Codable, Sendable {
     public let subject, owner: String
     public let operations: [ArrangementOperation]
-    public init(subject: String, owner: String, operations: [ArrangementOperation]) { self.subject = subject; self.owner = owner; self.operations = operations }
+    public let version: UInt8?
+    public init(subject: String, owner: String, operations: [ArrangementOperation], version: UInt8? = nil) { self.subject = subject; self.owner = owner; self.operations = operations; self.version = version }
+}
+public struct OrderedMembershipPosition: Codable, Sendable {
+    public let bucket: String?
+    public let key: String
+    public init(bucket: String?, key: String) { self.bucket = bucket; self.key = key }
+    enum CodingKeys: String, CodingKey { case bucket, key }
+    public func encode(to encoder: Encoder) throws { var box = encoder.container(keyedBy: CodingKeys.self); try box.encode(bucket, forKey: .bucket); try box.encode(key, forKey: .key) }
+}
+public enum OrderedMembershipOperation: Codable, Sendable {
+    case place(member: String, bucket: String?, key: String)
+    case remove(member: String)
+    enum CodingKeys: String, CodingKey { case op, member, bucket, key }
+    public init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        let member = try box.decode(String.self, forKey: .member)
+        switch try box.decode(String.self, forKey: .op) {
+        case "place":
+            guard box.contains(.bucket) else { throw DecodingError.keyNotFound(CodingKeys.bucket, .init(codingPath: decoder.codingPath, debugDescription: "Place requires bucket, including null root")) }
+            self = .place(member: member, bucket: try box.decodeIfPresent(String.self, forKey: .bucket), key: try box.decode(String.self, forKey: .key))
+        case "remove": self = .remove(member: member)
+        default: throw DecodingError.dataCorruptedError(forKey: .op, in: box, debugDescription: "Unknown ordered membership operation")
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var box = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .place(let member, let bucket, let key): try box.encode("place", forKey: .op); try box.encode(member, forKey: .member); try box.encode(bucket, forKey: .bucket); try box.encode(key, forKey: .key)
+        case .remove(let member): try box.encode("remove", forKey: .op); try box.encode(member, forKey: .member)
+        }
+    }
+}
+public struct ArrangementMembershipEditParameters: Codable, Sendable {
+    public let subject, owner: String
+    public let operations: [OrderedMembershipOperation]
+    public init(subject: String, owner: String, operations: [OrderedMembershipOperation]) { self.subject = subject; self.owner = owner; self.operations = operations }
+}
+public struct OrderedMembership: Codable, Sendable, Identifiable { public let id, container, member, revision: String; public let position: OrderedMembershipPosition }
+/// The whole container's membership state, carried by every `ordered-memberships` window frame
+/// so a held window observes edits outside its rows. `changedIndex` is an opaque, host-local,
+/// monotonic invalidation frontier scoped by the frame's `snapshot.hostID`; it is neither a
+/// canonical revision nor a count of global history and never compares across hosts.
+public struct OrderedMembershipState: Codable, Sendable, Equatable {
+    public let container: String
+    public let liveCount, changedIndex: UInt64
+    public init(container: String, liveCount: UInt64, changedIndex: UInt64) { self.container = container; self.liveCount = liveCount; self.changedIndex = changedIndex }
+    enum CodingKeys: String, CodingKey { case container, liveCount = "live_count", changedIndex = "changed_index" }
+}
+public struct OrderedMembershipPage: Codable, Sendable { public let kind, collection: String; public let filters: [String: String]; public let items: [OrderedMembership]; public let page: PageInfo; public let sync: SyncNotice?; public let replicated: ReplicatedNotice? }
+/// One `ordered-memberships` socket frame. `snapshot` and `changes` frames always carry
+/// `membership`; decoding refuses one without it.
+public struct OrderedMembershipCollectionFrame: Codable, Sendable {
+    public let kind: String
+    public let id: String?
+    public let snapshot: Snapshot?
+    public let membership: OrderedMembershipState?
+    public let items, upserts: [OrderedMembership]?
+    public let removes, order: [String]?
+    public let hasMore: Bool?
+    public let code, message: String?
+    enum CodingKeys: String, CodingKey { case kind, id, snapshot, membership, items, upserts, removes, order, code, message, hasMore = "has_more" }
+    public init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try box.decode(String.self, forKey: .kind)
+        id = try box.decodeIfPresent(String.self, forKey: .id)
+        snapshot = try box.decodeIfPresent(Snapshot.self, forKey: .snapshot)
+        membership = kind == "snapshot" || kind == "changes"
+            ? try box.decode(OrderedMembershipState.self, forKey: .membership)
+            : try box.decodeIfPresent(OrderedMembershipState.self, forKey: .membership)
+        items = try box.decodeIfPresent([OrderedMembership].self, forKey: .items)
+        upserts = try box.decodeIfPresent([OrderedMembership].self, forKey: .upserts)
+        removes = try box.decodeIfPresent([String].self, forKey: .removes)
+        order = try box.decodeIfPresent([String].self, forKey: .order)
+        hasMore = try box.decodeIfPresent(Bool.self, forKey: .hasMore)
+        code = try box.decodeIfPresent(String.self, forKey: .code)
+        message = try box.decodeIfPresent(String.self, forKey: .message)
+    }
 }
 public enum ArrangementOperation: Codable, Sendable {
     case create(name: String), rename(name: String)
