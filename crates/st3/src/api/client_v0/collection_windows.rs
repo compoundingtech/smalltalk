@@ -327,6 +327,11 @@ impl Windows {
             compute()
         };
         if request.collection == "summary" { return compute(); }
+        // A published view is already the shared copy, and it can be published anew without a
+        // commit (a deadline passing): caching it by commit revision would serve the older one.
+        if state.store.collection_view_published(&request.collection) {
+            return compute();
+        }
         let Some(prepared) = prepared else {
             return compute();
         };
@@ -480,6 +485,24 @@ mod tests {
         assert_ne!(read(99), first, "backward clocks cannot reuse future inputs");
         assert_eq!(count.load(Ordering::SeqCst), 2);
         assert_ne!(read(200), first, "expiry is exclusive even within the same clock period");
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn shared_windows_leave_published_views_to_their_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let missions = request("missions");
+        let count = AtomicUsize::new(0);
+        let first = read(&windows, &state, &session, &missions, 0, &count);
+        assert_eq!(read(&windows, &state, &session, &missions, 0, &count), first);
+        assert_eq!(count.load(Ordering::SeqCst), 1, "an unpublished window is shared by revision");
+        // Once a refresher publishes the view, every read serves its newest publication.
+        state.store.publish_collection_view("missions");
+        assert_ne!(read(&windows, &state, &session, &missions, 0, &count), first);
+        assert_ne!(read(&windows, &state, &session, &missions, 0, &count), first);
         assert_eq!(count.load(Ordering::SeqCst), 3);
     }
 
