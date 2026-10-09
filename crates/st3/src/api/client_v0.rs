@@ -15762,7 +15762,7 @@ mission "example/zero-run" state="ready" {
         let (state, session_id, _path) =
             conversation_first_frame_fixture(root.path(), "first-frame-prepared", 130);
         let session = ClientSession::local(Some("person/example")).unwrap();
-        conversation_blocks::reset_prepared_bodies();
+        conversation_blocks::reset_prepared_bodies(&session_id);
         let (_, small) = conversation_open_local(&state, &session, &session_id, 20).unwrap();
         assert_eq!(small["items"].as_array().unwrap().len(), 20);
         assert!(
@@ -15772,7 +15772,7 @@ mission "example/zero-run" state="ready" {
         );
         // The explicit 200-entry frame still prepares its own whole page: the control
         // discriminates, and the discarded 180-entry work is exactly what this change removes.
-        conversation_blocks::reset_prepared_bodies();
+        conversation_blocks::reset_prepared_bodies(&session_id);
         let (_, full) = conversation_open_local(&state, &session, &session_id, 200).unwrap();
         assert_eq!(full["items"].as_array().unwrap().len(), 200);
         assert!(
@@ -15932,7 +15932,7 @@ mission "example/zero-run" state="ready" {
         .unwrap();
         let session = ClientSession::local(Some("person/example")).unwrap();
         // The relayed page read asks the owner for exactly the frame it will show.
-        conversation_blocks::reset_prepared_bodies();
+        conversation_blocks::reset_prepared_bodies(&session_id);
         let page = conversation_page(
             &gateway,
             &session,
