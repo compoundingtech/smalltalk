@@ -13853,17 +13853,18 @@ impl Store {
         {
             let connection = self.readers.get();
             for review in reviews {
-                // The gate's owner is the step whose work it reviews, or its run.
-                let step = review
-                    .step
-                    .as_deref()
-                    .filter(|step| step.starts_with("step-run/"))
-                    .or_else(|| {
-                        Some(review.owner.as_str()).filter(|owner| owner.starts_with("step-run/"))
-                    });
+                // The gate's owner is the step whose work it reviews, a loop whose step runs
+                // it, or its run.
+                let step = if review.owner.starts_with("step-run/") {
+                    Some(review.owner.clone())
+                } else if review.owner.starts_with("loop-run/") {
+                    loop_step_tx(&connection, &review.owner)?.map(|step| step.subject)
+                } else {
+                    None
+                };
                 let conversation = attention_snapshot::conversation_agent(
                     &connection,
-                    step,
+                    step.as_deref(),
                     Some(&review.mission_run),
                 )?;
                 items.push(AttentionItemView {
@@ -16951,7 +16952,6 @@ impl Store {
             episode: String,
             requested_at: u128,
         }
-        let mut accounts = None;
         let mut logins: BTreeMap<(String, String, String), Vec<Seat>> = BTreeMap::new();
         for desired in self.desired_harness_login_candidates()? {
             if !person_work::declaration_live(&self.readers.get(), &desired.subject)? {
@@ -16980,15 +16980,7 @@ impl Store {
                 .as_ref()
                 .map(|m| m.host.clone())
                 .unwrap_or_else(|| "unknown".into());
-            if accounts.is_none() {
-                accounts = Some(self.declared_accounts()?);
-            }
-            let login = self.seat_login(
-                &desired,
-                &host,
-                &driver,
-                accounts.as_deref().unwrap_or_default(),
-            )?;
+            let login = self.seat_login(&desired, &host, &driver)?;
             let (fence, episode) =
                 self.harness_login_episode_key(&desired.subject, &harness.incarnation_id)?;
             let requested_at = fence.as_ref().map_or(harness.observed_at_unix_ms, |claim| {
@@ -17004,7 +16996,9 @@ impl Store {
         let mut items = Vec::new();
         for ((owner, host, login), mut seats) in logins {
             // The seat that failed first stands for the login: its terminal is where to sign in,
-            // and its episode is the alert's until it signs in.
+            // and its episode is the alert's. If it recovers before the others, the next seat
+            // stands for the login and the alert's ID changes with it: a login episode of its
+            // own would have to be written, and a read never writes.
             seats.sort_by(|left, right| {
                 (left.requested_at, &left.subject).cmp(&(right.requested_at, &right.subject))
             });
@@ -17050,30 +17044,31 @@ impl Store {
     }
 
     /// The login directory a seat's harness runs with on `host`: its account's, or the pool
-    /// account this node placed it on, else the harness's own default login on that host.
-    fn seat_login(
-        &self,
-        desired: &DesiredSubject,
-        host: &str,
-        driver: &str,
-        accounts: &[crate::accounts::AccountDecl],
-    ) -> Result<String> {
+    /// account this node placed it on, else the harness's own default login on that host. Only
+    /// the seat's own node knows which pool account it chose, so a pooled seat on another node
+    /// stands alone rather than being merged with seats that may use another login.
+    fn seat_login(&self, desired: &DesiredSubject, host: &str, driver: &str) -> Result<String> {
         let account = match crate::accounts::harness_binding(&desired.desired).map(|b| b.binding) {
-            Some(crate::accounts::Binding::Account(name)) => Some(name),
-            Some(crate::accounts::Binding::Pool(owner)) => Some(
-                self.seat_account_choice(&desired.subject)?
-                    .unwrap_or_else(|| format!("the {owner} pool")),
-            ),
-            None => None,
+            Some(crate::accounts::Binding::Account(name)) => name,
+            Some(crate::accounts::Binding::Pool(_)) if host == self.origin => {
+                match self.seat_account_choice(&desired.subject)? {
+                    Some(name) => name,
+                    None => return Ok(format!("the login of {}", desired.subject)),
+                }
+            }
+            Some(crate::accounts::Binding::Pool(_)) => {
+                return Ok(format!("the login of {}", desired.subject));
+            }
+            None => return Ok(format!("the default {driver} login")),
         };
-        Ok(match account {
-            Some(name) => accounts
-                .iter()
-                .find(|account| account.name == name)
-                .and_then(|account| account.login_for(host))
-                .map_or(name, str::to_owned),
-            None => format!("the default {driver} login"),
-        })
+        // One declaration read by its key, not a scan of every declared subject.
+        Ok(self
+            .desired_subject_with_writer(&format!("account/{account}"))?
+            .and_then(|(declared, _)| {
+                crate::accounts::parse_account(&declared.subject, &declared.desired)
+            })
+            .and_then(|declared| declared.login_for(host).map(str::to_owned))
+            .unwrap_or(account))
     }
 
     pub(crate) fn harness_login_episode_key(

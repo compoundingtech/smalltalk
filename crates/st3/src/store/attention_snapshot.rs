@@ -1206,8 +1206,12 @@ pub(super) fn person_attention_item(
         review_mode: None,
         subject: subject.to_owned(),
         person: person.into(),
-        conversation: match ask.as_ref().and_then(|ask| ask.actor.as_deref()) {
-            Some(actor) => agent(actor),
+        conversation: match ask
+            .as_ref()
+            .and_then(|ask| ask.actor.as_deref())
+            .and_then(agent)
+        {
+            Some(actor) => Some(actor),
             None => conversation_agent(connection, None, Some(&view.run))?,
         },
         requester_id: ask.and_then(|ask| ask.actor),

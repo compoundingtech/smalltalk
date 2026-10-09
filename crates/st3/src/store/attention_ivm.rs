@@ -73,7 +73,7 @@ impl View for Family {
     fn definition(&self) -> Definition {
         Definition {
             name: self.view(),
-            fingerprint: "projected-source.v1;canonical-person-fences.v3.lowercase-range;custom-source.v1;u128-time.v1;public-row.v1",
+            fingerprint: "projected-source.v1;canonical-person-fences.v3.lowercase-range;custom-source.v1;u128-time.v1;public-row.v2",
             kinds: &[],
             local_kinds: match self {
                 Self::Person => &[PERSON_CHANGE, PERSON_CLOCK],
