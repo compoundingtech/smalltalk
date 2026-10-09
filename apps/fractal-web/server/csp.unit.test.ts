@@ -6,7 +6,8 @@ it('hashes only inline scripts, normalizing HTML line endings and deduplicating 
   const code = '\nwindow.example = true\n'
   const hash = createHash('sha256').update(code).digest('base64')
   const policy = createContentSecurityPolicy(`<script>${code}</script><script type="module">${code.replaceAll('\n', '\r\n')}</script><script src="/bundle.js"></script>`)
-  expect(policy('app.example')).toContain(`script-src 'self' 'sha256-${hash}';`)
+  // The native terminal key encoder is WebAssembly; compiling it needs wasm-unsafe-eval, never unsafe-eval.
+  expect(policy('app.example')).toContain(`script-src 'self' 'wasm-unsafe-eval' 'sha256-${hash}';`)
   expect(policy('app.example')).not.toContain("'unsafe-eval'")
   expect(policy('app.example')).toContain("connect-src 'self' ws://app.example wss://app.example;")
 })

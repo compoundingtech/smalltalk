@@ -41,7 +41,8 @@ export const createContentSecurityPolicy = (
   const origins = [...new Set(connectOrigins.map(connectionOrigin))]
   const beforeConnections = [
     "default-src 'self'",
-    ["script-src 'self'", ...hashes].join(' '),
+    // The terminal key encoder compiles WebAssembly; 'wasm-unsafe-eval' allows that without allowing eval().
+    ["script-src 'self' 'wasm-unsafe-eval'", ...hashes].join(' '),
     // Runtime StyleX variables and React Aria geometry need style attributes.
     // Fixed React Aria stylesheet elements use hashes; only Vite dev is unbounded.
     ["style-src 'self'", ...reactAriaStyleSources].join(' '),

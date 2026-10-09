@@ -114,7 +114,7 @@ it('restricts HTML, assets, HEAD and cached responses with the same image policy
   const hash = createHash('sha256').update(script!).digest('base64')
   const expected = [
     "default-src 'self'",
-    `script-src 'self' 'sha256-${hash}'`,
+    `script-src 'self' 'wasm-unsafe-eval' 'sha256-${hash}'`,
     "style-src 'self' 'sha256-38RhXrc7EdReTKsOm23ZPOCUgniTUUcjky8QOOrQx6o=' 'sha256-gYiS/BvZvRcK27JIXTuwhZ3hs2+VJ1X+2gUlE+farlg='",
     "style-src-attr 'unsafe-inline'",
     "img-src 'self' data: blob:",
