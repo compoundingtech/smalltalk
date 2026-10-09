@@ -40,6 +40,8 @@ class ViewportController {
   private restored: ViewportState | undefined
   /** A restored line whose content is settling; the first reader scroll clears it. */
   private pendingTop: number | undefined
+  /** A pointer is down somewhere on the page; the dock keeps its layout until release. */
+  private pressing = false
 
   constructor(saved?: ViewportState) {
     if (saved !== undefined && !saved.following) {
@@ -50,7 +52,12 @@ class ViewportController {
 
   readonly attachJump = (button: HTMLButtonElement | null) => {
     this.jumpButton = button
-    if (button !== null) button.hidden = !this.unread
+    this.dock()
+  }
+
+  /** Shows the jump only for unread rows, and never reflows the lane under an active press. */
+  private dock() {
+    if (this.jumpButton !== null && !this.pressing) this.jumpButton.hidden = !this.unread
   }
 
   readonly released = (): ViewportState => ({ top: this.lastTop, following: this.following, unread: this.unread })
@@ -58,7 +65,7 @@ class ViewportController {
   /** Swaps a reused viewport to another conversation without carrying its unread mark across. */
   readonly resume = (saved?: ViewportState) => {
     this.unread = saved !== undefined && !saved.following && saved.unread
-    if (this.jumpButton !== null) this.jumpButton.hidden = !this.unread
+    this.dock()
     if (saved !== undefined && !saved.following) {
       this.following = false
       this.anchor = undefined
@@ -136,14 +143,14 @@ class ViewportController {
     this.unread = false
     this.anchor = undefined
     this.pendingTop = undefined
-    if (this.jumpButton !== null) this.jumpButton.hidden = true
+    this.dock()
     this.schedule()
   }
 
   readonly changed = () => {
     if (!this.following) {
       this.unread = true
-      if (this.jumpButton !== null) this.jumpButton.hidden = false
+      this.dock()
     }
     this.schedule()
   }
@@ -177,9 +184,16 @@ class ViewportController {
       this.following = element.scrollHeight - element.clientHeight - element.scrollTop <= geometryNumbers.scrollEndTolerance
       if (this.following) {
         this.unread = false
-        if (this.jumpButton !== null) this.jumpButton.hidden = true
+        this.dock()
         this.anchor = undefined
       } else this.scheduleCapture()
+    }
+    // Document-wide, so presses that start anywhere (a row action included) defer the reveal.
+    const page = element.ownerDocument
+    const press = () => { this.pressing = true }
+    const release = () => {
+      this.pressing = false
+      this.dock()
     }
     const observer = new ResizeObserver(this.schedule)
     observer.observe(element)
@@ -190,6 +204,9 @@ class ViewportController {
     element.addEventListener('pointerdown', manual, { passive: true })
     element.addEventListener('focusin', manual)
     element.addEventListener('scroll', scroll, { passive: true })
+    page.addEventListener('pointerdown', press, true)
+    page.addEventListener('pointerup', release, true)
+    page.addEventListener('pointercancel', release, true)
     if (this.restored !== undefined) {
       this.following = false
       this.pendingTop = this.restored.top
@@ -211,13 +228,29 @@ class ViewportController {
       element.removeEventListener('pointerdown', manual)
       element.removeEventListener('focusin', manual)
       element.removeEventListener('scroll', scroll)
+      page.removeEventListener('pointerdown', press, true)
+      page.removeEventListener('pointerup', release, true)
+      page.removeEventListener('pointercancel', release, true)
+      this.pressing = false
       this.element = null
     }
   }
 }
 
+/** `version` is the row's rendered content; without one, the row object itself is its version. */
+export interface ViewportRow { readonly id: string; readonly version?: string }
+
+/** A republished snapshot with the same rows is not news: compare ids and content versions, not array identity. */
+function sameRows(previous: readonly ViewportRow[], next: readonly ViewportRow[]) {
+  if (previous.length !== next.length) return false
+  return next.every((row, index) => {
+    const before = previous[index]!
+    return before.id === row.id && (row.version === undefined ? before === row : before.version === row.version)
+  })
+}
+
 export interface EmbraceScrollViewportProps extends React.HTMLAttributes<HTMLDivElement> {
-  readonly items: readonly { readonly id: string }[]
+  readonly items: readonly ViewportRow[]
   readonly contentProps?: React.HTMLAttributes<HTMLDivElement>
   /** Each key keeps its own scroll state across viewport mounts. */
   readonly stateKey?: string
@@ -233,7 +266,11 @@ export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({
       if (previousKey.current !== undefined) store?.save(previousKey.current, controller.released())
       previousKey.current = stateKey
       controller.resume(stateKey === undefined ? undefined : store?.get(stateKey))
-    } else if (previousItems.current !== items) controller.changed()
+    } else if (previousItems.current !== items) {
+      // Metadata-only snapshots still reach geometry; only new or changed rows count as unread.
+      if (sameRows(previousItems.current, items)) controller.schedule()
+      else controller.changed()
+    }
     previousItems.current = items
   }, [controller, items, store, stateKey])
   // Mutation-phase saves precede the owning surface's layout effect that removes closed keys.
