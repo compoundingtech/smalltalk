@@ -2615,6 +2615,15 @@ fn client_agent_resources_from_status(
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
     let member_faults = store.member_reconcile_faults_for(&agent_subjects, snapshot_index)?;
     let mailbox_faults = store.mailbox_faults_for(&agent_subjects, snapshot_index)?;
+    // Harnesses, activity, and who can have a suspension or rollout, for many agents at once.
+    // Each status names the actual-state claim it selected, the newest runtime observation
+    // whenever the agent has one.
+    let actual_claims = status
+        .subjects
+        .iter()
+        .map(|subject| (subject.subject.clone(), subject.actual_claim.clone()))
+        .collect();
+    let mut card_reads = store.agent_card_reads(&agent_subjects, snapshot_index, &actual_claims)?;
     // Cards without a harness need only their actual claim's acceptance time, not its body.
     // Keep the existing per-claim fallback if the bulk metadata read cannot be completed.
     let actual_claim_times = store.claim_acceptance_times(
@@ -2646,7 +2655,7 @@ fn client_agent_resources_from_status(
         })
         .filter(|subject| history || subject.projection.layer == "current")
         .map(|mut subject| -> anyhow::Result<(String, Value)> {
-            subject.harness = store.observed_harness_at(&subject.subject, snapshot_index)?;
+            subject.harness = card_reads.take_harness(store, &subject.subject)?;
             let member_fault = member_faults.get(&subject.subject);
             let mailbox_fault = mailbox_faults.get(&subject.subject);
             let fault = member_fault.or(mailbox_fault);
@@ -2666,13 +2675,13 @@ fn client_agent_resources_from_status(
             subject.harness = agent_harness::availability(subject.harness.take(), mailbox_fault.map(String::as_str));
             let driver = declared_provider.or_else(|| subject.harness.as_ref().and_then(|harness| harness.driver.clone()));
             let harness_state = subject.harness.as_ref().map(|harness| harness.state.clone());
-            let last_activity_at = store.agent_last_activity_at(
+            let last_activity_at = card_reads.last_activity_at(
+                store,
                 &subject.subject,
                 subject
                     .harness
                     .as_ref()
                     .map(|harness| harness.incarnation_id.as_str()),
-                snapshot_index,
             )?;
             let silent_since = if harness_state.as_deref() == Some("working") {
                 let working_since = match subject.harness.as_ref() {
@@ -2749,7 +2758,11 @@ fn client_agent_resources_from_status(
                 .transpose()?.flatten();
             let moving = handoff.as_ref().is_some_and(|h| h.phase != "running");
             let state = if member_fault.is_some() { "failed" } else if mailbox_fault.is_some() || moving { "waiting" } else { state };
-            let suspension = crate::suspension::current(store, &subject.subject)?;
+            let suspension = if card_reads.may_have_suspension(&subject.subject) {
+                crate::suspension::current(store, &subject.subject)?
+            } else {
+                None
+            };
             // A suspended seat has no process by design: it is neither stopped nor failed.
             let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
                 Some("suspended") if fault.is_none() => "suspended",
@@ -2836,7 +2849,11 @@ fn client_agent_resources_from_status(
                 "operational": subject.projection,
                 "suspension": suspension.as_ref().map(client_suspension),
                 "handoff": handoff,
-                "rollout": crate::rollout::status(store, &subject.subject)?,
+                "rollout": if card_reads.may_have_rollout(&subject.subject) {
+                    crate::rollout::status(store, &subject.subject)?
+                } else {
+                    None
+                },
             });
             if let Some((_, previous)) = changed.filter(|_| retain_queues)
                 && let Some(old) = previous.iter().find(|item| item["id"] == value["id"]) {

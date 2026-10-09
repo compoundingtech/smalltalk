@@ -13050,24 +13050,31 @@ impl Store {
         at_index: u64,
     ) -> Result<BTreeMap<String, String>> {
         let connection = self.readers.get();
+        // Each subject's newest member reconcile decision, for 256 subjects per statement.
         let mut statement = connection.prepare_cached(
-            "SELECT body FROM claims WHERE subject=?1 AND kind='runtime.reconcile-decision'
-               AND store_index<=?2 AND json_extract(body, '$.fields.key')='member-reconcile'
-             ORDER BY store_index DESC LIMIT 1",
+            "SELECT subjects.value,
+                    (SELECT body FROM claims WHERE subject=subjects.value
+                       AND kind='runtime.reconcile-decision' AND store_index<=?2
+                       AND json_extract(body, '$.fields.key')='member-reconcile'
+                     ORDER BY store_index DESC LIMIT 1)
+             FROM json_each(?1) subjects",
         )?;
+        let mut decisions = Vec::new();
+        for chunk in subjects.chunks(256) {
+            for row in statement.query_map(params![serde_json::to_string(chunk)?, at_index], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })? {
+                let (subject, body) = row?;
+                decisions.extend(body.map(|body| (subject, body)));
+            }
+        }
         let mut faults = BTreeMap::new();
-        for subject in subjects {
-            let Some(body) = statement
-                .query_row(params![subject, at_index], |row| row.get::<_, String>(0))
-                .optional()?
-            else {
-                continue;
-            };
+        for (subject, body) in decisions {
             let body: Value = serde_json::from_str(&body)?;
             let fields = body.get("fields").unwrap_or(&body);
             if fields.get("decision").and_then(Value::as_str) == Some("member-fault") {
                 faults.insert(
-                    subject.clone(),
+                    subject,
                     fields
                         .get("reason")
                         .and_then(Value::as_str)
@@ -21535,6 +21542,10 @@ fn selected_actual_source_at(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let rows = rows
+        .iter()
+        .map(|(id, kind, origin, body)| (id.as_str(), kind.as_str(), origin.as_str(), body))
+        .collect::<Vec<_>>();
     let Some((selected_id, selected_origin, rivals)) = select_actual_source(&rows, desired_host)
     else {
         return Ok((None, None, false));
@@ -21550,15 +21561,15 @@ fn selected_actual_source_at(
 /// The selected actual-state claim of `(id, kind, origin, runtime body)` rows in canonical
 /// order, its origin, and the rival observations it must descend from to hold alone.
 fn select_actual_source(
-    rows: &[(String, String, String, Value)],
+    rows: &[(&str, &str, &str, &Value)],
     desired_host: Option<&str>,
 ) -> Option<(String, String, Vec<String>)> {
     let selected = rows
         .iter()
         .rev()
-        .find(|(_, kind, _, _)| kind == "runtime.observed")
+        .find(|(_, kind, _, _)| *kind == "runtime.observed")
         .or_else(|| rows.last());
-    let (selected_id, _, selected_origin, selected_body) = selected?;
+    let &(selected_id, _, selected_origin, selected_body) = selected?;
     // An origin's newer runtime observation supersedes its older observations. In particular,
     // its stop must retire its earlier running claim even when the new owner's intent follows
     // the desired-state branch rather than descending from that runtime branch.
@@ -21567,11 +21578,11 @@ fn select_actual_source(
         .iter()
         .rev()
         .filter(|(_, kind, origin, _)| {
-            kind == "runtime.observed" && observed_origins.insert(origin.as_str())
+            *kind == "runtime.observed" && observed_origins.insert(*origin)
         })
         .filter(|(id, _, origin, body)| {
-            id != selected_id
-                && origin != selected_origin
+            *id != selected_id
+                && *origin != selected_origin
                 && !nonowner_terminal_observation(
                     desired_host,
                     selected_origin,
@@ -21580,9 +21591,9 @@ fn select_actual_source(
                     body,
                 )
         })
-        .map(|(id, _, _, _)| id.clone())
+        .map(|(id, _, _, _)| (*id).to_owned())
         .collect::<Vec<_>>();
-    Some((selected_id.clone(), selected_origin.clone(), rivals))
+    Some((selected_id.to_owned(), selected_origin.to_owned(), rivals))
 }
 
 /// Whether claim `descendant` of `subject` descends from every claim of `ancestors`, walking the
@@ -21695,18 +21706,33 @@ fn latest_actual_at(
 fn fold_latest_actual(
     rows: impl IntoIterator<Item = (String, String)>,
 ) -> Result<Option<Value>> {
+    let rows = rows
+        .into_iter()
+        .map(|(kind, body)| Ok((kind, serde_json::from_str::<Value>(&body)?)))
+        .collect::<Result<Vec<_>>>()?;
+    fold_latest_values(rows)
+}
+
+/// [`fold_latest_actual`] of claims already parsed, `(kind, body)` in canonical order. It takes
+/// the bodies, so each field moves into the folded state instead of being copied.
+fn fold_latest_values(rows: impl IntoIterator<Item = (String, Value)>) -> Result<Option<Value>> {
     let mut rows = rows.into_iter().peekable();
     if rows.peek().is_none() {
         return Ok(None);
     }
     let mut merged = serde_json::Map::new();
     let registry = st3_schema::registry();
-    for (kind, body) in rows {
-        let value: Value = serde_json::from_str(&body)?;
-        let source = value.get("fields").unwrap_or(&value);
-        if let Some(fields) = source.as_object() {
+    for (kind, value) in rows {
+        let source = match value {
+            Value::Object(mut body) => match body.remove("fields") {
+                Some(fields) => fields,
+                None => Value::Object(body),
+            },
+            other => other,
+        };
+        if let Value::Object(fields) = source {
             if kind == "resource.observed" {
-                resources::merge_observation(&mut merged, fields);
+                resources::merge_observation(&mut merged, &fields);
                 continue;
             }
             if registry
@@ -21722,7 +21748,7 @@ fn fold_latest_actual(
                 }
             }
             for (key, value) in fields {
-                merged.insert(key.clone(), value.clone());
+                merged.insert(key, value);
             }
         }
     }
