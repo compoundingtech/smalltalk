@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "The limits policy keeps its last good config when the config file is missing or invalid, instead of reading a missing file as the policy being off",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or stored history changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema, version or stored data changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, wire or config contract change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption or startup migration is required. A daemon that cannot read its config file on a limits pass logs the reason once and keeps the policy it had."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Only the reload of the limits config changes; reverting restores reading a missing file as the defaults."
+  }
+}

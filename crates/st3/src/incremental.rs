@@ -85,6 +85,9 @@ pub fn change_keys(change: &Change) -> Vec<String> {
         "intent.desired" => {
             keys.extend(field("owner_run").map(|run| format!("owned:{run}")));
             keys.extend(field("owner_step").map(|step| format!("owned-step:{step}")));
+            keys.extend(field("previous_owner_step").map(|step| format!("owned-step:{step}")));
+            keys.extend(field("previous_owner_generation"));
+            keys.extend(field("owner_generation"));
         }
         "run-generation.created" => {
             keys.extend(field("run").map(|run| format!("generations:{run}")));

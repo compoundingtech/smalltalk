@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Use one current statement for an empty owned-authority effect fence",
+  "replay": {"status": "none", "detail": "No replay or projection changes. One current SQLite statement proves there are no physical owned-set receipt rows anywhere and no historical staged owner marker on the exact subject. Any receipt or staged marker takes the existing fresh full fence; SQL errors remain errors."},
+  "schema": {"status": "none", "detail": "Uses existing claim indexes. No new table, index, trigger, authority registry or numeric schema version."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No API, admission, authority, idempotency or ordering contract change. Effects still enter outside pinned reads and wait for the current guard. Current desired revision, runtime and lease guards remain independently required. Nonempty authority pays an extra proof statement before its unchanged full evaluation."},
+  "downtime": {"status": "none", "detail": "No extra migration or service interruption beyond the normal binary swap."},
+  "manual": {"status": "none", "detail": "No manual migration or configuration is needed."},
+  "recovery": {"status": "none", "detail": "Swapping back restores the former full read fence for empty authority. This optimization retains no authority cache between calls and rewrites no durable state."}
+}

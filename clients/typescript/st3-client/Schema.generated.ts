@@ -1821,6 +1821,8 @@ export type SummaryMachinesEncoded = typeof SummaryMachines.Encoded
 /** Complete current source counts, independent of list page limits. One summary/current resource per authorized subscription. Unavailable source coverage sends resync, never inferred zero counts. */
 export const Summary = /*#__PURE__*/ (() => Schema.Struct({
   "active_missions": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** The published agents roster the agent counts came from, when a background refresher prepares it: its graph cut and when it was published. Absent when the counts come from this snapshot itself. */
+  "agents_as_of": optionalKey(Schema.Struct({ "published_at": Timestamp, "store_index": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) })).annotate({ description: "The published agents roster the agent counts came from, when a background refresher prepares it: its graph cut and when it was published. Absent when the counts come from this snapshot itself." }),
   "id": Id,
   "kind": Schema.Literal("summary"),
   "machines": SummaryMachines,

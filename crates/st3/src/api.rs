@@ -174,6 +174,10 @@ struct ClientListQuery {
     state: Option<String>,
     #[serde(default)]
     native_only: bool,
+    /// Agents only: wait briefly for a roster at least as new as this request, rather than
+    /// answering at once from the newest published one.
+    #[serde(default)]
+    fresh: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -459,6 +463,18 @@ pub(crate) fn admitted_mailbox_protocol_router(state: AppState) -> Router {
         .route("/v1/mailbox", get(mailbox::subscribe_admitted_fixture))
         .fallback_service(router(state.clone()))
         .with_state(state)
+}
+
+/// Synthetic private-store transport controls; never physical native admission.
+#[cfg(feature = "test-support")]
+pub(crate) fn synthetic_mailbox_protocol_router(state: AppState, subject: &str) -> Router {
+    assert!(subject.starts_with("agent/example/"));
+    admitted_mailbox_protocol_router(state).layer(Extension(NativeDeliveryPeer {
+        agent: subject.into(),
+        transport: "omp-channel",
+        pid: std::process::id(),
+        archives_inbox: false,
+    }))
 }
 
 /// Build the loopback-only client gateway. Unlike the local Unix boundary, every ordinary
@@ -1004,8 +1020,8 @@ async fn response_envelope_unbounded(
         (Some(error), _) | (None, Err(error)) => error.into_response(),
         // Most handlers use synchronous SQLite and filesystem APIs. Run the whole
         // handler on a blocking thread so a busy projection or replication pass cannot
-        // occupy an async worker needed to accept another call. Each read on that
-        // thread takes its own read connection, so it never waits for another read.
+        // occupy an async worker needed to accept another call. Read workers are admitted
+        // before taking store locks; nested work reuses the handler's reader.
         (None, Ok(_)) if request_path == "/v1/health" => next.run(request).await,
         (None, Ok(_)) => {
             let runtime = tokio::runtime::Handle::current();
@@ -1021,7 +1037,7 @@ async fn response_envelope_unbounded(
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
                 crate::performance::with_cpu(Some(&cpu_kind), Some(&cpu_client), || {
-                    runtime.block_on(async move {
+                    runtime.block_on(crate::api::read_deadline::handler(async move {
                         // Cancel the actual forwarded relay, not only its outer waiter.
                         // Other routes retain their existing cooperative cancellation;
                         // this transport's mutation variants carry no read budget.
@@ -1038,7 +1054,7 @@ async fn response_envelope_unbounded(
                         } else {
                             next.run(request).await
                         }
-                    })
+                    }))
                 })
             })
             .await
@@ -2282,19 +2298,21 @@ fn client_agent_cards_for_page(
         .iter()
         .filter_map(|r| r["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    let cards = client_agent_cards_selected(store, history, index, &selected)
+    let cards = client_agent_cards_selected(store, history, index, &selected, false)
         .map_err(ApiError::internal)?;
     client_agent_cards_from_cached(store, cards, refs, at)
 }
 
 /// The cards of `selected` agents at `index`, folding only those not already cached there.
+/// A `chunk` of a roster assembled in short folds refolds no card outside `selected`.
 fn client_agent_cards_selected(
     store: &Store,
     history: bool,
     index: u64,
     selected: &BTreeSet<String>,
+    chunk: bool,
 ) -> anyhow::Result<Vec<Value>> {
-    store.cached_agent_resources_for(index, history, Some(selected), |changed| {
+    let build = |changed: Option<(&BTreeSet<String>, &[Value])>| {
         let (subjects, previous) = changed.expect("a selected page always names its missing cards");
         // Delta metadata is current and already diffed; only cold pages need shallow refs.
         // Frozen continuation refs remain response metadata, never shared cache inputs.
@@ -2310,7 +2328,12 @@ fn client_agent_cards_selected(
         )?;
         add_agent_todos(store, &mut cards, index)?;
         Ok(cards)
-    })
+    };
+    if chunk {
+        store.cached_agent_resources_chunk(index, history, selected, build)
+    } else {
+        store.cached_agent_resources_for(index, history, Some(selected), build)
+    }
 }
 
 fn client_agent_cards_from_cached(
@@ -2549,6 +2572,16 @@ fn client_agent_resources_selected(
     client_agent_resources_from_status(store, history, snapshot_index, changed, status)
 }
 
+/// Every agent card at `snapshot_index` of a quiet store, folded as the roster folds them but
+/// outside a read snapshot: on a store just opened, nothing is kept yet, as at a daemon start.
+/// For load measurements; it returns how many cards it folded.
+#[doc(hidden)]
+pub fn cold_agent_roster_rebuild(store: &Store, snapshot_index: u64) -> anyhow::Result<usize> {
+    let mut cards = client_agent_resources_selected(store, false, snapshot_index, None)?;
+    add_agent_todos(store, &mut cards, snapshot_index)?;
+    Ok(cards.len())
+}
+
 fn client_agent_resources_from_status(
     store: &Store,
     history: bool,
@@ -2594,6 +2627,15 @@ fn client_agent_resources_from_status(
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
     let member_faults = store.member_reconcile_faults_for(&agent_subjects, snapshot_index)?;
     let mailbox_faults = store.mailbox_faults_for(&agent_subjects, snapshot_index)?;
+    // Harnesses, activity, and who can have a suspension or rollout, for many agents at once.
+    // Each status names the actual-state claim it selected, the newest runtime observation
+    // whenever the agent has one.
+    let actual_claims = status
+        .subjects
+        .iter()
+        .map(|subject| (subject.subject.clone(), subject.actual_claim.clone()))
+        .collect();
+    let mut card_reads = store.agent_card_reads(&agent_subjects, snapshot_index, &actual_claims)?;
     // Cards without a harness need only their actual claim's acceptance time, not its body.
     // Keep the existing per-claim fallback if the bulk metadata read cannot be completed.
     let actual_claim_times = store.claim_acceptance_times(
@@ -2625,7 +2667,7 @@ fn client_agent_resources_from_status(
         })
         .filter(|subject| history || subject.projection.layer == "current")
         .map(|mut subject| -> anyhow::Result<(String, Value)> {
-            subject.harness = store.observed_harness_at(&subject.subject, snapshot_index)?;
+            subject.harness = card_reads.take_harness(store, &subject.subject)?;
             let member_fault = member_faults.get(&subject.subject);
             let mailbox_fault = mailbox_faults.get(&subject.subject);
             let fault = member_fault.or(mailbox_fault);
@@ -2645,13 +2687,13 @@ fn client_agent_resources_from_status(
             subject.harness = agent_harness::availability(subject.harness.take(), mailbox_fault.map(String::as_str));
             let driver = declared_provider.or_else(|| subject.harness.as_ref().and_then(|harness| harness.driver.clone()));
             let harness_state = subject.harness.as_ref().map(|harness| harness.state.clone());
-            let last_activity_at = store.agent_last_activity_at(
+            let last_activity_at = card_reads.last_activity_at(
+                store,
                 &subject.subject,
                 subject
                     .harness
                     .as_ref()
                     .map(|harness| harness.incarnation_id.as_str()),
-                snapshot_index,
             )?;
             let silent_since = if harness_state.as_deref() == Some("working") {
                 let working_since = match subject.harness.as_ref() {
@@ -2728,7 +2770,11 @@ fn client_agent_resources_from_status(
                 .transpose()?.flatten();
             let moving = handoff.as_ref().is_some_and(|h| h.phase != "running");
             let state = if member_fault.is_some() { "failed" } else if mailbox_fault.is_some() || moving { "waiting" } else { state };
-            let suspension = crate::suspension::current(store, &subject.subject)?;
+            let suspension = if card_reads.may_have_suspension(&subject.subject) {
+                crate::suspension::current(store, &subject.subject)?
+            } else {
+                None
+            };
             // A suspended seat has no process by design: it is neither stopped nor failed.
             let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
                 Some("suspended") if fault.is_none() => "suspended",
@@ -2815,7 +2861,11 @@ fn client_agent_resources_from_status(
                 "operational": subject.projection,
                 "suspension": suspension.as_ref().map(client_suspension),
                 "handoff": handoff,
-                "rollout": crate::rollout::status(store, &subject.subject)?,
+                "rollout": if card_reads.may_have_rollout(&subject.subject) {
+                    crate::rollout::status(store, &subject.subject)?
+                } else {
+                    None
+                },
             });
             if let Some((_, previous)) = changed.filter(|_| retain_queues)
                 && let Some(old) = previous.iter().find(|item| item["id"] == value["id"]) {
@@ -4304,8 +4354,9 @@ async fn client_agents(
     unreachable!("an admitted roster read always builds missing cards")
 }
 
-/// An agents page from the refresher's publications. A first page waits briefly for a roster
-/// at or after its own cut, then answers from the newest one, or says not ready. A
+/// An agents page from the refresher's publications. A first page answers at once from the
+/// newest one, or says not ready; one that asks for a fresh roster first waits briefly for a
+/// roster at or after its own cut. A
 /// continuation answers from the roster published at exactly its first page's cut, or says the
 /// page expired. Neither folds a card.
 async fn client_agents_published(
@@ -4318,7 +4369,9 @@ async fn client_agents_published(
         return blocking_store(move || Ok(client_agents_published_continuation(&reader, snapshot, &query)))
             .await?;
     }
-    wait_for_agent_roster(&state.store, query.history).await;
+    if query.fresh {
+        wait_for_agent_roster(&state.store, query.history).await;
+    }
     let reader = state.clone();
     let history = query.history;
     match blocking_store(move || Ok(client_agents_published_page(&reader, &query))).await?? {
@@ -4363,13 +4416,34 @@ fn warm_agent_roster(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Publish the complete roster at a new cut. When the newest complete roster tells which cards
-/// changed since, one short snapshot refolds only those. Otherwise the cards fold in short
-/// snapshots of at most [`AGENT_ROSTER_WARM_CHUNK`]: each folds the next agents at its own cut
-/// and refolds the already folded cards whose claims changed, so the last step completes a
-/// roster coherent at its cut. Readers keep the previous complete roster meanwhile.
+/// How many times a refresh folds the roster in chunks before it gives up on a roster that
+/// keeps changing in ways it cannot follow card by card.
+const AGENT_ROSTER_ASSEMBLY_ROUNDS: usize = 3;
+
+/// Publish the complete roster at a new cut, never folding more than
+/// [`AGENT_ROSTER_WARM_CHUNK`] cards in one snapshot. A snapshot completes the roster only once
+/// the newest rows say which cards changed and at most that many are changed or missing.
+/// Otherwise the cards fold in chunks, each at its own cut, refolding the already folded cards
+/// whose claims changed, and completion is tried again. Readers keep the previous complete
+/// roster meanwhile, with its own cut and publication time; if it cannot be assembled, the
+/// refresh fails and is tried again on the next request.
 fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
-    if !store.read_snapshot(|index| store.agent_roster_delta_known(index, history))? {
+    if store.read_snapshot(|index| store.agent_roster_current(index, history))? {
+        return Ok(());
+    }
+    let complete = |store: &Store| store.read_snapshot(|index| {
+        if let Some(reason) =
+            store.agent_roster_unbounded_because(index, history, AGENT_ROSTER_WARM_CHUNK)?
+        {
+            return Ok(Some(reason));
+        }
+        client_agent_resources_cached(store, history, index).map(|_| None)
+    });
+    for _ in 0..AGENT_ROSTER_ASSEMBLY_ROUNDS {
+        let Some(reason) = complete(store)? else {
+            return Ok(());
+        };
+        store.note_agent_roster_chunked(&reason);
         let order = store.read_snapshot(|index| {
             Ok(client_agent_page_refs(store, history, index)?.iter()
                 .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
@@ -4378,11 +4452,14 @@ fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
         for chunk in order.chunks(AGENT_ROSTER_WARM_CHUNK) {
             let chunk = chunk.iter().cloned().collect::<BTreeSet<_>>();
             store.read_snapshot(|index| {
-                client_agent_cards_selected(store, history, index, &chunk).map(drop)
+                client_agent_cards_selected(store, history, index, &chunk, true).map(drop)
             })?;
         }
     }
-    store.read_snapshot(|index| client_agent_resources_cached(store, history, index).map(drop))
+    if complete(store)?.is_none() {
+        return Ok(());
+    }
+    anyhow::bail!("the agents roster kept changing in ways no short fold can follow; keeping the previous one")
 }
 
 /// Every current agent's refs, and the cards of as many as the largest window or page shows.
@@ -4391,10 +4468,10 @@ fn client_agent_roster_head(store: &Store, index: u64) -> anyhow::Result<()> {
     let head = refs.iter().take(CLIENT_MAX_PAGE_ITEMS + 1)
         .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    client_agent_cards_selected(store, false, index, &head).map(drop)
+    client_agent_cards_selected(store, false, index, &head, false).map(drop)
 }
 
-/// A page read once answers with what was written before it: wait, briefly, for the refresher
+/// For a read that asked to see what was written before it: wait, briefly, for the refresher
 /// to publish a roster at or after the current cut. The read itself folds nothing.
 async fn wait_for_agent_roster(store: &Store, history: bool) {
     let Ok(wanted) = store.index() else { return };
@@ -4434,7 +4511,8 @@ fn client_agents_published_page(
     query: &ClientListQuery,
 ) -> Result<Option<ClientPageResponse>, ApiError> {
     let store = &state.store;
-    let index = store.index().map_err(ApiError::internal)?;
+    let current = store.index().map_err(ApiError::internal)?;
+    let index = current;
     let Some((index, cards, published_at)) = store.published_agent_roster(index, query.history) else {
         // Before the first complete roster, an unfiltered first page can come from its head.
         if query.status.is_some() || query.history {
@@ -4453,10 +4531,14 @@ fn client_agents_published_page(
         )?;
         return Ok(Some((Extension(snapshot), Json(page))));
     };
-    if query.history {
-        store.request_agent_roster_history();
-    } else {
-        store.request_agent_roster_refresh();
+    // A roster older than the current cut, its local activity or its queue deadline needs a
+    // refresh; the newest one needs none.
+    if index < current || !store.agent_roster_current(current, query.history).map_err(ApiError::internal)? {
+        if query.history {
+            store.request_agent_roster_history();
+        } else {
+            store.request_agent_roster_refresh();
+        }
     }
     let snapshot = roster_snapshot(state, index, published_at);
     if let Some(status) = query.status.as_deref() {
@@ -5409,11 +5491,13 @@ pub fn start_native_session_discovery(state: &AppState) {
 }
 
 /// The shortest pause between two roster refreshes. A refresh also pauses as long as it took,
-/// so refreshing never takes more than about half a core however often readers ask.
-const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_millis(20);
+/// so refreshing never takes more than about half a core however often readers ask. Reads
+/// never wait for it: this bounds how stale a served roster can be, about a second plus a fold.
+const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_secs(1);
 
-/// How long a first page waits for the refresher to publish a roster at or after its own cut.
-const AGENT_ROSTER_READ_WAIT: Duration = Duration::from_secs(1);
+/// How long a read asking for a fresh roster waits for one at or after its own cut: long enough
+/// for the refresher's pause and one fold.
+const AGENT_ROSTER_READ_WAIT: Duration = Duration::from_secs(2);
 
 /// Keep the complete agents roster published off the request path. As the daemon starts it
 /// folds every agent's refs and the cards the largest window shows, then the rest of the cards.
@@ -6138,6 +6222,7 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         reader_store.readers.usage(),
         smallclaims::sqlite::read_cache_kib(),
         smallclaims::sqlite::max_idle_read_connections(),
+        smallclaims::sqlite::max_read_workers(),
         crate::memory::service_memory(),
     ));
     report.status = if report.checks.iter().any(|check| check.status == "fail") {
@@ -6185,6 +6270,7 @@ fn reader_memory_check(
     readers: smallclaims::sqlite::ReaderUsage,
     cache_kib: usize,
     retained: usize,
+    read_workers: usize,
     groups: anyhow::Result<Option<Vec<crate::memory::GroupMemory>>>,
 ) -> DoctorCheck {
     let targets = readers.open as u128 * cache_kib as u128;
@@ -6192,7 +6278,7 @@ fn reader_memory_check(
         + smallclaims::sqlite::WRITE_CACHE_KIB as u128
         + DAEMON_MEMORY_HEADROOM_KIB;
     let mut message = format!(
-        "{} open readers ({} idle, {} active), peak {}, {} opened since startup; per-reader cache target {} KiB; current reader targets {} MiB; idle retention {}; planning envelope {} MiB (reader targets + 32 MiB writer + 512 MiB reserve). Warning: concurrent reader bursts are unbounded; cache targets exclude schema, prepared statements and query results, and this envelope is not a process memory limit",
+        "{} open readers ({} idle, {} active), peak {}, {} opened since startup; per-reader cache target {} KiB; current reader targets {} MiB; idle retention {}; API read-worker admission {}; planning envelope {} MiB (reader targets + 32 MiB writer + 512 MiB reserve). Raw/background reader checkout is uncapped; cache targets exclude schema, prepared statements and query results, and this envelope is not a process memory limit",
         readers.open,
         readers.idle,
         readers.open.saturating_sub(readers.idle),
@@ -6201,6 +6287,7 @@ fn reader_memory_check(
         cache_kib,
         targets / 1024,
         retained,
+        read_workers,
         envelope_kib / 1024,
     );
     let mut warned = false;
@@ -11121,9 +11208,30 @@ async fn get_usage(
         ))
     })
     .await?;
-    Ok(Json(
-        json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages}),
-    ))
+    let mut report = json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages});
+    // The policy as the config file says now, so `st usage` shows which accounts it never stops.
+    let reloaded = tokio::task::spawn_blocking(crate::config::reload_daemon_limits)
+        .await
+        .ok()
+        .flatten();
+    if let Some(Ok(config)) = reloaded
+        && let Some(policy) = crate::store::LimitsPolicy::from_config(&config)
+    {
+        for (row, limit) in report["limits"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+            .zip(&limits)
+        {
+            row["exempt"] = json!(policy.exempts(limit));
+        }
+        report["limits_policy"] = json!({
+            "stop_at_weekly_percent": config.stop_at_weekly_percent,
+            "exempt_accounts": config.exempt_accounts,
+            "exempt_harnesses": config.exempt_harnesses,
+        });
+    }
+    Ok(Json(report))
 }
 
 #[derive(Deserialize)]
@@ -13160,6 +13268,10 @@ async fn revise_mission_run(
     let (_, reviewers) =
         crate::store::analyze_mission_revision(&old, replacement, &current.requester)
             .map_err(ApiError::bad)?;
+    state
+        .store
+        .validate_revision_seat_carry(&current, replacement)
+        .map_err(ApiError::bad)?;
     let mut publication = intent.clone();
     publication.subjects.clear();
     let mut planned = state
@@ -14275,7 +14387,9 @@ async fn logs_session(
             "a log chunk limit must be between 1 and 65536 bytes",
         )));
     }
-    let session = live_session(&state, &subject, None)?;
+    let session = read_deadline::query(&state.store, "/v1/sessions/logs/{*subject}", || {
+        live_session(&state, &subject, None)
+    })?;
     if session.terminal {
         return Err(ApiError::bad(St3Error::new(
             "unsupported-capability",
@@ -15713,7 +15827,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 max_events,
             }]))
         };
-        let normal = reader_memory_check(usage, 2048, 128, groups(Some(1 << 30), 0));
+        let normal = reader_memory_check(usage, 2048, 128, 32, groups(Some(1 << 30), 0));
         assert_eq!(normal.status, "pass");
         assert!(
             normal
@@ -15722,20 +15836,21 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         );
         assert!(normal.message.contains("current reader targets 194 MiB"));
         assert!(normal.message.contains("planning envelope 800 MiB"));
-        assert!(normal.message.contains("bursts are unbounded"));
+        assert!(normal.message.contains("API read-worker admission 32"));
+        assert!(normal.message.contains("Raw/background reader checkout is uncapped"));
         assert_eq!(
-            reader_memory_check(usage, 8192, 128, groups(Some(1 << 30), 0)).status,
+            reader_memory_check(usage, 8192, 128, 32, groups(Some(1 << 30), 0)).status,
             "warn"
         );
-        let pressure = reader_memory_check(usage, 2048, 128, groups(Some(1 << 30), 1225));
+        let pressure = reader_memory_check(usage, 2048, 128, 32, groups(Some(1 << 30), 1225));
         assert_eq!(pressure.status, "warn");
         assert!(pressure.message.contains("memory.events:max 1225"));
         assert_eq!(
-            reader_memory_check(usage, 2048, 128, groups(None, 0)).status,
+            reader_memory_check(usage, 2048, 128, 32, groups(None, 0)).status,
             "pass"
         );
         assert_eq!(
-            reader_memory_check(usage, 2048, 128, Err(anyhow::anyhow!("unavailable"))).status,
+            reader_memory_check(usage, 2048, 128, 32, Err(anyhow::anyhow!("unavailable"))).status,
             "warn"
         );
         let burst = smallclaims::sqlite::ReaderUsage {
@@ -15745,7 +15860,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             opened: 300,
         };
         assert_eq!(
-            reader_memory_check(burst, 2048, 128, groups(Some(1 << 30), 0)).status,
+            reader_memory_check(burst, 2048, 128, 32, groups(Some(1 << 30), 0)).status,
             "warn"
         );
     }
@@ -23180,6 +23295,63 @@ mission "wake" state="ready" {
                 checked_agent_cache(&state.store, false, index);
             }
         }
+    }
+
+    #[test]
+    fn agent_roster_refresh_publishes_an_empty_or_small_roster_at_once() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let _wake = store.start_agent_roster_refresher().unwrap();
+        for history in [false, true] {
+            refresh_agent_roster(store, history).unwrap();
+            let (cut, cards, _) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
+            assert_eq!((cut, cards.len()), (store.index().unwrap(), 0), "history {history}");
+        }
+        store.append_claim(&ClaimInput {
+            subject: "agent/small-roster".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":"small",
+                "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        for history in [false, true] {
+            refresh_agent_roster(store, history).unwrap();
+            let (_, cards, _) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
+            assert_eq!(cards.len(), 1, "history {history}");
+        }
+    }
+
+    #[test]
+    fn agent_roster_refresh_never_folds_more_than_a_chunk_in_one_call() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let add = |agents: std::ops::Range<usize>| for n in agents {
+            store.append_claim(&ClaimInput {
+                subject: format!("agent/bound-{n:04}"), kind: "runtime.observed".into(),
+                actor: None, fields: serde_json::from_value(json!({"status":"running",
+                    "runtime_id":format!("bound-{n}"), "incarnation_id":"one"})).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        let _wake = store.start_agent_roster_refresher().unwrap();
+        // Cold: nothing to start from.
+        add(0..600);
+        refresh_agent_roster(store, false).unwrap();
+        let (_, cards, _) = store.published_agent_roster(store.index().unwrap(), false).unwrap();
+        assert_eq!(cards.len(), 600);
+        // More changed and missing cards than one fold may take.
+        add(600..900);
+        refresh_agent_roster(store, false).unwrap();
+        let (cut, cards, _) = store.published_agent_roster(store.index().unwrap(), false).unwrap();
+        assert_eq!((cut, cards.len()), (store.index().unwrap(), 900));
+        assert!(store.agent_resources_largest_fold_for_test() <= AGENT_ROSTER_WARM_CHUNK,
+            "one call folded {} cards", store.agent_resources_largest_fold_for_test());
+        // A few changes complete in one short fold.
+        add(900..910);
+        refresh_agent_roster(store, false).unwrap();
+        assert_eq!(store.published_agent_roster(store.index().unwrap(), false).unwrap().1.len(), 910);
+        assert!(store.agent_resources_largest_fold_for_test() <= AGENT_ROSTER_WARM_CHUNK);
     }
 
     #[test]

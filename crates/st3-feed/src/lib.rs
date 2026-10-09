@@ -48,6 +48,9 @@ const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(30),
 ];
 
+/// How long a fresh request may take to prove st is answering after its stream dropped.
+const PROBE_WAIT: Duration = Duration::from_secs(3);
+
 /// The subscription ID of the open terminal.
 const TERMINAL: &str = "terminal";
 /// The subscription ID of the open conversation.
@@ -106,6 +109,11 @@ pub enum Update {
     Connected(Client),
     /// st cannot be reached; the feed keeps trying and every window keeps its last items.
     Offline(String),
+    /// st answers a fresh request, but the live stream to it dropped or would not open, with this
+    /// reason. The feed opens another after its usual short wait and every window keeps its last
+    /// items: the link is not offline, and the reason is shown rather than a red word that is not
+    /// true. Only a daemon on this machine is probed.
+    Degraded(String),
     /// The granted glasses shape, delivered before its window. The embedding UI chooses how
     /// to store glasses for this version; the feed owns no application state.
     GlassesVersion(u32),
@@ -295,7 +303,7 @@ pub async fn run_members_with(
             {
                 Ended::Closed => return,
                 Ended::Dropped(reason) => {
-                    if updates.send(Update::Offline(reason.clone())).is_err() {
+                    if updates.send(link_lost(client, remote, &reason).await).is_err() {
                         return;
                     }
                     if let Some(current) = following.as_mut() {
@@ -312,7 +320,10 @@ pub async fn run_members_with(
                     }
                 }
             }
-        } else if updates.send(Update::Offline(reason)).is_err() {
+        } else if updates
+            .send(link_lost(&clients[member % clients.len()], remote, &reason).await)
+            .is_err()
+        {
             return;
         }
         // Wait before trying again, still honouring an unfollow meanwhile.
@@ -350,6 +361,74 @@ pub async fn run_members_with(
                 },
             }
         }
+    }
+}
+
+/// What a lost stream means. st is offline only when a fresh request to it also fails; when it
+/// answers, only the stream is being replaced (a slow or failed read of another machine shows on
+/// the view that waits for it, not as the whole link going down).
+///
+/// Only a daemon on this machine is probed: each request to its socket connects afresh. A paired
+/// device's gateway is reached over HTTP connections that can be pooled and outlive the route
+/// that carried them, so an answer there proves nothing about the stream; it stays offline.
+async fn link_lost(client: &Client, remote: bool, reason: &str) -> Update {
+    let answered = !remote
+        && tokio::time::timeout(PROBE_WAIT, client.capabilities())
+            .await
+            .is_ok_and(|outcome| outcome.is_ok());
+    // A paired device keeps no daemon or replica state of its own, and writes none for this.
+    if !remote {
+        connection_log(reason, answered);
+    }
+    if answered {
+        Update::Degraded(reason.to_owned())
+    } else {
+        Update::Offline(reason.to_owned())
+    }
+}
+
+/// One line per lost stream of a local daemon in `$XDG_STATE_HOME/st3/stui/connection.log`, so a
+/// link that keeps dropping leaves its reasons behind. The file is cut to its last half when it grows past 256 KB.
+fn connection_log(reason: &str, answered: bool) {
+    use std::io::Write as _;
+    // Tests lose streams on purpose and must not write to the person's state.
+    if cfg!(test) {
+        return;
+    }
+    let Some(base) = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state"))
+        })
+    else {
+        return;
+    };
+    let directory = base.join("st3").join("stui");
+    let path = directory.join("connection.log");
+    let _ = std::fs::create_dir_all(&directory);
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 256 * 1024)
+        && let Ok(bytes) = std::fs::read(&path)
+    {
+        let _ = std::fs::write(&path, &bytes[bytes.len() / 2..]);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            file,
+            "{} {} {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs()),
+            if answered {
+                "stream-lost st-answers"
+            } else {
+                "offline"
+            },
+            reason.replace('\n', " ")
+        );
     }
 }
 
@@ -1505,6 +1584,56 @@ mod tests {
         assert!(model.machines.snapshot.is_some());
         assert_eq!(model.status, "Resynchronized after cursor gap");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_lost_stream_is_offline_only_when_st_does_not_answer_a_fresh_request() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let app = st3::api::router(test_state(root.path()));
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !socket.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let answering = link_lost(
+            &Client::unix_as(&socket, "person/avery"),
+            false,
+            "st stopped answering",
+        )
+        .await;
+        assert!(
+            matches!(&answering, Update::Degraded(reason) if reason == "st stopped answering"),
+            "st answered, so only its stream is replaced: {answering:?}"
+        );
+        // A paired device's gateway is never probed: its answer would prove nothing.
+        let remote = link_lost(
+            &Client::unix_as(&socket, "person/avery"),
+            true,
+            "the member stopped answering",
+        )
+        .await;
+        assert!(
+            matches!(&remote, Update::Offline(_)),
+            "a lost remote stream is offline: {remote:?}"
+        );
+        server.abort();
+        let _ = server.await;
+        let gone = link_lost(
+            &Client::unix_as(root.path().join("absent.sock"), "person/avery"),
+            false,
+            "st closed the connection",
+        )
+        .await;
+        assert!(
+            matches!(&gone, Update::Offline(reason) if reason == "st closed the connection"),
+            "no answer at all is offline: {gone:?}"
+        );
     }
 
     #[tokio::test]

@@ -490,6 +490,7 @@ pub fn run(context: Context) -> Result<()> {
                     }
                     extras.live = true;
                     extras.offline = None;
+                    extras.degraded = None;
                     model.last_connected =
                         Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
                     changed = true;
@@ -557,8 +558,21 @@ pub fn run(context: Context) -> Result<()> {
                     extras.window_errors.insert(format!("{window:?}"), error);
                     changed = true;
                 }
+                feed::Update::Degraded(reason) => {
+                    // st answered; only its live stream is being replaced. Not offline, and
+                    // nothing on screen is cleared.
+                    extras.live = false;
+                    extras.offline = None;
+                    ui.flash(format!(
+                        "Live stream lost ({reason}); st answers, reconnecting"
+                    ));
+                    extras.degraded = Some(reason);
+                    attached = None;
+                    changed = true;
+                }
                 feed::Update::Offline(error) => {
                     extras.live = false;
+                    extras.degraded = None;
                     extras.offline = Some(error);
                     attached = None;
                     save_cache(cache_path.as_deref(), &person, &model);
@@ -1045,7 +1059,11 @@ pub fn run(context: Context) -> Result<()> {
                 if let Effect::LoadContent(key) = effect {
                     ui.content.complete(key, Err("Offline · reconnect, then load again".into()));
                 }
-                ui.flash("Offline · reconnect before acting; nothing was queued");
+                ui.flash(if extras.degraded.is_some() {
+                    "Reconnecting to st · try again in a moment; nothing was queued"
+                } else {
+                    "Offline · reconnect before acting; nothing was queued"
+                });
                 continue;
             }
             ui.note_acted(&effect);

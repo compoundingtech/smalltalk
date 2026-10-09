@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Exercise default reconciliation spacing and cancelled queue through real background dispatch",
+  "replay": {
+    "status": "none",
+    "detail": "Test-only real Reconciler.run controls compare exact stored default30 admission times, synchronize burst publication before the next FakeRuntime snapshot probe, probe admission before pass SQL, and cancel a real single-worker blocking queue before restart. The returned PTY roster is empty; this establishes snapshot-probe reachability, not runtime decision parity or end-to-end latency. Per-instance cfg(test) probes do not replace the pass or change production configuration, scheduling, loans, effects, counters or performance budgets. All new execution outcomes remain pending."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Test-only real Reconciler.run controls compare exact stored default30 admission times, synchronize burst publication before the next FakeRuntime snapshot probe, probe admission before pass SQL, and cancel a real single-worker blocking queue before restart. The returned PTY roster is empty; this establishes snapshot-probe reachability, not runtime decision parity or end-to-end latency. Per-instance cfg(test) probes do not replace the pass or change production configuration, scheduling, loans, effects, counters or performance budgets. All new execution outcomes remain pending."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Test-only real Reconciler.run controls compare exact stored default30 admission times, synchronize burst publication before the next FakeRuntime snapshot probe, probe admission before pass SQL, and cancel a real single-worker blocking queue before restart. The returned PTY roster is empty; this establishes snapshot-probe reachability, not runtime decision parity or end-to-end latency. Per-instance cfg(test) probes do not replace the pass or change production configuration, scheduling, loans, effects, counters or performance budgets. All new execution outcomes remain pending."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Test-only real Reconciler.run controls compare exact stored default30 admission times, synchronize burst publication before the next FakeRuntime snapshot probe, probe admission before pass SQL, and cancel a real single-worker blocking queue before restart. The returned PTY roster is empty; this establishes snapshot-probe reachability, not runtime decision parity or end-to-end latency. Per-instance cfg(test) probes do not replace the pass or change production configuration, scheduling, loans, effects, counters or performance budgets. All new execution outcomes remain pending."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Test-only real Reconciler.run controls compare exact stored default30 admission times, synchronize burst publication before the next FakeRuntime snapshot probe, probe admission before pass SQL, and cancel a real single-worker blocking queue before restart. The returned PTY roster is empty; this establishes snapshot-probe reachability, not runtime decision parity or end-to-end latency. Per-instance cfg(test) probes do not replace the pass or change production configuration, scheduling, loans, effects, counters or performance budgets. All new execution outcomes remain pending."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Test-only real Reconciler.run controls compare exact stored default30 admission times, synchronize burst publication before the next FakeRuntime snapshot probe, probe admission before pass SQL, and cancel a real single-worker blocking queue before restart. The returned PTY roster is empty; this establishes snapshot-probe reachability, not runtime decision parity or end-to-end latency. Per-instance cfg(test) probes do not replace the pass or change production configuration, scheduling, loans, effects, counters or performance budgets. All new execution outcomes remain pending."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Test-only real Reconciler.run controls compare exact stored default30 admission times, synchronize burst publication before the next FakeRuntime snapshot probe, probe admission before pass SQL, and cancel a real single-worker blocking queue before restart. The returned PTY roster is empty; this establishes snapshot-probe reachability, not runtime decision parity or end-to-end latency. Per-instance cfg(test) probes do not replace the pass or change production configuration, scheduling, loans, effects, counters or performance budgets. All new execution outcomes remain pending."
+  }
+}

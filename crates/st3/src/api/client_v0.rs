@@ -12,6 +12,9 @@ mod collection_windows;
 mod collection_ivm;
 mod summary;
 
+#[cfg(test)]
+mod stream_start_tests;
+
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
 const COLLECTION_SUBPROTOCOL: &str = "st3.client.collections.v0";
@@ -69,6 +72,8 @@ struct CollectionSubscription {
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
 const CONVERSATION_MAX_ADMISSIONS: usize = 8;
 const CONVERSATION_MAX_DAEMON_ADMISSIONS: usize = 32;
+const CONVERSATION_INITIAL_RETRY_WINDOW: Duration = Duration::from_secs(3);
+const CONVERSATION_INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Both slots follow the physical lookup, not its cancelable subscription awaiter.
 struct ConversationAdmissionPermits {
@@ -141,6 +146,84 @@ pub(super) async fn collection_stream(
         .on_upgrade(move |socket| collection_stream_socket(socket, state, session, presence)))
 }
 
+/// Acquiring another resource never waits while retaining these unrelated guards.
+/// A bare FIFO grant stays owned until all remaining gates are tried or one contends.
+struct CollectionReadAdmission {
+    read_gate: Arc<tokio::sync::Semaphore>,
+    socket: Option<tokio::sync::OwnedSemaphorePermit>,
+    window: Option<tokio::sync::OwnedMutexGuard<()>>,
+    roster: Option<tokio::sync::OwnedMutexGuard<()>>,
+    reader: Option<smallclaims::sqlite::ReadPermit>,
+}
+
+impl CollectionReadAdmission {
+    fn new(socket: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            read_gate: socket.semaphore().clone(),
+            socket: Some(socket),
+            window: None,
+            roster: None,
+            reader: None,
+        }
+    }
+
+    async fn admit(
+        &mut self,
+        store: &Store,
+        prepared: Option<&collection_windows::Prepared>,
+        needs_roster: bool,
+    ) -> Result<(), ApiError> {
+        loop {
+            if self.socket.is_none() {
+                self.socket = self.read_gate.clone().try_acquire_owned().ok();
+                if self.socket.is_none() {
+                    drop(self.reader.take());
+                    drop(self.window.take());
+                    drop(self.roster.take());
+                    self.socket = Some(self.read_gate.clone().acquire_owned().await.map_err(|_| {
+                        ApiError::internal("the terminal read gate closed during admission")
+                    })?);
+                    continue;
+                }
+            }
+            if self.window.is_none() && let Some(prepared) = prepared {
+                self.window = prepared.try_admit();
+                if self.window.is_none() {
+                    drop(self.reader.take());
+                    drop(self.socket.take());
+                    drop(self.roster.take());
+                    self.window = Some(prepared.admit().await);
+                    continue;
+                }
+            }
+            if self.roster.is_none() && needs_roster {
+                self.roster = store.try_admit_agent_resources();
+                if self.roster.is_none() {
+                    drop(self.reader.take());
+                    drop(self.socket.take());
+                    drop(self.window.take());
+                    self.roster = Some(store.admit_agent_resources().await);
+                    continue;
+                }
+            }
+            // Mutex-only waits never acquire reader capacity. A reader granted by the
+            // FIFO queue is carried through the nonwaiting gate attempts above.
+            if self.reader.is_none() {
+                self.reader = store.readers.try_admit_read();
+                if self.reader.is_none() {
+                    drop(self.socket.take());
+                    drop(self.window.take());
+                    drop(self.roster.take());
+                    self.reader = Some(store.readers.admit_read(None).await
+                        .map_err(|error| ApiError::internal(smallclaims::error::typed(error)))?);
+                    continue;
+                }
+            }
+            return Ok(());
+        }
+    }
+}
+
 /// Read one bounded window. The whole read sees one SQLite snapshot, and the fence names
 /// that snapshot's index, so commits landing meanwhile never tear or delay it.
 #[cfg(test)]
@@ -183,19 +266,47 @@ async fn collection_items_with_windows(
     if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
         return Err(validation("collection limit must be 1 through 200"));
     }
+    if request.collection == "glasses" && (request.person.is_some() || request.actor.is_some()) {
+        return Err(validation("glasses select the session person"));
+    }
+    if request.collection == "arrangements" && request.actor.is_some() {
+        return Err(validation("arrangements select an explicit person, not an actor"));
+    }
+    let mut gates = CollectionReadAdmission::new(read_permit);
+    // Arrangement ownership and paired-window authority both read the store. Admit this
+    // preliminary physical read with the same bare waits as the eventual window query.
+    let current = if request.collection == "arrangements"
+        || (windows.is_some() && session.transport != "unix")
+    {
+        Some(if state.store.readers.has_request_reader() {
+            revalidate_session(state, session)?
+        } else {
+            gates.admit(&state.store, None, false).await?;
+            let read_permit = gates.socket.take().expect("admitted preparation socket");
+            let reader_permit = gates.reader.take().expect("admitted preparation reader");
+            let state = state.clone();
+            let session = session.clone();
+            let preparation_store = state.store.clone();
+            let label = collection_window_label(&request.collection);
+            let (current, read_permit) = super::blocking_store(move || {
+                preparation_store.readers.request_read_with_permit(reader_permit, move || {
+                    crate::profile::task(label, || {
+                        // Both tokens follow this physical SQL after caller cancellation.
+                        (revalidate_session(&state, &session), read_permit)
+                    })
+                })
+            }).await?;
+            gates.socket = Some(read_permit);
+            current?
+        })
+    } else {
+        None
+    };
+    let current = current.as_ref().unwrap_or(session);
     let person = if request.collection == "glasses" {
-        if request.person.is_some() || request.actor.is_some() {
-            return Err(validation("glasses select the session person"));
-        }
         Some(glass_person(session, false)?)
     } else if request.collection == "arrangements" {
-        if request.actor.is_some() {
-            return Err(validation(
-                "arrangements select an explicit person, not an actor",
-            ));
-        }
-        let current_session = revalidate_session(state, session)?;
-        let person = arrangements::person(&current_session, request.person.as_deref(), false)?;
+        let person = arrangements::person(current, request.person.as_deref(), false)?;
         if let Some(subject) = &request.subject {
             let owner = st3_schema::arrangements::owner(subject)
                 .map_err(|error| validation(error.message))?;
@@ -209,32 +320,7 @@ async fn collection_items_with_windows(
     } else {
         None
     };
-    let (prepared, read_permit) = if let Some(windows) = &windows {
-        let (current, read_permit) = if session.transport == "unix" {
-            (session.clone(), read_permit)
-        } else {
-            let state = state.clone();
-            let session = session.clone();
-            let label = collection_window_label(&request.collection);
-            let (current, read_permit) = super::blocking_store(move || {
-                crate::profile::task(label, || {
-                    // Preparation is physical SQL too; canceled callers retain their slot
-                    // until this indexed authority read actually finishes.
-                    Ok((revalidate_session(&state, &session), read_permit))
-                })
-            })
-            .await?;
-            (current?, read_permit)
-        };
-        (windows.prepare(state, &current, request), read_permit)
-    } else {
-        (None, read_permit)
-    };
-    let admission = match &prepared {
-        Some(prepared) => Some(prepared.admit().await),
-        None => None,
-    };
-    let mut physical_guards = Some((read_permit, admission));
+    let prepared = windows.as_ref().and_then(|windows| windows.prepare(state, current, request));
     let state = state.clone();
     let session = session.clone();
     let request = request.clone();
@@ -246,11 +332,15 @@ async fn collection_items_with_windows(
     let arrangement_window = collection == "arrangements";
     let mut admitted = collection != "agents";
     let (snapshot, mut items, mut has_more) = loop {
-        let roster_admission = if matches!(collection.as_str(), "agents" | "summary") && admitted {
-            Some(state.store.admit_agent_resources().await)
-        } else {
-            None
-        };
+        // Summary reads the published roster once a refresher keeps one; only a store without
+        // one folds it here, behind the shared admission.
+        gates.admit(&state.store, prepared.as_ref(),
+            admitted && (collection == "agents"
+                || collection == "summary" && !state.store.agent_roster_refresher_running())).await?;
+        let reader_permit = gates.reader.take().expect("admitted collection reader");
+        let read_permit = gates.socket.take().expect("admitted collection socket");
+        let admission = gates.window.take();
+        let roster_admission = gates.roster.take();
         let state = state.clone();
         let session = session.clone();
         let request = request.clone();
@@ -261,9 +351,9 @@ async fn collection_items_with_windows(
         let person = person.clone();
         let prepared = prepared.clone();
         let windows = windows.clone();
-        let (read_permit, admission) = physical_guards.take()
-            .expect("physical roster read guards");
-        let (result, read_permit, admission) = super::blocking_store(move || {
+        let worker_store = state.store.clone();
+        let (result, read_permit, returned_admission) = super::blocking_store(move || {
+            worker_store.readers.request_read_with_permit(reader_permit, move || {
         // The worker owns both guards until its physical snapshot finishes, including
         // after caller cancellation. A miss returns them without allocating shared guards.
         let mut admission = admission;
@@ -433,8 +523,11 @@ async fn collection_items_with_windows(
             })
         });
         Ok((result?, read_permit, admission))
-    }).await?;
-        physical_guards = Some((read_permit, admission));
+        })?
+        })
+        .await?;
+        gates.socket = Some(read_permit);
+        gates.window = returned_admission;
         if let Some(rows) = result? {
             break rows;
         }
@@ -636,11 +729,12 @@ async fn open_terminal_subscription(
         .ok_or_else(|| validation("a terminal subscription names its terminal"))?
         .to_owned();
     let follow = {
+        let admission_store = state.store.clone();
         let state = state.clone();
         let session = session.clone();
         let incarnation = request.incarnation.clone();
         let capability = request.capability.clone();
-        crate::api::read_deadline::spawn_blocking(move || {
+        super::read_deadline::store_read(&admission_store, move || {
             prepare_terminal_follow(
                 &state,
                 &session,
@@ -700,7 +794,8 @@ async fn open_conversation_subscription(
     request: CollectionSubscribe,
     permits: ConversationAdmissionPermits,
 ) -> Result<(String, Option<String>), ApiError> {
-    tokio::task::spawn_blocking(move || {
+    let subscription_store = state.store.clone();
+    super::read_deadline::store_read(&subscription_store, move || {
         let _permits = permits;
         crate::performance::task("conversation/admission", || {
             let target = request.conversation.as_deref().unwrap_or_default();
@@ -749,7 +844,8 @@ async fn conversation_page(
             .map_err(|error| conversation_blocks::availability(remote_read_error(owner, error)));
     }
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
-    crate::api::read_deadline::spawn_blocking(move || {
+    let admission_store = state.store.clone();
+    super::read_deadline::store_read(&admission_store, move || {
         timeline_value(
             &state,
             &new_client_snapshot(&state),
@@ -818,7 +914,8 @@ async fn conversation_open_value(
         return Ok((start, page));
     }
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
-    crate::api::read_deadline::spawn_blocking(move || {
+    let admission_store = state.store.clone();
+    super::read_deadline::store_read(&admission_store, move || {
         conversation_open_local(&state, &session, &session_id)
     }).await.map_err(ApiError::internal)?
 }
@@ -897,8 +994,25 @@ async fn follow_conversation(
 ) {
     let remote = remote.as_deref();
     let failed = |error: &ApiError| conversation_stream_error(&id, error);
+    let mut first_open = true;
     loop {
-        let (start, page) = match conversation_open_value(&state, &session, &session_id, remote).await {
+        let mut opened = conversation_open_value(&state, &session, &session_id, remote).await;
+        if std::mem::take(&mut first_open) && remote.is_some()
+            && matches!(&opened, Err(error) if error.code == "remote-unavailable")
+        {
+            // An opening viewer has no stale page to mark. Give a briefly unavailable
+            // owner one bounded recovery window without replacing the subscription.
+            let deadline = tokio::time::Instant::now() + CONVERSATION_INITIAL_RETRY_WINDOW;
+            while matches!(&opened, Err(error) if error.code == "remote-unavailable") {
+                tokio::time::sleep_until((tokio::time::Instant::now()
+                    + CONVERSATION_INITIAL_RETRY_INTERVAL).min(deadline)).await;
+                if tokio::time::Instant::now() >= deadline { break; }
+                // Once admitted, preserve the owner's normal read deadline: a slow
+                // but successful page must not be canceled by the retry-start window.
+                opened = conversation_open_value(&state, &session, &session_id, remote).await;
+            }
+        }
+        let (start, page) = match opened {
             Ok(opened) => opened,
             Err(error) => {
                 if client_error_retryable(error.status, Some(&error.code)) {
@@ -6349,11 +6463,19 @@ pub(super) async fn conversation_changes(
     Query(query): Query<ConversationQuery>,
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
-    let session_id = conversation_session_id(&state, &id)?;
-    let snapshot = new_client_snapshot(&state);
-    if let Some((_, _, Some(origin))) =
-        super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
-            .map_err(ApiError::internal)?
+    let (session_id, owner) = super::read_deadline::query(
+        &state.store,
+        "/v1/client/conversations/{id}/changes",
+        || {
+            let session_id = conversation_session_id(&state, &id)?;
+            let snapshot = new_client_snapshot(&state);
+            let owner = super::managed_session_owner_at(
+                &state.store, snapshot.store_index, &session_id,
+            ).map_err(ApiError::internal)?;
+            Ok((session_id, owner))
+        },
+    )?;
+    if let Some((_, _, Some(origin))) = owner
     {
         if origin != state.store.origin() {
             if !acting_party(&session) {
@@ -6782,39 +6904,43 @@ pub(super) async fn events(
             local: None,
         };
     }
-    let items = records
-        .into_iter()
-        .map(|(record, local)| {
-            let position = EventCursor {
-                claim: record.store_index,
-                local,
-            };
-            let previous = match local {
-                Some(local) => EventCursor {
+    // The projection enrichment reads the store (mission attribution, snapshot ids), so it
+    // takes one admitted query scope; the wait above held no reader.
+    let items = super::read_deadline::query(&state.store, "/v1/client/events", || {
+        Ok(records
+            .into_iter()
+            .map(|(record, local)| {
+                let position = EventCursor {
                     claim: record.store_index,
-                    local: Some(local.saturating_sub(1)),
-                },
-                None => EventCursor {
-                    claim: record.store_index.saturating_sub(1),
-                    local: None,
-                },
-            };
-            let event_snapshot = client_snapshot_at(&state, record.store_index);
-            let (event_type, resource_ids, body) = safe_event_projection(&state, &record);
-            json!({
-                "id": format!("projection-event/{}/{}", state.node, position.label()),
-                "epoch": state.node,
-                "sequence": record.store_index,
-                "previous_cursor": previous.encode(&state.node),
-                "next_cursor": position.encode(&state.node),
-                "timestamp": event_snapshot.created_at,
-                "type": event_type,
-                "resource_ids": resource_ids,
-                "snapshot_id": event_snapshot.id,
-                "body": body
+                    local,
+                };
+                let previous = match local {
+                    Some(local) => EventCursor {
+                        claim: record.store_index,
+                        local: Some(local.saturating_sub(1)),
+                    },
+                    None => EventCursor {
+                        claim: record.store_index.saturating_sub(1),
+                        local: None,
+                    },
+                };
+                let event_snapshot = client_snapshot_at(&state, record.store_index);
+                let (event_type, resource_ids, body) = safe_event_projection(&state, &record);
+                json!({
+                    "id": format!("projection-event/{}/{}", state.node, position.label()),
+                    "epoch": state.node,
+                    "sequence": record.store_index,
+                    "previous_cursor": previous.encode(&state.node),
+                    "next_cursor": position.encode(&state.node),
+                    "timestamp": event_snapshot.created_at,
+                    "type": event_type,
+                    "resource_ids": resource_ids,
+                    "snapshot_id": event_snapshot.id,
+                    "body": body
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>())
+    })?;
     Ok(Json(json!({
         "kind": "event-page",
         "oldest_cursor": format!("event-cursor/{}/{}", state.node, event_resume_floor(oldest)),
@@ -7439,7 +7565,11 @@ async fn terminal_screen_value(
     wait: Duration,
 ) -> Result<Value, ApiError> {
     let subject = terminal_subject(id);
-    let live = terminal_live_session(state, &subject, expected_incarnation)?;
+    let live = super::read_deadline::query(
+        &state.store,
+        "/v1/client/terminals/{id}/screen",
+        || terminal_live_session(state, &subject, expected_incarnation),
+    )?;
     if !live.terminal {
         return Err(validation(
             "the requested runtime does not expose a terminal",
@@ -7485,7 +7615,11 @@ const TERMINAL_FACTS_TIMEOUT: Duration = Duration::from_secs(1);
 /// session that does not answer in time has no facts, never a failed screen. Nothing here
 /// decides admission; the fences on actions still do.
 async fn terminal_facts(state: &AppState, id: &str) -> Option<Value> {
-    let live = terminal_live_session(state, &terminal_subject(id), None).ok()?;
+    let live = super::read_deadline::query(
+        &state.store,
+        "/v1/client/terminals/{id}/screen",
+        || terminal_live_session(state, &terminal_subject(id), None),
+    ).ok()?;
     let root = state.pty_root.clone();
     crate::api::read_deadline::spawn_blocking(move || {
         let stats = pty_client::stats::query_stats_in_with_timeout(
@@ -7552,10 +7686,11 @@ pub(super) async fn terminal_screen(
         }
         Err(error) if error.code == "runtime-not-local" => {
             let subject = terminal_subject(&id);
-            let status = state
-                .store
-                .status(Some(&subject))
-                .map_err(ApiError::internal)?;
+            let status = super::read_deadline::query(
+                &state.store,
+                "/v1/client/terminals/{id}/screen",
+                || state.store.status(Some(&subject)).map_err(ApiError::internal),
+            )?;
             let host = status
                 .subjects
                 .first()
@@ -7933,10 +8068,7 @@ fn existing_terminal_attachment(
         .body
         .pointer("/fields/request_digest")
         .and_then(Value::as_str);
-    let legacy_digest = hex::encode(Sha256::digest(
-        serde_json::to_vec(request).map_err(ApiError::internal)?,
-    ));
-    if old_digest != Some(request_digest) && old_digest != Some(legacy_digest.as_str()) {
+    if old_digest != Some(request_digest) {
         return Err(ApiError {
             status: StatusCode::CONFLICT,
             code: "idempotency-conflict".into(),
@@ -8430,10 +8562,22 @@ async fn terminal_stream_socket(
     expected_incarnation: String,
 ) {
     let subject = terminal_subject(&id);
-    let live = match terminal_live_session(&state, &subject, Some(&expected_incarnation)) {
-        Ok(live) => live,
-        Err(error) => {
+    let live_store = state.store.clone();
+    let live_subject = subject.clone();
+    let live_incarnation = expected_incarnation.clone();
+    let live_state = state.clone();
+    let live = match super::read_deadline::store_read(&live_store, move || {
+        terminal_live_session(&live_state, &live_subject, Some(&live_incarnation))
+    })
+    .await
+    {
+        Ok(Ok(live)) => live,
+        Ok(Err(error)) => {
             sink.fail(&error).await;
+            return;
+        }
+        Err(_) => {
+            sink.fail(&ApiError::internal("terminal live check failed")).await;
             return;
         }
     };
@@ -8490,8 +8634,15 @@ async fn terminal_stream_socket(
                 {
                     fence_check_at = None;
                     last_fence_check = tokio::time::Instant::now();
-                    if let Err(error) =
-                        terminal_live_session(&state, &subject, Some(&expected_incarnation))
+                    let fence_store = state.store.clone();
+                    let fence_subject = subject.clone();
+                    let fence_incarnation = expected_incarnation.clone();
+                    let fence_state = state.clone();
+                    if let Err(error) = super::read_deadline::store_read(&fence_store, move || {
+                        terminal_live_session(&fence_state, &fence_subject, Some(&fence_incarnation))
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err(ApiError::internal("terminal fence recheck failed")))
                     {
                         sink.fail(&error).await;
                         return;
@@ -10313,10 +10464,6 @@ pub(super) async fn action(
     let gate = action_gate(&state, &session, &request.idempotency_key);
     let _guard = gate.lock().await;
     let request_digest = action_request_digest(&request)?;
-    // Receipts written before action-content.v1 still accept the exact original request.
-    let legacy_digest = hex::encode(Sha256::digest(
-        serde_json::to_vec(&request).map_err(ApiError::internal)?,
-    ));
     let receipt_digest = hex::encode(Sha256::digest(
         format!("{}:{}", session.actor, request.idempotency_key).as_bytes(),
     ));
@@ -10331,8 +10478,7 @@ pub(super) async fn action(
             .body
             .pointer("/fields/request_digest")
             .and_then(Value::as_str);
-        if old_digest != Some(request_digest.as_str()) && old_digest != Some(legacy_digest.as_str())
-        {
+        if old_digest != Some(request_digest.as_str()) {
             return Err(ApiError {
                 status: StatusCode::CONFLICT,
                 code: "idempotency-conflict".into(),
@@ -11097,6 +11243,395 @@ mission "queue-parity" state="ready" {
         assert_eq!(state.store.agent_resources_builds_for_test(), builds);
     }
 
+    fn collection_admission_probe(state: &AppState) -> axum::Router {
+        axum::Router::new()
+            .route("/v1/probe", axum::routing::get({
+                let store = state.store.clone();
+                move || {
+                    let store = store.clone();
+                    async move {
+                        assert!(store.readers.has_request_reader());
+                        let answer = store.readers.get()
+                            .query_row("SELECT 42", [], |row| row.get::<_, u64>(0)).unwrap();
+                        Json(json!({"answer":answer}))
+                    }
+                }
+            }))
+            .layer(axum::middleware::from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collection_mutex_waiters_release_reader_capacity_and_unrelated_gates() {
+        use tower::ServiceExt as _;
+        for gate in ["window", "roster"] {
+            let root = tempfile::tempdir().unwrap();
+            let state = smallclaims::sqlite::with_read_limit_for_test(1, || test_state(root.path()));
+            let session = ClientSession::local(None).unwrap();
+            let request: CollectionSubscribe = serde_json::from_value(json!({
+                "kind":"subscribe", "id":"gate-waiter",
+                "collection":if gate == "window" { "missions" } else { "summary" }, "limit":200,
+            })).unwrap();
+            let windows = collection_windows::Windows::attach(&state.store).unwrap();
+            let prepared = windows.prepare(&state, &session, &request).unwrap();
+            let held_window = (gate == "window").then(|| prepared.try_admit().unwrap());
+            let held_roster = (gate == "roster")
+                .then(|| state.store.try_admit_agent_resources().unwrap());
+            let socket = Arc::new(tokio::sync::Semaphore::new(1));
+            let mut read = Box::pin(collection_items_with_windows(
+                &state, &session, &request, socket.clone().acquire_owned().await.unwrap(),
+                Some(windows),
+            ));
+            assert!(futures_util::poll!(&mut read).is_pending());
+            assert!(state.store.readers.try_admit_read().is_some(),
+                "{gate} followers must not reserve reader capacity");
+            assert!(socket.try_acquire().is_ok(),
+                "{gate} followers must release the socket gate");
+            if gate == "roster" {
+                assert!(prepared.try_admit().is_some(),
+                    "roster followers must release the window gate");
+            } else {
+                assert!(state.store.try_admit_agent_resources().is_some(),
+                    "window followers must not reserve the roster gate");
+            }
+            let response = tokio::time::timeout(Duration::from_secs(5),
+                collection_admission_probe(&state).oneshot(
+                    Request::builder().uri("/v1/probe").body(Body::empty()).unwrap(),
+                )).await.expect("an unrelated API read must run during a mutex wait").unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["value"]["answer"], 42);
+            drop(held_window);
+            drop(held_roster);
+            let (_, rows, _) = tokio::time::timeout(Duration::from_secs(5), read).await
+                .expect("the collection must complete after its gate is released").unwrap();
+            if gate == "roster" {
+                assert_eq!(rows[0]["kind"], "summary");
+            } else {
+                assert!(rows.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collection_cold_http_roster_waiter_cannot_form_a_reader_cycle() {
+        use tower::ServiceExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let state = smallclaims::sqlite::with_read_limit_for_test(1, || test_state(root.path()));
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/cycle-roster".into(), kind: "runtime.observed".into(),
+            actor: None, fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"cycle-roster", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let roster = state.store.admit_agent_resources().await;
+        let (waiting, mut waits) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new()
+            .route("/v1/client/agents", axum::routing::get({
+                let state = state.clone();
+                move || {
+                    let (state, waiting) = (state.clone(), waiting.clone());
+                    async move {
+                        let work = client_agents(State(state.clone()),
+                            Extension(new_client_snapshot(&state)), Query(ClientListQuery::default()));
+                        let mut work = std::pin::pin!(work);
+                        let mut notified = false;
+                        std::future::poll_fn(|cx| {
+                            let poll = work.as_mut().poll(cx);
+                            // This multithread HTTP handler's warm probe runs inline. Its
+                            // first Pending has queued on the deliberately held roster gate.
+                            if poll.is_pending() && !notified {
+                                waiting.send(()).unwrap();
+                                notified = true;
+                            }
+                            poll
+                        }).await
+                    }
+                }
+            }))
+            .layer(axum::middleware::from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let http = tokio::spawn(async move {
+            app.oneshot(Request::builder().uri("/v1/client/agents").body(Body::empty()).unwrap())
+                .await.unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(5), waits.recv()).await
+            .expect("the cold HTTP page must queue on roster admission").unwrap();
+        // Admission synchronizes with the HTTP handler returning its per-poll loan.
+        drop(state.store.readers.admit_read(None).await.unwrap());
+        let session = ClientSession::local(None).unwrap();
+        let request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe", "id":"cycle-summary", "collection":"summary", "limit":200,
+        })).unwrap();
+        let socket = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut collection = Box::pin(collection_items_with_windows(
+            &state, &session, &request, socket.acquire_owned().await.unwrap(),
+            collection_windows::Windows::attach(&state.store),
+        ));
+        assert!(futures_util::poll!(&mut collection).is_pending());
+        // The mutex reserves this grant for HTTP. HTTP must reacquire its reader before
+        // polling that awakened future; the collection must not retain the sole slot.
+        drop(roster);
+        let response = tokio::time::timeout(Duration::from_secs(5), http).await
+            .expect("HTTP and collection roster waiters must not form a reader cycle").unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["value"]["items"][0]["id"], "agent/cycle-roster");
+        let (_, rows, _) = tokio::time::timeout(Duration::from_secs(5), collection).await
+            .expect("collection work must complete after the cold HTTP page").unwrap();
+        assert_eq!(rows[0]["kind"], "summary");
+        assert_eq!(state.store.agent_resources_builds_for_test(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collection_cold_agents_miss_releases_all_other_gates_for_roster_wait() {
+        use tower::ServiceExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let state = smallclaims::sqlite::with_read_limit_for_test(1, || test_state(root.path()));
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/miss-roster".into(), kind: "runtime.observed".into(),
+            actor: None, fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"miss-roster", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let roster = state.store.admit_agent_resources().await;
+        let session = ClientSession::local(None).unwrap();
+        let request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe", "id":"miss-roster", "collection":"agents", "limit":200,
+        })).unwrap();
+        let socket = Arc::new(tokio::sync::Semaphore::new(1));
+        let windows = collection_windows::Windows::attach(&state.store).unwrap();
+        let prepared = windows.prepare(&state, &session, &request).unwrap();
+        let mut collection = Box::pin(collection_items_with_windows(
+            &state, &session, &request, socket.clone().acquire_owned().await.unwrap(), Some(windows),
+        ));
+        // The initial warm probe owns both gates until its physical worker returns.
+        // Acquiring both after polling the retry proves it reached the bare roster wait.
+        let freed = tokio::time::timeout(Duration::from_secs(5), std::future::poll_fn(|cx| {
+            assert!(collection.as_mut().poll(cx).is_pending());
+            match (socket.clone().try_acquire_owned().ok(), prepared.try_admit()) {
+                (Some(socket), Some(window)) => std::task::Poll::Ready((socket, window)),
+                _ => std::task::Poll::Pending,
+            }
+        })).await.expect("a cold agents miss must release its socket and shared window");
+        drop(freed);
+        assert!(state.store.readers.try_admit_read().is_some());
+        assert_eq!(state.store.agent_resources_builds_for_test(), 0,
+            "the unadmitted warm probe must not build missing cards");
+        let response = tokio::time::timeout(Duration::from_secs(5),
+            collection_admission_probe(&state).oneshot(
+                Request::builder().uri("/v1/probe").body(Body::empty()).unwrap(),
+            )).await.expect("an unrelated API query must run during the agents miss retry").unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(roster);
+        let (_, rows, has_more) = tokio::time::timeout(Duration::from_secs(5), collection).await
+            .expect("the agents retry must consume the released roster admission").unwrap();
+        let (_, Json(page)) = client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(ClientListQuery::default())).await.unwrap();
+        assert_eq!(rows, page.items);
+        assert!(!has_more);
+        assert_eq!(state.store.agent_resources_builds_for_test(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collection_paired_authority_preparation_releases_socket_before_waiting_for_reader() {
+        for collection in ["missions", "arrangements"] {
+            let root = tempfile::tempdir().unwrap();
+            let state = smallclaims::sqlite::with_read_limit_for_test(1, || test_state(root.path()));
+            let paired = state.store.append_claim(&ClaimInput {
+                subject: "custom/client/admission-preparation".into(),
+                kind: "custom.client.pairing-completed".into(), actor: Some("person/ada".into()),
+                fields: serde_json::from_value(json!({
+                    "session_actor":"client/admission-preparation", "person_id":"person/ada",
+                    "credential_hash":"test-not-a-secret", "expires_at_unix_ms":u64::MAX,
+                    "scopes":["read.projections","read.arrangements"],
+                })).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let session = paired_client_session(&state, &paired, "fabric-loopback", false).unwrap();
+            let request: CollectionSubscribe = serde_json::from_value(json!({
+                "kind":"subscribe", "id":"authority-preparation", "collection":collection,
+                "person":if collection == "arrangements" { Some("person/ada") } else { None },
+                "limit":200,
+            })).unwrap();
+            // Cover both paired-window preparation and the arrangement ownership read
+            // that must be admitted even when no shared window is attached.
+            let windows = (collection == "missions")
+                .then(|| collection_windows::Windows::attach(&state.store).unwrap());
+            let socket = Arc::new(tokio::sync::Semaphore::new(1));
+            let socket_permit = socket.clone().acquire_owned().await.unwrap();
+            let held_reader = state.store.readers.try_admit_read().unwrap();
+            let (started, entered) = tokio::sync::oneshot::channel();
+            let task_state = state.clone();
+            let task = tokio::spawn(async move {
+                started.send(()).unwrap();
+                collection_items_with_windows(&task_state, &session, &request, socket_permit, windows)
+                    .await
+            });
+            entered.await.unwrap();
+            let next_socket = tokio::time::timeout(Duration::from_secs(5),
+                socket.clone().acquire_owned()).await
+                .expect("paired authority preparation must release its socket during reader admission")
+                .unwrap();
+            assert!(!task.is_finished());
+            drop(next_socket);
+            drop(held_reader);
+            let (_, rows, has_more) = tokio::time::timeout(Duration::from_secs(5), task).await
+                .expect("paired authority preparation must finish after reader capacity is returned")
+                .unwrap().unwrap();
+            assert!(rows.is_empty());
+            assert!(!has_more);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collection_queued_reader_consumes_its_fifo_grant_before_a_later_read() {
+        let root = tempfile::tempdir().unwrap();
+        let state = smallclaims::sqlite::with_read_limit_for_test(1, || test_state(root.path()));
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/fifo-roster".into(), kind: "runtime.observed".into(),
+            actor: None, fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"fifo-roster", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe", "id":"fifo-roster", "collection":"agents", "limit":200,
+        })).unwrap();
+        let socket = Arc::new(tokio::sync::Semaphore::new(1));
+        let windows = collection_windows::Windows::attach(&state.store);
+        let (_, expected, expected_more) = collection_items_with_windows(
+            &state, &session, &request, socket.clone().acquire_owned().await.unwrap(), windows.clone(),
+        ).await.unwrap();
+        let held_reader = state.store.readers.try_admit_read().unwrap();
+        let mut collection = Box::pin(collection_items_with_windows(
+            &state, &session, &request, socket.clone().acquire_owned().await.unwrap(), windows,
+        ));
+        assert!(futures_util::poll!(&mut collection).is_pending());
+        assert!(socket.try_acquire().is_ok());
+        let mut later_read = Box::pin(state.store.readers.admit_read(None));
+        assert!(futures_util::poll!(&mut later_read).is_pending());
+        drop(held_reader);
+        // Keep the later waiter queued throughout the collection's physical query.
+        // Discarding the FIFO grant assigns it to that unpolled waiter and deadlocks here.
+        let (_, actual, actual_more) = tokio::time::timeout(Duration::from_secs(5), collection).await
+            .expect("the collection must use its FIFO turn before the later queued read").unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual_more, expected_more);
+        let later_permit = tokio::time::timeout(Duration::from_secs(5), &mut later_read).await
+            .expect("the later read must receive the collection's returned capacity").unwrap();
+        state.store.readers.request_read_with_permit(later_permit, || {
+            assert_eq!(state.store.readers.get()
+                .query_row("SELECT 42", [], |row| row.get::<_, u64>(0)).unwrap(), 42);
+        }).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collection_granted_reader_is_released_before_contended_gate_waits() {
+        for gate in ["socket", "window", "roster"] {
+            let root = tempfile::tempdir().unwrap();
+            let state = smallclaims::sqlite::with_read_limit_for_test(1, || test_state(root.path()));
+            let session = ClientSession::local(None).unwrap();
+            let request: CollectionSubscribe = serde_json::from_value(json!({
+                "kind":"subscribe", "id":"grant-retry", "collection":"summary", "limit":200,
+            })).unwrap();
+            let socket = Arc::new(tokio::sync::Semaphore::new(1));
+            let windows = collection_windows::Windows::attach(&state.store).unwrap();
+            let prepared = windows.prepare(&state, &session, &request).unwrap();
+            let held_reader = state.store.readers.try_admit_read().unwrap();
+            let mut collection = Box::pin(collection_items_with_windows(
+                &state, &session, &request, socket.clone().acquire_owned().await.unwrap(),
+                Some(windows),
+            ));
+            assert!(futures_util::poll!(&mut collection).is_pending());
+            let held_socket = (gate == "socket")
+                .then(|| socket.clone().try_acquire_owned().unwrap());
+            let held_window = (gate == "window").then(|| prepared.try_admit().unwrap());
+            let held_roster = (gate == "roster")
+                .then(|| state.store.try_admit_agent_resources().unwrap());
+            drop(held_reader);
+            assert!(futures_util::poll!(&mut collection).is_pending());
+            assert!(state.store.readers.try_admit_read().is_some(),
+                "a FIFO grant must be returned before waiting on the {gate} gate");
+            if gate != "socket" {
+                assert!(socket.try_acquire().is_ok());
+            }
+            if gate != "window" {
+                assert!(prepared.try_admit().is_some());
+            }
+            if gate != "roster" {
+                assert!(state.store.try_admit_agent_resources().is_some());
+            }
+            drop(held_socket);
+            drop(held_window);
+            drop(held_roster);
+            let (_, rows, _) = tokio::time::timeout(Duration::from_secs(5), collection).await
+                .expect("the granted-reader retry must complete once its gate is free").unwrap();
+            assert_eq!(rows[0]["kind"], "summary");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn collection_reader_contention_releases_the_socket_gate_and_completes() {
+        let root = tempfile::tempdir().unwrap();
+        let (state, session, request, semaphore, windows) =
+            smallclaims::sqlite::with_read_limit_for_test(1, || {
+                let state = test_state(root.path());
+                state.store.append_claim(&ClaimInput {
+                    subject: "agent/contention-roster".into(), kind: "runtime.observed".into(),
+                    actor: None, fields: serde_json::from_value(json!({"status":"running",
+                        "runtime_id":"contention-roster", "incarnation_id":"one"})).unwrap(),
+                    evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+                }).unwrap();
+                let request: CollectionSubscribe = serde_json::from_value(json!({
+                    "kind":"subscribe", "id":"contended-roster", "collection":"agents", "limit":200,
+                })).unwrap();
+                let windows = collection_windows::Windows::attach(&state.store);
+                (
+                    state,
+                    ClientSession::local(None).unwrap(),
+                    request,
+                    Arc::new(tokio::sync::Semaphore::new(1)),
+                    windows,
+                )
+            });
+        let (_, expected, _) = collection_items_with_windows(&state, &session, &request,
+            semaphore.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
+        // Saturate the single reader slot from a plain thread, as an escaped long reader would.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (entered, started) = std::sync::mpsc::channel::<()>();
+        let holder_store = state.store.clone();
+        let holder = std::thread::spawn(move || {
+            holder_store.readers.request_read(|| {
+                entered.send(()).unwrap();
+                held.recv_timeout(std::time::Duration::from_secs(30)).ok();
+            })
+        });
+        started.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(state.store.readers.try_admit_read().is_none(),
+            "the holder owns the only reader slot");
+        let mut task = Box::pin(collection_items_with_windows(
+            &state, &session, &request, semaphore.clone().acquire_owned().await.unwrap(), windows,
+        ));
+        // One poll deterministically queues on the saturated reader, rather than relying
+        // on a task-start signal or a sleep to guess whether admission has begun.
+        assert!(futures_util::poll!(&mut task).is_pending());
+        assert!(semaphore.try_acquire().is_ok(),
+            "the socket gate must be free while the collection waits for its reader");
+        drop(release);
+        holder.join().unwrap().unwrap();
+        let (_, actual, _) = tokio::time::timeout(std::time::Duration::from_secs(10), task).await
+            .expect("the collection completes once the reader frees")
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_roster_subscribers_share_one_build_and_http_reuses_it() {
         const SUBSCRIBERS: usize = 22;
@@ -11238,9 +11773,8 @@ mission "queue-parity" state="ready" {
         assert_eq!(snapshot["items"][0]["id"], subject);
         assert!(snapshot["items"][0]["harness_state"].is_null(), "{snapshot}");
 
-        // A page waits a bounded time for a publication at its own cut, then answers from the
-        // newest one rather than folding.
-        let (Extension(page_snapshot), Json(page)) = tokio::time::timeout(Duration::from_secs(3),
+        // A first page answers at once from the newest publication rather than folding.
+        let (Extension(page_snapshot), Json(page)) = tokio::time::timeout(Duration::from_millis(500),
             client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
                 Query(ClientListQuery::default())))
             .await.expect("an HTTP page must not wait for the held refresh").unwrap();
@@ -11261,6 +11795,53 @@ mission "queue-parity" state="ready" {
         assert_eq!(page.items, changes["upserts"].as_array().unwrap().clone());
         socket.close(None).await.unwrap();
         server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_pages_ask_for_a_refresh_after_local_activity_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/local-page";
+        for (kind, fields) in [
+            ("runtime.observed", json!({"status":"running", "runtime_id":"local-page", "incarnation_id":"one"})),
+            ("harness.observed", json!({"state":"working", "driver":"codex", "incarnation_id":"one"})),
+        ] {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let index = state.store.index().unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+        let page = || client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery::default()));
+        let (_, Json(before)) = page().await.unwrap();
+        assert!(before.items[0]["last_activity_at"].is_null());
+
+        // Local activity alone: no claim, so the graph index stays put.
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "harness.timeline".into(), actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({"operation":"append",
+                "entry_id":"local-page", "source_id":"fixture/local-page",
+                "sequence":1, "revision":1, "role":"assistant", "entry_type":"message",
+                "final":true, "driver":"codex", "incarnation_id":"one",
+                "observed_at_unix_ms":client_now_ms(), "body":{"text":"local activity"}})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        assert_eq!(state.store.index().unwrap(), index);
+        let revision = *published.borrow_and_update();
+        // This page still shows the published roster, and asks for a newer one.
+        let (_, Json(stale)) = page().await.unwrap();
+        assert!(stale.items[0]["last_activity_at"].is_null());
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|now| *now > revision))
+            .await.expect("a page asks the refresher for local activity").unwrap();
+        let (snapshot, Json(after)) = page().await.unwrap();
+        assert_eq!(snapshot.0.store_index, index);
+        assert!(!after.items[0]["last_activity_at"].is_null(), "{:?}", after.items[0]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11373,11 +11954,15 @@ mission "queue-parity" state="ready" {
         let list = |query: ClientListQuery| client_agents(State(state.clone()),
             Extension(new_client_snapshot(&state)), Query(query));
 
-        // A history page is folded by the refresher on request, never by the read.
+        // A history page is folded by the refresher on request, never by the read: at once it
+        // is not ready, and a read asking for a fresh roster waits for the refresher.
         let builds = state.store.agent_resources_builds_for_test();
+        let not_ready = list(ClientListQuery { history: true, ..ClientListQuery::default() })
+            .await.unwrap_err();
+        assert_eq!(not_ready.code, "agent-roster-not-ready");
         let (Extension(history_snapshot), Json(history)) = tokio::time::timeout(
             Duration::from_secs(5),
-            list(ClientListQuery { history: true, ..ClientListQuery::default() }),
+            list(ClientListQuery { history: true, fresh: true, ..ClientListQuery::default() }),
         ).await.unwrap().unwrap();
         assert_eq!(history.items.len(), 3);
         assert!(history_snapshot.published_at.is_some());
@@ -11403,6 +11988,38 @@ mission "queue-parity" state="ready" {
             Query(continue_query)).await.unwrap_err();
         assert_eq!(expired.code, "page-cursor-expired");
         assert_eq!(state.store.agent_resources_builds_for_test(), builds);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_summary_reads_the_publication_without_roster_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/summary-roster".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"summary-roster", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+        // A slow refresh holds the roster admission; summary must not queue behind it.
+        let _refresh = state.store.admit_agent_resources().await;
+        let request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe", "id":"summary", "collection":"summary",
+        })).unwrap();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let (_, items, _) = tokio::time::timeout(Duration::from_secs(2),
+            collection_items_with_windows(&state, &ClientSession::local(None).unwrap(), &request,
+                semaphore.acquire_owned().await.unwrap(),
+                collection_windows::Windows::attach(&state.store)))
+            .await.expect("summary must not wait for the roster admission").unwrap();
+        assert_eq!(items[0]["kind"], "summary");
+        // The agent counts name the published roster they came from.
+        let (cut, _, published_at) = state.store.published_agent_roster(state.store.index().unwrap(), false).unwrap();
+        assert_eq!(items[0]["agents_as_of"]["store_index"], cut);
+        assert_eq!(items[0]["agents_as_of"]["published_at"], client_timestamp(published_at));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14240,6 +14857,87 @@ subscription "watch/source" {
         other.idempotency_key = "steady-send-foreign-snapshot".into();
         other.fence.snapshot_id = snapshot.id.replace("snapshot/", "snapshot/foreign-");
         assert_eq!(submit(other).await.unwrap_err().code, "stale-fence");
+    }
+
+    #[tokio::test]
+    async fn legacy_action_receipt_replay_conflicts_without_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/legacy-send".into(),
+            action_type: "message.send".into(),
+            idempotency_key: "legacy-send-idempotency-key".into(),
+            fence: Fence {
+                snapshot_id: new_client_snapshot(&state).id,
+                ..Default::default()
+            },
+            parameters: json!({"to":"person/blair","content":"Do not send again."}),
+        };
+        let legacy_digest = hex::encode(Sha256::digest(serde_json::to_vec(&request).unwrap()));
+        assert_ne!(legacy_digest, action_request_digest(&request).unwrap());
+        let key_digest = hex::encode(Sha256::digest(
+            format!("{}:{}", session.actor, request.idempotency_key).as_bytes(),
+        ));
+        state.store.append_claim(&ClaimInput {
+            subject: format!("custom/client/action-{}", &key_digest[..32]),
+            kind: "custom.client.action-result".into(),
+            actor: Some(session_claim_actor(&session)),
+            fields: BTreeMap::from([
+                ("request_digest".into(), json!(legacy_digest)),
+                ("result".into(), json!({"status":"completed"})),
+            ]),
+            evidence: vec![],
+            expected_subject: Some(None),
+            idempotency_key: None,
+        }).unwrap();
+        let before = state.store.status(None).unwrap().store_index;
+        let error = action(
+            State(state.clone()),
+            Extension(new_client_snapshot(&state)),
+            Extension(session),
+            Json(request),
+        ).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "idempotency-conflict");
+        assert_eq!(state.store.status(None).unwrap().store_index, before);
+        assert!(state.store.claims_for_kind_at("message.sent", None, true, 100)
+            .unwrap().claims.is_empty());
+    }
+
+    #[test]
+    fn legacy_terminal_attachment_replay_conflicts_without_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/legacy-attach".into(),
+            action_type: "terminal.attach".into(),
+            idempotency_key: "legacy-attach-idempotency-key".into(),
+            fence: Fence::default(),
+            parameters: json!({"target_id":"terminal/agent/example"}),
+        };
+        let legacy_digest = hex::encode(Sha256::digest(serde_json::to_vec(&request).unwrap()));
+        let current_digest = action_request_digest(&request).unwrap();
+        assert_ne!(legacy_digest, current_digest);
+        let attachment_id = terminal_attachment_id(&session, &request);
+        state.store.append_claim(&ClaimInput {
+            subject: terminal_attachment_subject(&attachment_id).unwrap(),
+            kind: "custom.client.terminal-attached".into(),
+            actor: Some(session_claim_actor(&session)),
+            fields: BTreeMap::from([("request_digest".into(), json!(legacy_digest))]),
+            evidence: vec![],
+            expected_subject: Some(None),
+            idempotency_key: None,
+        }).unwrap();
+        let before = state.store.status(None).unwrap().store_index;
+        let error = existing_terminal_attachment(&state, &session, &request, &current_digest)
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "idempotency-conflict");
+        assert_eq!(state.store.status(None).unwrap().store_index, before);
     }
 
     #[test]

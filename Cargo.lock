@@ -3238,7 +3238,7 @@ dependencies = [
 [[package]]
 name = "pty-client"
 version = "0.13.0-rust"
-source = "git+https://github.com/compoundingtech/pty?rev=b9d02f3468b718ceff27031e0b9cb38de3bb6b1c#b9d02f3468b718ceff27031e0b9cb38de3bb6b1c"
+source = "git+https://github.com/compoundingtech/pty?rev=1ae8c187301034d2b343b6ec638f2b74c009f92e#1ae8c187301034d2b343b6ec638f2b74c009f92e"
 dependencies = [
  "libc",
  "pty-core",
@@ -3249,7 +3249,7 @@ dependencies = [
 [[package]]
 name = "pty-core"
 version = "0.13.0-rust"
-source = "git+https://github.com/compoundingtech/pty?rev=b9d02f3468b718ceff27031e0b9cb38de3bb6b1c#b9d02f3468b718ceff27031e0b9cb38de3bb6b1c"
+source = "git+https://github.com/compoundingtech/pty?rev=1ae8c187301034d2b343b6ec638f2b74c009f92e#1ae8c187301034d2b343b6ec638f2b74c009f92e"
 dependencies = [
  "indexmap",
  "libc",
@@ -3263,7 +3263,7 @@ dependencies = [
 [[package]]
 name = "pty-terminal"
 version = "0.13.0-rust"
-source = "git+https://github.com/compoundingtech/pty?rev=b9d02f3468b718ceff27031e0b9cb38de3bb6b1c#b9d02f3468b718ceff27031e0b9cb38de3bb6b1c"
+source = "git+https://github.com/compoundingtech/pty?rev=1ae8c187301034d2b343b6ec638f2b74c009f92e#1ae8c187301034d2b343b6ec638f2b74c009f92e"
 dependencies = [
  "libghostty-vt",
  "libghostty-vt-sys",
@@ -4434,6 +4434,10 @@ dependencies = [
  "libghostty-vt",
  "libghostty-vt-sys",
  "notify",
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
  "portable-pty",
  "predicates",
  "proptest",
@@ -4461,6 +4465,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tower",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "urlencoding",
  "uuid",

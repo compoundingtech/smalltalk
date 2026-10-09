@@ -10,10 +10,17 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OpenFlags, Transaction};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::read_budget::ReadBudget;
+
+mod read_lifetime;
 pub mod writer_budget;
 mod transaction_finalizer;
 mod writer_queue;
+
+#[cfg(test)]
+mod read_admission_tests;
 use transaction_finalizer::TransactionFinalizers;
 pub use transaction_finalizer::WriterTransaction;
 
@@ -28,6 +35,50 @@ use crate::store::current_index;
 /// themselves (issue #946: 55% of daemon CPU was `ReadPool::get` reopening connections the
 /// pool had just closed), so the pool keeps every connection it opened, up to this many.
 pub const MAX_IDLE_READ_CONNECTIONS: usize = 128;
+
+/// Concurrent admitted read workers per pool. Idle retention is a separate ceiling.
+pub const MAX_READ_WORKERS: usize = 32;
+
+pub fn max_read_workers() -> usize {
+    static MAX: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        configured_max_read_workers(std::env::var("SMALLCLAIMS_MAX_READ_WORKERS").ok().as_deref())
+    });
+    *MAX
+}
+
+fn configured_max_read_workers(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=Semaphore::MAX_PERMITS).contains(value))
+        .unwrap_or(MAX_READ_WORKERS)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static READ_LIMIT_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Override pools constructed synchronously in `work`, not already-open pools or other threads.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_read_limit_for_test<T>(limit: usize, work: impl FnOnce() -> T) -> T {
+    assert!((1..=Semaphore::MAX_PERMITS).contains(&limit));
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READ_LIMIT_FOR_TEST.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(READ_LIMIT_FOR_TEST.with(|slot| slot.replace(Some(limit))));
+    work()
+}
+
+fn constructor_read_limit() -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(limit) = READ_LIMIT_FOR_TEST.with(std::cell::Cell::get) {
+        return limit;
+    }
+    max_read_workers()
+}
 
 /// A fixed page-cache target per reader, leaving retained schema and statement caches intact.
 /// SQLite's page-cache target excludes statements, schema, query results and allocator overhead.
@@ -842,11 +893,11 @@ impl Drop for WriterGuard<'_> {
     }
 }
 
-/// Read connections. A read takes an idle connection, or opens another when every one is busy,
-/// so a read never waits for another read to finish: the pool holds as many connections as reads
-/// ever ran at once, retains up to `max_idle_read_connections()` between reads, and closes
-/// excess idle connections. Reads see the last committed state and, in WAL mode, never wait
-/// for the writer. The retention ceiling does not bound concurrent connections.
+/// Read connections, with separate admission and idle-retention ceilings. Top-level API
+/// workers enter admitted request scopes before acquiring a connection or other store locks.
+/// Cross-pool nested scopes never wait for admission, like legacy raw `get`/`try_get`:
+/// waiting while holding another loan or snapshot can create a dependency cycle.
+/// Within a request or pinned snapshot, raw reads reuse that thread's connection.
 pub struct ReadPool {
     pub idle: Mutex<Vec<ReadConnection>>,
     /// Wakes a read waiting for an idle connection, which happens only when the operating system
@@ -855,6 +906,16 @@ pub struct ReadPool {
     pub path: PathBuf,
     pub shared_memory: bool,
     counts: Arc<ReaderCounts>,
+    admission: Arc<Semaphore>,
+    diagnostic_id: u64,
+}
+
+/// A Send, pool-specific capacity token. Once lent to a request, it follows that reader
+/// until the connection is returned or closed, including loans that escape their scope.
+#[must_use = "dropping the permit returns its reader capacity"]
+pub struct ReadPermit {
+    admission: Arc<Semaphore>,
+    _capacity: OwnedSemaphorePermit,
 }
 
 #[derive(Default)]
@@ -866,8 +927,11 @@ struct ReaderCounts {
 
 /// Counts the actual connection lifetime, including a connection shared by a pinned snapshot.
 pub struct ReadConnection {
+    id: u64,
     connection: Connection,
     counts: Arc<ReaderCounts>,
+    // Last: close SQLite before returning capacity if this connection is not pooled.
+    permit: Option<ReadPermit>,
 }
 
 impl Deref for ReadConnection {
@@ -892,79 +956,12 @@ pub struct ReaderUsage {
     pub opened: u64,
 }
 
-/// Reads checked out right now, so a pinned WAL can be traced to its holder. SQLite keeps no
-/// list of who holds a snapshot, and the profile only records a read after it ends.
-static LIVE_READS: Mutex<std::collections::BTreeMap<u64, LiveRead>> =
-    Mutex::new(std::collections::BTreeMap::new());
-static NEXT_LIVE_READ: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Copy)]
-struct LiveRead {
-    started: std::time::Instant,
-    at: &'static std::panic::Location<'static>,
-    /// A `Store::read_snapshot`: one read transaction held open for the whole closure. Any other
-    /// checkout is a pooled connection lent out, which pins only while a statement is mid-step.
-    snapshot: bool,
-}
-
-/// Ends the live-read entry on every exit path.
-pub struct LiveReadToken(u64);
-
-impl Drop for LiveReadToken {
-    fn drop(&mut self) {
-        LIVE_READS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.0);
-    }
-}
-
-/// Note a read starting at the caller's location.
-#[track_caller]
-pub fn register_live_read(snapshot: bool) -> LiveReadToken {
-    let id = NEXT_LIVE_READ.fetch_add(1, Ordering::Relaxed);
-    LIVE_READS.lock().unwrap_or_else(PoisonError::into_inner).insert(
-        id,
-        LiveRead {
-            started: std::time::Instant::now(),
-            at: std::panic::Location::caller(),
-            snapshot,
-        },
-    );
-    LiveReadToken(id)
-}
-
-/// The longest-running read checked out now, and how many there are.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OldestLiveRead {
-    pub age_ms: u128,
-    pub snapshot: bool,
-    pub at: String,
-    pub live: usize,
-}
-
-pub fn oldest_live_read() -> Option<OldestLiveRead> {
-    let reads = LIVE_READS.lock().unwrap_or_else(PoisonError::into_inner);
-    let live = reads.len();
-    let oldest = reads.values().min_by_key(|read| read.started)?;
-    Some(OldestLiveRead {
-        age_ms: oldest.started.elapsed().as_millis(),
-        snapshot: oldest.snapshot,
-        at: format!("{}:{}", oldest.at.file(), oldest.at.line()),
-        live,
-    })
-}
-
-/// Every live read as (location, is_snapshot), for tests that look for their own entry.
+pub use read_lifetime::{
+    LiveReadToken, OldestLiveRead, ReadLifetime, ReadLifetimeReport, oldest_live_read,
+    register_live_read,
+};
 #[cfg(any(test, feature = "test-support"))]
-pub fn live_read_locations() -> Vec<(String, bool)> {
-    LIVE_READS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .values()
-        .map(|read| (format!("{}:{}", read.at.file(), read.at.line()), read.snapshot))
-        .collect()
-}
+pub use read_lifetime::live_read_locations;
 
 pub struct ReadGuard<'a> {
     pub pool: &'a ReadPool,
@@ -977,19 +974,72 @@ pub struct ReadGuard<'a> {
 }
 
 thread_local! {
-    /// While `Store::read_snapshot` runs on this thread: the pool it pinned a connection from,
-    /// and that connection, held inside one read transaction.
     /// A request worker's connection, lent without starting a transaction. Reusing it
     /// makes acquisition fallible at the worker boundary rather than inside an infallible get.
-    static REQUEST_READER: RefCell<Option<(usize, Rc<ReadConnection>)>> = const { RefCell::new(None) };
-    pub static PINNED_READER: RefCell<Option<(usize, Rc<ReadConnection>)>> = const { RefCell::new(None) };
+    /// The loans this thread holds form a retained stack, innermost last: a loan taken while
+    /// another pool's loan is active nests on top, so reentering the outer pool reuses its
+    /// reader instead of opening another or waiting on capacity the same thread already holds.
+    static REQUEST_READER: RefCell<Vec<RequestLoan>> = const { RefCell::new(Vec::new()) };
+    /// The snapshot pins this thread holds, innermost last, including pins of other stores:
+    /// the single authority for pin membership and reuse.
+    static PINNED_STACK: RefCell<Vec<(usize, Rc<ReadConnection>)>> = const { RefCell::new(Vec::new()) };
+}
+
+struct RequestLoan {
+    pool: usize,
+    connection: Rc<ReadConnection>,
+}
+
+/// This thread's innermost loan for `pool`, so nested scopes and raw `get` reuse it.
+fn request_reader_for(pool: usize) -> Option<Rc<ReadConnection>> {
+    REQUEST_READER.with(|slot| {
+        slot.borrow()
+            .iter()
+            .rev()
+            .find(|loan| loan.pool == pool)
+            .map(|loan| loan.connection.clone())
+    })
+}
+
+/// Whether this thread holds any pool's request loan or pinned snapshot. Such a thread must
+/// not wait for read admission: another worker may hold that capacity while waiting on this
+/// thread's reader. Async callers should run nested reads through `ReadPool::request_read`.
+pub fn thread_holds_reader() -> bool {
+    REQUEST_READER.with(|slot| !slot.borrow().is_empty())
+        || PINNED_STACK.with(|stack| !stack.borrow().is_empty())
+}
+
+/// This thread's innermost pin for `pool`, even below another store's pin: reentry must
+/// reuse that snapshot's open transaction, not BEGIN its connection a second time.
+pub(crate) fn pinned_reader_for(pool: usize) -> Option<Rc<ReadConnection>> {
+    PINNED_STACK.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(key, _)| *key == pool)
+            .map(|(_, connection)| connection.clone())
+    })
+}
+
+/// Register a snapshot pin once its transaction has begun.
+pub(crate) fn push_pinned_reader(pool: usize, connection: Rc<ReadConnection>) {
+    PINNED_STACK.with(|stack| stack.borrow_mut().push((pool, connection)));
+}
+
+/// Unregister a snapshot pin, leaving any outer or other-store pin below it.
+fn pop_pinned_reader(pool: usize) {
+    PINNED_STACK.with(|stack| {
+        let popped = stack.borrow_mut().pop();
+        debug_assert_eq!(popped.map(|(key, _)| key), Some(pool));
+    });
 }
 
 /// A write from inside `Store::read_snapshot` commits after the snapshot its thread reads, so
 /// the reads that follow it there cannot see it. Nothing writes from a pinned read.
 pub fn debug_assert_no_pinned_read() {
     debug_assert!(
-        PINNED_READER.with(|slot| slot.borrow().is_none()),
+        PINNED_STACK.with(|stack| stack.borrow().is_empty()),
         "a write from inside a pinned read"
     );
 }
@@ -998,13 +1048,16 @@ pub fn debug_assert_no_pinned_read() {
 pub struct PinnedRead<'a> {
     pub pool: &'a ReadPool,
     pub connection: Option<Rc<ReadConnection>>,
-    /// Restore an outer snapshot when a different store is read inside it.
-    pub previous: Option<(usize, Rc<ReadConnection>)>,
+    /// Whether the pin was registered in this thread's pin stack: set once its transaction
+    /// began, so a failed BEGIN neither registers nor disturbs an outer pin.
+    pub registered: bool,
 }
 
 impl Drop for PinnedRead<'_> {
     fn drop(&mut self) {
-        PINNED_READER.with(|slot| *slot.borrow_mut() = self.previous.take());
+        if self.registered {
+            pop_pinned_reader(self.pool.key());
+        }
         let Some(connection) = self.connection.take() else {
             return;
         };
@@ -1029,6 +1082,8 @@ impl ReadPool {
             path: path.to_path_buf(),
             shared_memory,
             counts: Arc::new(ReaderCounts::default()),
+            admission: Arc::new(Semaphore::new(constructor_read_limit())),
+            diagnostic_id: read_lifetime::next_pool_id(),
         };
         // Open one now, so a store that cannot be read fails to open.
         let connection = pool.open_connection()?;
@@ -1040,53 +1095,189 @@ impl ReadPool {
         std::ptr::from_ref(self) as usize
     }
 
+    /// Candidates for this pool and separately unpooled process entries with unknown database
+    /// identity. Neither group proves who holds a WAL frame.
+    pub fn live_read_report(&self) -> ReadLifetimeReport {
+        read_lifetime::report(self.diagnostic_id)
+    }
+
+    #[track_caller]
+    pub(crate) fn register_snapshot(&self) -> LiveReadToken {
+        read_lifetime::register_in_pool(self.diagnostic_id, true, None)
+    }
+
     fn open_connection(&self) -> Result<ReadConnection> {
         let connection = open_read_connection(&self.path, self.shared_memory)?;
         let open = self.counts.open.fetch_add(1, Ordering::Relaxed) + 1;
         self.counts.peak.fetch_max(open, Ordering::Relaxed);
-        self.counts.opened.fetch_add(1, Ordering::Relaxed);
+        let id = self.counts.opened.fetch_add(1, Ordering::Relaxed) + 1;
         Ok(ReadConnection {
+            id,
             connection,
             counts: self.counts.clone(),
+            permit: None,
         })
     }
 
-    /// Acquire before running an API worker. Connection-open failures are returned
-    /// immediately, and cancellation is checked before and after acquisition.
+    /// Ungated, fallible legacy acquisition. API workers must use an admitted request scope.
+    /// Connection-open failures return immediately; cancellation is checked around acquisition.
     #[track_caller]
     pub fn try_get(&self) -> Result<ReadGuard<'_>> {
         crate::read_budget::check()?;
         let idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner).pop();
         let connection = match idle { Some(connection) => connection, None => self.open_connection()? };
         configure_read_cancellation(&connection);
-        let guard = ReadGuard { pool: self, connection: Some(connection), pinned: None, _live: Some(register_live_read(false)) };
+        let live = read_lifetime::register_in_pool(self.diagnostic_id, false, Some(connection.id));
+        let guard = ReadGuard { pool: self, connection: Some(connection), pinned: None, _live: Some(live) };
         crate::read_budget::check()?;
         Ok(guard)
     }
 
+    /// Acquire capacity without acquiring a connection. Dropping this future removes its
+    /// semaphore queue entry. Explicit cancellation, parent cancellation, and deadlines all
+    /// wake a queued request; a token is returned only while its budget remains live.
+    pub async fn admit_read(&self, budget: Option<ReadBudget>) -> Result<ReadPermit> {
+        if let Some(budget) = &budget {
+            budget.check()?;
+        }
+        let permit = if let Some(permit) = self.try_admit_read() {
+            permit
+        } else {
+            let acquire = self.admission.clone().acquire_owned();
+            let capacity = if let Some(budget) = &budget {
+                tokio::select! {
+                    biased;
+                    _ = budget.cancellation() => {
+                        budget.check()?;
+                        unreachable!("cancellation completes only for an expired budget");
+                    }
+                    _ = tokio::time::sleep(budget.remaining()) => {
+                        budget.cancel();
+                        budget.check()?;
+                        unreachable!("the budget deadline elapsed");
+                    }
+                    capacity = acquire => capacity?,
+                }
+            } else {
+                acquire.await?
+            };
+            ReadPermit { admission: self.admission.clone(), _capacity: capacity }
+        };
+        if let Some(budget) = &budget {
+            budget.check()?;
+        }
+        Ok(permit)
+    }
+
+    /// Never waits. Fanout workers must fall back to inline work when this returns None.
+    pub fn try_admit_read(&self) -> Option<ReadPermit> {
+        let capacity = self.admission.clone().try_acquire_owned().ok()?;
+        Some(ReadPermit { admission: self.admission.clone(), _capacity: capacity })
+    }
+
+    /// Whether this thread holds a registered pinned snapshot of this pool, even below
+    /// another store's pin. Snapshot helpers must consult this, not the innermost mirror:
+    /// a cached read is valid only while this pool's own pin is registered.
+    pub fn has_pinned_reader(&self) -> bool {
+        pinned_reader_for(self.key()).is_some()
+    }
+
+    /// Whether this thread already holds this pool's request loan or a pinned snapshot,
+    /// including one below another store's pin.
+    pub fn has_request_reader(&self) -> bool {
+        self.has_pinned_reader() || request_reader_for(self.key()).is_some()
+    }
+
+    fn admit_read_sync(&self) -> Result<ReadPermit> {
+        let budget = crate::read_budget::current();
+        crate::read_budget::check()?;
+        if let Some(permit) = self.try_admit_read() {
+            crate::read_budget::check()?;
+            return Ok(permit);
+        }
+        // Semaphore and budget wakeups use the thread's park token, so a release/cancel
+        // between polling and parking cannot be lost. No Tokio runtime is needed here.
+        struct WakeThread(std::thread::Thread);
+        impl std::task::Wake for WakeThread {
+            fn wake(self: Arc<Self>) { self.0.unpark(); }
+            fn wake_by_ref(self: &Arc<Self>) { self.0.unpark(); }
+        }
+        let waker = std::task::Waker::from(Arc::new(WakeThread(std::thread::current())));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut acquire = std::pin::pin!(self.admission.clone().acquire_owned());
+        let mut cancellation = budget.as_ref().map(ReadBudget::cancellation);
+        loop {
+            crate::read_budget::check()?;
+            if let Some(cancellation) = &mut cancellation {
+                let _ = std::pin::Pin::new(cancellation).poll(&mut context);
+            }
+            if let std::task::Poll::Ready(capacity) = acquire.as_mut().poll(&mut context) {
+                let permit = ReadPermit {
+                    admission: self.admission.clone(),
+                    _capacity: capacity?,
+                };
+                crate::read_budget::check()?;
+                return Ok(permit);
+            }
+            crate::read_budget::check()?;
+            if let Some(budget) = &budget {
+                std::thread::park_timeout(budget.remaining());
+            } else {
+                std::thread::park();
+            }
+        }
+    }
+
     /// One reader per blocking worker, without BEGIN. Reads still take a snapshot per
-    /// statement unless Store::read_snapshot explicitly pins a transaction. Nested scopes
-    /// reuse the same loan; unrelated workers acquire their own connection.
+    /// statement unless Store::read_snapshot explicitly pins a transaction. Same-pool nested
+    /// scopes reuse their loan or snapshot. Cross-pool nesting tries admission without waiting
+    /// and, if unavailable, borrows outside the top-level bound like legacy raw checkout.
     #[track_caller]
     pub fn request_read<T>(&self, work: impl FnOnce() -> T) -> Result<T> {
-        if REQUEST_READER.with(|slot| slot.borrow().as_ref().is_some_and(|(key, _)| *key == self.key())) {
+        crate::read_budget::check()?;
+        if self.has_request_reader() {
             return Ok(work());
         }
+        let nested = thread_holds_reader();
+        let permit = if nested { self.try_admit_read() } else { Some(self.admit_read_sync()?) };
+        self.request_read_loan(permit, work)
+    }
+
+    /// Establish the normal request loan with capacity acquired before the worker was spawned.
+    #[track_caller]
+    pub fn request_read_with_permit<T>(&self, permit: ReadPermit, work: impl FnOnce() -> T) -> Result<T> {
+        anyhow::ensure!(Arc::ptr_eq(&permit.admission, &self.admission), "read permit belongs to another pool");
+        crate::read_budget::check()?;
+        if self.has_request_reader() {
+            drop(permit);
+            return Ok(work());
+        }
+        self.request_read_loan(Some(permit), work)
+    }
+
+    /// Register admitted and unadmitted nested loans with the same ownership and cleanup.
+    #[track_caller]
+    fn request_read_loan<T>(&self, permit: Option<ReadPermit>, work: impl FnOnce() -> T) -> Result<T> {
         let mut guard = self.try_get()?;
-        let connection = Rc::new(guard.connection.take().expect("try_get holds a connection"));
+        let mut connection = guard.connection.take().expect("try_get holds a connection");
+        connection.permit = permit;
+        let connection = Rc::new(connection);
         let live = guard._live.take();
         drop(guard);
         struct Loan<'a> {
             pool: &'a ReadPool,
-            connection: Option<Rc<ReadConnection>>,
-            previous: Option<(usize, Rc<ReadConnection>)>,
             // Keep the registry entry until the entire request loan has returned its reader.
             _live: Option<LiveReadToken>,
         }
         impl Drop for Loan<'_> {
             fn drop(&mut self) {
-                REQUEST_READER.with(|slot| *slot.borrow_mut() = self.previous.take());
-                let connection = self.connection.take().expect("the loan holds its connection");
+                // Pop this loan, restoring any outer loan below it — including another
+                // pool's — on every exit path, panics included.
+                let connection = REQUEST_READER.with(|slot| {
+                    let entry = slot.borrow_mut().pop().expect("the loan is registered while it runs");
+                    debug_assert_eq!(entry.pool, self.pool.key());
+                    entry.connection
+                });
                 connection.progress_handler(0, None::<fn() -> bool>);
                 // A cancelled read must not retain its snapshot in the pool. The connection
                 // is query_only; ending a leftover read transaction cannot commit writes.
@@ -1100,8 +1291,14 @@ impl ReadPool {
                 }
             }
         }
-        let previous = REQUEST_READER.with(|slot| slot.replace(Some((self.key(), connection.clone()))));
-        let _loan = Loan { pool: self, connection: Some(connection), previous, _live: live };
+        // Move the loan's only handle into the registry: the popped entry must be the
+        // connection's last Rc when the loan ends, or the pool would close it instead of
+        // retaining it idle.
+        REQUEST_READER.with(|slot| slot.borrow_mut().push(RequestLoan {
+            pool: self.key(),
+            connection,
+        }));
+        let _loan = Loan { pool: self, _live: live };
         Ok(work())
     }
 
@@ -1120,11 +1317,9 @@ impl ReadPool {
     #[track_caller]
     pub fn get(&self) -> ReadGuard<'_> {
         crate::read_budget::note_read_site();
-        let lookup = |slot: &RefCell<Option<(usize, Rc<ReadConnection>)>>| {
-            slot.borrow().as_ref().filter(|(pool, _)| *pool == self.key())
-                .map(|(_, connection)| connection.clone())
-        };
-        let pinned = PINNED_READER.with(lookup).or_else(|| REQUEST_READER.with(lookup));
+        // A registered pin, even below another store's pin, is this thread's snapshot of
+        // this store: reusing it keeps every read in `read_snapshot` on one transaction.
+        let pinned = pinned_reader_for(self.key()).or_else(|| request_reader_for(self.key()));
         if let Some(connection) = &pinned {
             configure_read_cancellation(connection);
             return ReadGuard {
@@ -1166,25 +1361,41 @@ impl ReadPool {
             crate::profile::read_waited(waiting.elapsed());
         }
         configure_read_cancellation(&connection);
+        let live = read_lifetime::register_in_pool(self.diagnostic_id, false, Some(connection.id));
         ReadGuard {
             pool: self,
             connection: Some(connection),
             pinned: None,
-            _live: Some(register_live_read(false)),
+            _live: Some(live),
         }
     }
 
     /// Keep `connection` for the next read, or close it when the pool already holds
     /// `max_idle_read_connections()` of them.
-    pub fn release(&self, connection: ReadConnection) {
+    pub fn release(&self, mut connection: ReadConnection) {
         // Remove cancellation before reuse by an unrelated request. No other thread can
         // still own this connection; pinned readers return only after their last guard.
         connection.progress_handler(0, None::<fn() -> bool>);
-        let _ = connection.busy_timeout(std::time::Duration::from_secs(5));
+        // Raw BEGIN is available on ordinary guards. Never retain an idle read transaction:
+        // it can pin WAL after its live-read entry is gone. Cleanup happens only at physical
+        // return, after every legitimate pinned/outer owner has released the connection.
+        if !connection.is_autocommit()
+            && (connection.execute_batch("ROLLBACK").is_err() || !connection.is_autocommit())
+        {
+            return; // Closing a failed-cleanup connection is safer than reusing it.
+        }
+        if connection.busy_timeout(std::time::Duration::from_secs(5)).is_err() {
+            return;
+        }
+        // Retain capacity through cleanup and insertion (or closing an excess connection).
+        // The idle mutex drops before this token, so a newly admitted worker sees the return.
+        let _permit = connection.permit.take();
         let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
         if idle.len() < max_idle_read_connections() {
             idle.push(connection);
             self.returned.notify_one();
+        } else {
+            drop(connection);
         }
     }
 }
@@ -1806,7 +2017,7 @@ mod tests {
         drop(PinnedRead {
             pool: &pool,
             connection: Some(connection),
-            previous: None,
+            registered: false,
         });
         assert_eq!((pool.usage().open, pool.usage().idle), (1, 0));
         drop(escaped);

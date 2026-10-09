@@ -35,6 +35,8 @@ use crate::store::Store;
 
 mod channel_recovery;
 mod placement;
+mod run_report;
+mod start_spacing;
 
 /// The actor of every attention request the reconciler raises.
 const RECONCILER_ACTOR: &str = "agent/st3/reconciler";
@@ -750,6 +752,9 @@ fn first_readiness_since(run: &MissionRunView) -> u128 {
 type MemberWake = (DesiredSubject, String, MemberSpec);
 #[cfg(test)]
 type WorkWakeObserveHook = Box<dyn FnOnce(&crate::incremental::Incremental, bool) + Send>;
+#[cfg(test)]
+type BackgroundEntryHook =
+    Arc<dyn Fn(bool, Option<tokio::time::Instant>, smallclaims::sqlite::work::SqliteWork) + Send + Sync>;
 
 pub struct Reconciler<R = NativeRuntime> {
     store: Arc<Store>,
@@ -764,6 +769,11 @@ pub struct Reconciler<R = NativeRuntime> {
     runtime_environment: BTreeMap<String, String>,
     notify: Arc<Notify>,
     event_notify: watch::Sender<u64>,
+    start_spacing: start_spacing::StartSpacing,
+    #[cfg(test)]
+    background_dispatch_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    background_entry_hook: Option<BackgroundEntryHook>,
     armed_schedules: Arc<Mutex<std::collections::HashSet<String>>>,
     schedule_peers: Vec<String>,
     /// The request and deadline of a failed workspace attempt, by schedule. Local retry state
@@ -918,6 +928,11 @@ impl Reconciler<NativeRuntime> {
             ]),
             notify,
             event_notify,
+            start_spacing: Default::default(),
+            #[cfg(test)]
+            background_dispatch_hook: Default::default(),
+            #[cfg(test)]
+            background_entry_hook: None,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             schedule_peers: Vec::new(),
             schedule_workspace_retries: Mutex::new(HashMap::new()),
@@ -988,6 +1003,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             runtime_environment: BTreeMap::new(),
             notify,
             event_notify: watch::channel(0_u64).0,
+            start_spacing: Default::default(),
+            #[cfg(test)]
+            background_dispatch_hook: Default::default(),
+            #[cfg(test)]
+            background_entry_hook: None,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             schedule_peers: Vec::new(),
             schedule_workspace_retries: Mutex::new(HashMap::new()),
@@ -1191,6 +1211,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         self
     }
 
+    pub fn set_max_passes_per_minute(&self, value: u32) -> Result<()> {
+        self.start_spacing.set(value)
+    }
+
     pub async fn run(self: Arc<Self>) {
         self.notify.notify_one();
         // When the last pass began, and whether it changed nothing.
@@ -1229,15 +1253,30 @@ impl<R: RuntimeControl> Reconciler<R> {
                 trigger
             };
             for pass in 0..64 {
-                let started = now_ms();
                 let check_recovery = may_have_failed;
                 let pass_trigger = if pass == 0 {
                     trigger
                 } else {
                     "trigger/changed-repeat"
                 };
-                let (changed, failed) = self
-                    .blocking(move |this| {
+                let (changed, failed, started) = loop {
+                    self.start_spacing.wait().await;
+                    let queued = start_spacing::QueuedAdmission::default();
+                    let active = queued.0.clone();
+                    #[cfg(test)]
+                    if let Some(hook) = self.background_dispatch_hook.lock().unwrap().take() {
+                        hook();
+                    }
+                    let outcome = self.blocking(move |this| {
+                        #[cfg(test)]
+                        let admission_work = smallclaims::sqlite::work::SqliteWorkScope::start();
+                        let admitted = this.start_spacing.try_start_if(&active);
+                        #[cfg(test)]
+                        if let Some(hook) = &this.background_entry_hook {
+                            hook(admitted, this.start_spacing.last_start(), admission_work.finish());
+                        }
+                        if !admitted { return None; }
+                        let started = now_ms();
                         let before = this.store.index().ok();
                         let failed = match crate::profile::task("task reconcile-pass", || {
                             let _trigger_span = crate::profile::span(pass_trigger);
@@ -1266,9 +1305,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 false
                             }
                         };
-                        (before != this.store.index().ok(), failed)
-                    })
-                    .await;
+                        Some((before != this.store.index().ok(), failed, started))
+                    }).await;
+                    if let Some(outcome) = outcome { break outcome; }
+                };
                 may_have_failed = failed;
                 self.event_notify
                     .send_modify(|generation| *generation = generation.saturating_add(1));
@@ -7011,6 +7051,25 @@ impl<R: RuntimeControl> Reconciler<R> {
                         // From the view the evaluation started with: a write it makes changes subjects
                         // it read, so the next pass evaluates it again and takes the new times.
                         due = crate::incremental::run_due(&run, now_ms());
+                        // Telling a run's reporter never holds the run back or fails it.
+                        match self.run_report(&run).and_then(|report| {
+                            report
+                                .map(|report| self.report_run(&run, &report, now_ms()))
+                                .transpose()
+                        }) {
+                            Ok(stalls_at) => {
+                                due = [due, stalls_at.flatten()].into_iter().flatten().min();
+                            }
+                            Err(error) => {
+                                if let Err(error) = self.record_fault(
+                                    &run.subject,
+                                    run_report::REPORT_FAULT_SCOPE,
+                                    Err(error),
+                                ) {
+                                    eprintln!("st3: run report for {}: {error:#}", run.subject);
+                                }
+                            }
+                        }
                         let evaluated = self.evaluate_active_mission_run(&run);
                         // Recovery is diagnostic too: admission and execution writes come first.
                         if (!first_readiness_pending(&run)
@@ -7072,7 +7131,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             .iter()
             .flatten()
             .filter(|((subject, scope), _)| match scope.as_str() {
-                "mission-run" | FIRST_READINESS_FAULT_SCOPE => !active.contains(subject),
+                "mission-run" | FIRST_READINESS_FAULT_SCOPE | run_report::REPORT_FAULT_SCOPE => {
+                    !active.contains(subject)
+                }
                 "step" => !active_steps.contains(subject),
                 _ => false,
             })
@@ -7523,7 +7584,19 @@ impl<R: RuntimeControl> Reconciler<R> {
                             .blocked_reason
                             .as_deref()
                             .is_some_and(|reason| reason.starts_with("step baseline `"));
-                    if view.status == "pending" || assignment_blocked || baseline_blocked {
+                    let ready_missing_agent = view.status == "ready"
+                        && !view.agentless
+                        && view.claimant.is_none()
+                        && !view
+                            .assigned_to
+                            .as_deref()
+                            .is_some_and(|a| a.starts_with("person/"))
+                        && self.ready_step_binding_missing(run, view)?;
+                    if view.status == "pending"
+                        || assignment_blocked
+                        || baseline_blocked
+                        || ready_missing_agent
+                    {
                         if view
                             .not_before_unix_ms
                             .is_some_and(|not_before| not_before > now_ms())
@@ -7787,10 +7860,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         if run.phase == "normal" {
-            let refreshed = self
-                .store
-                .mission_run(&run.id)?
-                .context("the active mission run disappeared")?;
+            let refreshed = self.store.mission_run_for_reconcile(&run.id)?;
             let normal = refreshed
                 .steps
                 .iter()
@@ -7805,8 +7875,20 @@ impl<R: RuntimeControl> Reconciler<R> {
             let failed = normal
                 .iter()
                 .any(|view| matches!(view.status.as_str(), "failed" | "cancelled"));
+            let missing_agent = normal.iter().find(|view| {
+                view.status == "blocked"
+                    && view
+                        .blocked_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.starts_with("no eligible agent is present"))
+            });
+            if let Some(view) = missing_agent {
+                changed |= self.store.record_missing_agent_failure(&refreshed, view)?;
+            }
             let (status, reason) = if advancing {
                 ("running", None)
+            } else if missing_agent.is_some() {
+                ("blocked", Some("the mission has no eligible desired agent"))
             } else if failed {
                 ("blocked", Some("the mission has no available step"))
             } else if mission.completion.is_none() && !changed {
@@ -7819,6 +7901,28 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .set_mission_run_state(&run.id, status, "normal", reason)?;
         }
         Ok(changed)
+    }
+
+    /// Cleanup may have selected a stop while a seat still owns ready work in another run.
+    /// Keep that existing queue alive until ordinary seat retention lets the runtime end.
+    fn ready_step_binding_missing(&self, run: &MissionRunView, step: &StepRunView) -> Result<bool> {
+        for name in step.assigned_to.iter().chain(step.available_to.iter()) {
+            let kind = self.store.selected_desired_kind(name)?;
+            if kind.as_deref() == Some("agent") {
+                return Ok(false);
+            }
+            if kind.as_deref() == Some("stop")
+                && let Some(owner) = self.store.selected_stop_owner_run(name)?
+                && owner != run.subject
+                && self
+                    .store
+                    .seat_work_in_other_runs(name, &owner)?
+                    .contains(&step.subject)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn record_first_readiness_wait(&self, run: &MissionRunView, now: u128) -> Result<()> {
@@ -15811,7 +15915,10 @@ mod tests {
     mod pull_request_run_tests;
     mod ready_idle_wake;
     mod ref_watch_tests;
+    mod revision_seat_tests;
     mod rollout_tests;
+    mod run_report_tests;
+    mod start_spacing_loop;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
         use super::{NativeRuntime, RuntimeControl};
@@ -15980,6 +16087,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
     #[derive(Default)]
     struct FakeRuntime {
         snapshot_error: Mutex<bool>,
+        before_snapshot: Mutex<Option<Box<dyn Fn() + Send>>>,
         before_observe_exec: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         ptys: Mutex<Vec<RuntimeObservation>>,
         execs: Mutex<HashMap<String, RuntimeObservation>>,
@@ -16041,6 +16149,9 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
 
     impl RuntimeControl for FakeRuntime {
         fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
+            if let Some(before) = self.before_snapshot.lock().unwrap().as_ref() {
+                before();
+            }
             if *self.snapshot_error.lock().unwrap() {
                 anyhow::bail!("the PTY snapshot is unavailable")
             }
@@ -24899,6 +25010,9 @@ mission "orchid/timeout" state="ready" timeout="1ms" {
             "node".into(),
             notify.clone(),
         ));
+        // This oracle checks convergence/lifecycle, at the fastest supported configured cap.
+        // Default30 start spacing is independently covered by deterministic gate controls.
+        reconciler.set_max_passes_per_minute(600).unwrap();
         let task = tokio::spawn(reconciler.run());
 
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -24995,6 +25109,9 @@ mission "orchid/timeout" state="ready" timeout="1ms" {
             "node".into(),
             notify.clone(),
         ));
+        // This oracle checks convergence/lifecycle, at the fastest supported configured cap.
+        // Default30 start spacing is independently covered by deterministic gate controls.
+        reconciler.set_max_passes_per_minute(600).unwrap();
         let task = tokio::spawn(reconciler.run());
 
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -25322,6 +25439,8 @@ mission "absent-stop" state="ready" {
             "node".into(),
             Arc::new(Notify::new()),
         ));
+        // Retain this deadline/convergence oracle and budget at a supported raised cap.
+        reconciler.set_max_passes_per_minute(600).unwrap();
         let task = tokio::spawn(reconciler.run());
 
         tokio::time::timeout(Duration::from_secs(10), async {
