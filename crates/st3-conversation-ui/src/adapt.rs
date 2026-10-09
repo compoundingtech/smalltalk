@@ -620,12 +620,14 @@ fn is_routine_record(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) ->
             // only the plain heartbeats are routine.
             TimelineBody::Status(status) => {
                 let detail = status.detail.as_deref().map(str::trim).filter(|d| !d.is_empty());
-                match status.status {
-                    TimelineStatus::Queued | TimelineStatus::Completed => true,
-                    TimelineStatus::Running => matches!(detail, None | Some("working")),
-                    TimelineStatus::Waiting => matches!(detail, None | Some("idle")),
-                    _ => false,
-                }
+                // A status that carries blocks carries content, whatever it is called.
+                status.blocks.is_empty()
+                    && match status.status {
+                        TimelineStatus::Queued | TimelineStatus::Completed => true,
+                        TimelineStatus::Running => matches!(detail, None | Some("working")),
+                        TimelineStatus::Waiting => matches!(detail, None | Some("idle")),
+                        _ => false,
+                    }
             }
             TimelineBody::Redaction(redaction) => redaction.reason == "sensitive-content",
             _ => false,

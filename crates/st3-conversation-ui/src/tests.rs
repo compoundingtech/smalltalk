@@ -1362,6 +1362,12 @@ fn a_waiting_or_running_status_with_a_real_reason_is_never_hidden() {
         assert_eq!(shown(status("waiting", Some(reason))), 1, "{reason}");
     }
     assert_eq!(shown(status("running", Some("compacting"))), 1);
+    // A plain-looking status that carries blocks carries content.
+    let mut with_blocks = serde_json::json!({"status":"waiting","detail":"idle"});
+    with_blocks["blocks"] = serde_json::json!([{
+        "id":"block/1","kind":"text","source_type":"status","visibility":"visible","payload":{"text":"approve?"}
+    }]);
+    assert_eq!(shown(review_entry("status", "system", with_blocks)), 1);
     assert_eq!(shown(status("failed", None)), 1);
     assert_eq!(shown(status("cancelled", None)), 1);
 }
