@@ -27,12 +27,17 @@ const normalize = (line) => {
 }
 const escapeRe = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 /** Substring literals deny full refs and multiword identities; `{ "token": … }` denies a bare
- *  delimited identity token without rejecting longer public identifiers such as app paths. */
+ *  delimited identity token without rejecting longer public identifiers such as app paths.
+ *  `{ "allow": … }` names an exact, case-sensitive public string (e.g. a protocol identifier)
+ *  that identity rules ignore; generic rules still see the whole line. */
 const compileRules = (policy) => {
-  if (policy === undefined) return []
+  if (policy === undefined) return { rules: [], allows: [] }
   if (!Array.isArray(policy) || policy.length === 0)
     throw new Error('A supplied identity policy must be a nonempty array')
-  const rules = policy.map((entry) => {
+  const isAllow = (entry) => entry !== null && typeof entry === 'object' && 'allow' in entry
+  const allows = policy.filter(isAllow).map((entry) =>
+    typeof entry.allow === 'string' && entry.allow.trim().length >= 3 && Object.keys(entry).length === 1 ? entry.allow : null)
+  const rules = policy.filter((entry) => !isAllow(entry)).map((entry) => {
     if (typeof entry === 'string')
       return entry.trim().length >= 3 ? (text) => text.toLowerCase().includes(entry.toLowerCase()) : null
     if (entry !== null && typeof entry === 'object' && typeof entry.token === 'string' && entry.token.trim().length >= 3) {
@@ -41,16 +46,20 @@ const compileRules = (policy) => {
     }
     return null
   })
-  if (rules.some((rule) => rule === null)) throw new Error('Invalid private identity denylist entry')
-  return rules
+  if (rules.some((rule) => rule === null) || allows.some((allow) => allow === null))
+    throw new Error('Invalid private identity denylist entry')
+  return { rules, allows }
 }
-export const forbiddenLine = (line, policy) => {
-  const text = normalize(line)
-  const rules = compileRules(policy)
-  return patterns.some((pattern) => pattern.test(text)) || rules.some((rule) => rule(text))
+// A space keeps the text on either side of an allowed string from joining into a new match.
+const identityText = (text, allows) => allows.reduce((rest, allow) => rest.split(allow).join(' '), text)
+const forbiddenText = (text, { rules, allows }) => {
+  if (patterns.some((pattern) => pattern.test(text))) return true
+  const identity = identityText(text, allows)
+  return rules.some((rule) => rule(identity))
 }
+export const forbiddenLine = (line, policy) => forbiddenText(normalize(line), compileRules(policy))
 export const scanFiles = async (roots, policy) => {
-  const rules = compileRules(policy)
+  const compiled = compileRules(policy)
   const findings = []
   const visit = async (path) => {
     const stat = await lstat(path)
@@ -69,9 +78,7 @@ export const scanFiles = async (roots, policy) => {
     // Raster captures/build blobs cannot be certified by a text scan; reject rather than skip.
     if (text.includes('\0')) { findings.push({ file: path, line: 1 }); return }
     text.split(/\r?\n/).forEach((line, i) => {
-      const text = normalize(line)
-      if (patterns.some((pattern) => pattern.test(text)) || rules.some((rule) => rule(text)))
-        findings.push({ file: path, line: i + 1 })
+      if (forbiddenText(normalize(line), compiled)) findings.push({ file: path, line: i + 1 })
     })
   }
   for (const root of roots) await visit(resolve(root))

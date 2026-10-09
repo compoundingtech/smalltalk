@@ -32,6 +32,16 @@ test('each deny category fails, including escaped and URL-encoded identities', (
   assert.equal(forbiddenLine('Actual Operator', undefined), false, 'identities need an owner-held policy')
   assert.equal(forbiddenLine('/ho' + 'me/operator', undefined), true, 'generic rules apply without a policy')
 })
+test('exact allow entries exempt only that string from identity rules', () => {
+  const allowPolicy = ['example.', { allow: 'custom.example.sidebar' }]
+  assert.equal(forbiddenLine('kind: "custom.example.sidebar"', allowPolicy), false)
+  assert.equal(forbiddenLine('kind: "custom.example.sidebar" example.x', allowPolicy), true, 'other matches still fail')
+  assert.equal(forbiddenLine('kind: "custom.example.sidebarexample.x"', allowPolicy), true, 'adjacent text is still scanned')
+  assert.equal(forbiddenLine('kind: "Custom.Example.Sidebar"', allowPolicy), true, 'allow entries are case-sensitive')
+  assert.equal(forbiddenLine('custom.example.sidebar /ho' + 'me/operator', allowPolicy), true, 'generic rules see the whole line')
+  assert.throws(() => forbiddenLine('x', [{ allow: 'ab' }]), /Invalid private identity denylist entry/)
+  assert.throws(() => forbiddenLine('x', [{ allow: 'custom.example.sidebar', token: 'x' }]), /Invalid private identity denylist entry/)
+})
 test('CLI fails with file and line only, and rejects binary or symlink bypasses', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'synthetic-privacy-'))
   try {
