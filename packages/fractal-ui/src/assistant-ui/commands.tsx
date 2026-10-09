@@ -89,7 +89,7 @@ export function CommandsProvider({ commands, platform = commandPlatform(), child
   }, [])
   return <Registry.Provider value={registry}><div ref={setPortalContainer} data-command-scope onCompositionStartCapture={() => { composing.current = true }} onCompositionEndCapture={() => { composing.current = false }} {...stylex.props(styles.scope)}>{children}
     <ModalOverlay UNSTABLE_portalContainer={portalContainer ?? undefined} isOpen={overlay !== null} onOpenChange={open => { if (!open) setOverlay(null) }} isDismissable {...stylex.props(styles.scrim)}><Modal {...stylex.props(styles.modal)}><Dialog aria-label={overlay === 'palette' ? 'Command palette' : 'Keyboard shortcuts'} {...stylex.props(styles.dialog)}>
-      <div {...stylex.props(styles.heading)}><Heading slot="title" {...stylex.props(styles.title)}>{overlay === 'palette' ? 'Command palette' : 'Keyboard shortcuts'}</Heading><Button aria-label="Close" onPress={() => setOverlay(null)} {...stylex.props(styles.close)}>Esc</Button></div>
+      <div {...stylex.props(styles.heading)}><Heading slot="title" {...stylex.props(styles.title)}>{overlay === 'palette' ? 'Command palette' : 'Keyboard shortcuts'}</Heading><Button aria-label="Close (Esc)" onPress={() => setOverlay(null)} {...stylex.props(styles.close)}>Esc</Button></div>
       {overlay === 'palette' ? <CommandPalette registry={registry} /> : <ShortcutList registry={registry} />}
     </Dialog></Modal></ModalOverlay>
   </div></Registry.Provider>
@@ -105,8 +105,9 @@ function CommandPalette({ registry }: { readonly registry: CommandRegistry }) {
     <Menu aria-label="Commands" onAction={id => registry.perform(String(id))} disabledKeys={registry.commands.filter(command => commandDisabledReason(command) !== undefined).map(command => command.id)} renderEmptyState={() => <span {...stylex.props(styles.empty)}>No matching commands</span>} {...stylex.props(styles.list)}>
       {groups(registry.commands).map(([group, commands]) => <MenuSection key={group}><Header {...stylex.props(styles.group)}>{group}</Header>{commands.map(command => {
         const reason = commandDisabledReason(command)
-        return <MenuItem key={command.id} id={command.id} textValue={command.label} className={state => stylex.props(styles.row, state.isFocused && styles.focused, state.isDisabled && styles.disabled).className ?? ''}>
-          <div {...stylex.props(styles.copy)}><Text slot="label">{command.label}</Text>{reason !== undefined && <Text slot="description" {...stylex.props(styles.reason)}>{reason}</Text>}</div><Shortcut shortcut={command.shortcut} platform={registry.platform} />
+        return <MenuItem key={command.id} id={command.id} textValue={command.label} className={state => stylex.props(styles.row, styles.menuRow, state.isFocused && styles.focused, state.isDisabled && styles.disabled).className ?? ''}>
+          <Text slot="label" {...stylex.props(styles.rowLabel)}><span>{command.label}</span>{' '}<Shortcut shortcut={command.shortcut} platform={registry.platform} /></Text>
+          {reason !== undefined && <Text slot="description" {...stylex.props(styles.reason)}>{reason}</Text>}
         </MenuItem>
       })}</MenuSection>)}
     </Menu>
@@ -146,6 +147,8 @@ const styles = stylex.create({
   list: { maxHeight: g.commandMaxHeight, overflowY: 'auto', outlineStyle: 'none' },
   group: { fontSize: t.metaSize, fontWeight: t.weightMedium, color: ink.fgMuted, paddingBlock: s.md, paddingInline: s.sm, margin: s.zero },
   row: { display: 'flex', alignItems: 'center', gap: s.lg, justifyContent: 'space-between', padding: s.md, minHeight: g.menuRow, boxSizing: 'border-box', borderRadius: r.sm, outlineStyle: 'none' },
+  menuRow: { flexDirection: 'column', alignItems: 'stretch', gap: s.xs },
+  rowLabel: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: s.lg, minWidth: 0, overflowWrap: 'anywhere' },
   focused: { backgroundColor: surface.rowActive, outline: `${g.focusRing} solid ${accent.primary}`, outlineOffset: '-2px' },
   disabled: { color: ink.fgMuted },
   copy: { display: 'flex', flexDirection: 'column', minWidth: 0, overflowWrap: 'anywhere' },
