@@ -34,7 +34,7 @@ export type GlassesHandlers = {
   onIssue: (issue: string) => void;
 };
 
-export type ConversationFrame = { replace: boolean; items: TimelineEntry[]; hasMore: boolean; sessionId?: string };
+export type ConversationFrame = { replace: boolean; items: TimelineEntry[]; hasMore: boolean; sessionId?: string; olderCursor?: string };
 export type ConversationHandlers = {
   /** `replace` carries the newest page; otherwise the entries changed since the last frame. */
   onEntries: (frame: ConversationFrame) => void;
@@ -342,7 +342,7 @@ export class Feed {
         this.conversation.failures = 0;
         this.conversation.handlers.onIssue('');
         this.handlers.onConversationFrame?.(frame.items.length, frame.replace);
-        this.conversation.handlers.onEntries({ replace: frame.replace, items: frame.items, hasMore: !!frame.has_more, sessionId: frame.session_id });
+        this.conversation.handlers.onEntries({ replace: frame.replace, items: frame.items, hasMore: !!frame.has_more, sessionId: frame.session_id, olderCursor: frame.older_cursor });
       }
     } else if (frame.kind === 'error') {
       if (id === TERMINAL) this.terminal?.failed(frame.code, frame.message);

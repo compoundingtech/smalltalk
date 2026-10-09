@@ -181,9 +181,9 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   const frames = [], issues = [];
   const follow = feed.followConversation('agent/example/worker', { onEntries: frame => frames.push(frame), onIssue: issue => issues.push(issue) });
   assert.deepEqual(sockets[0].sent.at(-1), { kind: 'subscribe', id: 'conversation', collection: 'conversation', conversation: 'agent/example/worker' });
-  sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: true, items: [{ id: 'entry/1' }], has_more: true });
+  sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: true, items: [{ id: 'entry/1' }], has_more: true, older_cursor: 'before-entry-1' });
   sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: false, items: [{ id: 'entry/2' }] });
-  assert.deepEqual(frames.map(frame => [frame.replace, frame.items.map(item => item.id), frame.hasMore]), [[true, ['entry/1'], true], [false, ['entry/2'], false]]);
+  assert.deepEqual(frames.map(frame => [frame.replace, frame.items.map(item => item.id), frame.hasMore, frame.olderCursor]), [[true, ['entry/1'], true, 'before-entry-1'], [false, ['entry/2'], false, undefined]]);
   sockets[0].frame({ kind: 'error', id: 'conversation', collection: 'conversation', code: 'remote-unavailable', message: 'owner host/two is temporarily unavailable' });
   assert.equal(issues.at(-1), 'two cannot be reached right now · trying again');
   // An ended subscription is asked for again after the backoff.

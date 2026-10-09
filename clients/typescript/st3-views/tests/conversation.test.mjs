@@ -40,35 +40,36 @@ const rows = conversationRows([content(1, 'old'), content(2, 'new')], true);
 assert.deepEqual(rows.map(row => row.kind === 'older' ? 'older' : row.entry.body.text), ['older', 'old', 'new']);
 assert.deepEqual(conversationRows([content(1, 'only')], false).map(row => row.kind), ['entry']);
 
-// Reading back: an earlier page goes above what is held and is never dropped; held entries win.
+// Reading back: earlier pages go above what is held and survive deltas; held entries win.
 const window = (items, hasMore) => ({ replace: true, items, hasMore, sessionId: 'session/a' });
+const requestFor = conversation => ({ sessionId: conversation.sessionId, historyVersion: conversation.historyVersion });
 let back = applyConversation(undefined, window([content(3, 'c'), content(4, 'd')], true));
 assert.equal(olderNote(back), 'Scroll up for earlier entries');
-back = olderLoading(back);
+back = olderLoading(back, requestFor(back));
 assert.equal(olderNote(back), 'Loading earlier entries…');
-back = applyOlderPage(back, 'session/a', { items: [content(2, 'b'), { ...content(3, 'stale'), revision: 0 }], hasMore: true, cursor: 'cursor-1' }, 1000);
+back = applyOlderPage(back, requestFor(back), { items: [content(2, 'b'), { ...content(3, 'stale'), revision: 0 }], hasMore: true, cursor: 'cursor-1' }, 1000);
 assert.deepEqual(texts(back), ['b', 'c', 'd']);
 assert.equal(back.hasOlder, true);
 assert.deepEqual(back.older.cursor, { value: 'cursor-1', at: 1000 });
-back = applyOlderPage(back, 'session/a', { items: [content(1, 'a')], hasMore: false });
+back = applyOlderPage(back, requestFor(back), { items: [content(1, 'a')], hasMore: false });
 assert.equal(back.hasOlder, false);
 assert.match(olderNote(back), /^Start of this session/);
-// A reconnect's newest page that meets what is held keeps the earlier pages; one that skipped
-// past it would leave a hole, so they go.
+// Every replacement starts a new authoritative history snapshot, even when its window overlaps.
 back = applyConversation(back, window([content(4, 'd'), content(5, 'e')], true));
-assert.deepEqual(texts(back), ['a', 'b', 'c', 'd', 'e']);
-assert.equal(back.hasOlder, false);
+assert.deepEqual(texts(back), ['d', 'e']);
+assert.equal(back.hasOlder, true);
+assert.equal(back.older.paged, false);
 const skipped = applyConversation(back, window([content(9, 'x')], true));
 assert.deepEqual(texts(skipped), ['x']);
 assert.equal(skipped.hasOlder, true);
 
-// Projection notices have session-stable IDs but do not connect disconnected history windows.
+// Projection notices have session-stable IDs, but never preserve pages across a replacement.
 const notice = sequence => ({ id: 'timeline-entry/session/a/timeline-query-limited', revision: 1, sequence, type: 'error', role: 'system', body: { code: 'timeline-query-limited', message: 'Older operations are outside this view', retryable: false } });
 let withNotice = applyConversation(undefined, window([content(3, 'c'), content(4, 'd'), notice(6)], true));
-withNotice = applyOlderPage(withNotice, 'session/a', { items: [content(1, 'a'), content(2, 'b')], hasMore: false });
+withNotice = applyOlderPage(withNotice, requestFor(withNotice), { items: [content(1, 'a'), content(2, 'b')], hasMore: false });
 withNotice = applyConversation(withNotice, window([content(4, 'd'), content(5, 'e'), notice(6)], true));
-assert.deepEqual(withNotice.entries.map(entry => entry.id), ['entry/1', 'entry/2', 'entry/3', 'entry/4', 'entry/5', notice(6).id]);
-assert.equal(withNotice.older.paged, true);
+assert.deepEqual(withNotice.entries.map(entry => entry.id), ['entry/4', 'entry/5', notice(6).id]);
+assert.equal(withNotice.older.paged, false);
 withNotice = applyConversation(withNotice, window([content(9, 'x'), notice(10)], true));
 assert.deepEqual(withNotice.entries.map(entry => entry.id), ['entry/9', notice(10).id]);
 assert.equal(withNotice.older.paged, false);
@@ -78,21 +79,50 @@ assert.equal(withNotice.hasOlder, true);
 const timedContent = (sequence, text) => ({ ...content(sequence, text), timestamp: '2026-09-30T10:00:00Z' });
 const stalePrefixNotice = { ...notice(0), id: 'timeline-entry/session/a/timeline-history-incomplete', timestamp: '2026-09-30T09:00:00Z', body: { ...notice(0).body, code: 'timeline-history-incomplete' } };
 let stalePrefix = applyConversation(undefined, window([stalePrefixNotice, timedContent(3, 'c'), timedContent(4, 'd')], true));
-stalePrefix = applyOlderPage(stalePrefix, 'session/a', { items: [timedContent(1, 'a'), timedContent(2, 'b')], hasMore: false });
+stalePrefix = applyOlderPage(stalePrefix, requestFor(stalePrefix), { items: [timedContent(1, 'a'), timedContent(2, 'b')], hasMore: false });
 stalePrefix = applyConversation(stalePrefix, window([timedContent(4, 'd'), timedContent(5, 'e')], true));
-assert.deepEqual(stalePrefix.entries.map(entry => entry.id), ['entry/1', 'entry/2', 'entry/3', 'entry/4', 'entry/5']);
-assert.equal(stalePrefix.older.paged, true);
+assert.deepEqual(stalePrefix.entries.map(entry => entry.id), ['entry/4', 'entry/5']);
+assert.equal(stalePrefix.older.paged, false);
 const freshEarlyNotice = { ...notice(7), timestamp: '2026-09-30T09:30:00Z' };
 stalePrefix = applyConversation(stalePrefix, window([freshEarlyNotice, timedContent(5, 'e'), timedContent(6, 'f')], true));
-assert.deepEqual(stalePrefix.entries.filter(entry => entry.type !== 'error').map(entry => entry.id), ['entry/1', 'entry/2', 'entry/3', 'entry/4', 'entry/5', 'entry/6']);
+assert.deepEqual(stalePrefix.entries.filter(entry => entry.type !== 'error').map(entry => entry.id), ['entry/5', 'entry/6']);
 assert.equal(stalePrefix.entries.find(entry => entry.type === 'error').body.code, 'timeline-query-limited');
 
 // A page for another session is dropped; a failure says why.
-assert.deepEqual(texts(applyOlderPage(skipped, 'session/b', { items: [content(8, 'w')], hasMore: true })), ['x']);
-assert.match(olderNote(olderFailed(skipped, 'st did not answer')), /^Could not load earlier entries: st did not answer/);
+assert.deepEqual(texts(applyOlderPage(skipped, { sessionId: 'session/b', historyVersion: skipped.historyVersion }, { items: [content(8, 'w')], hasMore: true })), ['x']);
+assert.match(olderNote(olderFailed(skipped, requestFor(skipped), 'st did not answer')), /^Could not load earlier entries: st did not answer/);
 // Paged entries are kept past the live bound.
-const many = applyOlderPage(applyConversation(undefined, window([content(100, 'new')], true), 2), 'session/a', { items: [content(97, 'x'), content(98, 'y'), content(99, 'z')], hasMore: true });
+const live = applyConversation(undefined, window([content(100, 'new')], true), 2);
+const many = applyOlderPage(live, requestFor(live), { items: [content(97, 'x'), content(98, 'y'), content(99, 'z')], hasMore: true });
 assert.equal(applyConversation(many, { replace: false, items: [content(101, 'newer')], hasMore: true }, 2).entries.length, 5);
+
+// A replacement that revises an entry the person already paged back to is authoritative: the old
+// revision and its cursor go, an in-flight page from before it cannot bring them back, and the
+// replacement's own cursor reaches the revision.
+{
+  const revised = (sequence, text, revision) => ({ ...content(sequence, text), revision });
+  let held = applyConversation(undefined, { ...window([content(3, 'c'), content(4, 'd')], true), olderCursor: 'first-older' }, 1000, 10);
+  assert.deepEqual(held.older.cursor, { value: 'first-older', at: 10 });
+  held = applyOlderPage(held, requestFor(held), { items: [revised(2, 'b, first', 1)], hasMore: true, cursor: 'first-next' }, 20);
+  assert.deepEqual(texts(held), ['b, first', 'c', 'd']);
+  const inFlight = requestFor(held);
+  held = olderLoading(held, inFlight);
+  held = applyConversation(held, { ...window([content(4, 'd'), content(5, 'e')], true), olderCursor: 'fresh-older' }, 1000, 30);
+  assert.deepEqual(texts(held), ['d', 'e']);
+  assert.deepEqual(held.older, { paged: false, start: false, loading: false, cursor: { value: 'fresh-older', at: 30 } });
+  assert.equal(held.hasOlder, true);
+  assert.equal(applyOlderPage(held, inFlight, { items: [revised(2, 'b, first', 1)], hasMore: true, cursor: 'first-next' }), held, 'a page from the old snapshot is dropped');
+  assert.equal(olderFailed(held, inFlight, 'old snapshot failed'), held, 'a failure from the old snapshot is dropped');
+  const fresh = [];
+  const page = await readOlder(async cursor => { fresh.push(cursor); return { items: [revised(2, 'b, revised', 2), content(3, 'c')], hasMore: false }; }, held.older, held.entries[0], 40);
+  assert.deepEqual(fresh, ['fresh-older']);
+  held = applyOlderPage(held, requestFor(held), page);
+  assert.deepEqual(texts(held), ['b, revised', 'c', 'd', 'e']);
+  assert.equal(held.entries[0].revision, 2);
+  // A replacement too large for the live bound has no cursor for the window kept.
+  const bounded = applyConversation(undefined, { ...window([content(1, 'a'), content(2, 'b')], true), olderCursor: 'before-a' }, 1);
+  assert.equal(bounded.older.cursor, undefined);
+}
 
 // A live cursor continues; an expired one (or none) reads again from the newest until a page
 // reaches past the oldest entry held.

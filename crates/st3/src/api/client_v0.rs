@@ -866,8 +866,11 @@ fn conversation_open_local(
         &ClientListQuery { limit: Some(limit), ..Default::default() },
     )?.0;
     let native = native_latest_sequence(&page);
+    let native_generation = page["page"]["next_cursor"].as_str()
+        .filter(|cursor| cursor.starts_with(NATIVE_PAGE_CURSOR_PREFIX))
+        .map(decode_native_page_cursor).transpose()?.map(|cursor| cursor.source_generation);
     let cursor = conversation_cursor(
-        state, session_id, snapshot.store_index, local_position, native,
+        state, session_id, snapshot.store_index, local_position, native, native_generation,
     );
     remember_cursor(&cursor, mark.transcript_seen);
     Ok((json!({"next_cursor":cursor}), page))
@@ -4782,6 +4785,18 @@ fn native_slice_page(
     query: &ClientListQuery,
     source: &crate::external_sessions::ExternalSession,
 ) -> Result<Json<Value>, ApiError> {
+    native_slice_page_with_generation(state, snapshot, session, session_id, query, source)
+        .map(|(page, _)| page)
+}
+
+fn native_slice_page_with_generation(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    session_id: &str,
+    query: &ClientListQuery,
+    source: &crate::external_sessions::ExternalSession,
+) -> Result<(Json<Value>, u64), ApiError> {
     let cursor = query.cursor.as_deref().map(decode_native_page_cursor).transpose()?;
     let source_basis = conversation_blocks::basis(source)?;
     let order = native_timeline_order(state, snapshot, session_id)?;
@@ -4878,7 +4893,7 @@ fn native_slice_page(
         None
     };
     let items: Vec<_> = items.into_iter().rev().map(|(item, _)| item).collect();
-    Ok(Json(json!({
+    Ok((Json(json!({
         "kind": "timeline-page",
         "session_id": session_id,
         "items": items,
@@ -4886,7 +4901,7 @@ fn native_slice_page(
             limit, has_more, next_cursor,
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
-    })))
+    })), native.generation))
 }
 
 /// What st3 established about a managed seat's native transcript.
@@ -5767,15 +5782,20 @@ fn conversation_cursor(
     store_index: u64,
     local_position: u64,
     native_sequence: u64,
+    native_generation: Option<u64>,
 ) -> String {
-    format!(
-        "conversation-cursor/{}/{}/{}.{}.{}",
-        state.node,
-        session_id.trim_start_matches("session/"),
-        store_index,
-        local_position,
-        native_sequence
-    )
+    match native_generation {
+        Some(generation) => format!(
+            "conversation-cursor/{}/{}/{}.{}.{}.{}",
+            state.node, session_id.trim_start_matches("session/"),
+            store_index, local_position, native_sequence, generation,
+        ),
+        None => format!(
+            "conversation-cursor/{}/{}/{}.{}.{}",
+            state.node, session_id.trim_start_matches("session/"),
+            store_index, local_position, native_sequence,
+        ),
+    }
 }
 
 pub(super) fn conversation_session_id(state: &AppState, id: &str) -> Result<String, ApiError> {
@@ -5825,6 +5845,9 @@ fn conversation_position(
                 parts.next()?.parse().ok()?,
                 parts.next()?.parse().ok()?,
             );
+            if let Some(generation) = parts.next() {
+                generation.parse::<u64>().ok()?;
+            }
             parts.next().is_none().then_some(result)
         })
         .ok_or_else(|| ApiError {
@@ -5836,6 +5859,10 @@ fn conversation_position(
                 Value::Bool(true),
             )])),
         })
+}
+
+fn conversation_native_generation(cursor: &str) -> Option<u64> {
+    cursor.rsplit('/').next()?.split('.').nth(3)?.parse().ok()
 }
 
 fn conversation_read_now(
@@ -5857,7 +5884,7 @@ fn conversation_read_now_unbounded(
 ) -> Result<Value, ApiError> {
     let snapshot = new_client_snapshot(state);
     let query = ClientListQuery { limit: Some(200), ..Default::default() };
-    let page = match conversation_blocks::source(state, session_id) {
+    let (page, native_generation) = match conversation_blocks::source(state, session_id) {
         // Replay selects only its newest bounded projection, including for OpenCode.
         Ok(source) => {
             // Native replay bypasses timeline_first_page after the incremental-fold cutover.
@@ -5865,10 +5892,20 @@ fn conversation_read_now_unbounded(
             if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
                 *rebuilds.entry(session_id.to_owned()).or_default() += 1;
             }
-            native_slice_page(state, &snapshot, session, session_id, &query, &source)
+            native_slice_page_with_generation(state, &snapshot, session, session_id, &query, &source)
+                .map(|(page, generation)| (page, Some(generation)))
         },
-        Err(_) => timeline_value(state, &snapshot, session, session_id, &query),
-    }?.0;
+        Err(_) => timeline_value(state, &snapshot, session, session_id, &query)
+            .map(|page| (page, None)),
+    }?;
+    let page = page.0;
+    if let Some(previous) = after.and_then(conversation_native_generation)
+        && native_generation != Some(previous)
+    {
+        return Err(client_page_expired(
+            "the transcript was replaced; refresh the conversation page",
+        ));
+    }
     let all = page["items"]
         .as_array()
         .ok_or_else(|| ApiError::internal("the timeline has no items"))?;
@@ -6036,7 +6073,7 @@ fn conversation_read_now_unbounded(
         });
     }
     Ok(
-        json!({"kind":"conversation-changes", "session_id":session_id, "items":items, "next_cursor":conversation_cursor(state, session_id, snapshot.store_index, local_latest, native_latest)}),
+        json!({"kind":"conversation-changes", "session_id":session_id, "items":items, "next_cursor":conversation_cursor(state, session_id, snapshot.store_index, local_latest, native_latest, native_generation)}),
     )
 }
 
@@ -6228,6 +6265,7 @@ async fn conversation_changes_local(
                         mark.store_index,
                         mark.local_position,
                         native,
+                        conversation_native_generation(cursor),
                     );
                     remember_cursor(&next, mark.transcript_seen);
                     value["next_cursor"] = Value::String(next);
@@ -16216,6 +16254,43 @@ mission "example/zero-run" state="ready" {
     }
 
     #[tokio::test]
+    async fn native_first_frame_refreshes_history_after_a_same_sequence_rewrite() {
+        let _guard = conversation_blocks::prepared_counter_guard();
+        let root = tempfile::tempdir().unwrap();
+        let (state, session_id, path) =
+            conversation_first_frame_fixture(root.path(), "first-frame-native-rewrite", 60);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let (sender, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        let follower = tokio::spawn(follow_conversation(
+            state.clone(), session, "chat".into(), 1, session_id.clone(), None, 20, sender,
+        ));
+        let (_, _, first) = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+            .await.unwrap().unwrap();
+        let original = history_from_frame(&state, &session_id, &first).await;
+        let highest = original.iter().filter_map(|item| item["sequence"].as_u64()).max();
+        let old = original.iter().find(|item|
+            item["body"]["text"].as_str().is_some_and(|text| text.starts_with("entry 5 ")))
+            .unwrap();
+        let old_id = old["id"].clone();
+        assert!(!first["items"].as_array().unwrap().iter().any(|item| item["id"] == old_id));
+        // Rewrite native content in place, including older records, without appending a record.
+        // Same byte count, inode and highest sequence: only the content generation changes.
+        let transcript = std::fs::read_to_string(&path).unwrap();
+        let revised = transcript.replace("\"text\":\"entry ", "\"text\":\"EDIT! ");
+        assert_ne!(revised, transcript);
+        assert_eq!(revised.len(), transcript.len());
+        std::fs::write(&path, revised).unwrap();
+        let replacement = next_replacement(&mut frames).await;
+        assert_eq!(replacement["items"].as_array().unwrap().len(), 20);
+        assert_ne!(replacement["older_cursor"], first["older_cursor"]);
+        let history = history_from_frame(&state, &session_id, &replacement).await;
+        assert_eq!(history.iter().filter_map(|item| item["sequence"].as_u64()).max(), highest);
+        assert!(history.iter().any(|item| item["id"] == old_id
+            && item["body"]["text"].as_str().is_some_and(|text| text.starts_with("EDIT! 5 "))));
+        follower.abort();
+    }
+
+    #[tokio::test]
     async fn native_first_frame_refreshes_history_after_an_older_message_arrives() {
         let _guard = conversation_blocks::prepared_counter_guard();
         let root = tempfile::tempdir().unwrap();
@@ -16510,7 +16585,7 @@ mission "example/zero-run" state="ready" {
         let latest_local = local_latest_position(&state).unwrap();
         assert!(latest_local > local);
         // Control: the former post-snapshot local high-water silently skips this exact row.
-        let skipped = conversation_cursor(&state, &session_id, graph, latest_local, native);
+        let skipped = conversation_cursor(&state, &session_id, graph, latest_local, native, conversation_native_generation(cursor));
         remember_cursor(&skipped, issued_transcript(cursor).unwrap());
         let lost = conversation_changes_local(&state, &session, &session_id, Some(&skipped), 0).await.unwrap();
         assert!(!contains_local(&lost));
@@ -16607,7 +16682,7 @@ mission "example/zero-run" state="ready" {
         assert_eq!(rebuilds(), 2);
         // A cursor this member did not give out (another member's, or one from before a
         // restart) is read as before.
-        let unknown = conversation_cursor(&owner, &session_id, 0, 0, 0);
+        let unknown = conversation_cursor(&owner, &session_id, 0, 0, 0, None);
         conversation_changes_local(&owner, &session, &session_id, Some(&unknown), 0)
             .await
             .unwrap();

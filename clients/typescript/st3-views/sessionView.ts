@@ -88,20 +88,15 @@ export type Older = {
   /** Why the last page could not be read; scrolling up tries again. */
   failed?: string;
 };
-export type Conversation<T extends Entry> = { entries: T[]; hasOlder: boolean; newestSequence: number; sessionId?: string; older: Older };
+export type Conversation<T extends Entry> = { entries: T[]; hasOlder: boolean; newestSequence: number; sessionId?: string; historyVersion: number; older: Older };
+/** The session and history snapshot an older-page request started from. */
+export type OlderRequest = { sessionId: string; historyVersion: number };
 const noOlder: Older = { paged: false, start: false, loading: false };
 
 // Everything a person reads in a conversation: the harness's turns, tool calls and results, Small
 // Talk st joins in, and st's diagnostics. Status heartbeats and usage are not conversation.
 export function isConversational(entry: Entry): boolean {
   return entry.type !== 'status' && entry.type !== 'usage';
-}
-
-// Session-stable availability notices are not evidence that two history windows overlap.
-function isProjectionNotice(entry: Entry): boolean {
-  return entry.type === 'error' && typeof entry.body === 'object' && entry.body !== null
-    && 'code' in entry.body
-    && (entry.body.code === 'timeline-query-limited' || entry.body.code === 'timeline-history-incomplete');
 }
 
 /** st's order: by time, then by sequence. */
@@ -115,29 +110,24 @@ function moreBefore(older: Older, live: boolean): boolean {
   return older.paged ? !older.start : live;
 }
 
-// A followed conversation arrives as its newest page (`replace`), then as each change since. A
-// revised entry replaces its earlier revision in place. Until the person reads back, only the
-// newest `want` entries are kept and anything older is marked as older history; pages they read
-// back are never dropped. A new newest page keeps those pages while it still meets them.
+// A followed conversation arrives as its newest page (`replace`), then as each change since.
+// Deltas revise entries in place and retain pages the person read back. Every replacement is a
+// new authoritative history snapshot: discard those pages and start from its fresh cursor.
 export function applyConversation<T extends Entry>(
   previous: Conversation<T> | undefined,
-  frame: { replace: boolean; items: T[]; hasMore: boolean; sessionId?: string },
+  frame: { replace: boolean; items: T[]; hasMore: boolean; sessionId?: string; olderCursor?: string },
   want = 1000,
+  now = Date.now(),
 ): Conversation<T> {
   const otherSession = !!frame.sessionId && !!previous?.sessionId && frame.sessionId !== previous.sessionId;
   const sessionId = frame.sessionId ?? previous?.sessionId;
-  let older = previous && !otherSession ? previous.older : noOlder;
-  let base: T[] = [];
-  let live = previous?.hasOlder ?? frame.hasMore;
-  if (!frame.replace && !otherSession) base = previous?.entries ?? [];
-  else if (frame.replace) {
-    live = frame.hasMore;
-    const held = previous && !otherSession ? previous.entries : [];
-    const meets = frame.items.some(item => !isProjectionNotice(item) && held.some(entry => !isProjectionNotice(entry) && entry.id === item.id));
-    const oldest = frame.items.filter(item => !isProjectionNotice(item)).sort(before)[0];
-    if (older.paged && (meets || !frame.hasMore)) base = held.filter(entry => !isProjectionNotice(entry) && oldest && before(entry, oldest) < 0);
-    else older = noOlder;
-  }
+  const reset = frame.replace || otherSession;
+  const historyVersion = (previous?.historyVersion ?? 0) + (reset ? 1 : 0);
+  let older: Older = reset || !previous
+    ? { ...noOlder, ...(frame.replace && frame.hasMore && frame.olderCursor ? { cursor: { value: frame.olderCursor, at: now } } : {}) }
+    : previous.older;
+  const base = reset ? [] : previous?.entries ?? [];
+  let live = reset ? frame.hasMore : previous?.hasOlder ?? frame.hasMore;
   const found = new Map<string, T>(base.map(entry => [entry.id, entry]));
   let newestSequence = frame.replace || otherSession ? -1 : previous?.newestSequence ?? -1;
   for (const entry of frame.items) {
@@ -148,31 +138,39 @@ export function applyConversation<T extends Entry>(
   let entries = [...found.values()].sort(before);
   if (!older.paged && entries.length > want) {
     entries = entries.slice(-want);
+    // The frame's cursor precedes its whole window, not this smaller retained window.
+    older = noOlder;
     live = true;
   }
-  return { entries, hasOlder: moreBefore(older, live), newestSequence, sessionId, older };
+  return { entries, hasOlder: moreBefore(older, live), newestSequence, sessionId, historyVersion, older };
 }
 
-/** An earlier page of `sessionId`'s timeline; entries already held win. A page for another
- * session (the agent restarted meanwhile) is dropped. */
+/** An earlier page from the current history snapshot; entries already held win. Responses from
+ * before a replacement or a session change are dropped without changing the current request. */
 export function applyOlderPage<T extends Entry>(
   conversation: Conversation<T>,
-  sessionId: string,
+  request: OlderRequest,
   page: { items: T[]; hasMore: boolean; cursor?: string },
   now = Date.now(),
 ): Conversation<T> {
-  if (conversation.sessionId !== sessionId) return { ...conversation, older: { ...conversation.older, loading: false } };
+  if (!sameHistory(conversation, request)) return conversation;
   const found = new Map<string, T>(conversation.entries.map(entry => [entry.id, entry]));
   for (const entry of page.items) if (isConversational(entry) && !found.has(entry.id)) found.set(entry.id, entry);
   const older: Older = { paged: true, start: !page.hasMore, loading: false, ...(page.cursor ? { cursor: { value: page.cursor, at: now } } : {}) };
   return { ...conversation, entries: [...found.values()].sort(before), hasOlder: moreBefore(older, true), older };
 }
 
-export function olderLoading<T extends Entry>(conversation: Conversation<T>): Conversation<T> {
+function sameHistory(conversation: Conversation<Entry>, request: OlderRequest): boolean {
+  return conversation.sessionId === request.sessionId && conversation.historyVersion === request.historyVersion;
+}
+
+export function olderLoading<T extends Entry>(conversation: Conversation<T>, request: OlderRequest): Conversation<T> {
+  if (!sameHistory(conversation, request)) return conversation;
   return { ...conversation, older: { ...conversation.older, loading: true, failed: undefined } };
 }
 
-export function olderFailed<T extends Entry>(conversation: Conversation<T>, reason: string): Conversation<T> {
+export function olderFailed<T extends Entry>(conversation: Conversation<T>, request: OlderRequest, reason: string): Conversation<T> {
+  if (!sameHistory(conversation, request)) return conversation;
   return { ...conversation, older: { ...conversation.older, loading: false, failed: reason } };
 }
 

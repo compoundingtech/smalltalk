@@ -24,7 +24,7 @@ import { Button, Field, LINE, Markdown, T } from '../ui';
 const RULES: ConversationRules = rules;
 const c = tokenColor;
 
-const empty: Conversation<TimelineEntry> = { entries: [], hasOlder: false, newestSequence: -1, older: { paged: false, start: false, loading: false } };
+const empty: Conversation<TimelineEntry> = { entries: [], hasOlder: false, newestSequence: -1, historyVersion: 0, older: { paged: false, start: false, loading: false } };
 type Pending = { id: string; text: string; at: string; failed?: string; images?: number };
 type Row = { kind: 'entry'; entry: ConversationEntry } | Exclude<SimpleRow, { kind: 'entry' }> | { kind: 'pending'; pending: Pending } | { kind: 'older' };
 
@@ -54,11 +54,13 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     const current = timelineNow.current;
     const sessionId = current.sessionId;
     if (!dragged.current || !current.hasOlder || current.older.loading || !sessionId || status !== 'online') return;
+    // A replacement can arrive while this page is loading, even for the same session.
+    const request = { sessionId, historyVersion: current.historyVersion };
     const keep = (next: Conversation<TimelineEntry>) => { rememberBounded(conversationCache.current, target, next, 24); return next; };
-    setTimeline(previous => olderLoading(previous));
+    setTimeline(previous => olderLoading(previous, request));
     void actions.olderTimeline(sessionId, current.older, current.entries[0]).then(
-      page => setTimeline(previous => keep(applyOlderPage(previous, sessionId, page))),
-      error => setTimeline(previous => olderFailed(previous, error instanceof Error ? error.message : String(error))),
+      page => setTimeline(previous => keep(applyOlderPage(previous, request, page))),
+      error => setTimeline(previous => olderFailed(previous, request, error instanceof Error ? error.message : String(error))),
     );
   };
   // Whether st has answered at all: until it has, the screen says it is loading, never "nothing".

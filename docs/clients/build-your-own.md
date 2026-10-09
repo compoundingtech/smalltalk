@@ -112,7 +112,7 @@ const stream = await client.collectionStream({
     } else if (frame.kind === 'conversation' && frame.id === 'chosen') {
       conversation = applyConversation(conversation, {
         replace: frame.replace, items: frame.items,
-        hasMore: frame.has_more ?? false, sessionId: frame.session_id,
+        hasMore: frame.has_more ?? false, sessionId: frame.session_id, olderCursor: frame.older_cursor,
       });
       render(conversationEntries(conversation.entries, agentNames));
     }
@@ -157,7 +157,10 @@ loading, empty, failed and stale visible states distinct. Clear derived conversa
 the selected target changes; only apply updates for the current target.
 
 For older history, read the resolved session's timeline through the typed client and use
-`Timeline::older_page` or TS `readOlder`/`applyOlderPage`. Expired cursors require a fresh read;
+`Timeline::older_page` or TS `readOlder`/`applyOlderPage`. In TS, capture
+`{ sessionId, historyVersion }` when a read starts and pass it to `olderLoading`,
+`applyOlderPage` and `olderFailed`: a replacement frame discards earlier pages and their
+cursors, so a response requested before it is dropped. Expired cursors require a fresh read;
 do not invent entries to cover gaps. The optional Rust snapshot/event model has a separate
 cursor-gap recovery path: `Model::sync` reports the gap, resets its bounded collections and
 requires the application to discard other derived state. This is not a reason to poll joined
