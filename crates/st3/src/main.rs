@@ -4166,6 +4166,11 @@ enum MessageCommand {
     /// A message is a direct connection: it wakes the recipient agent for a full turn,
     /// which rereads its context.
     Reply(MessageReplyArgs),
+    /// Wait up to a deadline for a reply from one sender, and print the reply or `no reply`.
+    ///
+    /// The reply is marked read for the waiting seat, so native delivery does not hand it over
+    /// again as a separate turn. Without `--after` only messages sent after the wait began count.
+    Wait(MessageWaitArgs),
     /// Close exact messages after their related action is complete.
     Archive(MessageArchiveArgs),
     /// Archive unread mail past an age threshold as each recipient.
@@ -4311,6 +4316,25 @@ struct MessageReplyArgs {
     /// replied to, the words and attachments, as for `send`.
     #[arg(long)]
     idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+struct MessageWaitArgs {
+    /// The seat waiting for the reply; defaults to the non-empty ST_AGENT value.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
+    #[arg(long = "as")]
+    actor: Option<String>,
+    /// Whose reply to wait for, for example `person/ada`.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
+    #[arg(long = "from")]
+    sender: String,
+    /// Count a reply sent after this message, for a question sent just before the wait began.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
+    #[arg(long)]
+    after: Option<String>,
+    /// How long to wait, such as 30s or 2m. Zero checks once and returns.
+    #[arg(long, default_value = "30s")]
+    timeout: String,
 }
 
 #[derive(Args)]
@@ -16246,6 +16270,25 @@ async fn run_message(
             };
             print_message_receipt(&receipt, json_output)
         }
+        MessageCommand::Wait(args) => {
+            let actor = message_list_identity(args.actor, std::env::var("ST_AGENT").ok())?;
+            reject_foreign_agent_actor(&actor)?;
+            let sender = normalize_message_subject(&args.sender);
+            let timeout = parse_timeout(&args.timeout)?;
+            let after = match args.after.as_deref() {
+                Some(reference) => Some(read_message(client, reference).await?.created_index),
+                None => None,
+            };
+            let reply = wait_for_reply(client, &actor, &sender, after, timeout).await?;
+            let reply = match reply {
+                Some(message) => {
+                    Some(read_message_after_lifecycle(client, &message.subject, &actor, false).await?)
+                }
+                None => None,
+            };
+            sync_message_projection(client).await?;
+            print_reply_wait(reply.as_ref(), json_output)
+        }
         MessageCommand::Cleanup { all, actor, older_than, dry_run } => {
             if let Some(actor) = actor.as_deref() {
                 reject_foreign_agent_actor(actor)?;
@@ -16980,6 +17023,80 @@ fn normalize_message_reference(reference: &str) -> String {
     };
     let reference = urlencoding::decode(reference).unwrap_or(std::borrow::Cow::Borrowed(reference));
     reference.trim_start_matches("message/").to_owned()
+}
+
+/// The earliest message to `actor` from `sender` that arrived after `after`.
+fn earliest_reply(messages: Vec<MessageView>, sender: &str, after: u64) -> Option<MessageView> {
+    messages
+        .into_iter()
+        .filter(|message| {
+            message.from == sender
+                && message.created_index > after
+                && matches!(message.status.as_str(), "sent" | "staged" | "delivered")
+        })
+        .min_by_key(|message| message.created_index)
+}
+
+async fn unread_replies(client: &Client, actor: &str, sender: &str, after: u64) -> Result<Option<MessageView>> {
+    let mut candidates = Vec::new();
+    for_each_message(client, Some(actor), false, |message| {
+        candidates.push(message);
+        Ok(())
+    })
+    .await?;
+    Ok(earliest_reply(candidates, sender, after))
+}
+
+/// Wait until `sender` writes to `actor` or the deadline passes. The graph's event feed wakes the
+/// wait as soon as a message lands, so an early reply returns at once.
+async fn wait_for_reply(
+    client: &Client,
+    actor: &str,
+    sender: &str,
+    after: Option<u64>,
+    timeout: Duration,
+) -> Result<Option<MessageView>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    // Capture the index before looking, so a message that lands during the look still wakes the
+    // event wait instead of being missed.
+    let health: Value = client.get("/v1/health").await?;
+    let started = health["store_index"]
+        .as_u64()
+        .context("the daemon health response has no store index")?;
+    let after = after.unwrap_or(started);
+    let mut cursor = started;
+    let mut event_feed = LocalEventFeed::default();
+    loop {
+        if let Some(message) = unread_replies(client, actor, sender, after).await? {
+            return Ok(Some(message));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let wait_ms = remaining.as_millis().clamp(1, 30_000);
+        let page = event_feed
+            .read(client, &format!("after={cursor}&wait=true&timeout_ms={wait_ms}"))
+            .await?;
+        if let Some(scanned) = page.next_after {
+            cursor = cursor.max(scanned);
+        }
+    }
+}
+
+fn print_reply_wait(reply: Option<&MessageView>, json_output: bool) -> Result<()> {
+    match (reply, json_output) {
+        (Some(message), true) => print_value(&json!({"reply": true, "message": message}), true),
+        (None, true) => print_value(&json!({"reply": false}), true),
+        (Some(message), false) => {
+            println!("{}", message.content);
+            Ok(())
+        }
+        (None, false) => {
+            println!("no reply");
+            Ok(())
+        }
+    }
 }
 
 async fn sync_message_projection(client: &Client) -> Result<()> {

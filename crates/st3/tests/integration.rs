@@ -46,6 +46,7 @@ mod human_gates;
 mod idle_budget;
 mod log_diet;
 mod message_send_once;
+mod message_wait;
 mod messaging_faults;
 mod mission_cancellation;
 mod no_st2_seat;

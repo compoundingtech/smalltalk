@@ -797,6 +797,16 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st conversations wait",
+      "description": "Wait up to a deadline for a reply from one sender, and print the reply or `no reply`",
+      "tests": [
+        "crates/st3/tests/message_wait.rs::a_wait_with_no_reply_returns_no_reply_at_the_deadline",
+        "crates/st3/tests/message_wait.rs::a_reply_returns_the_wait_early_and_is_marked_read",
+        "crates/st3/tests/message_wait.rs::after_counts_a_reply_that_beat_the_wait"
+      ],
+      "verification": "real CLI over private Unix socket; deadline, early return and read receipt"
+    },
+    {
       "command": "st devices",
       "description": "Default read command for this group.",
       "tests": [
@@ -1781,7 +1791,7 @@
         "crates/st3/tests/setup.rs::archive_setup_installs_st_and_starts_one_isolated_daemon_without_gh_or_harness",
         "crates/st3/tests/setup.rs::flags_merge_config_without_prompting_and_invalid_names_do_not_write",
         "crates/st3/tests/setup.rs::harness_probe_uses_login_path_order_and_flags_without_starting_a_seat",
-        "crates/st3/tests/setup.rs::onboarding_publication_is_graph_decided_and_preserves_stopped_expert"
+        "crates/st3/tests/setup.rs::onboarding_publication_is_graph_decided_and_preserves_stopped_assistant"
       ],
       "verification": "real CLI with isolated HOME, state and sockets; graph publication, concurrent first setup, stopped expert preservation and explicit rerun; simulated provider inventory"
     },

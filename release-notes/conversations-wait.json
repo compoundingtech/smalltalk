@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add st conversations wait: an agent waits up to a deadline for one sender's reply and gets the reply or no reply.",
+  "replay": {
+    "status": "none",
+    "detail": "No new claim kinds. The wait reads the mailbox and the event feed, and marks the returned reply read through the existing delivery and read receipts."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or claim schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or replication rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Add the st conversations wait command with --as, --from, --after and --timeout. Older daemons answer through the same message and event routes, so no daemon upgrade is required."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon or seat restart is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action is needed."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No store migration or recovery procedure changes."
+  }
+}
