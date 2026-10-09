@@ -1,4 +1,5 @@
 import * as stylex from '@stylexjs/stylex'
+import { textVars, statusVars } from './composition-tokens.stylex'
 
 // Neutral defaults retain V1; the full-app exploration opts into token themes.
 // Group rule: one createTheme group per DOM path. Nested partial themes of the
@@ -7,8 +8,8 @@ import * as stylex from '@stylexjs/stylex'
 export const tokens = stylex.defineVars({
   canvas: '#fafafa', panel: '#ffffff', recess: '#f3f3f3', ink: '#202020',
   muted: '#626262', line: '#d6d6d6', accent: '#303030', onAccent: '#ffffff',
-  selection: '#e6e6e6', good: '#276447', warning: '#805510', danger: '#a42b36',
-  added: '#e6f1e9', removed: '#f8e8e9',
+  selection: '#e6e6e6', good: textVars.fgSoft, warning: '#805510', danger: '#a42b36',
+  added: statusVars.diffAddTint, removed: '#f8e8e9',
 })
 
 /** Accent lives on its own group so a hue picker never re-resolves the palette. */

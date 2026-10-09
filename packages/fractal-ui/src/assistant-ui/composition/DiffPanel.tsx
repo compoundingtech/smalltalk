@@ -90,7 +90,7 @@ function pairRows(rows: readonly DiffRow[]) {
 function CodeLine({ row, side, wrap, language }: { row: DiffRow; side?: 'old' | 'new'; wrap: boolean; language: string }) {
   const number = side === 'old' ? row.oldNumber : row.newNumber ?? row.oldNumber
   const sign = row.kind === 'added' ? '+' : row.kind === 'removed' ? '−' : ''
-  return <div {...stylex.props(styles.codeRow, row.kind === 'added' && styles.addedRow, row.kind === 'removed' && styles.removedRow)}><span {...stylex.props(styles.gutter, row.kind === 'added' && styles.addedGutter, row.kind === 'removed' && styles.removedGutter)}><span>{number ?? ''}</span><span>{sign}</span></span><code {...stylex.props(styles.codeText, wrap && styles.wrappedText)}><HighlightedSource code={row.text} language={language} /></code></div>
+  return <div data-diff-kind={row.kind} {...stylex.props(styles.codeRow, row.kind === 'added' && styles.addedRow, row.kind === 'removed' && styles.removedRow)}><span data-diff-gutter {...stylex.props(styles.gutter, row.kind === 'added' && styles.addedGutter, row.kind === 'removed' && styles.removedGutter)}><span>{number ?? ''}</span><span>{sign}</span></span><code {...stylex.props(styles.codeText, wrap && styles.wrappedText)}><HighlightedSource code={row.text} language={language} /></code></div>
 }
 
 function ContextRow({ row, split = false, wrap, language }: { row: DiffRow; split?: boolean; wrap: boolean; language: string }) {
@@ -189,15 +189,15 @@ const styles = stylex.create({
   fileHead: { minHeight: g.controlLg, display: 'flex', alignItems: 'center', gap: s.md, paddingInline: s.lg },
   fileToggle: { display: 'flex', alignItems: 'center', gap: s.sm, flexGrow: 1, minWidth: 0, padding: 0, minHeight: g.controlMd, backgroundColor: 'transparent', borderWidth: 0, color: text.fgMuted, textAlign: 'left', cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
   path: { fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading, color: text.fg, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  added: { fontFamily: t.fontMono, fontSize: t.denseSize, color: text.fgMuted, fontVariantNumeric: 'tabular-nums', flexShrink: 0 },
-  removed: { fontFamily: t.fontMono, fontSize: t.denseSize, color: status.diffRemoved, fontVariantNumeric: 'tabular-nums', flexShrink: 0 },
+  added: { fontFamily: t.fontMono, fontSize: t.denseSize, color: status.diffAdded, fontVariantNumeric: 'tabular-nums', flexShrink: 0 },
+  removed: { fontFamily: t.fontMono, fontSize: t.denseSize, color: text.fgMuted, fontVariantNumeric: 'tabular-nums', flexShrink: 0 },
   spacer: { flexGrow: 1 },
   code: { minHeight: 0, overflowX: 'auto', fontFamily: t.fontMono, fontSize: t.codeSize, lineHeight: t.uiLeading, paddingBottom: s.lg, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: `calc(0px - ${g.focusRing})` } },
   codeRow: { display: 'flex', alignItems: 'stretch', minHeight: t.uiLeading, minWidth: '100%' },
-  addedRow: { backgroundColor: surface.rowActive },
+  addedRow: { backgroundColor: `color-mix(in srgb, ${status.diffAddTint} 9%, transparent)` },
   removedRow: { backgroundColor: status.diffRemovedWash },
   gutter: { width: g.gutter40, minWidth: g.gutter40, flexShrink: 0, boxSizing: 'border-box', display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: s.xs2, paddingInline: s.xs, color: text.fgFaint, fontVariantNumeric: 'tabular-nums', userSelect: 'none', borderLeftWidth: g.focusRing, borderLeftStyle: 'solid', borderLeftColor: 'transparent' },
-  addedGutter: { backgroundColor: surface.washSubtle, borderLeftColor: text.fgMuted, color: text.fgMuted },
+  addedGutter: { backgroundColor: surface.washSubtle, borderLeftColor: status.diffAddTint, color: status.diffAddTint },
   removedGutter: { backgroundColor: surface.washSubtle, borderLeftColor: status.diffRemoved, color: status.diffRemoved },
   codeText: { fontFamily: 'inherit', fontSize: 'inherit', lineHeight: 'inherit', paddingInline: s.sm, color: text.fgSoft, whiteSpace: 'pre', flexGrow: 1 },
   wrappedText: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', minWidth: 0, flexBasis: 0 },
