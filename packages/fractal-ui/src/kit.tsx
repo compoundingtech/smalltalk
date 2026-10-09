@@ -1,5 +1,7 @@
 import * as React from 'react'
 import * as Aria from 'react-aria-components'
+import { CommandTooltip } from './assistant-ui/commands'
+export * from './assistant-ui/commands'
 
 export type Direction = 'folio' | 'relay' | 'orbit'
 export type Scheme = 'light' | 'dark'
@@ -107,8 +109,8 @@ export function Checkbox({ label, isDisabled, isIndeterminate = false, defaultSe
 }
 
 /* Tooltip, Menu, Modal, Tabs, Table — compound surfaces. */
-export function Tooltip({ label, placement = 'bottom', delay = 350, children }: { label: string; placement?: 'top' | 'bottom'; delay?: number; children: React.ReactNode }) {
-  return <Aria.TooltipTrigger delay={delay} closeDelay={0}>{children}<Aria.Tooltip placement={placement} offset={6} className="z-50 rounded-control bg-ink px-2.5 py-1.5 text-[11px] font-sans text-panel shadow-lg">{label}</Aria.Tooltip></Aria.TooltipTrigger>
+export function Tooltip({ label, commandId, placement = 'bottom', delay = 350, children }: { label: string; commandId?: string; placement?: 'top' | 'bottom'; delay?: number; children: React.ReactNode }) {
+  return <CommandTooltip commandId={commandId} label={label} placement={placement} delay={delay}>{children}</CommandTooltip>
 }
 export interface MenuItemSpec { id: string; label: string; kbd?: string; separatorBefore?: boolean }
 export function Menu({ items, onAction, ariaLabel = 'Actions' }: { items: readonly MenuItemSpec[]; onAction?: (key: React.Key) => void; ariaLabel?: string }) {

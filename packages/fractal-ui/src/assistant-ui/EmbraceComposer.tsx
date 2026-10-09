@@ -9,6 +9,7 @@ import { surfaceVars as surface, textVars as text, borderVars as border, accentV
 import { readingColumnStyles } from './reading-column.stylex'
 import { Icon } from './composition/Icons'
 import { EffortPicker } from './embrace-composer/EffortPicker'
+import { CommandTooltip } from './commands'
 import {
   activeTrigger, defaultCommands, draftFromText, insertToken, serializeDraft,
   type Draft, type DraftToken, type MentionToken, type SerializedDraft, type SlashCommand,
@@ -48,6 +49,8 @@ export interface EmbraceComposerProps {
   /** Optional host-owned keyboard policy; structured draft bridging still happens here. */
   readonly onRequestSubmit?: (modified: boolean) => void
   readonly submitLabel?: string
+  /** Host command registry ids for shortcut discovery on composer actions. */
+  readonly commandIds?: { readonly send?: string; readonly stop?: string }
   /** Renders the submit action icon-only (named by the submit label) where the footer must stay narrow. */
   readonly submitIcon?: React.ReactNode
   readonly inputStyle?: stylex.StyleXStyles
@@ -252,7 +255,7 @@ export function EmbraceComposer(props: EmbraceComposerProps) {
 
 const CompactComposerContext = React.createContext({ compact: false, iconOnly: false })
 export interface ComposerRecipient { readonly ref: string; readonly label: string; readonly model?: string }
-export function EmbraceComposerToolbar({ target, recipients, models, onTargetChange, selectRecipient = false, selectModel = false, effort }: {
+export function EmbraceComposerToolbar({ target, recipients, models, onTargetChange, selectRecipient = false, selectModel = false, effort, commandIds }: {
   readonly target: ComposerRecipient
   readonly recipients: readonly ComposerRecipient[]
   readonly models: readonly string[]
@@ -260,6 +263,7 @@ export function EmbraceComposerToolbar({ target, recipients, models, onTargetCha
   readonly selectRecipient?: boolean
   readonly selectModel?: boolean
   readonly effort: Omit<React.ComponentProps<typeof EffortPicker>, 'compact'>
+  readonly commandIds?: EmbraceComposerProps['commandIds']
 }) {
   const { compact, iconOnly } = React.useContext(CompactComposerContext)
   const running = useAuiState(state => state.thread.isRunning)
@@ -292,11 +296,11 @@ export function EmbraceComposerToolbar({ target, recipients, models, onTargetCha
       <EffortPicker {...effort} compact={compact} />
     </div>
     <ComposerPrimitive.AddAttachment asChild><Button aria-label="Attach image" {...stylex.props(styles.button, compact && styles.iconCompact)}><Icon name="attach" /></Button></ComposerPrimitive.AddAttachment>
-    {running && <ComposerPrimitive.Cancel asChild><Button aria-label="Stop run" {...stylex.props(styles.button, compact && styles.iconCompact)}><Icon name="stop" /></Button></ComposerPrimitive.Cancel>}
+    {running && <CommandTooltip commandId={commandIds?.stop} label="Stop run"><ComposerPrimitive.Cancel asChild><Button aria-label="Stop run" {...stylex.props(styles.button, compact && styles.iconCompact)}><Icon name="stop" /></Button></ComposerPrimitive.Cancel></CommandTooltip>}
   </>
 }
 
-function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestSubmit, submitLabel, submitIcon, inputStyle, fieldStyle, footerStyle, input, actions, placeholder = 'Message, @ mentions and / commands as text' }: EmbraceComposerProps) {
+function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestSubmit, submitLabel, commandIds, submitIcon, inputStyle, fieldStyle, footerStyle, input, actions, placeholder = 'Message, @ mentions and / commands as text' }: EmbraceComposerProps) {
   const isDisabled = useAuiState((s) => s.thread.isDisabled)
   const readOnly = disabledReason !== undefined || isDisabled
   const helpId = React.useId()
@@ -338,7 +342,7 @@ function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestS
         </div>
         {toolbar}
         <div {...stylex.props(styles.grow)} />
-        {actions !== undefined ? actions(compact) : onRequestSubmit === undefined ? <ComposerPrimitive.Send disabled={readOnly} aria-label={submitIcon === undefined ? undefined : 'Send'} {...stylex.props(styles.button, styles.primary, submitIcon !== undefined && styles.submitIcon)}>{submitIcon ?? 'Send'}</ComposerPrimitive.Send> : <Button isDisabled={readOnly || !canSend} onPress={() => onRequestSubmit(false)} aria-label={submitIcon === undefined ? undefined : submitLabel ?? 'Send'} {...stylex.props(styles.button, styles.primary, submitIcon !== undefined && styles.submitIcon)}>{submitIcon ?? submitLabel ?? 'Send'}</Button>}
+        {actions !== undefined ? actions(compact) : <CommandTooltip commandId={commandIds?.send} label={submitLabel ?? 'Send'}>{onRequestSubmit === undefined ? <ComposerPrimitive.Send asChild disabled={readOnly}><Button aria-label="Send" {...stylex.props(styles.button, styles.primary, submitIcon !== undefined && styles.submitIcon)}>{submitIcon ?? 'Send'}</Button></ComposerPrimitive.Send> : <Button isDisabled={readOnly || !canSend} onPress={() => onRequestSubmit(false)} aria-label={submitIcon === undefined ? undefined : submitLabel ?? 'Send'} {...stylex.props(styles.button, styles.primary, submitIcon !== undefined && styles.submitIcon)}>{submitIcon ?? submitLabel ?? 'Send'}</Button>}</CommandTooltip>}
       </div>
     </ComposerPrimitive.Root>
   )
@@ -356,7 +360,7 @@ interface Option {
 function TokenComposer({
   variant, history = emptyHistory, tokenHistory, targetLabel, disabledReason, cancelUnavailableReason, maxContentBytes, toolbar,
   mentionCandidates = emptyCandidates, mentionHints, commands = defaultCommands,
-  tokenDraft, onTokenDraftChange, onSendDraft, renderToken, style, onRequestSubmit, submitLabel, submitIcon, inputStyle, fieldStyle, footerStyle, showQueue = true, sendDisabled = false,
+  tokenDraft, onTokenDraftChange, onSendDraft, renderToken, style, onRequestSubmit, submitLabel, commandIds, submitIcon, inputStyle, fieldStyle, footerStyle, showQueue = true, sendDisabled = false,
   placeholder = 'Message, @ to mention, / for commands',
 }: EmbraceComposerProps) {
   const aui = useAui()
@@ -561,15 +565,17 @@ function TokenComposer({
         {variant === 'C3' && toolbar === undefined ? <>
           <Button isDisabled={readOnly || history.length === 0} onPress={() => recallHistory('previous')}
             aria-label="Recall previous message" aria-description="ArrowUp on an empty field" {...stylex.props(styles.button)}><Icon name="clock" /></Button>
-          <ComposerPrimitive.Cancel disabled={readOnly || !canCancel} title={canCancel ? undefined : cancelUnavailableReason} {...stylex.props(styles.button, styles.cancelVisibility)}>Cancel run</ComposerPrimitive.Cancel>
+          <CommandTooltip commandId={commandIds?.stop} label="Cancel run"><ComposerPrimitive.Cancel asChild disabled={readOnly || !canCancel} title={canCancel ? undefined : cancelUnavailableReason}><Button {...stylex.props(styles.button, styles.cancelVisibility)}>Cancel run</Button></ComposerPrimitive.Cancel></CommandTooltip>
         </> : null}
         {/* A controlled TokenField can contain a draft before runtime text is bridged.
             The explicit adapter submits after bridging instead of inheriting Input's canSend gate. */}
+        <CommandTooltip commandId={commandIds?.send} label={submitLabel ?? 'Send'}>
         <Button isDisabled={!canSubmit} onPress={() => submit()}
           aria-label={submitIcon === undefined ? undefined : submitLabel ?? 'Send'}
           {...stylex.props(styles.button, styles.primary, submitIcon !== undefined && styles.submitIcon)}>
           {submitIcon ?? submitLabel ?? (variant === 'C3' && isRunning && canQueue ? 'Queue message' : 'Send')}
         </Button>
+        </CommandTooltip>
       </div>
       {variant === 'C3' && showQueue ? <ComposerQueueStrip disabled={readOnly} /> : null}
     </ComposerPrimitive.Root>

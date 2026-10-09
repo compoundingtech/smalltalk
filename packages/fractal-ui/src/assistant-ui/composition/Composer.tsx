@@ -6,6 +6,7 @@ import { surfaceVars as surface, textVars as text, accentVars as accent, statusV
 import { Icon } from './Icons'
 import { Button } from './Controls'
 import { EmbraceComposer } from '../EmbraceComposer'
+import { CommandTooltip } from '../commands'
 
 export interface ComposerProps {
   agent: string; running?: boolean; folder?: string; branch?: string
@@ -15,6 +16,9 @@ export interface ComposerProps {
   onQueue?: (text: string) => void | Promise<void>
   history?: readonly string[]
   draftKey?: string
+  /** Registry ids supply discovery; host performs send/stop against its composer state. */
+  commandIds?: { readonly send?: string; readonly stop?: string }
+  inputRef?: React.Ref<HTMLTextAreaElement>
 }
 const drafts = new Map<string, string>()
 const queues = new Map<string, readonly string[]>()
@@ -25,7 +29,7 @@ export const Composer = React.memo(function Composer(props: ComposerProps) {
   const key = props.draftKey ?? `${props.folder}/${props.agent}`
   return <ComposerEditor key={key} {...props} storageKey={key} />
 })
-function ComposerEditor({ agent, running, folder, branch, onSend, onStop, onSteer, onQueue, history, storageKey }: ComposerProps & { storageKey: string }) {
+function ComposerEditor({ agent, running, folder, branch, onSend, onStop, onSteer, onQueue, history, storageKey, commandIds, inputRef }: ComposerProps & { storageKey: string }) {
   const aui = useAui()
   const [value, setValue] = React.useState(() => readDraft(storageKey))
   const [queued, setQueued] = React.useState<readonly string[]>(() => queues.get(storageKey) ?? [])
@@ -70,13 +74,7 @@ function ComposerEditor({ agent, running, folder, branch, onSend, onStop, onStee
     void dispatch(message, onSend)
   }, [running, queued, onSend, storageKey, dispatching])
   React.useLayoutEffect(() => {
-    const focus = (event: KeyboardEvent) => {
-      const target = event.target
-      const editable = target instanceof HTMLElement && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))
-      if ((event.key === '/' && !editable) || (event.key.toLowerCase() === 'l' && (event.metaKey || event.ctrlKey))) { event.preventDefault(); input.current?.focus() }
-    }
-    window.addEventListener('keydown', focus)
-    return () => { window.removeEventListener('keydown', focus); clearTimeout(saveTimer.current); try { sessionStorage.setItem(`composition.draft.${storageKey}`, current.current) } catch {} }
+    return () => { clearTimeout(saveTimer.current); try { sessionStorage.setItem(`composition.draft.${storageKey}`, current.current) } catch {} }
   }, [storageKey])
   const stop = () => {
     if (queued.length > 0) { edit([current.current, ...queued].filter(Boolean).join('\n\n')); queues.delete(storageKey); setQueued([]) }
@@ -90,12 +88,12 @@ function ComposerEditor({ agent, running, folder, branch, onSend, onStop, onStee
       plainText
       showQueue={false}
       onRequestSubmit={modified => send(modified)}
-      input={(inputStyle, descriptionId) => <ComposerPrimitive.Input asChild ref={input} data-testid="composer-input" aria-label="Message" aria-describedby={descriptionId} placeholder="" value={value} submitMode="none" cancelOnEscape={false} unstable_focusOnRunStart={false} unstable_focusOnScrollToBottom={false} onChange={event => edit(event.target.value, false)} onCompositionStart={() => { composing.current = true }} onCompositionEnd={() => { composing.current = false }} onKeyDown={event => {
+      input={(inputStyle, descriptionId) => <ComposerPrimitive.Input asChild ref={node => { input.current = node; if (typeof inputRef === 'function') inputRef(node); else if (inputRef != null) inputRef.current = node }} data-testid="composer-input" aria-label="Message" aria-describedby={descriptionId} placeholder="" value={value} submitMode="none" cancelOnEscape={false} unstable_focusOnRunStart={false} unstable_focusOnScrollToBottom={false} onChange={event => edit(event.target.value, false)} onCompositionStart={() => { composing.current = true }} onCompositionEnd={() => { composing.current = false }} onKeyDown={event => {
         if (event.nativeEvent.isComposing || composing.current || event.keyCode === 229 || event.repeat) return
         if (event.key === 'ArrowUp' && current.current === '') { const previous = (history ?? histories.get(storageKey) ?? []).at(-1); if (previous) { event.preventDefault(); edit(previous) } }
       }} {...stylex.props(inputStyle)}><textarea rows={1} /></ComposerPrimitive.Input>}
       toolbar={<><Button size="md">{agent}<Icon name="chevron-down" /></Button><span {...stylex.props(styles.spacer)} /><ComposerPrimitive.AddAttachment asChild><AriaButton aria-label="Attach context" {...stylex.props(styles.attach)}><Icon name="attach" /></AriaButton></ComposerPrimitive.AddAttachment></>}
-      actions={() => running ? <ComposerPrimitive.Cancel asChild><AriaButton aria-label="Stop" onClick={event => { event.preventDefault(); stop() }} {...stylex.props(styles.primary, styles.stop)}><Icon name="stop" /></AriaButton></ComposerPrimitive.Cancel> : <ComposerPrimitive.Send asChild><AriaButton aria-label="Send" isDisabled={value.trim() === '' || onSend === undefined} onClick={event => { event.preventDefault(); send() }} {...stylex.props(styles.primary)}><Icon name="send" /></AriaButton></ComposerPrimitive.Send>}
+      actions={() => running ? <CommandTooltip commandId={commandIds?.stop} label="Stop"><ComposerPrimitive.Cancel asChild><AriaButton aria-label="Stop" onClick={event => { event.preventDefault(); stop() }} {...stylex.props(styles.primary, styles.stop)}><Icon name="stop" /></AriaButton></ComposerPrimitive.Cancel></CommandTooltip> : <CommandTooltip commandId={commandIds?.send} label="Send"><ComposerPrimitive.Send asChild><AriaButton aria-label="Send" isDisabled={value.trim() === '' || onSend === undefined} onClick={event => { event.preventDefault(); send() }} {...stylex.props(styles.primary)}><Icon name="send" /></AriaButton></ComposerPrimitive.Send></CommandTooltip>}
     />
     {folder !== undefined || branch !== undefined ? <div data-testid="composer-context" {...stylex.props(styles.context)}>{folder !== undefined && <span>{folder}</span>}{folder !== undefined && branch !== undefined && <span>·</span>}{branch !== undefined && <span>{branch}</span>}<Icon name="chevron-down" /></div> : null}
   </div>

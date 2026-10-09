@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/kit.tsx",
+    "./commands": "./src/assistant-ui/commands.tsx",
     "./tokens.css": "./src/tokens.css",
     "./assistant-ui": "./src/assistant-ui/index.ts",
     "./assistant-ui/shell": "./src/assistant-ui/shell.ts",

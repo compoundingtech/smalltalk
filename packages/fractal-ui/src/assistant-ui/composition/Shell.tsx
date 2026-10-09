@@ -5,6 +5,7 @@ import { colorVars as c, typeVars as t, radiusVars as r, geometryVars as g } fro
 import { SidebarStatus as StatusGlyph } from '../sidebar/SidebarStatus'
 import { Icon } from './Icons'
 import type { AgentStatus } from '../sidebar/model'
+import { CommandButton } from '../commands'
 
 /**
  * Keyboard/pointer resizable separator. Arrow ±8, Shift+Arrow ±32,
@@ -121,6 +122,7 @@ export function ThreadHeader({
   onToggleDrawer,
   sidebarCollapsed = false,
   onToggleSidebar,
+  commandIds,
 }: {
   folder: string
   title: string
@@ -147,14 +149,16 @@ export function ThreadHeader({
   /** When the sidebar is collapsed its separator is gone; the header carries the expand toggle. */
   sidebarCollapsed?: boolean
   onToggleSidebar?: () => void
+  /** Host registry ids; registered actions use registry.perform rather than the callback. */
+  commandIds?: { readonly sidebar?: string; readonly terminal?: string; readonly panel?: string; readonly open?: string; readonly commit?: string }
 }) {
   const terminalReasonId = React.useId()
   return (
     <header data-testid="thread-header" {...stylex.props(styles.header)}>
       {sidebarCollapsed && onToggleSidebar !== undefined ? (
-        <button type="button" aria-label="Expand sidebar" title="Expand sidebar" onClick={onToggleSidebar} {...stylex.props(styles.ghostMd)}>
+        <CommandButton commandId={commandIds?.sidebar} label="Expand sidebar" onPress={onToggleSidebar} {...stylex.props(styles.ghostMd)}>
           <Icon name="chevron-right" />
-        </button>
+        </CommandButton>
       ) : null}
       <nav aria-label="Breadcrumb" {...stylex.props(styles.breadcrumb)}>
         <span {...stylex.props(styles.crumbFolder)}>{folder}</span>
@@ -165,11 +169,11 @@ export function ThreadHeader({
         {status !== undefined ? <StatusGlyph status={status} statusLabel={statusLabel} statusSince={statusSince} freshness={freshness} now={now} /> : null}
         {elapsed !== undefined ? <span role="timer" aria-label="Current conversation turn elapsed">{elapsed}</span> : null}
         <div data-testid="native-action-slot" ref={actionPortalRef}>{nativeActions}</div>
-        {onOpen !== undefined && <button type="button" onClick={onOpen} {...stylex.props(styles.outlineXs)}>Open <Icon name="chevron-down" size={12} /></button>}
-        {onCommit !== undefined && <button type="button" onClick={onCommit} {...stylex.props(styles.outlineXs)}>Commit <Icon name="chevron-down" size={12} /></button>}
-        {terminalAvailable && <button type="button" aria-label="Toggle terminal drawer" title="Toggle terminal drawer" aria-pressed={drawerOpen} onClick={onToggleDrawer} {...stylex.props(styles.ghostMd, drawerOpen && styles.ghostOn)}>
+        {onOpen !== undefined && <CommandButton commandId={commandIds?.open} label="Open" onPress={onOpen} {...stylex.props(styles.outlineXs)}>Open <Icon name="chevron-down" size={12} /></CommandButton>}
+        {onCommit !== undefined && <CommandButton commandId={commandIds?.commit} label="Commit" onPress={onCommit} {...stylex.props(styles.outlineXs)}>Commit <Icon name="chevron-down" size={12} /></CommandButton>}
+        {terminalAvailable && <CommandButton commandId={commandIds?.terminal} label="Toggle terminal drawer" aria-pressed={drawerOpen} onPress={onToggleDrawer} {...stylex.props(styles.ghostMd, drawerOpen && styles.ghostOn)}>
           <Icon name="drawer" />
-        </button>}
+        </CommandButton>}
         {/* A disabled button receives no pointer events, so the hover title sits on its wrapper. */}
         {!terminalAvailable && terminalDisabledReason !== undefined && <span data-testid="terminal-toggle-disabled" title={terminalDisabledReason} {...stylex.props(styles.disabledWrap)}>
           <Button isDisabled aria-label="Toggle terminal drawer" aria-describedby={terminalReasonId} {...stylex.props(styles.ghostMd, styles.ghostDisabled)}>
@@ -177,9 +181,9 @@ export function ThreadHeader({
           </Button>
           <span id={terminalReasonId} hidden>{terminalDisabledReason}</span>
         </span>}
-        <button type="button" aria-label="Toggle right panel" title="Toggle right panel" aria-pressed={panelOpen} onClick={onTogglePanel} {...stylex.props(styles.ghostMd, panelOpen && styles.ghostOn)}>
+        <CommandButton commandId={commandIds?.panel} label="Toggle right panel" aria-pressed={panelOpen} onPress={onTogglePanel} {...stylex.props(styles.ghostMd, panelOpen && styles.ghostOn)}>
           <Icon name="panel" />
-        </button>
+        </CommandButton>
       </div>
     </header>
   )

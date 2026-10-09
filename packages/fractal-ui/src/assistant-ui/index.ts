@@ -1,4 +1,5 @@
 /** Shared assistant-ui presentation and external-store boundary. Applications own transport and state. */
+export * from './commands.tsx'
 export * from './EmbraceRuntime.tsx'
 export * from './EmbraceThread.tsx'
 export * from './EmbraceScrollViewport.tsx'

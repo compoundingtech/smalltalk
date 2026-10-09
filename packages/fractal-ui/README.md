@@ -31,6 +31,49 @@ Stories:
 - **Fractal UI / Sync Line**: every observation across both schemes; `TransitionSequence` asserts fixed-height slots and CLS 0 across all transitions.
 - **Fractal UI / Transcript**: the locked U2·F3·Y3 transcript in dark and light: settled/expanded work, streamed answers, failed/interrupted/unknown work, loading, retained-history synchronization, answer metadata, unavailable conversations, the older-history boundary with and without a load action, pending and failed sends (including Pending→Sent identity) and the read-only empty state.
 - **Fractal UI / Sidebar/Agent Row**: compact hover-card facts, omitted unreported fields, the known-vs-none time cohort and the quick Open hover action.
+- **Fractal UI / Commands**: host registry, grouped fuzzy palette, disabled reasons, platform-specific shortcut text, shortcut help, input/IME guards and keyboard/pointer tooltips.
+
+## Commands
+
+`CommandsProvider`, `KitCommand`, `CommandButton`, `CommandTooltip`, `useCommands`,
+`formatCommandShortcut` and `commandPlatform` are exported from the package root,
+`./commands`, `./assistant-ui` and `./assistant-ui/shell`
+(`src/assistant-ui/commands.tsx`). Mount one provider
+around the workspace, with the host's current command array. Its one document
+capture listener also covers portals and body focus: do not install a second global shortcut listener.
+Nested providers are rejected.
+
+Each command has a unique `id`, `label`, `group`, optional `shortcut`, `perform`
+and optionally `when: () => true | string` or `disabledReason`. A string is the
+host's concrete explanation for why the command cannot run. Availability is checked
+again at execution, not just when the row was rendered. The host updates its array
+when capability/state changes. Shortcut chords are `{ key, modifiers?: ['Mod',
+'Shift', 'Alt'] }`, or `{ mac: chord, other: chord }` for different platform
+bindings. `Mod` resolves to Cmd on macOS and Ctrl elsewhere. `platform` may be
+supplied explicitly for SSR and deterministic tests.
+
+Mod+K opens the searchable grouped palette even from an editor; arrows and Enter
+operate its React Aria menu while typing remains in the search field. Escape and
+scrim dismissal return focus through React Aria's modal focus scope. `?` opens the
+registry's grouped shortcut help outside editable controls. Ordinary commands
+ignore input, textarea, select, contenteditable and textbox targets unless the
+host explicitly sets `allowInEditable: true`. Composition, keyCode 229 and repeated
+keydown events never dispatch commands. Mod+K and `?` are reserved discovery keys.
+
+Use `CommandButton commandId=\"layout.details\" label=\"Toggle right panel\"` for
+registry-owned actions; the button, palette and key binding then invoke the same
+`perform`. `ThreadHeader.commandIds` accepts sidebar/terminal/panel/open/commit
+ids. Its old callbacks remain the uncontrolled action path when no id is supplied.
+The existing root `Tooltip` accepts `commandId`; `CommandTooltip` also works around
+React Aria buttons. Both expose registry shortcut text on hover and keyboard focus.
+`Composer.commandIds`, `EmbraceComposer.commandIds` and `ComposerSession.commandIds`
+accept send/stop ids for discovery on their runtime-backed controls. Hosts own editor action registration
+and must bind those commands to the same runtime submission policy; registered
+editable shortcuts are intercepted before the composer's local Enter policy.
+`Composer.inputRef` lets the host register focus-composer actions without installing
+another key listener. The former global composer `/` and Mod+L listener is removed;
+register those focus actions in the host registry if desired.
+
 
 ## Families
 

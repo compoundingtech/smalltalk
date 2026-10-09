@@ -34,6 +34,7 @@ export interface ComposerSessionProps {
   readonly offline: boolean
   readonly effortControl?: EffortControl
   readonly queuedEffort?: ReadonlyMap<string, string>
+  readonly commandIds?: { readonly send?: string; readonly stop?: string }
 }
 const SavedDraft = Schema.Struct({
   text: Schema.String,
@@ -51,7 +52,7 @@ const readDraft = (key: string, initialDraft: string): SavedDraft => {
 export function ComposerSession({ draftKey, ...props }: ComposerSessionProps & { readonly draftKey: string }) {
   return <EmbraceRuntimeProvider options={props.options}><ComposerSessionBody key={draftKey} {...props} draftKey={draftKey} /></EmbraceRuntimeProvider>
 }
-function ComposerSessionBody({ draftKey, layout, runningBehavior, mentions, targeting, initialDraft, initialTokenDraft, initialImage, recipients, models, limitedMentions, allMentions, mentionHints, failure, offline, effortControl = unknownEffort, queuedEffort }: ComposerSessionProps & { readonly draftKey: string }) {
+function ComposerSessionBody({ draftKey, layout, runningBehavior, mentions, targeting, initialDraft, initialTokenDraft, initialImage, recipients, models, limitedMentions, allMentions, mentionHints, failure, offline, effortControl = unknownEffort, queuedEffort, commandIds }: ComposerSessionProps & { readonly draftKey: string }) {
   const aui = useAui()
   // Client snapshots commit with React; send handlers must preserve metadata
   // written by TokenField's bridge earlier in the same event.
@@ -123,13 +124,13 @@ function ComposerSessionBody({ draftKey, layout, runningBehavior, mentions, targ
     if (running && runningBehavior === 'R3') { setAsk(true); return }
     send(running && (runningBehavior === 'R1' ? modified : !modified))
   }
-  const toolbar = <EmbraceComposerToolbar target={target} recipients={recipients} models={models} onTargetChange={writeTarget} selectRecipient={targeting !== 'K1'} selectModel={targeting === 'K3'} effort={{ control: effortControl, value: effort, pinned: effortPinned, onChange: setEffort, onPinnedChange: setEffortPinned }} />
+  const toolbar = <EmbraceComposerToolbar target={target} recipients={recipients} models={models} onTargetChange={writeTarget} selectRecipient={targeting !== 'K1'} selectModel={targeting === 'K3'} effort={{ control: effortControl, value: effort, pinned: effortPinned, onChange: setEffort, onPinnedChange: setEffortPinned }} commandIds={commandIds} />
   const submitLabel = running ? runningBehavior === 'R1' ? 'Queue' : runningBehavior === 'R2' ? 'Steer' : 'Choose action' : 'Send'
   return <div data-testid="composer-session" data-layout={layout} data-running-behavior={runningBehavior} data-mentions={mentions} data-targeting={targeting} {...stylex.props(styles.stack)}>
     {failure !== undefined && <div role="alert" {...stylex.props(styles.notice)}>{failure}</div>}
     {offline && <div role="status" {...stylex.props(styles.notice)}>Offline: the draft remains editable and saved locally. Reconnect before sending.</div>}
     <div {...stylex.props(styles.attachments)}><ComposerPrimitive.Attachments>{() => <AttachmentPreview />}</ComposerPrimitive.Attachments></div>
-    <EmbraceComposer variant={layout} plainText={mentions === 'M1'} toolbar={toolbar} mentionCandidates={mentions === 'M3' ? allMentions : limitedMentions} mentionHints={mentionHints} commands={defaultCommands} tokenDraft={tokenSnapshot?.runtimeText === runtimeText ? tokenSnapshot.draft : undefined} onTokenDraftChange={onTokenDraftChange} onRequestSubmit={requestSubmit} submitLabel={submitLabel} showQueue={false} sendDisabled={offline} />
+    <EmbraceComposer variant={layout} plainText={mentions === 'M1'} toolbar={toolbar} mentionCandidates={mentions === 'M3' ? allMentions : limitedMentions} mentionHints={mentionHints} commands={defaultCommands} tokenDraft={tokenSnapshot?.runtimeText === runtimeText ? tokenSnapshot.draft : undefined} onTokenDraftChange={onTokenDraftChange} onRequestSubmit={requestSubmit} submitLabel={submitLabel} commandIds={commandIds} showQueue={false} sendDisabled={offline} />
     <div {...stylex.props(styles.help)}>{running ? runningBehavior === 'R1' ? 'Enter queues · Mod+Enter steers' : runningBehavior === 'R2' ? 'Enter steers · Mod+Enter queues' : 'Choose queue or steer for each message' : 'Enter sends'} · Shift+Enter adds a newline</div>
     <ComposerQueueStrip disabled={offline} effortById={queuedEffort} />
     <ModalOverlay isOpen={ask} isDismissable onOpenChange={setAsk} {...stylex.props(styles.overlay)}><Modal {...stylex.props(styles.modal)}><Dialog aria-label="Choose running message action" {...stylex.props(styles.dialog)}><h2 {...stylex.props(styles.dialogTitle)}>Send while running</h2><p>Queue after the current run, or steer the current run?</p><div {...stylex.props(styles.dialogActions)}><Button onPress={() => send(false)} {...stylex.props(styles.button)}>Queue</Button><Button onPress={() => send(true)} {...stylex.props(styles.button)}>Steer</Button><Button onPress={() => setAsk(false)} {...stylex.props(styles.button)}>Cancel</Button></div></Dialog></Modal></ModalOverlay>
