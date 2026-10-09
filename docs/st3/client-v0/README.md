@@ -1634,6 +1634,20 @@ stream sends `resync`) and the refresher is asked for one. A continuation reads 
 published at its first page's cut; once that roster is gone it answers `page-cursor-expired`.
 A stream rereads when a newer roster is published.
 
+## Missions and work window freshness
+
+The `missions` and `work` collection streams answer from lists the daemon's background
+refreshers keep published, as the agents roster is; no window read folds a mission card or a
+work row. After commits, each refresher refolds only the missions or steps whose claims, worker
+leases or attention changed, at most once a second, and keeps the rest. Each frame's `snapshot`
+names the list's own cut (`store_index`, `created_at`) and when it was folded (`published_at`),
+which can be older than the subscription by about a second plus one fold. A work window with an
+`actor` filters the published list; its ready work follows the seat's queue order. A work row's
+`execution_elapsed_ms` counts to the list's time, the projection time of its cut. While nothing
+is published yet the stream sends `resync` and the refresher is asked for a list. HTTP pages of
+`/v1/client/missions` and `/v1/client/work` are unchanged. A daemon started with
+`ST3_PUBLISHED_LISTS=off` folds each window on read instead.
+
 ## Exact terminal lookup
 
 `GET /v1/client/terminals?owner=agent%2Fexample%2Fworker&state=running` matches the

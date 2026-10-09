@@ -75,6 +75,8 @@ mod owned_sets;
 mod request_latency;
 mod terminal_view;
 mod work_response;
+mod published_lists;
+pub use published_lists::start_published_lists;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
 pub(crate) use client_v0::raw_terminal::{
