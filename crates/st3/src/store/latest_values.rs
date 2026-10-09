@@ -845,6 +845,61 @@ mod tests {
     }
 
     #[test]
+    fn a_retained_workspace_cannot_relabel_a_runtime_after_handoff() {
+        let store = Store::open_memory("amber").unwrap();
+        let subject = "agent/example/worker";
+        let claim = |kind: &str, fields: Value| ClaimInput {
+            subject: subject.into(),
+            kind: kind.into(),
+            actor: None,
+            fields: serde_json::from_value(fields).unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        store
+            .append_claim(&claim(
+                "runtime.observed",
+                json!({"status":"running", "host":"amber", "incarnation_id":"one"}),
+            ))
+            .unwrap();
+        store
+            .append_claim(&claim(
+                "workspace.observed",
+                json!({"host":"amber", "workspace":"/tmp/amber"}),
+            ))
+            .unwrap();
+        assert_eq!(
+            store.latest_actual_value(subject).unwrap().unwrap()["workspace"],
+            "/tmp/amber"
+        );
+        store
+            .append_claim(&claim(
+                "runtime.observed",
+                json!({"status":"running", "host":"cobalt", "incarnation_id":"two"}),
+            ))
+            .unwrap();
+        let actual = store.latest_actual_value(subject).unwrap().unwrap();
+        assert_eq!(actual["host"], "cobalt");
+        assert_eq!(actual["incarnation_id"], "two");
+        assert!(
+            actual.get("workspace").is_none(),
+            "a predecessor's workspace is not the destination's: {actual}"
+        );
+        // A fresh value from the destination remains visible.
+        store
+            .append_claim(&claim(
+                "workspace.observed",
+                json!({"host":"cobalt", "workspace":"/tmp/cobalt"}),
+            ))
+            .unwrap();
+        assert_eq!(
+            store.latest_actual_value(subject).unwrap().unwrap()["workspace"],
+            "/tmp/cobalt"
+        );
+    }
+
+    #[test]
     fn permission_blocking_and_explicit_clears_start_distinct_status_episodes() {
         let store = Store::open_memory("owner").unwrap();
         let publish = |at, blocked_on: Value, ask: Value| {

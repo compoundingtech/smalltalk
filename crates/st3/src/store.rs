@@ -975,14 +975,6 @@ struct ViewEntry {
     owners: Vec<String>,
 }
 
-fn subject_current_revision(connection: &Connection, subject: &str) -> Result<u64> {
-    // Harness/workspace registers are agent-only. Host connectivity has its own reducer;
-    // terminal/exec status must keep a fixed statement budget regardless of fleet size.
-    if !subject.starts_with("agent/") { return Ok(0); }
-    Ok(connection.query_row("SELECT COALESCE(MAX(local_id),0) FROM latest_values WHERE subject=?1",
-        [subject], |row| row.get(0))?)
-}
-
 fn subject_current_revisions(connection: &Connection, names: &BTreeSet<String>) -> Result<BTreeMap<String, u64>> {
     let agents = names.iter().filter(|name| name.starts_with("agent/")).collect::<Vec<_>>();
     let mut revisions = BTreeMap::new();
@@ -11409,22 +11401,24 @@ impl Store {
         subject: &str,
         store_index: u64,
         newest: bool,
+        current_revision: u64,
     ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
-        self.cached_subject_status_with_mode(connection, subject, store_index, newest, SubjectStatusMode::Full)
-    }
-
-    fn cached_subject_status_with_mode(
-        &self, connection: &Connection, subject: &str, store_index: u64,
-        newest: bool, mode: SubjectStatusMode,
-    ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
-        let current_revision = subject_current_revision(connection, subject)?;
+        let mode = SubjectStatusMode::Full;
         if let Some(kept) = self.kept_subject_status(subject, store_index, mode, current_revision) {
             return Ok(kept);
         }
-        let (status, action) = subject_status_at_with_mode(connection, subject, Some(store_index), None, mode)?
-            .expect("a reduction without an owner filter always has a status");
+        let (status, action) =
+            subject_status_at_with_mode(connection, subject, Some(store_index), None, mode)?
+                .expect("a reduction without an owner filter always has a status");
         if newest {
-            self.keep_subject_status(subject, store_index, mode, current_revision, &status, &action);
+            self.keep_subject_status(
+                subject,
+                store_index,
+                mode,
+                current_revision,
+                &status,
+                &action,
+            );
         }
         Ok((status, action))
     }
@@ -11791,6 +11785,11 @@ impl Store {
             }
             _ => None,
         };
+        let revisions = if newest.is_some() {
+            subject_current_revisions(&connection, &subject_names)?
+        } else {
+            BTreeMap::new()
+        };
         let mut subjects = Vec::new();
         let mut pending_actions = Vec::new();
         for subject in subject_names {
@@ -11798,9 +11797,13 @@ impl Store {
                 continue;
             }
             let reduced = match newest {
-                Some(newest) => {
-                    Some(self.cached_subject_status(&connection, &subject, store_index, newest)?)
-                }
+                Some(newest) => Some(self.cached_subject_status(
+                    &connection,
+                    &subject,
+                    store_index,
+                    newest,
+                    revisions.get(&subject).copied().unwrap_or(0),
+                )?),
                 None => subject_status_at(&connection, &subject, at_index, selected_owner_run)?,
             };
             let Some((status, action)) = reduced else {
@@ -22102,15 +22105,31 @@ fn latest_actual_at(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let legacy = fold_latest_actual(rows)?;
-    let body: Option<String> = connection.query_row(
-        "SELECT body FROM latest_values WHERE subject=?1 AND kind='workspace.observed'",
-        [subject], |row| row.get(0),
-    ).optional()?;
+    let body: Option<String> = connection
+        .query_row(
+            "SELECT body FROM latest_values WHERE subject=?1 AND kind='workspace.observed'",
+            [subject],
+            |row| row.get(0),
+        )
+        .optional()?;
     match body {
-        Some(body) => fold_latest_values([
-            (String::new(), legacy.unwrap_or(Value::Null)),
-            ("workspace.observed".into(), serde_json::from_str(&body)?),
-        ]),
+        Some(body) => {
+            let workspace: Value = serde_json::from_str(&body)?;
+            let fields = workspace.get("fields").unwrap_or(&workspace);
+            // A workspace register survives a placement change. It describes its source
+            // host, and cannot overwrite the new runtime's host or workspace on a read.
+            if legacy
+                .as_ref()
+                .and_then(|actual| actual["host"].as_str())
+                .is_some_and(|host| fields["host"].as_str() != Some(host))
+            {
+                return Ok(legacy);
+            }
+            fold_latest_values([
+                (String::new(), legacy.unwrap_or(Value::Null)),
+                ("workspace.observed".into(), workspace),
+            ])
+        }
         None => Ok(legacy),
     }
 }

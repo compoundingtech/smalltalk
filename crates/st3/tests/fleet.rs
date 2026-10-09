@@ -801,15 +801,20 @@ agent "move/worker" {
             })
         }).await;
     }
-    wait_until("both replicas report the destination incarnation", 30, || async {
-        [&a, &b].iter().all(|node| {
-            let view = status(node);
-            view["actual"]["host"] == "cobalt"
-                && view["actual"]["status"] == "running"
-                && view["actual"]["incarnation_id"] != old_incarnation
-                && view["reachability"] == "reachable"
-        })
+    let settled = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if [&a, &b].iter().all(|node| {
+                let view = status(node);
+                view["actual"]["host"] == "cobalt"
+                    && view["actual"]["status"] == "running"
+                    && view["actual"]["incarnation_id"] != old_incarnation
+                    && view["reachability"] == "reachable"
+            }) { break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }).await;
+    assert!(settled.is_ok(), "destination did not settle: amber={} cobalt={}\namber logs={}\ncobalt logs={}",
+        status(&a), status(&b), a.logs(), b.logs());
     let runtime_claims = b.claims().await.into_iter()
         .filter(|claim| claim["subject"] == SUBJECT && claim["kind"] == "runtime.observed")
         .collect::<Vec<_>>();

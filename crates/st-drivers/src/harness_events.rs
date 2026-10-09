@@ -299,6 +299,21 @@ fn current_token(connection: &Connection) -> Result<Option<String>> {
 }
 
 pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
+    write_snapshot_with_policy(agent_dir, kind, body, false)
+}
+
+/// Ownership establishment is control, and must not be lost to the current-value writer.
+/// Wait for the local writer before entering the short transaction; never queue a sample.
+pub(crate) fn write_ownership_snapshot(agent_dir: &Path, body: &[u8]) -> Result<()> {
+    write_snapshot_with_policy(agent_dir, "harness-state", body, true)
+}
+
+fn write_snapshot_with_policy(
+    agent_dir: &Path,
+    kind: &str,
+    body: &[u8],
+    ownership: bool,
+) -> Result<()> {
     anyhow::ensure!(
         matches!(kind, "harness-state" | "harness-context" | "harness-todo"),
         "unsupported observation kind"
@@ -319,7 +334,9 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
     );
     let mut connection = open(agent_dir)?;
     let current_result = (|| -> Result<()> {
-        connection.busy_timeout(Duration::ZERO)?;
+        if !ownership {
+            connection.busy_timeout(Duration::ZERO)?;
+        }
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if kind == "harness-state" {
             let token = value["incarnation"].as_str().unwrap();
@@ -864,6 +881,52 @@ pub(crate) fn read_timeline(agent_dir: &Path) -> Result<Option<Record>> {
 mod tests {
     use super::*;
     use crate::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer, claim};
+    #[test]
+    fn ownership_waits_for_the_writer_but_current_samples_do_not() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime-a").unwrap();
+        let connection = open(root.path()).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let placeholder =
+            serde_json::json!({"incarnation":"provider-a", "state":"ended", "reason":"superseded"});
+        assert!(
+            write_snapshot(
+                root.path(),
+                "harness-state",
+                &serde_json::to_vec(&placeholder).unwrap()
+            )
+            .is_err()
+        );
+        let dir = root.path().to_owned();
+        let (sent, received) = std::sync::mpsc::channel();
+        let claim = std::thread::spawn(move || {
+            let outcome = crate::harness_state::claim(&dir, "example/seat", "omp", "provider-a");
+            sent.send(outcome).unwrap();
+        });
+        assert!(matches!(
+            received.recv_timeout(Duration::from_millis(120)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        connection.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        claim.join().unwrap();
+        assert!(
+            read_runtime_state(root.path(), "runtime-a")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            pending(root.path(), 10).unwrap().is_empty(),
+            "ownership is not a queued categorical observation"
+        );
+    }
+
     #[test]
     fn repeated_publication_refusal_survives_reexec_and_reports_without_acknowledging() {
         let root = tempfile::tempdir().unwrap();

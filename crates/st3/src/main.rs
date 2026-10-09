@@ -13383,11 +13383,13 @@ async fn wait_for_agent_harness(
                 reported = progress;
             }
         }
+        // Readiness registers do not advance the durable event cursor. Bound the wait
+        // so a current observation is visible even without a new graph event.
         let page = event_feed
             .read(
                 client,
                 &format!(
-                    "after={cursor}&subject={}&wait=true&timeout_ms=30000",
+                    "after={cursor}&subject={}&wait=true&timeout_ms=1000",
                     urlencoding::encode(subject),
                 ),
             )
@@ -18002,8 +18004,15 @@ async fn drive_st2_native(
         runtime_id,
         ..
     } = paths.clone();
-    let mut mailbox =
-        NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state).await?;
+    let (mut mailbox, mut observations) = start_native_observations_and_mailbox(
+        client,
+        subject,
+        &incarnation,
+        driver,
+        &agent_dir,
+        &mut loop_state,
+    )
+    .await?;
     let attach_started = Instant::now();
     if driver == "claude" && mailbox.subscription.is_some()
         && let Err(error) = check_claude_attachment(
@@ -18015,15 +18024,6 @@ async fn drive_st2_native(
             &format!("Claude attachment check will retry: {error:#}"),
         );
     }
-    let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
-    observations.current_publisher = current_harness_publisher::Publisher::start(
-        client,
-        subject,
-        driver,
-        &agent_dir,
-        &incarnation,
-    )?;
-    observations.background_durable = true;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
@@ -21687,17 +21687,15 @@ async fn drive_codex_native(
     let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
-    let mut mailbox =
-        NativeMailbox::start(client, subject, &incarnation, "codex", &mut loop_state).await?;
-    let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
-    observations.current_publisher = current_harness_publisher::Publisher::start(
+    let (mut mailbox, mut observations) = start_native_observations_and_mailbox(
         client,
         subject,
+        &incarnation,
         "codex",
         &agent_dir,
-        &incarnation,
-    )?;
-    observations.background_durable = true;
+        &mut loop_state,
+    )
+    .await?;
     if push_mailbox_enabled() {
         st_drivers::push_mailbox::register(&agent_dir);
     }
@@ -23115,6 +23113,29 @@ fn claude_attachment_path(fence: &st3::mailbox::Fence) -> String {
         fence.epoch,
         fence.token,
     )
+}
+
+/// Current publication starts before reliable mailbox admission. A pending binding must
+/// not keep provider evidence from reaching the daemon, and cancellation owns both tasks.
+async fn start_native_observations_and_mailbox(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    driver: &str,
+    agent_dir: &Path,
+    loop_state: &mut NativeLoopState,
+) -> Result<(NativeMailbox, NativeObservations)> {
+    let mut observations = NativeObservations::start(agent_dir, incarnation)?;
+    observations.current_publisher = current_harness_publisher::Publisher::start(
+        client,
+        subject,
+        driver,
+        agent_dir,
+        incarnation,
+    )?;
+    observations.background_durable = true;
+    let mailbox = NativeMailbox::start(client, subject, incarnation, driver, loop_state).await?;
+    Ok((mailbox, observations))
 }
 
 struct NativeMailbox {

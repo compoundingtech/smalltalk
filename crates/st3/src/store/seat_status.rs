@@ -687,9 +687,8 @@ mod tests {
         assert_eq!(current.incarnation_id, "two");
         assert_eq!(current.state, "working");
         let history = store.seat_status_history("agent/cedar", at + 6).unwrap();
-        let last = history["items"].as_array().unwrap().last().unwrap();
-        assert_eq!(last["state"], "working");
-        assert_eq!(last["runtime_incarnation"], "two");
+        assert!(history["items"].as_array().unwrap().is_empty());
+        assert_eq!(history["complete"], false);
     }
 
     #[test]

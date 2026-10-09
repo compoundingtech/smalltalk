@@ -918,7 +918,13 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
             .as_ref()
             .map_or(0, |record| record.transitions.saturating_add(1)),
     };
-    write_record(&writer.path, &record)?;
+    if let Some(dir) = writer.path.parent()
+        && crate::harness_events::enabled(dir)
+    {
+        crate::harness_events::write_ownership_snapshot(dir, &serde_json::to_vec(&record)?)?;
+    } else {
+        write_record(&writer.path, &record)?;
+    }
     // The floor accompanies every act that establishes ownership; its own failure
     // modes must never be quiet ones.
     persist_floor(&writer.path, seq);

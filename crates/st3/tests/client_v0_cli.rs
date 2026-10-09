@@ -2268,9 +2268,7 @@ mission "cli/child" state="ready" {
         .unwrap();
     let nested_work = child_run.steps[0].subject.clone();
     store.set_step_state(&nested_work, "ready", None).unwrap();
-    state
-        .store
-        .append_claim(&ClaimInput {
+    st3::test_support::append_legacy_claim(&state.store, &ClaimInput {
             subject: "host/discovered-history".into(),
             kind: "transport.observed".into(),
             actor: Some("daemon/runtime".into()),

@@ -220,6 +220,7 @@ fn seat_driver(root: &Path, socket: &Path, index: usize) -> Child {
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_RUNTIME_DIR", root.join("runtime"))
         .env("ST3_DRIVER_STATE_DIR", root.join("drivers"))
+        .env("ST_AGENT", format!("agent/{runtime_id}"))
         .env("ST3_DAEMON_WAIT", "0")
         .arg("--endpoint")
         .arg(socket)

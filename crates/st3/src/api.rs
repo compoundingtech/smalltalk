@@ -2465,6 +2465,9 @@ fn client_suspension(suspension: &crate::suspension::Suspension) -> Value {
 /// Each seat's running subagents: open, with a lease that runs past this read. A lease runs out
 /// without a claim, so this is read per request rather than cached with the agents.
 fn overlay_subagents(store: &Store, items: &mut [Value]) -> anyhow::Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
     let mut running = BTreeMap::<String, Vec<Value>>::new();
     for subagent in store.running_subagents(client_now_ms() as u64)? {
         running
@@ -21004,7 +21007,7 @@ mission "planned/direct" state="ready" {
         let store = state(root.path()).store;
         let subject = "agent/diagnostic-run/sig.base";
         store
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "harness.observed".into(),
                 actor: Some(subject.into()),

@@ -78,6 +78,104 @@ mod tests {
     use tokio::sync::{Notify, mpsc};
 
     #[tokio::test]
+    async fn current_publication_runs_while_mailbox_binding_is_stalled() {
+        const CHILD: &str = "ST3_TEST_CURRENT_BEFORE_BIND";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let outcome = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "current_harness_publisher::tests::current_publication_runs_while_mailbox_binding_is_stalled", "--nocapture"])
+                .env(CHILD, "1").env("ST3_MAILBOX_TRANSPORT", "push")
+                .output().unwrap();
+            assert!(
+                outcome.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&outcome.stdout),
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
+        let seq =
+            st_drivers::harness_state::claim(root.path(), "example/seat", "opencode", "provider-a")
+                .unwrap();
+        let mut writer = Writer::new(root.path(), "example/seat", "opencode", Some("pty".into()))
+            .with_ownership("provider-a", seq);
+        writer
+            .observe(Observation::new(
+                Activity::Idle,
+                BlockedOn::None,
+                InputBuffer::Unknown,
+            ))
+            .unwrap();
+        let entered = Arc::new(Notify::new());
+        let (sender, mut updates) = mpsc::unbounded_channel();
+        let store = Arc::new(st3::store::Store::open_memory("example").unwrap());
+        let app = Router::new()
+            .route(
+                "/v1/mailbox/bind",
+                post({
+                    let entered = entered.clone();
+                    move || {
+                        let entered = entered.clone();
+                        async move {
+                            entered.notify_one();
+                            std::future::pending::<()>().await;
+                            StatusCode::SERVICE_UNAVAILABLE
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/claims",
+                post(move |Json(input): Json<ClaimInput>| {
+                    let (sender, store) = (sender.clone(), store.clone());
+                    async move {
+                        let record = store.append_claim(&input).unwrap();
+                        sender.send(input).unwrap();
+                        Json(json!({"api_version":"st3.v1", "value":record}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(Endpoint::Http(format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = root.path().to_owned();
+        let starter = tokio::spawn(async move {
+            super::super::start_native_observations_and_mailbox(
+                &client,
+                "agent/example/seat",
+                "runtime-a",
+                "opencode",
+                &dir,
+                &mut super::super::NativeLoopState::default(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.fields["state"], "idle");
+        assert!(!starter.is_finished(), "mailbox admission is still pending");
+        writer.heartbeat().unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(2), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.fields["state"], "idle");
+        assert!(!starter.is_finished());
+        starter.abort();
+        assert!(matches!(starter.await, Err(error) if error.is_cancelled()));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn a_dropped_first_sample_waits_for_fresh_provider_evidence() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let root = tempfile::tempdir().unwrap();
