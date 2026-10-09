@@ -6,7 +6,7 @@ use st3::client::FollowTestReply as Reply;
 const SUBJECT: &str = "host/follow-fixture";
 const RUN: &str = "mission-run/example/follow-fixture";
 const RUN_PATH: &str = "/v1/mission-runs/mission-run%2Fexample%2Ffollow-fixture";
-const TREE_PATH: &str = "/v1/mission-runs?root=mission-run%2Fexample%2Ffollow-fixture";
+const TREE_PATH: &str = "/v1/mission-runs/tree?root=mission-run%2Fexample%2Ffollow-fixture&limit=50";
 
 struct FollowOutput {
     result: Result<()>,
@@ -38,6 +38,7 @@ async fn scripted_cli(args: &[&str], script: Vec<(String, Reply)>) -> FollowOutp
                 run,
                 cli.json,
                 false,
+                args.limit,
                 OutputStyle::plain(),
                 &mut stdout,
             )
@@ -83,6 +84,15 @@ fn run(status: &str, phase: &str) -> Value {
         "root_revision": "fixture", "root_mission_run": RUN, "workspace": "/tmp/follow-fixture",
         "requester": "person/avery", "mode": "run", "status": status, "phase": phase,
         "created_at_unix_ms": 0, "updated_at_unix_ms": 0, "steps": [],
+    })
+}
+
+fn tree(run: Value, next_cursor: Option<&str>) -> Value {
+    json!({
+        "runs": [run],
+        "next_cursor": next_cursor,
+        "has_more": next_cursor.is_some(),
+        "frontier": 0,
     })
 }
 
@@ -407,7 +417,7 @@ async fn mission_timeout(interrupt_tree: bool) {
     let finished = run("completed", "normal");
     let mut script = vec![
         (RUN_PATH.into(), Reply::Value(before.clone())),
-        (TREE_PATH.into(), Reply::Value(json!([before]))),
+        (TREE_PATH.into(), Reply::Value(tree(before, None))),
     ];
     if interrupt_tree {
         script.push((RUN_PATH.into(), Reply::Value(after.clone())));
@@ -417,9 +427,9 @@ async fn mission_timeout(interrupt_tree: bool) {
         script.push((RUN_PATH.into(), Reply::Value(after.clone())));
     }
     script.extend([
-        (TREE_PATH.into(), Reply::Value(json!([after]))),
+        (TREE_PATH.into(), Reply::Value(tree(after, None))),
         (RUN_PATH.into(), Reply::Value(finished.clone())),
-        (TREE_PATH.into(), Reply::Value(json!([finished]))),
+        (TREE_PATH.into(), Reply::Value(tree(finished, None))),
     ]);
     let output = scripted_cli(&["missions", "show", RUN, "--follow"], script).await;
     assert!(output.result.is_ok(), "{}", stderr(&output));
@@ -461,6 +471,34 @@ async fn mission_timeout(interrupt_tree: bool) {
             .count(),
         1
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn mission_follow_honors_page_limit_and_refreshes_when_lookahead_appears() {
+    let running = run("running", "normal");
+    let finished = run("completed", "normal");
+    let tree_path = TREE_PATH.replace("limit=50", "limit=20");
+    let output = scripted_cli(
+        &["missions", "show", RUN, "--follow", "--limit", "20"],
+        vec![
+            (RUN_PATH.into(), Reply::Value(running.clone())),
+            (tree_path.clone(), Reply::Value(tree(running.clone(), None))),
+            (RUN_PATH.into(), Reply::Value(running.clone())),
+            (tree_path.clone(), Reply::Value(tree(running, Some("page-child-020")))),
+            (RUN_PATH.into(), Reply::Value(finished.clone())),
+            (tree_path.clone(), Reply::Value(tree(finished, Some("page-child-020")))),
+        ],
+    )
+    .await;
+    assert!(output.result.is_ok(), "{}", stderr(&output));
+    assert_eq!(
+        output.requests.iter().filter(|(path, _)| path == &tree_path).count(),
+        3
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.matches("STATE     running · normal").count(), 2, "{stdout}");
+    assert_eq!(stdout.matches("More runs follow").count(), 2, "{stdout}");
+    assert!(stdout.contains("--cursor page-child-020 --limit 20"));
 }
 
 #[tokio::test(start_paused = true)]
