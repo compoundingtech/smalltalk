@@ -3171,6 +3171,41 @@ impl Store {
                 && entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)))
     }
 
+    /// Whether the newest complete roster published at or before `index` already shows every
+    /// card as it would at `index`: no claim since its cut changes a card's inputs (the same
+    /// delta the incremental fold trusts), no agent timeline row arrived, and no queue deadline
+    /// passed. A read that must see what was written before it need not wait for a refresh
+    /// that would fold nothing. One range read over the claims since the cut; it never folds.
+    pub(crate) fn published_agent_roster_unchanged_through(
+        &self,
+        index: u64,
+        history: bool,
+    ) -> Result<bool> {
+        if self.smalltalk.agent_roster_refresh.get().is_none() {
+            return Ok(false);
+        }
+        let Some((cut, local, valid_until, items)) = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
+            .max_by_key(|entry| (entry.index, entry.local))
+            .map(|entry| (entry.index, entry.local, entry.valid_until_unix_ms, Arc::clone(&entry.items)))
+        else {
+            return Ok(false);
+        };
+        if valid_until.is_some_and(|expiry| now_ms() >= expiry)
+            || roster_local_frontier(&self.readers.get(), index)? != local
+        {
+            return Ok(false);
+        }
+        if cut == index {
+            return Ok(true);
+        }
+        Ok(match self.agent_resources_delta(cut, index, &items)? {
+            Ok(delta) => delta.subjects.is_empty() && !delta.queues && !delta.membership,
+            Err(_) => false,
+        })
+    }
+
     /// Whether a refresher keeps the roster published, so readers must never fold it.
     pub(crate) fn agent_roster_refresher_running(&self) -> bool {
         self.smalltalk.agent_roster_refresh.get().is_some()
