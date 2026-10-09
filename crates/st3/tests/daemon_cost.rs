@@ -66,13 +66,9 @@ const ADAPTER_ACTOR: &str = "agent/bench/cost/adapter";
 const KNOWN_GROWTH: &[(&str, f64)] = &[
     // Attention reads every person ask (11.8x full-scan steps).
     ("GET /v1/attention", 18.0),
-    // Checkpoint status walks the sealed set (9.8x).
-    ("GET /v1/checkpoint/status", 15.0),
     // Runtimes read every runtime observation (3.8x for the list, 9.0x for one runtime).
     ("GET /v1/client/runtimes", 6.0),
     ("GET /v1/client/runtimes/{*id}", 14.0),
-    // Doctor checks the whole store, as it must (11.4x full-scan steps).
-    ("GET /v1/doctor", 17.0),
     // Fleet and replication status count every replica record (9.7x).
     ("GET /v1/internal/fleet/status", 15.0),
     ("GET /v1/replication/status", 15.0),
@@ -1408,6 +1404,18 @@ async fn no_request_does_work_that_grows_with_the_store() {
             failures.push(format!("{name}: failed: {error}"));
             continue;
         }
+        if matches!(name.as_str(), "GET /v1/doctor" | "GET /v1/checkpoint/status") {
+            // These reads expose uncertified evidence and must not scan history. Keep the
+            // ordinary growth/slack limits below and also enforce an absolute SQLite bound
+            // at BOTH sizes; this is not a filesystem/process/network or availability proof.
+            for (size, cost) in [("small", before), ("large", after)] {
+                if cost.fullscan_steps != 0 || cost.vm_steps > SLACK {
+                    failures.push(format!(
+                        "{name}: {size} uncertified diagnostic exceeded its SQLite bound: {cost:?}"
+                    ));
+                }
+            }
+        }
         // A list that answers more rows may read more; a request answering the same may not.
         // One seat changed at either scale: its rebuild must not grow with fleet size.
         let answered = if name == COLD_AGENTS {
@@ -1881,7 +1889,25 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                         None => client.get::<Value>(&path).await,
                         Some(body) => client.post::<_, Value>(&path, body).await,
                     };
-                    answer.map_err(|error| error.to_string().chars().take(200).collect())
+                    if path == "/v1/checkpoint/status" {
+                        // Measure the explicit refusal, not a healthy checkpoint or an
+                        // arbitrary failed request. Wrong status/code/state/text must fail.
+                        let error = answer
+                            .expect_err("uncertified checkpoint evidence must not look healthy");
+                        let (status, code, message, details) = st3::client::api_error_parts(&error)
+                            .expect("checkpoint status preserves the structured API error");
+                        assert_eq!(status, 503);
+                        assert_eq!(code, "diagnostic-evidence-incomplete");
+                        assert_eq!(details, &serde_json::Map::from_iter([
+                            ("comparison_state".into(), json!("uncomputed")),
+                        ]));
+                        assert_eq!(message, "checkpoint evidence incomplete; the current set is not certified; this read does not start an audit");
+                        // Reconstitute the refusal body for answer-size accounting. Its
+                        // error code and incomplete state stay visible in the cost sample.
+                        Ok(json!({"code":code, "message":message, "details":details}))
+                    } else {
+                        answer.map_err(|error| error.to_string().chars().take(200).collect())
+                    }
                 })
                 .await
             };
