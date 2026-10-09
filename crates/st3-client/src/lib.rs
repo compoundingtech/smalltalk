@@ -607,6 +607,9 @@ pub enum CollectionEvent {
         items: Vec<TimelineEntry>,
         /// Availability before the live window; absent on deltas means unchanged.
         has_more: Option<bool>,
+        /// On a replacement with older history: the timeline cursor for the entries just
+        /// before this frame's oldest entry. Absent on deltas and when nothing is older.
+        older_cursor: Option<String>,
     },
     /// Subscribe again: the server could not bring this subscription up to date.
     /// `code` and `message` say why when a temporary failure caused it, such as a conversation
@@ -666,6 +669,7 @@ impl CollectionEvent {
                 replace: field(&frame, "replace")?,
                 items: field(&frame, "items")?,
                 has_more: field(&frame, "has_more")?,
+                older_cursor: field(&frame, "older_cursor")?,
                 id,
             }),
             Some("resync") => Ok(Self::Resync {

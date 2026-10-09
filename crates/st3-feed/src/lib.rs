@@ -546,7 +546,7 @@ async fn connected(
                             }
                         }
                     }
-                    CollectionEvent::Conversation { id, session_id, replace, items, has_more } => {
+                    CollectionEvent::Conversation { id, session_id, replace, items, has_more, .. } => {
                         let Some(current) = conversing.iter_mut().find(|current| current.id == id) else { continue };
                         current.failures = 0;
                         if updates.send(Update::Conversation { target: current.target.clone(), session_id, replace, has_more, items }).is_err() {
