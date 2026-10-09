@@ -58,6 +58,10 @@ pub(super) struct Prepared {
 }
 
 impl Prepared {
+    pub(super) fn try_admit(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.entry.admission.clone().try_lock_owned().ok()
+    }
+
     pub(super) async fn admit(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.entry.admission.clone().lock_owned().await
     }
@@ -297,7 +301,7 @@ impl Windows {
         }).to_string()
     }
 
-    /// Reserve and await admission before opening SQLite or scheduling a blocking worker.
+    /// Reserve a window before gate admission and its physical SQLite query.
     pub(super) fn prepare(
         &self,
         state: &AppState,
@@ -313,7 +317,7 @@ impl Windows {
         Some(Prepared { key, entry })
     }
 
-    /// Called inside the authorized SQLite snapshot after async admission. Cache mutexes
+    /// Called inside the authorized SQLite snapshot after gate admission. Cache mutexes
     /// hold only Arc loads/stores; computation, serialization and deep clones run outside them.
     pub(super) fn read(
         &self,
@@ -951,17 +955,34 @@ mod tests {
         physical.abort(); // a started physical worker still owns admission
         let second = windows.prepare(&state, &session, &query).unwrap();
         let mut waiter = Box::pin(second.admit());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
-                .await
-                .is_err()
-        );
+        assert!(futures_util::poll!(&mut waiter).is_pending());
         // Drop the canceled async waiter: it has never opened a snapshot or a worker.
         drop(waiter);
-        assert!(second.entry.admission.clone().try_lock_owned().is_err());
+        assert!(second.try_admit().is_none());
         release.send(()).unwrap();
         physical.await.unwrap();
         let _guard = second.admit().await;
+    }
+
+    #[tokio::test]
+    async fn collection_window_try_admission_cannot_discard_a_queued_followers_grant() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let query = request("missions");
+        let first = windows.prepare(&state, &session, &query).unwrap();
+        let second = windows.prepare(&state, &session, &query).unwrap();
+        let holder = first.try_admit().unwrap();
+        let mut follower = Box::pin(second.admit());
+        assert!(futures_util::poll!(&mut follower).is_pending());
+        assert!(first.try_admit().is_none());
+        drop(holder);
+        assert!(first.try_admit().is_none(), "the queued follower owns the reserved grant");
+        let granted = follower.await;
+        assert!(first.try_admit().is_none());
+        drop(granted);
+        assert!(first.try_admit().is_some());
     }
 
     #[test]

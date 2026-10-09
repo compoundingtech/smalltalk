@@ -104,6 +104,15 @@ ordinary requests without a paired bearer credential, except for pairing complet
 paths can be set with `socket` and `client_gateway_socket` in `config.toml`, or with `--socket` and
 `--client-gateway-socket` for a foreground daemon. They must never name the same path.
 
+Without an explicit `--client-gateway-socket`, a private `st up --state-dir DIR` derives its
+gateway as `DIR/st3-client.sock`, even when `--socket` is also supplied. With only `--socket`,
+the gateway is `st3-client.sock` beside that socket. If this derived path equals the shared
+default gateway (including symlinked ancestors above directories not yet created), startup
+refuses before creating daemon state. Missing path suffixes normalize `.` and `..` after
+resolving existing symlinks. Pass `--client-gateway-socket` to select the private gateway
+explicitly.
+Default startup without either private flag is unchanged.
+
 For a direct tailnet connection, forward a TCP listener bound to the host's Tailscale IP to
 `st3-client.sock`. Pair the phone with `http://TAILSCALE_IP:PORT`. Tailscale encrypts the link;
 the paired gateway still authenticates each client request. Never bind this listener to a public
@@ -684,10 +693,13 @@ fields are:
 The authenticated session supplies actor and scopes. `actor`, `credential`, and fleet secrets are
 invalid request fields. Repeating the same key, action ID, type and parameters returns the
 original result; a refreshed fence does not change the action's idempotency identity. A different
-action under that key returns `idempotency-conflict`. Receipts from older daemons still accept the
-exact original request. A snapshot fence proves the host and an index no newer than the current
-store; unrelated commits do not stale an action. Stale generation, subject revision, incarnation,
-preview or terminal screen fences return `stale-fence` without a partial mutation.
+action under that key returns `idempotency-conflict`. A receipt or terminal attachment storing
+only the legacy full-request digest also returns HTTP 409 `idempotency-conflict`, even for
+an exact replay; it never executes the action again. Inspect the original committed outcome
+before deliberately submitting a new action with a fresh key. A snapshot fence proves the host
+and an index no newer than the current store; unrelated commits do not stale an action.
+Stale generation, subject revision, incarnation, preview or terminal screen fences return
+`stale-fence` without a partial mutation.
 Multi-subject actions commit atomically or have no effect.
 
 New completed local response receipts last at least **7 days**. Clients must never reuse a
