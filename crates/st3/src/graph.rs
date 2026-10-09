@@ -498,6 +498,8 @@ fn parse_mission_run_declaration(
             "mode",
             "input",
             "after",
+            "report-to",
+            "report-completed",
             "revision",
             "reset",
             "cancellation",
@@ -508,7 +510,14 @@ fn parse_mission_run_declaration(
     let has_creation = body.nodes().iter().any(|child| {
         matches!(
             child.name().value(),
-            "mission" | "workspace" | "requester" | "mode" | "input" | "after"
+            "mission"
+                | "workspace"
+                | "requester"
+                | "mode"
+                | "input"
+                | "after"
+                | "report-to"
+                | "report-completed"
         )
     });
     let creation = if has_creation {
@@ -570,6 +579,26 @@ fn parse_mission_run_declaration(
                 ));
             }
         }
+        let report_to = child_string(body, "report-to")?;
+        if let Some(report_to) = &report_to {
+            crate::mission::validate_report_to(report_to)?;
+        }
+        let report_completed = match child_string(body, "report-completed")?.as_deref() {
+            None => false,
+            Some("true") => true,
+            Some(other) => {
+                return Err(St3Error::new(
+                    "invalid-report-completed",
+                    format!("`report-completed` is `true` when present, not `{other}`"),
+                ));
+            }
+        };
+        if report_completed && report_to.is_none() {
+            return Err(St3Error::new(
+                "report-without-recipient",
+                format!("mission run `{subject}` sets `report-completed` but no `report-to` agent"),
+            ));
+        }
         Some(MissionRunCreation {
             mission,
             revision,
@@ -578,6 +607,8 @@ fn parse_mission_run_declaration(
             inputs,
             mode,
             after,
+            report_to,
+            report_completed,
         })
     } else {
         None

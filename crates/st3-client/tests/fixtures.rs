@@ -557,3 +557,15 @@ fn a_kind_this_client_does_not_know_reads_as_unknown_and_the_page_still_reads() 
         .is_err()
     );
 }
+
+#[test]
+fn relay_omission_fixture_round_trips_without_inventing_nonnullable_fields() {
+    let bytes = fixture("timeline-relay-omission.json");
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let typed: Envelope<TimelinePage> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(serde_json::to_value(&typed).unwrap(), raw);
+    let changes = serde_json::json!({"kind":"conversation-changes", "session_id":raw["value"]["session_id"],
+        "items":raw["value"]["items"], "next_cursor":"conversation-cursor/relay/next"});
+    let typed: ConversationChanges = serde_json::from_value(changes.clone()).unwrap();
+    assert_eq!(serde_json::to_value(typed).unwrap(), changes);
+}

@@ -1611,6 +1611,15 @@ pub struct Summary {
     pub working_agents: u64,
     pub active_missions: u64,
     pub machines: SummaryMachines,
+    /// The published agents roster the agent counts came from, when the daemon prepares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents_as_of: Option<SummaryAgentsAsOf>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SummaryAgentsAsOf {
+    pub store_index: u64,
+    pub published_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1945,11 +1954,11 @@ pub struct TimelineMessageBody {
     pub message_id: String,
     #[serde(default)]
     pub reply_to: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
@@ -1981,9 +1990,9 @@ pub struct MessageProvenance {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TimelineContentBody {
     pub media_type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<TimelineBlock>,
@@ -2020,7 +2029,7 @@ pub enum TimelineToolStatus {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TimelineStatusBody {
     pub status: TimelineStatus,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<TimelineBlock>,
@@ -2053,35 +2062,35 @@ pub struct TimelineErrorBody {
 pub struct TimelineUsageBody {
     pub semantics: TimelineUsageSemantics,
     pub driver: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_used_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_used_percent: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compactions: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_compaction_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_compaction_trigger: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
     pub attribution: TimelineAttribution,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2110,7 +2119,7 @@ pub struct TimelineAttribution {
 pub struct TimelineRedactionBody {
     pub reason: String,
     pub withheld_bytes: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withheld_items: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<TimelineBlock>,
@@ -2121,7 +2130,7 @@ pub struct TimelineTruncationBody {
     pub reason: String,
     pub omitted_from_sequence: u64,
     pub omitted_to_sequence: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<TimelineBlock>,

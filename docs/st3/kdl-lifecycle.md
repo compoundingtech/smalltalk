@@ -181,6 +181,23 @@ mission-run "release/deploy" {
 
 `st missions start deploy --after release/build` publishes the same declaration.
 
+### Reporting a run
+
+A run can name an agent to tell when it fails, is cancelled or stalls:
+
+```kdl
+mission-run "release/deploy" {
+  mission "mission/deploy@0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  workspace "/work/deploy"
+  requester "person/operator"
+  report-to "agent/ops/watcher"
+  report-completed "true"
+}
+```
+
+`st missions start deploy --report-to agent/ops/watcher --report-completed` publishes the same
+declaration. `report-completed` needs `report-to`. See [Run reports](mission-graph-runtime.md#run-reports).
+
 st gives the run an agentless first step, `after-run`. Every other step of the normal phase depends on it. The step completes when the named run completes. It fails when that run fails or is cancelled, and the waiting run then fails.
 
 The named run must exist when the run is published. A run cannot wait for itself. A mission with a root step named `after-run` cannot start with `after`.

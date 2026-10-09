@@ -112,6 +112,7 @@ st agents queue agent/garden/worker
 | --- | --- |
 | One step must follow another in the same run | `depends-on`; the order of steps in the file does not set the order they run. `queue {}` is a shorter way to write a series of steps. |
 | A whole run must wait for another run | `--after RUN`; if the earlier run fails or is cancelled, the waiting run also fails. |
+| Someone must hear that a run failed, was cancelled or stalled | `report-to="agent/NAME"` on the mission, or `--report-to AGENT` when starting. The agent gets one message for each event. See [run reports](st3/mission-graph-runtime.md#run-reports). |
 | Several independent runs share one durable seat | Its seat queue. Runs enter in the order they start. The queue skips a blocked run until it has work ready. |
 | New external events should create work | An observer watches for events. A subscription starts a separate run for each matching event. Each run finishes, and the seat queue handles them. See [repository intake](github-integration.md). |
 

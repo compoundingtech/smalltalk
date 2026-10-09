@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Prefer local foreground writes over queued replication receipt and admission pages",
+  "replay": {
+    "status": "none",
+    "detail": "No startup or heal replay is added."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, index, trigger or persisted format changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Membership windows, exact signatures and tombstone exclusions remain authoritative. Admission rechecks the prepared authority generation and retained envelope source after acquisition."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, peer, signature or certificate format changes; background receipt keeps the complete page atomic and finalizes before its durable acknowledgement."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal binary restart only. Foreground preference does not preempt active work or establish production latency acceptance."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual repair or coordinated fleet conversion is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Older binaries read the unchanged store; no migration or new durable state is introduced."
+  }
+}

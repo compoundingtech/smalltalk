@@ -676,6 +676,8 @@ async fn a_stale_seat_publishing_last_cannot_lower_usage_or_disable_the_limits_p
             &st3::store::LimitsPolicy {
                 stop_at_weekly_percent: 95,
                 keep: Default::default(),
+                exempt_accounts: Default::default(),
+                exempt_harnesses: Default::default(),
                 notify: "agent/example/operations".into(),
                 fresh_ms: 3_600_000,
             },
@@ -785,6 +787,8 @@ async fn usage_hides_legacy_unknowns_preserves_account_identity_and_stops_at_95_
             &st3::store::LimitsPolicy {
                 stop_at_weekly_percent: 95,
                 keep: Default::default(),
+                exempt_accounts: Default::default(),
+                exempt_harnesses: Default::default(),
                 notify: "agent/example/operations".into(),
                 fresh_ms: 3_600_000,
             },
@@ -870,6 +874,8 @@ async fn weekly_usage_survives_a_member_restart_with_a_partial_harness_report() 
                         &st3::store::LimitsPolicy {
                             stop_at_weekly_percent: 95,
                             keep: Default::default(),
+                            exempt_accounts: Default::default(),
+                            exempt_harnesses: Default::default(),
                             notify: "agent/example/operations".into(),
                             fresh_ms: 3_600_000,
                         },

@@ -1437,6 +1437,7 @@ export type Snapshot = {
   host_id: HostId;
   id: SnapshotId;
   projection_version: "client-projection.v0";
+  published_at?: Timestamp;
   store_index: number;
 };
 
@@ -1522,6 +1523,10 @@ export type SubscriptionSpec = {
 
 export type Summary = ResourceHeader & {
   active_missions: number;
+  agents_as_of?: {
+  published_at: Timestamp;
+  store_index: number;
+};
   kind: "summary";
   machines: SummaryMachines;
   needs_you: number;

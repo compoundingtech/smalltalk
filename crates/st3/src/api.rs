@@ -64,6 +64,7 @@ mod client_presence;
 mod client_v0;
 mod custom;
 mod delivery_presence;
+pub(crate) mod agent_harness;
 mod delivery_probes;
 mod github_watch;
 mod harness_events;
@@ -149,6 +150,9 @@ struct ClientSnapshot {
     store_index: u64,
     projection_version: String,
     created_at: String,
+    /// For rows a background refresher folded: when it published them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_at: Option<String>,
 }
 
 /// A client page and the snapshot it was read in, which the envelope names.
@@ -170,6 +174,10 @@ struct ClientListQuery {
     state: Option<String>,
     #[serde(default)]
     native_only: bool,
+    /// Agents only: wait briefly for a roster at least as new as this request, rather than
+    /// answering at once from the newest published one.
+    #[serde(default)]
+    fresh: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -444,6 +452,29 @@ impl IntoResponse for ApiError {
 pub fn router(state: AppState) -> Router {
     delivery_presence::start();
     router_for_transport(state, ClientTransportBoundary::Unix)
+}
+
+/// Already-admitted snapshot/receipt transport fixtures only. There is no CLI/API switch
+/// into this router: real native custody controls and the daemon use `router`.
+#[cfg(feature = "test-support")]
+pub(crate) fn admitted_mailbox_protocol_router(state: AppState) -> Router {
+    Router::new()
+        .route("/v1/mailbox/bind", post(mailbox::bind_admitted_fixture))
+        .route("/v1/mailbox", get(mailbox::subscribe_admitted_fixture))
+        .fallback_service(router(state.clone()))
+        .with_state(state)
+}
+
+/// Synthetic private-store transport controls; never physical native admission.
+#[cfg(feature = "test-support")]
+pub(crate) fn synthetic_mailbox_protocol_router(state: AppState, subject: &str) -> Router {
+    assert!(subject.starts_with("agent/example/"));
+    admitted_mailbox_protocol_router(state).layer(Extension(NativeDeliveryPeer {
+        agent: subject.into(),
+        transport: "omp-channel",
+        pid: std::process::id(),
+        archives_inbox: false,
+    }))
 }
 
 /// Build the loopback-only client gateway. Unlike the local Unix boundary, every ordinary
@@ -989,8 +1020,8 @@ async fn response_envelope_unbounded(
         (Some(error), _) | (None, Err(error)) => error.into_response(),
         // Most handlers use synchronous SQLite and filesystem APIs. Run the whole
         // handler on a blocking thread so a busy projection or replication pass cannot
-        // occupy an async worker needed to accept another call. Each read on that
-        // thread takes its own read connection, so it never waits for another read.
+        // occupy an async worker needed to accept another call. Read workers are admitted
+        // before taking store locks; nested work reuses the handler's reader.
         (None, Ok(_)) if request_path == "/v1/health" => next.run(request).await,
         (None, Ok(_)) => {
             let runtime = tokio::runtime::Handle::current();
@@ -1006,7 +1037,7 @@ async fn response_envelope_unbounded(
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
                 crate::performance::with_cpu(Some(&cpu_kind), Some(&cpu_client), || {
-                    runtime.block_on(async move {
+                    runtime.block_on(crate::api::read_deadline::handler(async move {
                         // Cancel the actual forwarded relay, not only its outer waiter.
                         // Other routes retain their existing cooperative cancellation;
                         // this transport's mutation variants carry no read budget.
@@ -1023,7 +1054,7 @@ async fn response_envelope_unbounded(
                         } else {
                             next.run(request).await
                         }
-                    })
+                    }))
                 })
             })
             .await
@@ -1250,6 +1281,7 @@ fn client_snapshot_at(state: &AppState, store_index: u64) -> ClientSnapshot {
         store_index,
         projection_version: CLIENT_PROJECTION_VERSION.into(),
         created_at,
+        published_at: None,
     }
 }
 
@@ -2270,7 +2302,21 @@ fn client_agent_cards_for_page(
         .iter()
         .filter_map(|r| r["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    let cards = store.cached_agent_resources_for(index, history, Some(&selected), |changed| {
+    let cards = client_agent_cards_selected(store, history, index, &selected, false)
+        .map_err(ApiError::internal)?;
+    client_agent_cards_from_cached(store, cards, refs, at)
+}
+
+/// The cards of `selected` agents at `index`, folding only those not already cached there.
+/// A `chunk` of a roster assembled in short folds refolds no card outside `selected`.
+fn client_agent_cards_selected(
+    store: &Store,
+    history: bool,
+    index: u64,
+    selected: &BTreeSet<String>,
+    chunk: bool,
+) -> anyhow::Result<Vec<Value>> {
+    let build = |changed: Option<(&BTreeSet<String>, &[Value])>| {
         let (subjects, previous) = changed.expect("a selected page always names its missing cards");
         // Delta metadata is current and already diffed; only cold pages need shallow refs.
         // Frozen continuation refs remain response metadata, never shared cache inputs.
@@ -2286,8 +2332,12 @@ fn client_agent_cards_for_page(
         )?;
         add_agent_todos(store, &mut cards, index)?;
         Ok(cards)
-    }).map_err(ApiError::internal)?;
-    client_agent_cards_from_cached(store, cards, refs, at)
+    };
+    if chunk {
+        store.cached_agent_resources_chunk(index, history, selected, build)
+    } else {
+        store.cached_agent_resources_for(index, history, Some(selected), build)
+    }
 }
 
 fn client_agent_cards_from_cached(
@@ -2368,7 +2418,7 @@ fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyh
             Some(_) => "current",
         };
         item["observation"] = json!(observation);
-        if observation == "stale" && item["harness_state"] == "idle" {
+        if observation == "stale" && matches!(item["harness_state"].as_str(), Some("ready" | "idle" | "working")) {
             item["harness_state"] = json!("indeterminate");
             if item["state"] == "running" {
                 item["state"] = json!("waiting");
@@ -2451,7 +2501,7 @@ fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
     let Some(recipient) = item.get("id").and_then(Value::as_str) else {
         return;
     };
-    let assessment = delivery_presence::assess(recipient, &driver);
+    let assessment = delivery_presence::assess_current(recipient, &driver, item["incarnation_id"].as_str());
     if assessment.stale() {
         item["state"] = Value::String("waiting".into());
     }
@@ -2526,6 +2576,16 @@ fn client_agent_resources_selected(
     client_agent_resources_from_status(store, history, snapshot_index, changed, status)
 }
 
+/// Every agent card at `snapshot_index` of a quiet store, folded as the roster folds them but
+/// outside a read snapshot: on a store just opened, nothing is kept yet, as at a daemon start.
+/// For load measurements; it returns how many cards it folded.
+#[doc(hidden)]
+pub fn cold_agent_roster_rebuild(store: &Store, snapshot_index: u64) -> anyhow::Result<usize> {
+    let mut cards = client_agent_resources_selected(store, false, snapshot_index, None)?;
+    add_agent_todos(store, &mut cards, snapshot_index)?;
+    Ok(cards.len())
+}
+
 fn client_agent_resources_from_status(
     store: &Store,
     history: bool,
@@ -2570,6 +2630,16 @@ fn client_agent_resources_from_status(
         .collect::<BTreeMap<_, _>>();
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
     let member_faults = store.member_reconcile_faults_for(&agent_subjects, snapshot_index)?;
+    let mailbox_faults = store.mailbox_faults_for(&agent_subjects, snapshot_index)?;
+    // Harnesses, activity, and who can have a suspension or rollout, for many agents at once.
+    // Each status names the actual-state claim it selected, the newest runtime observation
+    // whenever the agent has one.
+    let actual_claims = status
+        .subjects
+        .iter()
+        .map(|subject| (subject.subject.clone(), subject.actual_claim.clone()))
+        .collect();
+    let mut card_reads = store.agent_card_reads(&agent_subjects, snapshot_index, &actual_claims)?;
     // Cards without a harness need only their actual claim's acceptance time, not its body.
     // Keep the existing per-claim fallback if the bulk metadata read cannot be completed.
     let actual_claim_times = store.claim_acceptance_times(
@@ -2601,8 +2671,10 @@ fn client_agent_resources_from_status(
         })
         .filter(|subject| history || subject.projection.layer == "current")
         .map(|mut subject| -> anyhow::Result<(String, Value)> {
-            subject.harness = store.observed_harness_at(&subject.subject, snapshot_index)?;
-            let fault = member_faults.get(&subject.subject);
+            subject.harness = card_reads.take_harness(store, &subject.subject)?;
+            let member_fault = member_faults.get(&subject.subject);
+            let mailbox_fault = mailbox_faults.get(&subject.subject);
+            let fault = member_fault.or(mailbox_fault);
             let fields = subject
                 .actual
                 .as_ref()
@@ -2610,19 +2682,22 @@ fn client_agent_resources_from_status(
             let observed = fields
                 .and_then(|fields| fields.get("status"))
                 .and_then(Value::as_str);
-            let driver = subject
-                .harness
-                .as_ref()
-                .and_then(|harness| harness.driver.clone())
-                .or_else(|| subject.desired.as_ref().and_then(desired_harness_driver));
+            let declared_provider = subject.desired.as_ref().and_then(desired_harness_driver);
+            subject.harness = agent_harness::eligible(
+                declared_provider.as_deref(),
+                fields.and_then(|fields| fields.get("incarnation_id")).and_then(Value::as_str),
+                subject.harness.take(),
+            );
+            subject.harness = agent_harness::availability(subject.harness.take(), mailbox_fault.map(String::as_str));
+            let driver = declared_provider.or_else(|| subject.harness.as_ref().and_then(|harness| harness.driver.clone()));
             let harness_state = subject.harness.as_ref().map(|harness| harness.state.clone());
-            let last_activity_at = store.agent_last_activity_at(
+            let last_activity_at = card_reads.last_activity_at(
+                store,
                 &subject.subject,
                 subject
                     .harness
                     .as_ref()
                     .map(|harness| harness.incarnation_id.as_str()),
-                snapshot_index,
             )?;
             let silent_since = if harness_state.as_deref() == Some("working") {
                 let working_since = match subject.harness.as_ref() {
@@ -2698,8 +2773,12 @@ fn client_agent_resources_from_status(
                 .map(|token| crate::placement::handoff(store, &subject.subject, token, snapshot_index))
                 .transpose()?.flatten();
             let moving = handoff.as_ref().is_some_and(|h| h.phase != "running");
-            let state = if fault.is_some() { "failed" } else if moving { "waiting" } else { state };
-            let suspension = crate::suspension::current(store, &subject.subject)?;
+            let state = if member_fault.is_some() { "failed" } else if mailbox_fault.is_some() || moving { "waiting" } else { state };
+            let suspension = if card_reads.may_have_suspension(&subject.subject) {
+                crate::suspension::current(store, &subject.subject)?
+            } else {
+                None
+            };
             // A suspended seat has no process by design: it is neither stopped nor failed.
             let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
                 Some("suspended") if fault.is_none() => "suspended",
@@ -2786,7 +2865,11 @@ fn client_agent_resources_from_status(
                 "operational": subject.projection,
                 "suspension": suspension.as_ref().map(client_suspension),
                 "handoff": handoff,
-                "rollout": crate::rollout::status(store, &subject.subject)?,
+                "rollout": if card_reads.may_have_rollout(&subject.subject) {
+                    crate::rollout::status(store, &subject.subject)?
+                } else {
+                    None
+                },
             });
             if let Some(lifecycle) = crate::model::declared_agent_lifecycle(subject.desired.as_ref()) {
                 value["lifecycle"] = json!(lifecycle);
@@ -4239,6 +4322,10 @@ async fn client_agents(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<ClientPageResponse, ApiError> {
+    // A daemon's readers never fold the roster: they answer from its refresher's publications.
+    if state.store.agent_roster_refresher_running() {
+        return client_agents_published(state, snapshot, query).await;
+    }
     // A warm request never queues behind a cold projection. Drop the probe's SQLite
     // snapshot before waiting, then recheck all cache fences in the admitted snapshot.
     for admitted in [false, true] {
@@ -4268,6 +4355,254 @@ async fn client_agents(
         }
     }
     unreachable!("an admitted roster read always builds missing cards")
+}
+
+/// An agents page from the refresher's publications. A first page answers at once from the
+/// newest one, or says not ready; one that asks for a fresh roster first waits briefly for a
+/// roster at or after its own cut. A
+/// continuation answers from the roster published at exactly its first page's cut, or says the
+/// page expired. Neither folds a card.
+async fn client_agents_published(
+    state: AppState,
+    snapshot: ClientSnapshot,
+    query: ClientListQuery,
+) -> Result<ClientPageResponse, ApiError> {
+    if query.cursor.is_some() {
+        let reader = state.clone();
+        return blocking_store(move || Ok(client_agents_published_continuation(&reader, snapshot, &query)))
+            .await?;
+    }
+    if query.fresh {
+        wait_for_agent_roster(&state.store, query.history).await;
+    }
+    let reader = state.clone();
+    let history = query.history;
+    match blocking_store(move || Ok(client_agents_published_page(&reader, &query))).await?? {
+        Some(page) => Ok(page),
+        None => {
+            if history {
+                state.store.request_agent_roster_history();
+            } else {
+                state.store.request_agent_roster_refresh();
+            }
+            Err(agent_roster_not_ready())
+        }
+    }
+}
+
+fn agent_roster_not_ready() -> ApiError {
+    ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "agent-roster-not-ready".into(),
+        message: "the agents roster is still being prepared; retry shortly".into(),
+        details: Box::default(),
+    }
+}
+
+/// How many agents one short snapshot reduces while the refresher warms the roster.
+const AGENT_ROSTER_WARM_CHUNK: usize = 250;
+
+/// Reduce every agent's current-view and card status in short snapshots of at most
+/// [`AGENT_ROSTER_WARM_CHUNK`] agents. These per-agent reductions stay cached until a claim
+/// they depend on arrives, so the folds that follow at one cut read them instead of the log.
+fn warm_agent_roster(store: &Store) -> anyhow::Result<()> {
+    let subjects = store.read_snapshot(|index| {
+        Ok(store.readers.get()
+            .prepare_cached(crate::store::RANGE_SUBJECTS)?
+            .query_map(rusqlite::params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    })?;
+    for chunk in subjects.chunks(AGENT_ROSTER_WARM_CHUNK) {
+        let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
+        store.read_snapshot(|index| store.agent_card_status_at(Some(&names), index, false).map(drop))?;
+    }
+    Ok(())
+}
+
+/// How many times a refresh folds the roster in chunks before it gives up on a roster that
+/// keeps changing in ways it cannot follow card by card.
+const AGENT_ROSTER_ASSEMBLY_ROUNDS: usize = 3;
+
+/// Publish the complete roster at a new cut, never folding more than
+/// [`AGENT_ROSTER_WARM_CHUNK`] cards in one snapshot. A snapshot completes the roster only once
+/// the newest rows say which cards changed and at most that many are changed or missing.
+/// Otherwise the cards fold in chunks, each at its own cut, refolding the already folded cards
+/// whose claims changed, and completion is tried again. Readers keep the previous complete
+/// roster meanwhile, with its own cut and publication time; if it cannot be assembled, the
+/// refresh fails and is tried again on the next request.
+fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
+    if store.read_snapshot(|index| store.agent_roster_current(index, history))? {
+        return Ok(());
+    }
+    let complete = |store: &Store| store.read_snapshot(|index| {
+        if let Some(reason) =
+            store.agent_roster_unbounded_because(index, history, AGENT_ROSTER_WARM_CHUNK)?
+        {
+            return Ok(Some(reason));
+        }
+        client_agent_resources_cached(store, history, index).map(|_| None)
+    });
+    for _ in 0..AGENT_ROSTER_ASSEMBLY_ROUNDS {
+        let Some(reason) = complete(store)? else {
+            return Ok(());
+        };
+        store.note_agent_roster_chunked(&reason);
+        let order = store.read_snapshot(|index| {
+            Ok(client_agent_page_refs(store, history, index)?.iter()
+                .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>())
+        })?;
+        for chunk in order.chunks(AGENT_ROSTER_WARM_CHUNK) {
+            let chunk = chunk.iter().cloned().collect::<BTreeSet<_>>();
+            store.read_snapshot(|index| {
+                client_agent_cards_selected(store, history, index, &chunk, true).map(drop)
+            })?;
+        }
+    }
+    if complete(store)?.is_none() {
+        return Ok(());
+    }
+    anyhow::bail!("the agents roster kept changing in ways no short fold can follow; keeping the previous one")
+}
+
+/// Every current agent's refs, and the cards of as many as the largest window or page shows.
+fn client_agent_roster_head(store: &Store, index: u64) -> anyhow::Result<()> {
+    let refs = client_agent_page_refs(store, false, index)?;
+    let head = refs.iter().take(CLIENT_MAX_PAGE_ITEMS + 1)
+        .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    client_agent_cards_selected(store, false, index, &head, false).map(drop)
+}
+
+/// For a read that asked to see what was written before it: wait, briefly, for the refresher
+/// to publish a roster at or after the current cut. The read itself folds nothing.
+async fn wait_for_agent_roster(store: &Store, history: bool) {
+    let Ok(wanted) = store.index() else { return };
+    let published = |store: &Store| {
+        let index = store.index().ok()?;
+        store.published_agent_roster(index, history).map(|(cut, _, _)| cut).or_else(|| {
+            (!history).then(|| store.published_agent_roster_head(index, 1)).flatten()
+                .map(|(cut, _, _, _)| cut)
+        })
+    };
+    let mut publications = store.subscribe_agent_roster();
+    let _ = tokio::time::timeout(AGENT_ROSTER_READ_WAIT, async {
+        while published(store).is_none_or(|cut| cut < wanted) {
+            if history {
+                store.request_agent_roster_history();
+            } else {
+                store.request_agent_roster_refresh();
+            }
+            if publications.changed().await.is_err() {
+                return;
+            }
+        }
+    }).await;
+}
+
+/// The snapshot of a roster published at `cut`: that cut, its time, and when it was folded.
+fn roster_snapshot(state: &AppState, cut: u64, published_at_unix_ms: u128) -> ClientSnapshot {
+    ClientSnapshot {
+        published_at: Some(client_timestamp(published_at_unix_ms)),
+        ..client_snapshot_at(state, cut)
+    }
+}
+
+/// A first page of the newest published roster, under the snapshot it was folded at.
+fn client_agents_published_page(
+    state: &AppState,
+    query: &ClientListQuery,
+) -> Result<Option<ClientPageResponse>, ApiError> {
+    let store = &state.store;
+    let current = store.index().map_err(ApiError::internal)?;
+    let index = current;
+    let Some((index, cards, published_at)) = store.published_agent_roster(index, query.history) else {
+        // Before the first complete roster, an unfiltered first page can come from its head.
+        if query.status.is_some() || query.history {
+            return Ok(None);
+        }
+        let Some((index, refs, head, published_at)) =
+            store.published_agent_roster_head(index, CLIENT_MAX_PAGE_ITEMS + 1)
+        else {
+            return Ok(None);
+        };
+        store.request_agent_roster_refresh();
+        let snapshot = roster_snapshot(state, index, published_at);
+        let mut page = client_page_read(state, &snapshot, "agents", (*refs).clone(), query, true)?;
+        page.items = client_agent_cards_from_cached(
+            store, page_cards(&head, &page.items), &page.items, &snapshot.created_at,
+        )?;
+        return Ok(Some((Extension(snapshot), Json(page))));
+    };
+    // A roster older than the current cut, its local activity or its queue deadline needs a
+    // refresh; the newest one needs none.
+    if index < current || !store.agent_roster_current(current, query.history).map_err(ApiError::internal)? {
+        if query.history {
+            store.request_agent_roster_history();
+        } else {
+            store.request_agent_roster_refresh();
+        }
+    }
+    let snapshot = roster_snapshot(state, index, published_at);
+    if let Some(status) = query.status.as_deref() {
+        let mut cards = (*cards).clone();
+        overlay_agent_resources(store, &mut cards, &snapshot.created_at)
+            .map_err(ApiError::internal)?;
+        cards.retain(|card| card["state"].as_str() == Some(status));
+        let page = client_page_read(state, &snapshot, "agents", cards, query, true)?;
+        return Ok(Some((Extension(snapshot), Json(page))));
+    }
+    // Continuations keep the same membership, order and queue metadata as the exact path's
+    // refs, and read their cards from this same publication.
+    let refs = cards.iter().map(|card| {
+        let mut reference = serde_json::Map::new();
+        for field in ["id", "name", "host_id"].into_iter().chain(AGENT_QUEUE_FIELDS) {
+            reference.insert(field.to_owned(), card[field].clone());
+        }
+        Value::Object(reference)
+    }).collect();
+    let mut page = client_page_read(state, &snapshot, "agents", refs, query, true)?;
+    page.items = client_agent_cards_from_cached(
+        store, page_cards(&cards, &page.items), &page.items, &snapshot.created_at,
+    )?;
+    Ok(Some((Extension(snapshot), Json(page))))
+}
+
+/// A page continuing a first page served from a publication: its cards come from the roster
+/// published at exactly that page's cut. Once that roster is gone, pagination restarts.
+fn client_agents_published_continuation(
+    state: &AppState,
+    snapshot: ClientSnapshot,
+    query: &ClientListQuery,
+) -> Result<ClientPageResponse, ApiError> {
+    let store = &state.store;
+    let mut page = client_page_read(state, &snapshot, "agents", Vec::new(), query, true)?;
+    let published = store.published_agent_roster_at(snapshot.store_index, query.history);
+    let snapshot = match &published {
+        Some((_, published_at)) => roster_snapshot(state, snapshot.store_index, *published_at),
+        None => snapshot,
+    };
+    // A status-filtered first page kept its whole overlaid cards for its continuations.
+    if query.status.is_some() {
+        return Ok((Extension(snapshot), Json(page)));
+    }
+    let Some((cards, _)) = published else {
+        return Err(client_page_expired(
+            "the roster this page was read from is no longer published; restart pagination",
+        ));
+    };
+    page.items = client_agent_cards_from_cached(
+        store, page_cards(&cards, &page.items), &page.items, &snapshot.created_at,
+    )?;
+    Ok((Extension(snapshot), Json(page)))
+}
+
+/// The cards a page's refs name, from published cards.
+fn page_cards(cards: &[Value], refs: &[Value]) -> Vec<Value> {
+    let selected = refs.iter().filter_map(|item| item["id"].as_str()).collect::<BTreeSet<_>>();
+    cards.iter()
+        .filter(|card| card["id"].as_str().is_some_and(|id| selected.contains(id)))
+        .cloned().collect()
 }
 
 fn client_agents_page_at(
@@ -5147,6 +5482,77 @@ pub fn start_native_session_discovery(state: &AppState) {
     crate::external_sessions::start_history_inventory(state.native_session_home.as_deref());
 }
 
+/// The shortest pause between two roster refreshes. A refresh also pauses as long as it took,
+/// so refreshing never takes more than about half a core however often readers ask. Reads
+/// never wait for it: this bounds how stale a served roster can be, about a second plus a fold.
+const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_secs(1);
+
+/// How long a read asking for a fresh roster waits for one at or after its own cut: long enough
+/// for the refresher's pause and one fold.
+const AGENT_ROSTER_READ_WAIT: Duration = Duration::from_secs(2);
+
+/// Keep the complete agents roster published off the request path. As the daemon starts it
+/// folds every agent's refs and the cards the largest window shows, then the rest of the cards.
+/// A roster read that misses its exact cut serves the newest publication under
+/// that publication's own snapshot and wakes this one task, so readers neither fold the fleet's
+/// cards nor wait behind a fold once the first has published. Each refresh reuses the previous
+/// publication and refolds only the cards whose claims changed, when it can tell which.
+pub fn start_agent_roster(state: &AppState) {
+    let Some(wake) = state.store.start_agent_roster_refresher() else {
+        return;
+    };
+    let store = state.store.clone();
+    tokio::spawn(async move {
+        let mut head = true;
+        loop {
+            let started = tokio::time::Instant::now();
+            let mut admission = store.admit_agent_resources().await;
+            let reader = store.clone();
+            let first = std::mem::take(&mut head);
+            if first {
+                // Warm without admission: nothing is published, and no reader folds.
+                drop(admission);
+                let reader = store.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::performance::task("roster/warm", || warm_agent_roster(&reader))
+                }).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("st3: agents roster warm-up failed: {error:#}"),
+                    Err(error) => eprintln!("st3: agents roster warm-up stopped: {error}"),
+                }
+                admission = store.admit_agent_resources().await;
+            }
+            let refreshed = tokio::task::spawn_blocking(move || {
+                let _admission = admission;
+                // The first fold publishes only what windows and first pages show; the rest
+                // follows at once.
+                crate::performance::task("roster/refresh", || if first {
+                    reader.read_snapshot(|index| client_agent_roster_head(&reader, index))
+                } else {
+                    reader.answer_agent_roster_requests(|| {
+                        refresh_agent_roster(&reader, false)?;
+                        if reader.take_agent_roster_history_request() {
+                            refresh_agent_roster(&reader, true)?;
+                        }
+                        Ok(())
+                    })
+                })
+            })
+            .await;
+            match refreshed {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("st3: agents roster refresh failed: {error:#}"),
+                Err(error) => eprintln!("st3: agents roster refresh stopped: {error}"),
+            }
+            if first {
+                continue;
+            }
+            tokio::time::sleep(started.elapsed().max(AGENT_ROSTER_REFRESH_PAUSE)).await;
+            wake.notified().await;
+        }
+    });
+}
+
 /// The local daemon binds a Unix peer to the harness identity inherited by that peer or one of
 /// its parents. `state_socket` gives clients without the daemon's runtime environment a stable
 /// address for the same listener. Test servers and the paired gateway use the unbound listener.
@@ -5808,6 +6214,7 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         reader_store.readers.usage(),
         smallclaims::sqlite::read_cache_kib(),
         smallclaims::sqlite::max_idle_read_connections(),
+        smallclaims::sqlite::max_read_workers(),
         crate::memory::service_memory(),
     ));
     report.status = if report.checks.iter().any(|check| check.status == "fail") {
@@ -5855,6 +6262,7 @@ fn reader_memory_check(
     readers: smallclaims::sqlite::ReaderUsage,
     cache_kib: usize,
     retained: usize,
+    read_workers: usize,
     groups: anyhow::Result<Option<Vec<crate::memory::GroupMemory>>>,
 ) -> DoctorCheck {
     let targets = readers.open as u128 * cache_kib as u128;
@@ -5862,7 +6270,7 @@ fn reader_memory_check(
         + smallclaims::sqlite::WRITE_CACHE_KIB as u128
         + DAEMON_MEMORY_HEADROOM_KIB;
     let mut message = format!(
-        "{} open readers ({} idle, {} active), peak {}, {} opened since startup; per-reader cache target {} KiB; current reader targets {} MiB; idle retention {}; planning envelope {} MiB (reader targets + 32 MiB writer + 512 MiB reserve). Warning: concurrent reader bursts are unbounded; cache targets exclude schema, prepared statements and query results, and this envelope is not a process memory limit",
+        "{} open readers ({} idle, {} active), peak {}, {} opened since startup; per-reader cache target {} KiB; current reader targets {} MiB; idle retention {}; API read-worker admission {}; planning envelope {} MiB (reader targets + 32 MiB writer + 512 MiB reserve). Raw/background reader checkout is uncapped; cache targets exclude schema, prepared statements and query results, and this envelope is not a process memory limit",
         readers.open,
         readers.idle,
         readers.open.saturating_sub(readers.idle),
@@ -5871,6 +6279,7 @@ fn reader_memory_check(
         cache_kib,
         targets / 1024,
         retained,
+        read_workers,
         envelope_kib / 1024,
     );
     let mut warned = false;
@@ -10791,9 +11200,30 @@ async fn get_usage(
         ))
     })
     .await?;
-    Ok(Json(
-        json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages}),
-    ))
+    let mut report = json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages});
+    // The policy as the config file says now, so `st usage` shows which accounts it never stops.
+    let reloaded = tokio::task::spawn_blocking(crate::config::reload_daemon_limits)
+        .await
+        .ok()
+        .flatten();
+    if let Some(Ok(config)) = reloaded
+        && let Some(policy) = crate::store::LimitsPolicy::from_config(&config)
+    {
+        for (row, limit) in report["limits"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+            .zip(&limits)
+        {
+            row["exempt"] = json!(policy.exempts(limit));
+        }
+        report["limits_policy"] = json!({
+            "stop_at_weekly_percent": config.stop_at_weekly_percent,
+            "exempt_accounts": config.exempt_accounts,
+            "exempt_harnesses": config.exempt_harnesses,
+        });
+    }
+    Ok(Json(report))
 }
 
 #[derive(Deserialize)]
@@ -12830,6 +13260,10 @@ async fn revise_mission_run(
     let (_, reviewers) =
         crate::store::analyze_mission_revision(&old, replacement, &current.requester)
             .map_err(ApiError::bad)?;
+    state
+        .store
+        .validate_revision_seat_carry(&current, replacement)
+        .map_err(ApiError::bad)?;
     let mut publication = intent.clone();
     publication.subjects.clear();
     let mut planned = state
@@ -13945,7 +14379,9 @@ async fn logs_session(
             "a log chunk limit must be between 1 and 65536 bytes",
         )));
     }
-    let session = live_session(&state, &subject, None)?;
+    let session = read_deadline::query(&state.store, "/v1/sessions/logs/{*subject}", || {
+        live_session(&state, &subject, None)
+    })?;
     if session.terminal {
         return Err(ApiError::bad(St3Error::new(
             "unsupported-capability",
@@ -15320,7 +15756,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 max_events,
             }]))
         };
-        let normal = reader_memory_check(usage, 2048, 128, groups(Some(1 << 30), 0));
+        let normal = reader_memory_check(usage, 2048, 128, 32, groups(Some(1 << 30), 0));
         assert_eq!(normal.status, "pass");
         assert!(
             normal
@@ -15329,20 +15765,21 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         );
         assert!(normal.message.contains("current reader targets 194 MiB"));
         assert!(normal.message.contains("planning envelope 800 MiB"));
-        assert!(normal.message.contains("bursts are unbounded"));
+        assert!(normal.message.contains("API read-worker admission 32"));
+        assert!(normal.message.contains("Raw/background reader checkout is uncapped"));
         assert_eq!(
-            reader_memory_check(usage, 8192, 128, groups(Some(1 << 30), 0)).status,
+            reader_memory_check(usage, 8192, 128, 32, groups(Some(1 << 30), 0)).status,
             "warn"
         );
-        let pressure = reader_memory_check(usage, 2048, 128, groups(Some(1 << 30), 1225));
+        let pressure = reader_memory_check(usage, 2048, 128, 32, groups(Some(1 << 30), 1225));
         assert_eq!(pressure.status, "warn");
         assert!(pressure.message.contains("memory.events:max 1225"));
         assert_eq!(
-            reader_memory_check(usage, 2048, 128, groups(None, 0)).status,
+            reader_memory_check(usage, 2048, 128, 32, groups(None, 0)).status,
             "pass"
         );
         assert_eq!(
-            reader_memory_check(usage, 2048, 128, Err(anyhow::anyhow!("unavailable"))).status,
+            reader_memory_check(usage, 2048, 128, 32, Err(anyhow::anyhow!("unavailable"))).status,
             "warn"
         );
         let burst = smallclaims::sqlite::ReaderUsage {
@@ -15352,7 +15789,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             opened: 300,
         };
         assert_eq!(
-            reader_memory_check(burst, 2048, 128, groups(Some(1 << 30), 0)).status,
+            reader_memory_check(burst, 2048, 128, 32, groups(Some(1 << 30), 0)).status,
             "warn"
         );
     }
@@ -22812,6 +23249,63 @@ mission "wake" state="ready" {
     }
 
     #[test]
+    fn agent_roster_refresh_publishes_an_empty_or_small_roster_at_once() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let _wake = store.start_agent_roster_refresher().unwrap();
+        for history in [false, true] {
+            refresh_agent_roster(store, history).unwrap();
+            let (cut, cards, _) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
+            assert_eq!((cut, cards.len()), (store.index().unwrap(), 0), "history {history}");
+        }
+        store.append_claim(&ClaimInput {
+            subject: "agent/small-roster".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":"small",
+                "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        for history in [false, true] {
+            refresh_agent_roster(store, history).unwrap();
+            let (_, cards, _) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
+            assert_eq!(cards.len(), 1, "history {history}");
+        }
+    }
+
+    #[test]
+    fn agent_roster_refresh_never_folds_more_than_a_chunk_in_one_call() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let add = |agents: std::ops::Range<usize>| for n in agents {
+            store.append_claim(&ClaimInput {
+                subject: format!("agent/bound-{n:04}"), kind: "runtime.observed".into(),
+                actor: None, fields: serde_json::from_value(json!({"status":"running",
+                    "runtime_id":format!("bound-{n}"), "incarnation_id":"one"})).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        let _wake = store.start_agent_roster_refresher().unwrap();
+        // Cold: nothing to start from.
+        add(0..600);
+        refresh_agent_roster(store, false).unwrap();
+        let (_, cards, _) = store.published_agent_roster(store.index().unwrap(), false).unwrap();
+        assert_eq!(cards.len(), 600);
+        // More changed and missing cards than one fold may take.
+        add(600..900);
+        refresh_agent_roster(store, false).unwrap();
+        let (cut, cards, _) = store.published_agent_roster(store.index().unwrap(), false).unwrap();
+        assert_eq!((cut, cards.len()), (store.index().unwrap(), 900));
+        assert!(store.agent_resources_largest_fold_for_test() <= AGENT_ROSTER_WARM_CHUNK,
+            "one call folded {} cards", store.agent_resources_largest_fold_for_test());
+        // A few changes complete in one short fold.
+        add(900..910);
+        refresh_agent_roster(store, false).unwrap();
+        assert_eq!(store.published_agent_roster(store.index().unwrap(), false).unwrap().1.len(), 910);
+        assert!(store.agent_resources_largest_fold_for_test() <= AGENT_ROSTER_WARM_CHUNK);
+    }
+
+    #[test]
     #[ignore = "focused roster timing fixture; run explicitly with --ignored --nocapture"]
     fn agent_roster_snapshot_fixture_timing() {
         let root = tempfile::tempdir().unwrap();
@@ -23310,6 +23804,46 @@ mission "agent-health" state="ready" {
         let resources =
             client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
         assert_eq!(resources[0]["state"], "running");
+
+        let healthy_cut = store.index().unwrap();
+        let harness = |driver: &str, incarnation: &str, key: &str| {
+            store.append_claim(&ClaimInput {
+                subject: subject.clone(), kind: "harness.observed".into(), actor: Some(subject.clone()),
+                fields: serde_json::from_value(json!({"state":"ready","driver":driver,"incarnation_id":incarnation})).unwrap(),
+                evidence: vec![], expected_subject: None, idempotency_key: Some(key.into()),
+            }).unwrap();
+        };
+        harness("claude", "incarnation-1", "agent-health-foreign-provider");
+        let resources = client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["driver"], "codex");
+        assert_eq!(resources[0]["state"], "starting");
+        assert!(resources[0]["harness_state"].is_null(), "wrong-provider readiness must not survive the cached card");
+        assert_eq!(resources[0]["queued_work_count"], 1);
+        harness("codex", "incarnation-1", "agent-health-native-provider-restored");
+        let fault = crate::model::AttentionRequest {
+            reviewer: "person/test".into(), title: "Mailbox unavailable".into(), reason: "The current mailbox lost delivery custody.".into(),
+            severity: "error".into(), targets: vec![subject.clone()], actor: "daemon/runtime".into(), idempotency_key: "agent-health-mailbox-loss".into(),
+        };
+        let episode = "attention/agent-health-mailbox";
+        let recorded = store.record_runtime_failure(episode, &fault, "mailbox-channel-lost").unwrap();
+        let repeated = store.record_runtime_failure(episode, &fault, "mailbox-channel-lost").unwrap();
+        assert_eq!(recorded.request, repeated.request);
+        let resources = client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["state"], "waiting");
+        assert_eq!(resources[0]["harness_state"], "indeterminate");
+        assert_eq!(resources[0]["blocked_on"], "channel");
+        assert_eq!(resources[0]["fault"], fault.reason);
+        harness("codex", "incarnation-1", "agent-health-superficial-ready");
+        let resources = client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["state"], "waiting", "ready alone cannot clear a mailbox fault");
+        let historic = client_agent_resources(&store, false, "snapshot", healthy_cut).unwrap();
+        assert_eq!(historic[0]["state"], "running");
+        assert!(historic[0]["fault"].is_null(), "the historical cut must not observe a later fault");
+        store.recover_operational_failure(episode, "authenticated replay control", "agent-health-repaired").unwrap();
+        let resources = client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["state"], "running");
+        assert!(resources[0]["fault"].is_null());
+        assert_eq!(resources[0]["next_work_id"], queued);
 
         store
             .append_claim(&ClaimInput {

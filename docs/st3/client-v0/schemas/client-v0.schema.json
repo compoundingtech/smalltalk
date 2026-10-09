@@ -91,7 +91,8 @@
         "host_id": { "$ref": "#/$defs/HostId" },
         "store_index": { "type": "integer", "minimum": 0 },
         "projection_version": { "const": "client-projection.v0" },
-        "created_at": { "$ref": "#/$defs/Timestamp" }
+        "created_at": { "$ref": "#/$defs/Timestamp" },
+        "published_at": { "$ref": "#/$defs/Timestamp", "description": "For rows a background refresher prepared, such as the agents roster: when it published them. They reflect `store_index`, and local activity up to this time." }
       }
     },
     "CanonicalNode": {
@@ -1596,7 +1597,17 @@
             "needs_you": { "type": "integer", "minimum": 0 },
             "working_agents": { "type": "integer", "minimum": 0 },
             "active_missions": { "type": "integer", "minimum": 0 },
-            "machines": { "$ref": "#/$defs/SummaryMachines" }
+            "machines": { "$ref": "#/$defs/SummaryMachines" },
+            "agents_as_of": {
+              "description": "The published agents roster the agent counts came from, when a background refresher prepares it: its graph cut and when it was published. Absent when the counts come from this snapshot itself.",
+              "type": "object",
+              "required": ["store_index", "published_at"],
+              "additionalProperties": false,
+              "properties": {
+                "store_index": { "type": "integer", "minimum": 0 },
+                "published_at": { "$ref": "#/$defs/Timestamp" }
+              }
+            }
           }
         }
       ],
