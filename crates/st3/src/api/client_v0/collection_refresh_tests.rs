@@ -94,22 +94,27 @@ impl Fixture {
     }
 
     async fn frame(&mut self) -> Value {
-        let message = tokio::time::timeout(Duration::from_secs(10), self.socket.next())
-            .await
-            .expect("a collection frame")
-            .unwrap()
-            .unwrap();
-        serde_json::from_str(message.to_text().unwrap()).unwrap()
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(10), self.socket.next())
+                .await
+                .expect("a collection frame")
+                .unwrap()
+                .unwrap();
+            // Protocol pings carry no frame.
+            if let Message::Text(text) = message {
+                return serde_json::from_str(&text).unwrap();
+            }
+        }
     }
 
     /// No frame arrives for longer than a paced reread can take.
     async fn quiet(&mut self) {
-        let waited = tokio::time::timeout(
-            COLLECTION_REREAD_INTERVAL + Duration::from_millis(500),
-            self.socket.next(),
-        )
-        .await;
-        assert!(waited.is_err(), "unexpected frame: {waited:?}");
+        let until = tokio::time::Instant::now() + COLLECTION_REREAD_INTERVAL + Duration::from_millis(500);
+        while let Ok(message) = tokio::time::timeout_at(until, self.socket.next()).await {
+            if let Message::Text(text) = message.unwrap().unwrap() {
+                panic!("unexpected frame: {text}");
+            }
+        }
     }
 
     fn counts(&self) -> BTreeMap<String, usize> {
@@ -308,8 +313,10 @@ async fn settle(fixture: &mut Fixture, held: &mut BTreeMap<String, Held>) {
             fixture.socket.next()).await
         {
             Ok(message) => {
-                let message = message.unwrap().unwrap();
-                apply(held, &serde_json::from_str(message.to_text().unwrap()).unwrap());
+                // Protocol pings carry no frame.
+                if let Message::Text(text) = message.unwrap().unwrap() {
+                    apply(held, &serde_json::from_str(&text).unwrap());
+                }
             }
             Err(_) => {
                 let index = fixture.state.store.index().unwrap();

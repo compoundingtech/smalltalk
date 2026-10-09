@@ -1391,8 +1391,11 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
         if refresh.is_empty() {
             continue;
         }
-        // Rereads are paced together: reading any due window starts the next interval.
-        if refresh.iter().any(|id| reread_due.contains(id)) {
+        // Rereads are paced together: reading any due window, or every held window (as a lone
+        // new subscription does), starts the next interval.
+        let legacy_windows = subscriptions.values().filter(|s| s.ivm.is_none()).count();
+        let refreshed_legacy = refresh.iter().filter(|id| subscriptions.get(*id).is_some_and(|s| s.ivm.is_none())).count();
+        if refresh.iter().any(|id| reread_due.contains(id)) || legacy_windows > 0 && refreshed_legacy == legacy_windows {
             last_reread = tokio::time::Instant::now();
         }
         reread_due.retain(|id| !refresh.contains(id));
