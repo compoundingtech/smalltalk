@@ -14,6 +14,8 @@ mod summary;
 
 #[cfg(test)]
 mod stream_start_tests;
+#[cfg(test)]
+mod agents_window_tests;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -463,15 +465,15 @@ async fn collection_items_with_windows(
                             client_attention_resources_at(&store, person.as_deref(), false, now)?
                         }
                         "agents" => {
-                            // Unfiltered windows keep one row past the limit for `has_more`.
+                            // Published cards already exist; a cold unfiltered window folds
+                            // only its visible cards and gets has_more from shallow membership.
                             let keep = if status.is_none() { limit + 1 } else { usize::MAX };
                             match &cached_agents {
                                 Some(cards) => cards.iter().take(keep).cloned().collect(),
-                                None => {
-                                    let mut cards = client_agent_resources_cached(&store, false, index)?;
-                                    cards.truncate(keep);
-                                    cards
+                                None if status.is_none() => {
+                                    return client_agent_window_cards(&store, index, limit);
                                 }
+                                None => client_agent_resources_cached(&store, false, index)?,
                             }
                         }
                         "work" => client_work_resources(
@@ -519,7 +521,7 @@ async fn collection_items_with_windows(
                     if let Some(status) = &status {
                         items.retain(|item| item["state"].as_str() == Some(status.as_str()));
                     }
-                    has_more = items.len() > limit;
+                    has_more |= items.len() > limit;
                     items.truncate(limit);
                 }
                 Ok(Ok(Some((snapshot, items, has_more))))
@@ -543,6 +545,17 @@ async fn collection_items_with_windows(
         items.truncate(end);
     }
     Ok((snapshot, items, has_more))
+}
+
+/// Membership and display order come from the existing shallow page refs. The next
+/// reference proves `has_more` without folding an invisible card.
+fn client_agent_window_cards(store: &Store, index: u64, limit: usize) -> anyhow::Result<(Vec<Value>, bool)> {
+    let refs = client_agent_page_refs(store, false, index)?;
+    let has_more = refs.len() > limit;
+    let selected = refs.iter().take(limit)
+        .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    Ok((client_agent_cards_selected(store, false, index, &selected, true)?, has_more))
 }
 
 fn collection_window_label(collection: &str) -> &'static str {

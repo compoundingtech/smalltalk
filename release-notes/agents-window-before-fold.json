@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Fold only the visible agents collection cards on cold reads",
+  "replay": {
+    "status": "none",
+    "detail": "Existing claims and reducers remain authoritative. Cold unfiltered collection reads reuse ordered page references and fold only the requested prefix. No replay is needed."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, claim kinds or stored formats change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Authorization, ownership and admission rules are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Snapshot rows, display order, has-more behavior and existing HTTP cursors are unchanged. Status-filtered windows still filter the complete live-overlay result. Partial windows inherit their projection's queue lease deadline."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "The read-path change requires no migration or coordinated shutdown."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "The immutable projection entries remain rebuildable from the store with the existing snapshot, local-frontier, coverage and queue-expiry fences."
+  }
+}
