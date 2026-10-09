@@ -20,11 +20,12 @@ const source = vi.hoisted(() => ({
   conversation: vi.fn(),
   conversationSync: vi.fn(),
   feedInterest: vi.fn(),
+  retryConversation: vi.fn(),
 }))
 vi.mock('../data/react.tsx', () => ({
   useConversation: (ref: string) => { source.conversation(ref); return source.feed },
   useConversationSync: (ref: string) => { source.conversationSync(ref); return source.sync },
-  useDataSource: () => ({ conversationInterest: undefined }),
+  useDataSource: () => ({ conversationInterest: undefined, retryConversation: source.retryConversation }),
   useFeedInterest: source.feedInterest,
   useNow: () => 1000,
 }))
@@ -186,12 +187,8 @@ describe('ConversationPane kit composition', () => {
   })
 })
 
-/**
- * Pending the fractal-ui unavailable-state change (kit Transcript unavailable branch: omit its
- * SyncLine and render the host's onRetrySync as one recovery action). Flip to `it` when it lands.
- */
-describe('pending kit change: single unavailable state', () => {
-  it.skip('does not repeat the failure in a header sync line while the pane shows the unavailable state', () => {
+describe('single unavailable state', () => {
+  it('does not repeat the failure in a header sync line while the pane shows the unavailable state', () => {
     source.feed = { _tag: 'Unavailable', reason: 'failed', detail: 'diagnostic', code: 'not-found' }
     source.sync = { status: { _tag: 'Failed', cause: { _tag: 'Server', code: 'not-found', message: 'diagnostic' } }, observedAt: 500 }
     const html = render()
@@ -200,7 +197,7 @@ describe('pending kit change: single unavailable state', () => {
     expect(html).toContain('Conversation not found')
   })
 
-  it.skip('offers one recovery action in the unavailable body and no second error surface', () => {
+  it('offers one recovery action in the unavailable body and no second error surface', () => {
     source.feed = { _tag: 'Unavailable', reason: 'failed', detail: 'diagnostic', code: 'not-found' }
     source.sync = { status: { _tag: 'Failed', cause: { _tag: 'Server', code: 'not-found', message: 'diagnostic' } }, observedAt: 500 }
     const html = render()

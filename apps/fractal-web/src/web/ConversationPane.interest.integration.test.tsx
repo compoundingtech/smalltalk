@@ -344,9 +344,9 @@ describe('ConversationPane conversation demand', () => {
     expect(paneText()).toContain('Conversation not found')
     expect(container.innerHTML).not.toContain(sentinel)
     expect(container.innerHTML).not.toContain('Unknown')
-    // The kit renders the host's onRetrySync; today in its sync line, after the kit change as 'Try again'.
+    expect(container.querySelector('[data-testid="sync-line"]')).toBeNull()
     const recovery = [...container.querySelectorAll<HTMLButtonElement>('[data-testid="transcript-unavailable"] button')]
-      .filter(button => button.getAttribute('aria-label') === 'Retry loading conversation' || button.textContent === 'Try again')
+      .filter(button => button.textContent === 'Try again')
     expect(recovery).toHaveLength(1)
     expect(recovery[0]!.disabled).toBe(false)
     flushSync(() => recovery[0]!.click())

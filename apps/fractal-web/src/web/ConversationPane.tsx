@@ -41,9 +41,13 @@ export const ConversationPane = ({
       now={now}
       observedAt={transcriptObservedAt(observation, now)}
       onOpenTool={onOpenTool}
-      onRetrySync={retryConversation === undefined ? undefined : () => retryConversation(agentRef)}
+      onRetrySync={state._tag === 'Unavailable' || retryConversation === undefined ? undefined : () => retryConversation(agentRef)}
       onLoadImage={(src) => { const url = openableImageUrl(src); if (url !== undefined) window.open(url, '_blank', 'noopener,noreferrer') }}
-      {...(state._tag === 'Unavailable' ? { availability: state.availability } : {})}
+      {...(state._tag === 'Unavailable' ? { availability: {
+        ...state.availability,
+        // Preserve the follow-retry policy; the unavailable body owns its single recovery action.
+        ...(retryConversation === undefined ? {} : { action: { label: 'Try again', onPress: () => retryConversation(agentRef) } }),
+      } } : {})}
       {...(state._tag === 'Observed' && state.history._tag === 'HasOlder' ? { history: state.history } : {})}
       {...(state._tag === 'Observed' && state.emptyState !== undefined ? { emptyState: state.emptyState } : {})}
     />
