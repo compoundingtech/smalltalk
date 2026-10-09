@@ -1253,7 +1253,8 @@ The client-facing carrier remains a forwarder to `st3-client.sock`, never `st3.s
 Errors have `error_version: st3.client.error.v0`, a stable kebab-case code, safe message,
 `retryable`, structured details, and optional `retry_after_ms`. Required v0 codes are `not-found`,
 `forbidden`, `unsupported-capability`, `validation-failed`, `idempotency-conflict`, `stale-fence`,
-`cursor-gap`, `page-cursor-expired`, `rate-limited`, `runtime-not-local`,
+`cursor-gap`, `page-cursor-expired`, `projection-detail-too-large`,
+`projection-detail-invalid-source`, `rate-limited`, `runtime-not-local`,
 `runtime-authority-indeterminate`, `remote-unavailable`, `terminal-unavailable`, `terminal-ended`,
 and `internal`.
 
