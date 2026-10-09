@@ -61,9 +61,19 @@ pub(super) async fn bind(
         }
         if let Some(bound) =
             authority::with_argv_channel(&bind_state, &request, &peer, |member, validate| {
-                bind_state
+                let admitted = bind_state
                     .store
-                    .bind_argv_mailbox_checked(&request, member, validate)
+                    .bind_argv_mailbox_checked(&request, member, validate);
+                startup::reclassify_native_startup(&bind_state.store, &request, admitted, || {
+                    validate().is_ok()
+                        && startup::live_native_incarnation(
+                            &bind_state.store,
+                            &bind_state.node,
+                            &bind_state.pty_root,
+                            &peer,
+                            &request,
+                        )
+                })
             })?
         {
             return Ok(bound);

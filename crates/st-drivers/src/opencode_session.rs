@@ -413,7 +413,13 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
     let mut next_seed_attempt = Instant::now();
     let mut next_gate_attempt = Instant::now();
     let mut next_presence = Instant::now();
-    let mut next_observation = Instant::now();
+    // Concurrent launches must not refresh their evidence at the same writer phase.
+    // Each heartbeat is a new source reading; only its initial phase varies, within the
+    // existing refresh interval. Publication remains one attempt with no replay or wait.
+    let phase = Sha256::digest(session.adoption.session.as_bytes());
+    let phase_ms = u64::from_be_bytes(phase[..8].try_into().expect("SHA-256 has eight bytes"))
+        % harness_state::HARNESS_STATE_REFRESH.as_millis() as u64;
+    let mut next_observation = Instant::now() + Duration::from_millis(phase_ms);
     let mut next_inbox = Instant::now();
     // The context producer's own handle on the server: `Client` is a port and a password, and a
     // separate one keeps its pull from borrowing the session while the producer is borrowed

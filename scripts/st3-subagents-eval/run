@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -319,7 +320,10 @@ def old_settings_capture(node, seat, checks):
     # The hook must have recorded idle locally. Current publication gets one attempt per
     # source revision; a dropped Stop sample is replaced by the provider's fresh heartbeat
     # (30 s), rather than replayed. Wait for that publication as the other controls do.
-    local_state = json.loads((ledger_path.parent / "harness-state").read_text())
+    with sqlite3.connect(ledger_path.parent / "st-harness-events.sqlite") as connection:
+        raw = connection.execute("SELECT body FROM snapshots WHERE kind='harness-state'").fetchone()
+    expect(raw is not None, "old-settings hook never recorded local state")
+    local_state = json.loads(raw[0])
     expect(local_state.get("state") == "idle", f"old-settings local state: {local_state}")
     parent = None
     def idle_parent():

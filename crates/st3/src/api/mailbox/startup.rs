@@ -365,159 +365,244 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    struct ArgvStats {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        task: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ArgvStats {
+        fn start(root: &std::path::Path) -> Self {
+            use std::io::{Read as _, Write as _};
+            use std::sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            };
+            let listener =
+                std::os::unix::net::UnixListener::bind(root.join("eval.worker.sock")).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = stop.clone();
+            let pid = std::process::id();
+            let body = json!({"name":"eval.worker", "createdAt":"launch-time", "uptimeSeconds":1,
+                "daemon":{"pid":pid,"resources":null},
+                "process":{"alive":true,"pid":pid,"exitCode":null,"resources":null},
+                "terminal":{"cols":80,"rows":24,"cursorX":0,"cursorY":0,
+                    "scrollbackUsed":0,"scrollbackCapacity":100},
+                "clients":{"total":0,"attached":0,"readOnly":0},
+                "modes":{"sgrMouse":false,"cursorHidden":false,"kittyKeyboard":false,"kittyKeyboardFlags":[]}
+            }).to_string();
+            let task = std::thread::spawn(move || {
+                while !stopped.load(Ordering::Acquire) {
+                    if let Ok((mut socket, _)) = listener.accept() {
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        let mut request = [0; 128];
+                        if socket.read(&mut request).is_ok() {
+                            let _ = socket
+                                .write_all(&pty_core::protocol::encode_status_response(&body));
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            });
+            Self {
+                stop,
+                task: Some(task),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ArgvStats {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            self.task.take().unwrap().join().unwrap();
+        }
+    }
+
     #[tokio::test]
     #[cfg(target_os = "linux")]
     async fn linux_bind_route_waits_for_the_exact_launch_and_preserves_refusals() {
         use st_drivers::{harness_events, harness_state};
-        for case in [
-            "pending",
-            "admitted",
-            "foreign-birth",
-            "ended",
-            "exited",
-            "other-running",
-            "generation-mismatch",
-            "provider-ended",
-            "past-token",
-        ] {
-            let root = tempfile::tempdir().unwrap();
-            let (state, mut peer, mut fence, mut metadata) = bootstrap_fixture(root.path());
-            // Ordinary Linux admission inventories the registry's daemon PID file as well
-            // as metadata. The point-proof helper alone does not need that inventory.
-            fs::write(
-                state.pty_root.join("eval.worker.pid"),
-                std::process::id().to_string(),
-            )
-            .unwrap();
-
-            let agent_dir = crate::hooks::claude_agent_dir(
-                &state.state_dir.join("drivers"),
-                &fence.subject,
-                &state.node,
-            );
-            harness_events::enable(&agent_dir, &fence.incarnation).unwrap();
-            let sequence =
-                harness_state::claim(&agent_dir, "eval.worker", "opencode", "provider").unwrap();
-            harness_state::Writer::new(
-                &agent_dir,
-                "eval.worker",
-                "opencode",
-                Some("eval.worker".into()),
-            )
-            .with_ownership("provider", sequence)
-            .observe(harness_state::Observation::new(
-                harness_state::Activity::Idle,
-                harness_state::BlockedOn::None,
-                harness_state::InputBuffer::Empty,
-            ))
-            .unwrap();
-            let claim = |kind: &str, fields: Value| crate::model::ClaimInput {
-                subject: fence.subject.clone(),
-                kind: kind.into(),
-                actor: None,
-                fields: serde_json::from_value(fields).unwrap(),
-                evidence: vec![],
-                expected_subject: None,
-                idempotency_key: None,
-            };
-            match case {
-                "foreign-birth" => {
-                    peer.start_token = peer.start_token.map(|token| token.wrapping_add(1))
+        for argv in [false, true] {
+            for case in [
+                "pending",
+                "admitted",
+                "foreign-birth",
+                "foreign-subject",
+                "ended",
+                "exited",
+                "other-running",
+                "generation-mismatch",
+                "provider-ended",
+                "past-token",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                if argv && case == "provider-ended" {
+                    continue;
                 }
-                "ended" => {
+                let (state, mut peer, mut fence, mut metadata) = bootstrap_fixture(root.path());
+                let _stats = if argv {
+                    let intent = crate::graph::parse_intent(
+                    "version 2\nagent \"eval.worker\" { workspace \"/tmp\"; argv \"fixture\"; }", "node",
+                ).unwrap();
                     state
                         .store
-                        .append_claim(&claim(
-                            "harness.observed",
-                            json!({"state":"ended","incarnation_id":fence.incarnation}),
-                        ))
+                        .apply_internal(&intent, "argv-bind-route-fixture")
                         .unwrap();
-                }
-                "exited" => {
-                    state.store.append_claim(&claim("runtime.observed",
+                    peer.transport = "omp-channel";
+                    Some(ArgvStats::start(&state.pty_root))
+                } else {
+                    None
+                };
+                // Ordinary Linux admission inventories the registry's daemon PID file as well
+                // as metadata. The point-proof helper alone does not need that inventory.
+                fs::write(
+                    state.pty_root.join("eval.worker.pid"),
+                    std::process::id().to_string(),
+                )
+                .unwrap();
+
+                let agent_dir = crate::hooks::claude_agent_dir(
+                    &state.state_dir.join("drivers"),
+                    &fence.subject,
+                    &state.node,
+                );
+                harness_events::enable(&agent_dir, &fence.incarnation).unwrap();
+                let sequence =
+                    harness_state::claim(&agent_dir, "eval.worker", "opencode", "provider")
+                        .unwrap();
+                harness_state::Writer::new(
+                    &agent_dir,
+                    "eval.worker",
+                    "opencode",
+                    Some("eval.worker".into()),
+                )
+                .with_ownership("provider", sequence)
+                .observe(harness_state::Observation::new(
+                    harness_state::Activity::Idle,
+                    harness_state::BlockedOn::None,
+                    harness_state::InputBuffer::Empty,
+                ))
+                .unwrap();
+                let claim = |kind: &str, fields: Value| crate::model::ClaimInput {
+                    subject: fence.subject.clone(),
+                    kind: kind.into(),
+                    actor: None,
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                };
+                match case {
+                    "foreign-birth" => {
+                        peer.start_token = peer.start_token.map(|token| token.wrapping_add(1))
+                    }
+                    "foreign-subject" => peer.agent = "agent/foreign".into(),
+                    "ended" => {
+                        state
+                            .store
+                            .append_claim(&claim(
+                                "harness.observed",
+                                json!({"state":"ended","incarnation_id":fence.incarnation}),
+                            ))
+                            .unwrap();
+                    }
+                    "exited" => {
+                        state.store.append_claim(&claim("runtime.observed",
                     json!({"status":"exited","runtime_id":"eval.worker","incarnation_id":fence.incarnation}))).unwrap();
+                    }
+                    "admitted" => crate::mailbox::tests::ready(&state.store, &fence.incarnation),
+                    "other-running" => {
+                        crate::mailbox::tests::ready(&state.store, "another-incarnation")
+                    }
+                    "generation-mismatch" => {
+                        metadata["createdAt"] = json!("another-launch-generation");
+                        fs::write(
+                            state.pty_root.join("eval.worker.json"),
+                            metadata.to_string(),
+                        )
+                        .unwrap();
+                    }
+                    "provider-ended" => {
+                        let mut raw: Value = serde_json::from_slice(
+                            &harness_events::read_runtime_state(&agent_dir, &fence.incarnation)
+                                .unwrap()
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        raw["state"] = json!("ended");
+                        raw["exit"] = json!("exit 0");
+                        raw["reason"] = Value::Null;
+                        harness_events::write_snapshot(
+                            &agent_dir,
+                            "harness-state",
+                            &serde_json::to_vec(&raw).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "past-token" => {
+                        crate::mailbox::tests::ready(&state.store, &fence.incarnation);
+                        fence = super::super::bind(
+                            State(state.clone()),
+                            Some(Extension(peer.clone())),
+                            Json(fence.clone()),
+                        )
+                        .await
+                        .unwrap()
+                        .0;
+                        let successor = Fence::new(&fence.subject, &fence.incarnation, "delivery");
+                        // The same live provider may reconnect, but a fresh token cannot
+                        // make the already-bound predecessor regain its capability.
+                        state.store.bind_mailbox(&successor).unwrap();
+                    }
+                    _ => {}
                 }
-                "admitted" => crate::mailbox::tests::ready(&state.store, &fence.incarnation),
-                "other-running" => {
-                    crate::mailbox::tests::ready(&state.store, "another-incarnation")
+                let before = state.store.index().unwrap();
+                let routed =
+                    super::super::bind(State(state.clone()), Some(Extension(peer)), Json(fence))
+                        .await;
+                if case == "admitted" {
+                    assert!(routed.unwrap().0.epoch > 0);
+                    assert_eq!(state.store.index().unwrap(), before);
+                    continue;
                 }
-                "generation-mismatch" => {
-                    metadata["createdAt"] = json!("another-launch-generation");
-                    fs::write(
-                        state.pty_root.join("eval.worker.json"),
-                        metadata.to_string(),
-                    )
-                    .unwrap();
-                }
-                "provider-ended" => {
-                    let mut raw: Value = serde_json::from_slice(
-                        &harness_events::read_runtime_state(&agent_dir, &fence.incarnation)
-                            .unwrap()
-                            .unwrap(),
-                    )
-                    .unwrap();
-                    raw["state"] = json!("ended");
-                    raw["exit"] = json!("exit 0");
-                    raw["reason"] = Value::Null;
-                    harness_events::write_snapshot(
-                        &agent_dir,
-                        "harness-state",
-                        &serde_json::to_vec(&raw).unwrap(),
-                    )
-                    .unwrap();
-                }
-                "past-token" => {
-                    crate::mailbox::tests::ready(&state.store, &fence.incarnation);
-                    fence = super::super::bind(
-                        State(state.clone()),
-                        Some(Extension(peer.clone())),
-                        Json(fence.clone()),
-                    )
-                    .await
-                    .unwrap()
-                    .0;
-                    let successor = Fence::new(&fence.subject, &fence.incarnation, "delivery");
-                    // The same live provider may reconnect, but a fresh token cannot
-                    // make the already-bound predecessor regain its capability.
-                    state.store.bind_mailbox(&successor).unwrap();
-                }
-                _ => {}
-            }
-            let before = state.store.index().unwrap();
-            let routed =
-                super::super::bind(State(state.clone()), Some(Extension(peer)), Json(fence)).await;
-            if case == "admitted" {
-                assert!(routed.unwrap().0.epoch > 0);
-                assert_eq!(state.store.index().unwrap(), before);
-                continue;
-            }
-            let error = routed.err().unwrap();
-            let expected = match case {
-                "pending" => "mailbox-session-starting",
-                "generation-mismatch" => "mailbox-authority-unavailable",
-                _ => "stale-mailbox-session",
-            };
-            assert_eq!(error.code, expected, "{case}: {}", error.message);
-            assert_eq!(
-                state.store.index().unwrap(),
-                before,
-                "{case} wrote graph facts"
-            );
-            if case != "past-token" {
-                let connection = state.store.readers.get();
-                for table in [
-                    "local_mailbox_owners",
-                    "local_mailbox_leases",
-                    "local_mailbox_bindings",
-                ] {
-                    assert_eq!(
-                        connection
-                            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
-                                .get::<_, u64>(0))
-                            .unwrap(),
-                        0,
-                        "{case} allocated {table}"
-                    );
+                let error = routed.err().unwrap();
+                let expected = match case {
+                    "pending" => "mailbox-session-starting",
+                    "foreign-subject" => "foreign-mailbox",
+                    "generation-mismatch" => "mailbox-authority-unavailable",
+                    _ => "stale-mailbox-session",
+                };
+                assert_eq!(error.code, expected, "{case}: {}", error.message);
+                assert_eq!(
+                    state.store.index().unwrap(),
+                    before,
+                    "{case} wrote graph facts"
+                );
+                if case != "past-token" {
+                    let connection = state.store.readers.get();
+                    for table in [
+                        "local_mailbox_owners",
+                        "local_mailbox_leases",
+                        "local_mailbox_bindings",
+                        "local_mailbox_argv_bindings",
+                    ] {
+                        assert_eq!(
+                            connection
+                                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                                    .get::<_, u64>(
+                                    0
+                                ))
+                                .unwrap(),
+                            0,
+                            "{case} allocated {table}"
+                        );
+                    }
                 }
             }
         }

@@ -102,7 +102,16 @@ def status_line():
 def turn(prompt, answer):
     hooks("UserPromptSubmit", {"prompt": prompt, "permission_mode": "default"})
     append("user", prompt)
-    time.sleep(1.5)
+    if "reply-token:native-seat" in prompt:
+        # Keep the fixture's working interval observable until the client has read it.
+        # Current samples get one attempt; a fresh wrapper heartbeat can replace a drop.
+        deadline = time.monotonic() + 45
+        while not (Path.cwd() / "working-observed").exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("the client never observed this working interval")
+            time.sleep(0.1)
+    else:
+        time.sleep(1.5)
     append("assistant", answer)
     hooks("Stop", {"stop_hook_active": False, "last_assistant_message": answer})
 

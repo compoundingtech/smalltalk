@@ -214,6 +214,8 @@ agent "native-seat" {{
             card = node.api("/v1/client/agents/" + urllib.parse.quote(SUBJECT, safe="/")) or {}
             if card.get("observation") == "current":
                 observed_states.add(card.get("harness_state"))
+                if card.get("harness_state") == "working":
+                    (root / "ws/working-observed").touch()
             return card
         until(lambda: current_card().get("harness_state") == "idle", args.ready_seconds,
               "the current client card never showed idle")
@@ -253,7 +255,7 @@ agent "native-seat" {{
             return view if (view or {}).get("status") in ("read", "closed") else None
         checks["message_status"] = until(read, 90, f"{message} was never read")["status"]
         until(lambda: current_card().get("harness_state") == "idle" and {"working", "idle"} <= observed_states,
-              10, "current client cards never showed both working and idle during delivery")
+              45, "current client cards never showed both working and idle during delivery")
         checks["observed_states"] = sorted(state for state in observed_states if state)
         checks["durable_status_claims"] = len(claims(node, "harness.observed"))
         if checks["durable_status_claims"]:

@@ -18804,6 +18804,7 @@ struct NativeObservations {
     initial_wake: bool,
     latest_attempted: BTreeMap<String, String>,
     admission_diagnostic: Option<String>,
+    current_warning: Option<Instant>,
     current_publisher: Option<current_harness_publisher::Publisher>,
     durable_wake: bool,
     background_durable: bool,
@@ -18851,6 +18852,7 @@ impl NativeObservations {
             initial_wake: enabled,
             latest_attempted: BTreeMap::new(),
             admission_diagnostic: None,
+            current_warning: None,
             current_publisher: None,
             durable_wake: true,
             background_durable: false,
@@ -18949,6 +18951,7 @@ impl NativeObservations {
                 initial_wake: false,
                 latest_attempted: BTreeMap::new(),
                 admission_diagnostic: self.admission_diagnostic.clone(),
+                current_warning: None,
                 current_publisher: None,
                 durable_wake: false,
                 background_durable: false,
@@ -18972,6 +18975,14 @@ impl NativeObservations {
         }
         self.retry_pending |= self.durable_task.is_some();
         Ok(terminal)
+    }
+
+    fn note_current_drop(&mut self, subject: &str, reason: &str) {
+        let now = Instant::now();
+        if self.current_warning.is_none_or(|prior| now.duration_since(prior) >= Duration::from_secs(10)) {
+            let _ = write_driver_log(subject, reason);
+            self.current_warning = Some(now);
+        }
     }
 
     async fn publish_snapshots(
@@ -19040,7 +19051,7 @@ impl NativeObservations {
             snapshots.push((kind, raw, payload, expired));
         }
         // One budget for the entire wake. Canceled samples are dropped, not retried later.
-        let _ = tokio::time::timeout(st3::client::LATEST_VALUE_TIMEOUT, async {
+        let published = tokio::time::timeout(st3::client::LATEST_VALUE_TIMEOUT, async {
             for (kind, raw, payload, expired) in snapshots {
                 match kind {
                     "harness-state" => {
@@ -19063,7 +19074,7 @@ impl NativeObservations {
                             *ready = true;
                         }
                         if !claimed {
-                            let _ = publish_harness_activity(
+                            if let Err(error) = publish_harness_activity(
                                 &publisher,
                                 subject,
                                 driver,
@@ -19078,7 +19089,9 @@ impl NativeObservations {
                                 &observed,
                                 &mut None,
                             )
-                            .await;
+                            .await {
+                                self.note_current_drop(subject, &format!("current activity sample dropped: {error:#}"));
+                            }
                         }
                     }
                     "harness-context" => {
@@ -19128,6 +19141,9 @@ impl NativeObservations {
             Ok::<_, anyhow::Error>(())
         })
         .await;
+        if published.is_err() {
+            self.note_current_drop(subject, "current wake exceeded its 100 ms publication deadline; samples dropped");
+        }
         Ok(())
     }
 
@@ -19804,7 +19820,7 @@ async fn publish_harness_activity(
         return Ok(());
     }
     *last_fingerprint = Some(fingerprint.clone());
-    let _: Result<ClaimRecord> = client
+    let _: ClaimRecord = client
         .post(
             "/v1/claims",
             &ClaimInput {
@@ -19817,7 +19833,7 @@ async fn publish_harness_activity(
                 idempotency_key: Some(format!("native-activity:{subject}:{fingerprint}")),
             },
         )
-        .await;
+        .await?;
     *last_fingerprint = Some(fingerprint);
     Ok(())
 }
