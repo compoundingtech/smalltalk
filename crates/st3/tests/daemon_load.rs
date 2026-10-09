@@ -224,6 +224,7 @@ struct Report {
     fixture_legacy_reconstruction_ms: f64,
     #[serde(default)]
     store_open_ms: f64,
+    #[serde(default)]
     current_dropped: usize,
     paths: BTreeMap<String, PathReport>,
     failed: BTreeMap<String, usize>,
