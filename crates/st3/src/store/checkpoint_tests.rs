@@ -450,7 +450,7 @@ fn sealed_capture_rejects_invalid_times_even_when_another_claim_excludes_the_env
         )).unwrap();
         store.seal_local_batches().unwrap();
         {
-            let connection = store.writer.lock();
+            let connection = store.connection.write();
             connection.execute(
                 "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
                 params![malformed, broken.id],
@@ -485,7 +485,7 @@ fn sealed_capture_rejects_invalid_envelope_times_at_first_use() {
         json!({"state":"idle", "incarnation_id":"broken"}), "broken",
     )).unwrap();
     store.seal_local_batches().unwrap();
-    store.writer.lock().execute(
+    store.connection.write().execute(
         "UPDATE replica_envelopes SET accepted_at_unix_ms='not-a-time'", [],
     ).unwrap();
     assert!(store.checkpoint_sealed_set(150).is_err());
