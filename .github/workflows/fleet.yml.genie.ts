@@ -298,7 +298,10 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         // boot canary's evidence under target/boot-canaries.
         env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:1/2', CI_TEST_THREADS: '8' },
         extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
-        before: [nixDevelopStep({ name: 'Prove both shards cover every selected test', command: ['python3', 'scripts/ci-test-partitions'] })],
+        before: [
+          nixDevelopStep({ name: 'Prove both shards cover every selected test', command: ['python3', 'scripts/ci-test-partitions'] }),
+          nixDevelopStep({ name: 'Run eight doctor correctness controls without retries', command: ['python3', 'scripts/ci-doctor-correctness'] }),
+        ],
       }),
       needs: [pickRunnerJobId, 'linux-test-build'],
       if: "${{ !cancelled() }}",
