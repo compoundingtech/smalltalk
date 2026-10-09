@@ -925,8 +925,8 @@ async fn follow_conversation(
         }
         frame_limit = first_frame_limit;
         // With older history the client holds nothing before this frame's oldest entry. A
-        // revision of such an entry is left out of later deltas: it would arrive above a gap,
-        // and the client sees it when it pages back through `older_cursor`. "Before" is decided
+        // change there must refresh the frame and its history cursor, not insert a delta above
+        // a gap or leave the client paging an obsolete history snapshot. "Before" is decided
         // in the order the page itself was built in.
         let oldest = frame["items"].get(0).filter(|_| frame["has_more"] == true).cloned();
         let oldest_sent = match oldest {
@@ -955,12 +955,16 @@ async fn follow_conversation(
             .await
             {
                 Ok(mut changes) => {
-                    let mut items = match changes["items"].take() {
+                    let items = match changes["items"].take() {
                         Value::Array(items) => items,
                         _ => Vec::new(),
                     };
-                    if let Some((order, oldest)) = &oldest_sent {
-                        items.retain(|item| delta_follows_window(*order, item, oldest));
+                    if let Some((order, oldest)) = &oldest_sent
+                        && items.iter().any(|item| !delta_follows_window(*order, item, oldest))
+                    {
+                        // Both cached stored pages and native cursors pin a history snapshot.
+                        // Re-open at the same limit to pair fresh items with a fresh older_cursor.
+                        break;
                     }
                     if !items.is_empty() {
                         let frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":false, "items":items});
@@ -15854,6 +15858,13 @@ mission "example/zero-run" state="ready" {
             frame["older_cursor"].is_string(),
             "older_cursor accompanies has_more: {frame}"
         );
+        let items = history_from_frame(state, session_id, &frame).await;
+        (frame, items)
+    }
+
+    /// Page back from this exact frame, never from a freshly opened substitute.
+    async fn history_from_frame(state: &AppState, session_id: &str, frame: &Value) -> Vec<Value> {
+        let session = ClientSession::local(Some("person/example")).unwrap();
         let mut items = frame["items"].as_array().unwrap().clone();
         let mut cursor = frame["older_cursor"].as_str().map(str::to_owned);
         while let Some(active) = cursor {
@@ -15870,7 +15881,23 @@ mission "example/zero-run" state="ready" {
             items.splice(0..0, page["items"].as_array().unwrap().iter().cloned());
             cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
         }
-        (frame, items)
+        items
+    }
+
+    async fn next_replacement(
+        frames: &mut tokio::sync::mpsc::UnboundedReceiver<(String, u64, Value)>,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (_, _, frame) = frames.recv().await.expect("follower remains open");
+                if frame["replace"] == true {
+                    return frame;
+                }
+                assert_eq!(frame["replace"], false, "{frame}");
+            }
+        })
+        .await
+        .expect("an older revision must refresh the replacement frame and its history cursor")
     }
 
     #[tokio::test]
@@ -15985,7 +16012,7 @@ mission "example/zero-run" state="ready" {
         }
         assert!(full_items.len() > 20);
         let tail = full_items.len() - 20;
-        let (start, small) = conversation_open_local(&state, &session, &session_id, 20).unwrap();
+        let (_, small) = conversation_open_local(&state, &session, &session_id, 20).unwrap();
         assert_eq!(small["items"].as_array().unwrap(), &full_items[tail..]);
         assert_eq!(small["page"]["has_more"], true);
         assert_eq!(timeline_walk(&state, &session_id, 20), full_items.to_vec());
@@ -16053,28 +16080,21 @@ mission "example/zero-run" state="ready" {
         .await;
         assert!(full_delta.iter().any(|item| item["id"] == "timeline-entry/stored-30"
             && item["revision"] == 2), "control: the change feed carries the old revision");
-        let mut small_delta =
-            deltas_until(&mut small_frames, &["timeline-entry/stored-60", "timeline-entry/stored-55"])
-                .await;
-        assert!(small_delta.iter().any(|item| item["id"] == "timeline-entry/stored-55"
-            && item["revision"] == 2), "a revision the client holds arrives: {small_delta:?}");
-        // Include anything else the small follower sends shortly after.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        while let Ok((_, _, frame)) = small_frames.try_recv() {
-            assert_eq!(frame["replace"], false, "{frame}");
-            small_delta.extend(frame["items"].as_array().unwrap().iter().cloned());
-        }
-        assert!(
-            small_delta.iter().all(|item| item["id"] != "timeline-entry/stored-30"),
-            "a revision older than the small frame stays out of its deltas: {small_delta:?}"
-        );
+        let replacement = next_replacement(&mut small_frames).await;
+        assert_eq!(replacement["items"].as_array().unwrap().len(), 20);
+        assert_collection_frame_conforms(&replacement);
+        assert!(replacement["items"].as_array().unwrap().iter().any(|item|
+            item["id"] == "timeline-entry/stored-60"));
+        assert!(replacement["items"].as_array().unwrap().iter().any(|item|
+            item["id"] == "timeline-entry/stored-55" && item["revision"] == 2));
+        assert_ne!(replacement["older_cursor"], frame["older_cursor"],
+            "the replacement must provide a fresh history snapshot");
+        let refreshed_history = history_from_frame(&state, &session_id, &replacement).await;
+        assert!(refreshed_history.iter().any(|item| item["id"] == "timeline-entry/stored-30"
+            && item["revision"] == 2 && item["body"]["text"] == "stored 30 revised"),
+            "page back from the emitted replacement, not a fresh independent open");
         small_follower.abort();
         full_follower.abort();
-        // The client sees it by paging back through a fresh frame's older_cursor.
-        let (_, walked) = first_frame_and_older_history(&state, &session_id, None, Some(20)).await;
-        assert!(walked.iter().any(|item| item["id"] == "timeline-entry/stored-30"
-            && item["body"]["text"] == "stored 30 revised"));
-        let _ = start;
     }
 
     /// Stored pages sort by sequence alone. When observed timestamps run against the sequence,
@@ -16148,7 +16168,7 @@ mission "example/zero-run" state="ready" {
         // an older entry with a late one.
         claim("harness.timeline", entry(30, 1, "skewed 30"));
         claim("harness.timeline", entry(25, 2, "skewed 25 revised"));
-        claim("harness.timeline", entry(5, 2, "skewed 5 revised"));
+        // First check that a held revision stays a delta even with its early timestamp.
         async fn sent_until(
             frames: &mut tokio::sync::mpsc::UnboundedReceiver<(String, u64, Value)>,
             wanted: &[&str],
@@ -16168,10 +16188,10 @@ mission "example/zero-run" state="ready" {
             }
             items
         }
-        // Control: the change feed carries all three to a follower that holds everything.
+        // Control: the whole-window follower receives the append and held revision as deltas.
         sent_until(
             &mut full_frames,
-            &["timeline-entry/skewed-30", "timeline-entry/skewed-25", "timeline-entry/skewed-5"],
+            &["timeline-entry/skewed-30", "timeline-entry/skewed-25"],
         )
         .await;
         let small = sent_until(
@@ -16183,12 +16203,55 @@ mission "example/zero-run" state="ready" {
             small.iter().any(|item| item["id"] == "timeline-entry/skewed-25" && item["revision"] == 2),
             "a held entry's revision arrives despite its early timestamp: {small:?}"
         );
-        assert!(
-            small.iter().all(|item| item["id"] != "timeline-entry/skewed-5"),
-            "an older entry's revision stays out despite its late timestamp: {small:?}"
-        );
+        // Now revise the older entry with a late timestamp: it refreshes the frame's cursor,
+        // not an out-of-window delta. The projection's sequence order decides "older".
+        claim("harness.timeline", entry(5, 2, "skewed 5 revised"));
+        let replacement = next_replacement(&mut small_frames).await;
+        assert_eq!(replacement["items"].as_array().unwrap().len(), 10);
+        let history = history_from_frame(&state, &session_id, &replacement).await;
+        assert!(history.iter().any(|item|
+            item["id"] == "timeline-entry/skewed-5" && item["revision"] == 2));
         small_follower.abort();
         full_follower.abort();
+    }
+
+    #[tokio::test]
+    async fn native_first_frame_refreshes_history_after_an_older_message_arrives() {
+        let _guard = conversation_blocks::prepared_counter_guard();
+        let root = tempfile::tempdir().unwrap();
+        let (state, session_id, path) =
+            conversation_first_frame_fixture(root.path(), "first-frame-native-history", 60);
+        // Put native records after the later graph message in timestamp order, so the message
+        // lands before the frame. Native cursors pin the graph cut, as well as the transcript.
+        let transcript = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, transcript.replace("2026-10-08T12:00:00Z", "2099-10-08T12:00:00Z")).unwrap();
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let (sender, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        let follower = tokio::spawn(follow_conversation(
+            state.clone(), session, "chat".into(), 1, session_id.clone(), None, 20, sender,
+        ));
+        let (_, _, first) = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+            .await.unwrap().unwrap();
+        assert_eq!(first["replace"], true, "{first}");
+        assert_eq!(first["items"].as_array().unwrap().len(), 20);
+        state.store.append_claim(&ClaimInput {
+            subject: "message/native-older-history".into(),
+            kind: "message.sent".into(),
+            actor: Some("person/example".into()),
+            fields: serde_json::from_value(json!({
+                "from":"person/example", "to":"agent/first-frame-native-history",
+                "session_id":session_id, "status":"sent", "content":"older native history message",
+            })).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let replacement = next_replacement(&mut frames).await;
+        assert_eq!(replacement["items"].as_array().unwrap().len(), 20);
+        assert_collection_frame_conforms(&replacement);
+        assert_ne!(replacement["older_cursor"], first["older_cursor"]);
+        let history = history_from_frame(&state, &session_id, &replacement).await;
+        assert!(history.iter().any(|item|
+            item["body"]["text"] == "older native history message"));
+        follower.abort();
     }
 
     #[tokio::test]

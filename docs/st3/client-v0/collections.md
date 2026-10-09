@@ -126,8 +126,9 @@ carries `older_cursor`: pass it to `GET /v1/client/sessions/{id}/timeline?cursor
 entries just before the frame's oldest entry, then follow that response's `page.next_cursor`.
 A client that pages this way can ask for a small first frame, such as `"limit":20`. When a
 replacement frame has older history, later deltas carry only new entries and revisions of
-entries from that frame onward; a revision of an older entry shows up when the client pages
-back through `older_cursor`.
+entries from that frame onward. A change to an older entry sends a replacement frame instead,
+with the same requested limit and a fresh `older_cursor`. Page back from this new cursor to
+see the revision; the preceding frame's cursor still names its preceding history snapshot.
 
 An agent's conversation is its current session's timeline with the Smalltalk to or from the agent
 joined in. The first `conversation` frame carries `id`, `collection` (`conversation`),
