@@ -38,13 +38,14 @@ vi.mock('@stylexjs/stylex', () => {
 import { fixtureSource } from '../data/fixtureSource.ts'
 import { DataSourceProvider, useSubjectList } from '../data/react.tsx'
 import { fixtureProjections } from '../fixtures/projections.ts'
-import { createFolder, place, type FolderOp } from '../folders/core.mts'
+import type { ArrangementRefusal, SidebarOperation } from '../folders/edit.ts'
+import type { FolderState } from '../folders/client.ts'
 import { fixtureFolders } from '../folders/fixture.ts'
 import { SubjectAddress } from '../resources/contract.ts'
 import { dailyDriver } from './fixtures/layouts.ts'
 import { defaultFilters, fixtureSidebarState } from './sidebar/state.ts'
 import { createWindow, projectWorkspaces, reduceWindow, type WindowAction } from './workspaces.ts'
-import { AgentFolders } from './AgentFolders.tsx'
+import { AgentFolders, ArrangementEditFeedback } from './AgentFolders.tsx'
 import { WorkbenchContextProvider } from './context.tsx'
 
 const viewport = { width: 340, height: 800 }
@@ -73,9 +74,9 @@ Element.prototype.getBoundingClientRect = function (): DOMRect {
   return DOMRect.fromRect(viewport)
 }
 
-const folderOps = (refs: readonly string[]): readonly FolderOp[] => [
-  createFolder('product', 'Product', null, 'V', [1, 0, 'fixture']),
-  place(refs[0]!, 'product', 'W', [10, 0, 'fixture']),
+const folderOps = (refs: readonly string[]): readonly SidebarOperation[] => [
+  { op: 'folder.create', id: 'product', name: 'Product', parent: null, key: 'V' },
+  { op: 'subject.place', subject: refs[0]!, folder: 'product', key: 'W' },
 ]
 
 const FolderTree = ({ query }: { readonly query: string }) => {
@@ -179,4 +180,43 @@ describe('AgentFolders row styling', () => {
       tree.unmount()
     }
   })
+})
+
+it('discloses Known and Unknown edit refusals only beside affected folder or agent rows', () => {
+  const refusals: readonly ArrangementRefusal[] = [
+    { reason: { _tag: 'Known', code: 'arrangement-cycle' }, detail: 'The folder cannot contain itself.', targets: ['product', 'agent/example'] },
+    { reason: { _tag: 'Unknown' }, detail: 'No reason was returned.', targets: ['product'] },
+  ]
+  for (const refusal of refusals) {
+    const state: FolderState = {
+      doc: { folders: {}, placements: {} }, phase: 'fixture', refusal,
+      edit: async () => ({ _tag: 'Success' }),
+    }
+    const registry = AtomRegistry.make({ initialValues: [[fixtureFolders, state]] })
+    const source = fixtureSource({ world: fixtureProjections })
+    const container = document.createElement('div')
+    const root = createRoot(container)
+    try {
+      flushSync(() => root.render(
+        <DataSourceProvider source={source} registry={registry}>
+          <ArrangementEditFeedback target="product" />
+          <ArrangementEditFeedback target="agent/example" />
+          <ArrangementEditFeedback target="unaffected" />
+        </DataSourceProvider>,
+      ))
+      expect(container.querySelectorAll('[role="status"]')).toHaveLength(refusal.targets.length)
+      expect(container.textContent).toContain(refusal.reason._tag === 'Known'
+        ? 'A folder cannot contain itself; choose a different parent folder.' : 'The change was not saved.')
+      expect(container.textContent).not.toContain('Unknown')
+      expect(container.textContent).not.toContain('arrangement-cycle')
+      expect(container.textContent).not.toContain(refusal.detail)
+      for (const status of container.querySelectorAll('[role="status"]')) {
+        expect(status.getAttribute('data-wf-refusal-reason')).toBe(refusal.reason._tag)
+        expect(status.getAttribute('data-wf-refusal-code')).toBe(refusal.reason.code ?? null)
+      }
+    } finally {
+      flushSync(() => root.unmount())
+      registry.dispose()
+    }
+  }
 })

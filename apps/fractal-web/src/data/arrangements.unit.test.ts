@@ -6,6 +6,8 @@ import {
   inventoryItemBudget,
   inventoryPageLimit,
   readArrangementInventory,
+  reservedSidebarSubject,
+  sidebarCandidates,
   sidebarWinner,
   st3InventoryGateway,
   type ArrangementInventoryGateway,
@@ -346,10 +348,22 @@ describe('owner-wide arrangement inventory', () => {
 })
 
 describe('sidebarWinner', () => {
-  it('selects the lowest UUIDv7 among live arrangements named exactly "Sidebar"', () => {
-    expect(sidebarWinner([arrangement(3, 'Sidebar'), arrangement(1, 'Renamed'), arrangement(2, 'Sidebar')])?.id).toBe(arrangement(2).id)
-    expect(sidebarWinner([arrangement(0x10, 'Sidebar'), arrangement(0x9, 'Sidebar')])?.id).toBe(arrangement(0x9).id)
-    expect(sidebarWinner([arrangement(1, 'sidebar'), arrangement(2, 'Sidebar ')])).toBeUndefined()
-    expect(sidebarWinner([])).toBeUndefined()
+  it('keeps the live reserved subject as Sidebar identity after a native rename', () => {
+    const reserved = arrangement(1, 'Archive')
+    expect(sidebarWinner([arrangement(2, 'Sidebar'), reserved], owner)).toEqual(reserved)
+    expect(reservedSidebarSubject(owner)).toBe(reserved.id)
+    expect(sidebarWinner([arrangement(2, 'Sidebar')], owner)?.id).toBe(arrangement(2).id)
+  })
+
+  it('selects the lowest UUIDv7 among exact-name live person-owned legacy candidates', () => {
+    const candidates = [arrangement(0x10, 'Sidebar'), arrangement(9, 'Sidebar')]
+    const foreign = { ...arrangement(2, 'Sidebar'), owner: 'person/other', id: `arrangement/person/other/${uuid(2)}` }
+    const invalid = { ...arrangement(3, 'Sidebar'), id: `arrangement/${owner}/invalid` }
+    const rows = [foreign, invalid, arrangement(5, 'sidebar'), arrangement(6, 'Sidebar '), ...candidates]
+    expect(sidebarWinner(rows, owner)?.id).toBe(arrangement(9).id)
+    expect(sidebarCandidates(rows, owner).map((item) => item.id)).toEqual([arrangement(9).id, arrangement(0x10).id])
+    expect(sidebarWinner([arrangement(7, 'sidebar'), arrangement(8, 'Sidebar ')], owner)).toBeUndefined()
+    expect(sidebarWinner(rows, 'agent/example')).toBeUndefined()
+    expect(sidebarWinner([], owner)).toBeUndefined()
   })
 })
