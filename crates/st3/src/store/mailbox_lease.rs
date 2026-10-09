@@ -47,6 +47,20 @@ fn lease(
         .map_err(internal)
 }
 
+/// Whether `promote_current_mailbox_ownership` has nothing to promote for this lease row: there
+/// is none, or the caller is not a bootstrap promotion and not a same-session sequence advance.
+/// Re-exec can claim a newer sequence for the surviving provider session; only that exact
+/// process and current capability may retain its lease, which the caller checks.
+fn promotion_is_noop(row: Option<&(Fence, Authority, bool)>, authority: &Authority) -> bool {
+    let Some((_, prior, _)) = row else {
+        return true;
+    };
+    let advancing_session = prior.sequence > 0
+        && authority.sequence > prior.sequence
+        && authority.session == prior.session;
+    authority.sequence == 0 || (prior.sequence != 0 && !advancing_session)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,6 +788,175 @@ mod tests {
         assert!(store.repair_mailbox(&old, &authority(1)).is_err());
         store.check_mailbox(&current).unwrap();
     }
+
+    /// Call `promote_current_mailbox_ownership` on another thread, so a test can hold the writer
+    /// on this one. A call that needs the writer cannot finish while the test holds it.
+    fn promote_elsewhere(
+        store: &Arc<Store>,
+        fence: &Fence,
+        candidate: &Authority,
+    ) -> (
+        std::sync::mpsc::Receiver<Result<(), String>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (store, fence, candidate) = (Arc::clone(store), fence.clone(), candidate.clone());
+        let worker = std::thread::spawn(move || {
+            let result = store
+                .promote_current_mailbox_ownership(&fence, &candidate)
+                .map_err(|error| format!("{error:?}"));
+            let _ = sender.send(result);
+        });
+        (receiver, worker)
+    }
+
+    // These controls cover `promote_current_mailbox_ownership` itself. They say nothing about
+    // other work an attachment request does.
+    #[test]
+    fn promotions_that_would_change_nothing_do_not_borrow_the_writer() {
+        let store = Arc::new(fixture());
+        let owner = authority(1);
+        let bound = store
+            .bind_mailbox_with_lease(&request(), Some(&owner))
+            .unwrap();
+        let no_lease = Fence::new("agent/eval.worker", "current", "title");
+        let held = store.connection.write();
+        for (case, fence, candidate) in [
+            ("same sequence, exact owner", bound.clone(), owner.clone()),
+            (
+                "sequence zero against a promoted lease",
+                bound.clone(),
+                Authority { sequence: 0, ..owner.clone() },
+            ),
+            (
+                "higher sequence from another session",
+                bound.clone(),
+                Authority { session: "different-session".into(), sequence: 2, ..owner.clone() },
+            ),
+            ("no lease row", no_lease, owner.clone()),
+        ] {
+            let (receiver, worker) = promote_elsewhere(&store, &fence, &candidate);
+            let result = receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("{case}: waited for the writer"));
+            assert_eq!(result, Ok(()), "{case}");
+            worker.join().unwrap();
+        }
+        drop(held);
+        assert_eq!(store.mailbox_lease_authority(&bound).unwrap(), Some(owner));
+    }
+
+    #[test]
+    fn a_same_session_sequence_advance_still_waits_for_the_writer_and_records() {
+        let store = Arc::new(fixture());
+        let owner = authority(1);
+        let bound = store
+            .bind_mailbox_with_lease(&request(), Some(&owner))
+            .unwrap();
+        let advanced = Authority { sequence: 2, ..owner.clone() };
+        let held = store.connection.write();
+        let (receiver, worker) = promote_elsewhere(&store, &bound, &advanced);
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "an advance cannot finish without the writer"
+        );
+        drop(held);
+        assert_eq!(
+            receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            Ok(())
+        );
+        worker.join().unwrap();
+        assert_eq!(
+            store.mailbox_lease_authority(&bound).unwrap(),
+            Some(advanced)
+        );
+    }
+
+    #[test]
+    fn a_bootstrap_promotion_from_sequence_zero_still_waits_for_the_writer_and_records() {
+        let store = Arc::new(fixture());
+        let intent = crate::graph::parse_intent("version 2\nagent \"eval.worker\" { host \"node\"; workspace \"/tmp\"; harness \"codex\" {} }", "node").unwrap();
+        store
+            .apply_internal(&intent, "codex-bootstrap-fixture")
+            .unwrap();
+        let mut bootstrap = authority(1);
+        bootstrap.provider = "codex".into();
+        bootstrap.session = "runtime:current".into();
+        bootstrap.sequence = 0;
+        let bound = store
+            .bind_mailbox_with_lease(&request(), Some(&bootstrap))
+            .unwrap();
+        let mut provider = authority(1);
+        provider.provider = "codex".into();
+        let held = store.connection.write();
+        let (receiver, worker) = promote_elsewhere(&store, &bound, &provider);
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a bootstrap promotion cannot finish without the writer"
+        );
+        drop(held);
+        assert_eq!(
+            receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            Ok(())
+        );
+        worker.join().unwrap();
+        assert_eq!(
+            store.mailbox_lease_authority(&bound).unwrap(),
+            Some(provider)
+        );
+    }
+
+    #[test]
+    fn a_lease_revoked_while_a_promotion_waits_is_refused_on_the_writer() {
+        let store = Arc::new(fixture());
+        let owner = authority(1);
+        let bound = store
+            .bind_mailbox_with_lease(&request(), Some(&owner))
+            .unwrap();
+        let advanced = Authority { sequence: 2, ..owner.clone() };
+        let held = store.connection.write();
+        let (receiver, worker) = promote_elsewhere(&store, &bound, &advanced);
+        // Whether the promotion has read the lease yet or not, the lease changes before it can
+        // use the writer, so the writer's own read of the row has to decide.
+        held.execute("UPDATE local_mailbox_leases SET revoked=1", [])
+            .unwrap();
+        drop(held);
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(result.is_err(), "{result:?}");
+        worker.join().unwrap();
+        assert_eq!(store.mailbox_lease_authority(&bound).unwrap(), Some(owner));
+    }
+
+    #[test]
+    fn a_failed_lease_read_is_returned_without_borrowing_the_writer() {
+        let store = Arc::new(fixture());
+        let owner = authority(1);
+        let bound = store
+            .bind_mailbox_with_lease(&request(), Some(&owner))
+            .unwrap();
+        store
+            .connection
+            .write()
+            .execute(
+                "ALTER TABLE local_mailbox_leases RENAME TO local_mailbox_leases_unreadable",
+                [],
+            )
+            .unwrap();
+        let held = store.connection.write();
+        let (receiver, worker) = promote_elsewhere(&store, &bound, &owner);
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a failed read must not wait for the writer");
+        assert!(result.is_err(), "{result:?}");
+        drop(held);
+        worker.join().unwrap();
+    }
 }
 
 fn refused(reason: &str) -> St3Error {
@@ -1141,24 +1324,30 @@ impl Store {
     /// Promote physical Codex bootstrap custody, or advance a surviving process's
     /// same-session ownership after re-exec, under the caller's provider ownership lock.
     /// Both retain only the still-current capability and exact process generation.
+    ///
+    /// A reader first reads the lease row, only to skip the writer when this call can promote
+    /// nothing: no lease row, or `promotion_is_noop`. That result never authorizes anything.
+    /// It is released before the writer is borrowed, and any call that may promote reruns the
+    /// whole transaction below on the writer's current state.
     pub(crate) fn promote_current_mailbox_ownership(
         &self,
         fence: &Fence,
         authority: &Authority,
     ) -> Result<(), St3Error> {
-        let mut connection = self.connection.write();
-        let tx = connection.transaction().map_err(internal)?;
-        let Some((held, prior, revoked)) = lease(&tx, fence)? else {
-            return Ok(());
-        };
-        // Re-exec can claim a newer sequence for the surviving provider session.
-        // Only that exact process and current capability may retain its lease.
-        let advancing_session = prior.sequence > 0
-            && authority.sequence > prior.sequence
-            && authority.session == prior.session;
-        if authority.sequence == 0 || (prior.sequence != 0 && !advancing_session) {
+        let observed = lease(&self.readers.get(), fence)?;
+        if promotion_is_noop(observed.as_ref(), authority) {
             return Ok(());
         }
+        drop(observed);
+        let mut connection = self.connection.write();
+        let tx = connection.transaction().map_err(internal)?;
+        let current = lease(&tx, fence)?;
+        if promotion_is_noop(current.as_ref(), authority) {
+            return Ok(());
+        }
+        let Some((held, prior, revoked)) = current else {
+            return Ok(());
+        };
         if held.incarnation != fence.incarnation
             || held.token != fence.token
             || held.epoch != fence.epoch
