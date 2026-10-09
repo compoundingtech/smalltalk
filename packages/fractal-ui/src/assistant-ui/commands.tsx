@@ -49,6 +49,7 @@ interface CommandRegistry {
   readonly openPalette: () => void
   readonly openShortcuts: () => void
   readonly portalContainer: HTMLElement | null
+  readonly tooltipDelay: number
 }
 const Registry = React.createContext<CommandRegistry | null>(null)
 export const useCommands = () => React.useContext(Registry)
@@ -59,7 +60,7 @@ function matches(event: KeyboardEvent, chord: CommandChord, platform: CommandPla
   return event.key.toLowerCase() === chord.key.toLowerCase() && event.metaKey === (mod && platform === 'mac') && event.ctrlKey === (mod && platform === 'other') && event.altKey === modifiers.includes('Alt') && event.shiftKey === modifiers.includes('Shift')
 }
 /** Host registers its complete current command list. One document capture listener owns all shortcuts. */
-export function CommandsProvider({ commands, platform = commandPlatform(), children }: { readonly commands: readonly KitCommand[]; readonly platform?: CommandPlatform; readonly children: React.ReactNode }) {
+export function CommandsProvider({ commands, platform = commandPlatform(), tooltipDelay = 300, children }: { readonly commands: readonly KitCommand[]; readonly platform?: CommandPlatform; readonly tooltipDelay?: number; readonly children: React.ReactNode }) {
   const parent = useCommands()
   if (parent !== null) throw new Error('CommandsProvider must not be nested: use one host registry.')
   const [overlay, setOverlay] = React.useState<'palette' | 'shortcuts' | null>(null)
@@ -72,7 +73,7 @@ export function CommandsProvider({ commands, platform = commandPlatform(), child
     command.perform()
     return true
   }
-  const registry: CommandRegistry = { commands, platform, portalContainer, perform, openPalette: () => setOverlay('palette'), openShortcuts: () => setOverlay('shortcuts') }
+  const registry: CommandRegistry = { commands, platform, tooltipDelay, portalContainer, perform, openPalette: () => setOverlay('palette'), openShortcuts: () => setOverlay('shortcuts') }
   const keyDown = React.useEffectEvent((event: KeyboardEvent) => {
     if (event.defaultPrevented || event.repeat || event.isComposing || composing.current || event.keyCode === 229) return
     if (matches(event, { key: 'k', modifiers: ['Mod'] }, platform)) { event.preventDefault(); event.stopPropagation(); setOverlay('palette'); return }
@@ -120,12 +121,12 @@ function Shortcut({ shortcut, platform }: { readonly shortcut?: CommandShortcut;
   return label === undefined ? null : <kbd {...stylex.props(styles.shortcut)}>{label}</kbd>
 }
 /** Uses the same registry as keyboard dispatch and palette; React Aria opens on hover and keyboard focus. */
-export function CommandTooltip({ commandId, label, children, placement = 'bottom', delay = 300 }: { readonly commandId?: string; readonly label?: string; readonly children: React.ReactNode; readonly placement?: 'top' | 'bottom'; readonly delay?: number }) {
+export function CommandTooltip({ commandId, label, children, placement = 'bottom', delay }: { readonly commandId?: string; readonly label?: string; readonly children: React.ReactNode; readonly placement?: 'top' | 'bottom'; readonly delay?: number }) {
   const registry = useCommands()
   const command = registry?.commands.find(entry => entry.id === commandId)
   const text = command?.label ?? label
   if (text === undefined) return <>{children}</>
-  return <TooltipTrigger delay={delay} closeDelay={0}>{children}<Tooltip UNSTABLE_portalContainer={registry?.portalContainer ?? undefined} placement={placement} offset={6} {...stylex.props(styles.tooltip)}><span>{text}</span>{command !== undefined && registry !== null && <Shortcut shortcut={command.shortcut} platform={registry.platform} />}</Tooltip></TooltipTrigger>
+  return <TooltipTrigger delay={delay ?? registry?.tooltipDelay ?? 300} closeDelay={0}>{children}<Tooltip UNSTABLE_portalContainer={registry?.portalContainer ?? undefined} placement={placement} offset={6} {...stylex.props(styles.tooltip)}><span>{text}</span>{command !== undefined && registry !== null && <Shortcut shortcut={command.shortcut} platform={registry.platform} />}</Tooltip></TooltipTrigger>
 }
 /** Existing controls may omit commandId; registered controls dispatch exclusively through the registry. */
 export function CommandButton({ commandId, label, onPress, ...props }: ButtonProps & { readonly commandId?: string; readonly label: string }) {

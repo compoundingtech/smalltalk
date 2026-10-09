@@ -66,6 +66,8 @@ registry-owned actions; the button, palette and key binding then invoke the same
 ids. Its old callbacks remain the uncontrolled action path when no id is supplied.
 The existing root `Tooltip` accepts `commandId`; `CommandTooltip` also works around
 React Aria buttons. Both expose registry shortcut text on hover and keyboard focus.
+The provider's `tooltipDelay` defaults to 300 ms; a tooltip-specific `delay`
+overrides it. Stories use zero delay while asserting the real hover/focus behavior.
 `Composer.commandIds`, `EmbraceComposer.commandIds` and `ComposerSession.commandIds`
 accept send/stop ids for discovery on their runtime-backed controls. Hosts own editor action registration
 and must bind those commands to the same runtime submission policy; registered

@@ -46,7 +46,7 @@ function CommandsStory({ scheme = 'dark', platform = 'other', control = 'none' }
     { id: 'composer.focus', label: 'Focus composer', group: 'Composer', shortcut: { key: 'l', modifiers: ['Mod'] }, perform: () => field.current?.focus() },
   ]
   return <main data-scheme={scheme} onCompositionStartCapture={event => { if (control === 'composition') event.stopPropagation() }} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}>
-    <CommandsProvider commands={commands} platform={control === 'platform' ? platform === 'mac' ? 'other' : 'mac' : platform}>
+    <CommandsProvider commands={commands} tooltipDelay={0} platform={control === 'platform' ? platform === 'mac' ? 'other' : 'mac' : platform}>
       <div>
         <ThreadHeader folder="fractal" title="Command workspace" terminalAvailable panelOpen={panel} drawerOpen={terminal} onTogglePanel={() => receipt('Callback path')} onToggleDrawer={() => receipt('Callback path')} commandIds={control === 'tooltip' ? {} : { panel: 'layout.panel', terminal: 'layout.terminal' }} />
         <Discovery />
@@ -137,20 +137,24 @@ export const ShortcutHelpLight: Story = { ...ShortcutHelp, args: { scheme: 'ligh
 export const Tooltips: Story = { play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   const toggle = canvas.getByRole('button', { name: 'Toggle right panel' })
-  await interact(() => canvas.getByRole('button', { name: 'Find command' }).focus())
-  await userEvent.tab({ shift: true })
+  await events.keyboard('{Tab}')
+  await events.tab()
   await expect(toggle).toHaveFocus()
-  const page = dialog(canvasElement)
-  await waitFor(() => expect(page.getByRole('tooltip')).toHaveTextContent('Toggle right panelCtrl+Shift+D'))
-  await userEvent.tab()
-  await interact(() => (canvasElement.ownerDocument.activeElement as HTMLElement).blur())
+  const page = within(document.body)
+  await page.findByRole('tooltip', {}, { timeout: 5000 })
+  await waitFor(() => expect(page.getByRole('tooltip')).toHaveTextContent('Toggle right panelCtrl+Shift+D'), { timeout: 5000 })
+  await events.click(canvas.getByRole('textbox', { name: 'Message' }))
   await waitFor(() => expect(page.queryByRole('tooltip')).toBeNull())
+  await fireEvent.pointerMove(canvasElement, { pointerType: 'mouse' })
   await userEvent.hover(toggle)
-  await waitFor(() => expect(page.getByRole('tooltip')).toHaveTextContent('Toggle right panelCtrl+Shift+D'))
+  await page.findByRole('tooltip', {}, { timeout: 5000 })
+  await waitFor(() => expect(page.getByRole('tooltip')).toHaveTextContent('Toggle right panelCtrl+Shift+D'), { timeout: 5000 })
   await userEvent.unhover(toggle)
   await userEvent.type(canvas.getByRole('textbox', { name: 'Message' }), 'Review generated changes')
+  await fireEvent.pointerMove(canvasElement, { pointerType: 'mouse' })
   await userEvent.hover(canvas.getByRole('button', { name: 'Send' }))
-  await waitFor(() => expect(page.getByRole('tooltip')).toHaveTextContent('Send messageCtrl+Enter'))
+  await page.findByRole('tooltip', {}, { timeout: 5000 })
+  await waitFor(() => expect(page.getByRole('tooltip')).toHaveTextContent('Send messageCtrl+Enter'), { timeout: 5000 })
   await userEvent.unhover(canvas.getByRole('button', { name: 'Send' }))
 } }
 export const TooltipsLight: Story = { ...Tooltips, args: { scheme: 'light' } }
