@@ -46,6 +46,45 @@ def check(name, outcome, expected):
     assert outcome[:2] == expected, (name, outcome)
     print("passed:", name)
 
+# Match the generated client export graph and web lane inputs, not their Rust generators.
+detector_contract = runpy.run_path(str(detector))
+web_inputs = (
+    "clients/typescript/st3-client/index.ts",
+    "clients/typescript/st3-client/Models.generated.ts",
+    "clients/typescript/st3-client/Client.generated.ts",
+    "clients/typescript/st3-client/Schema.generated.ts",
+    "clients/typescript/st3-client/errors.ts",
+    "clients/typescript/st3-client/package.json",
+    "clients/typescript/st3-client/tsconfig.json",
+    "clients/typescript/st3-client/tsconfig.schema.json",
+    "clients/typescript/st3-client/types.test.ts",
+    "clients/typescript/st3-client/BUCK",
+    "fixtures/clients/device-signing-v1.json",
+    "fixtures/clients/transcripts/example.json",
+    "fixtures/scenarios/example.json",
+)
+non_web_inputs = (
+    "crates/st3-client/src/lib.rs",
+    "crates/st3-client-codegen/src/main.rs",
+    "crates/st3-schema/x.rs",
+    "docs/st3/client-v0/x.md",
+    "docs/st3/client-v0/schemas/client-v0.schema.json",
+    "flake.nix",
+    "flake.lock",
+    "clients/typescript/st3-client/README.md",
+    "clients/typescript/st3-client/contract.test.cjs",
+    "clients/typescript/st3-client/schema.test.cjs",
+    "clients/typescript/st3-client/fetch-receiver.test.ts",
+)
+unexpected = []
+for paths, expected in ((web_inputs, True), (non_web_inputs, False)):
+    for path in paths:
+        actual = bool(detector_contract["relevant_paths"]([path]))
+        print(f"path: {path}: relevant={actual}, expected={expected}")
+        if actual != expected:
+            unexpected.append(path)
+assert not unexpected, f"incorrect web input classification: {unexpected}"
+
 
 with tempfile.TemporaryDirectory() as scratch:
     repo = Path(scratch)
@@ -77,7 +116,7 @@ with tempfile.TemporaryDirectory() as scratch:
     check("Rust-only pull request schedules no web execution", detect(repo, "pull_request", base, rust), (0, "relevant=false"))
     check("pull requests diff from the merge base", detect(repo, "pull_request", advanced, rust), (0, "relevant=false"))
     check("client change executes", detect(repo, "pull_request", base, client), (0, "relevant=true"))
-    check("schema change executes", detect(repo, "pull_request", base, schema), (0, "relevant=true"))
+    check("Rust schema changes alone do not execute web lanes", detect(repo, "pull_request", base, schema), (0, "relevant=false"))
     check("lock change executes", detect(repo, "pull_request", base, lock), (0, "relevant=true"))
     check("rename out of a web path executes", detect(repo, "pull_request", base, renamed_out), (0, "relevant=true"))
     check("rename into a web path executes", detect(repo, "pull_request", base, renamed_in), (0, "relevant=true"))
@@ -116,6 +155,11 @@ for event in ("pull_request", "merge_group", "workflow_dispatch"):
     assert f"  {event}:" in header, event
 blocks = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", jobs))
 changes, execution, gate_job = blocks["fractal-web-changes"], blocks["fractal-web-execution"], blocks["fractal-web"]
+for pattern in detector_contract["PATTERNS"]:
+    assert f'"{pattern}"' in changes, f"generated detector omits {pattern}"
+for pattern in ("clients/typescript/st3-client/**", "crates/st3-client*/**", "crates/st3-schema/**",
+                "docs/st3/client-v0/**", "flake.nix", "flake.lock"):
+    assert f'"{pattern}"' not in changes, f"generated detector retains broad input {pattern}"
 for block in (changes, execution, gate_job):
     assert "runs-on: ubuntu-latest" in block
 assert "timeout-minutes: 1" in changes and "timeout-minutes: 1" in gate_job and "timeout-minutes: 25" in execution

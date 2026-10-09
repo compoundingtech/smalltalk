@@ -378,12 +378,16 @@ workflow-level path filters. `linux-gate` does not depend on them.
   `base_sha..head_sha`. `--no-renames` counts both sides of a rename. Missing or malformed
   SHAs, failed fetches and failed diffs fail closed; `workflow_dispatch` forces execution.
   Relevant paths are `apps/fractal-web/**`, `packages/fractal-ui/**`,
-  `clients/typescript/st3-client/**`, `clients/typescript/st3-views/**`,
-  `crates/st3-client*/**`, `crates/st3-schema/**`, `docs/st3/client-v0/**`,
+  `clients/typescript/st3-views/**` and `fixtures/**`. Within `clients/typescript/st3-client`,
+  only the consumed export graph (`index.ts`, `Models.generated.ts`, `Client.generated.ts`,
+  `Schema.generated.ts`, `errors.ts`), `package.json`, `tsconfig.json`, `tsconfig.schema.json`,
+  `types.test.ts` and `BUCK*` trigger web execution. Rust generators and their schema/docs
+  inputs do not trigger it without a changed generated client file; root flake-only changes
+  also do not trigger it. Other relevant paths are
   root `package.json*`, `pnpm-workspace.yaml*`, `pnpm-lock.yaml`,
   `pnpm-install-contract.json*`, `.npmrc`, root `tsconfig*.json*`, `.buckroot*`,
   `.buckconfig*`, root `BUCK*`, `buck2/**`, `genie/**`, `nix/web/**`,
-  `nix/fractal-web*.nix`, `flake.nix`, `flake.lock`, `scripts/ci-fractal-web*`,
+  `nix/fractal-web*.nix`, `scripts/ci-fractal-web*`,
   `scripts/ci-typescript-client*`,
   `.github/workflows/{fleet.yml*,workspace-ci.ts,main-upkeep.yml*,cache-audit.ts}`,
   and `.github/repo-settings.json*`.
