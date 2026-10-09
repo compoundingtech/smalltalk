@@ -51,7 +51,7 @@ function TranscriptStory({ scheme = 'dark', state = 'settled', availability, his
   const [opened, setOpened] = React.useState<WorkLogCall | undefined>(undefined)
   const [retried, setRetried] = React.useState(false)
   const retry = React.useCallback(() => setRetried(true), [])
-  return <section aria-label="Conversation example" data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><div {...stylex.props(styles.frame)}><RuntimeTranscript data={cases[state]} onOpenTool={setOpened} onRetry={retry} availability={availability} history={history} emptyState={emptyState} /></div>{opened !== undefined && <section aria-label="Opened tool detail" {...stylex.props(styles.detail)}><strong>{opened.title} {opened.argsSummary}</strong><pre>{opened.detail}</pre></section>}{retried && <p role="status">Retry requested by the host.</p>}</section>
+  return <section aria-label={`${state} conversation example`} data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><div {...stylex.props(styles.frame)}><RuntimeTranscript data={cases[state]} onOpenTool={setOpened} onRetry={retry} availability={availability} history={history} emptyState={emptyState} /></div>{opened !== undefined && <section aria-label="Opened tool detail" {...stylex.props(styles.detail)}><strong>{opened.title} {opened.argsSummary}</strong><pre>{opened.detail}</pre></section>}{retried && <p role="status">Retry requested by the host.</p>}</section>
 }
 const meta = { title: 'Fractal UI/Transcript', component: TranscriptStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', state: 'settled' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' }, state: { options: Object.keys(cases), control: 'select' } } } satisfies Meta<typeof TranscriptStory>
 export default meta
@@ -131,7 +131,9 @@ export const SyncFailedLight: Story = { args: { state: 'sync-failed', scheme: 'l
 export const AllStates: Story = { render: args => <main {...stylex.props(styles.all, ...baselineTheme, args.scheme === 'light' && lightTheme)}>{(['settled', 'streaming', 'failed', 'interrupted', 'unknown', 'loading', 'catching-up', 'reconnecting', 'sync-failed'] as const).map(state => <section key={state}><h2>{state}</h2><TranscriptStory scheme={args.scheme} state={state} /></section>)}</main>, play: async ({ canvasElement }) => {
   await expect(within(canvasElement).getAllByRole('main')).toHaveLength(1)
   await expect(canvasElement.querySelector('main main')).toBeNull()
-  await expect(within(canvasElement).getAllByRole('region', { name: 'Conversation example' })).toHaveLength(9)
+  const examples = within(canvasElement).getAllByRole('region', { name: / conversation example$/ })
+  await expect(examples).toHaveLength(9)
+  await expect(new Set(examples.map(example => example.getAttribute('aria-label'))).size).toBe(9)
 } }
 export const AllStatesLight: Story = { ...AllStates, args: { scheme: 'light' } }
 const metadataCases = ['known', 'unknown', 'streaming'] as const
