@@ -487,25 +487,25 @@ fn repair_checkpoint_extrema_refuse_corruption_and_roll_back_the_entire_repair()
     {
         let connection = store.connection.write();
         checkpoint_candidate(&connection, "op/new", "a", "cp/least");
-        checkpoint_candidate(&connection, "op/new", "z", "cp/greatest");
+        checkpoint_candidate(&connection, "op/new", "𐀀", "cp/greatest");
         checkpoint_candidate(&connection, "op/new", "c", "cp/bad");
-        // Invalid UTF-8 in an interior TEXT ID must fail too, even though neither digest
-        // extremum names it. Refusing only non-text fields would silently accept this.
+        // Keep the immutable source ID intact. The malformed TEXT digest sorts between
+        // the two valid extrema, so decoding only first/last rows would miss its refusal.
         connection
             .execute(
-                "UPDATE checkpoint_claims SET id=CAST(x'80' AS TEXT) WHERE id='cp/bad'",
+                "UPDATE checkpoint_claims SET request_digest=CAST(x'80' AS TEXT) WHERE id='cp/bad'",
                 [],
             )
             .unwrap();
         assert!(legacy_expected_operation(&connection, "op/new").is_err());
         assert!(expected_operation(&connection, "op/new").is_err());
         connection
-            .execute("DELETE FROM checkpoint_claims WHERE request_digest='c'", [])
+            .execute("DELETE FROM checkpoint_claims WHERE id='cp/bad'", [])
             .unwrap();
         checkpoint_candidate(&connection, "op/new", "c", "cp/bad");
         connection
             .execute(
-                "UPDATE checkpoint_claims SET id=x'80' WHERE id='cp/bad'",
+                "UPDATE checkpoint_claims SET request_digest=x'80' WHERE id='cp/bad'",
                 [],
             )
             .unwrap();
@@ -530,7 +530,7 @@ fn repair_checkpoint_extrema_refuse_corruption_and_roll_back_the_entire_repair()
     store
         .connection
         .write()
-        .execute("DELETE FROM checkpoint_claims WHERE typeof(id)<>'text'", [])
+        .execute("DELETE FROM checkpoint_claims WHERE id='cp/bad'", [])
         .unwrap();
     assert_eq!(store.apply_replication_repairs().unwrap(), 1);
     assert_canonical(&store);
