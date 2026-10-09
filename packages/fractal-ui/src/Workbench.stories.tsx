@@ -21,8 +21,8 @@ type State = 'one' | 'two' | 'three' | 'dragging' | 'nested' | 'tabs'
 type ThreadState = 'live' | 'empty' | 'loading' | 'stale' | 'failed' | 'unavailable'
 const tabLayout = group([{ uri: 'agent:worker-1' }, { uri: 'agent:worker-2' }])
 const fixtureLayout = (state: State): WorkbenchLayout => state === 'one' ? onePaneLayout : state === 'nested' ? nestedLayout : state === 'tabs' ? tabLayout : twoPaneLayout
-function WorkbenchStory({ scheme = 'dark', state = 'two', threadState = 'live', persist = true, workspaceId = `kit-b-${scheme}-${state}-${threadState}` }: { scheme?: Scheme; state?: State; threadState?: ThreadState; persist?: boolean; workspaceId?: string }) {
-  const fixture = useWorkbenchFixture()
+function WorkbenchStory({ scheme = 'dark', state = 'two', threadState = 'live', seed = 'running', persist = true, workspaceId = `kit-b-${scheme}-${state}-${seed}-${threadState}` }: { scheme?: Scheme; state?: State; threadState?: ThreadState; seed?: 'running' | 'idle'; persist?: boolean; workspaceId?: string }) {
+  const fixture = useWorkbenchFixture(seed)
   const initial = fixtureLayout(state)
   const [layout, setLayout] = React.useState(() => persist ? readStoredLayout(workspaceId, initial) : initial)
   const [epoch, setEpoch] = React.useState(0)
@@ -57,9 +57,9 @@ function WorkbenchStory({ scheme = 'dark', state = 'two', threadState = 'live', 
   </section>
 }
 const meta = {
-  title: 'Fractal UI/Workbench', component: WorkbenchStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', state: 'two', threadState: 'live' },
-  argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' }, state: { options: ['one', 'two', 'three', 'dragging', 'nested', 'tabs'], control: 'select' }, threadState: { options: ['live', 'empty', 'loading', 'stale', 'failed', 'unavailable'], control: 'select' }, persist: { table: { disable: true } }, workspaceId: { table: { disable: true } } },
-  render: (args, { id }) => <main aria-label="Workbench"><WorkbenchStory key={`${id}-${args.scheme}-${args.state}-${args.threadState}`} {...args} workspaceId={`kit-b-${id}-${args.scheme}-${args.state}-${args.threadState}`} /></main>,
+  title: 'Fractal UI/Workbench', component: WorkbenchStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', state: 'two', threadState: 'live', seed: 'running' },
+  argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' }, state: { options: ['one', 'two', 'three', 'dragging', 'nested', 'tabs'], control: 'select' }, threadState: { options: ['live', 'empty', 'loading', 'stale', 'failed', 'unavailable'], control: 'select' }, seed: { options: ['running', 'idle'], control: 'radio' }, persist: { table: { disable: true } }, workspaceId: { table: { disable: true } } },
+  render: (args, { id }) => <main aria-label="Workbench"><WorkbenchStory key={`${id}-${args.scheme}-${args.state}-${args.seed}-${args.threadState}`} {...args} workspaceId={`kit-b-${id}-${args.scheme}-${args.state}${args.seed === 'idle' ? '-idle' : ''}-${args.threadState}`} /></main>,
 } satisfies Meta<typeof WorkbenchStory>
 export default meta
 type Story = StoryObj<typeof meta>
@@ -67,6 +67,29 @@ const settle = () => new Promise<void>(resolve => requestAnimationFrame(() => re
 export const Dark: Story = {}
 export const Light: Story = { args: { scheme: 'light' } }
 export const OnePane: Story = { args: { state: 'one' } }
+/** The exact reviewed idle sample seed keeps plain Enter's immediate-send case independent of running policy. */
+export const IdleSample: Story = { args: { state: 'one', seed: 'idle' }, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const input = canvas.getByTestId('composer-input')
+  await userEvent.clear(input)
+  await userEvent.type(input, 'Send from the idle sample fixture{Enter}')
+  await canvas.findByText('Send from the idle sample fixture')
+  await expect(canvas.getByTestId('pane-header')).toHaveTextContent('Done')
+  await expect(canvas.queryByText(/will send after run/)).toBeNull()
+} }
+/** Plain Enter queues during a run; a modifier explicitly steers without draining that queue. */
+export const RunningQueueAndSteer: Story = { args: { state: 'one', seed: 'running' }, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const input = canvas.getByTestId('composer-input')
+  await userEvent.clear(input)
+  await userEvent.type(input, 'Keep this message queued{Enter}')
+  await expect(canvas.getByText('1 message will send after run')).toBeVisible()
+  await expect(canvas.queryByText('Keep this message queued')).toBeNull()
+  await userEvent.type(input, 'Steer the active run')
+  await userEvent.keyboard('{Control>}{Enter}{/Control}')
+  await canvas.findByText('Steer the active run')
+  await expect(canvas.getByText('1 message will send after run')).toBeVisible()
+} }
 export const TerminalOpen: Story = { args: { state: 'three' } }
 export const Dragging: Story = { args: { state: 'dragging' } }
 export const NestedRatios: Story = { args: { state: 'nested' } }
