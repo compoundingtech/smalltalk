@@ -43,6 +43,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case invalidArrangementSubject, invalidArrangementAction, invalidArrangementOperations
     case invalidArrangementFolder, invalidArrangementName, invalidArrangementKey, invalidSubjectReference
     case staleFence, cursorGap, pageCursorExpired, rateLimited
+    case projectionDetailTooLarge, projectionDetailInvalidSource
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete, conversationContentInvalidated, transcriptUnavailable
     case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired
@@ -65,6 +66,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "invalid-arrangement-name": .invalidArrangementName; case "invalid-arrangement-key": .invalidArrangementKey
         case "invalid-subject-reference": .invalidSubjectReference
         case "cursor-gap": .cursorGap; case "page-cursor-expired": .pageCursorExpired
+        case "projection-detail-too-large": .projectionDetailTooLarge; case "projection-detail-invalid-source": .projectionDetailInvalidSource
         case "rate-limited": .rateLimited; case "runtime-not-local": .runtimeNotLocal
         case "timeline-history-incomplete": .timelineHistoryIncomplete
         case "conversation-content-invalidated": .conversationContentInvalidated; case "transcript-unavailable": .transcriptUnavailable
@@ -91,6 +93,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .invalidArrangementName: "invalid-arrangement-name"; case .invalidArrangementKey: "invalid-arrangement-key"
         case .invalidSubjectReference: "invalid-subject-reference"
         case .cursorGap: "cursor-gap"; case .pageCursorExpired: "page-cursor-expired"
+        case .projectionDetailTooLarge: "projection-detail-too-large"; case .projectionDetailInvalidSource: "projection-detail-invalid-source"
         case .rateLimited: "rate-limited"; case .runtimeNotLocal: "runtime-not-local"
         case .timelineHistoryIncomplete: "timeline-history-incomplete"
         case .conversationContentInvalidated: "conversation-content-invalidated"; case .transcriptUnavailable: "transcript-unavailable"

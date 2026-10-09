@@ -394,6 +394,18 @@ async fn detail_router_admits_timestamp_and_host_before_any_snapshot_constructio
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
+    // Normal digest admission rejects malformed timestamp encoding. This isolated
+    // corruption fixture suspends its UPDATE digest trigger, restores the exact
+    // original timestamp, then reinstalls the trigger before successful reads.
+    let triggers = connection.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='claims' AND sql LIKE '%AFTER UPDATE%' AND sql LIKE '%st_projection_change%'")
+        .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert!(!triggers.is_empty());
+    for (name, _) in &triggers {
+        connection
+            .execute_batch(&format!("DROP TRIGGER \"{}\"", name.replace('"', "\"\"")))
+            .unwrap();
+    }
     let snapshots = SnapshotConstructions::track(&state);
     // The latest claim is a subscription state, not the selected observer state.
     // Both routes must guard this envelope input before the initial snapshot helper.
@@ -454,6 +466,9 @@ async fn detail_router_admits_timestamp_and_host_before_any_snapshot_constructio
             0,
             "oversize host was formatted before admission"
         );
+    }
+    for (_, sql) in triggers {
+        connection.execute_batch(&sql).unwrap();
     }
     // A successful detail constructs exactly the guarded response snapshot, which
     // still appears in the wire envelope. Other routes keep admission snapshots.
@@ -565,6 +580,14 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
             .unwrap();
         refuses(&state, raw_path, "projection-detail-invalid-source").await;
     }
+    // DELETE digest admission reads OLD.kind. Restore the original valid kind
+    // while this fixture's UPDATE digest trigger is still suspended.
+    connection
+        .execute(
+            "UPDATE desired SET kind='agent' WHERE subject='detail/watch/source'",
+            [],
+        )
+        .unwrap();
     connection
         .execute(
             "DELETE FROM desired WHERE subject='detail/watch/source'",
