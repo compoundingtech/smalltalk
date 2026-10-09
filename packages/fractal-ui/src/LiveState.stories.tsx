@@ -122,7 +122,7 @@ const axisPlay: NonNullable<Story['play']> = async ({ canvasElement, args }) => 
   await expect(dialog.querySelector('[aria-label="Execution identity"]')?.textContent).toContain('execution-iris')
   await userEvent.keyboard('{Escape}')
   await waitFor(async () => { await expect(within(surface.ownerDocument.body).queryByRole('dialog')).toBeNull() })
-  await expect(trigger).toHaveFocus()
+  await waitFor(async () => { await expect(trigger).toHaveFocus() })
   await assertNoPlaceholder(surface)
 }
 export const AllKnown: Story = { play: axisPlay }
