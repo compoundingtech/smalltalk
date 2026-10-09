@@ -11019,9 +11019,8 @@ mission "queue-parity" state="ready" {
         assert_eq!(snapshot["items"][0]["id"], subject);
         assert!(snapshot["items"][0]["harness_state"].is_null(), "{snapshot}");
 
-        // A page waits a bounded time for a publication at its own cut, then answers from the
-        // newest one rather than folding.
-        let (Extension(page_snapshot), Json(page)) = tokio::time::timeout(Duration::from_secs(3),
+        // A first page answers at once from the newest publication rather than folding.
+        let (Extension(page_snapshot), Json(page)) = tokio::time::timeout(Duration::from_millis(500),
             client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
                 Query(ClientListQuery::default())))
             .await.expect("an HTTP page must not wait for the held refresh").unwrap();
@@ -11154,11 +11153,15 @@ mission "queue-parity" state="ready" {
         let list = |query: ClientListQuery| client_agents(State(state.clone()),
             Extension(new_client_snapshot(&state)), Query(query));
 
-        // A history page is folded by the refresher on request, never by the read.
+        // A history page is folded by the refresher on request, never by the read: at once it
+        // is not ready, and a read asking for a fresh roster waits for the refresher.
         let builds = state.store.agent_resources_builds_for_test();
+        let not_ready = list(ClientListQuery { history: true, ..ClientListQuery::default() })
+            .await.unwrap_err();
+        assert_eq!(not_ready.code, "agent-roster-not-ready");
         let (Extension(history_snapshot), Json(history)) = tokio::time::timeout(
             Duration::from_secs(5),
-            list(ClientListQuery { history: true, ..ClientListQuery::default() }),
+            list(ClientListQuery { history: true, fresh: true, ..ClientListQuery::default() }),
         ).await.unwrap().unwrap();
         assert_eq!(history.items.len(), 3);
         assert!(history_snapshot.published_at.is_some());

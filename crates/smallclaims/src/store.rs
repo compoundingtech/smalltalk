@@ -42,6 +42,8 @@ mod projection_busy_tests;
 mod receive_writer_tests;
 #[cfg(test)]
 mod membership_query_tests;
+#[cfg(test)]
+mod repair_operation_tests;
 mod binary_payloads;
 pub mod events;
 pub mod idempotency;
@@ -4891,7 +4893,7 @@ impl Store {
             return read(index);
         }
         // The snapshot's own entry: the guard below is lent out and dropped at once.
-        let _live = crate::sqlite::register_live_read(true);
+        let live = self.readers.register_snapshot();
         let mut guard = self.readers.get();
         // Declared first so it drops last: on every exit it ends the transaction, releases the
         // pin, and returns the connection to the pool.
@@ -4911,6 +4913,7 @@ impl Store {
         connection.execute_batch("BEGIN")?;
         // The first read starts the snapshot; every later read in `read` sees the same one.
         let index = current_index(&connection)?;
+        live.snapshot_started(&connection);
         PINNED_READER.with(|slot| *slot.borrow_mut() = Some((key, connection)));
         read(index)
     }
@@ -6789,14 +6792,20 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         let mut changed = 0;
+        let mut operation_ids = BTreeSet::new();
         for (repair_claim, body) in repairs {
             transaction.execute_batch("SAVEPOINT apply_repair")?;
-            let result =
-                apply_replication_repair_tx(&*self.runtime, &transaction, &repair_claim, &body);
+            let result = apply_replication_repair_with_operations_tx(
+                &*self.runtime,
+                &transaction,
+                &repair_claim,
+                &body,
+            );
             match result {
-                Ok(applied) => {
+                Ok((applied, affected_operations)) => {
                     transaction.execute_batch("RELEASE apply_repair")?;
                     changed += applied;
+                    operation_ids.extend(affected_operations);
                 }
                 Err(error) => {
                     transaction.execute_batch("ROLLBACK TO apply_repair; RELEASE apply_repair")?;
@@ -6815,7 +6824,7 @@ impl Store {
             }
         }
         if changed != 0 {
-            rebuild_operations_tx(&transaction)?;
+            repair_operations_tx(&transaction, &operation_ids.into_iter().collect::<Vec<_>>())?;
         }
         transaction.commit()?;
         drop(connection);
@@ -8202,13 +8211,50 @@ pub fn apply_replication_repair_tx(
     repair_claim: &str,
     body: &str,
 ) -> Result<usize> {
+    apply_replication_repair_with_operations_tx(runtime, transaction, repair_claim, body)
+        .map(|(changed, _)| changed)
+}
+
+/// Keep dependencies inside the repair savepoint, including the original claim when it is
+/// checkpointed. The caller merges these IDs only after the savepoint succeeds. Replacements
+/// can move between operations; the preceding replacement and rows naming any of these claims
+/// must not retain an obsolete canonical receipt.
+fn repaired_operation_ids_tx(
+    transaction: &Transaction<'_>,
+    claim_ids: BTreeSet<&str>,
+) -> Result<BTreeSet<String>> {
+    let mut ids = BTreeSet::new();
+    let mut statement = transaction.prepare_cached(
+        "SELECT json_extract(body, '$._operation.id') FROM claims WHERE id=?1
+           AND json_type(body, '$._operation.id')='text'
+           AND json_type(body, '$._operation.request_digest')='text'
+         UNION SELECT operation_id FROM checkpoint_claims WHERE id=?1
+           AND operation_id IS NOT NULL AND request_digest IS NOT NULL
+         UNION SELECT id FROM operations WHERE canonical_claim_id=?1",
+    )?;
+    for claim_id in claim_ids {
+        ids.extend(
+            statement
+                .query_map([claim_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+    }
+    Ok(ids)
+}
+
+fn apply_replication_repair_with_operations_tx(
+    runtime: &dyn Runtime,
+    transaction: &Transaction<'_>,
+    repair_claim: &str,
+    body: &str,
+) -> Result<(usize, BTreeSet<String>)> {
     let body: Value = serde_json::from_str(body)?;
     let fields = body.get("fields").unwrap_or(&body);
     let Some(record_ref) = fields.get("record").and_then(Value::as_str) else {
-        return Ok(0);
+        return Ok((0, BTreeSet::new()));
     };
     let Some(replacement) = fields.get("replacement").and_then(Value::as_str) else {
-        return Ok(0);
+        return Ok((0, BTreeSet::new()));
     };
     let replacement_exists = transaction
         .query_row(
@@ -8219,16 +8265,16 @@ pub fn apply_replication_repair_tx(
         .optional()?
         .is_some();
     if !replacement_exists {
-        return Ok(0);
+        return Ok((0, BTreeSet::new()));
     }
-    let repaired_claim = transaction
+    let (repaired_claim, previous_replacement) = transaction
         .query_row(
-            "SELECT claim_id FROM replica_records WHERE record_ref=?1",
+            "SELECT claim_id, replacement_claim_id FROM replica_records WHERE record_ref=?1",
             [record_ref],
-            |row| row.get::<_, Option<String>>(0),
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
         )
         .optional()?
-        .flatten();
+        .unwrap_or_default();
     let changed = transaction.execute(
         "UPDATE replica_records SET state='repaired', replacement_claim_id=?2,
                 error_code=NULL, error_message=NULL, updated_at_unix_ms=?3
@@ -8236,6 +8282,17 @@ pub fn apply_replication_repair_tx(
                AND (replacement_claim_id IS NULL OR replacement_claim_id<>?2)",
         params![record_ref, replacement, now_ms().to_string()],
     )?;
+    let operation_ids = if changed != 0 {
+        repaired_operation_ids_tx(
+            transaction,
+            repaired_claim.as_deref().into_iter()
+                .chain(previous_replacement.as_deref())
+                .chain([replacement])
+                .collect(),
+        )?
+    } else {
+        BTreeSet::new()
+    };
     if let Some(repaired_claim) = repaired_claim {
         runtime.apply_repair_tx(transaction, &repaired_claim, replacement)?;
     }
@@ -8252,7 +8309,7 @@ pub fn apply_replication_repair_tx(
         "DELETE FROM projection_health WHERE aggregate=?1",
         [format!("repair:{repair_claim}")],
     )?;
-    Ok(changed)
+    Ok((changed, operation_ids))
 }
 
 /// Verify a replicated claim against its batch and its content hash, then ask the runtime
