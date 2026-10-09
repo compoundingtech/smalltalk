@@ -51,6 +51,7 @@ mod message_wait;
 mod messaging_faults;
 mod mission_cancellation;
 mod no_st2_seat;
+mod onboarding_eval;
 mod node_identity_cli;
 mod operational_state_contract;
 mod owned_sets;

@@ -1,0 +1,41 @@
+{
+ "variant": "skip",
+ "started_ms": 0,
+ "person_messages": [
+  {
+   "ms": 70000,
+   "text": "skip"
+  }
+ ],
+ "assistant_text": [
+  {
+   "ms": 2000,
+   "text": "Hello! I will show you two agents talking. You can say skip any time."
+  },
+  {
+   "ms": 30000,
+   "text": "I started a second agent and asked it a question; you can see it answer."
+  },
+  {
+   "ms": 75000,
+   "text": "Understood, you want to skip. I stopped the demo. Nothing else is left running, and you can bring the tour back any time with st setup --onboarding."
+  }
+ ],
+ "messages": [
+  {
+   "ms": 25000,
+   "from": "agent/st/assistant",
+   "to": "agent/st/demo"
+  },
+  {
+   "ms": 40000,
+   "from": "agent/st/demo",
+   "to": "agent/st/assistant"
+  }
+ ],
+ "demo_agent_exists": true,
+ "demo_mission_state": "running",
+ "welcome_bytes": 0,
+ "onboarding_run_state": "running",
+ "skip_ms": 70000
+}
