@@ -15,15 +15,15 @@ const diffAddTint = { dark: '#7295ed', light: '#4269df' } as const
 const ansi = {
   dark: [
     '#1b2b36', '#e06c75', diffAddTint.dark, '#e5c07b',
-    '#356bcc', '#c678dd', '#279dcc', '#d6dee3',
+    '#356bcc', '#c678dd', '#5195dc', '#d6dee3',
     '#5c6f7b', '#ff7b86', '#adc1f5', '#ffd68a',
-    '#c0dcff', '#e09cf0', '#85dcf5', '#f3f7fa',
+    '#c0dcff', '#e09cf0', '#8bbcff', '#f3f7fa',
   ],
   light: [
     '#1b2b36', '#b42332', diffAddTint.light, '#946514',
-    '#163a93', '#9345a8', '#076a91', '#b5bec5',
+    '#163a93', '#9345a8', '#2165ac', '#b5bec5',
     '#5c6f7b', '#d43a48', '#708ee8', '#b88118',
-    '#2f8fe8', '#b269c2', '#159bc3', '#f3f7fa',
+    '#2360b0', '#b269c2', '#5299e6', '#f3f7fa',
   ],
 } as const
 

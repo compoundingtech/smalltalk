@@ -148,13 +148,17 @@ The shared diff tint assertion identifies a token through its causal effect on b
 ### Interactive terminal presentation
 
 `TerminalSurface`, `TerminalDrawer`, `resolveTerminalColor`, `createTerminalPalette`
-and their prop types are exported from the package root and `assistant-ui/shell`.
+and their prop types are exported from the package root, `assistant-ui` and `assistant-ui/shell`.
 The surface renders the generated `TerminalScreen` DOM lines/runs; it has no
 JavaScript terminal emulator, client actions, network transport, or PTY ownership.
 The host owns subscriptions, grants, incarnation fences, resize actions and process
 lifecycle. The drawer accepts one `screen` and `connection` per agent, with no tabs.
-`open`, `height` and `onHeight` are controlled; Close calls `onDetach` then `onToggle`,
+`open`, `height` and `onHeight` are controlled. Pointer resizing previews locally
+and commits `onHeight` once on release; keyboard resizing commits immediately.
+Close (including Enter on the resize separator) calls `onDetach` then `onToggle`,
 not `onKill`. Ending the process requires the destructive confirmation dialog.
+Bell notifications remain host-owned: the projected screen has no bell field, so
+the kit does not expose an unobservable `onBell` callback.
 
 `onInput(data)` receives plain strings containing valid UTF-8 escape sequences,
 never base64. The kit alone encodes application cursor/keypad modes, normalizes
@@ -192,6 +196,11 @@ cursor and drawer lifecycle in both themes. Each scenario exposes `defect`, a
 negative-control fixture/behavior that must make that scenario's play fail.
 Null-screen SSR renders a static connection placeholder; screen SSR renders DOM
 runs without accessing browser globals.
+
+`test:terminal` server-renders null and real screens in both schemes with no
+`window`, and asserts that terminal modules import no emulator or runtime client
+actions. The base placeholder and forbidden imports are checked as failing
+controls.
 
 ## Clean-room note
 

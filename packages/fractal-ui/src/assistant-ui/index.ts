@@ -15,6 +15,10 @@ export type { Draft, DraftToken, MentionToken, CommandToken, SerializedDraft, Sl
 /** Reusable round-2 live composition primitives; transport stays application-owned. */
 export { AgentRow, StatusGlyph } from './composition/Sidebar.tsx'
 export { ThreadHeader, ResizableSplit } from './composition/Shell.tsx'
+export { TerminalSurface } from './terminal/TerminalSurface'
+export { TerminalDrawer } from './terminal/TerminalDrawer'
+export { resolveTerminalColor, createTerminalPalette } from './terminal/terminal-palette'
+export type { TerminalSurfaceProps, TerminalSurfaceHandle, TerminalDrawerProps, TerminalPalette, TerminalFont, TerminalConnection, TerminalColorInput, TerminalScreen } from './terminal/terminal-types'
 export { DiffPanel } from './composition/DiffPanel.tsx'
 export type { DiffPanelProps, DiffFile, DiffTurn, DiffRevealRequest } from './composition/DiffPanel.tsx'
 export { Markdown, ResourceChip, HighlightedSource, completeStreamingTail } from './composition/Markdown.tsx'

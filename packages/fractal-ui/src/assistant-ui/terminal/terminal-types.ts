@@ -10,7 +10,7 @@ export interface TerminalSurfaceProps {
   readonly screen: TerminalScreen | null; readonly connection: TerminalConnection; readonly readOnly: boolean; readonly palette: TerminalPalette
   readonly font?: TerminalFont; readonly scrollbackLines?: number; readonly focusRing?: boolean; readonly readOnlyReason?: string
   readonly onInput?: (data: string) => void; readonly onPaste?: (text: string) => void; readonly onResize?: (size: { readonly cols: number; readonly rows: number }) => void
-  readonly onCopy?: (text: string) => void; readonly onFocusChange?: (focused: boolean) => void; readonly onBell?: () => void
+  readonly onCopy?: (text: string) => void; readonly onFocusChange?: (focused: boolean) => void
   readonly onRecover?: () => void; readonly recoveryLabel?: string; readonly handleRef?: React.Ref<TerminalSurfaceHandle>; readonly label?: string
 }
 /** One terminal per agent. Closing detaches the view, not the process. */
