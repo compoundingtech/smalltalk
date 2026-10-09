@@ -68,10 +68,13 @@ const idleSampleTurns: readonly TranscriptTurn[] = [
   { id: 'design/review', prompt: idleSampleItems[0] as TextItem & { role: 'user' }, items: idleSampleItems.slice(1, -1), work: workLogTurnFromItems(idleSampleItems.slice(1, -1), { kindFor: name => name === 'read' ? 'read' : name === 'edit' ? 'edit' : 'run', running: false, failed: false, interrupted: false, completeHistory: true }) },
   { id: 'design/next', prompt: idleSampleItems.at(-1) as TextItem & { role: 'user' }, items: [], work: { ...settledWork, durationMs: undefined } },
 ]
+// Exact route worker-2 seed: designItems('idle', 'peer') with `peer-` ids, one delivered review and its answer.
+const peerItems = idleSampleItems.filter(item => item.id === 'design/peer-review' || item.id === 'design/result').map(item => ({ ...item, id: `peer-${item.id}` }))
+const peerTurns: readonly TranscriptTurn[] = [{ id: 'peer-design/peer-review', prompt: peerItems[0] as TextItem & { role: 'user' }, items: peerItems.slice(1), work: { ...settledWork, durationMs: undefined } }]
 const currentTurnFiles: readonly DiffFile[] = [{ path: 'sample/rows.ts', diff: ['@@ -1,2 +1,3 @@', '-const rows = [1, 2, 3]', '+const rows = [1, 2, 3, 4]', '+', ' export { rows }'], added: 2, removed: 1 }]
 const branchFiles: readonly DiffFile[] = [...currentTurnFiles, { path: 'sample/README.md', diff: ['@@ -1 +1,3 @@', ' # Synthetic sample', '+', '+Four rows are ready for review.'], added: 2, removed: 0 }]
 const initialWorkbenchResources = {
-  threads: new Map([['agent:worker-1', projectThread([...initialTurns('worker-1'), liveTurn], true)], ['agent:worker-2', projectThread(initialTurns('worker-2'), false)]]),
+  threads: new Map([['agent:worker-1', projectThread([...initialTurns('worker-1'), liveTurn], true)], ['agent:worker-2', projectThread(peerTurns, false, Date.parse(sampleAt) + 30000)]]),
   diffs: new Map([['diff:sample/rows.ts', { lines: currentTurnFiles[0]!.diff, path: 'sample/rows.ts', added: 2, removed: 1, currentTurnFiles, branchFiles }]]),
   terminals: terminalFixtureFrame,
 }
