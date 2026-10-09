@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Run the strict outbound-only real-network timing test once in the optional performance job",
+  "replay": {"status": "none", "detail": "CI test routing only; no claim replay or rebuild."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No authority or claim rule change."},
+  "compatibility": {"status": "none", "detail": "The existing timing test and all its assertions are unchanged. Required CI retains the deterministic backoff and inbound/route controls."},
+  "downtime": {"status": "none", "detail": "No production runtime change."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "No production retry, cancellation or recovery change."}
+}

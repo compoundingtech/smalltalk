@@ -11172,6 +11172,59 @@ mission "queue-parity" state="ready" {
     }
 
     #[tokio::test]
+    async fn agent_lifecycle_declaration_updates_live_roster_rows() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let writer = state.clone();
+        let apply = |lifecycle: Option<&str>, key: &str| {
+            let field = lifecycle.map(|value| format!("lifecycle \"{value}\";")).unwrap_or_default();
+            let source = format!("version 2\nagent \"example/purpose\" {{ {field} command \"true\" }}");
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let planned = writer.store.mission(&intent, IntentInput {
+                kdl: source, source_name: None,
+            }).unwrap();
+            writer.store.apply(&intent, &planned.subject_tokens, key).unwrap();
+            signal_changed(&writer);
+        };
+        apply(Some("standing"), "lifecycle-initial");
+        let app = axum::Router::new().route("/stream", axum::routing::get(
+            move |upgrade: WebSocketUpgrade| {
+                let state = state.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| collection_stream_socket_with_reader(
+                        socket, state, ClientSession::local(None).unwrap(), None,
+                        |state, session, request, permit| async move {
+                            collection_items(&state, &session, &request, permit).await
+                        },
+                    ))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"lifecycle","collection":"agents","limit":2}).to_string().into(),
+        )).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["kind"], "snapshot");
+        assert_eq!(frame["items"][0]["lifecycle"], "standing");
+        for (lifecycle, key) in [(Some("owner"), "lifecycle-owner"), (Some("bounded"), "lifecycle-bounded"), (None, "lifecycle-removed")] {
+            apply(lifecycle, key);
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["kind"], "changes", "{frame}");
+            assert_eq!(frame["upserts"][0]["id"], "agent/example/purpose");
+            assert_eq!(frame["upserts"][0].get("lifecycle"), lifecycle.map(|value| json!(value)).as_ref());
+        }
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn agent_roster_warm_ws_read_bypasses_a_cold_builder_admission() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());

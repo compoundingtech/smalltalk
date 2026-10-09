@@ -31,6 +31,8 @@ Keys (`?` shows them all): `Ctrl+K` opens anything (agents, missions, machines, 
 was said in conversations); `Tab` and `Shift+Tab` move between a split's tabs; `Alt+arrows` move
 between splits; `Ctrl+T`, `Ctrl+V`, `Ctrl+X` and `Ctrl+W` open a tab, split right or below, and
 close a tab; `Ctrl+S` shows the sidebar and `Ctrl+H` opens Home over the space; `Ctrl+Q` quits.
+Middle-click a tab to close it: press and release over the same tab. This uses the same
+close action as `Ctrl+W` and the tab's right-click menu.
 In a conversation, letters type into its message box and commands are chords: `Ctrl+F` finds,
 `Ctrl+E` expands tool output, `Ctrl+P` simplifies, `Ctrl+D` shows the agent's details, `Ctrl+]`
 attaches the agent's terminal and `Ctrl+\` leaves it. A drag selects text in one pane and copies
