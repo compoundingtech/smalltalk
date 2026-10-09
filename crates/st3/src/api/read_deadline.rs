@@ -185,8 +185,14 @@ fn forwarded_deadline(operation: &crate::peer::ClientReadOperation) -> Option<Du
 }
 
 fn timeout_response(state: &AppState, path: &str) -> Response {
+    if let Some(trace) = crate::relay_trace::current() {
+        trace.finish(crate::relay_trace::Outcome::TimedOut);
+    }
     let error = json!({"code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}});
     let request_id = super::new_request_id();
+    if let Some(trace) = crate::relay_trace::current() {
+        trace.response(&request_id);
+    }
     let value = if path.starts_with("/v1/client/") {
         super::client_error_envelope(StatusCode::GATEWAY_TIMEOUT, &error, &request_id)
     } else {
@@ -211,11 +217,58 @@ fn body_timeout_response(state: &AppState) -> Response {
 
 pub(super) async fn envelope(
     state: (AppState, ClientTransportBoundary),
-    mut request: Request<Body>,
+    request: Request<Body>,
     next: Next,
 ) -> Response {
     let started = std::time::Instant::now();
+    let caller = request
+        .extensions()
+        .get::<crate::profile::Caller>()
+        .map(|caller| caller.0.as_ref())
+        .unwrap_or("");
+    let trace = crate::relay_trace::gateway(
+        request
+            .uri()
+            .path_and_query()
+            .map_or("", |path| path.as_str()),
+        request
+            .headers()
+            .get(super::client_v0::LOCAL_PERSON_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        caller,
+        request.method() == Method::GET && matches!(state.1, ClientTransportBoundary::Unix),
+        request.extensions().get::<crate::relay_trace::Connection>(),
+    );
+    let _root = trace.as_ref().map(crate::relay_trace::Trace::guard);
+    let response = crate::relay_trace::scope(trace.clone(), async {
+        let mut span = crate::relay_trace::span(crate::relay_trace::Phase::Request);
+        let response = envelope_inner(state, request, next, started).await;
+        span.finish(if response.status().is_success() {
+            crate::relay_trace::Outcome::Completed
+        } else {
+            crate::relay_trace::Outcome::Failed
+        });
+        response
+    })
+    .await;
+    if let Some(trace) = trace {
+        trace.finish(if response.status().is_success() {
+            crate::relay_trace::Outcome::Completed
+        } else {
+            crate::relay_trace::Outcome::Failed
+        });
+    }
+    response
+}
+
+async fn envelope_inner(
+    state: (AppState, ClientTransportBoundary),
+    mut request: Request<Body>,
+    next: Next,
+    started: std::time::Instant,
+) -> Response {
     let mut duration = deadline(&request);
+    let mut forwarding_trace = None;
     if request.method() == Method::POST
         && request.uri().path() == crate::peer::CLIENT_READ_FORWARD_PATH
     {
@@ -240,9 +293,50 @@ pub(super) async fn envelope(
         };
         if let Ok(forwarded) = serde_json::from_slice::<crate::peer::ClientReadRequest>(&bytes) {
             duration = forwarded_deadline(&forwarded.request);
+            if matches!(
+                &forwarded.request,
+                crate::peer::ClientReadOperation::Timeline { .. }
+            ) {
+                let caller = parts
+                    .extensions
+                    .get::<crate::profile::Caller>()
+                    .map(|caller| caller.0.as_ref())
+                    .unwrap_or("");
+                forwarding_trace = crate::relay_trace::forwarded(
+                    &bytes,
+                    caller,
+                    matches!(state.1, ClientTransportBoundary::Unix),
+                    parts.extensions.get::<crate::relay_trace::Connection>(),
+                );
+            }
         }
         request = Request::from_parts(parts, Body::from(bytes));
     }
+    if let Some(trace) = forwarding_trace {
+        let _root = trace.guard();
+        let response = crate::relay_trace::scope(
+            Some(trace.clone()),
+            envelope_work(state, request, next, started, duration),
+        )
+        .await;
+        trace.finish(if response.status().is_success() {
+            crate::relay_trace::Outcome::Completed
+        } else {
+            crate::relay_trace::Outcome::Failed
+        });
+        response
+    } else {
+        envelope_work(state, request, next, started, duration).await
+    }
+}
+
+async fn envelope_work(
+    state: (AppState, ClientTransportBoundary),
+    request: Request<Body>,
+    next: Next,
+    started: std::time::Instant,
+    duration: Option<Duration>,
+) -> Response {
     let Some(duration) = duration.map(|limit| limit.saturating_sub(started.elapsed())) else {
         return super::response_envelope_unbounded(axum::extract::State(state), request, next)
             .await;
@@ -329,6 +423,10 @@ where
         }
     });
     let worker_budget = budget.clone();
+    let diagnostic = crate::relay_trace::current();
+    let mut diagnostic_queue = diagnostic
+        .as_ref()
+        .map(|trace| trace.span(crate::relay_trace::Phase::BlockingQueue));
     let store = STORE.with(|slot| slot.borrow().clone());
     // Capture cancellation before executing an inline operation, including a panic.
     struct Cancel(Option<ReadBudget>);
@@ -343,28 +441,36 @@ where
     let profile = query.then(crate::profile::current).flatten();
     let queued = profile.as_ref().map(|op| op.wall_span("blocking/queue"));
     let run = move || {
+        if let Some(span) = &mut diagnostic_queue {
+            span.finish(crate::relay_trace::Outcome::Completed);
+        }
         drop(queued);
         let _work = profile.as_ref().map(|op| op.wall_span("blocking/work"));
-        with_store(store.clone(), || {
-            read_budget::with(worker_budget.clone(), || {
-                if let Some(budget) = &worker_budget {
-                    budget.check().map_err(WorkError::Deadline)?;
-                }
-                let result = if worker_budget.is_some() {
-                    match &store {
-                        Some(store) => store
-                            .readers
-                            .request_read(work)
-                            .map_err(|error| WorkError::Store(smallclaims::error::typed(error)))?,
-                        None => work(),
-                    }
-                } else {
-                    work()
-                };
-                if let Some(budget) = &worker_budget {
-                    budget.check().map_err(WorkError::Deadline)?;
-                }
-                Ok(result)
+        crate::relay_trace::blocking(diagnostic, || {
+            crate::relay_trace::result(crate::relay_trace::Phase::BlockingWork, || {
+                with_store(store.clone(), || {
+                    read_budget::with(worker_budget.clone(), || {
+                        if let Some(budget) = &worker_budget {
+                            budget.check().map_err(WorkError::Deadline)?;
+                        }
+                        let result = if worker_budget.is_some() {
+                            match &store {
+                                Some(store) => {
+                                    store.readers.request_read(work).map_err(|error| {
+                                        WorkError::Store(smallclaims::error::typed(error))
+                                    })?
+                                }
+                                None => work(),
+                            }
+                        } else {
+                            work()
+                        };
+                        if let Some(budget) = &worker_budget {
+                            budget.check().map_err(WorkError::Deadline)?;
+                        }
+                        Ok(result)
+                    })
+                })
             })
         })
     };

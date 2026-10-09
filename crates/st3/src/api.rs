@@ -450,6 +450,7 @@ impl IntoResponse for ApiError {
 }
 
 pub fn router(state: AppState) -> Router {
+    crate::relay_trace::init();
     delivery_presence::start();
     router_for_transport(state, ClientTransportBoundary::Unix)
 }
@@ -989,14 +990,22 @@ async fn response_envelope_unbounded(
         let transport = transport.as_str();
         let auth_profile = profile.clone();
         let admission_queue = profile.as_ref().map(|op| op.wall_span("admission/queue"));
+        let mut diagnostic_queue =
+            crate::relay_trace::span(crate::relay_trace::Phase::AdmissionQueue);
         let admitted = crate::api::read_deadline::spawn_blocking(move || {
+            diagnostic_queue.finish(crate::relay_trace::Outcome::Completed);
             drop(admission_queue);
             let _entered = crate::profile::enter(auth_profile.as_ref());
             let authentication_span = crate::profile::span("admission/authenticate");
-            let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
+            let authentication =
+                crate::relay_trace::result(crate::relay_trace::Phase::Authenticate, || {
+                    client_v0::authenticate(&auth_state, &auth_request, transport)
+                });
             drop(authentication_span);
             let snapshot_span = crate::profile::span("admission/snapshot");
-            let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
+            let snapshot = crate::relay_trace::work(crate::relay_trace::Phase::Snapshot, || {
+                client_request_snapshot(&auth_state, cursor_snapshot.flatten())
+            });
             drop(snapshot_span);
             (authentication, snapshot)
         })
@@ -1029,15 +1038,20 @@ async fn response_envelope_unbounded(
             let cpu_kind = request_route.clone();
             let cpu_client = caller.clone();
             let handler_queue = profile.as_ref().map(|op| op.wall_span("handler/queue"));
+            let mut diagnostic_queue =
+                crate::relay_trace::span(crate::relay_trace::Phase::HandlerQueue);
             let forwarded_handler = request_path == crate::peer::CLIENT_READ_FORWARD_PATH;
             match crate::api::read_deadline::spawn_handler(move || {
+                diagnostic_queue.finish(crate::relay_trace::Outcome::Completed);
                 drop(handler_queue);
                 if let Some(profile) = &handler_profile {
                     profile.queued();
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
                 crate::performance::with_cpu(Some(&cpu_kind), Some(&cpu_client), || {
-                    runtime.block_on(async move {
+                    let mut diagnostic_handler =
+                        crate::relay_trace::span(crate::relay_trace::Phase::Handler);
+                    let response = runtime.block_on(async move {
                         // Cancel the actual forwarded relay, not only its outer waiter.
                         // Other routes retain their existing cooperative cancellation;
                         // this transport's mutation variants carry no read budget.
@@ -1054,7 +1068,13 @@ async fn response_envelope_unbounded(
                         } else {
                             next.run(request).await
                         }
-                    })
+                    });
+                    diagnostic_handler.finish(if response.status().is_success() {
+                        crate::relay_trace::Outcome::Completed
+                    } else {
+                        crate::relay_trace::Outcome::Failed
+                    });
+                    response
                 })
             })
             .await
@@ -1084,6 +1104,7 @@ async fn response_envelope_unbounded(
         return response;
     }
     let enveloping = Instant::now();
+    let mut diagnostic_envelope = crate::relay_trace::span(crate::relay_trace::Phase::Envelope);
     let status = response.status();
     let (mut parts, body) = response.into_parts();
     // A page read inside one SQLite snapshot names that snapshot, which can be newer than the
@@ -1115,10 +1136,16 @@ async fn response_envelope_unbounded(
         state.store.index().unwrap_or_default()
     };
     let request_id = if client_request {
-        format!("request/{}", new_request_id())
+        crate::relay_trace::current().map_or_else(
+            || format!("request/{}", new_request_id()),
+            |trace| trace.id().to_owned(),
+        )
     } else {
         new_request_id()
     };
+    if let Some(trace) = crate::relay_trace::current() {
+        trace.response(&request_id);
+    }
     let envelope = if client_request && status.is_success() {
         json!({
             "api_version": CLIENT_API_VERSION,
@@ -1148,6 +1175,11 @@ async fn response_envelope_unbounded(
         })
     };
     let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
+    diagnostic_envelope.finish(if status.is_success() {
+        crate::relay_trace::Outcome::Completed
+    } else {
+        crate::relay_trace::Outcome::Failed
+    });
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     record_request_latency(
         &request_method,
@@ -1195,7 +1227,7 @@ fn record_request_latency(
     eprintln!("st3: slow request {path} took {} ms", elapsed.as_millis());
 }
 
-fn new_request_id() -> String {
+pub(crate) fn new_request_id() -> String {
     let mut bytes = [0_u8; 16];
     if getrandom::fill(&mut bytes).is_err() {
         let fallback = format!(
@@ -4724,10 +4756,14 @@ async fn client_sessions_detail(
 ) -> Result<Json<Value>, ApiError> {
     if let Some(id) = id.strip_suffix("/timeline") {
         // An agent's timeline is its current session's: st resolves it, not the client.
-        let session_id = client_v0::conversation_session_id(&state, id)?;
+        let session_id = crate::relay_trace::result(crate::relay_trace::Phase::Session, || {
+            client_v0::conversation_session_id(&state, id)
+        })?;
         let id = session_id.as_str();
-        let managed = managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
-            .map_err(ApiError::internal)?;
+        let managed = crate::relay_trace::result(crate::relay_trace::Phase::Owner, || {
+            managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
+        })
+        .map_err(ApiError::internal)?;
         if let Some((_, _, origin)) = managed {
             let remote_host = origin
                 .as_deref()
@@ -5647,24 +5683,37 @@ async fn serve_unix_with_ancestor_ready(
             }
         };
         // Every local connection names its caller, so request counts by client are always on.
+        let mut diagnostic_connection = crate::relay_trace::Connection::capture();
         let peer_pid = local_peer_pid(&stream);
         let app = app.clone();
         tokio::spawn(async move {
+            if let Some(connection) = &mut diagnostic_connection {
+                connection.dispatched();
+            }
             // /proc ancestry may fault in pages on a loaded host. Keep that work
             // out of the accept loop so a slow lookup delays only this peer.
-            let (bound_agent, caller, delivery_peer) = match peer_pid {
+            if let Some(connection) = &mut diagnostic_connection {
+                connection.queued();
+            }
+            let (bound_agent, caller, delivery_peer, diagnostic_connection) = match peer_pid {
                 Some(pid) => crate::api::read_deadline::spawn_blocking(move || {
+                    if let Some(connection) = &mut diagnostic_connection {
+                        connection.started();
+                    }
                     let bound_agent = bind_ancestry.then(|| ancestor(pid)).flatten();
                     let caller = Some(crate::profile::Caller::of_command(
                         local_process_arguments(pid).map(|(arguments, _)| arguments),
                         bound_agent.as_deref(),
                     ));
                     let delivery_peer = bind_harness.then(|| native_delivery_peer(pid)).flatten();
-                    (bound_agent, caller, delivery_peer)
+                    if let Some(connection) = &mut diagnostic_connection {
+                        connection.finished();
+                    }
+                    (bound_agent, caller, delivery_peer, diagnostic_connection)
                 })
                 .await
                 .unwrap_or_default(),
-                None => (None, None, None),
+                None => (None, None, None, diagnostic_connection),
             };
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let app = app.clone();
@@ -5673,6 +5722,9 @@ async fn serve_unix_with_ancestor_ready(
                 let delivery_peer = delivery_peer.clone();
                 async move {
                     let mut request = request.map(Body::new);
+                    if let Some(connection) = diagnostic_connection {
+                        request.extensions_mut().insert(connection);
+                    }
                     if let Some(pid) = peer_pid {
                         request.extensions_mut().insert(LocalPeer {
                             pid,
