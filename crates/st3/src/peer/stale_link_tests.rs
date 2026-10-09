@@ -58,9 +58,21 @@ async fn stale_dial_out_links_never_offer_reverse_routes() {
     let old_success = smallclaims::store::now_ms()
         - smallclaims::store::TRANSPORT_LINK_MAX_AGE_MS
         - smallclaims::store::TRANSPORT_LINK_CLOCK_SKEW_MS;
+    // A legacy peer's immutable observation still syncs and must age by its source time.
     states[2]
         .store
-        .record_transport_observation("birch", "up", None, Some(old_success))
+        .append_legacy_claim(&ClaimInput {
+            subject: "host/birch".into(),
+            kind: "transport.observed".into(),
+            actor: None,
+            fields: serde_json::from_value(
+                serde_json::json!({"status":"up","last_success_at":old_success}),
+            )
+            .unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
         .unwrap();
     states[2]
         .store

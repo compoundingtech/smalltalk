@@ -28,6 +28,7 @@ pub struct SmalltalkRuntime {
     pub(crate) subject_cache: Mutex<SubjectCache>,
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
+    pub(crate) latest_cache_id: Mutex<u64>,
     pub(crate) agent_resources_cache: Mutex<VecDeque<AgentResourcesEntry>>,
     /// Ordering and queue metadata for lazy HTTP pages, shared at the same graph cuts.
     pub(crate) agent_page_refs_cache: Mutex<VecDeque<AgentResourcesEntry>>,
@@ -169,6 +170,9 @@ impl Runtime for SmalltalkRuntime {
 
     fn create_schema(&self, connection: &Connection) -> Result<()> {
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(latest_values::SCHEMA)?;
+        connection.execute_batch(numeric_values::SCHEMA)?;
+        latest_values::initialize_epoch(connection)?;
         connection.execute_batch(arrangements::SCHEMA)?;
         usage_period::create_schema(connection)?;
         migrate_local_usage_seen(connection)?;
@@ -215,6 +219,7 @@ impl Runtime for SmalltalkRuntime {
         agent_messages::open(transaction)?;
         arrangements::open(transaction)?;
         limits::open_limits(transaction)?;
+        numeric_values::open(transaction)?;
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
@@ -253,6 +258,14 @@ impl Runtime for SmalltalkRuntime {
 
     fn schema_digest(&self) -> String {
         compatibility_digest(&self.claim_registry().digest())
+    }
+
+    fn current_observation_sql(&self, kind: &str, sql: &str) -> String {
+        if is_current_value(kind) {
+            current_sql(sql)
+        } else {
+            sql.to_owned()
+        }
     }
 
     fn classify_replicated_claim(

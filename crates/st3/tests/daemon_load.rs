@@ -171,6 +171,7 @@ struct Report {
     fixture_legacy_reconstruction_ms: f64,
     #[serde(default)]
     store_open_ms: f64,
+    current_dropped: usize,
     paths: BTreeMap<String, PathReport>,
     failed: BTreeMap<String, usize>,
 }
@@ -833,6 +834,7 @@ fn print(report: &Report) {
         "\n== load test: scale {}, {} claims, {:.0}s, daemon {:.2} cores",
         report.scale, report.claims, report.seconds, report.daemon_cores
     );
+    println!("current samples dropped on writer contention: {}", report.current_dropped);
     println!(
         "agents roster: {}/{} concurrent subscribers with correct snapshots; {} validated change frames; window limit {}",
         report.roster_subscribers, ROSTER_SUBSCRIBERS, report.roster_change_frames, ROSTER_LIMIT
@@ -904,6 +906,7 @@ struct Context {
     subjects: Subjects,
     /// Turns, so each request kind cycles through seats and reads.
     turns: AtomicUsize,
+    current_dropped: AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -1156,6 +1159,7 @@ fn run(
         daemon: daemon.handle().clone(),
         subjects,
         turns: AtomicUsize::new(0),
+        current_dropped: AtomicUsize::new(0),
     });
     // Let the daemon settle after opening: its first reconciler pass is not the load's.
     std::thread::sleep(Duration::from_secs(5));
@@ -1470,6 +1474,7 @@ fn run(
         migration_pending_at_load_end,
         fixture_legacy_reconstruction_ms,
         store_open_ms,
+        current_dropped: context.current_dropped.load(Ordering::Relaxed),
         paths,
         failed,
     }
@@ -1759,13 +1764,22 @@ async fn send_one(context: &Context, name: &str) -> Result<(), String> {
                 sequence: turn as u64 + 1,
                 claim,
             };
-            on_daemon(context, move |store| {
-                store
-                    .append_harness_event(&publication)
-                    .map(drop)
-                    .map_err(|error| error.message)
+            let current = st3::store::is_current_input(&publication.claim);
+            let result = on_daemon(context, move |store| {
+                Ok(store.append_harness_event(&publication).map(drop))
             })
-            .await
+            .await?;
+            match result {
+                Err(error)
+                    if current
+                        && error.code == "internal"
+                        && error.message.contains("database is locked") =>
+                {
+                    context.current_dropped.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                result => result.map_err(|error| error.message),
+            }
         }
         "seat mailbox page" => {
             get(format!(
@@ -1910,7 +1924,11 @@ async fn replication_exchange(context: &Context, turn: usize, key: &str) -> Resu
     let key = key.to_owned();
     // The peer's side runs on the load runtime: on a real fleet it is another machine.
     let (peer_inventory, exchange) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        peer.append_claim(&claim_input("harness.observed", &key, turn, ""))?;
+        // Current observations are outside graph inventories. Exercise durable replication
+        // with a fresh message rather than an empty register-only exchange.
+        let mut input = claim_input("message.sent", &key, turn, "");
+        input.subject = format!("message/{key}");
+        peer.append_claim(&input)?;
         let inventory =
             serde_json::from_value(summary["exchange"]["inventory"].clone()).unwrap_or_default();
         let exchange = peer.export_replication_exchange(FLEET, &inventory)?;

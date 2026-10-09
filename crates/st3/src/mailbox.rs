@@ -402,6 +402,80 @@ pub(crate) mod tests {
         assert_eq!(seat_label(&seat, None), "Qu]0;xartz");
     }
     #[test]
+    fn a_dropped_starting_observation_does_not_make_a_proven_local_launch_terminal() {
+        let store = Store::open_memory("node").unwrap();
+        let request = Fence::new("agent/eval.worker", "session-1", "delivery");
+        assert_eq!(
+            store.bind_mailbox(&request).unwrap_err().code,
+            "stale-mailbox-session"
+        );
+        assert!(store.mailbox_bootstrap_pending(&request).unwrap());
+        assert_eq!(
+            store
+                .readers
+                .get()
+                .query_row("SELECT count(*) FROM local_mailbox_bindings", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        store
+            .append_claim(&claim(
+                "agent/eval.worker",
+                "runtime.observed",
+                json!({"status":"starting","runtime_id":"eval.worker"}),
+                "runtime-starting",
+            ))
+            .unwrap();
+        assert!(store.mailbox_bootstrap_pending(&request).unwrap());
+        ready(&store, "session-1");
+        assert!(!store.mailbox_bootstrap_pending(&request).unwrap());
+        let bound = store.bind_mailbox(&request).unwrap();
+        assert_eq!(bound.epoch, 1);
+        // Startup fallback cannot turn an existing token/epoch into a fresh binding.
+        assert!(!store.mailbox_bootstrap_pending(&request).unwrap());
+        let successor = Fence::new("agent/eval.worker", "session-1", "delivery");
+        assert_eq!(store.bind_mailbox(&successor).unwrap().epoch, 2);
+        assert_eq!(
+            store.check_mailbox(&bound).unwrap_err().code,
+            "stale-mailbox-session"
+        );
+        assert!(!store.mailbox_bootstrap_pending(&bound).unwrap());
+    }
+
+    #[test]
+    fn native_bootstrap_cannot_wait_past_its_own_terminal_runtime_or_harness() {
+        for terminal in ["runtime", "harness"] {
+            let store = Store::open_memory("node").unwrap();
+            let request = Fence::new("agent/eval.worker", "session-1", "delivery");
+            if terminal == "runtime" {
+                store.append_claim(&claim("agent/eval.worker", "runtime.observed",
+                    json!({"status":"exited","runtime_id":"eval.worker","incarnation_id":"session-1"}),
+                    "runtime-exited")).unwrap();
+            } else {
+                store
+                    .append_claim(&claim(
+                        "agent/eval.worker",
+                        "harness.observed",
+                        json!({"state":"ended","driver":"omp","incarnation_id":"session-1"}),
+                        "harness-ended",
+                    ))
+                    .unwrap();
+            }
+            assert!(!store.mailbox_bootstrap_pending(&request).unwrap());
+            // A different, proven live launch may wait for its own lifecycle publication.
+            assert!(
+                store
+                    .mailbox_bootstrap_pending(&Fence::new(
+                        "agent/eval.worker",
+                        "replacement",
+                        "delivery"
+                    ))
+                    .unwrap()
+            );
+        }
+    }
+    #[test]
     fn mailbox_startup_waits_for_running_evidence_without_allocating_or_admitting_stale_sessions() {
         let store = Store::open_memory("node").unwrap();
         let request = Fence::new("agent/eval.worker", "session-1", "delivery");

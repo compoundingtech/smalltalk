@@ -801,16 +801,28 @@ const PROBES: &[Probe] = &[
     ),
     // Writes, each with a new idempotency key.
     post("POST /v1/claims", "/v1/claims", |fixture, attempt| {
-        let seat = &fixture.subjects.seats[0];
-        json!({
-            "subject": seat,
-            "kind": "harness.observed",
-            "actor": seat,
-            "fields": {"state": "working", "incarnation_id": format!("seat-0-{attempt}")},
-            "evidence": [],
-            "idempotency_key": format!("cost-heartbeat-{attempt}"),
+        serde_json::to_value(claim_input(
+            "message.sent",
+            &format!("cost-claim-{attempt}"),
+            attempt,
+            "",
+        ))
+        .map(|mut input| {
+            input["actor"] = json!(fixture.subjects.seats[0]);
+            input["subject"] = json!(format!("message/cost-claim-{attempt}"));
+            input
         })
+        .unwrap()
     }),
+    direct(
+        "POST /v1/internal/current-value",
+        |store, fixture, attempt| {
+            store
+                .receive_current_value(&fixture.current_reports[attempt])
+                .map(|changed| json!({"changed":changed}))
+                .map_err(|error| error.message)
+        },
+    ),
     post("POST /v1/messages", "/v1/messages", |fixture, attempt| {
         json!({
             "idempotency_key": format!("cost-message-{attempt}"),
@@ -1256,6 +1268,7 @@ struct Fixture {
     acknowledgments: Vec<(String, String)>,
     peer_inventory: Value,
     peer_exchange: Value,
+    current_reports: Vec<st3::model::ClaimRecord>,
 }
 
 impl Fixture {
@@ -1397,6 +1410,10 @@ async fn no_request_does_work_that_grows_with_the_store() {
         );
     }
     let (small, large) = (&measured[0], &measured[1]);
+    for measurement in [small, large] {
+        assert!(measurement.costs["POST /v1/internal/current-value"].vm_steps > 0,
+            "the independent current-value connection must participate in SQLite work accounting");
+    }
 
     let mut failures = Vec::new();
     let mut rows = Vec::new();
@@ -1844,6 +1861,24 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         !event_page["items"].as_array().unwrap().is_empty(),
         "measure a populated event page, not a refused or empty traversal"
     );
+    let current_source = Store::open_memory(NODE).unwrap();
+    fixture.current_reports = (0..4)
+        .map(|attempt| {
+            let mut input = claim_input(
+                "harness.observed",
+                &format!("cost-current-{attempt}"),
+                attempt,
+                "",
+            );
+            input.subject = fixture.subjects.seats[0].clone();
+            input.actor = Some(input.subject.clone());
+            input.fields.insert("driver".into(), json!("codex"));
+            input
+                .fields
+                .insert("incarnation_id".into(), json!(SEAT_RUNTIME));
+            current_source.append_claim(&input).unwrap()
+        })
+        .collect();
 
     let mut costs = BTreeMap::new();
     for probe in PROBES {
@@ -1905,6 +1940,14 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     }
     // A real seat update invalidates its card between every read. Count only the read, using
     // the same canonical claim path as a driver; the warm probe above remains unchanged.
+    let page: Value = person.get("/v1/client/agents").await.unwrap();
+    let card_subject = page["items"][0]["id"].as_str().unwrap().to_owned();
+    let mut running = claim_input("runtime.observed", "cost-visible-card-running", 0, "");
+    running.subject = card_subject.clone();
+    running.actor = Some(card_subject.clone());
+    running.fields.insert("status".into(), json!("running"));
+    running.fields.insert("incarnation_id".into(), json!(SEAT_RUNTIME));
+    store.append_claim(&running).unwrap();
     let mut samples = Vec::new();
     for attempt in 0..4 {
         let mut observation = claim_input(
@@ -1913,7 +1956,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
             attempt,
             "",
         );
-        observation.subject = fixture.subjects.seats[0].clone();
+        observation.subject = card_subject.clone();
         observation.actor = Some(observation.subject.clone());
         observation
             .fields
@@ -1923,12 +1966,18 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
             json!(if attempt % 2 == 0 { "idle" } else { "working" }),
         );
         observation.fields.insert("driver".into(), json!("codex"));
+        observation.fields.insert("provider_auth".into(), json!(true));
+        observation.fields.insert("observed_at_ms".into(), json!(st_drivers::message::now_ms()));
         store.append_claim(&observation).unwrap();
         let cost = counted(|| async {
-            person
+            let page = person
                 .get::<Value>("/v1/client/agents")
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            let card = page["items"].as_array().unwrap().iter()
+                .find(|item| item["id"] == card_subject).expect("the changed card remains visible");
+            assert_eq!(card["harness_state"], if attempt % 2 == 0 { "idle" } else { "working" });
+            Ok(page)
         })
         .await;
         if attempt > 0 {
@@ -2169,6 +2218,7 @@ async fn fixture(person: &Client, client: &Client, subjects: Subjects) -> Fixtur
         custom_replies: Vec::new(),
         peer_inventory: Value::Null,
         peer_exchange: Value::Null,
+        current_reports: Vec::new(),
     }
 }
 
@@ -2302,9 +2352,9 @@ fn write_claims(store: &Store, origin: &str, round: usize) {
     for n in 0..3 {
         let index = 1_000_000 + round * 10 + n;
         let key = format!("cost-replication-{origin}-{index}");
-        store
-            .append_claim(&claim_input("harness.observed", &key, index, ""))
-            .unwrap();
+        let mut input = claim_input("message.sent", &key, index, "");
+        input.subject = format!("message/{key}");
+        store.append_claim(&input).unwrap();
     }
 }
 

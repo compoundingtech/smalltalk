@@ -269,7 +269,11 @@ impl Daemon {
     }
 
     async fn post(&self, input: ClaimInput) -> ClaimRecord {
-        self.client.post("/v1/claims", &input).await.unwrap()
+        if st3::store::is_current_input(&input) {
+            self.store.append_claim(&input).unwrap()
+        } else {
+            self.client.post("/v1/claims", &input).await.unwrap()
+        }
     }
 }
 
@@ -490,6 +494,7 @@ async fn run_workload(seconds: u64) -> Report {
 
     let mut harnesses = (0..HARNESSES).map(Harness::new).collect::<Vec<_>>();
     let mut state_changes = BTreeMap::<String, Vec<ClaimRecord>>::new();
+    let mut posted = BTreeMap::<String, u64>::new();
     let mut messages = Vec::new();
     daemon.observe("version = 0\n").await;
     for second in 0..=seconds {
@@ -497,12 +502,13 @@ async fn run_workload(seconds: u64) -> Report {
         for harness in &mut harnesses {
             let before = harness.transitions;
             for record in harness.tick(&daemon, second, last).await {
+                *posted.entry(record.kind.clone()).or_default() += 1;
                 if record.kind == "message.sent" {
                     messages.push(record);
                 } else if record.kind == "harness.observed" && harness.transitions != before {
                     assert!(
-                        local_observation_position(&record).is_none(),
-                        "a state change replicates at once"
+                        local_observation_position(&record).is_some(),
+                        "state changes replace the current register"
                     );
                     state_changes
                         .entry(harness.subject.clone())
@@ -522,6 +528,13 @@ async fn run_workload(seconds: u64) -> Report {
     }
 
     let store = daemon.store.clone();
+    // Simulated providers stop here; the real daemon performs this durable flush separately
+    // from its best-effort current-status publication.
+    for harness in &harnesses {
+        store
+            .flush_pending_usage(&harness.subject, "inc-1")
+            .unwrap();
+    }
     daemon.stop().await;
     let all = claims(&store);
     let workload = all
@@ -529,18 +542,14 @@ async fn run_workload(seconds: u64) -> Report {
         .filter(|claim| claim.store_index > setup_index)
         .collect::<Vec<_>>();
     let local = store.local_observations_after(0, usize::MAX).unwrap();
-    let latest_claims = workload
-        .iter()
-        .filter(|claim| matches!(claim.kind.as_str(), "harness.observed" | "harness.usage"))
-        .count() as u64;
     // Per kind: (what main would replicate, what this build replicated). Main replicates
     // every observation the local log holds and every other claim this build replicated.
     let mut by_kind = BTreeMap::<String, (u64, u64)>::new();
     for claim in &workload {
         by_kind.entry(claim.kind.clone()).or_default().1 += 1;
     }
-    for observation in &local {
-        by_kind.entry(observation.kind.clone()).or_default().0 += 1;
+    for (kind, count) in posted {
+        by_kind.entry(kind).or_default().0 = count;
     }
     for (main, replicated) in by_kind.values_mut() {
         if *main == 0 {
@@ -571,30 +580,44 @@ async fn run_workload(seconds: u64) -> Report {
         );
     }
     for harness in &harnesses {
-        let replicated_states = replica
-            .claims_for(&harness.subject, Some("harness.observed"))
-            .unwrap();
-        let posted = &state_changes[&harness.subject];
-        assert_eq!(
-            replicated_states
-                .iter()
-                .map(|claim| claim.id.clone())
-                .collect::<Vec<_>>(),
-            posted
-                .iter()
-                .map(|claim| claim.id.clone())
-                .collect::<Vec<_>>(),
-            "every state change of {} and nothing else replicated",
-            harness.subject
+        assert!(
+            replica
+                .claims_for(&harness.subject, Some("harness.observed"))
+                .unwrap()
+                .is_empty()
         );
+        let current = store
+            .latest_claim(&harness.subject, Some("harness.observed"))
+            .unwrap()
+            .unwrap();
+        assert!(replica.receive_current_value(&current).unwrap());
         assert_eq!(
-            replicated_states.last().unwrap().body["fields"]["state"],
+            replica
+                .latest_claim(&harness.subject, Some("harness.observed"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]["state"],
             "idle"
         );
+        let context = store
+            .latest_claim(&harness.subject, Some("harness.usage"))
+            .unwrap()
+            .unwrap();
+        if context.body["fields"]["semantics"] == "context_occupancy" {
+            assert!(replica.receive_current_value(&context).unwrap());
+        }
         let usage = replica
             .claims_for(&harness.subject, Some("harness.usage"))
             .unwrap();
         for (semantics, fields) in &harness.last_usage {
+            if semantics == "context_occupancy" {
+                assert!(
+                    usage
+                        .iter()
+                        .all(|claim| claim.body["fields"]["semantics"] != "context_occupancy")
+                );
+                continue;
+            }
             let latest = usage
                 .iter()
                 .rev()
@@ -643,7 +666,7 @@ async fn run_workload(seconds: u64) -> Report {
     Report {
         seconds,
         replicated,
-        main_estimate: replicated - latest_claims + local.len() as u64,
+        main_estimate: by_kind.values().map(|(main, _)| *main).sum(),
         local_rows: local.len() as u64,
         by_kind,
     }

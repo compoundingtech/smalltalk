@@ -42,7 +42,7 @@ impl Daemon {
     }
 
     async fn start(&mut self) {
-        self.start_with_binding(false).await;
+        self.start_with_binding(true).await;
     }
 
     /// Protocol/receipt controls with fabricated incarnations and bare channel children.
@@ -181,8 +181,9 @@ impl Daemon {
     /// API's write lock fails with `SQLITE_LOCKED`. A waiting read treats that as "not yet".
     fn harness_states(&self, subject: &str, incarnation: &str) -> Vec<String> {
         self.store
-            .claims_for(subject, Some("harness.observed"))
-            .unwrap_or_default()
+            .latest_claim(subject, Some("harness.observed"))
+            .ok()
+            .flatten()
             .into_iter()
             .filter(|claim| {
                 claim
@@ -850,6 +851,7 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
     daemon.stop().await;
 
     let mut driver = seat_command(root, &daemon.socket)
+        .env("ST_AGENT", seat)
         .args(["driver", "claude", "--subject", seat, "--", "sleep", "300"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -976,6 +978,7 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
     daemon.start().await;
 
     let mut channel = seat_command(root, &daemon.socket)
+        .env("ST_AGENT", seat)
         .arg("--catalog")
         .arg(root.join("catalog"))
         .args(["driver", "omp-channel", "--identity", "restart-omp"])
@@ -1008,8 +1011,10 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
     assert!(daemon.harness_states(seat, incarnation).is_empty());
 
     daemon.start().await;
+    writeln!(input, "{}", json!({"type":"state", "state":"idle"})).unwrap();
+    input.flush().unwrap();
     wait_until(
-        "the channel publishes the state it kept",
+        "the channel publishes a fresh state after the outage",
         Duration::from_secs(10),
         || daemon.harness_states(seat, incarnation) == ["idle"],
     )
@@ -1087,10 +1092,24 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
         ]}], "totals":{"pending":0,"in_progress":1,"completed":0,"blocked":0},
         "truncated":false});
     st_drivers::harness_events::enable(&dir, &incarnation).unwrap();
-    let mut fields = st_drivers::pi_channel::todo_observation(&todo, "omp", Some("native"), &incarnation).unwrap();
+    let mut fields =
+        st_drivers::pi_channel::todo_observation(&todo, "omp", Some("native"), &incarnation)
+            .unwrap();
     fields.get_mut("phases").unwrap()[0]["tasks"][0]["content"] = "Older rejected hydration".into();
     st_drivers::harness_events::write_channel_todo(&dir, &incarnation, &json!(fields)).unwrap();
-    let event = st_drivers::harness_events::pending(&dir, 10).unwrap().remove(0);
+    // Model an actual older-build pending event; modern current writers enqueue nothing.
+    let raw = st_drivers::harness_events::read_snapshot(&dir, "harness-todo")
+        .unwrap()
+        .unwrap();
+    let connection =
+        rusqlite::Connection::open(st_drivers::harness_events::database_path(&dir)).unwrap();
+    connection.execute("INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES (?1,0,'harness-todo',?2)",
+        rusqlite::params![incarnation, String::from_utf8(raw).unwrap()]).unwrap();
+    connection.execute("UPDATE metadata SET value=(SELECT sum(length(CAST(body AS BLOB))) FROM events) WHERE key='pending-bytes'", []).unwrap();
+    drop(connection);
+    let event = st_drivers::harness_events::pending(&dir, 10)
+        .unwrap()
+        .remove(0);
     let mut bad_fields: BTreeMap<String, Value> = serde_json::from_value(event.payload).unwrap();
     bad_fields.remove("incarnation");
     let rejected = ClaimInput {
@@ -1121,8 +1140,10 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
     for frame in [
         json!({"type":"ready", "sessionId":"native"}),
         json!({"type":"state", "state":"idle"}),
-        todo,
-    ] { writeln!(input, "{frame}").unwrap(); }
+        todo.clone(),
+    ] {
+        writeln!(input, "{frame}").unwrap();
+    }
     input.flush().unwrap();
     daemon.send("message/restart-todo-mail", seat, "GRAPH LAG MAIL");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1138,14 +1159,37 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
         }
     }
     assert_alive(&mut channel, "the graph-lag channel");
-    assert!(daemon.store.claims_for(seat, Some("harness.todo.observed")).unwrap().is_empty());
+    assert!(
+        daemon
+            .store
+            .claims_for(seat, Some("harness.todo.observed"))
+            .unwrap()
+            .is_empty()
+    );
     daemon.observe_running(seat, &incarnation);
+    let mut fresh_todo = todo;
+    fresh_todo["observed_at"] = "2026-10-03T20:00:02Z".into();
+    writeln!(input, "{fresh_todo}").unwrap();
+    input.flush().unwrap();
     let deadline = Instant::now() + Duration::from_secs(65);
-    while !daemon.store.claims_for(seat, Some("harness.todo.observed")).unwrap_or_default().iter()
-            .any(|claim| claim.body.pointer("/fields/incarnation_id").and_then(Value::as_str)
-                    == Some(incarnation.as_str())
-                && claim.body.pointer("/fields/phases/0/tasks/0/content").and_then(Value::as_str)
-                    == Some("Preserved through graph lag"))
+    while !daemon
+        .store
+        .latest_claim(seat, Some("harness.todo.observed"))
+        .ok()
+        .flatten()
+        .into_iter()
+        .any(|claim| {
+            claim
+                .body
+                .pointer("/fields/incarnation_id")
+                .and_then(Value::as_str)
+                == Some(incarnation.as_str())
+                && claim
+                    .body
+                    .pointer("/fields/phases/0/tasks/0/content")
+                    .and_then(Value::as_str)
+                    == Some("Preserved through graph lag")
+        })
     {
         assert!(Instant::now() < deadline, "hydration after graph catch-up: {}", driver_log(root));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1258,10 +1302,15 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
     daemon.start().await;
     let client = st3::client::Client::unix(&daemon.socket);
     let mut channel = seat_command(root, &daemon.socket)
-        .arg("--catalog").arg(root.join("catalog"))
+        .env("ST_AGENT", seat)
+        .arg("--catalog")
+        .arg(root.join("catalog"))
         .args(["driver", "omp-channel", "--identity", "human-omp"])
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let mut input = channel.stdin.take().unwrap();
 
     writeln!(input, "{}", json!({
@@ -1288,13 +1337,30 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
     })).unwrap();
     writeln!(input, "{}", json!({"type": "state", "state": "active"})).unwrap();
     input.flush().unwrap();
-    wait_until("the channel publishes the answered state", Duration::from_secs(10), || {
-        daemon.harness_states(seat, incarnation) == ["working", "working"]
-    }).await;
-    let status: st3::model::StatusResponse =
-        client.get(&format!("/v1/status?subject={seat}")).await.unwrap();
-    let answered = status.subjects.into_iter().find(|status| status.subject == seat)
-        .unwrap().harness.unwrap();
+    wait_until(
+        "the channel publishes the answered state",
+        Duration::from_secs(10),
+        || {
+            daemon
+                .store
+                .current_harness(seat)
+                .ok()
+                .flatten()
+                .is_some_and(|state| state.state == "working" && state.blocked_on.is_none())
+        },
+    )
+    .await;
+    let status: st3::model::StatusResponse = client
+        .get(&format!("/v1/status?subject={seat}"))
+        .await
+        .unwrap();
+    let answered = status
+        .subjects
+        .into_iter()
+        .find(|status| status.subject == seat)
+        .unwrap()
+        .harness
+        .unwrap();
     assert_eq!(answered.state, "working");
     assert!(answered.blocked_on.is_none());
     assert!(answered.ask.is_none());
@@ -1303,18 +1369,42 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
 
     // A delayed ask from the old channel must not block a resumed runtime's fresh idle proof.
     daemon.observe_running(seat, "human-2");
-    daemon.append(seat, "harness.observed", json!({
-        "state": "idle", "driver": "omp", "incarnation_id": "human-2",
-        "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
-    }));
-    daemon.append(seat, "harness.observed", json!({
-        "state": "working", "driver": "omp", "incarnation_id": incarnation,
-        "blocked_on": "human", "ask": "question", "reason": "An obsolete question",
-    }));
-    let status: st3::model::StatusResponse =
-        client.get(&format!("/v1/status?subject={seat}")).await.unwrap();
-    let resumed = status.subjects.into_iter().find(|status| status.subject == seat)
-        .unwrap().harness.unwrap();
+    daemon.append(
+        seat,
+        "harness.observed",
+        json!({
+            "state": "idle", "driver": "omp", "incarnation_id": "human-2",
+            "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
+        }),
+    );
+    let stale = daemon
+        .store
+        .append_claim(&ClaimInput {
+            subject: seat.into(),
+            kind: "harness.observed".into(),
+            actor: Some(seat.into()),
+            fields: serde_json::from_value(json!({
+                "state":"working", "driver":"omp", "incarnation_id":incarnation,
+                "blocked_on":"human", "ask":"question", "reason":"An obsolete question",
+            }))
+            .unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap_err();
+    assert_eq!(stale.code, "stale-harness-event-session");
+    let status: st3::model::StatusResponse = client
+        .get(&format!("/v1/status?subject={seat}"))
+        .await
+        .unwrap();
+    let resumed = status
+        .subjects
+        .into_iter()
+        .find(|status| status.subject == seat)
+        .unwrap()
+        .harness
+        .unwrap();
     assert_eq!(resumed.state, "idle");
     assert_eq!(resumed.incarnation_id, "human-2");
     assert!(resumed.blocked_on.is_none());

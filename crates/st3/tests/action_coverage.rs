@@ -3468,10 +3468,10 @@ async fn cli_replication_inspection_and_repair_survive_restart() {
     let source = Store::open_memory("fixture-source").unwrap();
     let replacement = source
         .append_claim(&ClaimInput {
-            subject: "host/fixture-source".into(),
-            kind: "transport.observed".into(),
+            subject: "agent/fixture-source".into(),
+            kind: "runtime.observed".into(),
             actor: None,
-            fields: serde_json::from_value(json!({"status": "up"})).unwrap(),
+            fields: serde_json::from_value(json!({"status": "running", "runtime_id":"fixture-source", "incarnation_id":"one"})).unwrap(),
             evidence: Vec::new(),
             expected_subject: None,
             idempotency_key: Some("coverage-replacement".into()),

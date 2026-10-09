@@ -212,6 +212,24 @@ impl CardReads {
                 chunks.push_back(vec![subject]);
             }
         }
+        let mut registers = connection.prepare_cached(
+            "SELECT subject,kind,body FROM latest_values
+             WHERE subject IN (SELECT value FROM json_each(?1))
+             AND kind='workspace.observed' ORDER BY source_at,source_id",
+        )?;
+        for chunk in missing.chunks(CHUNK) {
+            for row in registers.query_map([json_list(chunk)?], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })? {
+                let (subject, kind, body) = row?;
+                if let Some(actual) = self.actual.get_mut(&subject) {
+                    actual.latest = fold_latest_values([
+                        (String::new(), actual.latest.take().unwrap_or(Value::Null)),
+                        (kind, serde_json::from_str(&body)?),
+                    ])?;
+                }
+            }
+        }
         Ok(())
     }
 

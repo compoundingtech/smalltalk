@@ -6,6 +6,23 @@ pub(super) async fn publish(
     peer: Option<Extension<NativeDeliveryPeer>>,
     Json(request): Json<Publication>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
+    publish_with_mode(state, peer, request, false).await
+}
+
+pub(super) async fn publish_current(
+    State(state): State<AppState>,
+    peer: Option<Extension<NativeDeliveryPeer>>,
+    Json(request): Json<Publication>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    publish_with_mode(state, peer, request, true).await
+}
+
+async fn publish_with_mode(
+    state: AppState,
+    peer: Option<Extension<NativeDeliveryPeer>>,
+    request: Publication,
+    current_route: bool,
+) -> Result<Json<ClaimRecord>, ApiError> {
     let Some(peer) = peer else {
         return Err(ApiError::bad(St3Error::new(
             "unbound-harness-event",
@@ -23,8 +40,19 @@ pub(super) async fn publish(
     }
     let store = state.store.clone();
     let kind = request.claim.kind.clone();
-    let (record, changed, transition) =
-        blocking_action(move || store.append_harness_event_publication(&request)).await?;
+    let current = crate::store::is_current_input(&request.claim);
+    let (record, changed, transition) = blocking_action(move || {
+        if current && current_route {
+            let (record, changed) =
+                store.append_bound_current(&request.claim, &request.runtime_incarnation)?;
+            let transition = request.claim.kind == "harness.observed"
+                && record.body["fields"]["status_transition"] == true;
+            Ok((record, changed, transition))
+        } else {
+            store.append_harness_event_publication(&request)
+        }
+    })
+    .await?;
     finish_claim_publication(&state, &kind, record, changed, Some(transition)).await
 }
 
@@ -88,6 +116,7 @@ mod tests {
                     .uri("/v1/harness-events")
                     .header("content-type", "application/json")
                     .extension(NativeDeliveryPeer {
+                        start_token: None,
                         agent: agent.into(),
                         transport: "claude-channel",
                         pid: 37,

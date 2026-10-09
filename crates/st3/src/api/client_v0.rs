@@ -11884,13 +11884,30 @@ mission "queue-parity" state="ready" {
             "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":1,"abandoned":0}, "truncated":false
         });
         let first = append("harness.todo.observed", snapshot.clone());
-        assert!(crate::store::local_observation_position(&first).is_none());
-        assert!(state.store.index().unwrap() > before);
-        let old = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
-        assert!(old.iter().find(|agent| agent["id"] == subject).unwrap()["todo"].is_null());
-        let refreshed = client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", first.store_index).unwrap();
-        assert_eq!(refreshed.iter().find(|agent| agent["id"] == subject).unwrap()["todo"]["snapshot"], snapshot);
-        let first_value = agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap();
+        assert!(crate::store::local_observation_position(&first).is_some());
+        assert_eq!(state.store.index().unwrap(), before);
+        let old =
+            client_agent_resources(&state.store, true, "2026-10-03T09:00:00Z", before).unwrap();
+        assert_eq!(
+            old.iter().find(|agent| agent["id"] == subject).unwrap()["todo"]["snapshot"],
+            snapshot
+        );
+        let refreshed = client_agent_resources(
+            &state.store,
+            true,
+            "2026-10-03T09:00:00Z",
+            first.store_index,
+        )
+        .unwrap();
+        assert_eq!(
+            refreshed
+                .iter()
+                .find(|agent| agent["id"] == subject)
+                .unwrap()["todo"]["snapshot"],
+            snapshot
+        );
+        let first_value =
+            agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap();
         assert_eq!(first_value["snapshot"], snapshot);
         assert_eq!(first_value["claim_id"], first.id);
         assert_eq!(first_value["stale"], false);
@@ -11906,11 +11923,20 @@ mission "queue-parity" state="ready" {
         let latest = agent_todo(&state.store, subject, Some("one"), second.store_index).unwrap();
         assert_eq!(latest["snapshot"], empty);
         assert_eq!(latest["claim_id"], second.id);
-        assert_eq!(agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap()["claim_id"], first.id);
-        let changed = append("harness.session-file", json!({
-            "harness":"omp", "agent":subject, "session_id":"native-two", "path":"/tmp/session"
-        }));
-        assert_eq!(agent_todo(&state.store, subject, Some("one"), changed.store_index).unwrap()["stale"], true);
+        assert_eq!(
+            agent_todo(&state.store, subject, Some("one"), first.store_index).unwrap()["claim_id"],
+            second.id
+        );
+        let changed = append(
+            "harness.session-file",
+            json!({
+                "harness":"omp", "agent":subject, "session_id":"native-two", "path":"/tmp/session"
+            }),
+        );
+        assert_eq!(
+            agent_todo(&state.store, subject, Some("one"), changed.store_index).unwrap()["stale"],
+            true
+        );
     }
 
     #[test]
@@ -11937,7 +11963,7 @@ mission "queue-parity" state="ready" {
         // Simulate an older or corrupt replicated record beyond the typed writer boundary.
         let connection = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
         connection.execute(
-            "UPDATE claims SET body=json_set(body, '$.fields.unrecognized', 1) WHERE id=?1",
+            "UPDATE latest_values SET body=json_set(body, '$.fields.unrecognized', 1) WHERE source_id=?1",
             [&claim.id],
         ).unwrap();
         let items = client_agent_resources(
@@ -19536,10 +19562,10 @@ mission "example/zero-run" state="ready" {
         let index = state.store.index().unwrap();
         let before = client_agent_resources(&state.store, false, "", index).unwrap();
         let before = before.iter().find(|item| item["id"] == subject).unwrap();
-        // The quick read uses the cached card's receipt time. The backdated payload time is
-        // deliberately no longer recovered by a separate per-request history query.
-        assert_eq!(before["observation"], "current");
-        assert_eq!(before["harness_state"], "idle");
+        // The cached current register keeps the actual source time. Receipt cannot
+        // freshen a backdated provider reading, and no history query is needed.
+        assert_eq!(before["observation"], "stale");
+        assert_eq!(before["harness_state"], "indeterminate");
         assert!(before.get("_status_source").is_none());
         let mut aged = vec![before.clone()];
         let mut cached_harness = state.store.observed_harness_at(subject, index).unwrap().unwrap();
