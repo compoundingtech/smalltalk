@@ -243,6 +243,18 @@ impl Windows {
             .map(|position| revisions.values[position]))
     }
 
+    /// Every collection's revision, when another socket already weighed the newest commit: then
+    /// no snapshot or worker is needed. `None` means [`Self::changes`] must weigh it.
+    pub(super) fn current_changes(&self, store: &Store) -> Option<[u64; 8]> {
+        let commits = self.commits();
+        let index = store.index().ok()?;
+        let revisions = self
+            .revisions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (revisions.commits == commits && revisions.index == index).then_some(revisions.values)
+    }
+
     pub(super) fn changes(&self, store: &Store) -> anyhow::Result<[u64; 8]> {
         let commits = self.commits();
         store.read_snapshot(|index| {
@@ -469,6 +481,21 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 2);
         assert_ne!(read(200), first, "expiry is exclusive even within the same clock period");
         assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn shared_windows_weigh_each_commit_once_for_every_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let weighed = windows.changes(&state.store).unwrap();
+        assert_eq!(windows.current_changes(&state.store), Some(weighed));
+        diagnostic(&state);
+        assert_eq!(windows.current_changes(&state.store), None, "a new commit must be weighed");
+        let after = windows.changes(&state.store).unwrap();
+        assert!(!Windows::changed("missions", &weighed, &after), "a diagnostic changes no mission");
+        assert!(Windows::changed("summary", &weighed, &after), "summary weighs every commit");
+        assert_eq!(windows.current_changes(&state.store), Some(after));
     }
 
     #[test]

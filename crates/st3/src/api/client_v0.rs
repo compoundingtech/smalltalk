@@ -1272,8 +1272,14 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 }
                 let mut affected = BTreeSet::<String>::new();
                 if let Some(windows) = &windows {
+                    // Sockets on one store share the revisions: the first to look weighs a commit.
+                    let current = windows.current_changes(&state.store);
                     let (windows, store) = (windows.clone(), state.store.clone());
-                    match blocking_store(move || crate::profile::task("stream collection/invalidation", || windows.changes(&store))).await {
+                    let revisions = match current {
+                        Some(revisions) => Ok(revisions),
+                        None => blocking_store(move || crate::profile::task("stream collection/invalidation", || windows.changes(&store))).await,
+                    };
+                    match revisions {
                         Ok(revisions) => {
                             affected.extend(subscriptions.iter().filter(|(_, s)| followed(s)
                                 && collection_windows::Windows::changed(&s.request.collection, &window_revisions, &revisions))
