@@ -400,5 +400,48 @@ mod tests {
             assert!(!text.to_lowercase().contains("expert"));
         }
     }
+    #[test]
+    fn the_play_is_three_acts_spoken_to_you() {
+        let guide = hex::encode(sha2::Sha256::digest(super::GUIDE.as_bytes()));
+        let mission = crate::parse_intent(
+            &super::ONBOARDING.replace("@GUIDE@", &format!("doc/st/guide@{guide}")),
+            "studio",
+        )
+        .unwrap();
+        assert!(mission.missions.contains_key(super::MISSION));
+        for act in ["hello", "act-one", "act-two", "act-three"] {
+            assert!(
+                super::ONBOARDING.contains(&format!("step \"{act}\"")),
+                "the play lost {act}"
+            );
+        }
+        // Goals describe what the person experiences, addressed to them. Nothing the person
+        // reads may send them to Home or an attention item, or name a sample person.
+        let goals: Vec<&str> = super::ONBOARDING
+            .lines()
+            .filter(|line| line.trim_start().starts_with("goal \""))
+            .collect();
+        assert!(goals.len() >= 5);
+        for text in goals.iter().copied().chain([super::ASSISTANT]) {
+            let lowered = text.to_lowercase();
+            if text.contains("agent \"st/assistant\"") {
+                continue;
+            }
+            for banned in ["the person", " ada", "attention item to", "open home", "go to home"] {
+                assert!(!lowered.contains(banned), "{banned:?} in {text}");
+            }
+        }
+        assert!(super::GUIDE.contains("conversations wait"), "the guide must pace with wait");
+        assert!(super::GUIDE.contains("setup --onboarding"), "skip must say how to return");
+        assert!(!super::GUIDE.to_lowercase().contains("ada"));
+        // The demo mission the guide hands the Assistant must be publishable as written.
+        let block = super::GUIDE
+            .split("```kdl\n")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("the guide carries the demo mission");
+        let demo = crate::parse_intent(block, "studio").unwrap();
+        assert!(demo.missions.contains_key("st/onboarding-demo"));
+    }
     use sha2::Digest as _;
 }

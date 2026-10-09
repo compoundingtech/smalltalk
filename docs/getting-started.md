@@ -77,11 +77,15 @@ projects and tasks you give them accordingly.
 When a usable harness is available, first-run setup creates `agent/st/assistant` and
 starts `mission/st/onboarding`. When setup publishes the Assistant during a plain `st`
 launch, the interface opens that conversation. You can also find it under Agents.
-Follow its guidance for your first mission; the Assistant stays available afterward.
 
-Home shows questions, decisions and failures that need you. Agents shows conversations
-and transcripts; Missions shows work and results. **Ctrl+K** opens the palette and
-**Ctrl+Q** quits the interface while agents keep working.
+The Assistant talks to you in that one conversation and runs the commands itself. In
+about five minutes it shows you two agents messaging each other, then a small mission
+running beside the conversation, then asks what you want to accomplish and starts that
+work. If you stay quiet it carries on with the default it told you; say "skip" at any
+time to stop, and `st setup --onboarding` brings the tour back. The Assistant stays
+available afterward.
+
+**Ctrl+K** opens the palette and **Ctrl+Q** quits the interface while agents keep working.
 
 After quitting, make the installed commands available in this shell and reopen st:
 

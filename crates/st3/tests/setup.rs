@@ -707,6 +707,12 @@ async fn onboarding_publication_is_graph_decided_and_preserves_stopped_assistant
             .unwrap()
             .contains("--dangerously-bypass-approvals-and-sandbox")
     );
+    let published = serde_json::to_string(assistant).unwrap();
+    assert!(published.contains("Smalltalk Assistant"), "{published}");
+    assert!(
+        !published.to_lowercase().contains("expert"),
+        "the published seat still calls itself an expert: {published}"
+    );
     let guides: st3::model::DocumentListResponse = client
         .get("/v1/documents?name=doc%2Fst%2Fguide")
         .await
