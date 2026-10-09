@@ -5,7 +5,10 @@
  * shared grammar `<uri>[ form=…][ view=…]` and stay opaque to the layout.
  */
 
-import type { ConversationItem } from '../embrace-data/model'
+import type { ConversationRuntimeOptions } from '../EmbraceRuntime'
+import type { TranscriptProps } from '../composition/Transcript'
+import type { DiffFile } from '../composition/DiffPanel'
+import type { TerminalFrame } from './terminal-model'
 
 
 /** Diff payload for a `diff:` pane. */
@@ -14,13 +17,31 @@ export interface DiffResource {
   readonly path: string
   readonly added: number
   readonly removed: number
+  readonly branchFiles?: readonly DiffFile[]
+  readonly currentTurnFiles?: readonly DiffFile[]
+}
+
+/** Exact host snapshots: turn boundaries, lifecycle, work, sync and clock are never inferred here. */
+export interface ThreadResource {
+  readonly title?: string
+  readonly runtime: ConversationRuntimeOptions
+  readonly transcript: Omit<TranscriptProps, 'title' | 'viewportKey'>
+}
+
+export interface ThreadControls {
+  readonly folder: string
+  readonly branch: string
+  readonly onSend?: (text: string) => void | Promise<void>
+  readonly onSteer?: (text: string) => void | Promise<void>
+  readonly onStop?: () => void | Promise<void>
 }
 
 /** Per-uri resources the pane host renders; supplied by the app or a fixture. */
 export interface WorkbenchResources {
-  readonly threads: ReadonlyMap<string, readonly ConversationItem[]>
+  readonly threads: ReadonlyMap<string, ThreadResource>
+  readonly threadControls?: ReadonlyMap<string, ThreadControls>
   readonly diffs: ReadonlyMap<string, DiffResource>
-  readonly terminals: ReadonlyMap<string, readonly string[]>
+  readonly terminals: TerminalFrame
 }
 /** One open resource: `uri` plus optional `form` (rendering mode) and `view` (device-local view state id). */
 export interface WorkbenchPane {
@@ -48,13 +69,13 @@ export const parsePaneKey = (key: string): WorkbenchPane => {
   return form === undefined && view === undefined ? { uri } : { uri, form, view }
 }
 
-export type PaneKind = 'thread' | 'diff' | 'terminal' | 'placeholder'
+/** Terminal sessions are drawer resources, not split-tree panes. */
+export type PaneKind = 'thread' | 'diff' | 'placeholder'
 
 /** Resource kind derived from the uri scheme; unknown schemes render as placeholders. */
 export const paneKind = (pane: WorkbenchPane): PaneKind => {
   if (pane.uri.startsWith('agent:') || pane.uri.startsWith('agent/')) return 'thread'
   if (pane.uri.startsWith('diff:')) return 'diff'
-  if (pane.uri.startsWith('terminal:')) return 'terminal'
   return 'placeholder'
 }
 
@@ -82,6 +103,15 @@ export interface SplitLayout {
 export type WorkbenchLayout = TabGroupLayout | SplitLayout
 
 export const group = (tabs: readonly WorkbenchPane[]): TabGroupLayout => ({ kind: 'group', tabs })
+
+/** Exact pane selection wins over a stored selection; stale storage falls back to the first tab. */
+export const displayedTabKey = (keys: readonly string[], focusedPaneKey: string | undefined, storedActive: string | null): string =>
+  focusedPaneKey !== undefined && keys.includes(focusedPaneKey) ? focusedPaneKey : storedActive !== null && keys.includes(storedActive) ? storedActive : keys[0]!
+
+export const isFocusedPaneDisplayed = (layout: WorkbenchLayout, focusedPaneKey: string): boolean =>
+  layout.kind === 'group'
+    ? displayedTabKey(layout.tabs.map(paneKey), focusedPaneKey, null) === focusedPaneKey
+    : isFocusedPaneDisplayed(layout.children[0], focusedPaneKey) || isFocusedPaneDisplayed(layout.children[1], focusedPaneKey)
 
 export const split = (
   axis: 'right' | 'below',
@@ -143,6 +173,17 @@ export const nodeAtPath = (layout: WorkbenchLayout, path: LayoutPath): Workbench
   return segments === null ? null : nodeAtSegments(layout, segments)
 }
 
+/** Closing a sole-tab group promotes its sibling without rebuilding the surviving subtree. */
+export const removeGroupAtPath = (layout: WorkbenchLayout, path: LayoutPath): WorkbenchLayout => {
+  const segments = parsePath(path)
+  if (segments === null) return layout
+  if (segments.length === 0) return group([{ uri: 'about:blank' }])
+  const parentSegments = segments.slice(0, -1)
+  const parent = nodeAtSegments(layout, parentSegments)
+  if (parent?.kind !== 'split') return layout
+  return replaceSegments(layout, parentSegments, parent.children[segments[segments.length - 1] === 0 ? 1 : 0])
+}
+
 /** Adds a pane to the tab group at `path`. */
 export const addTabAtPath = (layout: WorkbenchLayout, path: LayoutPath, pane: WorkbenchPane): WorkbenchLayout => {
   const node = nodeAtPath(layout, path)
@@ -166,12 +207,15 @@ export const splitGroupAtPath = (
   return replaceAtPath(layout, path, split(axis, node, group([pane])))
 }
 
-/** Finds the group containing a resource, or the first group for a new tab. */
-export const findGroupPath = (layout: WorkbenchLayout, uri?: string, path: LayoutPath = '0'): LayoutPath | undefined => {
-  if (layout.kind === 'group') return uri === undefined || layout.tabs.some(pane => pane.uri === uri) ? path : undefined
-  return findGroupPath(layout.children[0], uri, childPath(path, 0)) ?? findGroupPath(layout.children[1], uri, childPath(path, 1))
+/** Finds a group by exact pane key or resource URI, or the first group for a new pane. */
+export const findGroupPath = (layout: WorkbenchLayout, key?: string, path: LayoutPath = '0'): LayoutPath | undefined => {
+  if (layout.kind === 'group') return key === undefined || layout.tabs.some(pane => paneKey(pane) === key || pane.uri === key) ? path : undefined
+  return findGroupPath(layout.children[0], key, childPath(path, 0)) ?? findGroupPath(layout.children[1], key, childPath(path, 1))
 }
 
+/** All pane keys, including inactive tabs, for the surface's scroll-memory retention boundary. */
+export const layoutPaneKeys = (layout: WorkbenchLayout): readonly string[] =>
+  layout.kind === 'group' ? layout.tabs.map(paneKey) : [...layoutPaneKeys(layout.children[0]), ...layoutPaneKeys(layout.children[1])]
 
 /** Every split path with its axis and stored ratio default, depth-first. */
 export const walkSplits = (layout: WorkbenchLayout, path: LayoutPath = '0'): readonly { readonly path: LayoutPath; readonly node: SplitLayout }[] => {

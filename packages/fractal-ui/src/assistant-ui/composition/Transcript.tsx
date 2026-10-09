@@ -46,6 +46,8 @@ export interface TranscriptProps {
   readonly availability?: TranscriptAvailability
   readonly history?: TranscriptHistory
   readonly emptyState?: React.ReactNode | TranscriptEmptyState
+  /** Workbench conversation key for the owning surface's scroll memory. */
+  readonly viewportKey?: string
 }
 const SenderCaption = React.createContext<string | undefined>(undefined)
 const RetrySend = React.createContext<TranscriptProps['onRetrySend']>(undefined)
@@ -107,7 +109,7 @@ const PreparedTurn = React.memo(function PreparedTurn({ turn, stranded, onOpenTo
   </section>
 })
 /** Locked U2·F3·Y3 presentation under the host's AssistantRuntimeProvider. */
-export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, onRetrySync, onRetryRun, onRetrySend, resolveImage, onLoadImage, availability = { _tag: 'Available' }, history = { _tag: 'Complete' }, emptyState }: TranscriptProps) {
+export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, onRetrySync, onRetryRun, onRetrySend, resolveImage, onLoadImage, availability = { _tag: 'Available' }, history = { _tag: 'Complete' }, emptyState, viewportKey }: TranscriptProps) {
   const messages = useAuiState(state => state.thread.messages)
   // External-store runtimes adopt each snapshot in a passive effect, and the store publishes the
   // adopted messages a task later. Recording the snapshot after its commit is the adoption epoch.
@@ -162,7 +164,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
       {committed.length > 0 && <SyncLine status={sync} label="conversation" now={now} observedAt={observedAt} onRetry={onRetrySync} />}
       {running !== undefined && <><div role="progressbar" aria-label="Run in progress" aria-valuetext="Running" data-testid="run-progress" {...stylex.props(styles.runningProgress)}><span {...stylex.props(styles.runningSegment)} /></div><span data-testid="run-elapsed">Running{Number.isFinite(started) && started <= now ? ` · ${formatWorkDuration(now - started) || '<1s'}` : ''}</span></>}
     </header>
-    <ErrorOverlayHost lane><EmbraceScrollViewport items={committed} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(styles.content)}>
+    <ErrorOverlayHost lane><EmbraceScrollViewport items={committed} stateKey={viewportKey} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(styles.content)}>
       {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
       {committed.length === 0 ? empty : <div {...stylex.props(styles.timeline)}>{committed.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} />)}</div>}
     </EmbraceScrollViewport>{failure?.tone === 'error' && <ErrorOverlay id={`sync-${failure.text}`} title={failure.text} detail="History stays on screen." onRetry={onRetrySync} />}</ErrorOverlayHost>

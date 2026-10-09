@@ -6,6 +6,25 @@ import { surfaceVars, textVars, borderVars, radiusVars, spaceVars, typeVars, geo
 const rowSelector = '[data-item-id], [data-embrace-entry-id]'
 const navigationKeys: Readonly<Record<string, true>> = { PageUp: true, PageDown: true, Home: true, End: true, ArrowUp: true, ArrowDown: true, ' ': true }
 
+/** Scroll state a conversation keeps while it stays on a surface. */
+export interface ViewportState { readonly top: number; readonly following: boolean; readonly unread: boolean }
+
+/** Per-surface memory, one entry per conversation. Owners drop closed keys and dispose on unmount. */
+export class ViewportStore {
+  private readonly states = new Map<string, ViewportState>()
+  private disposed = false
+  get size(): number { return this.states.size }
+  get(key: string): ViewportState | undefined { return this.states.get(key) }
+  save(key: string, state: ViewportState): void { if (!this.disposed) this.states.set(key, state) }
+  retain(keys: ReadonlySet<string>): void { for (const key of this.states.keys()) if (!keys.has(key)) this.states.delete(key) }
+  open(): void { this.disposed = false }
+  /** Parent-first teardown must ignore late saves from unmounting viewports. */
+  dispose(): void { this.disposed = true; this.states.clear() }
+}
+
+/** Viewports outside a store-owning surface keep memory only for their own mount. */
+export const ViewportStoreContext = React.createContext<ViewportStore | undefined>(undefined)
+
 /** Scroll and row geometry are imperative; they never invalidate the message subtree. */
 class ViewportController {
   private element: HTMLDivElement | null = null
@@ -18,10 +37,41 @@ class ViewportController {
   private lastTop = 0
   private lastWidth = 0
   private programmaticTop: number | undefined
+  private restored: ViewportState | undefined
+  /** A restored line whose content is settling; the first reader scroll clears it. */
+  private pendingTop: number | undefined
+
+  constructor(saved?: ViewportState) {
+    if (saved !== undefined && !saved.following) {
+      this.restored = saved
+      this.unread = saved.unread
+    }
+  }
 
   readonly attachJump = (button: HTMLButtonElement | null) => {
     this.jumpButton = button
     if (button !== null) button.hidden = !this.unread
+  }
+
+  readonly released = (): ViewportState => ({ top: this.lastTop, following: this.following, unread: this.unread })
+
+  /** Swaps a reused viewport to another conversation without carrying its unread mark across. */
+  readonly resume = (saved?: ViewportState) => {
+    this.unread = saved !== undefined && !saved.following && saved.unread
+    if (this.jumpButton !== null) this.jumpButton.hidden = !this.unread
+    if (saved !== undefined && !saved.following) {
+      this.following = false
+      this.anchor = undefined
+      this.pendingTop = saved.top
+      this.writeTop(saved.top)
+      this.scheduleCapture()
+      this.schedule()
+    } else {
+      this.following = true
+      this.anchor = undefined
+      if (this.element !== null) this.writeTop(this.element.scrollHeight)
+      this.schedule()
+    }
   }
 
   private capture() {
@@ -68,7 +118,13 @@ class ViewportController {
       const element = this.element
       if (element === null) return
       if (this.following) this.writeTop(element.scrollHeight)
-      else if (this.captureFrame === undefined && this.anchor?.element.isConnected) {
+      else if (this.pendingTop !== undefined) {
+        this.writeTop(this.pendingTop)
+        if (Math.abs(element.scrollTop - Math.max(0, Math.min(this.pendingTop, element.scrollHeight - element.clientHeight))) < geometryNumbers.scrollEndTolerance) {
+          this.pendingTop = undefined
+          this.scheduleCapture()
+        }
+      } else if (this.captureFrame === undefined && this.anchor?.element.isConnected) {
         this.writeTop(element.scrollTop + this.anchor.element.getBoundingClientRect().top - element.getBoundingClientRect().top - this.anchor.offset)
       }
       this.lastWidth = element.clientWidth
@@ -79,6 +135,7 @@ class ViewportController {
     this.following = true
     this.unread = false
     this.anchor = undefined
+    this.pendingTop = undefined
     if (this.jumpButton !== null) this.jumpButton.hidden = true
     this.schedule()
   }
@@ -99,6 +156,7 @@ class ViewportController {
       if (event instanceof KeyboardEvent && (navigationKeys[event.key] !== true || (event.target instanceof HTMLElement && event.target.closest('input,textarea,[contenteditable="true"]')))) return
       this.following = false
       this.programmaticTop = undefined
+      this.pendingTop = undefined
       this.scheduleCapture()
       if (this.frame !== undefined) cancelAnimationFrame(this.frame)
       this.frame = undefined
@@ -111,6 +169,10 @@ class ViewportController {
       // Reflow is not a request to follow. Width changes preserve the reader's anchor.
       if (element.clientWidth !== this.lastWidth) { this.schedule(); return }
       if (Math.abs(element.scrollTop - this.lastTop) < geometryNumbers.scrollEndTolerance) return
+      if (this.pendingTop !== undefined) {
+        this.writeTop(this.pendingTop)
+        return
+      }
       this.lastTop = element.scrollTop
       this.following = element.scrollHeight - element.clientHeight - element.scrollTop <= geometryNumbers.scrollEndTolerance
       if (this.following) {
@@ -128,6 +190,14 @@ class ViewportController {
     element.addEventListener('pointerdown', manual, { passive: true })
     element.addEventListener('focusin', manual)
     element.addEventListener('scroll', scroll, { passive: true })
+    if (this.restored !== undefined) {
+      this.following = false
+      this.pendingTop = this.restored.top
+      this.writeTop(this.restored.top)
+      this.lastTop = this.restored.top
+      this.scheduleCapture()
+      this.restored = undefined
+    }
     this.schedule()
     return () => {
       observer.disconnect()
@@ -149,17 +219,29 @@ class ViewportController {
 export interface EmbraceScrollViewportProps extends React.HTMLAttributes<HTMLDivElement> {
   readonly items: readonly { readonly id: string }[]
   readonly contentProps?: React.HTMLAttributes<HTMLDivElement>
+  /** Each key keeps its own scroll state across viewport mounts. */
+  readonly stateKey?: string
 }
 
-export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({ items, children, contentProps, ...props }: EmbraceScrollViewportProps) {
-  const [controller] = React.useState(() => new ViewportController())
+export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({ items, children, contentProps, stateKey, ...props }: EmbraceScrollViewportProps) {
+  const store = React.useContext(ViewportStoreContext)
+  const [controller] = React.useState(() => new ViewportController(stateKey === undefined ? undefined : store?.get(stateKey)))
   const previousItems = React.useRef(items)
+  const previousKey = React.useRef(stateKey)
   React.useLayoutEffect(() => {
-    if (previousItems.current !== items) controller.changed()
+    if (stateKey !== previousKey.current) {
+      if (previousKey.current !== undefined) store?.save(previousKey.current, controller.released())
+      previousKey.current = stateKey
+      controller.resume(stateKey === undefined ? undefined : store?.get(stateKey))
+    } else if (previousItems.current !== items) controller.changed()
     previousItems.current = items
-  }, [controller, items])
+  }, [controller, items, store, stateKey])
+  // Mutation-phase saves precede the owning surface's layout effect that removes closed keys.
+  React.useLayoutEffect(() => () => {
+    if (previousKey.current !== undefined) store?.save(previousKey.current, controller.released())
+  }, [controller, store])
   return <div {...stylex.props(styles.frame)}>
-    <div {...props} ref={controller.attach}><div {...contentProps}>{children}</div></div>
+    <div {...props} style={{ ...props.style, overflowAnchor: 'none' }} ref={controller.attach}><div {...contentProps}>{children}</div></div>
     <Button ref={controller.attachJump} onPress={controller.jump} hidden {...stylex.props(styles.jump)}>New messages ↓</Button>
   </div>
 })
