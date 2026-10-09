@@ -21,7 +21,8 @@
     "typecheck": "tsc --noEmit",
     "test:palettes": "node --test src/legacy-palettes.test.mjs",
     "test:transcript": "node --test --test-force-exit src/assistant-ui/composition/Transcript.unit.test.mjs",
-    "check:shell-imports": "node scripts/check-shell-imports.mjs"
+    "check:shell-imports": "node scripts/check-shell-imports.mjs",
+    "test:work-log": "node --test --test-force-exit src/assistant-ui/taste/work-log.unit.test.mjs"
   },
   "dependencies": {
     "react": "19.2.3",

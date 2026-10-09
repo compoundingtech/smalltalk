@@ -8,6 +8,7 @@ import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
 import { EmbraceComposer } from './assistant-ui/EmbraceComposer'
 import type { ConversationItem, SendState, TextItem } from './assistant-ui/embrace-data/model'
 import { workLogTurnFromItems, type WorkLogCall } from './assistant-ui/taste/work-log'
+import { WorkLogV1 } from './assistant-ui/taste/WorkLogV1'
 import type { SyncStatus } from './assistant-ui/st3-views/sync-status'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
@@ -85,6 +86,29 @@ export const Expanded: Story = { args: { state: 'expanded' }, play: async ({ can
   await expect(canvas.getByRole('region', { name: 'Opened tool detail' }).querySelector('pre')?.textContent).toBe(source)
 } }
 export const ExpandedLight: Story = { ...Expanded, args: { state: 'expanded', scheme: 'light' } }
+const nativeOutputItems: readonly ConversationItem[] = [
+  { name: 'string output', content: 'String result retained.' },
+  { name: 'native array output', content: [{ type: 'text', text: 'First native line.' }, { type: 'image', data: 'synthetic-bytes' }, { type: 'text', text: 'Second native line.' }] },
+  { name: 'empty output', content: [] },
+  { name: 'non-text output', content: [{ type: 'image', data: 'synthetic-bytes' }] },
+].map(({ name, content }, index) => ({ _tag: 'ToolCall', id: `native-output/${index}`, callId: `native-call/${index}`, name, input: {}, status: 'success', callSeen: true, at, result: { content, isError: false, at } }))
+const nativeOutputTurn = workLogTurnFromItems(nativeOutputItems, { kindFor: () => 'read', running: false, failed: false, interrupted: false, completeHistory: true })
+export const NativeToolOutput: Story = { render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><WorkLogV1 turn={nativeOutputTurn} /></main>, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  await userEvent.click(canvas.getByRole('button', { name: 'Worked', exact: true }))
+  const native = canvas.getByRole('button', { name: /^native array output/ })
+  await userEvent.click(native)
+  await expect(native).toHaveAttribute('aria-expanded', 'true')
+  await expect(canvas.getByTestId('work-call-output')).toHaveTextContent('First native line.')
+  await expect(canvas.getByTestId('work-call-output')).toHaveTextContent('Second native line.')
+  await expect(native).not.toHaveTextContent('No output')
+  await userEvent.click(canvas.getByRole('button', { name: /^string output/ }))
+  await expect(canvas.getAllByTestId('work-call-output')).toHaveLength(2)
+  await expect(canvas.getAllByTestId('work-call-output')[0]).toHaveTextContent('String result retained.')
+  await expect(canvas.queryByRole('button', { name: /empty output|non-text output/ })).toBeNull()
+  await expect(canvas.getAllByText('No output', { exact: true })).toHaveLength(2)
+} }
+export const NativeToolOutputLight: Story = { ...NativeToolOutput, args: { scheme: 'light' } }
 export const Streaming: Story = { args: { state: 'streaming' }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   await canvas.findByTestId('live-work')
