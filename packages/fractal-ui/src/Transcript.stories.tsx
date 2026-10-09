@@ -95,7 +95,7 @@ const nativeOutputItems: readonly ConversationItem[] = [
 const nativeOutputTurn = workLogTurnFromItems(nativeOutputItems, { kindFor: () => 'read', running: false, failed: false, interrupted: false, completeHistory: true })
 export const NativeToolOutput: Story = { render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><WorkLogV1 turn={nativeOutputTurn} /></main>, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
-  await userEvent.click(canvas.getByRole('button', { name: 'Worked', exact: true }))
+  await userEvent.click(canvas.getByRole('button', { name: 'Worked' }))
   const native = canvas.getByRole('button', { name: /^native array output/ })
   await userEvent.click(native)
   await expect(native).toHaveAttribute('aria-expanded', 'true')

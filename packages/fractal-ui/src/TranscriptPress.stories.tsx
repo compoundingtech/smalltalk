@@ -255,7 +255,7 @@ const hostInsertPlay: NonNullable<Story['play']> = async ({ canvasElement }) => 
   viewport.dispatchEvent(new WheelEvent('wheel', { deltaY: -viewport.scrollHeight }))
   const index = 39
   const id = `action-${index}`
-  const action = canvas.getByRole('button', { name: `Activate ${id}`, exact: true })
+  const action = canvas.getByRole('button', { name: `Activate ${id}` })
   const row = action.closest<HTMLElement>('[data-item-id]')!
   // The failed outbox/action row is last; incoming server rows insert immediately above it.
   if (external) {
@@ -272,7 +272,7 @@ const hostInsertPlay: NonNullable<Story['play']> = async ({ canvasElement }) => 
     canvas.getByRole('button', { name: 'Insert host rows above' }).click()
     await waitFor(() => expect(canvas.getByRole('button', { name: 'Activate inserted-0' })).toBeInTheDocument())
     await settleFrames()
-    await expect(canvas.getByRole('button', { name: `Activate ${id}`, exact: true }), 'host key must preserve the action DOM node').toBe(action)
+    await expect(canvas.getByRole('button', { name: `Activate ${id}` }), 'host key must preserve the action DOM node').toBe(action)
     await expect(Number(row.dataset.rowIndex), 'same key must shift index').toBeGreaterThan(index)
     await expect(viewport.scrollHeight, 'incoming rows must grow the scrollable content').toBeGreaterThan(contentHeight)
     if (!external) await expect(Math.abs(viewport.getBoundingClientRect().bottom - laneBottom), 'bounded lane must remain the scroll owner during the press').toBeLessThanOrEqual(1)
@@ -292,7 +292,7 @@ const externalOwnerPlay: NonNullable<Story['play']> = async context => {
   console.warn = (...args: unknown[]) => { warnings.push(String(args[0])); original(...args) }
   try {
     await hostInsertPlay(context)
-    const action = within(context.canvasElement).getByRole('button', { name: 'Activate action-39', exact: true })
+    const action = within(context.canvasElement).getByRole('button', { name: 'Activate action-39' })
     pointer(action, 'pointerdown', 1, 'mouse')
     pointer(action, 'pointerup', 1, 'mouse')
     await expect(warnings.filter(text => text.startsWith('EmbraceScrollViewport:')), 'warn once per lane, not per press').toHaveLength(1)
