@@ -20,7 +20,8 @@
     "build-storybook": "storybook build --disable-telemetry",
     "typecheck": "tsc --noEmit",
     "test:palettes": "node --test src/legacy-palettes.test.mjs",
-    "test:transcript": "node --test --test-force-exit src/assistant-ui/composition/Transcript.unit.test.mjs"
+    "test:transcript": "node --test --test-force-exit src/assistant-ui/composition/Transcript.unit.test.mjs",
+    "check:shell-imports": "node scripts/check-shell-imports.mjs"
   },
   "dependencies": {
     "react": "19.2.3",
