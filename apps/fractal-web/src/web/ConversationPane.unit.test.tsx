@@ -199,7 +199,7 @@ describe('ConversationPane kit composition', () => {
     expect(pane.match(/<[a-z][a-z\d]*(?:\s|>)/g)).toEqual(['<div ', '<div ', '<div '])
     expect(pane).toContain("style={{ display: 'contents' }}")
     const workspace = readFileSync(new URL('./LiveAgentWorkspace.tsx', import.meta.url), 'utf8')
-    expect(workspace).toContain('createPortal(<WorkspaceBody current={current} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />, paneHost)')
+    expect(workspace).toContain('createPortal(<WorkspaceBody current={current} rosterRefs={agents.map(agent => agent.ref)} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />, paneHost)')
     expect(workspace).toContain("hiddenPane: { contentVisibility: 'hidden'")
     expect(workspace).toContain('<ConversationPaneLoadBoundary agentRef={pane.ref} agentName={pane.name} onOpenTool={onOpenTool} ux={ux} visible={shown} />')
     expect(workspace).not.toContain('This subject has no available native view.')

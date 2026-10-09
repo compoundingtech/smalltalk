@@ -14,6 +14,9 @@ import type { ConversationPage, Feed } from '../data/source.ts'
 import type { FeedSyncObservation } from '../data/feedSync.ts'
 import { Markdown, type WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
 import type * as Kit from '@smalltalk/fractal-ui/assistant-ui'
+import type * as KitRuntime from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceRuntime.tsx'
+import type * as KitTranscript from '../../../../packages/fractal-ui/src/assistant-ui/composition/Transcript.tsx'
+import type * as KitComposer from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceComposer.tsx'
 import type { ConversationRuntimeOptions, TranscriptTurn } from '@smalltalk/fractal-ui/assistant-ui'
 import { Tracer } from 'effect'
 import { makeUxTelemetry, type UxTelemetry } from '../telemetry/ux.ts'
@@ -52,19 +55,31 @@ vi.mock('../data/react.tsx', async () => {
 })
 
 // Tap the input seams but keep the real kit/runtime rendering and effects.
-vi.mock('@smalltalk/fractal-ui/assistant-ui', async importOriginal => {
-  const kit = await importOriginal<typeof Kit>()
+vi.mock('../../../../packages/fractal-ui/src/assistant-ui/EmbraceRuntime.tsx', async importOriginal => {
+  const kit = await importOriginal<typeof KitRuntime>()
   return {
     ...kit,
     EmbraceRuntimeProvider: (props: React.ComponentProps<typeof Kit.EmbraceRuntimeProvider>) => {
       source.runtimeItems.push(props.options.messages ?? [])
       return <kit.EmbraceRuntimeProvider {...props} />
     },
+  }
+})
+vi.mock('../../../../packages/fractal-ui/src/assistant-ui/composition/Transcript.tsx', async importOriginal => {
+  const kit = await importOriginal<typeof KitTranscript>()
+  return {
+    ...kit,
     Transcript: (props: React.ComponentProps<typeof Kit.Transcript>) => {
       source.transcriptTurns.push(props.turns)
       source.scrollToBottomKeys.push(props.scrollToBottomKey)
       return <kit.Transcript {...props} />
     },
+  }
+})
+vi.mock('../../../../packages/fractal-ui/src/assistant-ui/EmbraceComposer.tsx', async importOriginal => {
+  const kit = await importOriginal<typeof KitComposer>()
+  return {
+    ...kit,
     EmbraceComposer: (props: React.ComponentProps<typeof Kit.EmbraceComposer>) => {
       source.composerProps.push(props)
       return <kit.EmbraceComposer {...props} />
@@ -73,6 +88,7 @@ vi.mock('@smalltalk/fractal-ui/assistant-ui', async importOriginal => {
 })
 
 import { ConversationPane } from './ConversationPane.tsx'
+import { WorkspaceBody } from './LiveAgentWorkspace.tsx'
 
 const at = (seconds: number) => `2026-10-08T12:00:${String(seconds).padStart(2, '0').slice(-2)}.000Z`
 /** The recorded scenario page: every item kind the gate replays, in delivery order. */
@@ -185,6 +201,100 @@ describe('ConversationPane composition activation', () => {
       else Object.defineProperty(document, 'elementFromPoint', elementFromPoint)
     }
   })
+  it('restores a detached conversation across switches and eviction, but reload follows the end', async () => {
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
+    // jsdom supplies no layout. Give the real kit controller a deterministic scroll lane;
+    // all scroll, detach, save and restore behavior still runs in the actual components.
+    const height = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(2000)
+    const client = vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(400)
+    const frames = new Map<number, FrameRequestCallback>()
+    let nextFrame = 0
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frames.set(++nextFrame, callback)
+      return nextFrame
+    })
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => frames.delete(id))
+    // No visible row geometry: the controller preserves the reading coordinate directly.
+    const elementFromPoint = Object.getOwnPropertyDescriptor(document, 'elementFromPoint')
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => null })
+    const flushFrames = async () => {
+      await act(async () => {
+        const pending = [...frames.values()]
+        frames.clear()
+        for (const callback of pending) callback(0)
+      })
+    }
+    let rosterRefs = ['agent/A', 'agent/B', 'agent/C', 'agent/D']
+    const show = async (ref: string, surfaceKey = 'surface') => {
+      await act(async () => root!.render(<WorkspaceBody key={surfaceKey} current={ref} rosterRefs={rosterRefs} view={{ _tag: 'Thread' }} agentName={ref} onOpenTool={() => {}} />))
+      await flushFrames()
+    }
+    const lane = (ref: string) => {
+      const title = [...container.querySelectorAll('[data-testid="transcript-scroll"]')]
+        .find(node => node.textContent?.includes(ref))
+      expect(title).toBeInstanceOf(HTMLElement)
+      return title as HTMLElement
+    }
+    try {
+      await show('agent/A')
+      expect(lane('agent/A').scrollTop).toBe(1600)
+      await act(async () => {
+        const a = lane('agent/A')
+        a.dispatchEvent(new WheelEvent('wheel', { deltaY: -900 }))
+        a.scrollTop = 700
+        a.dispatchEvent(new Event('scroll'))
+      })
+      await flushFrames()
+      await show('agent/B')
+      expect(lane('agent/B').scrollTop).toBe(1600)
+      await show('agent/A')
+      expect(lane('agent/A').scrollTop).toBe(700)
+      // Retained DOM makes the short switch cheap. Eviction must not discard the
+      // surface's reading memory when the fourth conversation remounts that pane.
+      await show('agent/B')
+      await show('agent/C')
+      await show('agent/D')
+      await show('agent/A')
+      expect(lane('agent/A').scrollTop).toBe(700)
+      await show('agent/A', 'reloaded-surface')
+      expect(lane('agent/A').scrollTop).toBe(1600)
+      await act(async () => {
+        const a = lane('agent/A')
+        a.dispatchEvent(new WheelEvent('wheel', { deltaY: -900 }))
+        a.scrollTop = 700
+        a.dispatchEvent(new Event('scroll'))
+      })
+      await flushFrames()
+      await show('agent/B', 'reloaded-surface')
+      await show('agent/C', 'reloaded-surface')
+      await show('agent/D', 'reloaded-surface')
+      // A leaves the roster after its DOM was evicted: remove only A's memory.
+      rosterRefs = ['agent/B', 'agent/C', 'agent/D']
+      await show('agent/D', 'reloaded-surface')
+      rosterRefs = ['agent/A', ...rosterRefs]
+      await show('agent/A', 'reloaded-surface')
+      expect(lane('agent/A').scrollTop).toBe(1600)
+      await act(async () => {
+        const a = lane('agent/A')
+        a.dispatchEvent(new WheelEvent('wheel', { deltaY: -900 }))
+        a.scrollTop = 700
+        a.dispatchEvent(new Event('scroll'))
+      })
+      await flushFrames()
+      // A huge roster must not turn surface memory into an unbounded history.
+      const extraRefs = Array.from({ length: 32 }, (_, index) => `agent/extra-${index}`)
+      rosterRefs = [...rosterRefs, ...extraRefs]
+      for (const ref of extraRefs) await show(ref, 'reloaded-surface')
+      await show('agent/A', 'reloaded-surface')
+      expect(lane('agent/A').scrollTop).toBe(1600)
+    } finally {
+      height.mockRestore()
+      client.mockRestore()
+      if (elementFromPoint === undefined) Reflect.deleteProperty(document, 'elementFromPoint')
+      else Object.defineProperty(document, 'elementFromPoint', elementFromPoint)
+    }
+  })
+
   it('opts the composer into the shared reading column without overriding its placeholder', async () => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
     await mount()
@@ -229,6 +339,7 @@ describe('ConversationPane composition activation', () => {
     const changes = source.scrollToBottomKeys.filter((key, index, keys) => index === 0 || key !== keys[index - 1])
     expect(changes).toEqual([undefined, first.id, second.id, third.id])
   })
+
   it('keeps runtime items and transcript turns stable for sixty idle clock, sync and no-op frame updates', async () => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
     source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }

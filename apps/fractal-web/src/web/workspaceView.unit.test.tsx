@@ -16,12 +16,12 @@ describe('workspace body', () => {
   it('shows a terminal-specific unavailable state instead of the transcript when a terminal pane is selected', () => {
     const view = workspaceView({ ref: 'terminal/fixture/one' })
     expect(view._tag).toBe('TerminalUnavailable')
-    const html = renderToStaticMarkup(createElement(WorkspaceBody, { current: 'agent/fixture/one', view, agentName: 'Fixture', onOpenTool: vi.fn() }))
+    const html = renderToStaticMarkup(createElement(WorkspaceBody, { current: 'agent/fixture/one', rosterRefs: ['agent/fixture/one'], view, agentName: 'Fixture', onOpenTool: vi.fn() }))
     expect(html).toMatch(/Terminal unavailable\. This web client has no terminal renderer yet\./)
     expect(html).not.toMatch(/conversation|transcript/i)
   })
   it('states that any other non-thread view is unavailable', () => {
-    const html = renderToStaticMarkup(createElement(WorkspaceBody, { current: 'agent/fixture/one', view: workspaceView({ ref: 'monitor/quota' }), agentName: 'Fixture', onOpenTool: vi.fn() }))
+    const html = renderToStaticMarkup(createElement(WorkspaceBody, { current: 'agent/fixture/one', rosterRefs: ['agent/fixture/one'], view: workspaceView({ ref: 'monitor/quota' }), agentName: 'Fixture', onOpenTool: vi.fn() }))
     expect(html).toMatch(/View unavailable\./)
   })
   it('keeps the thread for the thread tab', () => {

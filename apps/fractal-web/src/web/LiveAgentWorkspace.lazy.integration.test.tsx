@@ -118,7 +118,7 @@ describe('conversation import boundary', () => {
   })
 
   it('requests an initially selected thread immediately and suspends only its retained pane', async () => {
-    const show = (current: string) => <workspace.WorkspaceBody current={current} view={{ _tag: 'Thread' }} agentName={current} onOpenTool={() => {}} />
+    const show = (current: string) => <workspace.WorkspaceBody current={current} rosterRefs={['agent/a', 'agent/b']} view={{ _tag: 'Thread' }} agentName={current} onOpenTool={() => {}} />
     await act(async () => root.render(show('agent/a')))
     // No frame or post-paint task has run: a selected thread cannot wait a second frame.
     expect(requested).toHaveBeenCalledTimes(1)

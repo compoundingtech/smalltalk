@@ -179,6 +179,8 @@ its first paint. Demand and prefetch share one import. While code loads, the lig
 app-side fallback mirrors the kit's Waiting transcript chrome and skeleton. Its drift test
 compares the real kit structure, testids, accessibility labels and geometry; replace this
 mirror when the kit exposes its standalone skeleton.
+The fallback uses the kit's shared reading-column styles so chunk loading does not shift
+the history lane when the real transcript mounts.
 An import failure stays local to the requested pane, with the fixed message “This conversation
 view could not load.” and a “Try again” action. Rejection clears the shared request; explicit
 retry creates and shares a fresh lazy wrapper so React's cached rejection cannot poison the
@@ -198,6 +200,21 @@ open needs the slot. The pane's visibility lives in a wrapper, and the kit trans
 memoized, so a switch never re-renders a retained transcript. The panes are portalled from
 outside the workspace's shell context providers. Those providers change on every switch, and
 React would otherwise walk every retained fiber looking for consumers.
+
+Reading position is independent of that three-pane DOM cache. `WorkspaceBody` owns one
+memory-only kit `ViewportStore` for its surface lifetime, above the keyed panes, and each
+transcript uses its stable agent conversation ref as `viewportKey`. A detached reading line
+survives switching away and back, even after its pane is evicted and remounted. Memory is
+limited to the 32 most recently visited conversations still in the current agent roster;
+layout-phase pruning drops departed agents and older visits after viewport cleanup saves.
+Returning to a dropped key opens at the end. Remounting
+the whole surface (including a reload) discards the store and opens at the live end.
+The existing `lastSendId` command still re-attaches on a new own send; no clock tick drives
+running-turn motion. The composition integration test exercises A → B → A, eviction through
+C and D, a fresh surface, roster departure, and the 32-conversation bound, using the real
+kit controller with deterministic jsdom sizing.
+The surface imports viewport ownership from the lightweight scroll module rather than the
+full kit barrel, preserving the shell's eager-graph boundary.
 
 `node apps/fractal-web/scripts/switch-budget-proof.mjs [--turns=100] [--baseline]` builds a
 production bundle with a synthetic three-agent fixture

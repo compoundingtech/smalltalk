@@ -15,6 +15,7 @@ import { Schema } from 'effect'
 import * as Atom from 'effect/reactivity/Atom'
 import { SidebarAgentRow, ThreadHeader, ResizableSplit, assistantDarkTheme, liveComposerDarkTheme, liveAccentTheme, compositionLightTheme } from '@smalltalk/fractal-ui/assistant-ui/shell'
 import type { WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
+import { ViewportStore, ViewportStoreContext } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceScrollViewport.tsx'
 import { terminalSubjectForAgent } from '../data/projections.ts'
 import { useFleet, useSubjectList, useConnection, useNow } from '../data/react.tsx'
 import { persistedAtom } from '../state/persistence.ts'
@@ -273,7 +274,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
         </MonitorDetailProvider>
       </ResourcePanelProvider>
     </WorkbenchContextProvider>
-    {paneHost === null ? null : createPortal(<WorkspaceBody current={current} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />, paneHost)}
+    {paneHost === null ? null : createPortal(<WorkspaceBody current={current} rosterRefs={agents.map(agent => agent.ref)} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />, paneHost)}
   </>)
 }
 
@@ -283,10 +284,27 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
  * evict their follows. Render-time history updates avoid a second committed selection.
  * Locking a pane costs O(its rows) in the browser, so the outgoing pane is only covered by the
  * opaque shown pane during the switch frame and locked after that frame paints. */
-export function WorkspaceBody({ current, view, agentName, onOpenTool, ux }: { readonly current: string; readonly view: WorkspaceView; readonly agentName: string; readonly onOpenTool: (call: WorkLogCall) => void; readonly ux?: UxTelemetry }) {
+export function WorkspaceBody({ current, rosterRefs, view, agentName, onOpenTool, ux }: { readonly current: string; readonly rosterRefs: readonly string[]; readonly view: WorkspaceView; readonly agentName: string; readonly onOpenTool: (call: WorkLogCall) => void; readonly ux?: UxTelemetry }) {
+  // Reading positions belong to this surface, not its three-pane DOM cache. A new
+  // surface (including reload) starts following live; evicted panes keep memory here.
+  const [viewportStore] = React.useState(() => new ViewportStore())
+  React.useEffect(() => {
+    viewportStore.open()
+    return () => viewportStore.dispose()
+  }, [viewportStore])
   const [retained, setRetained] = React.useState<readonly RetainedPane[]>([])
   const [switched, setSwitched] = React.useState<{ readonly shown: string; readonly covered: string | undefined }>({ shown: current, covered: undefined })
   const visible = current !== '' && view._tag === 'Thread'
+  const [visited, setVisited] = React.useState<readonly string[]>([])
+  const rosterKeys = new Set(rosterRefs)
+  const recent = visited.filter(ref => rosterKeys.has(ref))
+  const readingKeys = visible && rosterKeys.has(current)
+    ? [current, ...recent.filter(ref => ref !== current)].slice(0, 32)
+    : recent
+  if (visited.length !== readingKeys.length || visited.some((ref, index) => ref !== readingKeys[index])) setVisited(readingKeys)
+  // Viewports save in mutation cleanup. Prune after those saves, including late
+  // eviction saves, rather than allowing departed keys to re-enter the memory.
+  React.useLayoutEffect(() => { viewportStore.retain(new Set(readingKeys)) })
   const latest = retained.reduce<RetainedPane | undefined>((best, pane) => best === undefined || pane.used > best.used ? pane : best, undefined)
   if (visible && (latest?.ref !== current || latest.name !== agentName)) {
     setRetained(retainPane({ panes: retained, ref: current, name: agentName, limit: 3 }))
@@ -299,7 +317,7 @@ export function WorkspaceBody({ current, view, agentName, onOpenTool, ux }: { re
     const frame = window.requestAnimationFrame(() => { timer = window.setTimeout(() => setSwitched(value => ({ shown: value.shown, covered: undefined }))) })
     return () => { window.cancelAnimationFrame(frame); window.clearTimeout(timer) }
   }, [switched])
-  return <>
+  return <ViewportStoreContext.Provider value={viewportStore}>
     {retained.map(pane => {
       const shown = visible && pane.ref === current
       return <div key={pane.ref} {...stylex.props(styles.retainedPane, shown ? styles.shownPane : visible && pane.ref === switched.covered ? null : styles.hiddenPane)}>
@@ -308,7 +326,7 @@ export function WorkspaceBody({ current, view, agentName, onOpenTool, ux }: { re
     })}
     {current === '' ? <div {...stylex.props(styles.empty)}>Choose an agent to open its live thread.</div>
       : view._tag === 'Thread' ? null : <p role="status" {...stylex.props(styles.empty)}>{workspaceViewNotice(view)}</p>}
-  </>
+  </ViewportStoreContext.Provider>
 }
 
 const styles = stylex.create({

@@ -1,6 +1,7 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { EmbraceScrollViewport } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceScrollViewport.tsx'
+import { readingColumnStyles } from '../../../../packages/fractal-ui/src/assistant-ui/reading-column.stylex.ts'
 import { ErrorOverlayHost } from '../../../../packages/fractal-ui/src/assistant-ui/composition/ErrorOverlay.tsx'
 import { SyncLine } from '../../../../packages/fractal-ui/src/assistant-ui/st3-views/SyncLine.tsx'
 import { surfaceVars as surface, textVars as ink, borderVars as border, accentVars as accent, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
@@ -17,7 +18,7 @@ export const ConversationPaneFallback = ({ agentName, visible = true }: {
   <div aria-label="Transcript" {...stylex.props(styles.frame)}>
     <header data-testid="transcript-header" {...stylex.props(styles.header)}><strong {...stylex.props(styles.title)}>{agentName}</strong></header>
     <ErrorOverlayHost lane>
-      <EmbraceScrollViewport items={noItems} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(styles.content)}>
+      <EmbraceScrollViewport items={noItems} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
         {/* TODO(kit): replace with the exported TranscriptSkeleton */}
         <div data-testid="transcript-placeholder" aria-label="Loading conversation" {...stylex.props(styles.placeholder)}>
           <p role="status">Loading conversation…</p>
@@ -38,7 +39,7 @@ const styles = stylex.create({
   header: { height: g.band, minHeight: g.band, position: 'relative', display: 'flex', alignItems: 'center', gap: s.md, paddingInline: s.lg, flexShrink: 0, borderBottomWidth: g.hairline, borderBottomStyle: 'solid', borderBottomColor: border.border },
   title: { flex: '1 1 0', minWidth: 0, fontWeight: t.weightMedium, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   lane: { flex: '1 1 0', minHeight: 0, minWidth: 0, overflowY: 'auto', overflowX: 'hidden', overflowAnchor: 'none' },
-  content: { maxWidth: g.lane, marginInline: 'auto', padding: s.lg, minWidth: 0 },
+  content: { paddingBlock: s.lg },
   placeholder: { display: 'flex', flexDirection: 'column', gap: s.lg },
   turn: { display: 'flex', flexDirection: 'column', gap: s.md, minWidth: 0 },
   skeletonPrompt: { width: '100%', height: `calc(${t.bodyLeading} + ${s.md})`, borderLeftWidth: g.focusRing, borderLeftStyle: 'solid', borderLeftColor: accent.primary, backgroundColor: surface.rowActive },
