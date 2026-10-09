@@ -138,7 +138,7 @@ original_run = g['subprocess'].run
 try:
     for limit in (5000, 1000):
         g['api_requests'] = 0; g['rate_limit'] = None; g['lowest_remaining'] = None
-        g['subprocess'].run = lambda *a, **k: SimpleNamespace(returncode=0, stderr='', stdout=f'HTTP/2.0 200 OK\nX-Ratelimit-Limit: {limit}\nX-Ratelimit-Remaining: 4999\n\n{{"jobs": []}}')
+        g['subprocess'].run = lambda *a, **k: SimpleNamespace(returncode=0, stderr='', stdout=f'HTTP/2.0 200 OK\nX-Ratelimit-Limit: {limit}\nX-Ratelimit-Remaining: {limit-1}\n\n{{"jobs": []}}')
         try:
             result = original_api('stand-in')
             assert limit == 5000 and result == {'jobs': []}
@@ -199,3 +199,35 @@ with tempfile.TemporaryDirectory() as temp:
     finally:
         sys.argv = saved
 print('passed: known/unknown runner intervals outside UTC day excluded; reversed in-window timestamps refuse with partial JSON')
+
+# Every response requires fresh limit AND remaining values, including after a
+# valid prior response; missing/invalid headers cannot bypass the reserve.
+try:
+    for previous in (False, True):
+        for headers in ('X-Ratelimit-Limit: 5000', 'X-Ratelimit-Remaining: 4999', '',
+                        'X-Ratelimit-Limit: bad\nX-Ratelimit-Remaining: 4999',
+                        'X-Ratelimit-Limit: 5000\nX-Ratelimit-Remaining: -1',
+                        'X-Ratelimit-Limit: 5000\nX-Ratelimit-Remaining: 5001'):
+            g['api_requests'] = 0
+            g['rate_limit'] = 5000 if previous else None
+            g['lowest_remaining'] = 4999 if previous else None
+            g['subprocess'].run = lambda *a, **k: SimpleNamespace(returncode=0, stderr='', stdout=f'HTTP/2.0 200 OK\n{headers}\n\n{{"jobs": []}}')
+            try:
+                original_api('rejected-header-stand-in')
+                raise AssertionError('incomplete/invalid current metadata must fail')
+            except RuntimeError as error:
+                assert 'capacity unknown' in str(error)
+            assert g['api_requests'] == 1
+    # Legitimate active crossing-midnight work keeps the clipped minute.
+    real_datetime = g['datetime']
+    class FixedNow(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return end + timedelta(hours=1)
+    g['datetime'] = FixedNow
+    crossing = {**jobs[1], 'status': 'in_progress', 'completed_at': None}
+    assert m['summarize']([crossing], start, end)['execution_minutes'] == 1
+finally:
+    g['subprocess'].run = original_run
+    g['datetime'] = real_datetime
+print('passed: fresh initial/subsequent rate-limit metadata required; invalid bounds rejected; legitimate active midnight clipping retained')

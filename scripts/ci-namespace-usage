@@ -102,17 +102,22 @@ def api(path):
     api_requests += 1
     result = subprocess.run(['gh', 'api', '--include', path], capture_output=True, text=True, timeout=30)
     header, separator, body = result.stdout.partition('\n\n')
-    if separator:
-        headers = dict(line.lower().split(': ', 1) for line in header.splitlines() if ': ' in line)
-        if 'x-ratelimit-limit' in headers:
-            rate_limit = int(headers['x-ratelimit-limit'])
-        if 'x-ratelimit-remaining' in headers:
-            remaining = int(headers['x-ratelimit-remaining'])
-            lowest_remaining = remaining if lowest_remaining is None else min(lowest_remaining, remaining)
     if result.returncode:
         raise RuntimeError(f"GitHub API failed for {path}: {result.stderr.strip()}")
-    if not separator or rate_limit is None:
+    if not separator:
         raise RuntimeError('GitHub rate-limit headers absent; API capacity unknown')
+    headers = dict(line.lower().split(': ', 1) for line in header.splitlines() if ': ' in line)
+    try:
+        current_limit = int(headers['x-ratelimit-limit'])
+        current_remaining = int(headers['x-ratelimit-remaining'])
+    except (KeyError, ValueError) as error:
+        raise RuntimeError('fresh valid rate-limit and remaining headers required; API capacity unknown') from error
+    if current_limit <= 0 or not 0 <= current_remaining <= current_limit:
+        raise RuntimeError('invalid current rate-limit/remaining bounds; API capacity unknown')
+    # Prior observations remain report evidence, never substitutes for absent
+    # headers on this response. Count even the rejected request.
+    rate_limit = current_limit
+    lowest_remaining = current_remaining if lowest_remaining is None else min(lowest_remaining, current_remaining)
     if rate_limit < API_REQUEST_LIMIT:
         raise RuntimeError(f'credential API limit {rate_limit} is below the {API_REQUEST_LIMIT}-request budget; need existing higher-limit read token')
     return json.loads(body)

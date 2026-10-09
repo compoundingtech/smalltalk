@@ -878,3 +878,20 @@ calls (142 run-list pages plus at least one jobs page per relevant run); its exa
 request count was not instrumented. Its older identity gap makes its 38,979.28
 observed job minutes a lower bound, not current collector qualification. The new
 collector records exact request/rate evidence for its own natural outcome.
+
+The reporter makes only read-only GET requests to Actions run/job endpoints. The
+existing secret must permit those reads in addition to the picker's organization
+runner-list access; workflow job-token permissions do not restrict a PAT's actual
+scopes. Source alone cannot confirm the installed secret's scope or capability.
+A missing permission returns partial evidence rather than a complete total.
+See GitHub's [workflow-run search limits](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-repository)
+and [REST rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
+Each response must have fresh valid limit and remaining headers; earlier values
+never substitute for missing current quota evidence.
+
+One pinned corrected local-auth report ended naturally with exit 1 after 207.77s:
+234 attempted API calls, observed limit 5,000, minimum remaining 499, and the
+explicit reserve-reached error. It retained 4,836.67 observed minutes as partial
+window evidence. This confirms the quota-reserve behavior with local authentication,
+not the scheduled credential, full window, or a successful daily total. No automatic
+retry follows quota exhaustion.
