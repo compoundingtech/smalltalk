@@ -1,10 +1,10 @@
 {
   "version": 1,
-  "summary": "fractal-web app shell: read-only agent sidebar, data layer and st3 SDK",
+  "summary": "fractal-web app shell: read-only agent sidebar, data layer and st3 SDK; gateway JSON streams negotiated Brotli/gzip representations with Accept-Encoding variation",
   "replay": {"status": "none", "detail": "Read-only shell and data projections; no runtime replay change."},
   "schema": {"status": "none", "detail": "No database schema change."},
   "rules": {"status": "none", "detail": "No checkpoint rules change."},
-  "compatibility": {"status": "none", "detail": "No client protocol or deployed runtime compatibility change."},
+  "compatibility": {"status": "none", "detail": "No client protocol or deployed runtime compatibility change. View preferences (collapsed folders, pane layout, devbar visibility, usage unit) persist in localStorage; they hold no content or names, unknown IDs are ignored, and invalid values fall back to defaults."},
   "downtime": {"status": "none", "detail": "No service interruption introduced."},
   "manual": {"status": "none", "detail": "No deployed installation action required; the app is not deployed by this change."},
   "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
