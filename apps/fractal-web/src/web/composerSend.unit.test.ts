@@ -1,6 +1,10 @@
+// @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest'
 import type { AttachmentPort } from '../data/source.ts'
 import { composerSendBinding, sendFailureDetail } from './composerSend.ts'
+import { ActionResult, decodeUnknownSync } from '@smalltalk/st3-client/schema'
+import { createComposerDraftSession, createLocalComposerDraftStore } from './composerDrafts.ts'
+import { createComposerDraftAdapter } from './composerDraftAdapter.ts'
 
 const message = {
   role: 'user', content: [{ type: 'text', text: 'hello' }], createdAt: new Date(0),
@@ -10,6 +14,64 @@ const grants = { actions: 'granted', messageSend: 'granted', terminalInput: 'ung
 const seat = 'agent/example/scratch'
 
 describe('composer send contract', () => {
+  it.each(['completed', 'accepted', 'rejected', 'failed'] as const)('clears a saved draft only on a completed send, not %s submission', async status => {
+    localStorage.clear()
+    const store = createLocalComposerDraftStore({ storage: localStorage, events: window })
+    const adapter = createComposerDraftAdapter({ store, conversationId: seat, getHandle: () => undefined, now: () => 10 })
+    adapter.onDraftChange({ text: 'hello', revision: 1, savedAt: 10, cause: 'user' })
+    const send = vi.fn<AttachmentPort['send']>().mockResolvedValue(status === 'failed'
+      ? { _tag: 'Refused', reason: 'failed', detail: 'Send did not complete' }
+      : { _tag: 'Success', value: decodeUnknownSync(ActionResult)({
+          kind: 'action-result', action_id: 'action/example', operation_id: 'operation/example',
+          snapshot_id: 'snapshot/example', affected_ids: ['message/example'], status,
+        }) })
+    const input = {
+      source: { attachments: { capabilities: vi.fn(), upload: vi.fn(), chunk: vi.fn(), send } },
+      agentRef: seat, grants, readable: true, items: [], onRefused: vi.fn(),
+      onSending: adapter.onSending,
+    }
+    const binding = composerSendBinding(input)
+    adapter.onDraftChange({ text: '', revision: 2, savedAt: 11, cause: 'submit-reset' })
+    await binding.runtime.onNew(message)
+    expect(store.read(seat)?.text).toBe(status === 'completed' ? '' : 'hello')
+    adapter.close()
+    if (status === 'failed') {
+      // The in-memory outbox does not survive reload; the browser-local text does.
+      const reloaded = createComposerDraftSession({
+        store: createLocalComposerDraftStore({ storage: localStorage, events: window }), conversationId: seat,
+      })
+      expect(reloaded.getSnapshot().text).toBe('hello')
+      reloaded.close()
+    }
+  })
+
+  it('never acknowledges a newly authored same-text draft when retrying an older outbox item', async () => {
+    localStorage.clear()
+    const store = createLocalComposerDraftStore({ storage: localStorage, events: window })
+    const adapter = createComposerDraftAdapter({ store, conversationId: seat, getHandle: () => undefined, now: () => 10 })
+    adapter.onDraftChange({ text: 'hello', revision: 1, savedAt: 10, cause: 'user' })
+    const send = vi.fn<AttachmentPort['send']>()
+      .mockResolvedValueOnce({ _tag: 'Refused', reason: 'failed', detail: 'Send did not complete' })
+      .mockResolvedValueOnce({ _tag: 'Success', value: decodeUnknownSync(ActionResult)({
+        kind: 'action-result', action_id: 'action/example', operation_id: 'operation/example',
+        snapshot_id: 'snapshot/example', affected_ids: ['message/example'], status: 'completed',
+      }) })
+    const binding = composerSendBinding({
+      source: { attachments: { capabilities: vi.fn(), upload: vi.fn(), chunk: vi.fn(), send } },
+      agentRef: seat, grants, readable: true, items: [], onRefused: vi.fn(), onSending: adapter.onSending,
+    })
+    await binding.runtime.onNew(message)
+    adapter.onDraftChange({ text: 'hello', revision: 2, savedAt: 11, cause: 'user' })
+    const authored = store.read(seat)
+    await binding.retry({
+      _tag: 'Text', id: 'pending/original-outbox-key', role: 'user', text: 'hello', attachments: [],
+      streaming: false, at: new Date(0).toISOString(), sendState: { _tag: 'Failed', reason: 'failed', detail: 'Send did not complete' },
+    })
+    expect(send.mock.calls[1]?.[0]).toMatchObject({ _tag: 'Resend', idempotencyKey: 'original-outbox-key' })
+    expect(store.read(seat)).toEqual(authored)
+    adapter.close()
+  })
+
   it('sends Send then Resend with the source key and leaves the fence to the data source', async () => {
     const send = vi.fn<AttachmentPort['send']>().mockResolvedValue({ _tag: 'Refused', reason: 'failed', detail: 'Actual refusal' })
     const onRefused = vi.fn()

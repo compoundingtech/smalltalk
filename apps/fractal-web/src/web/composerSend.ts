@@ -18,8 +18,8 @@ const sendFailureDetails: Readonly<Record<Extract<SendState, { _tag: 'Failed' }>
 export const sendFailureDetail = (reason: string): string =>
   (Object.hasOwn(sendFailureDetails, reason) ? sendFailureDetails[reason] : undefined) ?? sendFailureDetails.failed
 
-/** The kit owns the draft. The data source owns keys, outbox, send state and echo reconciliation. */
-export const composerSendBinding = ({ source, agentRef, grants, readable, items, refusal, onRefused }: {
+/** The app owns draft persistence; the source owns keys, outbox, send state and echo reconciliation. */
+export const composerSendBinding = ({ source, agentRef, grants, readable, items, refusal, onRefused, onSending }: {
   readonly source: Pick<DataSource, 'attachments'>
   readonly agentRef: string
   readonly grants: Grants
@@ -28,6 +28,8 @@ export const composerSendBinding = ({ source, agentRef, grants, readable, items,
   readonly items: NonNullable<ConversationRuntimeOptions['messages']>
   readonly refusal?: SendRefusal
   readonly onRefused: (refusal: SendRefusal) => void
+  /** Capture before dispatch; optimistic clears are not confirmed sends. */
+  readonly onSending?: (content: string) => (outcome: { readonly _tag: 'Confirmed' } | { readonly _tag: 'Unconfirmed' }) => void
 }): { readonly runtime: ConversationRuntimeOptions; readonly disabledReason?: string; readonly retry: (item: ConversationItem) => Promise<void> } => {
   const disabledReason = refusal !== undefined ? sendFailureDetail(refusal.reason)
     : source.attachments === undefined ? 'This view cannot send messages.'
@@ -39,12 +41,21 @@ export const composerSendBinding = ({ source, agentRef, grants, readable, items,
       api_version: 'st3.client.v0', type: 'message.send', id: `action/${crypto.randomUUID()}`,
       parameters: { to: agentRef, content, tags: [], attachments },
     } as const
-    const result = await source.attachments.send(retryKey === undefined
-      ? { ...request, _tag: 'Send' }
-      : { ...request, _tag: 'Resend', idempotencyKey: retryKey })
-    // Retryable send failures belong to the outbox row, not the next draft's availability.
-    if (result._tag === 'Refused' && result.reason !== 'failed'
-      && result.reason !== 'stale-fence' && result.reason !== 'snapshot-unavailable') onRefused({ reason: result.reason })
+    // An outbox retry has no original composer revision in this port. Never capture the
+    // current draft as its submission: equal text does not establish submission identity.
+    const settled = retryKey === undefined ? onSending?.(content) : undefined
+    let confirmed = false
+    try {
+      const result = await source.attachments.send(retryKey === undefined
+        ? { ...request, _tag: 'Send' }
+        : { ...request, _tag: 'Resend', idempotencyKey: retryKey })
+      // Retryable send failures belong to the outbox row, not the next draft's availability.
+      if (result._tag === 'Refused' && result.reason !== 'failed'
+        && result.reason !== 'stale-fence' && result.reason !== 'snapshot-unavailable') onRefused({ reason: result.reason })
+      confirmed = result._tag === 'Success' && result.value.status === 'completed'
+    } finally {
+      settled?.({ _tag: confirmed ? 'Confirmed' : 'Unconfirmed' })
+    }
   }
   return {
     ...(disabledReason === undefined ? {} : { disabledReason }),
