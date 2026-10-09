@@ -4378,7 +4378,7 @@ pub(super) async fn agent_queue(
     let queue = blocking_store(move || {
         // Only existence matters here. Reading the newest full claim sorts and decodes
         // the agent's entire observation history before an otherwise empty queue read.
-        if store.latest_claim_id(&lookup)?.is_none() {
+        if !store.has_claim_or_current_value(&lookup)? {
             return Ok(None);
         }
         store.seat_queue(&lookup).map(Some)
@@ -10540,7 +10540,7 @@ mod tests {
     fn agent_queue_history_fixture(root: &std::path::Path, observations: usize) -> AppState {
         let state = test_state(root);
         let agent = "agent/queue-history";
-        let seed = state.store.append_claim(&ClaimInput {
+        let seed = state.store.append_legacy_claim(&ClaimInput {
             subject: agent.into(),
             kind: "harness.observed".into(),
             actor: Some(agent.into()),
@@ -11470,7 +11470,7 @@ mission "queue-parity" state="ready" {
         let state = test_state(root.path());
         let subject = "agent/published-roster";
         let append = |kind: &str, fields: Value| {
-            state.store.append_claim(&ClaimInput {
+            state.store.append_legacy_claim(&ClaimInput {
                 subject: subject.into(), kind: kind.into(), actor: None,
                 fields: serde_json::from_value(fields).unwrap(),
                 evidence: Vec::new(), expected_subject: None, idempotency_key: None,

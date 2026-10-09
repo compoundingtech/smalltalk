@@ -612,6 +612,7 @@ fn supervise_provider(
     observed: Option<&SessionObserver>,
 ) -> Result<ProviderOutcome> {
     let mut next_refresh = Instant::now();
+    let mut next_observation = Instant::now();
     loop {
         if stop.load(Ordering::SeqCst) {
             return stop_provider_group(&mut child, observed).map(ProviderOutcome::Stopped);
@@ -638,10 +639,13 @@ fn supervise_provider(
             if let Some(status_path) = status_path {
                 let _ = status::refresh(status_path);
             }
+            next_refresh = now + refresh_interval;
+        }
+        if now >= next_observation {
             if let Some(observed) = observed {
                 observed.heartbeat();
             }
-            next_refresh = now + refresh_interval;
+            next_observation = now + harness_state::HARNESS_STATE_REFRESH;
         }
         thread::sleep(poll.min(next_refresh.saturating_duration_since(Instant::now())));
     }

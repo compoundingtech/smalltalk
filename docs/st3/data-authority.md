@@ -39,7 +39,8 @@ snapshot gets one HTTP attempt. All current snapshots in one wake share a 100 ms
 An independent publisher reads the newest source snapshots while durable accounting or timeline
 publication waits. Its own wake pipe prevents the ordered drain from consuming current wakes.
 Failure leaves no retry obligation; only
-a subsequent source snapshot triggers another attempt. The source account is captured with
+a subsequent source snapshot triggers another attempt. The producer re-observes live provider
+evidence every 30 seconds; five-minute presence refreshes have a separate timer. The source account is captured with
 context evidence, so delayed reads cannot attribute it to a successor's account. Authenticated
 fleet peers receive current values over `/v1/peer/current-value`, once per peer with a 250 ms
 whole-hop bound, including the receiver's 100 ms local hop, independently of signed graph inventories.
@@ -71,11 +72,16 @@ Numeric `harness.usage` readings and account limits remain durable accounting fa
 in place. A durable additive `accounting_stop` marker in the existing `harness-context`
 spool envelope requests the native-only `/v1/harness-events/usage-flush` route independently
 of whether an idle current sample was accepted. Older drivers decode the marker as an empty
-context reading and consume it; new drivers acknowledge retired incarnations or an older
-daemon's missing flush route with a private log entry. Install matching release artifacts to
+context reading and consume it. New drivers retain unconfirmed launch events for retry. Invalid
+and positively retired numeric events move atomically into local quarantine with their original
+incarnation, payload and reason; no automatic replay or successor attribution occurs. An older
+daemon's missing optional flush route is logged; a missing numeric publication route retains
+the event for a compatible daemon. Install matching release artifacts to
 obtain the independent stop guarantee during upgrades. One ordered spool publisher runs
-outside the driver's mail receive loop and completion waits for it before publishing exit.
-The daemon also recovers retained numeric work in indexed batches of at most 64 subjects,
+outside the driver's mail receive loop. Completion drains every retained batch and requests
+the stop flush even when the final current snapshot or stop marker dropped, before publishing exit.
+The daemon also recovers retained numeric work in indexed batches of at most 64 rows,
+continuing past a failed subject with bounded per-subject backoff,
 including adopted providers without a spool and daemon restarts. `context_occupancy` is exclusively a current
 value and never enters that flush. Messages, work ownership, runtime launch/stop proofs and
 replication inventories retain their durable contracts.

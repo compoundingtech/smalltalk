@@ -631,6 +631,12 @@ pub fn prepare_publication(
 pub fn acknowledge(agent_dir: &Path, sequence: u64) -> Result<()> {
     let mut connection = open(agent_dir)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    acknowledge_tx(&tx, sequence)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn acknowledge_tx(tx: &Connection, sequence: u64) -> Result<()> {
     let removed: u64 = tx.query_row(
         "SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM events WHERE sequence<=?1",
         [sequence],
@@ -642,6 +648,23 @@ pub fn acknowledge(agent_dir: &Path, sequence: u64) -> Result<()> {
         "UPDATE metadata SET value=CAST(value AS INTEGER)-?1 WHERE key='pending-bytes'",
         [removed],
     )?;
+    Ok(())
+}
+
+/// Retain an unpublishable event and its original provenance without blocking successors.
+/// Quarantine is local evidence, never an automatic replay or a new categorical publication.
+pub fn quarantine(agent_dir: &Path, sequence: u64, reason: &str) -> Result<()> {
+    let mut connection = open(agent_dir)?;
+    connection.busy_timeout(Duration::ZERO)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS quarantined_events (
+        sequence INTEGER PRIMARY KEY, runtime_incarnation TEXT NOT NULL,
+        queued_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, reason TEXT NOT NULL)")?;
+    let reason = reason.chars().take(1024).collect::<String>();
+    tx.execute("INSERT OR IGNORE INTO quarantined_events
+        SELECT sequence,runtime_incarnation,queued_at_ms,kind,body,?2 FROM events WHERE sequence=?1",
+        params![sequence,reason])?;
+    acknowledge_tx(&tx, sequence)?;
     tx.commit()?;
     Ok(())
 }
@@ -765,11 +788,55 @@ mod tests {
     use super::*;
     use crate::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer, claim};
     #[test]
+    fn quarantine_retains_provenance_and_advances_only_the_acknowledged_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime-a").unwrap();
+        let connection = open(root.path()).unwrap();
+        for kind in ["bad-driver", "harness-timeline"] {
+            let body = serde_json::json!({"driver":"fixture","kind":kind}).to_string();
+            connection.execute("INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES('runtime-a',1,?1,?2)",
+                params![kind, body]).unwrap();
+        }
+        connection.execute("UPDATE metadata SET value=(SELECT SUM(length(CAST(body AS BLOB))) FROM events) WHERE key='pending-bytes'", []).unwrap();
+        let events = pending(root.path(), 10).unwrap();
+        quarantine(root.path(), events[0].sequence, "invalid driver").unwrap();
+        let retained: (String, String, String) = connection
+            .query_row(
+                "SELECT runtime_incarnation,kind,reason FROM quarantined_events WHERE sequence=?1",
+                [events[0].sequence],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retained,
+            (
+                "runtime-a".into(),
+                "bad-driver".into(),
+                "invalid driver".into()
+            )
+        );
+        let remaining = pending(root.path(), 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].sequence, events[1].sequence);
+        let bytes: usize = connection
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='pending-bytes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&remaining[0].payload).unwrap().len()
+        );
+    }
+
+    #[test]
     fn accounting_stop_retries_a_full_spool_without_replaying_current_status() {
         let root = tempfile::tempdir().unwrap();
         enable(root.path(), "runtime-a").unwrap();
         let seq = claim(root.path(), "example/seat", "claude", "provider-a").unwrap();
-        let mut writer = Writer::new(root.path(), "example/seat", "claude", None)
+        let mut writer = Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
             .with_ownership("provider-a", seq);
         writer
             .observe(Observation::new(

@@ -1764,22 +1764,13 @@ async fn send_one(context: &Context, name: &str) -> Result<(), String> {
                 sequence: turn as u64 + 1,
                 claim,
             };
-            let current = st3::store::is_current_input(&publication.claim);
             let result = on_daemon(context, move |store| {
                 Ok(store.append_harness_event(&publication).map(drop))
             })
             .await?;
-            match result {
-                Err(error)
-                    if current
-                        && error.code == "internal"
-                        && error.message.contains("database is locked") =>
-                {
-                    context.current_dropped.fetch_add(1, Ordering::Relaxed);
-                    Ok(())
-                }
-                result => result.map_err(|error| error.message),
-            }
+            // Nonzero-sequence events remain reliable even for categorical legacy kinds.
+            // Any failure here still fails the load budget; these are not current samples.
+            result.map_err(|error| error.message)
         }
         "seat mailbox page" => {
             get(format!(

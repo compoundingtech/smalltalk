@@ -27,8 +27,9 @@ use serde::{Deserialize, Serialize};
 /// observed harness state.
 pub const HARNESS_STATE_STALE: Duration = Duration::from_secs(15 * 60);
 /// How often a live writer re-stamps unchanged evidence it still holds. State changes
-/// publish immediately; quiet sessions retain the cadence used before the twenty-second refresh.
-pub const HARNESS_STATE_REFRESH: Duration = Duration::from_secs(5 * 60);
+/// publish immediately. Fresh provider evidence arrives before the daemon's 90-second
+/// freshness window, independently of the slower presence refresh.
+pub const HARNESS_STATE_REFRESH: Duration = Duration::from_secs(30);
 /// Maximum accepted positive difference between the writer's UTC clock and the reader's clock.
 pub const HARNESS_STATE_FUTURE_SKEW: Duration = Duration::from_secs(60);
 

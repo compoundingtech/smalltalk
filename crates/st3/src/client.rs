@@ -987,6 +987,7 @@ pub fn http_status(error: &anyhow::Error) -> Option<u16> {
 /// ownership refusals remain errors; callers must never disguise a stale incarnation.
 pub fn current_publication_dropped(error: &anyhow::Error) -> bool {
     daemon_unreachable(error).is_some()
+        || http_status(error) == Some(503)
         || error
             .chain()
             .any(|cause| {

@@ -7,7 +7,7 @@
   },
   "schema": {
     "status": "changed",
-    "detail": "Adds latest_values, latest_readiness and local indexes plus current-value epoch and feed-boundary metadata. No numeric staging migration or graph backfill is introduced. Older binaries can open the additive schema. Adds a partial index over retained pending numeric usage for bounded background recovery."
+    "detail": "Adds latest_values, latest_readiness and local indexes plus current-value epoch and feed-boundary metadata. No numeric staging migration or graph backfill is introduced. Older binaries can open the additive schema. Adds a partial index over retained pending numeric usage for bounded background recovery. Adds a local quarantined_events spool table lazily when an invalid or positively retired event is retained; spool version stays unchanged."
   },
   "rules": {
     "status": "none",
@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Categorical status, context occupancy, todo, workspace and connectivity use one-shot current publication. Register-backed status-history returns empty items with complete=false and retained_from=now. Current values use request-time state even at a pinned graph cut; a missed heartbeat can produce staleness after 90 seconds. Old peers without current-value transport appear frozen then stale until upgraded. Numeric usage, limits, accounting stops, diagnostics and timeline keep durable publication and retries. Accounting stops use an additive accounting_stop marker on the existing harness-context spool kind; older drivers decode its ordinary context record, ignore that marker and consume the event. The new local native-only /v1/harness-events/usage-flush route returns a terminal compatibility miss on older daemons rather than blocking the spool. Retired-incarnation events are acknowledged without changing the successor runtime."
+    "detail": "Categorical status, context occupancy, todo, workspace and connectivity use one-shot current publication. Register-backed status-history returns empty items with complete=false and retained_from=now. Current values use request-time state even at a pinned graph cut; a missed heartbeat can produce staleness after 90 seconds. Old peers without current-value transport appear frozen then stale until upgraded. Numeric usage, limits, accounting stops, diagnostics and timeline keep durable publication and retries. Accounting stops use an additive accounting_stop marker on the existing harness-context spool kind; older drivers decode its ordinary context record, ignore that marker and consume the event. The new local native-only /v1/harness-events/usage-flush route returns a terminal compatibility miss on older daemons rather than blocking the spool. Unconfirmed launch fences retain numeric events for retry. Invalid and positively retired numeric events move atomically into local quarantine with their original incarnation, payload and reason; they never change the successor runtime. Nonzero-sequence legacy events retain their reliable replay protocol. Fresh live-provider observation heartbeats run every 30 seconds independently of five-minute presence refreshes."
   },
   "downtime": {
     "status": "none",
@@ -27,6 +27,6 @@
   },
   "recovery": {
     "status": "changed",
-    "detail": "Dropped current samples are never replayed; a new owner sample refreshes the register. Ordinary reopen preserves the database epoch. Feed cursor gaps require snapshot resynchronization. Durable accounting and control obligations remain in their outboxes across daemon outages and driver re-exec."
+    "detail": "Dropped current samples are never replayed; a new owner sample refreshes the register. Ordinary reopen preserves the database epoch. Feed cursor gaps require snapshot resynchronization. Durable accounting and control obligations remain in their outboxes across daemon outages and driver re-exec. Failed retained-usage subjects do not block later subjects; a bounded per-subject backoff retains their pending slots. Provider completion drains all retained accounting and requests the stop flush even when the ended snapshot or stop marker did not land. Quarantined records remain local for inspection and are not automatically replayed."
   }
 }

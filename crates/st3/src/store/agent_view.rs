@@ -1214,7 +1214,7 @@ mod tests {
         );
         let claim = f
             .store
-            .append_claim(&Fixture::input(
+            .append_legacy_claim(&Fixture::input(
                 SEAT,
                 "harness.observed",
                 json!({"state":"idle","incarnation_id":"one"}),

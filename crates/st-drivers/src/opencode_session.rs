@@ -413,6 +413,7 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
     let mut next_seed_attempt = Instant::now();
     let mut next_gate_attempt = Instant::now();
     let mut next_presence = Instant::now();
+    let mut next_observation = Instant::now();
     let mut next_inbox = Instant::now();
     // The context producer's own handle on the server: `Client` is a port and a password, and a
     // separate one keeps its pull from borrowing the session while the producer is borrowed
@@ -591,10 +592,13 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
         let now = Instant::now();
         if now >= next_presence {
             session.control.refresh(&session.status_path);
+            next_presence = now + crate::provider_session::SESSION_REFRESH;
+        }
+        if now >= next_observation {
             if evidence {
                 let _ = session.writer.heartbeat();
             }
-            next_presence = now + crate::provider_session::SESSION_REFRESH;
+            next_observation = now + harness_state::HARNESS_STATE_REFRESH;
         }
 
         let mut inbox_due = now >= next_inbox;

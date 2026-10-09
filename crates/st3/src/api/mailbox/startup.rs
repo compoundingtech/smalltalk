@@ -284,16 +284,13 @@ mod tests {
 
     #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    async fn full_native_bind_waits_without_starting_status_then_preserves_live_and_retired_fences()
-    {
+    async fn native_startup_binding_waits_without_starting_status_then_preserves_live_and_retired_fences()
+     {
         let root = tempfile::tempdir().unwrap();
         let (state, peer, fence, _) = bootstrap_fixture(root.path());
-        let result = super::super::bind(
-            State(state.clone()),
-            Some(Extension(peer.clone())),
-            Json(fence.clone()),
-        )
-        .await;
+        let result = bind_with_native_startup(&state.store, &fence, || {
+            live_native_incarnation(&state.store, &state.node, &state.pty_root, &peer, &fence)
+        });
         assert_eq!(result.err().unwrap().code, "mailbox-session-starting");
         assert_eq!(
             state
@@ -324,30 +321,28 @@ mod tests {
             "foreign-mailbox"
         );
         crate::mailbox::tests::ready(&state.store, &fence.incarnation);
-        let first = super::super::bind(
-            State(state.clone()),
-            Some(Extension(peer.clone())),
-            Json(fence.clone()),
-        )
-        .await
-        .unwrap()
-        .0;
+        let first = bind_with_native_startup(&state.store, &fence, || {
+            live_native_incarnation(&state.store, &state.node, &state.pty_root, &peer, &fence)
+        })
+        .unwrap();
         let successor = Fence::new(&fence.subject, &fence.incarnation, "delivery");
-        let second = super::super::bind(
-            State(state.clone()),
-            Some(Extension(peer.clone())),
-            Json(successor),
-        )
-        .await
-        .unwrap()
-        .0;
+        let second = bind_with_native_startup(&state.store, &successor, || {
+            live_native_incarnation(
+                &state.store,
+                &state.node,
+                &state.pty_root,
+                &peer,
+                &successor,
+            )
+        })
+        .unwrap();
         assert!(second.epoch > first.epoch);
         assert_eq!(
-            super::super::bind(State(state), Some(Extension(peer)), Json(first))
-                .await
-                .err()
-                .unwrap()
-                .code,
+            bind_with_native_startup(&state.store, &first, || {
+                live_native_incarnation(&state.store, &state.node, &state.pty_root, &peer, &first)
+            })
+            .unwrap_err()
+            .code,
             "stale-mailbox-session"
         );
     }

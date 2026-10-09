@@ -18120,7 +18120,7 @@ async fn drive_st2_native(
                             }).await?;
                         }
                     }
-                    if let Err(error) = observations.drain(client, subject, driver, &mut loop_state.ready).await {
+                    if let Err(error) = observations.finish_accounting(client, subject, driver, &mut loop_state.ready).await {
                         note_driver_tick_failure(subject, error, &mut last_control_warning);
                     }
                     // The harness is gone, and its subagents with it. The reconciler ends any this
@@ -18645,6 +18645,12 @@ fn harness_activity_state(activity: st_drivers::harness_state::Activity) -> &'st
 
 /// A pipe wake follows a durable spool commit. The timer
 /// retries a known pending publication only; it does not poll state/context/timeline records.
+struct DurableDrainOutcome {
+    result: Result<()>,
+    diagnostic: Option<String>,
+    retry: bool,
+}
+
 struct NativeObservations {
     dir: PathBuf,
     runtime: String,
@@ -18659,7 +18665,7 @@ struct NativeObservations {
     durable_wake: bool,
     background_durable: bool,
     durable_only: bool,
-    durable_task: Option<tokio::task::JoinHandle<(Result<()>, Option<String>, bool)>>,
+    durable_task: Option<tokio::task::JoinHandle<DurableDrainOutcome>>,
     pipe: Option<tokio::io::unix::AsyncFd<std::fs::File>>,
 }
 impl NativeObservations {
@@ -18759,10 +18765,10 @@ impl NativeObservations {
             .is_some_and(|task| wait || task.is_finished())
         {
             let task = self.durable_task.take().unwrap();
-            let (result, diagnostic, retry) = task.await?;
-            self.admission_diagnostic = diagnostic;
-            self.retry_pending = retry;
-            result?;
+            let outcome = task.await?;
+            self.admission_diagnostic = outcome.diagnostic;
+            self.retry_pending = outcome.retry;
+            outcome.result?;
         }
         Ok(())
     }
@@ -18811,11 +18817,11 @@ impl NativeObservations {
                     .drain_events(&client, &subject, &driver, &mut false, false)
                     .await
                     .map(|_| ());
-                (
+                DurableDrainOutcome {
                     result,
-                    worker.admission_diagnostic.take(),
-                    worker.retry_pending,
-                )
+                    diagnostic: worker.admission_diagnostic.take(),
+                    retry: worker.retry_pending,
+                }
             }));
         }
         self.retry_pending |= self.durable_task.is_some();
@@ -18829,7 +18835,8 @@ impl NativeObservations {
         driver: &str,
         ready: &mut bool,
     ) -> Result<()> {
-        self.publish_snapshots_mode(client, subject, driver, ready, false).await
+        self.publish_snapshots_mode(client, subject, driver, ready, false)
+            .await
     }
 
     async fn publish_snapshots_mode(
@@ -18859,7 +18866,9 @@ impl NativeObservations {
             };
             let Some(raw) = raw else { continue };
             let payload: Value = serde_json::from_slice(&raw)?;
-            if !terminal_completed && kind == "harness-state" && payload["state"] == "ended"
+            if !terminal_completed
+                && kind == "harness-state"
+                && payload["state"] == "ended"
                 && !payload["exit"].is_null()
             {
                 continue;
@@ -18925,7 +18934,6 @@ impl NativeObservations {
                             )
                             .await;
                         }
-
                     }
                     "harness-context" => {
                         let publisher = ObservationClient {
@@ -18985,10 +18993,47 @@ impl NativeObservations {
         ready: &mut bool,
     ) -> Result<()> {
         // Provider completion is the barrier: finish the ordered publisher before exit.
-        self.finish_durable_task(true).await?;
+        if let Err(error) = self.finish_durable_task(true).await {
+            let _ = write_driver_log(
+                subject,
+                &format!("background accounting failed before final drain: {error:#}"),
+            );
+        }
         self.drain_events(client, subject, driver, ready, false)
             .await
             .map(|_| ())
+    }
+
+    async fn finish_accounting(
+        &mut self,
+        client: &Client,
+        subject: &str,
+        driver: &str,
+        ready: &mut bool,
+    ) -> Result<()> {
+        let mut last_warning = None;
+        loop {
+            let result = async {
+                loop {
+                    self.drain(client, subject, driver, ready).await?;
+                    if !self.retry_pending {
+                        break;
+                    }
+                }
+                // An ended snapshot/control can lose its zero-wait writer attempt. Provider
+                // completion itself is the durable stop obligation; never depend on that sample.
+                flush_native_usage(client, subject, &self.runtime).await
+            }
+            .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if accounting_request_is_transient(&error) => {
+                    note_driver_tick_failure(subject, error, &mut last_warning);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn prepare_drain(
@@ -19080,7 +19125,23 @@ impl NativeObservations {
                     subject,
                     &format!("ignored unsupported harness event `{}`", event.kind),
                 );
-                st_drivers::harness_events::acknowledge(&self.dir, event.sequence)?;
+                st_drivers::harness_events::quarantine(
+                    &self.dir,
+                    event.sequence,
+                    "unsupported harness event kind",
+                )?;
+                continue;
+            }
+            if let Err(error) = validate_accounting_event(event) {
+                st_drivers::harness_events::quarantine(
+                    &self.dir,
+                    event.sequence,
+                    &format!("{error:#}"),
+                )?;
+                let _ = write_driver_log(
+                    subject,
+                    &format!("accounting event {} quarantined: {error:#}", event.sequence),
+                );
                 continue;
             }
             let account_ref = event
@@ -19131,15 +19192,7 @@ impl NativeObservations {
                             )
                             .await?;
                         }
-                        let _: Value = client
-                            .post(
-                                "/v1/harness-events/usage-flush",
-                                &st3::harness_events::UsageFlush {
-                                    subject: subject.into(),
-                                    runtime_incarnation: event.runtime_incarnation.clone(),
-                                },
-                            )
-                            .await?;
+                        flush_native_usage(client, subject, &event.runtime_incarnation).await?;
                     }
                     "harness-context" | "harness-accounting" => {
                         if let Some(observed) = st_drivers::harness_context::read_raw_at(
@@ -19209,32 +19262,41 @@ impl NativeObservations {
                 {
                     // The final reading can arrive after the stop control. Retain its
                     // acknowledgement until its independent stop flush has succeeded.
-                    let _: Value = client
-                        .post(
-                            "/v1/harness-events/usage-flush",
-                            &st3::harness_events::UsageFlush {
-                                subject: subject.into(),
-                                runtime_incarnation: event.runtime_incarnation.clone(),
-                            },
-                        )
-                        .await?;
+                    flush_native_usage(client, subject, &event.runtime_incarnation).await?;
                 }
                 Ok(())
             }
             .await;
             if let Err(error) = publication {
-                if st3::client::api_error_code(&error) == Some("stale-harness-event-session")
-                    || st3::client::is_missing_route(&error)
+                if harness_event_is_retired(client, subject, &event.runtime_incarnation, &error)
+                    .await?
                 {
+                    st_drivers::harness_events::quarantine(
+                        &self.dir,
+                        event.sequence,
+                        &format!("retired: {error:#}"),
+                    )?;
                     let _ = write_driver_log(
                         subject,
                         &format!(
-                            "retired or unsupported accounting event {} acknowledged: {error:#}",
+                            "retired accounting event {} quarantined: {error:#}",
                             event.sequence
                         ),
                     );
-                } else {
+                    continue;
+                } else if accounting_request_is_transient(&error) {
                     return Err(error);
+                } else {
+                    st_drivers::harness_events::quarantine(
+                        &self.dir,
+                        event.sequence,
+                        &format!("{error:#}"),
+                    )?;
+                    let _ = write_driver_log(
+                        subject,
+                        &format!("accounting event {} quarantined: {error:#}", event.sequence),
+                    );
+                    continue;
                 }
             }
             st_drivers::harness_events::acknowledge(&self.dir, event.sequence)?;
@@ -19251,6 +19313,109 @@ impl Drop for NativeObservations {
             task.abort();
         }
     }
+}
+
+fn validate_accounting_event(event: &st_drivers::harness_events::Event) -> Result<()> {
+    let driver = event.payload["harness"]
+        .as_str()
+        .or_else(|| event.payload["driver"].as_str())
+        .context("event has no source driver")?;
+    anyhow::ensure!(
+        matches!(driver, "claude" | "codex" | "pi" | "omp" | "opencode"),
+        "unknown event driver"
+    );
+    let raw = serde_json::to_vec(&event.payload)?;
+    if matches!(
+        event.kind.as_str(),
+        "harness-accounting" | "harness-context"
+    ) && event.payload["accounting_stop"] != true
+    {
+        st_drivers::harness_context::read_raw_at(&raw, st_drivers::message::now_ms())
+            .context("invalid numeric accounting record")?;
+    }
+    if event.kind == "harness-timeline" {
+        let _: st_drivers::harness_timeline::Operation = serde_json::from_slice(&raw)?;
+    }
+    Ok(())
+}
+
+fn accounting_request_is_transient(error: &anyhow::Error) -> bool {
+    st3::client::current_publication_dropped(error)
+        || st3::client::is_missing_route(error)
+        || st3::client::http_status(error)
+            .is_some_and(|status| status >= 500 || matches!(status, 408 | 429))
+        || error.chain().any(|cause| cause.is::<std::io::Error>())
+        || st3::client::api_error_parts(error).is_some_and(|(status, code, _, details)| {
+            status >= 500
+                || matches!(status, 408 | 429)
+                || code == "stale-harness-event-session"
+                    && details.get("retired") != Some(&Value::Bool(true))
+        })
+}
+
+async fn harness_event_is_retired(
+    client: &Client,
+    subject: &str,
+    runtime: &str,
+    error: &anyhow::Error,
+) -> Result<bool> {
+    let Some((_, code, _, details)) = st3::client::api_error_parts(error) else {
+        return Ok(false);
+    };
+    if code != "stale-harness-event-session" {
+        return Ok(false);
+    }
+    if let Some(retired) = details.get("retired").and_then(Value::as_bool) {
+        return Ok(retired);
+    }
+    // Older daemons did not distinguish an unconfirmed launch from a retired runtime.
+    let status: StatusResponse = client
+        .get(&format!(
+            "/v1/status?subject={}",
+            urlencoding::encode(subject)
+        ))
+        .await?;
+    let actual = status
+        .subjects
+        .first()
+        .and_then(|seat| seat.actual.as_ref());
+    Ok(actual.is_some_and(|actual| {
+        let fields = actual.get("fields").unwrap_or(actual);
+        fields["status"] == "running"
+            && fields["incarnation_id"]
+                .as_str()
+                .is_some_and(|current| current != runtime)
+            || fields["incarnation_id"].as_str() == Some(runtime)
+                && matches!(
+                    fields["status"].as_str(),
+                    Some("exited" | "stopped" | "absent" | "vanished")
+                )
+    }))
+}
+
+async fn flush_native_usage(client: &Client, subject: &str, runtime: &str) -> Result<()> {
+    let result: Result<Value> = client
+        .post(
+            "/v1/harness-events/usage-flush",
+            &st3::harness_events::UsageFlush {
+                subject: subject.into(),
+                runtime_incarnation: runtime.into(),
+            },
+        )
+        .await;
+    if let Err(error) = result {
+        if st3::client::is_missing_route(&error)
+            || harness_event_is_retired(client, subject, runtime, &error).await?
+        {
+            let _ = write_driver_log(
+                subject,
+                &format!("retired or unsupported accounting stop: {error:#}"),
+            );
+        } else {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 struct ObservationClient<'a> {
@@ -21601,7 +21766,7 @@ async fn drive_codex_native(
                     };
                     skip_native_continue(client, subject, &incarnation, "codex", thread, refusal).await;
                 }
-                if let Err(error) = observations.drain(client, subject, "codex", &mut loop_state.ready).await {
+                if let Err(error) = observations.finish_accounting(client, subject, "codex", &mut loop_state.ready).await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 // The harness is gone, and its subagents with it.
@@ -31420,7 +31585,7 @@ mission "review" state="ready" {
                         (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             Json(
-                                json!({"code":"stale-harness-event-session", "message":"retired"}),
+                                json!({"code":"stale-harness-event-session", "message":"retired", "details":{"retired":true}}),
                             ),
                         )
                     }),
@@ -31447,7 +31612,7 @@ mission "review" state="ready" {
                 store
                     .claims_for("agent/example/seat", Some("harness.usage"))
                     .unwrap()[0]
-                    .body["fields"]["context_used_tokens"],
+                    .body["fields"]["total_tokens"],
                 456
             );
             server.abort();
@@ -31463,7 +31628,7 @@ mission "review" state="ready" {
             st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-a")
                 .unwrap();
         let mut writer =
-            st_drivers::harness_state::Writer::new(root.path(), "example/seat", "claude", None)
+            st_drivers::harness_state::Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
                 .with_ownership("provider-a", seq);
         writer
             .observe(st_drivers::harness_state::Observation::new(
@@ -31548,7 +31713,7 @@ mission "review" state="ready" {
         let root = tempfile::tempdir().unwrap();
         st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
         let seq = st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-a").unwrap();
-        let mut writer = st_drivers::harness_state::Writer::new(root.path(), "example/seat", "claude", None)
+        let mut writer = st_drivers::harness_state::Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
             .with_ownership("provider-a", seq);
         writer.observe(st_drivers::harness_state::Observation::new(
             st_drivers::harness_state::Activity::Active,

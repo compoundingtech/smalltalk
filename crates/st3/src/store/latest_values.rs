@@ -397,8 +397,9 @@ pub(super) fn append(
                 && permission_blocked(&old["fields"])
                     == (input.fields.get("blocked_on") == Some(&json!("human"))
                         && input.fields.get("ask") == Some(&json!("permission")))
-                && (old["fields"]["reason"] == "providerAuth")
-                    == (input.fields.get("reason") == Some(&json!("providerAuth")))
+                && (old["fields"]["provider_auth"] == false
+                    || (old["fields"]["reason"] == "providerAuth")
+                        == (input.fields.get("reason") == Some(&json!("providerAuth"))))
             {
                 since = old["fields"]["observed_since_ms"].clone();
                 transition = false;
@@ -511,7 +512,10 @@ fn update_readiness(tx: &Transaction<'_>, input: &ClaimInput) -> Result<(), St3E
         let ready = matches!(
             input.fields.get("state").and_then(Value::as_str),
             Some("ready" | "working" | "idle")
-        ) && input.fields.get("reason").and_then(Value::as_str) != Some("providerAuth");
+        ) && input.fields.get("reason").and_then(Value::as_str) != Some("providerAuth")
+            && input.fields.get("provider_auth") != Some(&json!(false))
+            && !(input.fields.get("blocked_on") == Some(&json!("human"))
+                && input.fields.get("ask") == Some(&json!("permission")));
         tx.execute("INSERT INTO latest_readiness VALUES (?1,?2,?3)
             ON CONFLICT(subject) DO UPDATE SET incarnation=excluded.incarnation,
             ready=excluded.ready OR (latest_readiness.incarnation=excluded.incarnation AND latest_readiness.ready)",

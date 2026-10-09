@@ -5499,20 +5499,35 @@ pub fn start_stopped_usage_flush(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
         let mut after = String::new();
+        let mut backoff = BTreeMap::<String, tokio::time::Instant>::new();
         loop {
+            let now = tokio::time::Instant::now();
+            backoff.retain(|_, until| *until > now);
+            let skipped = backoff.keys().cloned().collect::<BTreeSet<_>>();
             let store = state.store.clone();
             let cursor = after.clone();
-            match blocking_action(move || store.flush_stopped_usage_batch(&cursor)).await {
-                Ok((next, changed)) => {
-                    after = next.unwrap_or_default();
-                    if changed {
+            match blocking_action(move || store.flush_stopped_usage_batch(&cursor, &skipped)).await
+            {
+                Ok(batch) => {
+                    // Advance even past a failed subject; its durable slot remains for retry.
+                    after = batch.after.unwrap_or_default();
+                    for (subject, error) in batch.failures {
+                        eprintln!("st3: retained accounting for {subject} failed: {error}");
+                        if backoff.len() >= 256
+                            && let Some(oldest) = backoff
+                                .iter()
+                                .min_by_key(|(_, until)| **until)
+                                .map(|(subject, _)| subject.clone())
+                        {
+                            backoff.remove(&oldest);
+                        }
+                        backoff.insert(subject, now + Duration::from_secs(30));
+                    }
+                    if batch.changed {
                         signal_visible_change(&state);
                     }
                 }
-                Err(error) => {
-                    // Pending slots are durable; a writer failure never advances this batch.
-                    eprintln!("st3: retained accounting flush failed: {error:?}");
-                }
+                Err(error) => eprintln!("st3: retained accounting reader failed: {error:?}"),
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
@@ -22963,7 +22978,7 @@ mission "wake" state="ready" {
         }
         assert_eq!(breakdown["work.claimed"], (6, 6));
         assert_eq!(breakdown["work.progress"], (6, 6));
-        assert_eq!(breakdown["harness.todo.observed"], (12, 0));
+        assert_eq!(local_breakdown["harness.todo.observed"], 12);
         assert_eq!(local_breakdown["harness.usage"], 12);
         assert_eq!(old_cold, 12);
     }
@@ -23285,12 +23300,12 @@ mission "wake" state="ready" {
             )
             .unwrap();
         store.apply(&intent, &plan.subject_tokens, "roster-followup").unwrap();
-        store.append_claim(&roster_local_observation(
+        store.append_legacy_claim(&roster_local_observation(
             "runtime.observed",
             json!({"status":"running", "runtime_id":"node.amber",
                 "incarnation_id":"amber-1"}),
         )).unwrap();
-        store.append_claim(&roster_local_observation(
+        store.append_legacy_claim(&roster_local_observation(
             "harness.observed",
             json!({"state":"idle", "driver":"codex", "incarnation_id":"amber-1",
                 "observed_at_ms":1}),
@@ -23387,7 +23402,7 @@ mission "wake" state="ready" {
         let started = Instant::now();
         let mut hits = 0;
         for n in 0..APPENDS {
-            let response = store.append_claim(&roster_local_observation(
+            let response = store.append_legacy_claim(&roster_local_observation(
                 "harness.observed",
                 json!({"state":"idle", "driver":"codex", "incarnation_id":"amber-1",
                     "observed_at_ms":300_001 + n as u64}),
@@ -23449,7 +23464,7 @@ mission "wake" state="ready" {
             })),
             roster_local_timeline(),
         ] {
-            let (response, appended) = state.store.append_claim_outcome(&request).unwrap();
+            let (response, appended) = state.store.append_legacy_claim_outcome(&request).unwrap();
             assert!(appended);
             assert!(crate::store::local_observation_position(&response).is_some());
             assert_eq!(state.store.index().unwrap(), index);

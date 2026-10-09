@@ -78,6 +78,86 @@ mod tests {
     use tokio::sync::{Notify, mpsc};
 
     #[tokio::test]
+    async fn a_dropped_first_sample_waits_for_fresh_provider_evidence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
+        let seq =
+            st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-a")
+                .unwrap();
+        let mut writer = Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
+            .with_ownership("provider-a", seq);
+        writer
+            .observe(Observation::new(
+                Activity::Idle,
+                BlockedOn::None,
+                InputBuffer::Unknown,
+            ))
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let (sender, mut updates) = mpsc::unbounded_channel();
+        let store = Arc::new(st3::store::Store::open_memory("example").unwrap());
+        let app = Router::new().route(
+            "/v1/claims",
+            post({
+                let calls = calls.clone();
+                let entered = entered.clone();
+                move |Json(input): Json<ClaimInput>| {
+                    let calls = calls.clone();
+                    let entered = entered.clone();
+                    let sender = sender.clone();
+                    let store = store.clone();
+                    async move {
+                        use axum::response::IntoResponse as _;
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            entered.notify_one();
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        let record = store.append_claim(&input).unwrap();
+                        sender.send(input).unwrap();
+                        Json(json!({"api_version":"st3.v1", "value":record})).into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(Endpoint::Http(format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let publisher = Publisher::start(
+            &client,
+            "agent/example/seat",
+            "claude",
+            root.path(),
+            "runtime-a",
+        )
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a dropped sample creates no retry obligation"
+        );
+        writer.heartbeat().unwrap();
+        let sample = tokio::time::timeout(Duration::from_secs(2), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sample.fields["state"], "idle");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(st_drivers::harness_state::HARNESS_STATE_REFRESH < Duration::from_secs(90));
+        drop(publisher);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn current_publisher_advances_while_durable_publication_is_stalled() {
         let root = tempfile::tempdir().unwrap();
         st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
@@ -160,10 +240,16 @@ mod tests {
             .unwrap();
         assert_eq!(first.fields["state"], "working");
         writer.observe(sample(Activity::Idle)).unwrap();
-        let current = tokio::time::timeout(Duration::from_secs(2), updates.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let current = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let sample = updates.recv().await.unwrap();
+                if sample.fields["state"] == "idle" {
+                    break sample;
+                }
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(current.fields["state"], "idle");
         assert!(!drain.is_finished());
         let pending = st_drivers::harness_events::pending(root.path(), 100).unwrap();

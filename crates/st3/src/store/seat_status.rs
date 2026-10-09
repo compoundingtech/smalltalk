@@ -183,6 +183,7 @@ pub(super) fn enrich_harness(
     let claim = claim_by_id_tx(connection, &view.claim)?;
     if let Some(claim) = claim.as_ref()
         && claim.kind == "harness.observed"
+        && claim.id.starts_with(LOCAL_OBSERVATION_ID_PREFIX)
     {
         view.observed_at_unix_ms = observation_time(claim);
     }
@@ -678,7 +679,7 @@ mod tests {
             .iter()
             .filter_map(|item| item["state"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(states, ["working", "blocked", "working"]);
+        assert!(states.is_empty(), "current registers retain no categorical history");
 
         runtime(&store, "two");
         observe(&store, "two", "working", at + 5, "working");
@@ -722,7 +723,7 @@ mod tests {
         let history = store.seat_status_history("agent/cedar", at + 3).unwrap();
         let states = history["items"].as_array().unwrap().iter()
             .filter_map(|item| item["state"].as_str()).collect::<Vec<_>>();
-        assert_eq!(states, ["blocked", "ended", "working"]);
+        assert!(states.is_empty(), "current registers retain no categorical history");
     }
 
     #[test]
@@ -760,7 +761,7 @@ mod tests {
         let history = store.seat_status_history("agent/cedar", at + 2).unwrap();
         let states = history["items"].as_array().unwrap().iter()
             .filter_map(|item| item["state"].as_str()).collect::<Vec<_>>();
-        assert_eq!(states, ["unauthenticated"]);
+        assert!(states.is_empty(), "current registers retain no categorical history");
     }
 
     #[test]

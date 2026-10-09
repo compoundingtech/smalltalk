@@ -36845,7 +36845,7 @@ mission "gated" state="ready" {
             );
             reconciler.reconcile_once().unwrap();
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: SEAT.into(),
                     kind: "harness.observed".into(),
                     actor: Some(SEAT.into()),
