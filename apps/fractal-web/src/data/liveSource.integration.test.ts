@@ -55,11 +55,12 @@ class Gateway {
   capabilityReads = 0
   readonly messageActions: MessageSendAction[] = []
   /** Resolves once the gateway has derived the send action's message identity. */
-  readonly nextAction = () =>
-    this.echoMessageId !== ''
+  readonly nextAction = (count = 1) =>
+    this.readyActions.has(count)
       ? Promise.resolve()
-      : new Promise<void>((resolve) => this.actionArrivals.push(resolve))
-  private readonly actionArrivals: Array<() => void> = []
+      : new Promise<void>((arrived) => this.actionArrivals.push({ count, arrived }))
+  private readonly readyActions = new Set<number>()
+  private readonly actionArrivals: Array<{ readonly count: number; readonly arrived: () => void }> = []
   echoMessageId = ''
 
   readonly fetch: typeof fetch = async (input, init) => {
@@ -126,10 +127,17 @@ class Gateway {
     } else if (path === '/v1/client/actions' && typeof init?.body === 'string') {
       const action = JSON.parse(init.body)
       if (action.type === 'message.send') {
-        this.messageActions.push(action)
+        const count = this.messageActions.push(action)
         const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(action.idempotency_key)))
         this.echoMessageId = `message/${[...hash.slice(0, 8)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`
-        this.actionArrivals.splice(0).forEach((arrived) => arrived())
+        this.readyActions.add(count)
+        for (let index = 0; index < this.actionArrivals.length;) {
+          const waiter = this.actionArrivals[index]!
+          if (waiter.count === count) {
+            this.actionArrivals.splice(index, 1)
+            waiter.arrived()
+          } else index += 1
+        }
         await this.sendGate
         if (this.transportFailure) throw new TypeError('Gateway disconnected')
         if (this.staleSendFence) return Response.json({
@@ -672,6 +680,93 @@ describe('optimistic conversation sends', () => {
       }),
     ),
   )
+
+  it.live('keeps outbox rows in send-time order across replies, retries, equal-time rows and echoes', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.setSystemTime('2026-10-08T12:00:01.000Z')
+    return withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        const conversation = live.source.conversation(agent.id)
+        live.registry.mount(conversation)
+        yield* settle
+        const content = (id: string, sequence: number, timestamp: string) => ({
+          id, sequence, revision: 1, type: 'content' as const, role: 'assistant' as const,
+          final: true, timestamp, body: { media_type: 'text/plain', text: id },
+        })
+        const page = (replace: boolean) => gateway.send({
+          kind: 'conversation', id: gateway.subscription('conversation').id,
+          collection: 'conversation', session_id: 'session/example', replace, has_more: false,
+          items: [
+            content('history', 1, '2026-10-08T12:00:00Z'),
+            content('equal-time', 2, sendAt.replace('.000Z', 'Z')),
+            content('reply', 3, '2026-10-08T12:00:04Z'),
+          ],
+        })
+        const observed = () => {
+          const feed = live.registry.get(conversation)
+          if (feed._tag !== 'Observed') throw new Error('Expected an observed conversation')
+          return feed.value
+        }
+        // Equal-time transcript content precedes an own send, even with differing ISO precision.
+        const sendAt = '2026-10-08T12:00:01.000Z'
+        gateway.send({
+          kind: 'conversation', id: gateway.subscription('conversation').id,
+          collection: 'conversation', session_id: 'session/example', replace: true, has_more: false,
+          items: [content('history', 1, '2026-10-08T12:00:00Z'), content('equal-time', 2, sendAt)],
+        })
+        yield* settle
+        vi.setSystemTime(sendAt)
+        let release!: () => void
+        gateway.sendGate = new Promise<void>((resolve) => { release = resolve })
+        const sending = live.source.attachments!.send(request)
+        const pendingRow = observed().items.at(-1)!
+        expect(pendingRow).toMatchObject({ _tag: 'Text', at: sendAt, sendState: { _tag: 'Pending' } })
+        yield* Effect.promise(() => gateway.nextAction())
+        // The reply arrives while the send is Pending, not above its original position.
+        page(false)
+        yield* settle
+        expect(observed().items.map(item => item.id)).toEqual(['history', 'equal-time', pendingRow.id, 'reply'])
+        gateway.transportFailure = true
+        release()
+        expect((yield* Effect.promise(() => sending))._tag).toBe('Refused')
+        expect(observed().items[2]).toMatchObject({ id: pendingRow.id, at: sendAt, sendState: { _tag: 'Failed' } })
+        const failedPage = observed()
+        expect(failedPage.change).toMatchObject({ from: expect.any(Array), index: 2 })
+        // Replace/no-op frames must not shuffle the failed row past the reply.
+        page(true)
+        yield* settle
+        expect(observed().items.map(item => item.id)).toEqual(['history', 'equal-time', pendingRow.id, 'reply'])
+        const beforeRetry = observed()
+        gateway.transportFailure = false
+        gateway.sendGate = new Promise<void>((resolve) => { release = resolve })
+        vi.setSystemTime('2026-10-08T12:00:05.000Z')
+        const retrying = live.source.attachments!.send({
+          ...request, _tag: 'Resend', idempotencyKey: gateway.messageActions[0]!.idempotency_key,
+        })
+        yield* Effect.promise(() => gateway.nextAction(2))
+        yield* settle
+        expect(observed().items[2]).toMatchObject({ id: pendingRow.id, at: sendAt, sendState: { _tag: 'Pending' } })
+        expect(observed().change?.from).toBe(beforeRetry.items)
+        expect(observed().change?.index).toBe(2)
+        release()
+        expect((yield* Effect.promise(() => retrying))._tag).toBe('Success')
+        expect(observed().items[2]).toMatchObject({ id: pendingRow.id, at: sendAt, sendState: { _tag: 'Sent' } })
+        expect(gateway.messageActions.map(action => action.idempotency_key)).toEqual([
+          gateway.messageActions[0]!.idempotency_key, gateway.messageActions[0]!.idempotency_key,
+        ])
+        // A second send belongs after the reply; retry did not move the first send after it.
+        yield* Effect.promise(() => live.source.attachments!.send(request))
+        const secondRow = observed().items.at(-1)!
+        expect(observed().items.map(item => item.id)).toEqual(['history', 'equal-time', pendingRow.id, 'reply', secondRow.id])
+        gateway.mailEcho()
+        yield* settle
+        expect(observed().items.some(item => item.id === secondRow.id)).toBe(false)
+        expect(observed().items.some(item => item.id === pendingRow.id)).toBe(true)
+        expect(observed().items.filter(item => item._tag === 'Message')).toHaveLength(1)
+      }),
+    )
+  })
 
   for (const echoFirst of [false, true]) {
     it.live(`publishes pending prose synchronously and replaces it when echo arrives ${echoFirst ? 'before' : 'after'} POST resolves`, () =>

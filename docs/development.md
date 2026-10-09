@@ -191,6 +191,11 @@ The conversation pane mounts the kit's `EmbraceComposer`. Its app-side binding l
 `apps/fractal-web/src/web/composerSend.ts`; sending, idempotency, the in-memory outbox and
 echo reconciliation remain owned by `source.attachments.send`. New submissions use `Send`;
 a failed outbox row's Retry uses `Resend` with the exact original source-owned key.
+Outbox rows keep their original send time on Retry and stay after earlier or equal-time
+transcript rows, before later replies. Multiple own sends retain submission order; only an
+authoritative message-identity echo replaces the matching outbox row.
+Merging visits transcript and retained outbox timestamps at most once each per projection,
+using monotone insertion boundaries to preserve that order even if send times move backward.
 Pending, Sent and Failed (reason plus disclosed detail) are rendered by kit A.
 Send failures use allowlisted human-readable explanations; raw diagnostics never enter row
 disclosures, composer help, status text or accessible names. Unclassified reasons use generic copy.

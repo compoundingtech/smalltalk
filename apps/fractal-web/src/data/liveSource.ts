@@ -33,6 +33,7 @@ import { gatewayAttachments, gatewayMessageSend } from './attachmentPort.ts'
 import { gatewayContentSearch } from './contentSearchPort.ts'
 import { makeFrameIngest } from './frameIngest.ts'
 import { nativeAgentFetch } from './nativeAgentFetch.ts'
+import { mergeOutboxItems } from './outbox.ts'
 import {
   initialFeedSync,
   observeFeedSync,
@@ -577,11 +578,19 @@ export const liveSource = ({
     const projectPage = (): ConversationPage => {
       const projection = timeline.project()
       const shown = timeline.shownMessageIds()
+      const hadPending = pending.size > 0
       for (const [id, send] of pending)
         if (send.messageIds.some((messageId) => shown.has(messageId))) pending.delete(id)
-      changedFrom = Math.min(changedFrom, projection.changedFrom)
+      const items = pending.size === 0 ? projection.items : mergeOutboxItems(projection.items, pending.values())
+      if (hadPending) {
+        // Timeline indices exclude interleaved outbox rows. Compare against the actual
+        // last published page, including when an echo retires the final outbox row.
+        let common = 0
+        while (common < items.length && common < publishedItems.length && items[common] === publishedItems[common]) common += 1
+        changedFrom = Math.min(changedFrom, common)
+      } else changedFrom = Math.min(changedFrom, projection.changedFrom)
       return {
-        items: pending.size === 0 ? projection.items : [...projection.items, ...[...pending.values()].map((send) => send.item)],
+        items,
         hasOlder: timeline.hasOlder,
         change: { from: publishedItems, index: changedFrom },
         ...(timeline.observation === undefined ? {} : { observation: timeline.observation }),
@@ -616,7 +625,6 @@ export const liveSource = ({
         ),
     })
     const publishPending = () => {
-      changedFrom = Math.min(changedFrom, timeline.project().changedFrom)
       const page = projectPage()
       if (!retained.publish(page)) return
       publishedItems = page.items
@@ -635,7 +643,7 @@ export const liveSource = ({
             // The encoded wire side carries `name: null`; the view model has no null names.
             ...(typeof attachment.name === 'string' ? { name: attachment.name } : {}),
           })),
-          streaming: false, at: new Date().toISOString(), sendState: { _tag: 'Pending' },
+          streaming: false, at: pending.get(id)?.item.at ?? new Date().toISOString(), sendState: { _tag: 'Pending' },
         },
         messageIds: [],
       }
