@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Run eight doctor library controls against the hosted, source-verified build."""
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+
+TESTS = (
+    "api::tests::checkpoint_diagnostic_read_is_incomplete_without_starting_store_work",
+    "api::tests::doctor_diagnostic_preserves_unsealed_evidence_through_checkpoint_attention",
+    "api::client_v0::tests::operations_answer_while_the_first_report_is_made",
+    "api::client_v0::tests::operations_serve_the_last_diagnostic_report",
+    "store::offline_audit::tests::offline_audit_preserves_corrupt_and_missing_evidence",
+    "store::offline_audit::tests::offline_audit_rejects_live_database_aliases_and_absent_inputs",
+    "store::checkpoint_agreement_tests::nodes_seal_then_verify_once_every_participant_sealed_the_same_set",
+    "store::checkpoint_agreement_tests::a_late_envelope_before_the_cut_reseals_until_someone_verified",
+)
+FILTER = "package(=st3) and kind(lib) and (" + " or ".join(
+    "test(=" + name + ")" for name in TESTS) + ")"
+
+
+def verify_inventory(document):
+    selected = []
+    for suite in document["rust-suites"].values():
+        for name, test in suite["testcases"].items():
+            if test["filter-match"]["status"] == "matches":
+                if test["ignored"]:
+                    raise ValueError("doctor control is ignored: " + name)
+                selected.append(name)
+    if len(selected) != 8 or set(selected) != set(TESTS):
+        raise ValueError("expected exactly eight named controls, got " + repr(selected))
+    return selected
+
+
+def verify_result(output, code):
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    summaries = re.findall(r"Summary[^\n]*?([0-9]+) tests run: ([0-9]+) passed", plain)
+    if code != 0 or summaries != [("8", "8")]:
+        raise ValueError(f"eight successful executed controls required: exit={code}, summaries={summaries}")
+
+
+def main():
+    logs = Path(os.environ["RUNNER_TEMP"]) / "ci-logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    # Archive consumers execute the already source/hash-verified workspace build. Never
+    # invoke Cargo compilation in a consumer or inherit its general shard partition.
+    if os.environ.get("CI_TEST_EXTRACTED"):
+        target = Path(os.environ["CI_TEST_EXTRACTED"]) / "workspace" / "target"
+        source = ["--binaries-metadata", str(target / "nextest/binaries-metadata.json"),
+                  "--cargo-metadata", str(target / "nextest/cargo-metadata.json"),
+                  "--target-dir-remap", str(target), "--workspace-remap", os.environ["CI_TEST_WORKSPACE"]]
+    else:
+        source = ["--locked", "-p", "st3", "--lib"]
+    common = source + ["--profile", "ci", "-E", FILTER]
+    inventory = subprocess.run(["cargo", "nextest", "list", *common, "--message-format", "json"],
+                               text=True, capture_output=True)
+    (logs / "doctor-eight-inventory.json").write_text(inventory.stdout)
+    (logs / "doctor-eight-inventory.stderr").write_text(inventory.stderr)
+    inventory.check_returncode()
+    selected = verify_inventory(json.loads(inventory.stdout))
+    command = ["cargo", "nextest", "run", *common, "--retries", "0", "--test-threads", "1",
+               "--status-level", "pass", "--final-status-level", "all", "--no-tests", "fail"]
+    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    (logs / "doctor-eight.log").write_text(result.stdout)
+    print(result.stdout, end="", flush=True)
+    proof = {"revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+             "command": command, "selected": selected, "selected_count": len(selected),
+             "exit_code": result.returncode, "success": False}
+    try:
+        verify_result(result.stdout, result.returncode)
+        proof["success"] = True
+    finally:
+        (logs / "doctor-eight-result.json").write_text(json.dumps(proof, indent=2) + "\n")
+    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
+        stream.write("Doctor correctness: exactly 8 selected, 8 executed, 8 passed; no retries.\n")
+
+
+if __name__ == "__main__":
+    main()

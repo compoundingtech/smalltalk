@@ -144,6 +144,8 @@ mod convergence;
 mod document_index_tests;
 mod lanes;
 mod operations;
+#[cfg(test)]
+mod offline_audit;
 pub(crate) mod mission_ivm;
 pub(crate) mod client_summary;
 mod unread_mail;

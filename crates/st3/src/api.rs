@@ -65,6 +65,7 @@ mod client_v0;
 mod custom;
 mod delivery_presence;
 pub(crate) mod agent_harness;
+#[cfg(test)]
 mod delivery_probes;
 mod github_watch;
 mod harness_events;
@@ -5461,12 +5462,9 @@ pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
     serve_unix_inner(socket, app, false).await
 }
 
-/// Make the daemon's first diagnostic report, which the operations collection lists, off the
-/// request path. Some of its checks read the whole claim log, seconds of work on a busy host's
-/// store; until it is made, the collection says so instead of making a read wait for it.
-pub fn start_operation_report(state: &AppState) {
-    client_v0::start_operation_report(state);
-}
+/// Compatibility for callers of the former startup report hook. Current invariant reads do
+/// not need a background whole-store report, so this hook starts no work.
+pub fn start_operation_report(_state: &AppState) {}
 
 /// Read the headers of this host's native session transcripts off the request path as the
 /// daemon starts. Saved-history session lists and session reads use this background inventory
@@ -6122,66 +6120,27 @@ fn isolation_name(mode: st_runtime::Isolation) -> &'static str {
 
 async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, ApiError> {
     let reader_store = state.store.clone();
-    let environment = crate::api::read_deadline::spawn_blocking(crate::environment::snapshot)
-        .await
-        .map_err(ApiError::internal)?;
-    // Linking a crate takes seconds, so it runs while the other checks do.
-    let build_tools = environment.as_ref().ok().cloned().map(|environment| {
-        crate::api::read_deadline::spawn_blocking(move || crate::environment::check_build_tools(&environment))
-    });
-    let pty_root = state.pty_root.clone();
-    let priority = crate::api::read_deadline::spawn_blocking(move || {
-        let observations = st_runtime::PtyRuntime::new(pty_root)
-            .snapshot()
-            .unwrap_or_default();
-        st_runtime::priority_report(&observations)
-    });
-    let token = crate::resource::github_auth().await;
-    let mut report = crate::api::read_deadline::spawn_blocking(move || {
-        // This node's claims are signed as their batches are sealed; seal and judge them so
-        // the signature counts cover everything written so far.
-        state.store.replication_snapshot().map_err(ApiError::internal)?;
-        doctor_report(&state)
-    })
+    let report_state = state.clone();
+    let mut report = read_deadline::spawn_blocking(move || current_doctor_report(&report_state))
         .await
         .map_err(ApiError::internal)??
         .0;
-    if let Some(build_tools) = build_tools {
-        report.checks.push(build_tools_check(
-            &build_tools.await.map_err(ApiError::internal)?,
-        ));
+    // These checks used to start shell, compiler, credential and runtime probes on GET.
+    // Until their bounded, off-read evidence is maintained, expose the missing evidence.
+    for name in [
+        "build-tools",
+        "daemon-environment",
+        "priority",
+        "github-observer-auth",
+    ] {
+        report.checks.push(DoctorCheck {
+            name: name.into(),
+            status: "unknown".into(),
+            message: "evidence incomplete; this read does not start a platform probe".into(),
+        });
     }
-    report.checks.push(match environment {
-        Ok(environment) => DoctorCheck {
-            name: "daemon-environment".into(),
-            status: "pass".into(),
-            message: format!(
-                "account interactive login shell; refreshed on use every 60 seconds; PATH={}",
-                environment.get("PATH").map(String::as_str).unwrap_or("")
-            ),
-        },
-        Err(error) => DoctorCheck {
-            name: "daemon-environment".into(),
-            status: "fail".into(),
-            message: error.to_string(),
-        },
-    });
-    let (status, message) = priority.await.map_err(ApiError::internal)?;
-    report.checks.push(DoctorCheck {
-        name: "priority".into(),
-        status: status.into(),
-        message,
-    });
-    report.checks.push(DoctorCheck {
-        name: "github-observer-auth".into(),
-        status: if token.is_ok() { "pass" } else { "warn" }.into(),
-        message: match token {
-            Ok(_) => "GitHub observers have a credential source; credential values are not displayed".into(),
-            Err(error) => error.to_string(),
-        },
-    });
     // Request samples are live operational telemetry. Keep them on /v1/doctor,
-    // outside the store-index-fenced operation projection built by doctor_report.
+    // alongside current invariant evidence.
     let mut routes = request_latency_snapshot();
     routes.sort_by_key(|route| std::cmp::Reverse(route["p99_ms"].as_u64().unwrap_or_default()));
     for route in routes.into_iter().take(10) {
@@ -6211,7 +6170,11 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
     ));
     report.status = if report.checks.iter().any(|check| check.status == "fail") {
         "fail"
-    } else if report.checks.iter().any(|check| check.status == "warn") {
+    } else if report
+        .checks
+        .iter()
+        .any(|check| matches!(check.status.as_str(), "warn" | "unknown"))
+    {
         "warn"
     } else {
         "pass"
@@ -6336,6 +6299,7 @@ fn descriptor_usage_check(soft: u64, hard: u64, usage: Option<u64>) -> DoctorChe
     }
 }
 
+#[cfg(test)]
 fn first_readiness_scheduler_check(store: &Store, node: &str) -> DoctorCheck {
     let (status, message) = match store.open_reconcile_faults(node) {
         Ok(faults) => {
@@ -6437,6 +6401,7 @@ fn github_usage_checks(usage: &crate::resource::GithubUsageReport, now: u128) ->
 /// Every person's open attention items that have waited more than a day, oldest first.
 /// Every person's attention, then every fault under the agent that owns it, so an old fault
 /// that no agent took up still shows in doctor.
+#[cfg(test)]
 fn doctor_attention_items(
     store: &Store,
     now: u128,
@@ -6451,6 +6416,7 @@ fn doctor_attention_items(
     Ok(items)
 }
 
+#[cfg(test)]
 fn stale_attention_check(items: &[crate::model::AttentionItemView], now: u128) -> DoctorCheck {
     const DAY_MS: u128 = 86_400_000;
     const LISTED: usize = 20;
@@ -6498,53 +6464,16 @@ fn stale_attention_check(items: &[crate::model::AttentionItemView], now: u128) -
     }
 }
 
-fn build_tools_check(tools: &crate::environment::BuildTools) -> DoctorCheck {
-    use crate::environment::LinkResult;
-    let mut problems = Vec::new();
-    if !tools.missing.is_empty() {
-        problems.push(format!(
-            "missing from the login PATH: {}",
-            tools.missing.join(", ")
-        ));
-    }
-    match &tools.link {
-        LinkResult::Linked => {}
-        LinkResult::NotAttempted => {
-            problems.push("no small crate was linked because cargo or rustc is missing".into());
-        }
-        LinkResult::Failed(error) => problems.push(format!("a small crate did not link: {error}")),
-    }
-    if problems.is_empty() {
-        return DoctorCheck {
-            name: "build-tools".into(),
-            status: "pass".into(),
-            message: format!(
-                "{} are on the login PATH, and a small crate links",
-                tools.found.join(", ")
-            ),
-        };
-    }
-    DoctorCheck {
-        name: "build-tools".into(),
-        status: "warn".into(),
-        message: format!(
-            "{}; install what is missing, or export its directory from the account's shell startup files",
-            problems.join("; ")
-        ),
-    }
-}
-
 fn daemon_pty(state: &AppState) -> anyhow::Result<st_runtime::PtyRuntime> {
     Ok(st_runtime::PtyRuntime::new(state.pty_root.clone())
         .with_binary(state.pty_binary.to_string_lossy())
         .with_environment(crate::environment::snapshot()?))
 }
 
-/// The references already in the graph that no longer resolve. Publication refuses new ones, so
-/// each of these was published before that check, or its target was removed later.
 /// Every Claude seat this host runs needs its hooks to run st3, and each running Claude session
 /// needs the native-session binding its SessionStart hook writes; without it st cannot find the
 /// seat's transcript.
+#[cfg(test)]
 fn claude_hooks_check(
     state: &AppState,
     desired: &[crate::model::DesiredSubject],
@@ -6623,6 +6552,7 @@ fn claude_hooks_check(
     })
 }
 
+#[cfg(test)]
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(path)
@@ -6631,12 +6561,18 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// How many claims' signatures verify. Verdicts are recorded, not enforced: a held or invalid
 /// one warns, and unsigned claims (written before signing, or by an older build) are counted.
+#[cfg(test)]
 fn claim_signatures_check(counts: &std::collections::BTreeMap<String, u64>) -> DoctorCheck {
     let count = |verdict: &str| counts.get(verdict).copied().unwrap_or_default();
     let (held, invalid) = (count("held"), count("invalid"));
     DoctorCheck {
         name: "claim-signatures".into(),
-        status: if held + invalid == 0 { "pass" } else { "warn" }.into(),
+        status: if held + invalid + count("unsigned") + count("unsealed") == 0 {
+            "pass"
+        } else {
+            "warn"
+        }
+        .into(),
         message: format!(
             "{} verified, {} unsigned, {} not yet sealed, {held} waiting for a delegation, {invalid} invalid",
             count("verified"),
@@ -6646,6 +6582,9 @@ fn claim_signatures_check(counts: &std::collections::BTreeMap<String, u64>) -> D
     }
 }
 
+/// The references already in the graph that no longer resolve. Publication refuses new ones, so
+/// each of these was published before that check, or its target was removed later.
+#[cfg(test)]
 fn graph_references_check(unresolved: &[String]) -> DoctorCheck {
     const LISTED: usize = 20;
     let mut listed = unresolved.iter().take(LISTED).cloned().collect::<Vec<_>>();
@@ -6677,6 +6616,7 @@ fn graph_references_check(unresolved: &[String]) -> DoctorCheck {
     }
 }
 
+#[cfg(test)]
 fn unread_current_seat_counts(
     store: &Store,
     recipients: &BTreeSet<&str>,
@@ -6711,6 +6651,7 @@ fn unread_current_seat_counts(
     }
     Ok((pending, accepted))
 }
+#[cfg(test)]
 fn terminal_exec_gates_check(store: &Store) -> anyhow::Result<DoctorCheck> {
     fn has_exit_code_gate(mission: &crate::model::MissionSpec) -> bool {
         let has_gate = |gates: &[crate::model::GateSpec]| {
@@ -6762,6 +6703,88 @@ fn terminal_exec_gates_check(store: &Store) -> anyhow::Result<DoctorCheck> {
     })
 }
 
+/// Missing materialized invariant evidence must not be replaced by a read-time oracle.
+/// The reviewed IVM integration will replace each unknown with a checked current source cut.
+fn current_doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
+    let mut checks = vec![match state.store.index() {
+        Ok(index) => DoctorCheck {
+            name: "claim-store".into(),
+            status: "pass".into(),
+            message: format!(
+                "store index {index} is available; invariant evidence is not certified"
+            ),
+        },
+        Err(error) => DoctorCheck {
+            name: "claim-store".into(),
+            status: "fail".into(),
+            message: error.to_string(),
+        },
+    }];
+    for name in [
+        "claim-signatures",
+        "operation-projection",
+        "operational-repair",
+        "terminal-exec-gates",
+        "account-limits",
+        "runtime-ownership",
+        "runtime-drift",
+        "driver-readiness",
+        "graph-references",
+        "replication",
+        "shared-projections",
+        "fleet-admission",
+        "idempotency-keys",
+        "mission-first-readiness",
+        "message-delivery",
+        "mail-backlog",
+        "delivery-probes",
+        "attention-age",
+        "checkpoint-evidence",
+        "claude-hooks",
+        "member-reconcile",
+    ] {
+        checks.push(DoctorCheck { name: name.into(), status: "unknown".into(),
+            message: "evidence incomplete; a current invariant has not been certified; this read does not start an audit".into() });
+    }
+    checks.push(match crate::disk::disk_space(&state.state_dir) {
+        Ok(space) => DoctorCheck {
+            name: "disk-space".into(),
+            status: if space.is_low() { "warn" } else { "pass" }.into(),
+            message: space.describe(),
+        },
+        Err(error) => DoctorCheck {
+            name: "disk-space".into(),
+            status: "warn".into(),
+            message: error.to_string(),
+        },
+    });
+    checks.push(DoctorCheck {
+        name: "state-directory".into(),
+        status: "unknown".into(),
+        message: "a read does not test writes to the state directory".into(),
+    });
+    checks.push(DoctorCheck {
+        name: "pty-runtime".into(),
+        status: "unknown".into(),
+        message: "current runtime observation evidence has not been certified".into(),
+    });
+    checks.push(DoctorCheck {
+        name: "command-recorder".into(),
+        status: "unknown".into(),
+        message: "evidence incomplete; a read does not test opening the command log for append"
+            .into(),
+    });
+    Ok(Json(DoctorReport {
+        machine_version: Some(st_drivers::version::machine_version()),
+        status: "warn".into(),
+        checks,
+        performance: crate::performance::snapshot(),
+    }))
+}
+
+/// The full diagnostic reducer is retained only as an oracle for fixture tests. Production
+/// full-store audits stay on private fixture copies, never a diagnostic HTTP read.
+#[cfg(test)]
 fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     let mut checks = Vec::new();
     match state.store.index() {
@@ -7631,13 +7654,19 @@ async fn checkpoint_plan(
 }
 
 async fn checkpoint_status(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
 ) -> Result<Json<crate::store::CheckpointStatusView>, ApiError> {
-    let store = state.store.clone();
-    let peers = state.configured_peers.clone();
-    blocking_store(move || store.checkpoint_status(client_now_ms(), &peers))
-        .await
-        .map(Json)
+    // The old status implementation seals batches and scans the whole sealed set. Until
+    // current invariant evidence is maintained on writes, do not manufacture a matching
+    // digest or make a diagnostic request start that work.
+    Err(ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "diagnostic-evidence-incomplete".into(),
+        message: "checkpoint evidence incomplete; the current set is not certified; this read does not start an audit".into(),
+        details: Box::new(serde_json::Map::from_iter([
+            ("comparison_state".into(), json!("uncomputed")),
+        ])),
+    })
 }
 
 async fn checkpoint_excuse(
@@ -7919,6 +7948,7 @@ async fn replication_heal_next(
 }
 
 /// A span such as `45s`, `12m` or `3h` for a doctor message.
+#[cfg(test)]
 fn elapsed_words(ms: u128) -> String {
     let seconds = ms / 1_000;
     match seconds {
@@ -19058,13 +19088,152 @@ agent "good" {{ workspace {:?}; command "true" }}
             .iter()
             .find(|check| check["name"] == "replication")
             .unwrap();
-        assert_eq!(check["status"], "pass", "{check}");
+        assert_eq!(check["status"], "unknown", "{check}");
         assert!(
             check["message"]
                 .as_str()
                 .unwrap()
-                .contains("cobalt: refused by that member's Fabric grants")
+                .contains("evidence incomplete")
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_diagnostic_read_is_incomplete_without_starting_store_work() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+        let error = checkpoint_status(State(state.clone())).await.unwrap_err();
+        assert_eq!(crate::store::STATEMENTS_RUN.with(std::cell::Cell::get), 0);
+        assert_eq!(error.code, "diagnostic-evidence-incomplete");
+        assert_eq!(error.details["comparison_state"], "uncomputed");
+        let index = state.store.index().unwrap();
+        crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+        let (status, body) = get_request(router(state.clone()), "/v1/checkpoint/status").await;
+        assert!(
+            crate::store::STATEMENTS_RUN.with(std::cell::Cell::get) <= 1,
+            "checkpoint route or middleware scanned diagnostic evidence"
+        );
+        assert_eq!(state.store.index().unwrap(), index);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["details"]["comparison_state"], "uncomputed");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("evidence incomplete")
+        );
+    }
+
+    #[test]
+    fn doctor_diagnostic_preserves_unsealed_evidence_through_checkpoint_attention() {
+        use smallclaims::store::checkpoint::{DAY_MS, SealedIdentities};
+        use smallclaims::store::{SealTerms, checkpoint_name, newest_due_cut};
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let cut = newest_due_cut(client_now_ms() - 7 * DAY_MS);
+        let checkpoint = checkpoint_name(cut);
+        let terms = SealTerms {
+            cut_unix_ms: cut,
+            participants: BTreeSet::from([state.node.clone(), "birch".into()]),
+            sealed_digest: "fixture-sealed-digest".into(),
+            rules_digest: crate::store::rules_digest(),
+        };
+        state
+            .store
+            .publish_seal(
+                &checkpoint,
+                &terms,
+                &SealedIdentities {
+                    digest: terms.sealed_digest.clone(),
+                    count: 0,
+                    seal_rowid: 0,
+                },
+                None,
+            )
+            .unwrap();
+        let unsealed = state.store.claim_verdict_counts().unwrap()["unsealed"];
+        assert!(unsealed > 0);
+        let before = state
+            .store
+            .seeded_batch_rowid
+            .load(std::sync::atomic::Ordering::Acquire);
+        let index = state.store.index().unwrap();
+        // The overdue pending seal forces fault_snapshot to inspect checkpoint_left_writers,
+        // whose former fleet_membership call sealed and judged the pending batch.
+        assert!(
+            !doctor_attention_items(&state.store, client_now_ms())
+                .unwrap()
+                .is_empty()
+        );
+        let report = current_doctor_report(&state).unwrap().0;
+        assert_eq!(
+            state
+                .store
+                .seeded_batch_rowid
+                .load(std::sync::atomic::Ordering::Acquire),
+            before
+        );
+        assert_eq!(state.store.index().unwrap(), index);
+        assert_eq!(
+            state.store.claim_verdict_counts().unwrap()["unsealed"],
+            unsealed
+        );
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .find(|check| check.name == "claim-signatures")
+                .unwrap()
+                .status,
+            "unknown"
+        );
+        for size in [0, 1000] {
+            for number in 0..size {
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: format!("resource/diagnostic-growth/{number}"),
+                        kind: "resource.observed".into(),
+                        actor: None,
+                        fields: BTreeMap::from([("kind".into(), json!("vcs.pull-request"))]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            }
+            let index = state.store.index().unwrap();
+            let frontier = state
+                .store
+                .seeded_batch_rowid
+                .load(std::sync::atomic::Ordering::Acquire);
+            crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+            let started = std::time::Instant::now();
+            let (status, response) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(get_request(router(state.clone()), "/v1/doctor"));
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                crate::store::STATEMENTS_RUN.with(std::cell::Cell::get) <= 2,
+                "doctor GET scanned history at fixture size {size}"
+            );
+            assert_eq!(response["status"], "warn");
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(250),
+                "doctor GET exceeded the synthetic fixture 250 ms budget at size {size}"
+            );
+            println!("doctor GET at size {size}: {:?}", started.elapsed());
+            assert_eq!(state.store.index().unwrap(), index);
+            assert_eq!(
+                state
+                    .store
+                    .seeded_batch_rowid
+                    .load(std::sync::atomic::Ordering::Acquire),
+                frontier
+            );
+        }
     }
 
     /// Two members apart, as during a partition, can each accept the same idempotency key for
@@ -19085,8 +19254,7 @@ agent "good" {{ workspace {:?}; command "true" }}
             expected_subject: None,
             idempotency_key: Some("partition-key".into()),
         };
-        let app = router(state.clone());
-        let (_, doctor) = get_request(app.clone(), "/v1/doctor").await;
+        let doctor = serde_json::to_value(doctor_report(&state).unwrap().0).unwrap();
         let check = |doctor: &Value| {
             doctor["checks"]
                 .as_array()
@@ -19112,7 +19280,7 @@ agent "good" {{ workspace {:?}; command "true" }}
         state.store.validate_replication_backlog().unwrap();
         state.store.project_replication_backlog().unwrap();
 
-        let (_, doctor) = get_request(app, "/v1/doctor").await;
+        let doctor = serde_json::to_value(doctor_report(&state).unwrap().0).unwrap();
         let check = check(&doctor);
         assert_eq!(check["status"], "warn", "{check}");
         let message = check["message"].as_str().unwrap();
@@ -19781,8 +19949,7 @@ mission "work" state="ready" {
                 "published before the reference checks",
             )
             .unwrap();
-        let (status, doctor) = get_request(router(state), "/v1/doctor").await;
-        assert_eq!(status, StatusCode::OK, "{doctor}");
+        let doctor = serde_json::to_value(doctor_report(&state).unwrap().0).unwrap();
         let check = doctor["checks"]
             .as_array()
             .unwrap()

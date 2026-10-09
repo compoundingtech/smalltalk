@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Diagnostic reads expose incomplete evidence without sealing, running full reducers, platform probes or report jobs.",
+  "replay": {
+    "status": "changed",
+    "detail": "Doctor and operation diagnostic reads no longer run full reducers or schedule a report refresh. Full audit reducers are test-only private-copy oracles; no offline CLI or IVM registration is activated."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No production table, index, trigger, migration or schema version changes. Private audit fixtures do not migrate the input."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Checkpoint participant membership helpers stop sealing on read; only the due checkpoint writer admits and seals after quiet exits. Claim and membership terms are read together after admission. Existing checkpoint rules/digests and peer wire are unchanged; earlier due/stable gates are not claimed one-cut."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Doctor lists uncertified invariants as named unknown checks and aggregates warn. Operation resources use the published degraded state, warning severity and unknown revision, without changing the generated client enum. Checkpoint status returns HTTP503 diagnostic-evidence-incomplete with comparison_state uncomputed. This library draft does not update CLI strict: existing st doctor --strict returns2 on the warning aggregate; independently reviewed CLI compatibility work is required before promotion."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "No restart phase is introduced; live latency, idle cores and fleet rollout have not been measured for this isolated draft."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Clients must treat named unknown checks and the diagnostic checkpoint503 as uncertified evidence, not healthy invariants or a daemon outage. The bounded draft does not expose an offline audit command and must not become a release before CLI strict compatibility is reviewed."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No production migration or diagnostic cache. Restoring the prior binary restores the previous read behavior. Private fixture copies are removed on ordinary errors; production state is not repaired."
+  }
+}
