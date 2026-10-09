@@ -88,8 +88,11 @@ impl<R> PublishedList<R> {
         self.serving.swap(false, Ordering::AcqRel)
     }
 
-    /// The projections were replaced without a new claim: fold from nothing, at once.
+    /// The projections were replaced without a new claim: stop serving rows folded from the
+    /// old ones, so readers fold on read, and fold from nothing at once. The next publication
+    /// serves the list again and announces it.
     pub(crate) fn forget(&self) {
+        self.serving.store(false, Ordering::Release);
         self.fold_from_nothing_next();
         self.wake.notify_one();
     }
@@ -129,9 +132,11 @@ mod tests {
         assert_eq!(list.newest().unwrap().cut, 4);
         assert_eq!(list.base().unwrap().rows, vec![4]);
         list.forget();
+        assert!(list.newest().is_none(), "readers fold on read until the list is folded again");
         assert!(list.base().is_none(), "the next fold starts from nothing");
         assert_eq!(list.base().unwrap().cut, 4, "only once");
-        assert_eq!(list.newest().unwrap().cut, 4, "readers keep the newest rows meanwhile");
+        assert!(!list.publish(publication(5)), "served again, so announced");
+        assert_eq!(list.newest().unwrap().cut, 5);
     }
 
     #[test]
