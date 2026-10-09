@@ -29,6 +29,21 @@ export function WorkLogV1({ turn, listStyle, renderCallDetail, previewCallDetail
   const overlayLayer = useErrorOverlaySurface()
   const toolbar = React.useRef<HTMLDivElement>(null)
   const { toolbarProps } = useToolbar({ 'aria-label': `${ariaLabel} controls`, orientation: 'vertical' }, toolbar)
+  const focusedControl = React.useRef<HTMLElement | null>(null)
+  const rove = () => {
+    const controls = [...(toolbar.current?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], input:not(:disabled), textarea:not(:disabled), [tabindex]') ?? [])].filter(control => !control.hidden && control.getAttribute('aria-disabled') !== 'true')
+    const active = controls.includes(focusedControl.current!) ? focusedControl.current : controls[0]
+    for (const control of controls) {
+      const tabIndex = control === active ? 0 : -1
+      if (control.tabIndex !== tabIndex) control.tabIndex = tabIndex
+    }
+  }
+  React.useLayoutEffect(() => {
+    rove()
+    const observer = new MutationObserver(rove)
+    if (toolbar.current !== null) observer.observe(toolbar.current, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled', 'aria-disabled', 'tabindex'] })
+    return () => observer.disconnect()
+  }, [])
   const settled = !turn.running && !turn.failed && !turn.interrupted && turn.foldable !== false
   const durationLabel = formatWorkDuration(turn.durationMs)
   const [open, setOpen] = React.useState(false)
@@ -41,7 +56,7 @@ export function WorkLogV1({ turn, listStyle, renderCallDetail, previewCallDetail
   const detail = [failedCommand, failedCall?.detail, turn.failureNote].filter((value, index, values) => value !== undefined && values.indexOf(value) === index).join('\n') || undefined
   const summaryContent = <><span {...stylex.props(styles.summaryLabel)}>{summary}</span>{Number.isFinite(started) && <time dateTime={new Date(started).toISOString()} {...stylex.props(styles.time)}>{timeFormat.format(started)}</time>}</>
   return <CallDetailRenderer.Provider value={renderCallDetail}><CallPresentation.Provider value={{ preview: previewCallDetail, interactive: interactiveCalls }}><section aria-label={ariaLabel} data-testid="work-log">
-    <div ref={toolbar} {...toolbarProps}>
+    <div ref={toolbar} {...toolbarProps} onFocusCapture={event => { focusedControl.current = event.target as HTMLElement; rove() }} onBlurCapture={undefined} onKeyDownCapture={event => { if (event.key !== 'Tab') toolbarProps.onKeyDownCapture?.(event) }}>
     {turn.running && !hideLiveRow && <div data-testid="live-work" role="status" aria-label="Response in progress" {...stylex.props(styles.live)}><Icon name="spinner" spinning /><span>Working</span></div>}
     {interactiveCalls ? <Button isDisabled={!settled} aria-expanded={!settled || open} onPress={() => setOpen(value => !value)} {...stylex.props(styles.summary, failed && styles.failureInk)}><Icon name={!settled || open ? 'chevron-down' : 'chevron-right'} size={12} />{summaryContent}</Button> : <div {...stylex.props(styles.summary, styles.staticCall, failed && styles.failureInk)}>{summaryContent}</div>}
     {(!interactiveCalls || !settled || open) && <><div {...stylex.props(styles.list, listStyle)}>{turn.calls.map(call => <TimelineCall key={call.id} call={call} />)}</div>{expandedBody}<hr data-testid="work-log-divider" {...stylex.props(styles.divider)} /></>}

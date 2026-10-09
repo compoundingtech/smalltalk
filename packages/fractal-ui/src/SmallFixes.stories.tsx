@@ -146,7 +146,7 @@ export const ComposerConnectionNotice: Story = { render: args => <ConnectionDock
   const observer = new PerformanceObserver(list => {
     for (const entry of list.getEntries()) {
       const shift = entry as PerformanceEntry & { value: number; sources?: readonly { node?: Node }[] }
-      if (shift.sources?.some(source => source.node === input || source.node instanceof Element && source.node.contains(input))) inputShift += shift.value
+      if (shift.sources?.some(source => source.node === input || source.node !== undefined && input.contains(source.node))) inputShift += shift.value
     }
   })
   observer.observe({ type: 'layout-shift' })
