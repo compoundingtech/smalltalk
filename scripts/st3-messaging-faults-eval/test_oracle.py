@@ -66,12 +66,20 @@ class OracleTests(unittest.TestCase):
                 proof.update(change)
                 self.assertIn(reason, "; ".join(runner.judge(proof)))
 
-    def test_legacy_liveness_does_not_claim_a_current_binary(self):
-        self.proof.update(case="old-channel", delivery_after={"state": "legacy"},
-                          seat_images_after=["/legacy/st3", "/next/st3"])
+    def test_previous_release_channel_must_reexec_without_replacement(self):
+        self.proof.update(case="old-channel", channel_pids_before=[789],
+                          channel_pids_after=[789], previous_release_channel_observed=True)
         self.assertEqual([], runner.judge(self.proof))
-        self.proof["delivery_after"] = {"state": "current"}
-        self.assertIn("report is current", "; ".join(runner.judge(self.proof)))
+        for change, reason in [
+            ({"channel_pids_after": [790]}, "same process"),
+            ({"channel_pids_before": []}, "same process"),
+            ({"previous_release_channel_observed": False}, "not observed"),
+            ({"delivery_after": {"state": "legacy"}}, "report is legacy"),
+            ({"seat_images_after": ["/release/st3", "/next/st3"]}, "still run a replaced binary"),
+        ]:
+            proof = copy.deepcopy(self.proof)
+            proof.update(change)
+            self.assertIn(reason, "; ".join(runner.judge(proof)))
 
     def test_a_failed_handoff_requires_visibility_in_all_three_views(self):
         self.proof.update(case="handoff-failed", failed_path_visible=True,

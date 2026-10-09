@@ -12,12 +12,15 @@ export default githubWorkflow(auditCaches({
   },
   "on": {
     "pull_request": null,
+    "merge_group": null,
+    "workflow_dispatch": null,
     "push": {
       "branches": [
         "main"
       ]
     }
   },
+  permissions: { contents: 'read' },
   "jobs": {
     "public-repo": {
       "runs-on": linuxRunner,
@@ -32,8 +35,17 @@ export default githubWorkflow(auditCaches({
         {
           "name": "Check repository content",
           "run": "python3 scripts/check-public-repo"
-        }
+        },
+        {
+          name: 'Test rolling compatibility baseline policy',
+          run: 'python3 scripts/compat-baseline-release-test\npython3 scripts/compat-baseline-test\n',
+        },
+        {
+          name: 'Check published stable release baseline freshness',
+          env: { GH_TOKEN: '${{ github.token }}', GH_REPO: '${{ github.repository }}' },
+          run: 'python3 scripts/compat-baseline-release check',
+        },
       ]
     }
   }
-}, {"public-repo": "Runs standard-library source checks without downloads or compilation."}))
+}, {"public-repo": "Runs standard-library guards and queries published release metadata; builds nothing."}))

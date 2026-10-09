@@ -92,7 +92,7 @@ The design review of the first version of this document raised seven findings. E
 | 2. High: invite deletion contradicts retry | The sponsor keeps the token, bound to one key and name, until expiry; each retry gets a freshly sealed answer and appends nothing ([Expiry and single use](#expiry-and-single-use)). Test 6 covers a lost answer, an immediate retry, a retry after a sponsor restart, and a retry after expiry. |
 | 3. High: leave can fence writes it promises to drain | `leave` stops local writes, drains to an exact condition, and only then appends the leave claim as the last envelope ([`st fleet leave`](#st-fleet-leave)). Test 10 drains 1,500 envelopes across sparse ranges with an interrupted confirmation and a peer restart. |
 | 4. High: CI filter skips core fleet changes | `fleet-compat` and `fleet-e2e` have no path filter and run on every pull request once added; a test fails if a filter appears; publication needs both platform legs of `fleet-e2e` ([CI](#ci)). |
-| 5. Medium: the v0.3.0 baseline may not exist | The baseline is pinned by checksum in `.github/fleet-compat-baseline.json`; the pull request that adds `fleet-compat` waits for the release and nothing skips or falls back. |
+| 5. Medium: a release compatibility bundle may be unavailable | `.github/fleet-compat-baseline.json` pins the previous published release's source commit, tag, platform bundle URLs and archive SHA-256 checksums. A missing or invalid bundle fails `fleet-compat`; there is no source-build fallback. An older temporary hold requires a nonempty `exception_reason`. |
 | 6. Medium: the Fabric command exposes the code | `st fleet invite --send-fabric` and `st fleet join --fabric-inbox` move the code as a Fabric file, never in argv. The argv form remains, with its exposure stated. Test 8 checks that a leaked code is visible and revocable; tests 12 and 13 check argument lists. |
 | 7. Medium: rejoin separation is bounded | Incarnations are told apart by the key that signed each envelope, not by a sequence gap, so the floor is `H` and the separation is exact ([Reusing a name](#reusing-a-name)). Test 9 covers envelopes at and above the floor and relays after the new incarnation is admitted. |
 
@@ -167,7 +167,8 @@ These gaps are deliberate and have tests that pin down their exact extent:
   connection. For a legacy writer that was removed, members refuse its envelopes above the
   removal's `high_water`, but still accept unsigned candidates at or below it. Migration closes
   this gap for each writer as it gets a key.
-- **Old builds** authenticate nothing beyond the secret.
+- **Pre-membership builds** authenticate nothing beyond the secret. This historical limit is not
+  an assumption about the rolling previous-release compatibility baseline.
 
 For a machine that was lost or stolen: remove it on every member you can reach, and finish
 migration (`st fleet migrate --finish`) on every member, so that no member accepts a legacy
@@ -1288,13 +1289,15 @@ files. For each test, the "fails if" clause is the assertion that would catch a 
     signature afterwards, or if exchanges after `--finish` lack member signatures. A third node L,
     listed on A at a port nothing serves, migrates with `--dial-out`; fails if A dials L afterwards
     or records it down. A fourth node that self-admits without a code must not become a member.
-15. `an_old_build_config_peer_replicates_with_new_members` (ignored unless `ST3_COMPAT_BIN` is set):
-    O runs the baseline release binary and lists N1 and N3 as config peers. N1 and N3 are
-    new-build members that list O. N2 joins N1 through an invite. N3 is cut off from N1, so N1's
-    and N2's writes reach N3 only through O, which drops their signatures. Fails if a write on any
-    node is missing on another, if N3 does not end up admitting N1's and N2's envelopes through
-    signature requests, or if O holds any `invalid` record (its `fleet.*` records must be
-    `unknown`).
+15. `previous_release_replicates_with_new_members_and_preserves_history_on_upgrade` (ignored
+    unless `ST3_COMPAT_BIN` is set): O runs the previous published release; N1 and N2 run the
+    current build. They exchange real writes as config peers, then migrate sequentially to
+    membership, with O migrating through its release CLI. N4 joins through N1; all four nodes
+    must receive every write, with no invalid records or unsigned member envelopes. Backups of
+    O's original and signed membership databases must restore the graph, table counts,
+    replication inventory and exact source envelopes, including member keys and signatures.
+    O then upgrades in place: every retained claim ID and its fleet binding must survive, and
+    writes in both directions must still converge on all four nodes.
 
 The docs step adds `readme_multi_machine_section_runs` to this file. It extracts the commands from
 the README section on running st on more than one machine and runs them against isolated nodes.
@@ -1303,11 +1306,12 @@ the README section on running st on more than one machine and runs them against 
 
 - **Nix** (existing `check-x86_64-linux (st3)` and `check-aarch64-darwin`): runs every unit test
   and every `fleet.rs` test except 15, on Linux and macOS, on every pull request.
-- **`fleet-compat`** (new workflow `.github/workflows/fleet.yml`, on `ubuntu-22.04` and
-  `macos-15`, on every pull request with no path filter): downloads the baseline bundle for the
-  runner, verifies it against the pinned checksum, sets `ST3_COMPAT_BIN`, and runs test 15 with
-  `--ignored --exact`. It fails if the download or checksum fails, if the variable is empty, or if
-  the output does not report exactly one test passed. It never skips.
+- **`fleet-compat`** (the Linux gate stage in `.github/workflows/fleet.yml`, on every pull request
+  with no path filter): `python3 scripts/compat-baseline fleet "$RUNNER_TEMP/baseline"` downloads
+  the native release bundle, checks its archive SHA-256 and extracts its `bin/st3`. The stage
+  sets `ST3_COMPAT_BIN` to the helper's executable path and runs test 15 with `--ignored --exact`.
+  A missing download, checksum mismatch, missing executable or result other than exactly one
+  test passed fails the gate. It never skips or builds an older source revision instead.
 - **`fleet-e2e`** (new job in the tag release workflow, also run on every pull request with no path
   filter, on `ubuntu-22.04` x86_64 and `macos-15` arm64): installs from the bundle the same run just
   built, never from cargo, and runs `scripts/fleet-e2e --bin-dir DIR`. The script runs node A as a
@@ -1329,11 +1333,14 @@ fails if `fleet.yml` names a macOS runner. On macOS, the fleet suite runs in st'
 (`st/ci-macos`, on the fleet's Mac), which runs `cargo test --workspace` and so skips the
 ignored compatibility test.
 
-**The compatibility baseline.** Until the `v0.3.0` release bundle exists, the old build is `st3`
-built with Nix at the commit pinned in `.github/fleet-compat-baseline.json`: `main` before fleet
-membership. The pin is its identity, and the job checks that the binary has no `st fleet`. Once
-`v0.3.0` is published, the pin moves to that bundle and the SHA-256 of each platform's archive.
-The job never skips and never falls back: an unbuildable baseline fails it.
+**The compatibility baseline.** `.github/fleet-compat-baseline.json` rolls forward to the
+previous published release when a new release is published. Its `commit` records the 40-character
+release source identity, `tag` names the release, `why` records the policy, and `bundles` maps each
+supported Rust target to its release archive URL and SHA-256. `exception_reason` is normally
+`null`; temporarily holding an older release requires a nonempty reason in the pin. The same
+bundle loader is used by the gate and cache warm-up. The baseline currently selects `v0.3.17`;
+it is a membership-capable released binary, not a permanently ancient fixture. Download,
+checksum or extraction failures fail closed, without skipping or a source-build fallback.
 
 ### Live test: `scripts/fleet-live-test`
 

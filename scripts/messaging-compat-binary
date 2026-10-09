@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
-# Print the pinned historical channel path; Nix caches the immutable build.
+# Print the checksum-pinned previous-release channel path.
 set -euo pipefail
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
-commit=$(jq -er '.commit | select(test("^[0-9a-fA-F]{40}$"))' "$repo/.github/messaging-compat-baseline.json")
-package=$(nix build --impure --no-link --print-out-paths --expr \
-  "((builtins.getFlake \"github:compoundingtech/smalltalk/$commit\").packages.\${builtins.currentSystem}.st3).overrideAttrs (_: { doCheck = false; nativeCheckInputs = []; postInstall = \"\"; cargoBuildFlags = [\"-p\" \"st3\"]; })")
-test -x "$package/bin/st3"
-printf '%s\n' "$package/bin/st3"
+exec python3 "$repo/scripts/compat-baseline" messaging "$repo/target/compat-baselines"

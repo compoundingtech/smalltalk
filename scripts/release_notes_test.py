@@ -417,6 +417,10 @@ class ReleaseNotes(unittest.TestCase):
             commands.append(args)
             if args[:2] == ('git', 'rev-parse'):
                 return self.base
+            if args[:2] == ('git', 'diff'):
+                return 'unclassified.rs'
+            if args[0] == 'python3' and args[2:] == ('check', '--source', source, '--require-latest'):
+                return ''
             raise AssertionError(f'Unexpected command before classification: {args}')
         with patch.object(sys, 'argv', ['release-smalltalk-daily']), \
              patch.object(daily, 'newest_verified_main_run', return_value=(1, source)), \

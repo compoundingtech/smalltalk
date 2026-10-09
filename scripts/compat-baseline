@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Print a checksum-verified previous-release st3 path, without installing it."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import tarfile
+import tempfile
+import urllib.request
+
+REPO = Path(__file__).resolve().parent.parent
+TARGETS = {("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
+           ("Darwin", "arm64"): "aarch64-apple-darwin"}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("baseline", choices=("fleet", "messaging"))
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    target = TARGETS.get((platform.system(), platform.machine()))
+    if target is None:
+        parser.error("no native release bundle for this platform")
+    pin = json.loads((REPO / f".github/{args.baseline}-compat-baseline.json").read_text())
+    bundle = pin["bundles"][target]
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    # Each immutable archive has a separate directory. Concurrent tests may safely
+    # download/extract the same archive without exposing a partial executable.
+    installed = output / bundle["sha256"]
+    binary = installed / f"smalltalk-{target}/bin/st3"
+    if not binary.is_file():
+        with tempfile.TemporaryDirectory(prefix="download-", dir=output) as temporary:
+            work = Path(temporary)
+            archive = work / "bundle.tar.gz"
+            digest = hashlib.sha256()
+            with urllib.request.urlopen(bundle["url"]) as response, archive.open("wb") as stream:
+                while chunk := response.read(1024 * 1024):
+                    digest.update(chunk)
+                    stream.write(chunk)
+            if digest.hexdigest() != bundle["sha256"]:
+                raise ValueError(f"{pin['tag']} bundle SHA-256 mismatch")
+            extracted = work / "extracted"
+            extracted.mkdir()
+            with tarfile.open(archive) as release:
+                release.extractall(extracted, filter="data")
+            build = json.loads((extracted / f"smalltalk-{target}/BUILD.json").read_text())
+            if build["source"] != pin["commit"] or build["target"] != target:
+                raise ValueError("release BUILD.json does not match the baseline source/target")
+            try:
+                os.rename(extracted, installed)
+            except FileExistsError:
+                pass  # Another reader published the same checksum-verified archive.
+            except OSError:
+                if not binary.is_file():
+                    raise
+    if not os.access(binary, os.X_OK):
+        raise ValueError(f"baseline executable missing: {binary}")
+    print(binary)
+
+
+if __name__ == "__main__":
+    main()

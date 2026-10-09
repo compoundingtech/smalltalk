@@ -8,7 +8,7 @@ is rebuilt, so a release is always an archive a main run has already proven.
 
 Usage: scripts/release-smalltalk-daily [--dry-run] [--tag TAG]
 Environment: GH_TOKEN and GH_REPO (as for gh). Run from a full-history checkout with tags.
-Needs contents: write (the release creates the tag) and actions: read (the artifact download).
+Needs contents: write, pull-requests: write and actions: write for publication and the baseline PR.
 """
 import argparse
 import json
@@ -40,7 +40,7 @@ def newest_verified_main_run():
 
 
 def latest_release_tag():
-    return run('gh', 'release', 'view', '--json', 'tagName', '--jq', '.tagName')
+    return run('python3', str(pathlib.Path(__file__).resolve().parent / 'compat-baseline-release'), 'latest')
 
 
 def next_tag():
@@ -65,7 +65,19 @@ def main():
     since = run('git', 'rev-parse', f'{previous}^{{commit}}', cwd=repo)
     if since == sha or subprocess.run(['git', 'merge-base', '--is-ancestor', sha, since], cwd=repo).returncode == 0:
         say(f'main has not changed since {previous} ({since}); nothing to release')
+        if not args.dry_run:
+            run('python3', str(repo / 'scripts/compat-baseline-release'), 'advance', previous)
         return 0
+    changed = run('git', 'diff', '--name-only', since, sha, cwd=repo).splitlines()
+    if changed and all(path in ('.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json')
+                       or re.fullmatch(r'release-notes/compat-baselines-v\d+\.\d+\.\d+\.json', path)
+                       for path in changed):
+        say('only postpublish baseline maintenance changed; nothing to release')
+        if not args.dry_run:
+            run('python3', str(repo / 'scripts/compat-baseline-release'), 'advance', previous)
+        return 0
+    # The previous release must have reached main before cutting its successor.
+    run('python3', str(repo / 'scripts/compat-baseline-release'), 'check', '--source', sha, '--require-latest')
     tag = args.tag or next_tag()
     if subprocess.run(['git', 'rev-parse', '-q', '--verify', f'refs/tags/{tag}'], cwd=repo,
                       capture_output=True).returncode == 0:
@@ -104,6 +116,7 @@ def main():
         say(f'published {tag}, but the tag does not point at {sha}: {tagged}')
         return 1
     say(f'published {tag} at {sha}')
+    run('python3', str(repo / 'scripts/compat-baseline-release'), 'advance', tag)
     return 0
 
 

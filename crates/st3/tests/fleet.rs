@@ -200,7 +200,7 @@ impl Node {
             .unwrap();
         self.daemon = Some(daemon);
         let client = self.client();
-        // The pinned compatibility build may be cold while other CI lanes compile.
+        // The release compatibility binary may start while other CI lanes compile.
         // Give startup room for that load. Bound each health probe as well: a request
         // stalled behind startup must not consume the whole startup deadline.
         let deadline = Instant::now() + Duration::from_secs(150);
@@ -713,7 +713,11 @@ async fn placement_handoff_source_offline_retires_the_returning_real_daemon_runt
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum SeatMove { Stopped, Running, SourceOffline }
+enum SeatMove {
+    Stopped,
+    Running,
+    SourceOffline,
+}
 
 async fn cross_host_seat_move(mode: SeatMove) {
     const SUBJECT: &str = "agent/move/worker";
@@ -765,52 +769,93 @@ agent "move/worker" {
     }
     if mode == SeatMove::SourceOffline {
         a.stop();
-        b.st_ok(&["agents", "start", SUBJECT, "--host", "cobalt", "--source-offline", "--as", PERSON]);
+        b.st_ok(&[
+            "agents",
+            "start",
+            SUBJECT,
+            "--host",
+            "cobalt",
+            "--source-offline",
+            "--as",
+            PERSON,
+        ]);
     } else {
-        b.st_ok(&["agents", "start", SUBJECT, "--host", "cobalt", "--as", PERSON]);
+        b.st_ok(&[
+            "agents", "start", SUBJECT, "--host", "cobalt", "--as", PERSON,
+        ]);
     }
-    wait_until("cobalt's running observation reaches both replicas", 30, || async {
-        let replicas = if mode == SeatMove::SourceOffline { vec![&b] } else { vec![&a, &b] };
-        for node in replicas {
-            if !node.claims().await.iter().any(|claim| {
-                claim["subject"] == SUBJECT
-                    && claim["kind"] == "runtime.observed"
-                    && claim["origin"] == "cobalt"
-                    && claim["body"]["fields"]["status"] == "running"
-                    && claim["body"]["fields"]["incarnation_id"] != old_incarnation
-            }) {
-                return false;
+    wait_until(
+        "cobalt's running observation reaches both replicas",
+        30,
+        || async {
+            let replicas = if mode == SeatMove::SourceOffline {
+                vec![&b]
+            } else {
+                vec![&a, &b]
+            };
+            for node in replicas {
+                if !node.claims().await.iter().any(|claim| {
+                    claim["subject"] == SUBJECT
+                        && claim["kind"] == "runtime.observed"
+                        && claim["origin"] == "cobalt"
+                        && claim["body"]["fields"]["status"] == "running"
+                        && claim["body"]["fields"]["incarnation_id"] != old_incarnation
+                }) {
+                    return false;
+                }
             }
-        }
-        true
-    })
+            true
+        },
+    )
     .await;
     if mode == SeatMove::SourceOffline {
-        let proof = b.claims().await.into_iter().find(|claim| {
-            claim["kind"] == "agent.placement.source-offline" && claim["subject"] == SUBJECT
-        }).expect("source-offline move records its exception");
+        let proof = b
+            .claims()
+            .await
+            .into_iter()
+            .find(|claim| {
+                claim["kind"] == "agent.placement.source-offline" && claim["subject"] == SUBJECT
+            })
+            .expect("source-offline move records its exception");
         assert_eq!(proof["actor"], PERSON);
         let peek = b.st_ok(&["terminals", "peek", SUBJECT]);
-        assert!(peek.contains("moved-seat-ready"), "destination is reachable while source is offline: {peek}");
+        assert!(
+            peek.contains("moved-seat-ready"),
+            "destination is reachable while source is offline: {peek}"
+        );
         a.start().await;
-        wait_until("returning source retires its old incarnation", 30, || async {
-            b.claims().await.iter().any(|claim| {
-                claim["subject"] == SUBJECT && claim["origin"] == "amber"
-                    && claim["body"]["fields"]["reason"] == "placed-elsewhere"
-                    && claim["body"]["fields"]["incarnation_id"] == old_incarnation
-            })
-        }).await;
+        wait_until(
+            "returning source retires its old incarnation",
+            30,
+            || async {
+                b.claims().await.iter().any(|claim| {
+                    claim["subject"] == SUBJECT
+                        && claim["origin"] == "amber"
+                        && claim["body"]["fields"]["reason"] == "placed-elsewhere"
+                        && claim["body"]["fields"]["incarnation_id"] == old_incarnation
+                })
+            },
+        )
+        .await;
     }
-    wait_until("both replicas report the destination incarnation", 30, || async {
-        [&a, &b].iter().all(|node| {
-            let view = status(node);
-            view["actual"]["host"] == "cobalt"
-                && view["actual"]["status"] == "running"
-                && view["actual"]["incarnation_id"] != old_incarnation
-                && view["reachability"] == "reachable"
-        })
-    }).await;
-    let runtime_claims = b.claims().await.into_iter()
+    wait_until(
+        "both replicas report the destination incarnation",
+        30,
+        || async {
+            [&a, &b].iter().all(|node| {
+                let view = status(node);
+                view["actual"]["host"] == "cobalt"
+                    && view["actual"]["status"] == "running"
+                    && view["actual"]["incarnation_id"] != old_incarnation
+                    && view["reachability"] == "reachable"
+            })
+        },
+    )
+    .await;
+    let runtime_claims = b
+        .claims()
+        .await
+        .into_iter()
         .filter(|claim| claim["subject"] == SUBJECT && claim["kind"] == "runtime.observed")
         .collect::<Vec<_>>();
     let source_stop = runtime_claims.iter().find(|claim| {
@@ -1810,7 +1855,9 @@ async fn rejoin_exchanges_live_claims_beyond_differing_checkpoint_tombstones() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rejoin_slow_exports_preserve_live_claims_and_show_overload_retry() {
-    if st3::test_support::supervise_test() { return; }
+    if st3::test_support::supervise_test() {
+        return;
+    }
     rejoin_tombstone_fixture(true).await;
 }
 
@@ -1871,7 +1918,10 @@ async fn rejoin_tombstone_fixture(slow_export: bool) {
     if slow_export {
         // Restart only the isolated daemon with the fixture-only injection. Each response
         // export takes 25 seconds, beyond the old caller's entire 20-second HTTP deadline.
-        cedar.env.push(("ST3_TEST_REPLICATION_EXPORT_DELAY_MS".into(), "25000".into()));
+        cedar.env.push((
+            "ST3_TEST_REPLICATION_EXPORT_DELAY_MS".into(),
+            "25000".into(),
+        ));
         cedar.stop();
         cedar.start().await;
         cedar.stop_worker();
@@ -1879,30 +1929,49 @@ async fn rejoin_tombstone_fixture(slow_export: bool) {
     birch.start_worker();
     cedar.start_worker();
     if slow_export {
-        wait_until("signed overload exposes polling phase and retry", 90, || async {
-            let status = birch.st_json(&["replication", "status"]);
-            status["peers"].as_array().unwrap().iter().any(|peer| {
-                peer["worker"]["phase"] == "overload"
-                    && peer["worker"]["last_attempt_at_unix_ms"].as_u64().is_some()
-                    && peer["worker"]["next_retry_at_unix_ms"].as_u64().is_some()
-            })
-        }).await;
+        wait_until(
+            "signed overload exposes polling phase and retry",
+            90,
+            || async {
+                let status = birch.st_json(&["replication", "status"]);
+                status["peers"].as_array().unwrap().iter().any(|peer| {
+                    peer["worker"]["phase"] == "overload"
+                        && peer["worker"]["last_attempt_at_unix_ms"].as_u64().is_some()
+                        && peer["worker"]["next_retry_at_unix_ms"].as_u64().is_some()
+                })
+            },
+        )
+        .await;
         let text = birch.st_ok(&["replication", "status"]);
         assert!(text.contains("worker overload"), "{text}");
         assert!(text.contains("next retry in"), "{text}");
     }
     for (node, before) in [&birch, &cedar].into_iter().zip(before) {
-        wait_until("both rejoined workers exchange successfully", if slow_export { 180 } else { 15 }, || async {
-            node.st_json(&["replication", "status"])["timings"]["exchanges"]
-                .as_u64()
-                .unwrap() >= before + 4
-        }).await;
+        wait_until(
+            "both rejoined workers exchange successfully",
+            if slow_export { 180 } else { 15 },
+            || async {
+                node.st_json(&["replication", "status"])["timings"]["exchanges"]
+                    .as_u64()
+                    .unwrap()
+                    >= before + 4
+            },
+        )
+        .await;
         let status = node.st_json(&["replication", "status"]);
-        eprintln!("{} rejoin exchanges={} envelopes_received={}",
-            node.name, status["timings"]["exchanges"], status["timings"]["envelopes_received"]);
+        eprintln!(
+            "{} rejoin exchanges={} envelopes_received={}",
+            node.name, status["timings"]["exchanges"], status["timings"]["envelopes_received"]
+        );
     }
     for node in [&birch, &cedar] {
-        wait_for_notes(node, &expected, if slow_export { 180 } else { 30 }, &[&birch, &cedar]).await;
+        wait_for_notes(
+            node,
+            &expected,
+            if slow_export { 180 } else { 30 },
+            &[&birch, &cedar],
+        )
+        .await;
         let connection =
             rusqlite::Connection::open(node.state_dir().join("claims.sqlite3")).unwrap();
         let count: u64 = connection
@@ -2906,22 +2975,13 @@ async fn a_member_switches_between_listening_and_dial_out() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs ST3_COMPAT_BIN: the st3 of the pinned baseline release"]
-async fn an_old_build_config_peer_replicates_with_new_members() {
+#[ignore = "needs ST3_COMPAT_BIN: the st3 of the previous published release"]
+async fn previous_release_replicates_with_new_members_and_preserves_history_on_upgrade() {
     if st3::test_support::supervise_test() {
         return;
     }
     let old = PathBuf::from(
         std::env::var("ST3_COMPAT_BIN").expect("ST3_COMPAT_BIN names the baseline st3"),
-    );
-    assert!(
-        !Command::new(&old)
-            .args(["fleet", "--help"])
-            .output()
-            .unwrap()
-            .status
-            .success(),
-        "the baseline must predate membership"
     );
     let root = tempfile::tempdir().unwrap();
     let fleet_id = "2a9d7c5e-1b3f-4e6a-8c0d-9e8f7a6b5c4d";
@@ -2948,9 +3008,8 @@ async fn an_old_build_config_peer_replicates_with_new_members() {
         wait_for_notes(node, &expected, 60, &[&o, &n1, &n2]).await;
     }
 
-    // The baseline predates the backup CLI. Export a private SQLite snapshot of its graph
-    // with the current envelope exporter, then restore the logical file at the current schema.
-    // This is also run by the existing exact fleet-compat CI invocation.
+    // Export an untouched release database through the current backup implementation and
+    // verify that restore retains the source envelopes and graph.
     backup_baseline_graph(&o, root.path());
 
     // n1 and n2 move to membership while the old build keeps replicating with them.
@@ -2962,6 +3021,13 @@ async fn an_old_build_config_peer_replicates_with_new_members() {
     n2.stop();
     n2.migrate(&[&code]);
     n2.start().await;
+    // The previous release understands membership too: migrate it with its own CLI and
+    // exercise signed old/new exchanges, not just the config-peer transport.
+    let code = n1.invite("o", &["--migrate"]);
+    o.stop();
+    o.migrate(&[&code]);
+    o.start().await;
+    o.wait_listening().await;
     // A newly joined member reaches the old build only through the members it can dial.
     let n4 = joined(root.path(), &n1, "n4", &[]).await;
     o.note("o-1").await;
@@ -2973,14 +3039,51 @@ async fn an_old_build_config_peer_replicates_with_new_members() {
     for node in [&o, &n1, &n2, &n4] {
         wait_for_notes(node, &expected, 90, &[&o, &n1, &n2, &n4]).await;
     }
-    // The old build keeps the fleet claims it cannot read as unknown, never invalid.
-    let status = o.st_json(&["replication", "status"]);
-    assert_eq!(status["invalid_records"], 0, "{status}");
+    for node in [&o, &n1, &n2, &n4] {
+        let status = node.st_json(&["replication", "status"]);
+        assert_eq!(status["unsigned_envelopes"], 0, "{}: {status}", node.name);
+        assert_eq!(status["invalid_records"], 0, "{}: {status}", node.name);
+    }
+
+    // Back up signed release envelopes as well as the original config-peer history.
+    let signed_backup = root.path().join("signed-backup");
+    fs::create_dir(&signed_backup).unwrap();
+    backup_baseline_graph(&o, &signed_backup);
+    let retained_ids: BTreeSet<String> = o
+        .claims()
+        .await
+        .into_iter()
+        .map(|claim| claim["id"].as_str().unwrap().to_owned())
+        .collect();
+    o.stop();
+    o.binary = PathBuf::from(st3());
+    o.start().await;
+    o.wait_listening().await;
+    let upgraded_ids: BTreeSet<String> = o
+        .claims()
+        .await
+        .into_iter()
+        .map(|claim| claim["id"].as_str().unwrap().to_owned())
+        .collect();
     assert!(
-        status["unknown_records"].as_u64().unwrap_or(0) > 0,
-        "the old build admitted fleet claims it cannot know: {status}"
+        retained_ids.is_subset(&upgraded_ids),
+        "upgrade lost release history"
     );
-    for node in [&n1, &n2, &n4] {
+    assert_eq!(
+        st3::config::FleetFile::load(&o.state_dir())
+            .unwrap()
+            .unwrap()
+            .fleet_id,
+        fleet_id
+    );
+    o.note("o-upgraded").await;
+    n4.note("n4-after-upgrade").await;
+    expected.extend([
+        "custom/fleet-test/o-upgraded".to_owned(),
+        "custom/fleet-test/n4-after-upgrade".to_owned(),
+    ]);
+    for node in [&o, &n1, &n2, &n4] {
+        wait_for_notes(node, &expected, 90, &[&o, &n1, &n2, &n4]).await;
         let status = node.st_json(&["replication", "status"]);
         assert_eq!(status["unsigned_envelopes"], 0, "{}: {status}", node.name);
         assert_eq!(status["invalid_records"], 0, "{}: {status}", node.name);
@@ -3008,8 +3111,20 @@ fn backup_baseline_graph(old: &Node, directory: &Path) {
             .unwrap();
     let baseline_envelopes = reader
         .prepare(
-            "SELECT writer,sequence,envelope_hash,previous_hash,accepted_at_unix_ms,payload
-         FROM replica_envelopes WHERE batch_id IS NOT NULL ORDER BY writer,sequence,envelope_hash",
+            "SELECT envelopes.writer,envelopes.sequence,envelopes.envelope_hash,
+                    envelopes.previous_hash,envelopes.accepted_at_unix_ms,envelopes.payload,
+                    (SELECT member_key FROM replica_envelope_signatures AS signatures
+                     WHERE signatures.writer=envelopes.writer
+                       AND signatures.sequence=envelopes.sequence
+                       AND signatures.envelope_hash=envelopes.envelope_hash
+                     ORDER BY member_key LIMIT 1),
+                    (SELECT signature FROM replica_envelope_signatures AS signatures
+                     WHERE signatures.writer=envelopes.writer
+                       AND signatures.sequence=envelopes.sequence
+                       AND signatures.envelope_hash=envelopes.envelope_hash
+                     ORDER BY member_key LIMIT 1)
+             FROM replica_envelopes AS envelopes WHERE batch_id IS NOT NULL
+             ORDER BY envelopes.writer,envelopes.sequence,envelopes.envelope_hash",
         )
         .unwrap()
         .query_map([], |row| {
@@ -3020,8 +3135,8 @@ fn backup_baseline_graph(old: &Node, directory: &Path) {
                 previous_hash: row.get(3)?,
                 accepted_at_unix_ms: row.get::<_, String>(4)?.parse().unwrap(),
                 payload: row.get(5)?,
-                member_key: None,
-                signature: None,
+                member_key: row.get(6)?,
+                signature: row.get(7)?,
             })
         })
         .unwrap()
@@ -3088,7 +3203,11 @@ fn fleet_workflows_have_no_path_filter() {
             "fleet.yml filters its runs with {filter}"
         );
     }
-    assert!(stages.contains("an_old_build_config_peer_replicates_with_new_members"));
+    assert!(
+        stages.contains(
+            "previous_release_replicates_with_new_members_and_preserves_history_on_upgrade"
+        )
+    );
     // The optional macOS job lives in macos.yml so label events cannot restart this gate.
     assert!(
         !compat.to_ascii_lowercase().contains("macos-"),
@@ -3964,7 +4083,9 @@ async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart
             }
         }),
     );
-    let server = tokio::spawn(async move { axum::serve(http, app).await.unwrap(); });
+    let server = tokio::spawn(async move {
+        axum::serve(http, app).await.unwrap();
+    });
     let mut node = Node::new(root.path(), "fixture-watch");
     node.env.push(("GH_TOKEN".into(), "fixture-token".into()));
     node.env.push(("ST3_GITHUB_API_URL".into(), api));
@@ -3973,34 +4094,116 @@ async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart
     fs::write(&file, format!("version 2\nagent \"example/watch\" {{ host \"fixture-watch\"; workspace {:?}; command \"true\"; restart \"never\" }}\n", node.root)).unwrap();
     node.st_ok(&["agents", "apply", file.to_str().unwrap(), "--as", PERSON]);
     let cli = |args: &[&str]| -> Value {
-        let output = node.command(args).env("ST_AGENT", "agent/example/watch").output().unwrap();
-        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stderr), node.logs());
+        let output = node
+            .command(args)
+            .env("ST_AGENT", "agent/example/watch")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            node.logs()
+        );
         serde_json::from_slice(&output.stdout).unwrap()
     };
-    let first = cli(&["--json", "gh", "watch", "fixture/app#12", "--until", "1h", "--as", "agent/example/watch"]);
+    let first = cli(&[
+        "--json",
+        "gh",
+        "watch",
+        "fixture/app#12",
+        "--until",
+        "1h",
+        "--as",
+        "agent/example/watch",
+    ]);
     let subject = first["subject"].as_str().unwrap().to_owned();
     assert_eq!(first["state"], "active");
-    let refused = node.command(&["--json", "gh", "comment", "fixture/app#12", "--body", "Foreign actor", "--as", "agent/example/other"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+    let refused = node
+        .command(&[
+            "--json",
+            "gh",
+            "comment",
+            "fixture/app#12",
+            "--body",
+            "Foreign actor",
+            "--as",
+            "agent/example/other",
+        ])
+        .env("ST_AGENT", "agent/example/watch")
+        .output()
+        .unwrap();
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("agent/example/watch"));
     assert!(posts.lock().unwrap().is_empty());
-    let posted = cli(&["--json", "gh", "comment", "fixture/app#12", "--body", "Copper proof", "--as", "agent/example/watch"]);
+    let posted = cli(&[
+        "--json",
+        "gh",
+        "comment",
+        "fixture/app#12",
+        "--body",
+        "Copper proof",
+        "--as",
+        "agent/example/watch",
+    ]);
     assert_eq!(posted["kind"], "comment");
     assert_eq!(posted["id"], 801);
     assert_eq!(posted["watch"]["subject"], subject);
     node.restart().await;
-    let output = node.command(&["--json", "gh", "ls", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = node
+        .command(&["--json", "gh", "ls", "--as", "agent/example/watch"])
+        .env("ST_AGENT", "agent/example/watch")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(listed.as_array().unwrap().iter().filter(|watch| watch["subject"] == subject).count(), 1);
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|watch| watch["subject"] == subject)
+            .count(),
+        1
+    );
     let foreign_url = "https://github.com/fixture/app/issues/12#issuecomment-902";
-    let refused = node.command(&["--json", "gh", "own", foreign_url, "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
+    let refused = node
+        .command(&[
+            "--json",
+            "gh",
+            "own",
+            foreign_url,
+            "--as",
+            "agent/example/watch",
+        ])
+        .env("ST_AGENT", "agent/example/watch")
+        .output()
+        .unwrap();
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("github-post-not-ours"));
     node.restart().await;
     for _ in 0..2 {
-        let output = node.command(&["--json", "gh", "own", "https://github.com/fixture/app/issues/12#issuecomment-801", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let output = node
+            .command(&[
+                "--json",
+                "gh",
+                "own",
+                "https://github.com/fixture/app/issues/12#issuecomment-801",
+                "--as",
+                "agent/example/watch",
+            ])
+            .env("ST_AGENT", "agent/example/watch")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let owned: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(owned["id"], 801);
         assert_eq!(owned["agent"], "agent/example/watch");
@@ -4008,21 +4211,74 @@ async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart
     }
     let review_file = node.root.join("review.txt");
     fs::write(&review_file, "The Copper proof is ready.").unwrap();
-    let output = node.command(&["--json", "gh", "comment", "fixture/app#12", "--body-file", review_file.to_str().unwrap(), "--review", "approve", "--no-watch", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = node
+        .command(&[
+            "--json",
+            "gh",
+            "comment",
+            "fixture/app#12",
+            "--body-file",
+            review_file.to_str().unwrap(),
+            "--review",
+            "approve",
+            "--no-watch",
+            "--as",
+            "agent/example/watch",
+        ])
+        .env("ST_AGENT", "agent/example/watch")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let review: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(review["kind"], "review");
     assert_eq!(review["id"], 802);
     node.restart().await;
-    let output = node.command(&["--json", "gh", "own", "https://github.com/fixture/app/pull/12#pullrequestreview-802", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    let store = st3::store::Store::open(&node.state_dir().join("claims.sqlite3"), "fixture-watch").unwrap();
+    let output = node
+        .command(&[
+            "--json",
+            "gh",
+            "own",
+            "https://github.com/fixture/app/pull/12#pullrequestreview-802",
+            "--as",
+            "agent/example/watch",
+        ])
+        .env("ST_AGENT", "agent/example/watch")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store =
+        st3::store::Store::open(&node.state_dir().join("claims.sqlite3"), "fixture-watch").unwrap();
     for (kind, id) in [("comment", 801), ("review", 802)] {
         let subject = st3::github_watch::github_post_subject("fixture/app", kind, id);
-        assert_eq!(store.claims_for(&subject, Some("github.posted")).unwrap().len(), 1);
-        assert_eq!(store.github_post_agent("fixture/app", kind, id).unwrap().as_deref(), Some("agent/example/watch"));
+        assert_eq!(
+            store
+                .claims_for(&subject, Some("github.posted"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .github_post_agent("fixture/app", kind, id)
+                .unwrap()
+                .as_deref(),
+            Some("agent/example/watch")
+        );
     }
-    assert_eq!(store.github_post_agent("fixture/app", "comment", 902).unwrap(), None);
+    assert_eq!(
+        store
+            .github_post_agent("fixture/app", "comment", 902)
+            .unwrap(),
+        None
+    );
     drop(store);
     {
         let bodies = posts.lock().unwrap();
@@ -4032,12 +4288,32 @@ async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart
         assert_eq!(bodies[1]["event"], "APPROVE");
     }
     for _ in 0..2 {
-        let output = node.command(&["--json", "gh", "unwatch", "fixture/app#12", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let output = node
+            .command(&[
+                "--json",
+                "gh",
+                "unwatch",
+                "fixture/app#12",
+                "--as",
+                "agent/example/watch",
+            ])
+            .env("ST_AGENT", "agent/example/watch")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         node.restart().await;
     }
     let listed = node.st_json(&["gh", "ls", "--all", "--as", PERSON]);
-    let ended = listed.as_array().unwrap().iter().find(|watch| watch["subject"] == subject).unwrap();
+    let ended = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|watch| watch["subject"] == subject)
+        .unwrap();
     assert_eq!(ended["state"], "ended");
     assert_eq!(ended["ended"], "unwatched");
     server.abort();
@@ -4080,7 +4356,10 @@ async fn suspended_seat_moves_between_two_daemons_with_its_workspace_and_convers
     let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let pty = st_runtime::resolve_executable("pty", &std::env::vars().collect()).unwrap();
     let node_program = st_runtime::resolve_executable("node", &std::env::vars().collect()).unwrap();
-    let mut cleanup = SeatCleanup { pty: pty.clone(), roots: Vec::new() };
+    let mut cleanup = SeatCleanup {
+        pty: pty.clone(),
+        roots: Vec::new(),
+    };
     let mut amber = anchor(root.path(), "fixture-move-amber").await;
     let mut jade = joined(root.path(), &amber, "fixture-move-jade", &[]).await;
     cleanup.roots = vec![amber.state_dir().join("pty"), jade.state_dir().join("pty")];
@@ -4264,10 +4543,16 @@ async fn suspended_seat_moves_between_two_daemons_with_its_workspace_and_convers
         before,
         "source transcript changed after the move"
     );
-    let source_ptys = Command::new(&pty).args(["list", "--json"])
-        .env("PTY_ROOT", amber.state_dir().join("pty")).output().unwrap();
+    let source_ptys = Command::new(&pty)
+        .args(["list", "--json"])
+        .env("PTY_ROOT", amber.state_dir().join("pty"))
+        .output()
+        .unwrap();
     let source_ptys: Vec<Value> = serde_json::from_slice(&source_ptys.stdout).unwrap();
-    assert!(source_ptys.iter().all(|row| row["status"] != "running"), "source still has a live PTY: {source_ptys:?}");
+    assert!(
+        source_ptys.iter().all(|row| row["status"] != "running"),
+        "source still has a live PTY: {source_ptys:?}"
+    );
     jade.st_ok(&[
         "agents",
         "suspend",
@@ -4332,7 +4617,7 @@ async fn terminal_owner_filters_are_safe_across_mixed_builds() {
 }
 
 /// This narrower compatibility boundary needs a build that already knows today's mission
-/// format, but predates mission.provenance. The ancient fleet baseline is a different contract.
+/// format, but predates mission.provenance; it is independent of the rolling fleet release pin.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs ST3_PROVENANCE_COMPAT_BIN: a pre-provenance build with the current mission format"]
 async fn an_older_daemon_runs_a_provenance_revision_and_reads_its_sidecar_after_upgrade() {

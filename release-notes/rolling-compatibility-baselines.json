@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Rolling previous-release compatibility baselines and published archive inputs",
+  "replay": {"status": "none", "detail": "No runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "Compatibility evidence now compares the current candidate with the previous published stable release instead of permanently historical sources. Fleet CI uses the checksum-verified published native binary; historical messaging uses channel source at the same pinned release commit. This changes test coverage, not runtime wire, client or harness contracts, and does not establish arbitrary mixed-fleet or downgrade support."},
+  "downtime": {"status": "none", "detail": "No additional service interruption introduced."},
+  "manual": {"status": "changed", "detail": "Release automation opens a postpublication baseline maintenance PR against main. A human must review and merge it before the next stable candidate is published; publication does not enable auto-merge or enrollment. CI rejects pins more than one published stable release behind unless exception_reason records an explicit temporary older hold. Publisher Actions permissions must allow pull request creation and workflow dispatch. See docs/ci.md for repin and postpublication recovery commands."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change. Published release sources remain immutable; baseline maintenance is a subsequent main change."}
+}

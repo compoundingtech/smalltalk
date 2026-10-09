@@ -27,7 +27,7 @@ export default githubWorkflow(auditCaches({
       name: 'daily-release',
       'runs-on': linuxRunner,
       'timeout-minutes': 20,
-      permissions: { contents: 'write', actions: 'read' },
+      permissions: { contents: 'write', actions: 'write', 'pull-requests': 'write' },
       env: {
         GH_TOKEN: '${{ github.token }}',
         GH_REPO: '${{ github.repository }}',

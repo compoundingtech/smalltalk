@@ -83,8 +83,8 @@ fixtures and budgets; retain completed failures as evidence. See Namespace's
   model check, the [warning ratchet](#clippy-warning-ratchet), then
   `cargo run --locked -p st3-client-codegen -- --check`;
 - `linux-fleet-compat`: the fleet compatibility test against `.github/fleet-compat-baseline.json`'s
-  pinned older st3. Building that baseline also runs the pinned pty's own unit tests, two of which
-  are timing-sensitive, so the build is retried up to three times.
+  previous-release native archive. CI verifies its pinned SHA-256 and embedded source/target
+  metadata before running it; it does not rebuild the baseline or its PTY dependency.
 
 The primary test job proves that the two actual nextest inventories are disjoint and their union
 equals the full selected suite. The explicit zero-retry mail canaries run in a parallel job. The primary also
@@ -130,7 +130,9 @@ fix if a merge group finds a raw path introduced by another PR; do not bypass th
 Main upkeep probes the exact Cargo and Nix cache keys for each stage before provisioning Nix
 or restoring build archives. When both entries exist it stops after the probes. A miss is flagged
 as P0 and fills the missing entries with builds only: selected test executables, Clippy artifacts,
-the fleet baseline and integration binary, the Genie shell, or the isolation archive and VM driver. Workspace tests and the isolation VM are not repeated on main. The TypeScript dependency cache is also kept on main without repeating its tests.
+the integration binary, the Genie shell, or the isolation archive and VM driver. The published
+fleet baseline is downloaded rather than compiled. Workspace tests and the isolation VM are not
+repeated on main. The TypeScript dependency cache is also kept on main without repeating its tests.
 Merge-group and PR caches have their own ref scope; they cannot replace these main-scope saves,
 which all PRs and Namespace overflow runs can restore. Manual Workspace CI dispatch on main
 remains available for a full run. Release and deployment workflows keep their own push triggers.
@@ -140,8 +142,8 @@ backend) holding Cargo's registry and the workspace `target/` directory, keyed o
 `flake.lock`, workspace manifests and linker configuration. A second keyed entry (`nix5-<job>-...`) holds a signed local Nix binary cache in
 `$RUNNER_TEMP/st-ci-cache`. Its key includes `flake.lock`, the flake, Nix expressions and both compatibility baseline pins.
 `scripts/ci-nix-cache use` makes it a preferred substituter. After a successful stage, `save`
-copies reference-free downloads and sources fetched by the run, plus the closures of the fleet
-baseline, historical messaging channel and provider components. It leaves the installer-managed
+copies reference-free downloads and sources fetched by the run, plus the closures of the
+previous-release messaging package and provider components. It leaves the installer-managed
 `/nix` directory intact. Cache failures emit a warning and let the job build normally.
 
 The [original trial measurements](https://github.com/compoundingtech/smalltalk/pull/849#issuecomment-5936374396)
@@ -208,10 +210,60 @@ The separate `api_accept` target also supervises its descriptor-exhaustion subpr
 The remaining daemon fixtures serve their APIs in process or use fake runtime observations;
 their tasks end with their test runtime. New process-spawning fixtures should use this helper.
 
-The workspace suite still covers the token-free two-node messaging fault matrix. Its historical
-channel build remains independently pinned in `.github/messaging-compat-baseline.json`. Its
+The workspace suite still covers the token-free two-node messaging fault matrix. Its
+previous-release channel archive is pinned in `.github/messaging-compat-baseline.json`. Its
 provider stand-in runs the omp channel hook's TypeScript with Node 24's built-in type stripping;
 the default devShell supplies that `node`. See [the eval contract](../evals/st3/messaging-faults/README.md).
+
+### Rolling compatibility baselines
+
+The fleet and messaging pins in `.github/*-compat-baseline.json` track the latest
+published stable release for testing the next candidate. Each contains `commit`, `tag`, policy
+`why`, `exception_reason` (`null` ordinarily), and both native archive URLs and hex SHA256
+checksums. Fleet CI downloads, verifies and extracts the published native archive instead of
+rebuilding an old workspace. Messaging consumes the pinned published archive too; Nix adjusts
+its Linux interpreter path for sandbox execution without recompiling the channel.
+
+The public-repository workflow runs `python3 scripts/compat-baseline-release check` on every
+PR, merge group and main push (and manual dispatch). It paginates the actual published release
+list and excludes drafts, prereleases and unpublished tags. A baseline more than one published
+stable release behind the newest publication fails unless `exception_reason` gives an explicit
+temporary older-hold reason. An ordinary policy `why` does not waive freshness; blank reasons
+are invalid. Holds should identify the boundary and the condition for removing them.
+
+Daily and tag publication verify that the candidate's unheld pins already name the latest
+published stable release. After publication, `compat-baseline-release advance TAG` verifies
+the published `RELEASE.json` source against the dereferenced Git tag, checks archive bytes
+against `SHA256SUMS` and embedded `BUILD.json`, and opens a labelled draft baseline maintenance PR with
+an upgrade-impact fragment. Explicit holds are preserved. The release source itself stays
+immutable; the new pins reach `main` only through human review and the existing merge queue.
+No auto-merge or enrollment is enabled by publication. The next release waits until that PR
+lands, except for explicitly held pins. A baseline-only maintenance delta is not a new daily
+release candidate, avoiding an endless release/repin loop.
+
+The publisher's token needs `contents: write`, `pull-requests: write` and `actions: write`;
+the read-only freshness job needs only `contents: read`. GitHub must allow Actions to create
+pull requests. Because PRs created with `GITHUB_TOKEN` do not trigger PR workflows, automation
+explicitly dispatches the existing Workspace CI and the public-repository workflow on the
+maintenance branch. A permission failure leaves the published release intact and fails the
+publication job; it never switches credentials or bypasses main protection.
+
+Focused commands (Python standard library, Git and authenticated `gh` only):
+
+```sh
+python3 scripts/compat-baseline-release-test
+python3 scripts/compat-baseline-release check
+python3 scripts/compat-baseline-release check --source HEAD --require-latest
+python3 scripts/compat-baseline-release repin v0.3.17
+python3 scripts/compat-baseline-release advance v0.3.17
+```
+
+`repin` rewrites the local unheld JSON pins only; review and commit them through a PR.
+`advance` opens or reuses the postpublish PR and dispatches its checks, without merging it.
+After a failed postpublish step, rerun `advance` for the latest stable tag; an unchanged daily
+run also repairs a missing postpublish PR. Remove a resolved `exception_reason` before repinning.
+Run `genie` after changing workflow generators, and `genie --check` to verify the generated
+workflows in the ordinary final validation.
 
 ### Boot canaries
 
