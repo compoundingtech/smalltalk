@@ -68,6 +68,10 @@ lifecycle dependencies and the shared reverse-edge projection to proof/replay. A
 hidden memberships and folder tombstones remain retained: no ordered-membership drop rule exists.
 Retiring a member changes visibility, not its retained pair position; redeclaring a reusable stable
 identity can restore that position.
+Version 15 distinguishes explicit placement migration: the arrangement witness includes its
+retained authority marker/source heads and membership witnesses include the original placement
+winner bytes/revisions plus live/lifecycle projections. Replay translates retained legacy claims
+without fresh winners. No additional claim-drop rule is introduced.
 Repairing a retained member's selected claim refreshes its lifecycle dependency from
 unrepaired authority in the repair transaction, so incremental and replay witnesses agree.
 Local membership repair watermarks survive projection rebuilds but are excluded from

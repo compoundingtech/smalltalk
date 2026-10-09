@@ -38,6 +38,14 @@ test('recursive Glass layouts enforce child bounds and strict nested keys', asyn
     assert.throws(() => Rich.decodeUnknownSync(Rich.GlassLayout, 'strict')(extra));
 });
 
+test('placement migration is a strict typed arrangement operation', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const operation = { op: 'membership.migrate' };
+    const decoded = Rich.decodeUnknownSync(Rich.ArrangementOperation, 'strict')(operation);
+    assert.deepEqual(Schema.encodeSync(Rich.ArrangementOperation)(decoded), operation);
+    assert.throws(() => Rich.decodeUnknownSync(Rich.ArrangementOperation, 'strict')({ ...operation, version: 2 }));
+});
+
 test('nullable Work timing codecs equate missing and null while rejecting unsafe wire integers', async () => {
     const [{ DateTime, Duration, Option, Schema }, Rich] = await modules;
     const wire = {

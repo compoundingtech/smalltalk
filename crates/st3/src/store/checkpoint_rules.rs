@@ -29,7 +29,9 @@ use smallclaims::store::checkpoint_agreement::*;
 /// Version 13 retains status transitions selected by the reader after filtering stamped heartbeats.
 /// Version 14 covers ordered membership heads, live ordering, counters and lifecycle dependencies;
 /// it adds no drop rule and retains absent/hidden membership winners.
-pub const RULES_VERSION: u32 = 14;
+/// Version 15 includes winner-preserving legacy placement migration and its authority marker
+/// in the existing arrangement/membership witnesses; it adds no claim-drop rule.
+pub const RULES_VERSION: u32 = 15;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local

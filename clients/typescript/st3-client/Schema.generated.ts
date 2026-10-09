@@ -259,6 +259,7 @@ export const ArrangementOperation = /*#__PURE__*/ (() => Schema.Union([
   Schema.Struct({ "id": ArrangementFolderId, "key": ArrangementKey, "op": Schema.Literal("folder.move"), "parent": Schema.OptionFromNullOr(ArrangementFolderId) }),
   Schema.Struct({ "id": ArrangementFolderId, "op": Schema.Literal("folder.delete") }),
   Schema.Struct({ "folder": Schema.OptionFromNullOr(ArrangementFolderId), "key": ArrangementKey, "op": Schema.Literal("subject.place"), "subject": ArrangementSubject }),
+  Schema.Struct({ "op": Schema.Literal("membership.migrate") }),
   Schema.Struct({ "op": Schema.Literal("retire") })
 ], { mode: "oneOf" }).pipe(Schema.toTaggedUnion("op")).annotate({ identifier: "ArrangementOperation" }))()
 export type ArrangementOperation = typeof ArrangementOperation.Type

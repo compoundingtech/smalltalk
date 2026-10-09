@@ -322,6 +322,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn placement_migration_action_retry_returns_exact_receipt_and_explicit_v2() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "placement-migration-retry");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        let creation = request(&state, "migration-create", json!([
+            {"op":"create","name":"Sidebar"},
+            {"op":"subject.place","subject":"agent/missing/seat","folder":null,"key":"a0"}
+        ]));
+        let _ = action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session.clone()), Json(creation)).await.unwrap();
+        let migration = request(&state, "migration-cutover", json!([{"op":"membership.migrate"}]));
+        let first = action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session.clone()), Json(migration.clone())).await.unwrap().0;
+        let index = state.store.index().unwrap();
+        let second = action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session.clone()), Json(migration)).await.unwrap().0;
+        assert_eq!(first, second);
+        assert_eq!(state.store.index().unwrap(), index);
+        let resource = state.store.arrangement(SUBJECT, u64::MAX).unwrap().unwrap();
+        assert_eq!(resource["body"]["version"], 2);
+        assert!(resource["body"].get("placements").is_none());
+        let migration_claim = state.store.claim_by_id(first["arrangement_revision"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(migration_claim.actor.as_deref(), Some("person/ada"));
+        let error = action(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Extension(session), Json(request(&state, "migration-old-write", json!([
+                {"op":"subject.place","subject":"agent/missing/seat","folder":null,"key":"a9"}
+            ])))).await.unwrap_err();
+        assert_eq!(error.code, "invalid-arrangement-operations");
+        assert_eq!(state.store.index().unwrap(), index);
+    }
+
+    #[tokio::test]
     async fn arrangement_folder_race_and_validation_refusals_stay_typed() {
         use st3_client::ErrorCode;
         let root = tempfile::tempdir().unwrap();

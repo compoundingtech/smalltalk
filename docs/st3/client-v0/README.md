@@ -1431,9 +1431,10 @@ immutable person in the subject. Operations are tagged by `op`:
 | `folder.move` | `id`, `parent: null \| folder ID`, `key` |
 | `folder.delete` | `id` |
 | `subject.place` | `subject`, `folder: null \| folder ID`, `key` |
+| `membership.migrate` | none (existing identity, sole operation) |
 | `retire` | none |
 
-Each atomic edit may touch a register at most once; retirement must be its only operation.
+Each atomic edit may touch a register at most once; retirement or migration must be its only operation.
 
 Creation declares the name and may atomically include folders and placements. Null
 placement folders unfile subjects; changing the key reorders them. Include any necessary
@@ -1536,10 +1537,41 @@ upstream Fractal-specific importer.
 New arrangements opt into a folder-only body with `arrangement.edit` parameters
 `{subject, owner, version: 2, operations: [{op: "create", name}]}`. Version is accepted only
 on creation; omission creates v1. A v2 body retains the versioned name and folder registers
-but has no `placements`. Existing v1 bodies and `subject.place` behavior remain supported:
-this primitive does not migrate historical winners or convert an existing arrangement.
-If offline v1 and v2 creates collide on one identity, retained unrepaired v1 creation or
-placement authority preserves the v1 layout; the v2 pair records remain retained but inactive.
+but has no `placements`. Unmigrated v1 bodies and `subject.place` remain supported.
+If offline v1 and v2 creates collide on one unmigrated identity, retained unrepaired v1
+creation or placement authority preserves v1; v2 pairs remain retained but inactive.
+
+#### Migrating existing placement authority
+
+Discover granted capability `arrangement-placement-migration` version 1. Select the
+existing canonical arrangement identity before migrating (migration never creates or
+reselects an arrangement). Submit `arrangement.edit` with
+`{subject, owner, operations: [{op: "membership.migrate"}]}` and no `version` field.
+Migration must be the sole operation. Observe the same arrangement resource with
+`body.version: 2`; its owner, name, folder IDs, parents, keys and tombstones are unchanged.
+Each historical placement becomes a pair retaining the original claim revision,
+canonical winner and actor provenance, including retired and not-yet-known members.
+Migration writes a retained authority marker, not fresh placement winners.
+
+The marker and backfill commit in one writer transaction: an interrupted request leaves
+v1 intact or v2 fully active. Retry the exact action ID/idempotency key for its receipt.
+Independent migration reruns are harmless and do not overwrite subsequent pair edits.
+After cutover all placement readers/streams use the membership API below. V1-only
+strict readers receive an explicit v2 body without `placements`, not an empty v1 fallback.
+Local `subject.place` actions are refused with `invalid-arrangement-operations`.
+A racing local action either commits before cutover and is included, or is refused.
+Late replicated/offline v1 placement claims remain decodable and are routed into the
+same ordered pair LWW reducer using their original winners; they cannot revert to v1.
+Retained historical placement registers are replay-boundary sources only, never
+an active v2 read/write authority. Existing membership writes compete in that same reducer.
+
+Rules version 15 and shared projection identity
+`st3.shared-projections.arrangement-placement-migration.v1` distinguish migration-aware
+peers/checkpoint witnesses. Upgrade participating daemons before migrating or sealing
+new checkpoints; older daemons may quarantine the new operation. There is no new drop
+rule, irreversible claim rewrite or automatic binary rollback. Keep a pre-upgrade backup.
+
+#### Membership pages and actions
 
 Read `GET /v1/client/arrangements/{person_name}/{uuid}/memberships?person=person%2FNAME`.
 The response is an `OrderedMembershipPage`, with `collection: "ordered-memberships"` and

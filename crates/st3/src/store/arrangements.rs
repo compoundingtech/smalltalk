@@ -44,6 +44,7 @@ pub(super) fn project(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Res
     let mut writes = Vec::new();
     let mut legacy_authority = false;
     let mut created_v2 = false;
+    let mut migrating = false;
     for operation in operations {
         match operation {
             Operation::Create { name } => {
@@ -66,6 +67,10 @@ pub(super) fn project(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Res
                 writes.push((format!("placement/{subject}"), json!({"folder":folder,"key":key})));
             }
             Operation::Retire {} => { transaction.execute("UPDATE arrangements SET retired=1 WHERE subject=?1", [&claim.subject])?; }
+            Operation::MembershipMigrate {} => {
+                migrating = true;
+                writes.push(("membership-authority".into(), json!(true)));
+            }
         }
     }
     for (register,value) in writes {
@@ -81,6 +86,11 @@ pub(super) fn project(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Res
         // only an existing register leaves pure legacy projections unchanged.
         transaction.execute("UPDATE arrangement_registers SET value='1'
             WHERE subject=?1 AND register='version' AND value!='1'", [&claim.subject])?;
+    }
+    if migrating {
+        ordered_membership::backfill_legacy(transaction, &claim.subject, claim.store_index)?;
+    } else if legacy_authority {
+        ordered_membership::project_legacy_claim(transaction, claim)?;
     }
     ordered_membership::container_changed(transaction, &claim.subject, claim.store_index)?;
     Ok(())
@@ -160,8 +170,16 @@ fn retained_legacy_authority(connection: &Connection, subject: &str) -> Result<b
         [subject], |row| row.get(0),
     )?)
 }
+/// The retained authority marker is monotone, independent of create/version claim ordering.
+pub(super) fn migrated(connection: &Connection, subject: &str) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM arrangement_registers WHERE subject=?1 AND register='membership-authority')",
+        [subject], |row| row.get(0),
+    )?)
+}
 
 pub(super) fn version(connection: &Connection, subject: &str) -> Result<u8> {
+    if migrated(connection, subject)? { return Ok(2); }
     Ok(connection.query_row(
         "SELECT CAST(value AS INTEGER) FROM arrangement_registers WHERE subject=?1 AND register='version'",
         [subject], |row| row.get(0),
@@ -207,10 +225,11 @@ fn resource(subject: &str, owner: &str, revision: &str, time: u128, heads: &BTre
             && let Some(position) = heads.get(&format!("folder/{id}/position")) {
             folders.insert(id.into(),json!({"name":register(head),"position":register(position),"tombstone":heads.get(&format!("folder/{id}/tombstone")).map(register)}));
         }
-        if let Some(subject) = key.strip_prefix("placement/") { placements.insert(subject.into(),register(head)); }
+        if version == 1 && let Some(subject) = key.strip_prefix("placement/") { placements.insert(subject.into(),register(head)); }
     }
     let mut body = json!({"version":version,"name":register(heads.get("name").context("created arrangement name")?),"folders":folders});
-    let resolved = resolved(heads);
+    let resolved = if version == 1 { resolved(heads) }
+        else { json!({"parents":live_ancestors(heads).0,"folders":{}}) };
     if version == 1 { body["placements"] = json!(placements); }
     Ok(json!({"id":subject,"kind":"arrangement","owner":owner,"revision":revision,"deleted":false,
         "body":body,"resolved":resolved,
@@ -245,6 +264,7 @@ pub(super) fn prepare(transaction: &Transaction<'_>, input: &ClaimInput) -> Resu
         if count >= schema::MAX_ARRANGEMENTS { return Err(St3Error::new("arrangement-limit","at most 100 arrangements may be live locally")); }
     }
     if matches!(operations.as_slice(), [Operation::Retire {}]) { return Ok(()); }
+    if matches!(operations.as_slice(), [Operation::MembershipMigrate {}]) { return Ok(()); }
     let prepared_head = |value| (value, "0".repeat(64), Vec::new());
     let mut heads = heads(transaction,&input.subject).map_err(internal)?;
     let known_ids: BTreeSet<_> = heads.keys().filter_map(|key| key.strip_prefix("folder/").and_then(|tail| tail.split_once('/')).map(|(id,_)| id.to_owned())).collect();
@@ -289,12 +309,15 @@ pub(super) fn prepare(transaction: &Transaction<'_>, input: &ClaimInput) -> Resu
             }
         }
     }
-    let folders = heads.keys().filter(|k| k.starts_with("folder/") && k.ends_with("/name")).count();
-    let placements = heads.keys().filter(|k| k.starts_with("placement/")).count();
-    if folders > schema::MAX_FOLDERS || placements > schema::MAX_PLACEMENTS { return Err(St3Error::new("arrangement-limit","arrangement folder or placement count exceeds its admission bound")); }
     let layout_version = if creating {
         u8::try_from(input.fields.get("version").and_then(Value::as_u64).unwrap_or(1)).expect("validated arrangement version")
     } else { version(transaction, &input.subject).map_err(internal)? };
+    let folders = heads.keys().filter(|k| k.starts_with("folder/") && k.ends_with("/name")).count();
+    let legacy_placements_exceed_limit = layout_version == 1
+        && heads.keys().filter(|k| k.starts_with("placement/")).count() > schema::MAX_PLACEMENTS;
+    if folders > schema::MAX_FOLDERS || legacy_placements_exceed_limit {
+        return Err(St3Error::new("arrangement-limit","arrangement folder or placement count exceeds its admission bound"));
+    }
     let projected = resource(&input.subject, input.fields["owner"].as_str().expect("validated owner"), &"0".repeat(64), now_ms(), &heads, layout_version).map_err(internal)?;
     if serde_json::to_vec(&projected).map_err(internal)?.len() > schema::MAX_RESOURCE_BYTES { return Err(St3Error::new("arrangement-body-too-large","projected arrangement resource exceeds 512 KiB")); }
     Ok(())
