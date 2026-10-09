@@ -60,8 +60,16 @@ pub(super) async fn open(client: &Client, terminal: &Terminal<'_>) -> Result<Ope
 /// Why Fabric did not carry a terminal: the owner turned the incarnation down (a refusal, never
 /// worked around), or it could not be reached (the gateway can still carry it).
 enum Miss {
+    /// The owner answered and refused: an error, never a fallback.
     Refused(String),
+    /// Fabric could not reach this owner (no fleet or fabric, no peer, a failed or slow dial or
+    /// tunnel). True of every terminal it owns, so it is remembered for a while.
     Unavailable(String),
+    /// Fabric was not tried because it failed for this owner a moment ago. Not remembered anew.
+    Skipped(String),
+    /// This terminal cannot go over Fabric yet or for this person (no incarnation, a missing
+    /// grant), which says nothing about its owner, so nothing is remembered.
+    NotThisTerminal(String),
 }
 
 /// `open`, with the directory that holds this machine's fleet file.
@@ -121,7 +129,7 @@ async fn open_in(
                         ))),
                     }
                 }
-                None => Err(Miss::Unavailable(format!(
+                None => Err(Miss::NotThisTerminal(format!(
                     "st does not say which host runs `{}`",
                     terminal.subject
                 ))),
@@ -145,6 +153,12 @@ async fn open_in(
                         route: format!("via the daemon (Fabric: {reason})"),
                     })
                 }
+                (Err(Miss::Skipped(reason)), _) => Ok(Opened::UseGateway {
+                    route: format!("via the daemon (Fabric: {reason}, not tried again yet)"),
+                }),
+                (Err(Miss::NotThisTerminal(reason)), _) => Ok(Opened::UseGateway {
+                    route: format!("via the daemon (Fabric: {reason})"),
+                }),
                 (Ok(_), None) => unreachable!("a Fabric stream needs an owner"),
             }
         }
@@ -190,11 +204,11 @@ async fn over_fabric(
     state_dir: Option<&Path>,
 ) -> Result<UnixStream, Miss> {
     if let Some(reason) = recently_unavailable(owner) {
-        return Err(Miss::Unavailable(format!("{reason}, not tried again yet")));
+        return Err(Miss::Skipped(reason));
     }
     if terminal.name.is_empty() || terminal.incarnation.is_empty() {
-        return Err(Miss::Unavailable(format!(
-            "st has no running terminal for `{}` on {owner}",
+        return Err(Miss::NotThisTerminal(format!(
+            "st has no running terminal for `{}` on {owner} yet",
             terminal.subject
         )));
     }
@@ -203,12 +217,12 @@ async fn over_fabric(
     let capabilities = client
         .capabilities()
         .await
-        .map_err(|error| Miss::Unavailable(error.plain()))?;
+        .map_err(|error| Miss::NotThisTerminal(error.plain()))?;
     for scope in ["terminal.read", "terminal.control"] {
         if !capabilities.value.capabilities.iter().any(|capability| {
             capability.id == scope && capability.state == st3_client::CapabilityState::Granted
         }) {
-            return Err(Miss::Unavailable(format!(
+            return Err(Miss::NotThisTerminal(format!(
                 "st does not grant you `{scope}` for a direct attachment"
             )));
         }
@@ -855,14 +869,58 @@ mod tests {
         let second = open_in(&client, &remote(Some("owner-down"), &incarnation), Some(&state_dir))
             .await
             .unwrap();
-        let Opened::UseGateway { route } = second else {
+        let Opened::UseGateway { route: skipped } = second else {
             panic!("still the daemon")
         };
-        assert!(route.contains("not tried again yet"), "{route}");
+        assert!(skipped.contains("not tried again yet"), "{skipped}");
         assert_eq!(
             std::fs::read_to_string(root.path().join("fabric-calls")).unwrap(),
             calls_before,
             "Fabric is not asked again"
+        );
+        // A skipped attach neither extends the window nor grows the route text: only a real
+        // attempt is remembered, and never in its decorated form.
+        let remembered = |owner: &str| {
+            FABRIC_UNAVAILABLE
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|table| table.get(owner).cloned())
+                .expect("remembered")
+        };
+        let (at, reason) = remembered("owner-down");
+        assert!(!reason.contains("not tried again yet"), "{reason}");
+        let third = open_in(&client, &remote(Some("owner-down"), &incarnation), Some(&state_dir))
+            .await
+            .unwrap();
+        let Opened::UseGateway { route: again } = third else {
+            panic!("still the daemon")
+        };
+        assert_eq!(again, skipped, "the route text does not grow");
+        assert_eq!(remembered("owner-down"), (at, reason), "the window is not extended");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_not_yet_running_does_not_mark_its_owner_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        let (client, server, _) = remote_fixture(root.path(), "owner-starting", true).await;
+
+        let starting = open_in(
+            &client,
+            &remote(Some("owner-starting"), ""),
+            Some(&root.path().join("state/st3")),
+        )
+        .await
+        .unwrap();
+
+        let Opened::UseGateway { route } = starting else {
+            panic!("a terminal with no incarnation yet goes through the daemon")
+        };
+        assert!(route.contains("yet"), "{route}");
+        assert!(
+            recently_unavailable("owner-starting").is_none(),
+            "one terminal that is not up yet says nothing about its owner"
         );
         server.abort();
     }
