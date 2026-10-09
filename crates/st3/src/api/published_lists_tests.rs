@@ -21,6 +21,11 @@ impl Clock {
     }
 }
 
+/// The tests' starting time: now, since the store stamps some times with the wall clock.
+fn start_time() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+}
+
 impl Drop for Clock {
     fn drop(&mut self) {
         set_thread_clock(None);
@@ -114,15 +119,24 @@ fn rows(publication: &Publication<MissionRows>) -> (Vec<String>, BTreeMap<String
 
 /// Fold from `base`, check the publication against the oracle and a fold from nothing, and
 /// return it with whether any row changed.
-fn fold(store: &Store, base: Option<Publication<MissionRows>>) -> (Publication<MissionRows>, bool) {
+/// Fold the store's missions list as its refresher does, from its newest publication unless
+/// the projections were replaced since.
+fn fold(store: &Store) -> (Arc<Publication<MissionRows>>, bool) {
+    let list = store.published_missions_list();
+    list.start("missions");
     let now = now_ms();
-    let (publication, changed) = match fold_missions(store, base.as_ref(), now).unwrap() {
-        Some(folded) => folded,
-        None => (base.expect("a current publication is the base"), false),
+    let base = list.base();
+    let changed = match fold_missions(store, base.as_deref(), now).unwrap() {
+        Some((publication, changed)) => {
+            list.publish(publication, 0);
+            changed
+        }
+        None => false,
     };
+    let publication = list.newest().expect("a published list");
     assert_eq!(publication.cut, store.index().unwrap(), "published at the current cut");
     let expected = oracle(store);
-    assert_eq!(rows(&publication), expected, "the published rows are the direct fold's");
+    assert_eq!(rows(&*publication), expected, "the published rows are the direct fold's");
     let (fresh, _) = fold_missions(store, None, now).unwrap().unwrap();
     assert_eq!(rows(&fresh), expected, "a fold from nothing agrees");
     // Every window a socket holds is the direct read's, including its bound and continuation.
@@ -144,7 +158,7 @@ fn fold(store: &Store, base: Option<Publication<MissionRows>>) -> (Publication<M
 
 #[test]
 fn published_missions_match_the_direct_fold_through_work_leases_failure_and_retirement() {
-    let clock = Clock::at(1_800_000_000_000);
+    let clock = Clock::at(start_time());
     let root = tempfile::tempdir().unwrap();
     let store = Store::open(&root.path().join("graph.db"), "cedar").unwrap();
     for name in ["garden/alpha", "garden/beta", "garden/gamma"] {
@@ -152,27 +166,27 @@ fn published_missions_match_the_direct_fold_through_work_leases_failure_and_reti
     }
     let alpha = start(&store, "garden/alpha", "alpha-1");
     let beta = start(&store, "garden/beta", "beta-1");
-    let (publication, _) = fold(&store, None);
+    let (publication, _) = fold(&store);
     assert_eq!(publication.rows.order.len(), 3);
 
     // Nothing changed: the publication stays current and no window rereads.
-    let (publication, changed) = fold(&store, Some(publication));
+    let (_, changed) = fold(&store);
     assert!(!changed);
 
     // A claim and progress refold only the claimed run's mission.
     let (plant, ash) = step(&alpha, "plant");
     store.set_step_state(&plant, "ready", None).unwrap();
     act(&store, &plant, &ash, "claim", "claim-plant");
-    let (publication, changed) = fold(&store, Some(publication));
+    let (_, changed) = fold(&store);
     assert!(changed);
     act(&store, &plant, &ash, "progress", "progress-plant");
-    let (publication, _) = fold(&store, Some(publication));
+    let (publication, _) = fold(&store);
 
     // The lease ends with no new claim: the card shows the step ready again.
     let lease = store.next_lease_end(now_ms()).unwrap().expect("the claim holds a lease");
     assert_eq!(publication.valid_until_unix_ms.map(|until| until <= lease), Some(true));
     clock.set(lease + 1);
-    let (publication, changed) = fold(&store, Some(publication));
+    let (_, changed) = fold(&store);
     assert!(changed, "the expired lease refolds alpha");
 
     // A failed step fails the run; the mission stays listed while recently ended, then leaves.
@@ -180,21 +194,21 @@ fn published_missions_match_the_direct_fold_through_work_leases_failure_and_reti
     store.set_step_state(&water, "ready", None).unwrap();
     act(&store, &water, &birch, "claim", "claim-water");
     act(&store, &water, &birch, "fail", "fail-water");
-    let (publication, _) = fold(&store, Some(publication));
+    fold(&store);
     // Retrying the only failed step reopens the run.
     store.retry_failed_step(&water, "person/operator", "try again", "retry-water").unwrap();
-    let (publication, _) = fold(&store, Some(publication));
+    fold(&store);
     store.set_mission_run_state(&beta.id, "cancelled", "terminal", Some("no longer needed")).unwrap();
-    let (publication, _) = fold(&store, Some(publication));
+    let (publication, _) = fold(&store);
     assert!(publication.rows.order.iter().any(|id| id.ends_with("garden/beta")));
     let until = publication.rows.visible_until().expect("beta leaves the list");
     assert_eq!(publication.valid_until_unix_ms.map(|valid| valid <= until), Some(true));
     clock.set(until - 1);
-    let (publication, changed) = fold(&store, Some(publication));
+    let (publication, changed) = fold(&store);
     assert!(!changed, "still recently ended");
     assert!(publication.rows.order.iter().any(|id| id.ends_with("garden/beta")));
     clock.set(until);
-    let (publication, changed) = fold(&store, Some(publication));
+    let (publication, changed) = fold(&store);
     assert!(changed);
     assert!(!publication.rows.order.iter().any(|id| id.ends_with("garden/beta")));
 
@@ -211,19 +225,19 @@ fn published_missions_match_the_direct_fold_through_work_leases_failure_and_reti
             idempotency_key: "rejected".into(),
         })
         .is_err());
-    let (publication, _) = fold(&store, Some(publication));
+    let (publication, _) = fold(&store);
     assert!(!publication.rows.order.iter().any(|id| id.ends_with("garden/gamma")));
 
     // Reopened, the store's first fold is the same list.
     drop(store);
     let store = Store::open(&root.path().join("graph.db"), "cedar").unwrap();
-    let (reopened, _) = fold(&store, None);
-    assert_eq!(rows(&reopened), rows(&publication));
+    let (reopened, _) = fold(&store);
+    assert_eq!(rows(&*reopened), rows(&*publication));
 }
 
 #[test]
 fn published_missions_follow_replication_in_any_order_and_fold_from_nothing_after_a_trim() {
-    let _clock = Clock::at(1_800_000_000_000);
+    let _clock = Clock::at(start_time());
     let source = Store::open_memory("cedar").unwrap();
     for name in ["garden/alpha", "garden/beta"] {
         mission(&source, name);
@@ -241,7 +255,7 @@ fn published_missions_follow_replication_in_any_order_and_fold_from_nothing_afte
     for reverse in [false, true] {
         let target = Store::open_memory("alder").unwrap();
         mission(&target, "garden/local");
-        let (publication, _) = fold(&target, None);
+        fold(&target);
         let mut permuted = exchange.clone();
         if reverse {
             permuted.envelopes.reverse();
@@ -252,7 +266,7 @@ fn published_missions_follow_replication_in_any_order_and_fold_from_nothing_afte
         target.apply_replication_repairs().unwrap();
         let projected = target.project_replication_backlog().unwrap();
         assert!(projected);
-        let (publication, _) = fold(&target, Some(publication));
+        let (publication, _) = fold(&target);
         assert_eq!(publication.rows.order.len(), 3, "{reverse}");
     }
 
@@ -260,16 +274,15 @@ fn published_missions_follow_replication_in_any_order_and_fold_from_nothing_afte
     let store = Store::open_memory("cedar").unwrap();
     mission(&store, "garden/alpha");
     start(&store, "garden/alpha", "alpha-1");
-    let list = store.published_missions_list();
-    list.start("missions");
-    let (publication, _) = fold(&store, None);
-    list.publish(publication, 0);
+    fold(&store);
+    let before = store.published_missions_list().rebuilds()["start"];
     let plan = crate::store::plan_drops(&store.checkpoint_sealed_set(now_ms() + 1_000).unwrap());
     store
         .apply_checkpoint_drop("checkpoint/garden", &plan.envelopes, &plan.claims)
         .unwrap();
-    assert!(list.base().is_none(), "forgotten after the trim");
-    fold(&store, None);
+    fold(&store);
+    // One fold from nothing for the trim, and the check's own.
+    assert_eq!(store.published_missions_list().rebuilds()["start"], before + 2, "the trim folds from nothing");
 }
 
 /// The actors whose work windows the parity checks read, besides the unfiltered one.
@@ -289,11 +302,20 @@ fn work_oracle(store: &Store, time: u128, actor: Option<&str>, limit: usize) -> 
 
 /// Fold the work list from `base`, check every actor's window against the direct read and a
 /// fold from nothing, and return it with whether any row changed.
-fn fold_work_checked(store: &Store, base: Option<Publication<WorkRows>>) -> (Publication<WorkRows>, bool) {
-    let (publication, changed) = match fold_work(store, base.as_ref(), now_ms()).unwrap() {
-        Some(folded) => folded,
-        None => (base.expect("a current publication is the base"), false),
+/// Fold the store's work list as its refresher does, from its newest publication unless the
+/// projections were replaced since.
+fn fold_work_checked(store: &Store) -> (Arc<Publication<WorkRows>>, bool) {
+    let list = store.published_work_list();
+    list.start("work");
+    let base = list.base();
+    let changed = match fold_work(store, base.as_deref(), now_ms()).unwrap() {
+        Some((publication, changed)) => {
+            list.publish(publication, 0);
+            changed
+        }
+        None => false,
     };
+    let publication = list.newest().expect("a published list");
     assert_eq!(publication.cut, store.index().unwrap(), "published at the current cut");
     let time = publication.rows.time_unix_ms;
     assert!(time >= store.projection_time_at(publication.cut).unwrap());
@@ -314,7 +336,8 @@ fn fold_work_checked(store: &Store, base: Option<Publication<WorkRows>>) -> (Pub
 
 #[test]
 fn published_work_matches_the_direct_read_for_every_actor_as_time_passes() {
-    let clock = Clock::at(1_800_000_000_000);
+    let started = start_time();
+    let clock = Clock::at(started);
     let root = tempfile::tempdir().unwrap();
     let store = Store::open(&root.path().join("graph.db"), "cedar").unwrap();
     for name in ["garden/alpha", "garden/beta"] {
@@ -327,52 +350,69 @@ fn published_work_matches_the_direct_read_for_every_actor_as_time_passes() {
             store.set_step_state(&step(run, path).0, "ready", None).unwrap();
         }
     }
-    let (publication, _) = fold_work_checked(&store, None);
+    let (publication, _) = fold_work_checked(&store);
     assert_eq!(publication.rows.order.len(), 4);
-    let (publication, changed) = fold_work_checked(&store, Some(publication));
+    let (_, changed) = fold_work_checked(&store);
     assert!(!changed, "nothing changed");
 
     // A claim starts the step's execution time, which grows with the list's time while
     // unrelated claims move the cut.
     let (plant, ash) = step(&alpha, "plant");
     act(&store, &plant, &ash, "claim", "claim-plant");
-    let (mut publication, _) = fold_work_checked(&store, Some(publication));
+    fold_work_checked(&store);
     for minute in 1..=3 {
-        clock.set(1_800_000_000_000 + minute * 60_000);
+        clock.set(started + minute * 60_000);
         mission(&store, &format!("garden/filler-{minute}"));
-        let (next, changed) = fold_work_checked(&store, Some(publication));
+        let (_, changed) = fold_work_checked(&store);
         assert!(changed, "the running step's time moved");
-        publication = next;
     }
     act(&store, &plant, &ash, "progress", "progress-plant");
-    let (publication, _) = fold_work_checked(&store, Some(publication));
+    fold_work_checked(&store);
+
+    // A quiet renewal moves the lease with no claim; the next fold still shows it.
+    clock.set(started + 4 * 60_000);
+    let before = store.index().unwrap();
+    store
+        .work_action(&plant, "renew", &WorkRequest {
+            actor: Some(ash.clone()),
+            incarnation: Some(format!("{ash}-1")),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: "renew-plant-quietly".into(),
+        })
+        .unwrap();
+    assert_eq!(store.index().unwrap(), before, "the renewal appended no claim");
+    mission(&store, "garden/after-renewal");
+    let (_, changed) = fold_work_checked(&store);
+    assert!(changed);
 
     // The lease ends: once the list's time passes it, the step is ready again.
     let lease = store.next_lease_end(0).unwrap().expect("the claim holds a lease");
     clock.set(lease + 1);
     mission(&store, "garden/after-lease");
-    let (publication, changed) = fold_work_checked(&store, Some(publication));
+    let (_, changed) = fold_work_checked(&store);
     assert!(changed);
 
     // Another seat claims and submits; a cancelled run's work leaves the list.
     let (water, birch) = step(&beta, "water");
     act(&store, &water, &birch, "claim", "claim-water");
     act(&store, &water, &birch, "submit", "submit-water");
-    let (publication, _) = fold_work_checked(&store, Some(publication));
+    fold_work_checked(&store);
     store.set_mission_run_state(&beta.id, "cancelled", "terminal", Some("no longer needed")).unwrap();
-    let (publication, _) = fold_work_checked(&store, Some(publication));
+    let (publication, _) = fold_work_checked(&store);
     assert!(beta.steps.iter().all(|step| !publication.rows.rows.contains_key(&step.subject)));
 
     // Reopened, the store's first fold is the same list.
     drop(store);
     let store = Store::open(&root.path().join("graph.db"), "cedar").unwrap();
-    let (reopened, _) = fold_work_checked(&store, None);
+    let (reopened, _) = fold_work_checked(&store);
     assert_eq!(reopened.rows.order, publication.rows.order);
 }
 
 #[test]
 fn published_work_follows_replication_in_any_order_and_folds_from_nothing_after_a_trim() {
-    let _clock = Clock::at(1_800_000_000_000);
+    let _clock = Clock::at(start_time());
     let source = Store::open_memory("cedar").unwrap();
     mission(&source, "garden/alpha");
     let alpha = start(&source, "garden/alpha", "alpha-1");
@@ -386,7 +426,7 @@ fn published_work_follows_replication_in_any_order_and_folds_from_nothing_after_
         mission(&target, "garden/local");
         let local = start(&target, "garden/local", "local-1");
         target.set_step_state(&step(&local, "plant").0, "ready", None).unwrap();
-        let (publication, _) = fold_work_checked(&target, None);
+        fold_work_checked(&target);
         let mut permuted = exchange.clone();
         if reverse {
             permuted.envelopes.reverse();
@@ -396,7 +436,7 @@ fn published_work_follows_replication_in_any_order_and_folds_from_nothing_after_
         target.validate_replication_backlog().unwrap();
         target.apply_replication_repairs().unwrap();
         assert!(target.project_replication_backlog().unwrap());
-        let (publication, _) = fold_work_checked(&target, Some(publication));
+        let (publication, _) = fold_work_checked(&target);
         assert!(publication.rows.rows.contains_key(&plant), "{reverse}");
     }
 
@@ -404,12 +444,11 @@ fn published_work_follows_replication_in_any_order_and_folds_from_nothing_after_
     mission(&store, "garden/alpha");
     let alpha = start(&store, "garden/alpha", "alpha-1");
     store.set_step_state(&step(&alpha, "plant").0, "ready", None).unwrap();
-    let list = store.published_work_list();
-    list.start("work");
-    let (publication, _) = fold_work_checked(&store, None);
-    list.publish(publication, 0);
+    fold_work_checked(&store);
+    let before = store.published_work_list().rebuilds()["start"];
     let plan = crate::store::plan_drops(&store.checkpoint_sealed_set(now_ms() + 1_000).unwrap());
     store.apply_checkpoint_drop("checkpoint/garden", &plan.envelopes, &plan.claims).unwrap();
-    assert!(list.base().is_none(), "forgotten after the trim");
-    fold_work_checked(&store, None);
+    fold_work_checked(&store);
+    // One fold from nothing for the trim, and the check's own.
+    assert_eq!(store.published_work_list().rebuilds()["start"], before + 2, "the trim folds from nothing");
 }

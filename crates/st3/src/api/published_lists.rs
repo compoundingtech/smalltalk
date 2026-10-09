@@ -439,6 +439,7 @@ fn refold_work(
     let subjects = views.iter().map(|view| view.subject.clone()).collect::<Vec<_>>();
     let desired = store.desired_subjects_for_owner_steps(&subjects)?;
     let values = client_work_values(store, views.clone(), &desired, cut)?;
+    let leases = store.work_leases()?;
     for step in steps {
         rows.rows.remove(step);
     }
@@ -449,9 +450,20 @@ fn refold_work(
         }
     }
     for (view, value) in views.into_iter().zip(values) {
+        let timing_lease_unix_ms = if running(&view) {
+            store.step_timing_lease(&view.subject, view.attempt, time)?
+        } else {
+            None
+        };
         rows.rows.insert(
             view.subject.clone(),
-            Arc::new(WorkRow { view: Arc::new(view), value: Arc::new(value), time_unix_ms: time }),
+            Arc::new(WorkRow {
+                lease_unix_ms: leases.get(&view.subject).copied(),
+                timing_lease_unix_ms,
+                view: Arc::new(view),
+                value: Arc::new(value),
+                time_unix_ms: time,
+            }),
         );
     }
     Ok(())
@@ -463,20 +475,28 @@ fn running(view: &crate::model::StepRunView) -> bool {
 }
 
 /// Bring every running step's execution time to `time`: with no new claim about it, a running
-/// step's elapsed time grows with the list's time until its lease ends, and a lease that ends
-/// refolds the step. Says whether any row changed.
+/// step's elapsed time grows with the list's time up to the lease its claims named, and passing
+/// that lease refolds the step. Says whether any row changed.
 fn retime_work(rows: &mut WorkRows, time: u128) -> bool {
     let mut changed = false;
     for row in rows.rows.values_mut() {
         if row.time_unix_ms >= time || !running(&row.view) {
             continue;
         }
+        let bound = |at: u128| row.timing_lease_unix_ms.map_or(at, |lease| at.min(lease));
+        let grown = bound(time).saturating_sub(bound(row.time_unix_ms));
         let mut view = (*row.view).clone();
-        view.execution_elapsed_ms = view.execution_elapsed_ms.saturating_add(time - row.time_unix_ms);
+        view.execution_elapsed_ms = view.execution_elapsed_ms.saturating_add(grown);
         let mut value = (*row.value).clone();
         value["execution_elapsed_ms"] = json!(view.execution_elapsed_ms);
-        *row = Arc::new(WorkRow { view: Arc::new(view), value: Arc::new(value), time_unix_ms: time });
-        changed = true;
+        changed |= grown > 0;
+        *row = Arc::new(WorkRow {
+            view: Arc::new(view),
+            value: Arc::new(value),
+            time_unix_ms: time,
+            lease_unix_ms: row.lease_unix_ms,
+            timing_lease_unix_ms: row.timing_lease_unix_ms,
+        });
     }
     changed
 }
@@ -493,6 +513,13 @@ fn work_since(store: &Store, base: &Publication<WorkRows>) -> anyhow::Result<Adv
         let mut steps = store.work_list_changes(base.cut, cut, &rows.seats)?;
         // Leases that ended by the new time show their steps ready again.
         steps.extend(store.steps_with_leases_ended(rows.time_unix_ms, time)?);
+        // A quiet renewal moves a lease with no claim; a running step whose claims' lease
+        // passed stops its execution time.
+        let leases = store.work_leases()?;
+        steps.extend(rows.rows.iter().filter(|(step, row)| {
+            row.lease_unix_ms != leases.get(*step).copied()
+                || row.timing_lease_unix_ms.is_some_and(|lease| lease > rows.time_unix_ms && lease <= time)
+        }).map(|(step, _)| step.clone()));
         if steps.len() > FOLD_CHUNK {
             return Ok(Advance::TooMany(WorkPlan { cut, time, steps }));
         }

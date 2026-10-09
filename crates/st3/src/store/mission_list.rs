@@ -20,7 +20,7 @@ pub(crate) struct MissionKey {
 /// One publication of the current missions list.
 #[derive(Clone, Default)]
 pub(crate) struct MissionRows {
-    /// Every mission the store knows, shown or not.
+    /// Every mission the store knows, shown or not, by its `mission/` ID.
     pub(crate) keys: HashMap<String, MissionKey>,
     /// The shown missions, in list order.
     pub(crate) order: Vec<String>,
@@ -171,7 +171,12 @@ impl Store {
         };
         let rows = match selected {
             Some(selected) => statement
-                .query_map([serde_json::to_string(selected)?], read)?
+                .query_map(
+                    [serde_json::to_string(
+                        &selected.iter().map(|id| id.trim_start_matches("mission/")).collect::<Vec<_>>(),
+                    )?],
+                    read,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?,
             None => statement.query_map([], read)?.collect::<rusqlite::Result<Vec<_>>>()?,
         };
@@ -191,7 +196,7 @@ impl Store {
             let recently_ended = ended && latest_updated.is_some_and(|updated| updated as i128 >= ended_since as i128);
             let shown = !system_mission(&id) && (open || recently_ended);
             keys.insert(
-                id,
+                format!("mission/{id}"),
                 MissionKey {
                     order,
                     page_time: page_time.parse().unwrap_or(0),
@@ -228,8 +233,8 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (subject, kind, origin) in claims {
             changes.attention |= !ATTENTION_NEUTRAL_KINDS.contains(&kind.as_str());
-            if let Some(mission) = subject.strip_prefix("mission/") {
-                changes.missions.insert(mission.to_owned());
+            if subject.starts_with("mission/") {
+                changes.missions.insert(subject.clone());
             } else if let Some(run) = subject.strip_prefix("mission-run/") {
                 runs.insert(run.to_owned());
                 // A root run's state ends the steps of every run under it.
@@ -278,7 +283,7 @@ impl Store {
             let mut owner = connection.prepare_cached("SELECT mission_id FROM mission_runs WHERE id=?1")?;
             for run in &runs {
                 if let Some(mission) = owner.query_row([run], |row| row.get::<_, String>(0)).optional()? {
-                    changes.missions.insert(mission);
+                    changes.missions.insert(format!("mission/{mission}"));
                 }
             }
         }
@@ -290,7 +295,7 @@ impl Store {
     pub(crate) fn missions_with_leases_ended(&self, after: u128, through: u128) -> Result<BTreeSet<String>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare_cached(
-            "SELECT DISTINCT r.mission_id FROM step_runs s INDEXED BY step_runs_lease_index
+            "SELECT DISTINCT 'mission/' || r.mission_id FROM step_runs s INDEXED BY step_runs_lease_index
              JOIN mission_runs r ON r.id=s.run_id
              WHERE s.lease_owner IS NOT NULL
                AND CAST(s.lease_expires_at_unix_ms AS INTEGER)>?1
@@ -329,7 +334,7 @@ impl Store {
         for run in runs {
             let run = run.strip_prefix("mission-run/").unwrap_or(run);
             if let Some(mission) = owner.query_row([run], |row| row.get::<_, String>(0)).optional()? {
-                missions.insert(mission);
+                missions.insert(format!("mission/{mission}"));
             }
         }
         Ok(missions)

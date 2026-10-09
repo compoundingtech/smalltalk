@@ -12,6 +12,10 @@ pub(crate) struct WorkRow {
     pub(crate) value: Arc<Value>,
     /// The list time the row was folded or re-timed at.
     pub(crate) time_unix_ms: u128,
+    /// The step's worker lease when folded. A quiet renewal moves it without a claim.
+    pub(crate) lease_unix_ms: Option<u128>,
+    /// For a running step, the lease its claims last named, which bounds its execution time.
+    pub(crate) timing_lease_unix_ms: Option<u128>,
 }
 
 /// One publication of the current work list.
@@ -178,6 +182,26 @@ impl Store {
         Ok(steps)
     }
 
+    /// Every step that holds a worker lease, with the lease's end: few, by the lease index.
+    pub(crate) fn work_leases(&self) -> Result<HashMap<String, u128>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, CAST(lease_expires_at_unix_ms AS INTEGER) FROM step_runs
+             INDEXED BY step_runs_lease_index
+             WHERE lease_owner IS NOT NULL AND lease_expires_at_unix_ms IS NOT NULL",
+        )?;
+        let leases = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.max(0) as u128)))?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+        Ok(leases)
+    }
+
+    /// The lease `subject`'s claims last named for the open execution interval of `attempt` at
+    /// `at`, when one is open.
+    pub(crate) fn step_timing_lease(&self, subject: &str, attempt: u32, at: u128) -> Result<Option<u128>> {
+        Ok(step_timing_lease_at(&self.readers.get(), subject, attempt, at)?)
+    }
+
     /// The published work list, while a refresher keeps one.
     pub(crate) fn published_work(&self) -> Option<Arc<published_list::Publication<WorkRows>>> {
         self.smalltalk.published_work.newest()
@@ -204,13 +228,21 @@ mod tests {
         ] {
             let mut view: StepRunView = serde_json::from_value(json!({
                 "subject": subject, "run": "mission-run/r", "generation": "run-generation/g",
-                "definition": "d", "step": step, "status": status, "attempt": 1,
+                "definition_hash": "d", "step": step, "status": status, "attempt": 1,
+                "agentless": false, "worker_reported": false, "readiness_epoch": 0,
+                "created_at_unix_ms": 0, "updated_at_unix_ms": 0,
             }))
             .unwrap();
             view.readiness_epoch = epoch;
             rows.rows.insert(
                 subject.into(),
-                Arc::new(WorkRow { view: Arc::new(view), value: Arc::new(Value::Null), time_unix_ms: 0 }),
+                Arc::new(WorkRow {
+                    view: Arc::new(view),
+                    value: Arc::new(Value::Null),
+                    time_unix_ms: 0,
+                    lease_unix_ms: None,
+                    timing_lease_unix_ms: None,
+                }),
             );
         }
         rows.sort();

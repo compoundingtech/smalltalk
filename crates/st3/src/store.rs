@@ -31484,6 +31484,33 @@ fn step_execution_timing_at(
     snapshot_unix_ms: u128,
     currently_active: bool,
 ) -> rusqlite::Result<(Option<u128>, u128)> {
+    Ok(fold_step_timing(
+        &step_timing_events(connection, subject)?,
+        attempt,
+        snapshot_unix_ms,
+        currently_active,
+    ))
+}
+
+/// The lease that bounds the open execution interval of `subject`'s `attempt` as of
+/// `snapshot_unix_ms`, as its claims last named it, when an interval is open under one. A
+/// quiet renewal moves the step's lease without a claim, never this one.
+pub(crate) fn step_timing_lease_at(
+    connection: &Connection,
+    subject: &str,
+    attempt: u32,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<Option<u128>> {
+    let (started, _, lease) =
+        fold_step_timing_open(&step_timing_events(connection, subject)?, attempt, snapshot_unix_ms);
+    Ok(started.and(lease))
+}
+
+/// A step's step and work events in canonical order, as its execution timing folds them.
+fn step_timing_events(
+    connection: &Connection,
+    subject: &str,
+) -> rusqlite::Result<Vec<(String, Value, u128)>> {
     let mut statement = connection.prepare(&canonical_sql(
         "SELECT claims.kind, claims.body, claims.accepted_at_unix_ms
          FROM claims JOIN batches ON batches.id=claims.batch_id
@@ -31501,8 +31528,7 @@ fn step_execution_timing_at(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let events = events
+    Ok(events
         .into_iter()
         .map(|(kind, body, accepted)| {
             (
@@ -31511,13 +31537,7 @@ fn step_execution_timing_at(
                 accepted.parse::<u128>().unwrap_or(0),
             )
         })
-        .collect::<Vec<_>>();
-    Ok(fold_step_timing(
-        &events,
-        attempt,
-        snapshot_unix_ms,
-        currently_active,
-    ))
+        .collect())
 }
 
 /// Fold a step's execution timing from its step and work events in canonical order: the active
@@ -31530,6 +31550,29 @@ pub(crate) fn fold_step_timing(
     snapshot_unix_ms: u128,
     currently_active: bool,
 ) -> (Option<u128>, u128) {
+    let (mut started, mut elapsed, lease_expires) =
+        fold_step_timing_open(events, attempt, snapshot_unix_ms);
+    if let Some(interval_start) = started {
+        let interval_end =
+            lease_expires.map_or(snapshot_unix_ms, |expiry| snapshot_unix_ms.min(expiry));
+        let expired = lease_expires.is_some_and(|expiry| expiry <= snapshot_unix_ms);
+        if expired || currently_active {
+            elapsed = elapsed.saturating_add(interval_end.saturating_sub(interval_start));
+        }
+        if expired || !currently_active {
+            started = None;
+        }
+    }
+    (started, elapsed)
+}
+
+/// [`fold_step_timing`]'s events folded up to `snapshot_unix_ms`: the open interval's start,
+/// if any, the time elapsed in closed intervals, and the lease the claims last named.
+fn fold_step_timing_open(
+    events: &[(String, Value, u128)],
+    attempt: u32,
+    snapshot_unix_ms: u128,
+) -> (Option<u128>, u128, Option<u128>) {
     let mut elapsed = 0_u128;
     let mut started = None;
     let mut lease_expires = None;
@@ -31627,19 +31670,7 @@ pub(crate) fn fold_step_timing(
             _ => {}
         }
     }
-
-    if let Some(interval_start) = started {
-        let interval_end =
-            lease_expires.map_or(snapshot_unix_ms, |expiry| snapshot_unix_ms.min(expiry));
-        let expired = lease_expires.is_some_and(|expiry| expiry <= snapshot_unix_ms);
-        if expired || currently_active {
-            elapsed = elapsed.saturating_add(interval_end.saturating_sub(interval_start));
-        }
-        if expired || !currently_active {
-            started = None;
-        }
-    }
-    (started, elapsed)
+    (started, elapsed, lease_expires)
 }
 
 fn apply_effective_step_state(
