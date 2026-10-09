@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep unrelated execution intervals out of daily Namespace usage and retain invalid-evidence reports.",
+  "replay": {
+    "status": "none",
+    "detail": "CI metadata summary only; no runtime, database or resource-policy change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI metadata summary only; no runtime, database or resource-policy change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI metadata summary only; no runtime, database or resource-policy change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI metadata summary only; no runtime, database or resource-policy change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI metadata summary only; no runtime, database or resource-policy change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "CI metadata summary only; no runtime, database or resource-policy change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "CI metadata summary only; no runtime, database or resource-policy change."
+  }
+}
