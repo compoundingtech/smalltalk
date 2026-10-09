@@ -5117,14 +5117,19 @@ fn managed_claude_transcript(
     // provider's binding can survive a restart, so it counts only when it names the same
     // provider incarnation as the seat's current observation; neither its presence nor the
     // newest transcript in a workspace is sufficient.
-    let hook_binding = std::fs::read(directory.join("claude-native-session"))
+    let hook_record = std::fs::read(directory.join("claude-native-session"))
         .ok()
         .and_then(|binding| serde_json::from_slice::<Value>(&binding).ok())
-        .and_then(|binding| {
-            (binding["incarnation"].as_str() == Some(evidence))
-                .then(|| binding["native_session_id"].as_str().map(str::to_owned))
-                .flatten()
-        });
+        .filter(|binding| binding["incarnation"].as_str() == Some(evidence));
+    let hook_binding = hook_record
+        .as_ref()
+        .and_then(|binding| binding["native_session_id"].as_str().map(str::to_owned));
+    // The path Claude gave the hook is where this session's transcript really is, on whatever
+    // login the seat runs: `~/.claude` or any account's `CLAUDE_CONFIG_DIR`.
+    let recorded_path = hook_record
+        .as_ref()
+        .and_then(|binding| binding["transcript_path"].as_str())
+        .map(std::path::PathBuf::from);
     let native_id = match hook_binding {
         Some(native_id) => native_id,
         // Without the hook, prove the session from the live processes instead; see
@@ -5134,11 +5139,35 @@ fn managed_claude_transcript(
             format!("the SessionStart hook did not bind this incarnation, and {reason}")
         })?,
     };
-    match crate::external_sessions::find_bound_transcript(
-        home,
-        crate::external_sessions::ExternalDriver::Claude,
-        &native_id,
-    ) {
+    let find = |extra_roots: &[std::path::PathBuf]| {
+        crate::external_sessions::find_bound_transcript_with(
+            home,
+            crate::external_sessions::ExternalDriver::Claude,
+            &native_id,
+            recorded_path.as_deref(),
+            extra_roots,
+        )
+    };
+    let mut found = find(&[]);
+    // A seat started before its binding recorded a path, on an account's own login: look in the
+    // declared accounts' login directories too. Only reached when the ordinary places miss.
+    if matches!(found, Ok(None)) {
+        let host = st_drivers::run::detect_host();
+        let roots = state
+            .store
+            .declared_accounts()
+            .unwrap_or_default()
+            .iter()
+            .filter(|account| account.driver() == Some("claude"))
+            .filter_map(|account| account.login_for(&host))
+            .filter_map(|login| crate::accounts::expand_login(login, Some(home)))
+            .map(|login| login.join("projects"))
+            .collect::<Vec<_>>();
+        if !roots.is_empty() {
+            found = find(&roots);
+        }
+    }
+    match found {
         Ok(Some(session)) => Ok(session),
         Ok(None) => Err(Missing::not_yet(format!(
             "Claude session {native_id} has no transcript file yet"
