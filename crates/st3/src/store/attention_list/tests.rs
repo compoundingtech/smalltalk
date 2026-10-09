@@ -475,3 +475,69 @@ fn every_seat_a_login_item_covers_counts_as_holding_it() {
         BTreeSet::from(["agent/alder.first".to_owned(), "agent/alder.second".to_owned()])
     );
 }
+
+#[test]
+fn a_claim_from_any_seat_a_shared_login_item_covers_folds() {
+    let (store, origin, _) = fixture();
+    store.start_attention_list_refresher().unwrap();
+    let published = refresh_and_check(&store);
+    // One login item for two seats sharing a login directory: its source is the first seat to
+    // fail; the asker is covered only through its targets.
+    let shared_at = |publication: &AttentionPublication, cut: u64| {
+        let mut rows = (*publication.rows).clone();
+        rows.push(json!({"attention_kind":"harness-login","source_id":"agent/alder.first",
+            "targets":["agent/alder.first","agent/alder.asker"]}));
+        AttentionPublication {
+            cut,
+            projection: publication.projection.clone(),
+            evaluated_at_unix_ms: publication.evaluated_at_unix_ms,
+            due_at_unix_ms: None,
+            future_after: None,
+            published_at_unix_ms: now_ms(),
+            rows: Arc::new(rows),
+        }
+    };
+    let without_at = |publication: &AttentionPublication, cut: u64| AttentionPublication {
+        cut,
+        projection: publication.projection.clone(),
+        evaluated_at_unix_ms: publication.evaluated_at_unix_ms,
+        due_at_unix_ms: None,
+        future_after: None,
+        published_at_unix_ms: now_ms(),
+        rows: Arc::clone(&publication.rows),
+    };
+    let delta = |publication: &AttentionPublication| {
+        store
+            .read_snapshot(|index| store.attention_list_delta(publication, index, now_ms()))
+            .unwrap()
+    };
+    // The covered seat recovers: an ordinary observation from it folds when it shares the item.
+    store
+        .append_claim(&input(
+            "agent/alder.asker",
+            "harness.observed",
+            Some("agent/alder.asker"),
+            json!({"state":"idle","incarnation_id":"one","driver":"claude"}),
+        ))
+        .unwrap();
+    assert_eq!(
+        delta(&shared_at(&published, published.cut)),
+        AttentionDelta::Refold("harness.observed".into())
+    );
+    assert_eq!(delta(&without_at(&published, published.cut)), AttentionDelta::Unchanged(None));
+    // So does work it reports, which ends its login wait.
+    let observed = store.index().unwrap();
+    {
+        let mut writer = store.connection.write();
+        let transaction = writer.transaction().unwrap();
+        append_claim_tx(&transaction, "alder", &origin.subject, "work.progress",
+            Some("agent/alder.asker"), &json!({"fields": {"summary": "halfway"}}), &[], None)
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    assert_eq!(
+        delta(&shared_at(&published, observed)),
+        AttentionDelta::Refold("work.progress".into())
+    );
+    assert_eq!(delta(&without_at(&published, observed)), AttentionDelta::Unchanged(None));
+}
