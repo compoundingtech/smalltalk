@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Show what a Claude seat bound to an account prints: read the transcript the driver recorded, not only ~/.claude",
+  "replay": {"status": "none", "detail": "No replay or projection changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes or stored data formats change."},
+  "rules": {"status": "none", "detail": "No rule or authorization changes. The daemon reads one file the seat's own driver recorded for the current provider incarnation and session; a path that does not name that session's transcript is ignored."},
+  "compatibility": {"status": "changed", "detail": "The conversation timeline of a Claude seat that runs on a declared account now includes the assistant text from the account's login directory. Before, the daemon looked only under ~/.claude/projects, so such a seat showed the person's messages and status but not what it printed. Clients need no update."},
+  "downtime": {"status": "none", "detail": "No restart migration or downtime is required."},
+  "manual": {"status": "none", "detail": "No configuration changes are needed. A seat shows its transcript again on its next timeline read."},
+  "recovery": {"status": "none", "detail": "Reverting the change restores the earlier lookup under ~/.claude; nothing is written."}
+}

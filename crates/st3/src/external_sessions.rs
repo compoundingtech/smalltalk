@@ -509,7 +509,11 @@ pub(crate) fn find_bound_transcript(
             found = Some(metadata);
         }
     }
-    Ok(found.map(|metadata| ExternalSession {
+    Ok(found.map(|metadata| bound_session(driver, native_id, metadata)))
+}
+
+fn bound_session(driver: ExternalDriver, native_id: &str, metadata: SessionMetadata) -> ExternalSession {
+    ExternalSession {
         id: external_session_id(driver, native_id),
         revision: metadata.revision,
         driver,
@@ -521,7 +525,26 @@ pub(crate) fn find_bound_transcript(
         started_at_unix_ms: metadata.started_at_unix_ms,
         updated_at_unix_ms: metadata.updated_at_unix_ms,
         process: None,
-    }))
+    }
+}
+
+/// Resolve a Claude transcript the seat's driver already recorded by exact path. A seat bound to
+/// an account keeps its transcripts under that account's login directory
+/// (`CLAUDE_CONFIG_DIR/projects`), which a search of `~/.claude/projects` never reaches. The file
+/// must be named for the session, so a recorded path cannot select another session's transcript.
+pub(crate) fn find_bound_transcript_at(
+    driver: ExternalDriver,
+    path: &Path,
+    native_id: &str,
+) -> Result<Option<ExternalSession>> {
+    let expected_name = format!("{native_id}.jsonl");
+    if driver != ExternalDriver::Claude
+        || !path.is_absolute()
+        || path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str())
+    {
+        return Ok(None);
+    }
+    Ok(read_metadata(driver, path)?.map(|metadata| bound_session(driver, native_id, metadata)))
 }
 
 /// Prove which Claude session a managed seat's live provider is running, from process evidence

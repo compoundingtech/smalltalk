@@ -5021,6 +5021,17 @@ fn managed_claude_transcript(
             format!("the SessionStart hook did not bind this incarnation, and {reason}")
         })?,
     };
+    // The driver records the exact transcript it verified for this incarnation, wherever the
+    // seat's login keeps it: an account's own `CLAUDE_CONFIG_DIR`, not only `~/.claude`.
+    if let Some(path) = driver_recorded_claude_transcript(&directory, evidence, &native_id)
+        && let Ok(Some(session)) = crate::external_sessions::find_bound_transcript_at(
+            crate::external_sessions::ExternalDriver::Claude,
+            &path,
+            &native_id,
+        )
+    {
+        return Ok(session);
+    }
     match crate::external_sessions::find_bound_transcript(
         home,
         crate::external_sessions::ExternalDriver::Claude,
@@ -5032,6 +5043,22 @@ fn managed_claude_transcript(
         ))),
         Err(error) => Err(format!("finding Claude session {native_id} failed: {error:#}").into()),
     }
+}
+
+/// The transcript path the Claude driver bound for this exact provider incarnation and session,
+/// from its `sessions/claude/binding.json` beside the hook observations. Anything that does not
+/// name the same incarnation and session is ignored.
+fn driver_recorded_claude_transcript(
+    observations: &std::path::Path,
+    incarnation: &str,
+    native_id: &str,
+) -> Option<std::path::PathBuf> {
+    let bytes = std::fs::read(observations.parent()?.join("sessions/claude/binding.json")).ok()?;
+    let binding: Value = serde_json::from_slice(&bytes).ok()?;
+    (binding["runtimeIncarnation"].as_str() == Some(incarnation)
+        && binding["nativeSessionId"].as_str() == Some(native_id))
+    .then(|| binding["transcriptPath"].as_str().map(std::path::PathBuf::from))
+    .flatten()
 }
 
 fn managed_pi_family_transcript(
@@ -16967,6 +16994,101 @@ mission "example/zero-run" state="ready" {
             stale.reason.contains("does not name a driver process") && !stale.not_yet,
             "{stale:?}"
         );
+    }
+
+    #[test]
+    fn a_claude_seat_bound_to_an_account_reads_the_transcript_its_driver_recorded() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let native_id = "33333333-3333-4333-8333-333333333333";
+        // The account's login directory is not under the home's `.claude`.
+        let account = root.path().join("accounts/ada-2");
+        let transcript = account.join(format!("projects/-work/{native_id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            format!("{}\n", json!({"type":"assistant","sessionId":native_id,"timestamp":"2026-10-09T08:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Printed in the chat"}]}})),
+        ).unwrap();
+        let mut state = test_state_named(root.path(), "managed-claude-account");
+        state.native_session_home = Some(home);
+        let owner = "agent/managed-claude-account";
+        let incarnation = "native-pty:current";
+        let provider_incarnation = "provider-current";
+        let seat = state
+            .state_dir
+            .join("drivers")
+            .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24]);
+        let observations = seat.join("observations");
+        std::fs::create_dir_all(&observations).unwrap();
+        std::fs::write(
+            observations.join("claude-native-session"),
+            serde_json::to_vec(
+                &json!({"incarnation":provider_incarnation,"native_session_id":native_id}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let binding = |incarnation: &str, session: &str, path: &std::path::Path| {
+            std::fs::create_dir_all(seat.join("sessions/claude")).unwrap();
+            std::fs::write(
+                seat.join("sessions/claude/binding.json"),
+                serde_json::to_vec(&json!({
+                    "schema": "st.claude-session-binding.v1",
+                    "runtimeIncarnation": incarnation,
+                    "nativeSessionId": session,
+                    "transcriptPath": path,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: owner.into(),
+                kind: "harness.observed".into(),
+                actor: Some(owner.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("working".into())),
+                    ("driver".into(), Value::String("claude".into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("evidence_incarnation".into(), Value::String(provider_incarnation.into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        // Without the driver's record, a search of the home's `.claude` finds nothing.
+        let missing = super::managed_transcript(&state, owner, incarnation)
+            .unwrap()
+            .unwrap()
+            .transcript
+            .unwrap_err();
+        assert!(missing.reason.contains("has no transcript file yet"), "{missing:?}");
+        // With the record for this incarnation and session, the exact file is read.
+        binding(provider_incarnation, native_id, &transcript);
+        let exact = super::managed_transcript(&state, owner, incarnation)
+            .unwrap()
+            .unwrap()
+            .transcript
+            .unwrap();
+        assert!(
+            crate::external_sessions::normalized_timeline(&exact)
+                .unwrap()
+                .iter()
+                .any(|entry| entry["body"]["text"] == "Printed in the chat")
+        );
+        // A record for another incarnation, another session, or another file name is ignored.
+        binding("provider-old", native_id, &transcript);
+        assert!(super::managed_transcript(&state, owner, incarnation).unwrap().unwrap().transcript.is_err());
+        binding(provider_incarnation, "44444444-4444-4444-8444-444444444444", &transcript);
+        assert!(super::managed_transcript(&state, owner, incarnation).unwrap().unwrap().transcript.is_err());
+        let other = account.join("projects/-work/other.jsonl");
+        std::fs::copy(&transcript, &other).unwrap();
+        binding(provider_incarnation, native_id, &other);
+        assert!(super::managed_transcript(&state, owner, incarnation).unwrap().unwrap().transcript.is_err());
     }
 
     #[test]
