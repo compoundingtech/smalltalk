@@ -752,6 +752,9 @@ fn first_readiness_since(run: &MissionRunView) -> u128 {
 type MemberWake = (DesiredSubject, String, MemberSpec);
 #[cfg(test)]
 type WorkWakeObserveHook = Box<dyn FnOnce(&crate::incremental::Incremental, bool) + Send>;
+#[cfg(test)]
+type BackgroundEntryHook =
+    Arc<dyn Fn(bool, Option<tokio::time::Instant>, smallclaims::sqlite::work::SqliteWork) + Send + Sync>;
 
 pub struct Reconciler<R = NativeRuntime> {
     store: Arc<Store>,
@@ -767,6 +770,10 @@ pub struct Reconciler<R = NativeRuntime> {
     notify: Arc<Notify>,
     event_notify: watch::Sender<u64>,
     start_spacing: start_spacing::StartSpacing,
+    #[cfg(test)]
+    background_dispatch_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    background_entry_hook: Option<BackgroundEntryHook>,
     armed_schedules: Arc<Mutex<std::collections::HashSet<String>>>,
     schedule_peers: Vec<String>,
     /// The request and deadline of a failed workspace attempt, by schedule. Local retry state
@@ -922,6 +929,10 @@ impl Reconciler<NativeRuntime> {
             notify,
             event_notify,
             start_spacing: Default::default(),
+            #[cfg(test)]
+            background_dispatch_hook: Default::default(),
+            #[cfg(test)]
+            background_entry_hook: None,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             schedule_peers: Vec::new(),
             schedule_workspace_retries: Mutex::new(HashMap::new()),
@@ -993,6 +1004,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             notify,
             event_notify: watch::channel(0_u64).0,
             start_spacing: Default::default(),
+            #[cfg(test)]
+            background_dispatch_hook: Default::default(),
+            #[cfg(test)]
+            background_entry_hook: None,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             schedule_peers: Vec::new(),
             schedule_workspace_retries: Mutex::new(HashMap::new()),
@@ -1248,8 +1263,19 @@ impl<R: RuntimeControl> Reconciler<R> {
                     self.start_spacing.wait().await;
                     let queued = start_spacing::QueuedAdmission::default();
                     let active = queued.0.clone();
+                    #[cfg(test)]
+                    if let Some(hook) = self.background_dispatch_hook.lock().unwrap().take() {
+                        hook();
+                    }
                     let outcome = self.blocking(move |this| {
-                        if !this.start_spacing.try_start_if(&active) { return None; }
+                        #[cfg(test)]
+                        let admission_work = smallclaims::sqlite::work::SqliteWorkScope::start();
+                        let admitted = this.start_spacing.try_start_if(&active);
+                        #[cfg(test)]
+                        if let Some(hook) = &this.background_entry_hook {
+                            hook(admitted, this.start_spacing.last_start(), admission_work.finish());
+                        }
+                        if !admitted { return None; }
                         let started = now_ms();
                         let before = this.store.index().ok();
                         let failed = match crate::profile::task("task reconcile-pass", || {
@@ -15892,6 +15918,7 @@ mod tests {
     mod revision_seat_tests;
     mod rollout_tests;
     mod run_report_tests;
+    mod start_spacing_loop;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
         use super::{NativeRuntime, RuntimeControl};
@@ -16060,6 +16087,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
     #[derive(Default)]
     struct FakeRuntime {
         snapshot_error: Mutex<bool>,
+        before_snapshot: Mutex<Option<Box<dyn Fn() + Send>>>,
         before_observe_exec: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         ptys: Mutex<Vec<RuntimeObservation>>,
         execs: Mutex<HashMap<String, RuntimeObservation>>,
@@ -16121,6 +16149,9 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
 
     impl RuntimeControl for FakeRuntime {
         fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
+            if let Some(before) = self.before_snapshot.lock().unwrap().as_ref() {
+                before();
+            }
             if *self.snapshot_error.lock().unwrap() {
                 anyhow::bail!("the PTY snapshot is unavailable")
             }

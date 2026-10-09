@@ -66,6 +66,14 @@ impl StartSpacing {
     /// Called at blocking-work entry, before the pass clock or any database loan. A config
     /// reduction while spawn_blocking was queued must defer admission rather than begin early.
     #[cfg(test)]
+    pub(super) fn last_start(&self) -> Option<Instant> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last
+    }
+
+    #[cfg(test)]
     fn try_start(&self) -> bool {
         self.try_start_if(&AtomicBool::new(true))
     }
