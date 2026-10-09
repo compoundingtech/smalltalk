@@ -385,6 +385,12 @@ mod tests {
             replay.claim_expires_at_unix_ms,
             renewed.claim_expires_at_unix_ms
         );
+        // The renewal cached its view without the history-derived fields; the retry fills them.
+        assert!(renewed.execution_started_at_unix_ms.is_some());
+        assert_eq!(
+            replay.execution_started_at_unix_ms,
+            renewed.execution_started_at_unix_ms
+        );
         assert!(
             work_action_response(
                 state,

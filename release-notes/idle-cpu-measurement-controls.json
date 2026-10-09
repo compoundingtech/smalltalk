@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Measure a quiescent integration process and reject injected busy CPU with the same idle-budget check.",
+  "replay": {
+    "status": "none",
+    "detail": "Test fixture only; no production replay or rebuild change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or migration change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No authority, projection or checkpoint rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Adds a Unix integration test using existing process CPU accounting and test supervision; no protocol or client change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No production runtime change or restart required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual production step. Ordinary integration CI runs the control."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Test-owned busy thread stops on completion or drop; production recovery is unchanged."
+  }
+}

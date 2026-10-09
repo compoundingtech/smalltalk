@@ -4177,10 +4177,11 @@ enum MessageCommand {
         limit: usize,
     },
 
-    /// Send one durable normalized message to a person or agent.
+    /// Send one durable normalized message to an agent.
     ///
     /// A message is a direct connection: it wakes the recipient agent for a full turn,
-    /// which rereads its context.
+    /// which rereads its context. People have no inbox: a send or reply to a person fails.
+    /// To reach a person, print in the chat.
     Send(MessageSendArgs),
     /// List the current mailbox for one explicit identity.
     Ls(MessageListArgs),
@@ -16654,9 +16655,11 @@ async fn send_message(
 ) -> Result<Option<MessageSendReceipt>> {
     let id = uuid::Uuid::now_v7().simple().to_string();
     let mission_id = format!("message/{id}");
+    // Before anything else: an agent that sends to a person needs this answer, not another.
+    let to = normalize_message_subject(&args.to);
+    st3::model::refuse_person_recipient(&to).map_err(|error| anyhow::anyhow!(error.message))?;
     reject_foreign_agent_actor(&args.from)?;
     let from = normalize_message_subject(&args.from);
-    let to = normalize_message_subject(&args.to);
     let kdl = message_mission_intent(
         &mission_id,
         &id,
@@ -17655,7 +17658,7 @@ async fn run_st2_native_driver(
         predecessor_harness_record: fs::read(&harness_state_path).ok(),
         ..NativeLoopState::default()
     };
-    let task = spawn_st2_provider(
+    let task = spawn_st3_provider(
         driver,
         &paths,
         ProviderStart::Launch(
@@ -17793,7 +17796,7 @@ enum ProviderStart {
     Adopt(st_drivers::provider_session::DetachedSession),
 }
 
-fn spawn_st2_provider(
+fn spawn_st3_provider(
     driver: &str,
     paths: &NativePaths,
     start: ProviderStart,
@@ -18007,7 +18010,7 @@ async fn resume_native_driver(
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
     resume.loop_state.paths = Some(paths.resolved());
-    let task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(resume.session));
+    let task = spawn_st3_provider(driver, &paths, ProviderStart::Adopt(resume.session));
     drive_st2_native(
         client,
         subject,
@@ -18234,7 +18237,7 @@ async fn drive_st2_native(
                     };
                     let _ = replacement.exec(subject, &paths.state_root(), &resume);
                     loop_state = resume.loop_state;
-                    task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(session));
+                    task = spawn_st3_provider(driver, &paths, ProviderStart::Adopt(session));
                     completion_announced = false;
                     continue;
                 }
@@ -27729,6 +27732,41 @@ mod tests {
                 .contains("cannot wait without claimed work")
         );
         assert_eq!(wait_interruption_reason(actor, true, &[], &[]), None);
+    }
+
+    #[tokio::test]
+    async fn a_send_or_reply_to_a_person_fails_in_the_cli_before_it_reaches_the_daemon() {
+        // The refusal needs no daemon: this endpoint has nothing behind it.
+        let client = Client::new(Endpoint::Unix(PathBuf::from("/nonexistent/st3.sock")));
+        let args = |to: &str| MessageSendArgs {
+            to: to.into(),
+            body: "Done.".into(),
+            subject: None,
+            in_reply_to: Some("message/0123456789abcdef".into()),
+            tags: Vec::new(),
+            from: "agent/example/worker".into(),
+            attach: Vec::new(),
+            print_kdl: false,
+            idempotency_key: Some("refuse-a-person".into()),
+        };
+        for to in ["person/ada", "requester"] {
+            let error = send_message(&client, args(to), Vec::new()).await.unwrap_err();
+            let text = format!("{error:#}");
+            assert!(
+                text.starts_with("people do not have inboxes: print your answer in the chat"),
+                "{to}: {text}"
+            );
+            assert!(text.contains("only if the person asked for it"), "{text}");
+        }
+        // Even a preview of the message is refused.
+        let mut preview = args("person/ada");
+        preview.print_kdl = true;
+        assert!(send_message(&client, preview, Vec::new()).await.is_err());
+        // An agent recipient passes the refusal; it fails later, on the sender or the daemon.
+        let error = send_message(&client, args("agent/example/other"), Vec::new())
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("people do not have inboxes"));
     }
 
     #[test]

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "A live mailbox stream handles each change in a fixed number of statements, whatever the size of the open mailbox",
+  "replay": {"status": "none", "detail": "No claim replay or stored history changes; the stream keeps sort keys only in memory."},
+  "schema": {"status": "none", "detail": "No database schema, version or stored data changes."},
+  "rules": {"status": "none", "detail": "No claim rule or coordination change. The rollout intake hold and canonical message order are the same; the hold is read once per update and order keys are reused between updates."},
+  "compatibility": {"status": "none", "detail": "Mailbox frames, their order and delivery policy are unchanged; native drivers see the same stream."},
+  "downtime": {"status": "none", "detail": "No service interruption; streams reconnect normally across the daemon restart."},
+  "manual": {"status": "none", "detail": "No action is required."},
+  "recovery": {"status": "none", "detail": "Nothing to recover; a reconnecting stream rebuilds its in-memory keys from a full read."}
+}

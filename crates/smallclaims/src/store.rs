@@ -1657,12 +1657,19 @@ pub fn selected_index(current: u64, requested: Option<u64>) -> Result<u64, St3Er
 }
 
 pub fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> {
+    let accepted = row.get::<_, String>(9)?;
+    claim_from_row_with_accepted_time(row, accepted.parse().unwrap_or_default())
+}
+
+pub(crate) fn claim_from_row_with_accepted_time(
+    row: &rusqlite::Row<'_>,
+    accepted_at_unix_ms: u128,
+) -> rusqlite::Result<ClaimRecord> {
     if crate::read_budget::check().is_err() {
         return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT), None));
     }
     let body = row.get::<_, String>(7)?;
     let predecessors = row.get::<_, String>(8)?;
-    let accepted = row.get::<_, String>(9)?;
     let body = serde_json::from_str(&body).unwrap_or(Value::Null);
     Ok(ClaimRecord {
         id: row.get(0)?,
@@ -1676,7 +1683,7 @@ pub fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> 
         request_digest: operation_parts(&body).map(|(_, digest)| digest.to_owned()),
         body,
         predecessors: serde_json::from_str(&predecessors).unwrap_or_default(),
-        accepted_at_unix_ms: accepted.parse().unwrap_or_default(),
+        accepted_at_unix_ms,
     })
 }
 
@@ -4921,6 +4928,9 @@ impl Store {
                 Some(connection) => Rc::new(connection),
                 None => guard.pinned.take().expect("a request loan holds its connection"),
             }),
+            transaction: Some(crate::windows::Timer::start(
+                crate::windows::StoreWork::ReadTransaction,
+            )),
         };
         drop(guard);
         let connection = pinned

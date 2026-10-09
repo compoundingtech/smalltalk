@@ -889,7 +889,9 @@ impl Store {
                         accepted_at_unix_ms: row
                             .get::<_, String>(3)?
                             .parse()
-                            .unwrap_or(u128::MAX),
+                            .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                                3, rusqlite::types::Type::Text, Box::new(error),
+                            ))?,
                         records: row.get(4)?,
                     })
                 })?

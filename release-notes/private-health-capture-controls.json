@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Prepare private snapshot, source-width and SQLite-work controls for harness health capture",
+  "replay": {"status": "none", "detail": "Test-only private capture; no mailbox replay or native event producer change."},
+  "schema": {"status": "none", "detail": "Uses existing claims and indexes; fixture schema exists only in isolated test databases."},
+  "rules": {"status": "none", "detail": "No rules, checkpoint or claim admission change."},
+  "compatibility": {"status": "none", "detail": "Private cfg(test) inputs only; no public health field, client schema or wire change."},
+  "downtime": {"status": "none", "detail": "No installed runtime path or service lifecycle change."},
+  "manual": {"status": "none", "detail": "No operator action or installation step."},
+  "recovery": {"status": "none", "detail": "No automatic recovery or provider authority change; native acceptance remains separate."}
+}

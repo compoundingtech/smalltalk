@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add unconnected prepared replication cut validation helpers and controls",
+  "replay": {"status": "none", "detail": "No runtime reader, writer or replay path calls these helpers."},
+  "schema": {"status": "none", "detail": "No table, index, trigger or migration change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest change."},
+  "compatibility": {"status": "none", "detail": "No wire field, peer negotiation or client behavior changes; old-peer exchanges retain their existing behavior."},
+  "downtime": {"status": "none", "detail": "No runtime adoption or additional interruption."},
+  "manual": {"status": "none", "detail": "No operator action for this unconnected helper module."},
+  "recovery": {"status": "none", "detail": "No stored-state or recovery behavior change."}
+}

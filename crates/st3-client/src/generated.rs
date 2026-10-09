@@ -907,6 +907,7 @@ pub struct MissionRunSummary {
     pub status: String,
     pub phase: String,
     pub progress: Value,
+    /// Step assignees and claimants are nullable ActorRef strings, not agent-only IDs.
     pub current_steps: Vec<Value>,
     pub must_act: String,
     pub state_since: String,
@@ -938,8 +939,10 @@ pub struct MissionStep {
     pub title: Option<String>,
     pub state: String,
     pub attempt: u32,
+    /// An ActorRef: agent, daemon, or person.
     #[serde(default)]
     pub assignee: Option<String>,
+    /// An ActorRef: agent, daemon, or person.
     #[serde(default)]
     pub claimant: Option<String>,
     #[serde(default)]
@@ -973,6 +976,7 @@ pub struct MissionStep {
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct MissionWake {
+    /// An ActorRef: agent, daemon, or person.
     pub assignee: String,
     pub assignee_state: String,
     pub incarnation_id: String,
@@ -1122,11 +1126,24 @@ pub struct Agent {
     pub checkout: Option<AgentCheckout>,
     #[serde(default)]
     pub workspace: Option<String>,
+    /// The selected agent declaration's optional `lifecycle` child; omitted when undeclared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<AgentLifecycle>,
     /// Placement handoff phase and the sources still holding its fence.
     #[serde(default)]
     pub handoff: Option<AgentHandoff>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout: Option<Value>,
+}
+/// Declared seat lifecycle: standing, owner, or bounded. Absence means undeclared.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentLifecycle {
+    Standing,
+    Owner,
+    Bounded,
+    #[serde(other)]
+    Unknown,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentHandoff {

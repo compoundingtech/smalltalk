@@ -495,6 +495,67 @@ fn sealed_record_windows_leave_later_envelopes_out_before_reading_bodies() {
 }
 
 #[test]
+fn sealed_capture_rejects_invalid_times_even_when_another_claim_excludes_the_envelope() {
+    for malformed in ["not-a-time", "-1", "340282366920938463463374607431768211456"] {
+        let store = Store::open_memory("alder").unwrap();
+        store.set_write_clock_at(100).unwrap();
+        let broken = store.append_claim(&input(
+            AGENT, "harness.observed", Some(AGENT),
+            json!({"state":"idle", "incarnation_id":"broken"}), "broken",
+        )).unwrap();
+        let later = store.append_claim(&input(
+            AGENT, "harness.observed", Some(AGENT),
+            json!({"state":"idle", "incarnation_id":"later"}), "later",
+        )).unwrap();
+        store.seal_local_batches().unwrap();
+        {
+            let connection = store.connection.write();
+            connection.execute(
+                "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                params![malformed, broken.id],
+            ).unwrap();
+            connection.execute(
+                "UPDATE claims SET accepted_at_unix_ms='200' WHERE id=?1",
+                [&later.id],
+            ).unwrap();
+            // Put both records in one envelope so a late claim would otherwise hide
+            // the malformed claim when the envelope is excluded from the sealed set.
+            connection.execute(
+                "UPDATE replica_records SET (writer, sequence, envelope_hash, position)=(
+                    SELECT writer, sequence, envelope_hash, position+1 FROM replica_records
+                    WHERE claim_id=?1) WHERE claim_id=?2",
+                params![broken.id, later.id],
+            ).unwrap();
+        }
+        let error = store.checkpoint_sealed_set_paged(150, None, 1, 1).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("invalid accepted time for checkpoint claim {}", broken.id)),
+            "malformed time {malformed:?} must not silently count as early: {error:#}",
+        );
+    }
+}
+
+#[test]
+fn sealed_capture_rejects_invalid_envelope_times_at_first_use() {
+    for malformed in ["not-a-time", "-1", "340282366920938463463374607431768211456"] {
+        let store = Store::open_memory("alder").unwrap();
+        store.set_write_clock_at(100).unwrap();
+        store.append_claim(&input(
+            AGENT, "harness.observed", Some(AGENT),
+            json!({"state":"idle", "incarnation_id":"broken"}), "broken",
+        )).unwrap();
+        store.seal_local_batches().unwrap();
+        store.connection.write().execute(
+            "UPDATE replica_envelopes SET accepted_at_unix_ms=?1", [malformed],
+        ).unwrap();
+        assert!(
+            store.checkpoint_sealed_set(150).is_err(),
+            "malformed envelope time {malformed:?} must fail instead of excluding the envelope",
+        );
+    }
+}
+
+#[test]
 fn a_usage_trim_keeps_lifetime_usage_and_the_proof_guards_it() {
     let store = Store::open_memory("alder").unwrap();
     store
