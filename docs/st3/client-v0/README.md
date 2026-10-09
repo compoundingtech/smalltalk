@@ -1578,6 +1578,9 @@ complete set rereads it. A `changes` frame may therefore repeat the window's row
 global history or a winner; it never compares across hosts and stays out of shared digests and
 checkpoint answers. A frame without `membership`, or with any of its fields missing, is
 refused. Resource collection frames carry no membership state.
+Projection rebuild and heal retain a local rebuild frontier, so replaying older canonical
+claims cannot move a lifecycle-updated frontier backwards. This watermark survives on the
+same host without becoming shared projection or checkpoint authority.
 
 ## Agent and plain-shell creation
 

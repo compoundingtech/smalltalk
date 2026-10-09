@@ -968,9 +968,15 @@ mod tests {
         for member in ["resource/a", "resource/b", "resource/c", "resource/d"] {
             declare_resource_member(&state, member);
         }
+        let declare = crate::graph::parse_internal_intent(
+            "version 2\nagent \"ada/outside\" { workspace \"/tmp\"; command \"true\"; }\n",
+            "membership-upstream-signal",
+        ).unwrap();
+        state.store.apply_internal(&declare, "declare-outside-seat").unwrap();
         edit_memberships(&state, &session, &membership_request(&state, "initial", json!([
             {"op":"place","member":"resource/a","bucket":null,"key":"a0"},
-            {"op":"place","member":"resource/b","bucket":null,"key":"a1"}
+            {"op":"place","member":"resource/b","bucket":null,"key":"a1"},
+            {"op":"place","member":"agent/ada/outside","bucket":null,"key":"a9"}
         ]))).await.unwrap();
         let route_state = state.clone();
         let app = axum::Router::new().route("/stream", axum::routing::get(
@@ -1006,8 +1012,45 @@ mod tests {
         assert_eq!(initial["kind"], "snapshot");
         assert_eq!(initial["items"][0]["member"], "resource/a");
         assert_eq!(initial["membership"]["container"], SUBJECT);
-        assert_eq!(initial["membership"]["live_count"], 2);
+        assert_eq!(initial["membership"]["live_count"], 3);
         let mut frontier = initial["membership"]["changed_index"].as_u64().unwrap();
+        let stop = crate::graph::parse_internal_intent(
+            "version 2\nstop \"agent/ada/outside\"\n", "membership-upstream-signal",
+        ).unwrap();
+        state.store.apply_internal(&stop, "retire-outside-seat").unwrap();
+        state.event_notify.send_replace(state.store.index().unwrap());
+        let retired = membership_frame(&mut socket).await;
+        assert_eq!(retired["kind"], "changes");
+        assert_eq!(retired["upserts"], json!([]));
+        assert_eq!(retired["removes"], json!([]));
+        assert_eq!(retired["order"], json!(["resource/a"]));
+        assert_eq!(retired["membership"]["live_count"], 2);
+        assert!(retired["membership"]["changed_index"].as_u64().unwrap() > frontier);
+        frontier = retired["membership"]["changed_index"].as_u64().unwrap();
+        let retired_state = state.store.ordered_membership_state(SUBJECT).unwrap();
+        for heal in [false, true] {
+            if heal {
+                assert!(state.store.replay_graph_for_heal().unwrap());
+            } else {
+                state.store.rebuild_claim_projections().unwrap();
+            }
+            assert_eq!(state.store.ordered_membership_state(SUBJECT).unwrap(), retired_state);
+            state.event_notify.send_replace(state.store.index().unwrap());
+            // Keep the original subscription alive; a second snapshot verifies that
+            // refreshed/cached window state cannot regress across replay.
+            socket.send(Message::Text(json!({
+                "kind":"subscribe","id":"rebuild-check","collection":"ordered-memberships",
+                "person":"person/ada","subject":SUBJECT,"limit":1
+            }).to_string().into())).await.unwrap();
+            let rebuilt = membership_frame(&mut socket).await;
+            assert_eq!(rebuilt["kind"], "snapshot", "{rebuilt}");
+            assert_eq!(rebuilt["id"], "rebuild-check");
+            assert_eq!(rebuilt["items"], initial["items"]);
+            assert_eq!(rebuilt["membership"], retired["membership"]);
+            socket.send(Message::Text(json!({
+                "kind":"unsubscribe","id":"rebuild-check"
+            }).to_string().into())).await.unwrap();
+        }
         // Every edit leaves the held first row and has_more unchanged. Counts alone
         // cannot distinguish the rekey or the net-zero outside-window replacement.
         for (key, operations, count) in [

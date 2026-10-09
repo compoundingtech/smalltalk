@@ -131,6 +131,44 @@ fn membership_state_tracks_same_count_edits_and_is_not_checkpoint_authority() {
     assert!(proof.passed, "local frontier values must not affect checkpoint witnesses");
 }
 
+#[test]
+fn lifecycle_frontier_survives_projection_rebuild_and_heal() {
+    let store = Store::open_memory("membership-rebuild-frontier").unwrap();
+    create(&store);
+    declare(&store, SEAT_A, "true", "rebuild-state-a");
+    declare(&store, SEAT_B, "true", "rebuild-state-b");
+    edit(&store, json!([place(SEAT_A, None, "a0"), place(SEAT_B, None, "a1")]));
+    retire(&store, SEAT_B, "rebuild-retire-b");
+    let before = store.ordered_membership_state(CONTAINER).unwrap();
+    assert_eq!(before.live_count, 1);
+    let expected = rows(&store);
+    let digests = layout_digests(&store);
+    for heal in [false, true] {
+        if heal {
+            assert!(store.replay_graph_for_heal().unwrap());
+        } else {
+            store.rebuild_claim_projections().unwrap();
+        }
+        assert_eq!(store.ordered_membership_state(CONTAINER).unwrap(), before);
+        assert_eq!(rows(&store), expected);
+        assert_eq!(layout_digests(&store), digests);
+        assert!(store.ordered_memberships_changed(before.changed_index - 1,
+            before.changed_index).unwrap());
+    }
+    // A new edit beyond the held prefix must advance past the preserved watermark.
+    declare(&store, SEAT_B, "true", "rebuild-restore-b");
+    let restored = store.ordered_membership_state(CONTAINER).unwrap();
+    assert_eq!(restored.live_count, 2);
+    assert!(restored.changed_index > before.changed_index);
+    edit(&store, json!([place(SEAT_B, None, "a2")]));
+    let edited = store.ordered_membership_state(CONTAINER).unwrap();
+    assert_eq!(edited.live_count, restored.live_count);
+    assert!(edited.changed_index > restored.changed_index);
+    let directory = tempfile::tempdir().unwrap();
+    let (_, proof) = store.plan_checkpoint(now_ms() + 1, directory.path()).unwrap();
+    assert!(proof.passed, "rebuild watermark is not shared checkpoint authority");
+}
+
 
 fn membership_digests(store: &Store) -> BTreeMap<String, String> {
     let digests = store.replication_status(true, None, &[]).unwrap().projection_digests;

@@ -319,6 +319,14 @@ pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
 }
 
 pub(super) fn rebuild(transaction: &Transaction<'_>) -> Result<()> {
+    // Replay restores canonical rows but can replace lifecycle fanout indexes with
+    // older claim indexes. Preserve the host's pre-rebuild frontier independently
+    // of those rows; this local invalidation metadata is not shared authority.
+    transaction.execute(
+        "INSERT INTO meta(key,value) VALUES('local_ordered_membership_rebuild_index',?1)
+         ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(meta.value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)",
+        [current_index(transaction)?],
+    )?;
     transaction.execute_batch("DELETE FROM ordered_membership_live; DELETE FROM ordered_membership_heads;
         DELETE FROM ordered_membership_counts; DELETE FROM ordered_membership_lifecycle;
         DELETE FROM local_ordered_membership_pending; DELETE FROM declared_resource_edges WHERE relation='ordered-membership';")?;
@@ -373,10 +381,12 @@ pub(super) fn witness(connection: &Connection, container: &str) -> Result<Value>
 fn state_at(connection: &Connection, container: &str) -> Result<schema::State> {
     Ok(connection.query_row(
         "SELECT COALESCE(c.live_count,0),
-           MAX(COALESCE(c.changed_index,0),COALESCE(CAST(r.value AS INTEGER),0))
+           MAX(COALESCE(c.changed_index,0),COALESCE(CAST(r.value AS INTEGER),0),
+               COALESCE(CAST(b.value AS INTEGER),0))
          FROM (SELECT ?1 AS container) requested
          LEFT JOIN ordered_membership_counts c ON c.container=requested.container
-         LEFT JOIN meta r ON r.key='local_ordered_membership_repair_index'",
+         LEFT JOIN meta r ON r.key='local_ordered_membership_repair_index'
+         LEFT JOIN meta b ON b.key='local_ordered_membership_rebuild_index'",
         [container], |row| Ok(schema::State { live_count: row.get(0)?, changed_index: row.get(1)? }),
     )?)
 }
@@ -427,7 +437,8 @@ impl Store {
     pub(crate) fn ordered_memberships_changed(&self, after: u64, through: u64) -> Result<bool> {
         Ok(self.readers.get().query_row(
             "SELECT EXISTS(SELECT 1 FROM ordered_membership_counts WHERE changed_index>?1 AND changed_index<=?2)
-             OR EXISTS(SELECT 1 FROM meta WHERE key='local_ordered_membership_repair_index'
+             OR EXISTS(SELECT 1 FROM meta WHERE key IN
+               ('local_ordered_membership_repair_index','local_ordered_membership_rebuild_index')
                AND CAST(value AS INTEGER)>?1 AND CAST(value AS INTEGER)<=?2)",
             params![after,through.min(i64::MAX as u64)], |row| row.get(0),
         )?)
