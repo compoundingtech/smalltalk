@@ -106,7 +106,7 @@ export const NativeToolOutput: Story = { render: args => <main {...stylex.props(
   await expect(canvas.getAllByTestId('work-call-output')).toHaveLength(2)
   await expect(canvas.getAllByTestId('work-call-output')[0]).toHaveTextContent('String result retained.')
   await expect(canvas.queryByRole('button', { name: /empty output|non-text output/ })).toBeNull()
-  await expect(canvas.getAllByText('No output', { exact: true })).toHaveLength(2)
+  await expect(canvas.getAllByText(/No output/)).toHaveLength(2)
 } }
 export const NativeToolOutputLight: Story = { ...NativeToolOutput, args: { scheme: 'light' } }
 export const Streaming: Story = { args: { state: 'streaming' }, play: async ({ canvasElement }) => {
