@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Bound human mission-run tree reads with an indexed root page and explicit continuation",
+  "replay": {"status": "none", "detail": "No claim replay or checkpoint replay changes. Existing mission rows are read through a new SQLite index built during Store initialization."},
+  "schema": {"status": "changed", "detail": "Adds mission_runs_root_page_index on root_run_id, created_at_unix_ms and id without a schema-version change. Existing stores build the index when first opened by this version; mission rows and claims are not rewritten."},
+  "rules": {"status": "none", "detail": "No checkpoint rules, graph digests or coordinated member versions change."},
+  "compatibility": {"status": "changed", "detail": "The human st missions show and follow commands use the new GET /v1/mission-runs/tree route. Older CLIs and the existing all-descendants route remain supported. A new CLI against an older daemon cannot use the new human tree route; exact-run JSON still uses the single-run route."},
+  "downtime": {"status": "unknown", "detail": "Index build time on existing large mission_runs tables and restart-to-API time have not been measured. The index is created during Store initialization; operators should allow for that work before expecting the daemon to serve requests."},
+  "manual": {"status": "none", "detail": "No data migration command, re-pairing or configuration change is required. Deploy the daemon with the new route before relying on a newer CLI's human tree command; stored identity and mission state are preserved."},
+  "recovery": {"status": "none", "detail": "A previous binary can read the unchanged mission rows and ignores the extra SQLite index. Swapping binaries does not remove the index or undo any mission state."}
+}

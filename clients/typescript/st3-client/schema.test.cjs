@@ -284,3 +284,16 @@ test('normalized conversation fallbacks and open block payloads survive schema r
     const decoded = Rich.decodeUnknownSync(Rich.TimelineBlock, 'strict')(block);
     assert.deepEqual(Schema.encodeSync(Rich.TimelineBlock)(decoded), block);
 });
+
+
+test('relay omission fixture keeps absent fields, nullable values, and unknown bodies', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const fixture = require('../../../docs/st3/client-v0/fixtures/timeline-relay-omission.json');
+    for (const entry of fixture.value.items) {
+        const typed = Rich.decodeUnknownSync(Rich.TimelineEntry)(entry);
+        assert.deepEqual(Schema.encodeSync(Rich.TimelineEntry)(typed), {
+            ...entry, timestamp: new Date(entry.timestamp).toISOString(),
+        });
+    }
+    assert.equal(fixture.value.items[0].body.reply_to, null);
+});

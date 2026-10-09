@@ -42,9 +42,10 @@ use crate::model::{
     LocalTerminal, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendReceipt,
     MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
     MissionResponse, MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest,
-    MissionRunRequest, MissionRunView, OperationalRepairApplyRequest, OperationalRepairPlan,
-    OperationalRepairResult, PlannerSpec, PlanningApprovalRequest, PlanningCancelRequest,
-    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningRevisionRequest,
+    MissionRunReportRequest, MissionRunReportView, MissionRunRequest, MissionRunView,
+    OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult, PlannerSpec,
+    PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
+    PlanningProposalRequest, PlanningRevisionRequest,
     PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest, QuickAgentResponse,
     ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse, ReplicationHealAnswer,
     ReplicationHealAnswerRequest, ReplicationHealNextRequest, ReplicationHealStep,
@@ -465,6 +466,18 @@ pub(crate) fn admitted_mailbox_protocol_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Synthetic private-store transport controls; never physical native admission.
+#[cfg(feature = "test-support")]
+pub(crate) fn synthetic_mailbox_protocol_router(state: AppState, subject: &str) -> Router {
+    assert!(subject.starts_with("agent/example/"));
+    admitted_mailbox_protocol_router(state).layer(Extension(NativeDeliveryPeer {
+        agent: subject.into(),
+        transport: "omp-channel",
+        pid: std::process::id(),
+        archives_inbox: false,
+    }))
+}
+
 /// Build the loopback-only client gateway. Unlike the local Unix boundary, every ordinary
 /// client request on this router requires a paired bearer credential.
 pub fn fabric_router(state: AppState) -> Router {
@@ -809,6 +822,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
         .route("/v1/mission-runs", get(list_mission_runs))
+        .route("/v1/mission-runs/tree", get(list_mission_run_tree))
         .route("/v1/mission-overview", get(mission_overview))
         .route("/v1/outcome-history", get(outcome_history))
         .route("/v1/performance", get(performance_report))
@@ -824,6 +838,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route(
             "/v1/mission-runs/{run}/outcome",
             post(set_mission_run_outcome),
+        )
+        .route(
+            "/v1/mission-runs/{run}/report-to",
+            post(set_mission_run_report),
         )
         .route("/v1/mission-runs/{run}", get(get_mission_run))
         .route("/v1/run-generations/{generation}", get(get_run_generation))
@@ -1008,8 +1026,8 @@ async fn response_envelope_unbounded(
         (Some(error), _) | (None, Err(error)) => error.into_response(),
         // Most handlers use synchronous SQLite and filesystem APIs. Run the whole
         // handler on a blocking thread so a busy projection or replication pass cannot
-        // occupy an async worker needed to accept another call. Each read on that
-        // thread takes its own read connection, so it never waits for another read.
+        // occupy an async worker needed to accept another call. Read workers are admitted
+        // before taking store locks; nested work reuses the handler's reader.
         (None, Ok(_)) if request_path == "/v1/health" => next.run(request).await,
         (None, Ok(_)) => {
             let runtime = tokio::runtime::Handle::current();
@@ -1025,7 +1043,7 @@ async fn response_envelope_unbounded(
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
                 crate::performance::with_cpu(Some(&cpu_kind), Some(&cpu_client), || {
-                    runtime.block_on(async move {
+                    runtime.block_on(crate::api::read_deadline::handler(async move {
                         // Cancel the actual forwarded relay, not only its outer waiter.
                         // Other routes retain their existing cooperative cancellation;
                         // this transport's mutation variants carry no read budget.
@@ -1042,7 +1060,7 @@ async fn response_envelope_unbounded(
                         } else {
                             next.run(request).await
                         }
-                    })
+                    }))
                 })
             })
             .await
@@ -2615,6 +2633,15 @@ fn client_agent_resources_from_status(
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
     let member_faults = store.member_reconcile_faults_for(&agent_subjects, snapshot_index)?;
     let mailbox_faults = store.mailbox_faults_for(&agent_subjects, snapshot_index)?;
+    // Harnesses, activity, and who can have a suspension or rollout, for many agents at once.
+    // Each status names the actual-state claim it selected, the newest runtime observation
+    // whenever the agent has one.
+    let actual_claims = status
+        .subjects
+        .iter()
+        .map(|subject| (subject.subject.clone(), subject.actual_claim.clone()))
+        .collect();
+    let mut card_reads = store.agent_card_reads(&agent_subjects, snapshot_index, &actual_claims)?;
     // Cards without a harness need only their actual claim's acceptance time, not its body.
     // Keep the existing per-claim fallback if the bulk metadata read cannot be completed.
     let actual_claim_times = store.claim_acceptance_times(
@@ -2646,7 +2673,7 @@ fn client_agent_resources_from_status(
         })
         .filter(|subject| history || subject.projection.layer == "current")
         .map(|mut subject| -> anyhow::Result<(String, Value)> {
-            subject.harness = store.observed_harness_at(&subject.subject, snapshot_index)?;
+            subject.harness = card_reads.take_harness(store, &subject.subject)?;
             let member_fault = member_faults.get(&subject.subject);
             let mailbox_fault = mailbox_faults.get(&subject.subject);
             let fault = member_fault.or(mailbox_fault);
@@ -2666,13 +2693,13 @@ fn client_agent_resources_from_status(
             subject.harness = agent_harness::availability(subject.harness.take(), mailbox_fault.map(String::as_str));
             let driver = declared_provider.or_else(|| subject.harness.as_ref().and_then(|harness| harness.driver.clone()));
             let harness_state = subject.harness.as_ref().map(|harness| harness.state.clone());
-            let last_activity_at = store.agent_last_activity_at(
+            let last_activity_at = card_reads.last_activity_at(
+                store,
                 &subject.subject,
                 subject
                     .harness
                     .as_ref()
                     .map(|harness| harness.incarnation_id.as_str()),
-                snapshot_index,
             )?;
             let silent_since = if harness_state.as_deref() == Some("working") {
                 let working_since = match subject.harness.as_ref() {
@@ -2749,7 +2776,11 @@ fn client_agent_resources_from_status(
                 .transpose()?.flatten();
             let moving = handoff.as_ref().is_some_and(|h| h.phase != "running");
             let state = if member_fault.is_some() { "failed" } else if mailbox_fault.is_some() || moving { "waiting" } else { state };
-            let suspension = crate::suspension::current(store, &subject.subject)?;
+            let suspension = if card_reads.may_have_suspension(&subject.subject) {
+                crate::suspension::current(store, &subject.subject)?
+            } else {
+                None
+            };
             // A suspended seat has no process by design: it is neither stopped nor failed.
             let state = match suspension.as_ref().map(|item| item.phase.as_str()) {
                 Some("suspended") if fault.is_none() => "suspended",
@@ -2836,7 +2867,11 @@ fn client_agent_resources_from_status(
                 "operational": subject.projection,
                 "suspension": suspension.as_ref().map(client_suspension),
                 "handoff": handoff,
-                "rollout": crate::rollout::status(store, &subject.subject)?,
+                "rollout": if card_reads.may_have_rollout(&subject.subject) {
+                    crate::rollout::status(store, &subject.subject)?
+                } else {
+                    None
+                },
             });
             if let Some((_, previous)) = changed.filter(|_| retain_queues)
                 && let Some(old) = previous.iter().find(|item| item["id"] == value["id"]) {
@@ -4392,7 +4427,8 @@ const AGENT_ROSTER_ASSEMBLY_ROUNDS: usize = 3;
 /// the newest rows say which cards changed and at most that many are changed or missing.
 /// Otherwise the cards fold in chunks, each at its own cut, refolding the already folded cards
 /// whose claims changed, and completion is tried again. Readers keep the previous complete
-/// roster meanwhile; if it cannot be assembled, they keep it until its requests are overdue.
+/// roster meanwhile, with its own cut and publication time; if it cannot be assembled, the
+/// refresh fails and is tried again on the next request.
 fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
     if store.read_snapshot(|index| store.agent_roster_current(index, history))? {
         return Ok(());
@@ -6177,6 +6213,7 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         reader_store.readers.usage(),
         smallclaims::sqlite::read_cache_kib(),
         smallclaims::sqlite::max_idle_read_connections(),
+        smallclaims::sqlite::max_read_workers(),
         crate::memory::service_memory(),
     ));
     report.status = if report.checks.iter().any(|check| check.status == "fail") {
@@ -6224,6 +6261,7 @@ fn reader_memory_check(
     readers: smallclaims::sqlite::ReaderUsage,
     cache_kib: usize,
     retained: usize,
+    read_workers: usize,
     groups: anyhow::Result<Option<Vec<crate::memory::GroupMemory>>>,
 ) -> DoctorCheck {
     let targets = readers.open as u128 * cache_kib as u128;
@@ -6231,7 +6269,7 @@ fn reader_memory_check(
         + smallclaims::sqlite::WRITE_CACHE_KIB as u128
         + DAEMON_MEMORY_HEADROOM_KIB;
     let mut message = format!(
-        "{} open readers ({} idle, {} active), peak {}, {} opened since startup; per-reader cache target {} KiB; current reader targets {} MiB; idle retention {}; planning envelope {} MiB (reader targets + 32 MiB writer + 512 MiB reserve). Warning: concurrent reader bursts are unbounded; cache targets exclude schema, prepared statements and query results, and this envelope is not a process memory limit",
+        "{} open readers ({} idle, {} active), peak {}, {} opened since startup; per-reader cache target {} KiB; current reader targets {} MiB; idle retention {}; API read-worker admission {}; planning envelope {} MiB (reader targets + 32 MiB writer + 512 MiB reserve). Raw/background reader checkout is uncapped; cache targets exclude schema, prepared statements and query results, and this envelope is not a process memory limit",
         readers.open,
         readers.idle,
         readers.open.saturating_sub(readers.idle),
@@ -6240,6 +6278,7 @@ fn reader_memory_check(
         cache_kib,
         targets / 1024,
         retained,
+        read_workers,
         envelope_kib / 1024,
     );
     let mut warned = false;
@@ -11162,7 +11201,11 @@ async fn get_usage(
     .await?;
     let mut report = json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages});
     // The policy as the config file says now, so `st usage` shows which accounts it never stops.
-    if let Some(Ok(config)) = crate::config::reload_daemon_limits()
+    let reloaded = tokio::task::spawn_blocking(crate::config::reload_daemon_limits)
+        .await
+        .ok()
+        .flatten();
+    if let Some(Ok(config)) = reloaded
         && let Some(policy) = crate::store::LimitsPolicy::from_config(&config)
     {
         for (row, limit) in report["limits"]
@@ -13023,6 +13066,13 @@ struct MissionRunQuery {
 }
 
 #[derive(Deserialize)]
+struct MissionRunTreeQuery {
+    root: String,
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct MissionOverviewQuery {
     mission: String,
 }
@@ -13112,6 +13162,43 @@ async fn list_mission_runs(
             "select exactly one mission or root mission run",
         ))),
     }
+}
+
+async fn list_mission_run_tree(
+    State(state): State<AppState>,
+    Query(query): Query<MissionRunTreeQuery>,
+) -> Result<Json<crate::model::MissionRunTreePage>, ApiError> {
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=50).contains(&limit) {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-mission-run-limit",
+            "mission run tree page limit must be 1 through 50",
+        )));
+    }
+    let store = state.store.clone();
+    let page = blocking_store(move || {
+        store.read_snapshot(|frontier| {
+            let Some((mut runs, next_cursor)) =
+                store.mission_runs_for_root_page(&query.root, query.after.as_deref(), limit)?
+            else {
+                return Ok(None);
+            };
+            annotate_stuck_gates(&store, &mut runs)?;
+            Ok(Some(crate::model::MissionRunTreePage {
+                runs,
+                has_more: next_cursor.is_some(),
+                next_cursor,
+                frontier,
+            }))
+        })
+    })
+    .await?;
+    page.map(Json).ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "invalid-mission-run-cursor",
+            "the mission run cursor is absent from this root; start again without a cursor",
+        ))
+    })
 }
 
 fn annotate_stuck_gates(store: &Store, runs: &mut [MissionRunView]) -> anyhow::Result<()> {
@@ -13680,6 +13767,29 @@ async fn set_mission_run_outcome(
     .await?;
     signal_changed(&state);
     Ok(Json(outcome))
+}
+
+/// A person or the run's requester changes who a running run reports to.
+async fn set_mission_run_report(
+    State(state): State<AppState>,
+    AxumPath(run): AxumPath<String>,
+    Json(request): Json<MissionRunReportRequest>,
+) -> Result<Json<MissionRunReportView>, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "run-report-authority-denied")?;
+    let store = state.store.clone();
+    let report = blocking_action(move || {
+        store.set_mission_run_report(
+            &run,
+            &actor,
+            request.report_to.as_deref(),
+            request.stalled_after_ms,
+            request.report_completed,
+            &request.idempotency_key,
+        )
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(report))
 }
 
 /// A person or an agent retires a mission.
@@ -14337,7 +14447,9 @@ async fn logs_session(
             "a log chunk limit must be between 1 and 65536 bytes",
         )));
     }
-    let session = live_session(&state, &subject, None)?;
+    let session = read_deadline::query(&state.store, "/v1/sessions/logs/{*subject}", || {
+        live_session(&state, &subject, None)
+    })?;
     if session.terminal {
         return Err(ApiError::bad(St3Error::new(
             "unsupported-capability",
@@ -15712,7 +15824,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 max_events,
             }]))
         };
-        let normal = reader_memory_check(usage, 2048, 128, groups(Some(1 << 30), 0));
+        let normal = reader_memory_check(usage, 2048, 128, 32, groups(Some(1 << 30), 0));
         assert_eq!(normal.status, "pass");
         assert!(
             normal
@@ -15721,20 +15833,21 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         );
         assert!(normal.message.contains("current reader targets 194 MiB"));
         assert!(normal.message.contains("planning envelope 800 MiB"));
-        assert!(normal.message.contains("bursts are unbounded"));
+        assert!(normal.message.contains("API read-worker admission 32"));
+        assert!(normal.message.contains("Raw/background reader checkout is uncapped"));
         assert_eq!(
-            reader_memory_check(usage, 8192, 128, groups(Some(1 << 30), 0)).status,
+            reader_memory_check(usage, 8192, 128, 32, groups(Some(1 << 30), 0)).status,
             "warn"
         );
-        let pressure = reader_memory_check(usage, 2048, 128, groups(Some(1 << 30), 1225));
+        let pressure = reader_memory_check(usage, 2048, 128, 32, groups(Some(1 << 30), 1225));
         assert_eq!(pressure.status, "warn");
         assert!(pressure.message.contains("memory.events:max 1225"));
         assert_eq!(
-            reader_memory_check(usage, 2048, 128, groups(None, 0)).status,
+            reader_memory_check(usage, 2048, 128, 32, groups(None, 0)).status,
             "pass"
         );
         assert_eq!(
-            reader_memory_check(usage, 2048, 128, Err(anyhow::anyhow!("unavailable"))).status,
+            reader_memory_check(usage, 2048, 128, 32, Err(anyhow::anyhow!("unavailable"))).status,
             "warn"
         );
         let burst = smallclaims::sqlite::ReaderUsage {
@@ -15744,7 +15857,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             opened: 300,
         };
         assert_eq!(
-            reader_memory_check(burst, 2048, 128, groups(Some(1 << 30), 0)).status,
+            reader_memory_check(burst, 2048, 128, 32, groups(Some(1 << 30), 0)).status,
             "warn"
         );
     }

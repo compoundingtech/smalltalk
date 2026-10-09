@@ -21,6 +21,57 @@ struct ActualState {
     source: Option<(String, String, Vec<String>)>,
 }
 
+/// An actual-state claim as the chunked read returns it: id, kind, origin, body, and whether
+/// the folded state includes it.
+type ActualRow = (String, String, String, String, bool);
+
+/// The leading terms of a claim's canonical key: accepted time, writer, writer sequence, batch.
+type BatchKey = (String, String, Option<i64>, String);
+
+/// One subject's `rows` in canonical order: by their canonical key's leading terms, and claims
+/// that tie on every leading term, in one batch, by their position in it and then by id.
+fn canonical_order(
+    connection: &Connection,
+    mut rows: Vec<(ActualRow, BatchKey)>,
+) -> Result<Vec<ActualRow>> {
+    // As SQLite orders them: accepted time by length and then text, writer and batch as text,
+    // and a missing writer sequence first.
+    rows.sort_by(|(_, left), (_, right)| {
+        (left.0.len(), &left.0, &left.1, left.2, &left.3)
+            .cmp(&(right.0.len(), &right.0, &right.1, right.2, &right.3))
+    });
+    let mut start = 0;
+    while start < rows.len() {
+        let end = start
+            + rows[start..]
+                .iter()
+                .take_while(|(_, key)| *key == rows[start].1)
+                .count();
+        if end - start > 1 {
+            let ids = rows[start..end].iter().map(|(row, _)| &row.0).collect::<Vec<_>>();
+            let mut positions = HashMap::new();
+            for row in connection
+                .prepare_cached(&format!(
+                    "SELECT claims.id, {} FROM claims
+                     WHERE claims.id IN (SELECT value FROM json_each(?1))",
+                    smallclaims::store::canonical::position_sql("claims")
+                ))?
+                .query_map([serde_json::to_string(&ids)?], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+            {
+                let (id, position) = row?;
+                positions.insert(id, position);
+            }
+            rows[start..end].sort_by(|(left, _), (right, _)| {
+                (positions.get(&left.0), &left.0).cmp(&(positions.get(&right.0), &right.0))
+            });
+        }
+        start = end;
+    }
+    Ok(rows.into_iter().map(|(row, _)| row).collect())
+}
+
 fn json_list<'a>(subjects: impl IntoIterator<Item = &'a String>) -> Result<String> {
     Ok(serde_json::to_string(&subjects.into_iter().collect::<Vec<_>>())?)
 }
@@ -104,58 +155,107 @@ impl CardReads {
             .into_iter()
             .collect::<Vec<_>>();
         // The same claims `latest_actual_at` folds and `selected_actual_source_at` selects from:
-        // the actual-state claims in canonical order, the fold leaving out `harness.` in any case.
+        // the actual-state claims, the fold leaving out `harness.` in any case. The cross join
+        // reads them one subject at a time, and each subject's rows are put in canonical order
+        // here (`canonical_order`) instead of by a sorter that would copy every body.
         let mut statement = connection.prepare_cached(&format!(
             "SELECT claims.subject, claims.id, claims.kind, claims.origin, claims.body,
-                    claims.kind NOT LIKE 'harness.%'
+                    claims.kind NOT LIKE 'harness.%',
+                    claims.accepted_at_unix_ms, batches.origin, batches.replica_sequence,
+                    claims.batch_id
              FROM json_each(?1) subjects
              CROSS JOIN claims INDEXED BY claims_subject_kind_index
                ON claims.subject=subjects.value
              JOIN batches ON batches.id=claims.batch_id
-             WHERE {ACTUAL_STATE_CLAIM} AND claims.store_index<=?2
-             ORDER BY claims.subject, {CANONICAL_ORDER}"
+             WHERE {ACTUAL_STATE_CLAIM} AND claims.store_index<=?2"
         ))?;
-        type Row = (String, String, String, String, bool);
-        for chunk in missing.chunks(CHUNK) {
-            let mut rows = BTreeMap::<String, Vec<Row>>::new();
-            for row in statement.query_map(params![json_list(chunk)?, self.index], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
+        // Each subject is folded as soon as its rows end, so a chunk holds one subject's
+        // history at a time, as a one-subject read does.
+        let mut chunks = missing.chunks(CHUNK).map(<[String]>::to_vec).collect::<VecDeque<_>>();
+        while let Some(chunk) = chunks.pop_front() {
+            let mut rows = statement.query(params![json_list(&chunk)?, self.index])?;
+            let mut current: Option<(String, Vec<(ActualRow, BatchKey)>)> = None;
+            let mut folded = HashSet::new();
+            let mut again = BTreeSet::new();
+            while let Some(row) = rows.next()? {
+                let subject = row.get::<_, String>(0)?;
+                let item = (
                     (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?),
-                ))
-            })? {
-                let (subject, row) = row?;
-                rows.entry(subject).or_default().push(row);
+                    (row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?),
+                );
+                match current.as_mut() {
+                    Some((held, items)) if *held == subject => items.push(item),
+                    _ => {
+                        // A subject whose rows did not arrive together is read again alone.
+                        if !folded.insert(subject.clone()) {
+                            again.insert(subject.clone());
+                        }
+                        if let Some((held, items)) = current.replace((subject, vec![item])) {
+                            let items = canonical_order(connection, items)?;
+                            self.fold_actual(held, items)?;
+                        }
+                    }
+                }
             }
-            for subject in chunk {
-                let rows = rows.remove(subject).unwrap_or_default();
-                let latest = fold_latest_actual(
-                    rows.iter()
-                        .filter(|(.., folded)| *folded)
-                        .map(|(_, kind, _, body, _)| (kind.clone(), body.clone())),
-                )?;
-                let sources = rows
-                    .into_iter()
-                    .map(|(id, kind, origin, body, _)| {
-                        let body = if kind == "runtime.observed" {
-                            serde_json::from_str::<Value>(&body).unwrap_or(Value::Null)
-                        } else {
-                            Value::Null
-                        };
-                        (id, kind, origin, body)
-                    })
-                    .collect::<Vec<_>>();
-                let host = self
-                    .desired
-                    .get(subject)
-                    .and_then(Option::as_ref)
-                    .and_then(|row| row.member.as_deref())
-                    .and_then(|value| serde_json::from_str::<crate::model::MemberSpec>(value).ok())
-                    .map(|member| member.host);
-                let source = select_actual_source(&sources, host.as_deref());
-                self.actual.insert(subject.clone(), ActualState { latest, source });
+            if let Some((held, items)) = current {
+                let items = canonical_order(connection, items)?;
+                self.fold_actual(held, items)?;
+            }
+            drop(rows);
+            for subject in &chunk {
+                if !self.actual.contains_key(subject) {
+                    self.fold_actual(subject.clone(), Vec::new())?;
+                }
+            }
+            for subject in again {
+                self.actual.remove(&subject);
+                chunks.push_back(vec![subject]);
             }
         }
+        Ok(())
+    }
+
+    /// Fold one subject's actual-state rows, as `latest_actual_at` and
+    /// `selected_actual_source_at` do.
+    fn fold_actual(&mut self, subject: String, rows: Vec<ActualRow>) -> Result<()> {
+        // Each body is parsed once, for the fold and for source selection both.
+        let mut parsed = Vec::with_capacity(rows.len());
+        for (id, kind, origin, body, folded) in rows {
+            let value = if folded {
+                serde_json::from_str::<Value>(&body)?
+            } else if kind == "runtime.observed" {
+                serde_json::from_str::<Value>(&body).unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+            parsed.push((id, kind, origin, value, folded));
+        }
+        let host = self
+            .desired
+            .get(&subject)
+            .and_then(Option::as_ref)
+            .and_then(|row| row.member.as_deref())
+            .and_then(|value| serde_json::from_str::<crate::model::MemberSpec>(value).ok())
+            .map(|member| member.host);
+        // Source selection reads the runtime bodies in place; then the fold takes them.
+        let source = {
+            let null = Value::Null;
+            let rows = parsed
+                .iter()
+                .map(|(id, kind, origin, value, _)| {
+                    let body = if kind == "runtime.observed" { value } else { &null };
+                    (id.as_str(), kind.as_str(), origin.as_str(), body)
+                })
+                .collect::<Vec<_>>();
+            select_actual_source(&rows, host.as_deref())
+        };
+        let latest = fold_latest_values(
+            parsed
+                .into_iter()
+                .filter(|(.., folded)| *folded)
+                .map(|(_, kind, _, value, _)| (kind, value)),
+        )?;
+        self.actual.insert(subject, ActualState { latest, source });
         Ok(())
     }
 
@@ -184,6 +284,19 @@ impl CardReads {
             .into_iter()
             .collect()
     }
+}
+
+/// Each subject's newest claim in canonical order at or before `?2`, for the subjects `?1`.
+/// The accepted-time index gives each subject's claims newest time first, so SQLite sorts only
+/// the claims of the newest millisecond, not the subject's whole history.
+pub(super) fn newest_claims_sql() -> String {
+    canonical_sql(
+        "SELECT subjects.value,
+                (SELECT id FROM claims INDEXED BY claims_subject_accepted_index
+                 WHERE subject=subjects.value AND store_index<=?2
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1)
+         FROM json_each(?1) subjects",
+    )
 }
 
 /// Each subject's newest claim index at or before `index`, one statement per chunk.
@@ -241,6 +354,10 @@ impl Store {
                 .collect::<Vec<_>>();
             reads.load_desired(connection, &candidates)?;
             let owner_subjects = if owners { reads.owners(&candidates) } else { Vec::new() };
+            // Owners are runs and generations. Their actual states are read before any
+            // declaration of theirs, so their selected source ignores a declared host; that holds
+            // only because no owner is itself a runtime this fold shows.
+            debug_assert!(owner_subjects.iter().all(|owner| !runtime_subject(owner)));
             let mut actual = candidates.clone();
             actual.extend(owner_subjects.iter().cloned());
             reads.load_actual(connection, &actual)?;
@@ -306,15 +423,8 @@ impl Store {
                ON claims.subject=subjects.value
              WHERE claims.store_index<=?2",
         )?;
-        // An undeclared card's provenance is its newest claim in canonical order. The index
-        // gives the newest accepted time first, so only that millisecond's claims are sorted.
-        let mut newest = connection.prepare_cached(&canonical_sql(
-            "SELECT subjects.value,
-                    (SELECT id FROM claims INDEXED BY claims_subject_accepted_index
-                     WHERE subject=subjects.value AND store_index<=?2
-                     ORDER BY CANONICAL_DESC(claims) LIMIT 1)
-             FROM json_each(?1) subjects",
-        ))?;
+        // An undeclared card's provenance is its newest claim in canonical order.
+        let mut newest = connection.prepare_cached(&newest_claims_sql())?;
         for chunk in batched.chunks(CHUNK) {
             let chunk = chunk.to_vec();
             reads.load_desired(connection, &chunk)?;
@@ -401,5 +511,280 @@ impl Store {
             }
         }
         Ok(statuses)
+    }
+}
+
+/// What the roster's per-card loop reads besides each agent's status, read for many agents at
+/// once: their harnesses and last activity, and which of them can have a suspension or a rollout
+/// to show, so that those readers run only for the agents that can have one.
+pub(crate) struct AgentCardReads {
+    index: u64,
+    harness: HashMap<String, Option<crate::model::CurrentHarnessView>>,
+    activity: HashMap<String, Option<u128>>,
+    suspensions: HashSet<String>,
+    rollouts: HashSet<String>,
+}
+
+impl AgentCardReads {
+    /// [`Store::observed_harness_at`] of `subject`.
+    pub(crate) fn take_harness(
+        &mut self,
+        store: &Store,
+        subject: &str,
+    ) -> Result<Option<crate::model::CurrentHarnessView>> {
+        match self.harness.remove(subject) {
+            Some(harness) => Ok(harness),
+            None => store.observed_harness_at(subject, self.index),
+        }
+    }
+
+    /// [`Store::agent_last_activity_at`] of `subject` with the harness it was read with.
+    pub(crate) fn last_activity_at(
+        &self,
+        store: &Store,
+        subject: &str,
+        incarnation: Option<&str>,
+    ) -> Result<Option<u128>> {
+        match self.activity.get(subject) {
+            Some(time) => Ok(*time),
+            None => store.agent_last_activity_at(subject, incarnation, self.index),
+        }
+    }
+
+    /// Whether `subject` has a suspend or resume request, without which
+    /// [`crate::suspension::current`] has nothing to show.
+    pub(crate) fn may_have_suspension(&self, subject: &str) -> bool {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        self.suspensions.contains(subject)
+    }
+
+    /// Whether `subject` is a member of an owned set or staged for one, without which
+    /// [`crate::rollout::status`] has nothing to show.
+    pub(crate) fn may_have_rollout(&self, subject: &str) -> bool {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        self.rollouts.contains(subject)
+    }
+}
+
+/// `(subject, incarnation)` pairs as one JSON array for `json_each`.
+fn json_pairs<'a>(pairs: impl IntoIterator<Item = (&'a String, &'a String)>) -> Result<String> {
+    Ok(serde_json::to_string(&pairs.into_iter().collect::<Vec<_>>())?)
+}
+
+fn parse_time(time: Option<String>) -> Option<u128> {
+    time.and_then(|time| time.parse::<u128>().ok())
+}
+
+impl Store {
+    /// The [`AgentCardReads`] of the agents `subjects` at `index`, a chunk of agents per
+    /// statement. `actual_claims` holds, for the agents whose status was reduced at `index`,
+    /// the actual-state claim it selected: an agent's newest runtime observation whenever it has
+    /// one, so the harness read takes it by id instead of sorting the agent's observations.
+    pub(crate) fn agent_card_reads(
+        &self,
+        subjects: &[String],
+        index: u64,
+        actual_claims: &HashMap<String, Option<String>>,
+    ) -> Result<AgentCardReads> {
+        let connection = self.readers.get();
+        let mut reads = AgentCardReads {
+            index,
+            harness: HashMap::new(),
+            activity: HashMap::new(),
+            suspensions: HashSet::new(),
+            rollouts: HashSet::new(),
+        };
+        // A harness view needs a runtime observation naming an incarnation; then a running one,
+        // or an admission refusal of that incarnation, is folded as `current_harness_fold_at`
+        // folds it. Every other agent has none.
+        let mut newest_runtime = connection.prepare_cached(&format!(
+            "SELECT subjects.value, runtime.body
+             FROM json_each(?1) subjects
+             JOIN claims runtime ON runtime.id=(
+                 SELECT claims.id FROM claims INDEXED BY claims_subject_kind_accepted_index
+                 JOIN batches ON batches.id=claims.batch_id
+                 WHERE claims.subject=subjects.value AND claims.kind='runtime.observed'
+                   AND +claims.store_index<=?2
+                 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1)"
+        ))?;
+        let mut claims_by_id = connection.prepare_cached(
+            "SELECT claims.id, claims.kind, claims.body FROM claims
+             WHERE claims.id IN (SELECT value FROM json_each(?1))",
+        )?;
+        let mut admission = connection.prepare_cached(
+            "SELECT json_extract(pairs.value, '$[0]') FROM json_each(?1) pairs
+             WHERE EXISTS(
+                 SELECT 1 FROM claims
+                 WHERE subject=json_extract(pairs.value, '$[0]') AND kind='harness.diagnostic'
+                   AND store_index<=?2
+                   AND json_extract(body, '$.fields.code')='harness-admission-failed'
+                   AND json_extract(body, '$.fields.incarnation_id')=json_extract(pairs.value, '$[1]'))",
+        )?;
+        // The statements of `agent_last_activity_at`, a chunk of agents at a time.
+        let mut activity = connection.prepare_cached(
+            "SELECT subjects.value,
+                    (SELECT accepted_at_unix_ms FROM claims
+                     WHERE actor=subjects.value AND kind IN ('work.progress','work.submitted')
+                       AND store_index<=?2 ORDER BY store_index DESC LIMIT 1),
+                    (SELECT accepted_at_unix_ms FROM claims
+                     WHERE kind='message.sent' AND json_extract(body, '$.fields.from')=subjects.value
+                       AND store_index<=?2 ORDER BY store_index DESC LIMIT 1),
+                    (SELECT accepted_at_unix_ms FROM claims
+                     WHERE kind='message.sent' AND json_extract(body, '$.fields.to')=subjects.value
+                       AND store_index<=?2 ORDER BY store_index DESC LIMIT 1)
+             FROM json_each(?1) subjects",
+        )?;
+        let mut timeline = connection.prepare_cached(
+            "SELECT json_extract(pairs.value, '$[0]'),
+                    (SELECT observed_at_unix_ms FROM local_observations
+                     WHERE subject=json_extract(pairs.value, '$[0]') AND kind='harness.timeline'
+                       AND json_extract(body, '$.fields.incarnation_id')=json_extract(pairs.value, '$[1]')
+                       AND json_extract(body, '$.fields.entry_type') IN ('message','content','tool_call','tool_result')
+                       AND after_store_index<=?2 ORDER BY id DESC LIMIT 1),
+                    (SELECT accepted_at_unix_ms FROM claims
+                     WHERE subject=json_extract(pairs.value, '$[0]') AND kind='harness.timeline'
+                       AND json_extract(body, '$.fields.incarnation_id')=json_extract(pairs.value, '$[1]')
+                       AND json_extract(body, '$.fields.entry_type') IN ('message','content','tool_call','tool_result')
+                       AND store_index<=?2 ORDER BY store_index DESC LIMIT 1)
+             FROM json_each(?1) pairs",
+        )?;
+        // `suspension::current` reads every suspend and resume request, at any index.
+        let mut suspensions = connection.prepare_cached(
+            "SELECT DISTINCT claims.subject
+             FROM json_each(?1) subjects
+             CROSS JOIN claims INDEXED BY claims_subject_kind_index
+               ON claims.subject=subjects.value AND claims.kind='runtime.action.requested'
+             WHERE claims.actor IS NOT NULL
+               AND json_extract(claims.body, CASE WHEN json_type(claims.body, '$.fields') IS NOT NULL
+                                                  THEN '$.fields.action' ELSE '$.action' END)
+                   IN ('suspend','resume')",
+        )?;
+        // A member no set owns has no rollout, unless a staged claim makes `guard_member` refuse.
+        let mut staged = connection.prepare_cached(
+            "SELECT DISTINCT claims.subject
+             FROM json_each(?1) subjects
+             CROSS JOIN claims INDEXED BY claims_owned_set_subject_index ON claims.subject=subjects.value
+             WHERE json_extract(claims.body, '$.owned_set') IS NOT NULL",
+        )?;
+        let mut members = owned_sets::owners_at(&connection, None)
+            .map_err(anyhow::Error::new)?
+            .into_keys()
+            .collect::<HashSet<_>>();
+        for view in owned_sets::selected(&connection, None).map_err(anyhow::Error::new)? {
+            members.extend(
+                owned_sets::effective_members(&connection, &view, None)
+                    .map_err(anyhow::Error::new)?
+                    .into_keys(),
+            );
+        }
+        let unique = subjects.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        for chunk in unique.chunks(CHUNK) {
+            let list = json_list(chunk)?;
+            let mut incarnations = BTreeMap::new();
+            let mut fold = Vec::new();
+            // Each agent's newest runtime observation: its selected actual claim when that is
+            // one, none when the selected claim is of another kind or there is none, and read
+            // by the canonical sort only for agents whose selection is not known.
+            let (known, unknown): (Vec<_>, Vec<_>) =
+                chunk.iter().partition(|subject| actual_claims.contains_key(*subject));
+            let selected = known
+                .iter()
+                .filter_map(|subject| Some((actual_claims[*subject].as_ref()?, *subject)))
+                .collect::<HashMap<_, _>>();
+            let mut runtimes = Vec::new();
+            if !selected.is_empty() {
+                for row in claims_by_id.query_map([json_list(selected.keys().copied())?], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })? {
+                    let (id, kind, body) = row?;
+                    if kind == "runtime.observed" {
+                        runtimes.push((selected[&id].clone(), body));
+                    }
+                }
+            }
+            if !unknown.is_empty() {
+                for row in newest_runtime.query_map(params![json_list(unknown)?, index], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })? {
+                    runtimes.push(row?);
+                }
+            }
+            for (subject, body) in runtimes {
+                let body: Value = serde_json::from_str(&body)?;
+                let fields = body.get("fields").unwrap_or(&body);
+                let Some(incarnation) = fields.get("incarnation_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if fields.get("status").and_then(Value::as_str) == Some("running") {
+                    fold.push(subject.clone());
+                }
+                incarnations.insert(subject, incarnation.to_owned());
+            }
+            let refused = incarnations
+                .iter()
+                .filter(|(subject, _)| !fold.contains(subject))
+                .collect::<Vec<_>>();
+            if !refused.is_empty() {
+                for row in admission.query_map(params![json_pairs(refused)?, index], |row| {
+                    row.get::<_, String>(0)
+                })? {
+                    fold.push(row?);
+                }
+            }
+            for subject in chunk {
+                reads.harness.insert(subject.clone(), None);
+            }
+            for subject in fold {
+                let mut harness =
+                    current_harness_fold_at(&connection, &subject, Some(index), false, false)?;
+                if let Some(view) = harness.as_mut() {
+                    seat_status::enrich_harness(&connection, &subject, Some(index), view)?;
+                }
+                reads.harness.insert(subject, harness);
+            }
+            for row in activity.query_map(params![list, index], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    [row.get::<_, Option<String>>(1)?, row.get(2)?, row.get(3)?],
+                ))
+            })? {
+                let (subject, times) = row?;
+                reads.activity.insert(subject, times.into_iter().filter_map(parse_time).max());
+            }
+            let observed = chunk
+                .iter()
+                .filter_map(|subject| {
+                    let harness = reads.harness.get(subject)?.as_ref()?;
+                    Some((subject, &harness.incarnation_id))
+                })
+                .collect::<Vec<_>>();
+            if !observed.is_empty() {
+                for row in timeline.query_map(params![json_pairs(observed)?, index], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })? {
+                    let (subject, local, replicated) = row?;
+                    let times = local
+                        .map(|time| time.max(0) as u128)
+                        .into_iter()
+                        .chain(parse_time(replicated));
+                    let newest = reads.activity.entry(subject).or_default();
+                    *newest = (*newest).into_iter().chain(times).max();
+                }
+            }
+            for row in suspensions.query_map(params![list], |row| row.get::<_, String>(0))? {
+                reads.suspensions.insert(row?);
+            }
+            for row in staged.query_map(params![list], |row| row.get::<_, String>(0))? {
+                reads.rollouts.insert(row?);
+            }
+            reads
+                .rollouts
+                .extend(chunk.iter().filter(|subject| members.contains(*subject)).cloned());
+        }
+        Ok(reads)
     }
 }

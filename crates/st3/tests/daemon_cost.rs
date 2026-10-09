@@ -314,6 +314,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "sets a run's outcome",
     ),
     (
+        "POST /v1/mission-runs/{run}/report-to",
+        "sets who a run reports to: one run row, two latest claims and one mission revision by key",
+    ),
+    (
         "POST /v1/revision-proposals/{proposal}/approve",
         "approves a revision",
     ),
@@ -763,6 +767,10 @@ const PROBES: &[Probe] = &[
     get(
         "GET /v1/mission-runs",
         "/v1/mission-runs?mission={mission_name}",
+    ),
+    get(
+        "GET /v1/mission-runs/tree",
+        "/v1/mission-runs/tree?root={run}&limit=50",
     ),
     get(
         "GET /v1/mission-overview",

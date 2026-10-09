@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "iOS Fabric proof screen checks an actual protected route (GET /v1/client/agents?limit=1) for an unpaired client instead of the public capabilities read.",
+  "commits": ["dbaf791a5d53daeff3c8f42266c2c73d6ca44f43"],
+  "replay": {"status": "none", "detail": "No daemon, store or projection code changed; the merge touches only the iOS app's Fabric proof screen, a new helper and its test."},
+  "schema": {"status": "none", "detail": "No database schema, claim or persisted-format change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and fleet coordination are unchanged."},
+  "compatibility": {"status": "none", "detail": "No protocol, route or gateway behavior changed. The proof screen's own check now requires a 401 or 403 carrying the st3.client error envelope from a protected route, because pairing discovery is public; it affects only that test screen."},
+  "downtime": {"status": "none", "detail": "No service restart or interruption; app-side test tooling only."},
+  "manual": {"status": "none", "detail": "No operator action. A test gateway whose protected route does not refuse an unpaired client now fails the proof, which is the intended check."},
+  "recovery": {"status": "none", "detail": "Revert the commit to restore the previous proof; no durable state is written."}
+}

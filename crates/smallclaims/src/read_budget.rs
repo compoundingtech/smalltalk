@@ -7,12 +7,16 @@
 
 use std::cell::RefCell;
 use std::panic::Location;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub struct ReadBudget(Arc<State>);
+
+type CancellationWaker = Mutex<Option<Waker>>;
 
 struct State {
     parent: Option<ReadBudget>,
@@ -22,6 +26,7 @@ struct State {
     read_site: OnceLock<&'static Location<'static>>,
     cancelled: AtomicBool,
     reported: AtomicBool,
+    cancellation_waiters: Mutex<Vec<Weak<CancellationWaker>>>,
 }
 
 thread_local! {
@@ -39,6 +44,7 @@ impl ReadBudget {
             read_site: OnceLock::new(),
             cancelled: AtomicBool::new(false),
             reported: AtomicBool::new(false),
+            cancellation_waiters: Mutex::new(Vec::new()),
         }))
     }
 
@@ -53,11 +59,23 @@ impl ReadBudget {
             read_site: OnceLock::new(),
             cancelled: AtomicBool::new(false),
             reported: AtomicBool::new(false),
+            cancellation_waiters: Mutex::new(Vec::new()),
         }))
     }
 
     pub fn cancel(&self) {
         self.0.cancelled.store(true, Ordering::Release);
+        let waiters = std::mem::take(
+            &mut *self.0.cancellation_waiters.lock().unwrap_or_else(PoisonError::into_inner),
+        );
+        for waiter in waiters {
+            if let Some(waiter) = waiter.upgrade() {
+                let waker = waiter.lock().unwrap_or_else(PoisonError::into_inner).take();
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }
+        }
     }
 
     pub fn expired(&self) -> bool {
@@ -90,6 +108,60 @@ impl ReadBudget {
 
     pub fn remaining(&self) -> Duration {
         self.0.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// Admission waits subscribe to every ancestor, so parent cancellation wakes both
+    /// async tasks and synchronous workers. Deadlines are timed by the admission caller.
+    pub(crate) fn cancellation(&self) -> Cancellation {
+        let cancellation = Cancellation {
+            budget: self.clone(),
+            waker: Arc::new(Mutex::new(None)),
+        };
+        let mut budget = Some(self);
+        while let Some(current) = budget {
+            current.0.cancellation_waiters.lock().unwrap_or_else(PoisonError::into_inner)
+                .push(Arc::downgrade(&cancellation.waker));
+            budget = current.0.parent.as_ref();
+        }
+        cancellation
+    }
+}
+
+pub(crate) struct Cancellation {
+    budget: ReadBudget,
+    waker: Arc<CancellationWaker>,
+}
+
+impl Future for Cancellation {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        if self.budget.expired() {
+            return Poll::Ready(());
+        }
+        let mut waker = self.waker.lock().unwrap_or_else(PoisonError::into_inner);
+        if !waker.as_ref().is_some_and(|waker| waker.will_wake(context.waker())) {
+            *waker = Some(context.waker().clone());
+        }
+        drop(waker);
+        // Cover cancellation between checking the budget and installing the waker.
+        if self.budget.expired() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for Cancellation {
+    fn drop(&mut self) {
+        let own = Arc::downgrade(&self.waker);
+        let mut budget = Some(&self.budget);
+        while let Some(current) = budget {
+            current.0.cancellation_waiters.lock().unwrap_or_else(PoisonError::into_inner)
+                .retain(|waiter| !waiter.ptr_eq(&own));
+            budget = current.0.parent.as_ref();
+        }
     }
 }
 
@@ -164,5 +236,31 @@ mod tests {
         });
         assert_eq!(result.unwrap_err().code, "read-deadline");
         assert_eq!(items, 0);
+    }
+
+    #[test]
+    fn cancellation_wakes_registered_wakers_through_ancestors() {
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Wake, Waker};
+        struct Counted(Arc<AtomicUsize>);
+        impl Wake for Counted {
+            fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+            fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        let parent = ReadBudget::new("/waker", Duration::from_secs(30));
+        let child = parent.child(Duration::from_secs(15));
+        let mut cancellation = child.cancellation();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(Counted(wakes.clone())));
+        let mut context = Context::from_waker(&waker);
+        assert_eq!(Pin::new(&mut cancellation).poll(&mut context), Poll::Pending);
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        // Cancelling the parent must reach a subscription made to the child.
+        parent.cancel();
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(Pin::new(&mut cancellation).poll(&mut context), Poll::Ready(()));
+        drop(cancellation);
+        parent.cancel();
+        assert_eq!(wakes.load(Ordering::SeqCst), 1, "a dropped subscription unregisters");
     }
 }

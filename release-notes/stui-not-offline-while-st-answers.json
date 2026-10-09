@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "stui says offline only when st also fails a fresh request; a lost live stream while a local st answers shows the reason and reconnects after the usual short wait, and each such lost stream is logged locally",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill, stored data or transcript change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Published schema, operations and contract digest are unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, retention or authority rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "stui-local status change only; the daemon, the Swift and TypeScript clients and the wire are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment; no data conversion or extra startup work."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery, durable payload or initialization changes. stui with a local daemon writes a bounded connection.log under its state directory; a paired device writes none."
+  }
+}

@@ -1673,4 +1673,8 @@ fn the_agent_card_fold_reads_set_owned_declarations_as_the_reduction_does() {
     }
     let indexes = (0..=store.index().unwrap()).collect::<Vec<_>>();
     super::card_fold_tests::assert_card_fold_parity(&store, &indexes);
+    let reads = store
+        .agent_card_reads(&["agent/garden/orchard".to_owned()], store.index().unwrap(), &HashMap::new())
+        .unwrap();
+    assert!(reads.may_have_rollout("agent/garden/orchard"));
 }

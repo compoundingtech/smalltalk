@@ -883,8 +883,14 @@ fn participants_trim_the_stable_checkpoint_and_keep_every_identity() {
     let held = claim_ids(&alder);
     let index = alder.index().unwrap();
     for node in [&alder, &birch] {
+        let reclaim_before = smallclaims::store::checkpoint::allocator_reclaim_stats_for_test();
         assert_eq!(kinds(&step(node, &context)), ["trimmed"]);
+        let reclaimed = smallclaims::store::checkpoint::allocator_reclaim_stats_for_test();
+        assert_eq!(reclaimed.0 - reclaim_before.0, 1,
+            "checkpoint application and its nested finish reclaim once");
         assert!(step(node, &context).is_empty());
+        assert_eq!(smallclaims::store::checkpoint::allocator_reclaim_stats_for_test(), reclaimed,
+            "periodic completed-checkpoint polling never reclaims");
     }
     // Every identity stays in the inventory, so the authority digest does not move, and
     // the graph is the same.
@@ -930,12 +936,16 @@ fn a_trim_that_stops_anywhere_finishes_the_same_after_a_restart() {
         assert_eq!(kinds(&step(&birch, &context)), ["trimmed"]);
         alder.set_trim_chunk_envelopes(2);
         alder.set_trim_fault(Some(fault));
+        let reclaim_before = smallclaims::store::checkpoint::allocator_reclaim_stats_for_test();
         assert!(alder.checkpoint_step(&context).is_err(), "{fault:?}");
+        assert_eq!(smallclaims::store::checkpoint::allocator_reclaim_stats_for_test().0 - reclaim_before.0, 1);
         drop(alder);
 
         let alder = Store::open(&path, "alder").unwrap();
+        let reclaim_before = smallclaims::store::checkpoint::allocator_reclaim_stats_for_test();
         let actions = step(&alder, &context);
         assert_eq!(kinds(&actions), ["trimmed"], "{fault:?}");
+        assert_eq!(smallclaims::store::checkpoint::allocator_reclaim_stats_for_test().0 - reclaim_before.0, 1);
         assert!(step(&alder, &context).is_empty());
         assert_eq!(claim_ids(&alder), claim_ids(&birch), "{fault:?}");
         assert_eq!(authority(&alder), authority(&birch), "{fault:?}");

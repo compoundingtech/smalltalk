@@ -1298,6 +1298,14 @@
       "verification": "shared API restart case"
     },
     {
+      "command": "st missions report-to",
+      "description": "Change who a running run tells when it fails, is cancelled or stalls, or clear it",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
       "command": "st missions requests",
       "description": "Show one subscription's automatic mission request queue",
       "tests": [
