@@ -6,9 +6,9 @@ use super::*;
 use crate::model::ReplicationInventory;
 use crate::store::tests::{exchange_from, receive_and_project};
 
-const PEOPLE: &[&str] = &["person/ada", "person/bo", "person/nobody"];
+const PEOPLE: &[&str] = &["person/ada", "person/robin", "person/visitor"];
 const ADA_LAYOUT: &str = "arrangement/person/ada/019a0000-0000-7000-8000-000000000001";
-const BO_LAYOUT: &str = "arrangement/person/bo/019a0000-0000-7000-8000-000000000002";
+const ROBIN_LAYOUT: &str = "arrangement/person/robin/019a0000-0000-7000-8000-000000000002";
 
 fn glass(person: &str, id: usize, name: &str) -> ClaimInput {
     ClaimInput {
@@ -73,7 +73,7 @@ fn refresh_and_check(store: &Store, view: OwnerView) -> Arc<OwnerListPublication
                 assert_eq!(published, view.rows(&connection, person, index)?, "{view:?} {person}");
                 if view == OwnerView::Arrangements {
                     // A window following one arrangement keeps that row of its owner's.
-                    for subject in [ADA_LAYOUT, BO_LAYOUT]
+                    for subject in [ADA_LAYOUT, ROBIN_LAYOUT]
                         .into_iter()
                         .filter(|subject| st3_schema::arrangements::owner(subject).ok() == Some(*person))
                     {
@@ -98,7 +98,7 @@ fn glasses_read_again_only_the_people_whose_glasses_changed() {
     let store = Store::open_memory("alder").unwrap();
     let ada = store.append_claim(&glass("person/ada", 1, "Desk")).unwrap();
     store.append_claim(&glass("person/ada", 2, "Phone")).unwrap();
-    let bo = store.append_claim(&glass("person/bo", 3, "Wall")).unwrap();
+    let robin = store.append_claim(&glass("person/robin", 3, "Wall")).unwrap();
     let first = refresh_and_check(&store, OwnerView::Glasses);
     assert_eq!(first.owners["person/ada"].len(), 2);
     assert_eq!(store.owner_list_reads(OwnerView::Glasses), (2, 1), "everyone, once");
@@ -107,15 +107,15 @@ fn glasses_read_again_only_the_people_whose_glasses_changed() {
     edit.fields.insert("base_revision".into(), json!(ada.id));
     store.append_claim(&edit).unwrap();
     let edited = refresh_and_check(&store, OwnerView::Glasses);
-    assert!(Arc::ptr_eq(&edited.owners["person/bo"], &first.owners["person/bo"]));
+    assert!(Arc::ptr_eq(&edited.owners["person/robin"], &first.owners["person/robin"]));
     assert_eq!(store.owner_list_reads(OwnerView::Glasses), (3, 1));
-    // A deletion removes Bo's entry.
-    let mut delete = glass("person/bo", 3, "Wall");
+    // A deletion removes Robin's entry.
+    let mut delete = glass("person/robin", 3, "Wall");
     delete.kind = "glass.deleted".into();
-    delete.fields = serde_json::from_value(json!({"base_revision":bo.id})).unwrap();
+    delete.fields = serde_json::from_value(json!({"base_revision":robin.id})).unwrap();
     store.append_claim(&delete).unwrap();
     let deleted = refresh_and_check(&store, OwnerView::Glasses);
-    assert!(!deleted.owners.contains_key("person/bo"));
+    assert!(!deleted.owners.contains_key("person/robin"));
     // A claim about something else reads nobody and keeps the same rows.
     store
         .append_claim(&ClaimInput {
@@ -143,7 +143,7 @@ fn glasses_converge_whichever_order_replication_delivers_them() {
     birch.set_write_clock_at(1_800_000_000_000).unwrap();
     alder.append_claim(&glass("person/ada", 1, "On alder")).unwrap();
     birch.append_claim(&glass("person/ada", 1, "On birch")).unwrap();
-    birch.append_claim(&glass("person/bo", 2, "Only birch")).unwrap();
+    birch.append_claim(&glass("person/robin", 2, "Only birch")).unwrap();
     let forward = Store::open_memory("cedar").unwrap();
     let reverse = Store::open_memory("elm").unwrap();
     for (target, sources) in [(&forward, [&alder, &birch]), (&reverse, [&birch, &alder])] {
@@ -164,15 +164,15 @@ fn arrangements_follow_edits_retirement_replication_reopen_and_forgotten_views()
     let a = Store::open_memory("alder").unwrap();
     a.append_client_claim(&arrangement(ADA_LAYOUT, "person/ada", json!([{"op":"create","name":"Work"}])))
         .unwrap();
-    a.append_client_claim(&arrangement(BO_LAYOUT, "person/bo", json!([{"op":"create","name":"Home"}])))
+    a.append_client_claim(&arrangement(ROBIN_LAYOUT, "person/robin", json!([{"op":"create","name":"Home"}])))
         .unwrap();
     let first = refresh_and_check(&a, OwnerView::Arrangements);
     assert_eq!(first.owners.len(), 2);
     a.append_client_claim(&arrangement(ADA_LAYOUT, "person/ada", json!([{"op":"rename","name":"Desk"}])))
         .unwrap();
     let renamed = refresh_and_check(&a, OwnerView::Arrangements);
-    assert!(Arc::ptr_eq(&renamed.owners["person/bo"], &first.owners["person/bo"]));
-    assert_eq!(store_reads(&a), (3, 1), "Ada again, not Bo");
+    assert!(Arc::ptr_eq(&renamed.owners["person/robin"], &first.owners["person/robin"]));
+    assert_eq!(store_reads(&a), (3, 1), "Ada again, not Robin");
     // Replication in either order converges, each receiver publishing after each exchange.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("arrangements.sqlite3");
@@ -184,11 +184,11 @@ fn arrangements_follow_edits_retirement_replication_reopen_and_forgotten_views()
     refresh_and_check(&b, OwnerView::Arrangements);
     sync(&b, &a);
     refresh_and_check(&a, OwnerView::Arrangements);
-    let mut retire = arrangement(BO_LAYOUT, "person/bo", json!([{"op":"retire"}]));
-    retire.actor = Some("person/bo".into());
+    let mut retire = arrangement(ROBIN_LAYOUT, "person/robin", json!([{"op":"retire"}]));
+    retire.actor = Some("person/robin".into());
     a.append_client_claim(&retire).unwrap();
     let retired = refresh_and_check(&a, OwnerView::Arrangements);
-    assert!(!retired.owners.contains_key("person/bo"));
+    assert!(!retired.owners.contains_key("person/robin"));
     sync(&a, &b);
     let before = refresh_and_check(&b, OwnerView::Arrangements);
     assert_eq!(before.owners, retired.owners);
