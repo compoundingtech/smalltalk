@@ -46,6 +46,7 @@ async fn cold_open_four_subscriptions_do_not_wait_for_slow_roster() {
         let raw = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
         let frame: Value = serde_json::from_str(raw.to_text().unwrap()).unwrap();
         assert_ne!(frame["id"], "agents", "cold roster admission must remain held");
+        assert_eq!(frame["kind"], if frame["id"] == "conversation" { "conversation" } else { "snapshot" });
         println!("cold-open independent first frame: {} {:.3} ms", frame["id"], start.elapsed().as_secs_f64() * 1000.0);
         received.insert(frame["id"].as_str().unwrap().to_owned());
     }
@@ -98,6 +99,8 @@ async fn cold_open_uncontended_snapshot_costs() {
             let (snapshot, items, has_more) = collection_items_with_windows(
                 &state, &session, &request, slots.clone().acquire_owned().await.unwrap(), windows.clone(),
             ).await.unwrap();
+            assert!(items.len() >= if collection == "agents" { 100 } else { 30 },
+                "use a sample-sized fixture with current missions and attention, not only history");
             let ready_ms = start.elapsed().as_secs_f64() * 1000.0;
             let order: Vec<_> = items.iter().map(|item| item["id"].clone()).collect();
             let frame = json!({"kind":"snapshot", "id":collection, "collection":collection,

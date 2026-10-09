@@ -15,6 +15,22 @@ fn main() {
     let store = st3::store::Store::open(&path, daemon_bench::NODE).unwrap();
     store.bind_fleet(daemon_bench::FLEET).unwrap();
     daemon_bench::generate(&store, "host", scale);
+    // The historical sampler closes almost every person request. Keep enough
+    // current requests to exercise an attention frame, not just its empty overhead.
+    for request in 0..(28.0 * scale).round() as usize {
+        store.ask_person(&st3::model::PersonAskRequest {
+            legacy_request: None,
+            person: "person/bench-operator".into(),
+            title: format!("Invented open decision {request}"),
+            reason: "An invented decision still needs a person.".into(),
+            actor: "agent/bench/host/standing-0".into(),
+            step: None,
+            new_run: Some(format!("cold-open-question-{request}")),
+            incarnation: None,
+            idempotency_key: format!("bench-cold-open-person-ask-{request}"),
+            request: None,
+        }).unwrap();
+    }
     println!("fixture claims={}", store.index().unwrap());
     drop(store);
     println!("ST_COLLECTION_FIXTURE={}", path.display());
