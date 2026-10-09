@@ -466,6 +466,22 @@ pub(crate) fn find_bound_transcript(
     find_bound_transcript_with(home, driver, native_id, None, &[])
 }
 
+/// Whether `hint`, a path a seat's hook recorded, can be this session's Claude transcript:
+/// Claude's layout `<config>/projects/<encoded cwd>/<session>.jsonl`, spelled with no link in any
+/// part of it. A recorded path is data a seat wrote, so it never reaches a file outside a
+/// `projects` directory, or through a symlinked parent.
+fn claude_transcript_hint(hint: &Path, filename: &str) -> bool {
+    hint.is_absolute()
+        && hint.file_name().and_then(|name| name.to_str()) == Some(filename)
+        && hint
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "projects")
+        && hint.canonicalize().is_ok_and(|real| real == hint)
+        && std::fs::symlink_metadata(hint).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// `find_bound_transcript`, also looking where a Claude seat on its own login keeps transcripts.
 /// `hint` is the path Claude gave the SessionStart hook for this very session, which follows the
 /// seat's `CLAUDE_CONFIG_DIR` whatever account it runs on; it counts only if it names this
@@ -491,11 +507,7 @@ pub(crate) fn find_bound_transcript_with(
     let codex_suffix = format!("-{filename}");
     let mut found: Option<SessionMetadata> = None;
     if driver == ExternalDriver::Claude
-        && let Some(hint) = hint.filter(|hint| {
-            hint.is_absolute()
-                && hint.file_name().and_then(|name| name.to_str()) == Some(filename.as_str())
-                && std::fs::symlink_metadata(hint).is_ok_and(|metadata| metadata.is_file())
-        })
+        && let Some(hint) = hint.filter(|hint| claude_transcript_hint(hint, &filename))
         && let Ok(Some(metadata)) = read_metadata(driver, hint)
     {
         found = Some(metadata);
@@ -4769,14 +4781,16 @@ mod tests {
     #[test]
     fn a_claude_seat_on_any_account_is_found_by_the_path_claude_gave_its_hook() {
         let home = tempfile::tempdir().unwrap();
+        // A recorded path must be spelled with no link, and a temporary directory may sit behind one.
+        let base = home.path().canonicalize().unwrap();
         let line = |id: &str| {
             format!(
                 r#"{{"sessionId":"{id}","timestamp":"2026-09-24T00:00:00Z","type":"user","message":{{"content":"hello"}}}}"#
             )
         };
         // Two accounts, neither under ~/.claude, in directories st has never heard of.
-        let first = home.path().join("logins/first/projects/-work");
-        let second = home.path().join("elsewhere/second-login/projects/-work");
+        let first = base.join("logins/first/projects/-work");
+        let second = base.join("elsewhere/second-login/projects/-work");
         fs::create_dir_all(&first).unwrap();
         fs::create_dir_all(&second).unwrap();
         fs::write(first.join("on-first.jsonl"), line("on-first")).unwrap();
@@ -4795,18 +4809,32 @@ mod tests {
         );
         // A declared account's login directory finds a seat whose binding recorded no path.
         let extra = [
-            home.path().join("logins/first/projects"),
-            home.path().join("elsewhere/second-login/projects"),
+            base.join("logins/first/projects"),
+            base.join("elsewhere/second-login/projects"),
         ];
         assert_eq!(find("on-first", None, &extra).unwrap().transcript, first.join("on-first.jsonl"));
         assert_eq!(find("on-second", None, &extra).unwrap().transcript, hint);
         // A recorded path never stands in for a different session, a relative path, or a link.
         assert!(find("on-first", Some(&hint), &[]).is_none());
         assert!(find("on-second", Some(Path::new("on-second.jsonl")), &[]).is_none());
-        let link = home.path().join("link/on-second.jsonl");
+        let link = base.join("link/on-second.jsonl");
         fs::create_dir_all(link.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&hint, &link).unwrap();
         assert!(find("on-second", Some(&link), &[]).is_none());
+        // A correctly named file outside any projects directory is not Claude's session file,
+        // even though the binding names both the file and the session.
+        let stray = base.join("stray/-work");
+        fs::create_dir_all(&stray).unwrap();
+        fs::write(stray.join("on-stray.jsonl"), line("on-stray")).unwrap();
+        assert!(find("on-stray", Some(&stray.join("on-stray.jsonl")), &[]).is_none());
+        // A symlinked parent directory is followed by an open but not by a recorded path, even
+        // when the spelled path looks like <config>/projects/<cwd>/<session>.jsonl.
+        let aliased = base.join("aliased/projects/-work");
+        fs::create_dir_all(aliased.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&second, &aliased).unwrap();
+        let through_link = aliased.join("on-second.jsonl");
+        assert!(through_link.is_file());
+        assert!(find("on-second", Some(&through_link), &[]).is_none());
     }
 
     #[cfg(target_os = "linux")]
