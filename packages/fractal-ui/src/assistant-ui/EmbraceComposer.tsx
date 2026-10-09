@@ -13,12 +13,16 @@ import {
   activeTrigger, defaultCommands, draftFromText, insertToken, serializeDraft,
   type Draft, type DraftToken, type MentionToken, type SerializedDraft, type SlashCommand,
 } from './embrace-composer/draft'
+import { ComposerSubmissions } from './EmbraceRuntime'
+
+export type ComposerDraftCause = 'user' | 'submit-reset' | 'restore' | 'send-failed-restore' | 'programmatic'
 
 export interface ComposerDraftSnapshot {
   readonly text: string
   /** Monotonic within this mounted composer; capture before starting an asynchronous storage read. */
   readonly revision: number
   readonly savedAt: number
+  readonly cause: ComposerDraftCause
 }
 export interface ComposerDraftRestore {
   readonly text: string
@@ -88,7 +92,6 @@ export interface EmbraceComposerProps {
 }
 
 const styles = stylex.create({
-  connectionSlot: { height: g.band, flexShrink: 0, display: 'flex', alignItems: 'end' },
   connectionNotice: { display: 'flex', alignItems: 'center', gap: s.md, width: '100%', maxHeight: g.band, overflowY: 'auto', paddingBlock: s.sm, color: text.fgMuted, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading },
   connectionOffline: { color: status.dangerFg },
   connectionCopy: { flex: '1 1 0', minWidth: 0, overflowWrap: 'anywhere' },
@@ -182,15 +185,30 @@ const groupPreviewLimit = 4
 export function EmbraceComposer(props: EmbraceComposerProps) {
   const aui = useAui()
   const readText = () => (aui.composer.__internal_getRuntime?.().getState() ?? aui.composer.getState()).text
-  const draftSnapshot = React.useRef<ComposerDraftSnapshot>({ text: readText(), revision: 0, savedAt: readText() === '' ? 0 : Date.now() })
+  const draftSnapshot = React.useRef<ComposerDraftSnapshot>({ text: readText(), revision: 0, savedAt: readText() === '' ? 0 : Date.now(), cause: 'programmatic' })
+  const cause = React.useRef<ComposerDraftCause>('programmatic')
+  const submissions = React.useContext(ComposerSubmissions)
+  const latestSubmission = React.useRef<{ id: number; revision: number } | undefined>(undefined)
+  const failedRestore = React.useRef<number | undefined>(undefined)
   const draftChange = React.useRef(props.onDraftChange)
   draftChange.current = props.onDraftChange
   const observeDraft = () => {
     const next = readText()
     const previous = draftSnapshot.current
+    if (next !== previous.text && failedRestore.current !== undefined) {
+      const revision = failedRestore.current
+      failedRestore.current = undefined
+      if (revision !== previous.revision) {
+        // Native failure recovery prepends the sent text; reject it if the user edited since sending.
+        aui.composer.setText(previous.text)
+        return previous
+      }
+      cause.current = 'send-failed-restore'
+    }
     if (next !== previous.text) {
-      draftSnapshot.current = { text: next, revision: previous.revision + 1, savedAt: Math.max(Date.now(), previous.savedAt + 1) }
+      draftSnapshot.current = { text: next, revision: previous.revision + 1, savedAt: Math.max(Date.now(), previous.savedAt + 1), cause: cause.current === 'submit-reset' && next !== '' ? 'programmatic' : cause.current }
       draftChange.current?.(draftSnapshot.current)
+      if (cause.current === 'send-failed-restore') cause.current = 'programmatic'
     }
     return draftSnapshot.current
   }
@@ -198,19 +216,27 @@ export function EmbraceComposer(props: EmbraceComposerProps) {
     getDraft: observeDraft,
     restoreDraft: ({ text: next, savedAt, expectedRevision }) => {
       const current = observeDraft()
-      if (expectedRevision !== current.revision || savedAt <= current.savedAt) return false
+      if (expectedRevision !== current.revision || !(savedAt > current.savedAt)) return false
       // Claim the revision before publishing: synchronous subscribers cannot replay an older restore.
-      draftSnapshot.current = { text: next, revision: current.revision + 1, savedAt }
+      draftSnapshot.current = { text: next, revision: current.revision + 1, savedAt, cause: 'restore' }
       aui.composer.setText(next)
       draftChange.current?.(draftSnapshot.current)
       return true
     },
   }))
   React.useLayoutEffect(() => {
-    if (props.ref === undefined && props.onDraftChange === undefined) return
+    if (props.ref === undefined && props.onDraftChange === undefined && submissions === undefined) return
     observeDraft()
     return aui.subscribe(observeDraft)
-  }, [aui, props.ref, props.onDraftChange])
+  }, [aui, props.ref, props.onDraftChange, submissions])
+  React.useLayoutEffect(() => submissions?.subscribe(event => {
+    if (event.type === 'start') latestSubmission.current = { id: event.id, revision: observeDraft().revision }
+    else if (latestSubmission.current?.id === event.id) failedRestore.current = latestSubmission.current.revision
+  }), [submissions, aui])
+  const markUserEdit = () => {
+    cause.current = 'user'
+    queueMicrotask(() => { if (cause.current === 'user') cause.current = 'programmatic' })
+  }
   const runtimeText = useAuiState(state => state.composer.text)
   const root = React.useRef<HTMLDivElement>(null)
   const [wrapped, setWrapped] = React.useState(false)
@@ -301,16 +327,21 @@ export function EmbraceComposer(props: EmbraceComposerProps) {
   const stacked = props.variant === 'C2' || wrapped || cramped || runtimeText.includes('\n')
   const composerProps = {
     ...props,
+    onRequestSubmit: (modified: boolean) => {
+      cause.current = 'submit-reset'
+      try {
+        if (props.onRequestSubmit !== undefined) props.onRequestSubmit(modified)
+        else aui.composer.send({ steer: false })
+      } finally { cause.current = 'programmatic' }
+    },
     style: [styles.adaptiveRoot, stacked ? styles.slab : props.variant === 'C3' ? styles.focusSlab : styles.pill, props.style],
     inputStyle: [styles.input, styles.growingEditor, props.inputStyle],
     fieldStyle: [stacked ? styles.field : styles.fieldRow, props.fieldStyle],
     footerStyle: [styles.adaptiveFooter, props.footerStyle],
     submitIcon: compact ? <Icon name="send" /> : props.submitIcon,
   }
-  return <CompactComposerContext.Provider value={densityContext}><div ref={root} data-testid="kit-composer" {...stylex.props(props.readingColumn === true && readingColumnStyles.column)}>
-    <div data-testid="composer-connection-slot" {...stylex.props(styles.connectionSlot)}>
-      {props.connectionNotice !== undefined && <div data-testid="composer-connection-notice" role="status" aria-live="polite" aria-atomic="true" {...stylex.props(styles.connectionNotice, props.connectionNotice.tone === 'offline' && styles.connectionOffline)}><span {...stylex.props(styles.connectionCopy)}>{props.connectionNotice.text}</span>{props.connectionNotice.action !== undefined && <Button onPress={props.connectionNotice.action.onPress} {...stylex.props(styles.button)}>{props.connectionNotice.action.label}</Button>}</div>}
-    </div>
+  return <CompactComposerContext.Provider value={densityContext}><div ref={root} data-testid="kit-composer" onInputCapture={markUserEdit} onClickCapture={markUserEdit} onKeyDownCapture={markUserEdit} {...stylex.props(props.readingColumn === true && readingColumnStyles.column)}>
+    {props.connectionNotice !== undefined && <div data-testid="composer-connection-notice" role="status" aria-live="polite" aria-atomic="true" {...stylex.props(styles.connectionNotice, props.connectionNotice.tone === 'offline' && styles.connectionOffline)}><span {...stylex.props(styles.connectionCopy)}>{props.connectionNotice.text}</span>{props.connectionNotice.action !== undefined && <Button onPress={props.connectionNotice.action.onPress} {...stylex.props(styles.button)}>{props.connectionNotice.action.label}</Button>}</div>}
     {(props.plainText ?? props.variant === 'C1') || props.input !== undefined ? <PlainComposer {...composerProps} /> : <TokenComposer {...composerProps} />}
   </div></CompactComposerContext.Provider>
 }
@@ -492,8 +523,8 @@ function TokenComposer({
     bridge(draft)
     // The store client snapshot updates on React commit; the native runtime reflects this bridge immediately.
     if (!composerStateNow().canSend) return
+    onSendDraft?.(draft)
     if (onRequestSubmit === undefined) {
-      onSendDraft?.(draft)
       // Explicit false matters: native send defaults to steering during an active queued run.
       aui.composer.send({ steer: false })
     } else onRequestSubmit(modified)

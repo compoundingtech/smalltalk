@@ -3,12 +3,13 @@ import * as stylex from '@stylexjs/stylex'
 import type { Meta, StoryObj } from '@storybook/react-vite'
 import { expect, userEvent, within, waitFor } from 'storybook/test'
 import { Button } from 'react-aria-components'
+import { MessageNotSentError } from '@assistant-ui/react'
 import { WorkLogV1 } from './assistant-ui/taste/WorkLogV1'
 import { ThinkingEntry } from './assistant-ui/composition/ThinkingEntry'
 import { Transcript } from './assistant-ui/composition/Transcript'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
 import { Input, CommandMenu } from './kit'
-import { EmbraceComposer, type EmbraceComposerHandle } from './assistant-ui/EmbraceComposer'
+import { EmbraceComposer, type EmbraceComposerHandle, type ComposerDraftCause } from './assistant-ui/EmbraceComposer'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
 import { surfaceVars as surface, textVars as ink, spaceVars as s, typeVars as t } from './assistant-ui/composition-tokens.stylex'
@@ -20,7 +21,10 @@ function WorkFocus({ scheme = 'dark' }: { scheme?: Scheme }) {
     <Button>After work log</Button>
   </section>
 }
-const styles = stylex.create({ root: { padding: s.xl, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, minHeight: '100vh' } })
+const styles = stylex.create({
+  root: { padding: s.xl, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, minHeight: '100vh' },
+  dock: { position: 'fixed', bottom: s.xl, insetInline: s.xl },
+})
 const meta = { title: 'Fractal UI/Small Fixes', component: WorkFocus, args: { scheme: 'dark' }, parameters: { layout: 'fullscreen' } } satisfies Meta<typeof WorkFocus>
 export default meta
 type Story = StoryObj<typeof meta>
@@ -123,15 +127,16 @@ export const PreserveNewerDraftLight: Story = { ...PreserveNewerDraft, args: { s
 function ConnectionDock({ scheme = 'dark' }: { scheme?: Scheme }) {
   const [notice, setNotice] = React.useState<'offline' | 'reconnecting'>()
   const [actions, setActions] = React.useState(0)
-  return <section {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><EmbraceRuntimeProvider options={{ messages: [], isRunning: false, onNew: async () => {} }}>
-    <EmbraceComposer variant="C1" onDraftChange={() => setNotice('offline')} connectionNotice={notice === undefined ? undefined : { tone: notice, text: notice === 'offline' ? 'Offline: your browser-local draft remains editable.' : 'Reconnecting to the conversation…', action: notice === 'offline' ? { label: 'Reconnect', onPress: () => { setActions(value => value + 1); setNotice('reconnecting') } } : undefined }} />
+  return <section {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><div {...stylex.props(styles.dock)}><EmbraceRuntimeProvider options={{ messages: [], isRunning: false, onNew: async () => {} }}>
+    <EmbraceComposer variant="C1" onDraftChange={draft => setNotice(draft.text === '' ? undefined : 'offline')} connectionNotice={notice === undefined ? undefined : { tone: notice, text: notice === 'offline' ? 'Offline: your browser-local draft remains editable.' : 'Reconnecting to the conversation…', action: notice === 'offline' ? { label: 'Reconnect', onPress: () => { setActions(value => value + 1); setNotice('reconnecting') } } : undefined }} />
     <output data-testid="connection-actions">{actions}</output>
-  </EmbraceRuntimeProvider></section>
+  </EmbraceRuntimeProvider></div></section>
 }
 export const ComposerConnectionNotice: Story = { render: args => <ConnectionDock {...args} />, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   const input = canvas.getByRole('textbox', { name: 'Message' })
   await expect(canvas.queryByTestId('composer-connection-notice')).toBeNull()
+  await expect(canvas.getByTestId('kit-composer').getBoundingClientRect().height).toBe(canvasElement.querySelector('form')!.getBoundingClientRect().height)
   input.focus()
   const before = input.getBoundingClientRect()
   let inputShift = 0
@@ -160,6 +165,57 @@ export const ComposerConnectionNotice: Story = { render: args => <ConnectionDock
     await waitFor(() => expect(notice).toHaveTextContent('Reconnecting to the conversation…'))
     await expect(within(notice).queryByRole('button')).toBeNull()
     await expect(input).toHaveValue('Keep my draft')
+    await userEvent.clear(input)
+    await waitFor(() => expect(canvas.queryByTestId('composer-connection-notice')).toBeNull())
+    await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+    const removed = input.getBoundingClientRect()
+    await expect([removed.x, removed.y, removed.width, removed.height]).toEqual([before.x, before.y, before.width, before.height])
+    await expect(input).toHaveFocus()
+    await expect(inputShift).toBe(0)
+    await expect(canvas.getByTestId('kit-composer').getBoundingClientRect().height).toBe(canvasElement.querySelector('form')!.getBoundingClientRect().height)
   } finally { observer.disconnect() }
 } }
 export const ComposerConnectionNoticeLight: Story = { ...ComposerConnectionNotice, args: { scheme: 'light' } }
+
+function DraftCauses({ scheme = 'dark' }: { scheme?: Scheme }) {
+  const reject = React.useRef<((error: Error) => void) | undefined>(undefined)
+  const [events, setEvents] = React.useState<readonly { cause: ComposerDraftCause; text: string }[]>([])
+  return <section {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><EmbraceRuntimeProvider options={{ messages: [], isRunning: false, onNew: () => { const pending = Promise.withResolvers<void>(); reject.current = pending.reject; return pending.promise } }}>
+    <EmbraceComposer variant="C1" onDraftChange={({ cause, text }) => setEvents(previous => [...previous, { cause, text }])} />
+    <Button onPress={() => setEvents([])}>Clear event log</Button>
+    <Button onPress={() => reject.current?.(new MessageNotSentError())}>Reject pending send</Button>
+    <output data-testid="draft-events">{JSON.stringify(events)}</output>
+  </EmbraceRuntimeProvider></section>
+}
+export const DraftChangeCauses: Story = { render: args => <DraftCauses {...args} />, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const input = canvas.getByRole('textbox', { name: 'Message' })
+  await userEvent.type(input, 'Sent text')
+  await userEvent.click(canvas.getByRole('button', { name: 'Clear event log' }))
+  await userEvent.click(canvas.getByRole('button', { name: 'Send' }))
+  await expect(input).toHaveValue('')
+  await expect(canvas.getByTestId('draft-events')).toHaveTextContent('[{"cause":"submit-reset","text":""}]')
+  await userEvent.click(canvas.getByRole('button', { name: 'Reject pending send' }))
+  await waitFor(() => expect(input).toHaveValue('Sent text'))
+  await expect(canvas.getByTestId('draft-events')).toHaveTextContent('"cause":"send-failed-restore"')
+  await userEvent.click(canvas.getByRole('button', { name: 'Clear event log' }))
+  await userEvent.clear(input)
+  await expect(canvas.getByTestId('draft-events')).toHaveTextContent('[{"cause":"user","text":""}]')
+} }
+export const DraftChangeCausesLight: Story = { ...DraftChangeCauses, args: { scheme: 'light' } }
+export const FailedSendPreservesNewerDraft: Story = { render: args => <DraftCauses {...args} />, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const input = canvas.getByRole('textbox', { name: 'Message' })
+  await userEvent.type(input, 'Sent text')
+  await userEvent.click(canvas.getByRole('button', { name: 'Send' }))
+  await expect(input).toHaveValue('')
+  await userEvent.type(input, 'Newer text')
+  await userEvent.click(canvas.getByRole('button', { name: 'Clear event log' }))
+  await userEvent.click(canvas.getByRole('button', { name: 'Reject pending send' }))
+  const settled = Promise.withResolvers<void>()
+  setTimeout(settled.resolve, 100)
+  await settled.promise
+  await expect(input).toHaveValue('Newer text')
+  await expect(canvas.getByTestId('draft-events')).toHaveTextContent('[]')
+} }
+export const FailedSendPreservesNewerDraftLight: Story = { ...FailedSendPreservesNewerDraft, args: { scheme: 'light' } }
