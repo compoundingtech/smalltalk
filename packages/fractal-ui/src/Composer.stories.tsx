@@ -92,7 +92,7 @@ function ComposerFrame({ policy, state, effort, frameId, composerWidth }: { read
       {snapshot.options.isRunning && <Button onPress={source.finish} {...stylex.props(styles.button)}>Finish run</Button>}
       {snapshot.offline && <Button onPress={source.reconnect} {...stylex.props(styles.button)}>Reconnect</Button>}
     </header>
-    <div {...stylex.props(styles.frameBody, composerWidth !== undefined && styles.budgetFrameBody)}>
+    <div data-testid="composer-geometry" {...stylex.props(styles.frameBody, composerWidth !== undefined && styles.budgetFrameBody)}>
       <ComposerSession draftKey={`fractal.composer.${frameId}.${state}.${effort}`} {...session} />
       <div aria-label="Accepted fixture messages" role="log" {...stylex.props(styles.receipts)}>{snapshot.receipts.map((receipt, index) => {
         const serialized = receipt.message.runConfig?.custom?.embraceDraft as SerializedDraft | undefined
@@ -134,6 +134,23 @@ const meta = {
 } satisfies Meta<typeof SingleComposer>
 export default meta
 type Story = StoryObj<typeof meta>
+
+/** Non-interacting fixtures let the source geometry gate measure real composer state, before any play mutates it. */
+export const Geometry: StoryObj<ComposerArgs & { compareLayout?: boolean; compareRunning?: boolean; compareTarget?: boolean; compareMentions?: boolean }> = {
+  beforeEach: clearDrafts,
+  argTypes: { compareLayout: { control: 'boolean' }, compareRunning: { control: 'boolean' }, compareTarget: { control: 'boolean' }, compareMentions: { control: 'boolean' } },
+  render: (args: ComposerArgs & { compareLayout?: boolean; compareRunning?: boolean; compareTarget?: boolean; compareMentions?: boolean }) => {
+    const axes = [
+      { flag: 'compareLayout', field: 'layout', choices: ['C1', 'C2', 'C3'], label: 'Layout comparison' },
+      { flag: 'compareRunning', field: 'running', choices: ['R1', 'R2', 'R3'], label: 'While running comparison' },
+      { flag: 'compareTarget', field: 'target', choices: ['K1', 'K2', 'K3'], label: 'Target/model comparison' },
+      { flag: 'compareMentions', field: 'mentions', choices: ['M1', 'M2', 'M3'], label: 'Mentions comparison' },
+    ] as const
+    const axis = axes.find(candidate => args[candidate.flag])
+    const policy = { layout: args.layout, running: args.running, mentions: args.mentions, target: args.target }
+    return axis === undefined ? <SingleComposer {...args} /> : <Surface scheme={args.scheme}><section role="region" aria-label={axis.label}><div {...stylex.props(styles.gallery)}>{axis.choices.map(choice => <ComposerFrame key={choice} policy={{ ...policy, [axis.field]: choice }} state={args.state} effort={args.effort} frameId={choice} />)}</div></section></Surface>
+  },
+}
 
 const settle = () => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
 const textbox = (canvasElement: HTMLElement) => within(canvasElement).getByRole('textbox')
