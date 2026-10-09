@@ -834,17 +834,28 @@ this PR does not claim one was provisioned.
 `Namespace usage` runs at 06:05 UTC on GitHub-hosted capacity and reports the previous
 UTC day's observed Namespace job execution minutes, split by event (merge_group,
 pull_request and other events). Cos can read the job summary and its 30-day JSON
-artifact for the morning cost check. The report has a 30-minute timeout: the first
-read-only full-history API invocation exceeded 15 minutes. This budget does not
-prove a fixed completion time as retained history grows. `python3 scripts/ci-namespace-usage --date YYYY-MM-DD
---output usage.json` also provides an on-demand report. It scans all retained workflow
-metadata, queries relevant jobs across all attempts, includes failed/cancelled execution,
-deduplicates job IDs and clips executions across midnight. The job identity must be
-an actual `nsc-runner-*`, rather than just a planned Namespace label. Queued jobs add
-no execution minutes. Missing/ambiguous Namespace runner identity or timestamps makes summary/JSON totals
-explicit partial lower bounds and fails the report. Queued/skipped jobs and known
-local/GitHub-hosted execution remain distinct. API failures or pagination limits fail
-visibly instead of declaring zero usage. Pagination is not an atomic history snapshot. Totals are operational execution minutes,
-not invoice dollars or billable unit minutes: provisioning before the first job step
-and deleted GitHub history are outside this method. Use Namespace's billing view
-for an invoice; the report preserves raw job IDs/timestamps for reconciliation.
+artifact for the morning cost check. The report has a 30-minute timeout, but request
+count is bounded separately: at most 800 GitHub API requests, leaving room below
+the standard job token's 1,000-request hourly repository limit (shared token use
+can still exhaust it). Every JSON records the actual call count and limit.
+`python3 scripts/ci-namespace-usage --date YYYY-MM-DD --output usage.json` also
+provides an on-demand report. It queries eight UTC creation days: the reporting
+day and seven prior days, so reruns of older runs are outside coverage. Each day
+is queried separately; a created-day search reaching GitHub's 1,000-result cap
+refuses completeness. Within this window it queries all attempts, includes
+failed/cancelled execution, deduplicates job IDs and clips executions across midnight.
+Every day total is explicitly a **daily lower bound**, never a complete-day or
+invoice total. “Complete window evidence” means only that this creation window
+was collected without known evidence gaps; it does not cover older-run reruns.
+The job identity must be an actual `nsc-runner-*`, rather than just a planned
+Namespace label. Queued/skipped jobs and queue cancellations with no runner or
+started step add no execution minutes. A started step with missing/ambiguous
+Namespace runner identity, or an actual Namespace runner with missing timestamps,
+makes summary/JSON totals explicitly partial and fails the report. Known local
+and GitHub-hosted execution stays excluded. API errors, exhausted request budgets
+or pagination limits retain collected JSON as partial lower-bound evidence before
+failing, rather than declaring zero usage. Pagination is not an atomic history snapshot.
+Totals are operational execution minutes, not invoice dollars or billable unit
+minutes: provisioning before the first job step and deleted GitHub history are
+outside this method. Use Namespace's billing view for an invoice; the report
+preserves raw job IDs/timestamps for reconciliation.

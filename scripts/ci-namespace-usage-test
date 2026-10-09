@@ -38,6 +38,11 @@ for name in ('ci1-1', 'hetz2-ci-merge-2', 'GitHub Actions 1234'):
     assert m['summarize']([{**unknown_identity, 'runner_name': name}], start, end)['complete']
 for change in ({'status': 'queued'}, {'conclusion': 'skipped'}):
     assert m['summarize']([{**unknown_identity, **change}], start, end)['complete']
+for completed_at in ('2026-10-08T12:10:00Z', '2026-10-07T12:10:00Z'):
+    cancelled_before_start = {**unknown_identity, 'status': 'completed',
+                              'conclusion': 'cancelled', 'steps': [], 'completed_at': completed_at}
+    r = m['summarize']([cancelled_before_start], start, end)
+    assert r['complete'] and r['execution_minutes'] == 0 and not r['ambiguous_runner_identity_jobs']
 assert not m['summarize']([missing], start, end)['complete']
 assert m['summarize']([{**jobs[0], 'runner_name': None}], end, end + timedelta(days=1))['complete']
 print('passed: executed Namespace identity ambiguity fails complete status; local/hosted/queued/skipped remain distinct; partial summaries')
@@ -45,3 +50,64 @@ responses = iter([{'jobs': [dict(id=i) for i in range(100)]}, {'jobs': [dict(id=
 m['pages'].__globals__['api'] = lambda _: next(responses)
 assert len(list(m['pages']('example?per_page=100', 'jobs'))) == 101
 print('passed: UTC boundaries, duplicate IDs, all attempts, failures, local/queued exclusion, missing evidence, pagination')
+
+# No network: bounded API calls stop before subprocess, and incomplete collection
+# still writes qualified JSON and summary before a nonzero verdict.
+import contextlib
+import io
+import json
+import sys
+import tempfile
+g = m['main'].__globals__
+original_api = m['api']
+g['api_requests'] = g['API_REQUEST_LIMIT']
+try:
+    original_api('never-requested')
+    raise AssertionError('budget must stop before a request')
+except RuntimeError as error:
+    assert 'budget exhausted' in str(error)
+g['api_requests'] = 0
+g['api'] = lambda _: {'workflow_runs': [], 'total_count': 1000}
+try:
+    list(m['pages']('created-day', 'workflow_runs', filtered=True))
+    raise AssertionError('filtered-search truncation must fail')
+except RuntimeError as error:
+    assert '1000-result' in str(error)
+
+def control(collection_failure):
+    paths = []
+    def fake_api(path):
+        g['api_requests'] += 1
+        paths.append(path)
+        if collection_failure:
+            raise RuntimeError('API request budget exhausted (800); remaining evidence unknown')
+        return {'workflow_runs': [], 'total_count': 0}
+    g['api_requests'] = 0
+    g['api'] = fake_api
+    with tempfile.TemporaryDirectory() as temp:
+        output = Path(temp) / 'usage.json'
+        saved = sys.argv
+        sys.argv = ['usage', '--date', '2026-10-08', '--output', str(output)]
+        text = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(text):
+                m['main']()
+            assert not collection_failure
+        except SystemExit:
+            assert collection_failure
+        finally:
+            sys.argv = saved
+        result = json.loads(output.read_text())
+    assert result['api_requests'] == len(paths)
+    assert result['api_request_limit'] == 800 and not result['full_day_complete']
+    assert result['rerun_creation_lookback_days'] == 7
+    assert result['creation_window_start'] == '2026-10-01T00:00:00+00:00'
+    assert result['creation_window_end'] == '2026-10-09T00:00:00+00:00'
+    assert result['complete'] == (not collection_failure)
+    assert bool(result['collection_errors']) == collection_failure
+    assert 'PARTIAL LOWER BOUND' in text.getvalue() if collection_failure else 'DAILY LOWER BOUND' in text.getvalue()
+    if not collection_failure:
+        assert len(paths) == 8 and all('&created=' in path for path in paths)
+control(False)
+control(True)
+print('passed: queue-cancelled current/prior-day exclusions, eight-day creation window, request budget, filtered cap, retained partial failure evidence')
