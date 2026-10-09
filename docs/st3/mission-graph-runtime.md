@@ -1338,6 +1338,26 @@ changing the launch ID explicitly requests a fresh attempt. No automatic boot in
 Pi treats an `@`-prefixed argument as a file even after `--`; such text gets a leading newline to
 keep it a literal message.
 
+An OMP harness can declare `seed "/absolute/path/time_UUID.jsonl"` to migrate an owner-local
+native transcript on its first native launch only. The transcript's filename and header must
+name the same UUID, every transcript line must be valid JSON, and the file must belong to the
+launch owner. The driver links only that transcript into its managed inventory, then atomically
+records a typed `seeded` outcome before spawning the provider. Missing or corrupt input records
+no outcome. Other harnesses do not accept `seed`; authored session selectors and resume
+environment cannot be combined with it.
+
+Every first native launch, including one without a seed or deliberately fresh, records one
+seat-scoped `seeded` or `fresh` outcome. Its identity does not depend on the declaration,
+transcript path, account, or harness. An existing native binding always wins. Later edits,
+restarts, fresh-context actions, account changes, and refused continuations never re-arm the
+opportunity. Strict suspension resume keeps its exact session selection.
+
+If an outcome exists but the seat has never bound a native session, the next launch fails
+explicitly with `first-native-launch-incomplete`; it never silently reseeds. This includes a
+crash after the receipt but before provider spawn and a provider failure before binding.
+Recover by inspecting the interrupted launch and its managed transcript; do not delete the
+durable outcome to request an automatic retry.
+
 A harness block cannot declare `prompt`. Parsing refuses it with `harness-prompt-removed`. Put the instruction in a step goal or send the seat a message.
 
 Each native harness driver installs the skill that `st skill` prints before it starts the harness. The skill describes how to use st: messages, work, and attention requests. It contains no mission goal and sets no rules of conduct.

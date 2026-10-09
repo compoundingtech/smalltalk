@@ -4465,6 +4465,9 @@ struct DriverArgs {
     initial_message: Option<String>,
     #[arg(long, requires = "initial_message")]
     initial_message_id: Option<String>,
+    /// OMP transcript selected only for the durable first native launch.
+    #[arg(long)]
+    seed: Option<PathBuf>,
     #[arg(last = true)]
     argv: Vec<String>,
 }
@@ -17429,6 +17432,19 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         if let Some(state) = st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV) {
             return resume_native_driver(client, subject, &args.driver, argv, &state).await;
         }
+        anyhow::ensure!(args.seed.is_none() || (args.driver == "omp"
+            && st3::native_resume::selector_scope(&args.driver, &argv).is_none()),
+            "native seed cannot accompany an authored session selector");
+        let incarnation = wait_for_agent_incarnation(client, subject).await?;
+        let paths = NativePaths::prepare(subject, &args.driver)?;
+        let sessions = paths.session_dir.join("provider-sessions");
+        if let Some(session) = st3::native_seed::first_launch(
+            client, subject, &incarnation, &args.driver, args.seed.as_deref(), &sessions,
+            st3::native_resume::requested().is_some(),
+        ).await? {
+            argv = st3::native_resume::pi_family_argv("omp", argv, &sessions, &session)
+                .map_err(|refusal| anyhow::anyhow!("{}: {}", refusal.code, refusal.reason))?;
+        }
         if let (Some(message), Some(id)) = (&args.initial_message, &args.initial_message_id) {
             // The durable launch receipt precedes invocation. A fresh incarnation never repeats
             // the first message; adoption resumes above without invoking a new provider.
@@ -17444,7 +17460,7 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         if args.driver == "codex" {
             return run_codex_native(client, subject, argv).await;
         }
-        return run_st2_native_driver(client, subject, &args.driver, argv).await;
+        return run_st2_native_driver(client, subject, &args.driver, argv, paths).await;
     }
     let (program, arguments) = args.argv.split_first().context("driver argv is empty")?;
     let mut child = tokio::process::Command::new(program)
@@ -17501,12 +17517,12 @@ async fn run_st2_native_driver(
     subject: &str,
     driver: &str,
     argv: Vec<String>,
+    paths: NativePaths,
 ) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the {driver} driver argv is empty");
     if driver == "claude" {
         reject_noninteractive_claude_argv(&argv)?;
     }
-    let paths = NativePaths::prepare(subject, driver)?;
     #[cfg(unix)]
     if matches!(driver, "pi" | "omp")
         && let Err(skip) = st3::native_resume::pi_family_link_transcript(

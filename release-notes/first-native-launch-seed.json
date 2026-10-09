@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add an OMP-only transcript seed fenced by one durable first native launch outcome per seat.",
+  "replay": {"status": "none", "detail": "Existing native binding claims win without rewriting history. First launch outcomes use the existing compare-and-create claim mechanism."},
+  "schema": {"status": "none", "detail": "No database migration. Adds typed custom.agent.first-native-launch receipts with fresh or seeded outcomes."},
+  "rules": {"status": "none", "detail": "Existing claim admission and actor authority remain unchanged."},
+  "compatibility": {"status": "changed", "detail": "Only OMP harness declarations accept seed. Seed conflicts with authored selectors and resume environment. Every native first launch records a seat-scoped outcome, independent of path, revision, account and harness."},
+  "manual": {"status": "changed", "detail": "Declare an absolute owner-local OMP transcript as seed rather than permanent resume arguments. Invalid input fails without consuming the opportunity."},
+  "recovery": {"status": "changed", "detail": "A receipt without any native binding is explicitly incomplete and never silently reseeds. Inspect the interrupted first launch and staged transcript; existing bindings retain ordinary continuation."},
+  "downtime": {"status": "unknown", "detail": "Normal daemon upgrade restart; interruption duration has not been measured."}
+}
