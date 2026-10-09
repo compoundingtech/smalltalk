@@ -11,7 +11,9 @@ build = "../../build.rs"
 anyhow = "1"
 crossterm = "0.29"
 ratatui = { workspace = true }
+smallclaims = { path = "../smallclaims" }
 st3-client = { path = "../st3-client" }
+st3-terminal-direct = { path = "../st3-terminal-direct" }
 st3-feed = { path = "../st3-feed" }
 st3-conversation-ui = { path = "../st3-conversation-ui", features = ["ratatui"] }
 st3-ui-model = { path = "../st3-ui-model" }
@@ -33,9 +35,9 @@ ratatui-image = { version = "11", default-features = false, features = ["crosste
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # Agent terminals attached through their PTY session (the gateway's raw stream), drawn here.
 alacritty_terminal = { version = "0.26", default-features = false }
-pty-client = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }
-pty-terminal = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }
-pty-core = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }
+pty-client = { git = "https://github.com/compoundingtech/pty", rev = "1ae8c187301034d2b343b6ec638f2b74c009f92e" }
+pty-terminal = { git = "https://github.com/compoundingtech/pty", rev = "1ae8c187301034d2b343b6ec638f2b74c009f92e" }
+pty-core = { git = "https://github.com/compoundingtech/pty", rev = "1ae8c187301034d2b343b6ec638f2b74c009f92e" }
 
 [[bin]]
 name = "stui"
@@ -47,7 +49,6 @@ name = "phone_client"
 test = true
 
 [dev-dependencies]
-smallclaims = { path = "../smallclaims" }
 st3 = { path = "../st3" }
 tempfile = "3"
 axum = { version = "0.8", features = ["ws"] }

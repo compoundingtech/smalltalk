@@ -44,6 +44,9 @@ pub struct Config {
     /// What this node does when an account nears its weekly limit. Off unless enabled.
     #[serde(skip_serializing_if = "LimitsConfig::is_default")]
     pub limits: LimitsConfig,
+    /// Background reconciliation start cap, reloaded with daemon policies.
+    #[serde(skip_serializing_if = "ReconcileConfig::is_default")]
+    pub reconcile: ReconcileConfig,
     /// `STATE/fleet/fleet.toml`, merged by `apply_fleet_file` after command-line overrides.
     #[serde(skip)]
     pub fleet: Option<FleetFile>,
@@ -177,6 +180,26 @@ impl LimitsConfig {
     }
 }
 
+/// `[reconcile]`: maximum background pass starts per minute, default30.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReconcileConfig {
+    pub max_passes_per_minute: u32,
+}
+
+impl Default for ReconcileConfig {
+    fn default() -> Self { Self { max_passes_per_minute: 30 } }
+}
+
+impl ReconcileConfig {
+    pub fn is_default(&self) -> bool { self == &Self::default() }
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!((1..=600).contains(&self.max_passes_per_minute),
+            "reconcile.max_passes_per_minute must be between 1 and 600");
+        Ok(())
+    }
+}
+
 /// The config file the running daemon was started with, so its `[limits]` can be read again.
 static DAEMON_CONFIG: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
@@ -190,6 +213,21 @@ pub fn set_daemon_config(path: Option<&Path>) {
 pub fn reload_daemon_limits() -> Option<Result<LimitsConfig>> {
     let path = DAEMON_CONFIG.get()?;
     Some(read_limits(path.as_deref()))
+}
+
+/// Read both policies once on the existing two-minute reload loop, outside database work.
+pub fn reload_daemon_policies() -> Option<Result<(LimitsConfig, ReconcileConfig)>> {
+    let path = DAEMON_CONFIG.get()?;
+    Some(read_daemon_policies(path.as_deref()))
+}
+
+fn read_daemon_policies(path: Option<&Path>) -> Result<(LimitsConfig, ReconcileConfig)> {
+    let selected = path.map(Path::to_path_buf).unwrap_or_else(Config::default_path);
+    anyhow::ensure!(selected.exists(), "st config {} is missing", selected.display());
+    let config = Config::load_unvalidated(Some(&selected))?;
+    config.limits.validate()?;
+    config.reconcile.validate()?;
+    Ok((config.limits, config.reconcile))
 }
 
 /// `[limits]` from a config file that must exist: a file that is missing for a moment must not
@@ -284,6 +322,7 @@ impl Default for Config {
             github: GithubConfig::default(),
             checkpoint: CheckpointConfig::default(),
             limits: LimitsConfig::default(),
+            reconcile: ReconcileConfig::default(),
             fleet: None,
         }
     }
@@ -391,6 +430,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.reconcile.validate()?;
         self.github.validate()?;
         anyhow::ensure!(
             matches!(
@@ -577,6 +617,28 @@ fn host_name() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reconcile_rate_defaults_and_bad_reload_preserves_the_callers_effective_value() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let (_, mut effective) = read_daemon_policies(Some(&path)).unwrap();
+        assert_eq!(effective.max_passes_per_minute, 30);
+        std::fs::write(&path, "[reconcile]\nmax_passes_per_minute=60\n").unwrap();
+        effective = read_daemon_policies(Some(&path)).unwrap().1;
+        for bad in ["0", "-1", "601", "4294967296", "\"bad\""] {
+            std::fs::write(&path, format!("[reconcile]\nmax_passes_per_minute={bad}\n")).unwrap();
+            assert!(read_daemon_policies(Some(&path)).is_err());
+            assert_eq!(effective.max_passes_per_minute, 60);
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_daemon_policies(Some(&path)).is_err());
+        assert_eq!(effective.max_passes_per_minute, 60);
+        std::fs::write(&path, "[reconcile]\nmax_passes_per_minute=15\n").unwrap();
+        effective = read_daemon_policies(Some(&path)).unwrap().1;
+        assert_eq!(effective.max_passes_per_minute, 15);
+    }
     use super::*;
     use tempfile::tempdir;
 

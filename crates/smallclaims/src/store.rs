@@ -1566,24 +1566,22 @@ pub fn insert_claim(
 /// writer floor this store took when it joined under a name the fleet had used before.
 pub fn next_replica_sequence(transaction: &Transaction<'_>, origin: &str) -> Result<u64> {
     transaction
-        .query_row(
+        .prepare_cached(
             "SELECT MAX(
                  COALESCE((SELECT MAX(replica_sequence) FROM batches WHERE origin=?1), 0),
                  COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='writer_floor/' || ?1), 0)
              ) + 1",
-            [origin],
-            |row| row.get(0),
-        )
+        )?
+        .query_row([origin], |row| row.get(0))
         .map_err(Into::into)
 }
 
 pub fn previous_batch_hash(transaction: &Transaction<'_>, origin: &str) -> Result<Option<String>> {
     transaction
-        .query_row(
+        .prepare_cached(
             "SELECT hash FROM batches WHERE origin=?1 ORDER BY replica_sequence DESC LIMIT 1",
-            [origin],
-            |row| row.get(0),
-        )
+        )?
+        .query_row([origin], |row| row.get(0))
         .optional()
         .map_err(Into::into)
 }
@@ -4914,6 +4912,9 @@ impl Store {
                 Some(connection) => Rc::new(connection),
                 None => guard.pinned.take().expect("a request loan holds its connection"),
             }),
+            transaction: Some(crate::windows::Timer::start(
+                crate::windows::StoreWork::ReadTransaction,
+            )),
         };
         drop(guard);
         let connection = pinned

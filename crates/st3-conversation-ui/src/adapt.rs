@@ -125,6 +125,9 @@ pub fn conversation_with_filters(
         })
         .collect::<BTreeSet<_>>();
     for entry in timeline {
+        if is_routine_record(entry, filters) {
+            continue;
+        }
         if mail.is_none() && is_bookkeeping(entry, filters) {
             continue;
         }
@@ -162,6 +165,27 @@ pub fn conversation_with_filters(
         if let TimelineBody::Content(content) = &entry.body
             && let Some((_, message)) = mail.take()
         {
+            // The harness's own echo of a delivery it received (`<channel>`, `<smalltalk-message>`,
+            // `<task-notification>`) is not the message's text: read it as such, never as raw markup.
+            let raw = content.text.as_deref().unwrap_or("");
+            if wraps_delivery(raw) {
+                let bodies = harness_bodies(true, raw, &shown, &mut delivered, filters);
+                for (index, mut body) in bodies.into_iter().enumerate() {
+                    if let Body::Mail { from, to, .. } = &mut body {
+                        *from = name(from);
+                        *to = name(to);
+                    }
+                    stamped.push((
+                        entry.timestamp.clone(),
+                        Entry {
+                            id: format!("{}#{index}", entry.id),
+                            at: at.clone(),
+                            body,
+                        },
+                    ));
+                }
+                continue;
+            }
             let mut body = content_text(content);
             for attachment in &message.attachments {
                 if !attachment.media_type.starts_with("image/")
@@ -581,6 +605,40 @@ fn claude_context_record(text: &str) -> bool {
     ["attachment", "system", "entry"]
         .iter()
         .any(|kind| text.starts_with(&format!("[unrecognized claude {kind} `")))
+}
+
+/// Status, usage and withheld-content records that repeat every turn and say nothing to read.
+/// A failure, a cancellation, a status with any detail beyond the plain `working` and `idle`, and
+/// any withholding reason other than the routine `sensitive-content` are still shown.
+fn is_routine_record(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> bool {
+    use st3_client::TimelineStatus;
+    filters.contains(&crate::DisplayFilter::Telemetry)
+        && match &entry.body {
+            TimelineBody::Usage(_) => true,
+            // A harness status st does not name becomes `waiting` with only its detail kept, so
+            // blocked, rate limited and waiting on approval arrive as `waiting` plus a detail:
+            // only the plain heartbeats are routine.
+            TimelineBody::Status(status) => {
+                let detail = status.detail.as_deref().map(str::trim).filter(|d| !d.is_empty());
+                // A status that carries blocks carries content, whatever it is called.
+                status.blocks.is_empty()
+                    && match status.status {
+                        TimelineStatus::Queued | TimelineStatus::Completed => true,
+                        TimelineStatus::Running => matches!(detail, None | Some("working")),
+                        TimelineStatus::Waiting => matches!(detail, None | Some("idle")),
+                        _ => false,
+                    }
+            }
+            TimelineBody::Redaction(redaction) => redaction.reason == "sensitive-content",
+            _ => false,
+        }
+}
+
+/// Whether harness-recorded text carries one of the delivery wrappers st reads.
+fn wraps_delivery(raw: &str) -> bool {
+    ["<channel", "<smalltalk-message", "<task-notification"]
+        .iter()
+        .any(|tag| raw.contains(tag))
 }
 
 fn is_bookkeeping(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> bool {

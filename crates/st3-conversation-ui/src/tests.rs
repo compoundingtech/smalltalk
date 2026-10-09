@@ -709,7 +709,7 @@ fn exposed_timeline_variants_media_and_unknown_payloads_are_visible() {
     let bodies = [
         (
             "status",
-            serde_json::json!({"status":"waiting","detail":"approval"}),
+            serde_json::json!({"status":"failed","detail":"approval"}),
         ),
         (
             "usage",
@@ -752,7 +752,7 @@ fn exposed_timeline_variants_media_and_unknown_payloads_are_visible() {
     let rendered = adapt::conversation(&timeline, &Default::default());
     let display = serde_json::to_string(&rendered).unwrap();
     for visible in [
-        "waiting",
+        "failed",
         "approval",
         "credential",
         "42",
@@ -769,7 +769,9 @@ fn exposed_timeline_variants_media_and_unknown_payloads_are_visible() {
     assert!(display.contains("must-not-render"));
     assert!(!display.contains("bounded read window"), "{display}");
     assert!(!display.contains("nothing in the harness"));
-    assert_eq!(rendered.len(), timeline.len());
+    // Every record is shown but the routine usage line, which is hidden by default.
+    assert!(!display.contains("usage:"), "{display}");
+    assert_eq!(rendered.len(), timeline.len() - 1);
 }
 
 #[test]
@@ -966,7 +968,15 @@ fn review_usage_is_compact_and_preserves_supplied_tokens_cost_and_semantics() {
     ] {
         let mut body = body;
         body["attribution"] = serde_json::json!({"agent_id":"ATTRIBUTION_SENTINEL","mission_run_id":"MISSION_SENTINEL","generation_id":null,"step_id":null});
-        let rendered = adapt::conversation(&[review_entry("usage", "assistant", body)], &Default::default());
+        let entries = [review_entry("usage", "assistant", body)];
+        // Routine usage lines are hidden by default; the record itself is unchanged.
+        assert!(adapt::conversation(&entries, &Default::default()).is_empty());
+        let without_telemetry = crate::DEFAULT_FILTERS
+            .iter()
+            .copied()
+            .filter(|filter| *filter != crate::DisplayFilter::Telemetry)
+            .collect::<Vec<_>>();
+        let rendered = adapt::conversation_with_filters(&entries, &Default::default(), &without_telemetry);
         assert!(matches!(&rendered[..], [Entry { body: Body::Event(line), .. }] if line == expected), "{rendered:?}");
     }
 }
@@ -1252,4 +1262,112 @@ fn native_run_shows_one_mail_and_collates_calls_without_bookkeeping() {
         adapt::conversation_with_filters(&items, &Default::default(), crate::SHOW_EVERYTHING).len(),
         items.len()
     );
+}
+
+/// A conversation as it reads in a real session: status, usage and withheld-content records every
+/// turn, a repeated channel error, and the harness's echo of two deliveries (a channel message and
+/// a background task) after message entries that name no sender. Shapes only; no real content.
+fn noise() -> Vec<st3_client::TimelineEntry> {
+    serde_json::from_str(include_str!("../../../fixtures/clients/transcripts/noise.json")).unwrap()
+}
+
+#[test]
+fn routine_records_and_delivery_echoes_do_not_reach_the_conversation() {
+    let items = noise();
+    let shown = adapt::conversation(&items, &Default::default());
+    let text = serde_json::to_string(&shown).unwrap();
+    // Nothing that reads as markup or as a heartbeat.
+    for gone in [
+        "<channel",
+        "<smalltalk-message",
+        "<task-notification",
+        "<task-id>",
+        "status: running",
+        "status: waiting",
+        "status: completed",
+        "usage:",
+        "sensitive-content",
+    ] {
+        assert!(!text.contains(gone), "{gone} reached the conversation: {text}");
+    }
+    // What a person needs is still there: the words, the failure, the other withholding reason,
+    // the transcript notice, and what each delivery was.
+    for kept in [
+        "Please run the build and tell me what fails.",
+        "I will run the build now.",
+        "status: failed",
+        "the harness reported an error",
+        "content withheld: credential",
+        "transcript unavailable",
+        "Run the clone command, then create a branch and work there.",
+        "background task completed",
+    ] {
+        assert!(text.contains(kept), "missing {kept}: {text}");
+    }
+    // The repeated channel error is one line with a count once the records between are gone.
+    let errors = shown
+        .iter()
+        .filter_map(|entry| match &entry.body {
+            Body::Event(line) if line.contains("claude-channel-unattached") => Some(line.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].ends_with("×3"), "{errors:?}");
+}
+
+#[test]
+fn the_filter_hides_a_view_only_and_every_record_stays_available() {
+    let items = noise();
+    // Showing everything keeps all of it, as reversible JSON.
+    assert_eq!(
+        adapt::conversation_with_filters(&items, &Default::default(), crate::SHOW_EVERYTHING).len(),
+        items.len()
+    );
+    // Without the telemetry filter the routine lines come back, in words.
+    let without = crate::DEFAULT_FILTERS
+        .iter()
+        .copied()
+        .filter(|filter| *filter != crate::DisplayFilter::Telemetry)
+        .collect::<Vec<_>>();
+    let text = serde_json::to_string(&adapt::conversation_with_filters(&items, &Default::default(), &without)).unwrap();
+    for back in ["status: waiting", "usage: context occupancy", "content withheld: sensitive-content"] {
+        assert!(text.contains(back), "{back} should return: {text}");
+    }
+}
+
+#[test]
+fn a_waiting_or_running_status_with_a_real_reason_is_never_hidden() {
+    let status = |kind: &str, detail: Option<&str>| {
+        let mut body = serde_json::json!({"status": kind});
+        if let Some(detail) = detail {
+            body["detail"] = serde_json::json!(detail);
+        }
+        review_entry("status", "system", body)
+    };
+    let shown = |entry: st3_client::TimelineEntry| adapt::conversation(&[entry], &Default::default()).len();
+    // The plain heartbeats are hidden.
+    for routine in [
+        status("waiting", None),
+        status("waiting", Some("idle")),
+        status("running", None),
+        status("running", Some("working")),
+        status("queued", None),
+        status("completed", None),
+    ] {
+        assert_eq!(shown(routine.clone()), 0, "{routine:?}");
+    }
+    // A harness state st has no word for arrives as `waiting` plus a detail: it is a reason.
+    for reason in ["rate limited", "waiting on approval", "blocked", "needs login"] {
+        assert_eq!(shown(status("waiting", Some(reason))), 1, "{reason}");
+    }
+    assert_eq!(shown(status("running", Some("compacting"))), 1);
+    // A plain-looking status that carries blocks carries content.
+    let mut with_blocks = serde_json::json!({"status":"waiting","detail":"idle"});
+    with_blocks["blocks"] = serde_json::json!([{
+        "id":"block/1","kind":"text","source_type":"status","visibility":"visible","payload":{"text":"approve?"}
+    }]);
+    assert_eq!(shown(review_entry("status", "system", with_blocks)), 1);
+    assert_eq!(shown(status("failed", None)), 1);
+    assert_eq!(shown(status("cancelled", None)), 1);
 }

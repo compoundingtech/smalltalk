@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""UTC clipping, attempts, failures and absent evidence must not fabricate daily usage."""
+import runpy
+from datetime import timedelta
+from pathlib import Path
+m = runpy.run_path(str(Path(__file__).with_name('ci-namespace-usage')))
+start = m['timestamp']('2026-10-08T00:00:00Z')
+end = start + timedelta(days=1)
+jobs = [dict(id=1, run_id=7, run_attempt=1, event='merge_group', name='linux-tests',
+             runner_name='nsc-runner-test', labels=['namespace-profile-linux-x86-64'],
+             status='completed', conclusion='failure',
+             steps=[dict(started_at='2026-10-07T23:59:00Z')], completed_at='2026-10-08T00:01:00Z'),
+        dict(id=2, run_id=7, run_attempt=2, event='merge_group', name='linux-tests',
+             runner_name='nsc-runner-test2', status='completed', conclusion='success',
+             steps=[dict(started_at='2026-10-08T23:59:00Z')], completed_at='2026-10-09T00:01:00Z')]
+r = m['summarize'](jobs + [jobs[0]], start, end)
+assert r['execution_minutes'] == 2 and r['minutes_by_event'] == {'merge_group': 2}
+assert len(r['jobs']) == 2 and r['jobs'][0]['conclusion'] == 'failure'
+local = {**jobs[0], 'id': 3, 'runner_name': 'hetz2-ci-1'}
+queued = {**jobs[0], 'id': 4, 'status': 'queued'}
+missing = {**jobs[0], 'id': 5, 'steps': []}
+missing_terminal = {**jobs[0], 'id': 6, 'completed_at': None}
+r = m['summarize']([local, queued, missing, missing_terminal], start, end)
+assert r['execution_minutes'] == 0 and r['missing_execution_timestamp_job_ids'] == [5, 6]
+assert m['summarize']([jobs[0]], end, end + timedelta(days=1))['execution_minutes'] == 0
+# Speed's exact counterexample must not become a complete zero-usage day.
+unknown_identity = {**jobs[0], 'id': 7, 'runner_name': None,
+                    'steps': [dict(started_at='2026-10-08T12:00:00Z')],
+                    'completed_at': '2026-10-08T12:10:00Z'}
+renamed = {**unknown_identity, 'id': 8, 'runner_name': 'unrecognized-cloud-worker'}
+r = m['summarize']([unknown_identity, renamed], start, end)
+assert r['execution_minutes'] == 0 and not r['complete']
+assert [job['id'] for job in r['ambiguous_runner_identity_jobs']] == [7, 8]
+r.update(date='2026-10-08', limits='not invoice minutes')
+assert 'PARTIAL LOWER BOUND' in m['render'](r)
+assert 'Total observed (PARTIAL LOWER BOUND)' in m['render'](r)
+for name in ('ci1-1', 'hetz2-ci-merge-2', 'GitHub Actions 1234'):
+    assert m['summarize']([{**unknown_identity, 'runner_name': name}], start, end)['complete']
+for change in ({'status': 'queued'}, {'conclusion': 'skipped'}):
+    assert m['summarize']([{**unknown_identity, **change}], start, end)['complete']
+for completed_at in ('2026-10-08T12:10:00Z', '2026-10-07T12:10:00Z'):
+    cancelled_before_start = {**unknown_identity, 'status': 'completed',
+                              'conclusion': 'cancelled', 'steps': [], 'completed_at': completed_at}
+    r = m['summarize']([cancelled_before_start], start, end)
+    assert r['complete'] and r['execution_minutes'] == 0 and not r['ambiguous_runner_identity_jobs']
+assert not m['summarize']([missing], start, end)['complete']
+assert m['summarize']([{**jobs[0], 'runner_name': None}], end, end + timedelta(days=1))['complete']
+print('passed: executed Namespace identity ambiguity fails complete status; local/hosted/queued/skipped remain distinct; partial summaries')
+responses = iter([{'jobs': [dict(id=i) for i in range(100)]}, {'jobs': [dict(id=100)]}])
+m['pages'].__globals__['api'] = lambda _: next(responses)
+assert len(list(m['pages']('example?per_page=100', 'jobs'))) == 101
+print('passed: UTC boundaries, duplicate IDs, all attempts, failures, local/queued exclusion, missing evidence, pagination')
+
+# No network: bounded API calls stop before subprocess, and incomplete collection
+# still writes qualified JSON and summary before a nonzero verdict.
+import contextlib
+import io
+import json
+import sys
+import tempfile
+g = m['main'].__globals__
+original_api = m['api']
+g['api_requests'] = g['API_REQUEST_LIMIT']
+try:
+    original_api('never-requested')
+    raise AssertionError('budget must stop before a request')
+except RuntimeError as error:
+    assert 'budget exhausted' in str(error)
+g['api_requests'] = 0
+g['api'] = lambda _: {'workflow_runs': [], 'total_count': 1000}
+try:
+    list(m['pages']('created-day', 'workflow_runs', filtered=True))
+    raise AssertionError('filtered-search truncation must fail')
+except RuntimeError as error:
+    assert '1000-result' in str(error)
+
+def control(collection_failure):
+    paths = []
+    def fake_api(path):
+        g['api_requests'] += 1
+        paths.append(path)
+        if collection_failure:
+            raise RuntimeError('API request budget exhausted (4000); remaining evidence unknown')
+        return {'workflow_runs': [], 'total_count': 0}
+    g['api_requests'] = 0
+    g['api'] = fake_api
+    with tempfile.TemporaryDirectory() as temp:
+        output = Path(temp) / 'usage.json'
+        saved = sys.argv
+        sys.argv = ['usage', '--date', '2026-10-08', '--output', str(output)]
+        text = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(text):
+                m['main']()
+            assert not collection_failure
+        except SystemExit:
+            assert collection_failure
+        finally:
+            sys.argv = saved
+        result = json.loads(output.read_text())
+    assert result['api_requests'] == len(paths)
+    assert result['api_request_limit'] == 4000 and not result['full_day_complete']
+    assert result['rerun_creation_lookback_days'] == 7
+    assert result['creation_window_start'] == '2026-10-01T00:00:00+00:00'
+    assert result['creation_window_end'] == '2026-10-09T00:00:00+00:00'
+    assert result['complete'] == (not collection_failure)
+    assert bool(result['collection_errors']) == collection_failure
+    assert 'PARTIAL LOWER BOUND' in text.getvalue() if collection_failure else 'DAILY LOWER BOUND' in text.getvalue()
+    if not collection_failure:
+        assert len(paths) == 8 and all('&created=' in path for path in paths)
+control(False)
+control(True)
+print('passed: queue-cancelled current/prior-day exclusions, eight-day creation window, request budget, filtered cap, retained partial failure evidence')
+
+# 1,699-run day from the review's actual volume fits split queries, without
+# treating the first 1,000-search response as the complete set. No API call here.
+from urllib.parse import parse_qs, urlsplit
+all_runs = [dict(id=i, created_at=(start + timedelta(seconds=i * 50)).isoformat()) for i in range(1699)]
+queries = []
+def split_api(path):
+    q = parse_qs(urlsplit(path).query)
+    lo, hi = q['created'][0].split('..')
+    matching = [run for run in all_runs if m['timestamp'](lo) <= m['timestamp'](run['created_at']) <= m['timestamp'](hi)]
+    page = int(q['page'][0]); queries.append(path)
+    return dict(total_count=len(matching), workflow_runs=matching[(page-1)*100:page*100])
+g['api'] = split_api
+assert [r['id'] for r in m['created_runs']('example/repo', start, end)] == list(range(1699))
+assert len(queries) < 30
+g['api'] = lambda _: {'total_count': 1000, 'workflow_runs': []}
+try:
+    list(m['created_runs']('example/repo', start, start + timedelta(seconds=1)))
+    raise AssertionError('unresolvable saturated second must fail')
+except RuntimeError as error:
+    assert 'saturated' in str(error)
+# Check real API parser with subprocess stand-ins, including lower-limit refusal.
+from types import SimpleNamespace
+original_run = g['subprocess'].run
+try:
+    for limit in (5000, 1000):
+        g['api_requests'] = 0; g['rate_limit'] = None; g['lowest_remaining'] = None
+        g['subprocess'].run = lambda *a, **k: SimpleNamespace(returncode=0, stderr='', stdout=f'HTTP/2.0 200 OK\nX-Ratelimit-Limit: {limit}\nX-Ratelimit-Remaining: {limit-1}\n\n{{"jobs": []}}')
+        try:
+            result = original_api('stand-in')
+            assert limit == 5000 and result == {'jobs': []}
+        except RuntimeError as error:
+            assert limit == 1000 and 'below' in str(error)
+        assert g['api_requests'] == 1 and g['rate_limit'] == limit
+finally:
+    g['subprocess'].run = original_run
+print('passed: 1699-run split-day coverage, second-level cap refusal, API request/rate metadata and insufficient credential refusal')
+
+g['api_requests'] = 0; g['lowest_remaining'] = 500
+try:
+    original_api('never-requested-reserve')
+    raise AssertionError('reserve must stop before request')
+except RuntimeError as error:
+    assert 'reserve reached' in str(error)
+assert g['api_requests'] == 0
+print('passed: preserve 500 remaining shared-token requests for runner admission')
+
+# Reruns starting after the day, including active ones without a terminal, are
+# outside coverage for known and unknown runner identities before clamping.
+for runner in ('nsc-runner-active', None):
+    after_day = {**unknown_identity, 'runner_name': runner, 'status': 'in_progress',
+                 'steps': [dict(started_at='2026-10-09T12:00:00Z')], 'completed_at': None}
+    before_day = {**unknown_identity, 'runner_name': runner,
+                  'steps': [dict(started_at='2026-10-07T12:00:00Z')],
+                  'completed_at': '2026-10-07T12:10:00Z'}
+    for job in (after_day, before_day):
+        result = m['summarize']([job], start, end)
+        assert result['complete'] and result['execution_minutes'] == 0
+    reversed_interval = {**unknown_identity, 'runner_name': runner,
+                         'completed_at': '2026-10-08T11:59:00Z'}
+    try:
+        m['summarize']([reversed_interval], start, end)
+        raise AssertionError('reversed in-window interval must be refused')
+    except ValueError as error:
+        assert 'terminal before first step' in str(error)
+# Collection succeeds, but malformed execution evidence still writes partial
+# JSON with the named error rather than losing the report to a traceback.
+run = dict(id=77, created_at='2026-10-08T00:00:00Z', updated_at='2026-10-08T13:00:00Z', status='completed', event='pull_request')
+def invalid_api(path):
+    g['api_requests'] += 1
+    if '/jobs?' in path:
+        return {'jobs': [{**reversed_interval, 'runner_name': 'nsc-runner-bad'}]}
+    return {'total_count': 1, 'workflow_runs': [run]}
+g['api_requests'] = 0; g['api'] = invalid_api
+with tempfile.TemporaryDirectory() as temp:
+    output = Path(temp) / 'partial.json'; saved = sys.argv
+    sys.argv = ['usage', '--date', '2026-10-08', '--output', str(output)]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            m['main']()
+        raise AssertionError('malformed execution must exit nonzero')
+    except SystemExit:
+        partial = json.loads(output.read_text())
+        assert not partial['complete'] and not partial['full_day_complete']
+        assert any('job 7: terminal before first step' in error for error in partial['collection_errors'])
+    finally:
+        sys.argv = saved
+print('passed: known/unknown runner intervals outside UTC day excluded; reversed in-window timestamps refuse with partial JSON')
+
+# Every response requires fresh limit AND remaining values, including after a
+# valid prior response; missing/invalid headers cannot bypass the reserve.
+try:
+    for previous in (False, True):
+        for headers in ('X-Ratelimit-Limit: 5000', 'X-Ratelimit-Remaining: 4999', '',
+                        'X-Ratelimit-Limit: bad\nX-Ratelimit-Remaining: 4999',
+                        'X-Ratelimit-Limit: 5000\nX-Ratelimit-Remaining: -1',
+                        'X-Ratelimit-Limit: 5000\nX-Ratelimit-Remaining: 5001'):
+            g['api_requests'] = 0
+            g['rate_limit'] = 5000 if previous else None
+            g['lowest_remaining'] = 4999 if previous else None
+            g['subprocess'].run = lambda *a, **k: SimpleNamespace(returncode=0, stderr='', stdout=f'HTTP/2.0 200 OK\n{headers}\n\n{{"jobs": []}}')
+            try:
+                original_api('rejected-header-stand-in')
+                raise AssertionError('incomplete/invalid current metadata must fail')
+            except RuntimeError as error:
+                assert 'capacity unknown' in str(error)
+            assert g['api_requests'] == 1
+    # Legitimate active crossing-midnight work keeps the clipped minute.
+    real_datetime = g['datetime']
+    class FixedNow(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return end + timedelta(hours=1)
+    g['datetime'] = FixedNow
+    crossing = {**jobs[1], 'status': 'in_progress', 'completed_at': None}
+    assert m['summarize']([crossing], start, end)['execution_minutes'] == 1
+finally:
+    g['subprocess'].run = original_run
+    g['datetime'] = real_datetime
+print('passed: fresh initial/subsequent rate-limit metadata required; invalid bounds rejected; legitimate active midnight clipping retained')

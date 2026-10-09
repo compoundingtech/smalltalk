@@ -25,6 +25,7 @@ members = [
   "crates/st3-feed",
   "crates/st3-migrate",
   "crates/st3-schema",
+  "crates/st3-terminal-direct",
   "crates/st3-ui-model",
   "crates/stui",
 ]
@@ -43,6 +44,7 @@ default-members = [
   "crates/st3-feed",
   "crates/st3-migrate",
   "crates/st3-schema",
+  "crates/st3-terminal-direct",
   "crates/st3-ui-model",
   "crates/stui",
 ]

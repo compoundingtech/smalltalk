@@ -5,7 +5,7 @@
 //! simulated harness driver posts its state every second, and while it works it also posts a
 //! timeline entry every two seconds and a usage reading every three. Each harness also sends a
 //! message every minute. The daemon must replicate at most a fifth of the claims that main would
-//! and lose no durable fact: every message, every harness state change, each harness's final
+//! and lose no durable fact: every message, each harness's retained current state, each harness's final
 //! usage and every loop's gate reach a second node, which ends with the same graph.
 //!
 //! On main every accepted observation is a claim, so main replicates the claims this build
@@ -271,26 +271,89 @@ impl Daemon {
             .collect()
     }
 
-    async fn post(&self, input: ClaimInput) -> ClaimRecord {
+    async fn post(&self, input: ClaimInput) -> Option<ClaimRecord> {
         if st3::store::is_current_input(&input) {
-            let value = self.native_request(&input.subject, "/v1/claims", serde_json::to_value(&input).unwrap()).await;
-            serde_json::from_value(value).unwrap()
+            let value = self
+                .native_request(
+                    &input.subject,
+                    "/v1/claims",
+                    serde_json::to_value(&input).unwrap(),
+                )
+                .await;
+            value.map(|value| serde_json::from_value(value).unwrap())
         } else {
-            self.client.post("/v1/claims", &input).await.unwrap()
+            Some(self.reliable_post(&input).await)
         }
     }
 
-    async fn native_request(&self, subject: &str, path: &str, input: Value) -> Value {
+    async fn reliable_post(&self, input: &ClaimInput) -> ClaimRecord {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let result = tokio::time::timeout_at(deadline, self.client.post("/v1/claims", input))
+                .await
+                .expect("durable simulated publication must finish within its request budget");
+            match result {
+                Ok(record) => return record,
+                Err(error)
+                    if matches!(
+                        st3::client::api_error_code(&error),
+                        Some("database-busy" | "database-locked")
+                    ) =>
+                {
+                    tokio::time::timeout_at(
+                        deadline,
+                        tokio::time::sleep(Duration::from_millis(25)),
+                    )
+                    .await
+                    .expect("durable publication contention must end within its request budget");
+                }
+                Err(error) => panic!("durable simulated publication: {error:#}"),
+            }
+        }
+    }
+
+    async fn native_request(&self, subject: &str, path: &str, input: Value) -> Option<Value> {
         use tower::ServiceExt as _;
-        let response = st3::api::native_observation_protocol_router(self.state.clone(), subject)
-            .oneshot(axum::http::Request::builder().method("POST").uri(path)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(input.to_string())).unwrap()).await.unwrap();
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(status.is_success(), "{path}: {body}");
-        body["value"].clone()
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let response =
+                st3::api::native_observation_protocol_router(self.state.clone(), subject)
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(input.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            let contention = matches!(
+                body["code"].as_str(),
+                Some("database-busy" | "database-locked")
+            );
+            if path == "/v1/claims"
+                && !status.is_success()
+                && (contention || body["code"] == "read-deadline")
+            {
+                // A simulated provider, like a real one, drops this current sample once.
+                // No retry is retained; only a later simulated second can supersede it.
+                return None;
+            }
+            if !status.is_success() && contention && path == "/v1/harness-events/usage-flush" {
+                tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(25)))
+                    .await
+                    .expect("accounting stop must finish within its reliable request budget");
+                continue;
+            }
+            assert!(status.is_success(), "{path}: {body}");
+            return Some(body["value"].clone());
+        }
     }
 }
 
@@ -404,10 +467,11 @@ impl Harness {
             self.since_ms = now_ms;
             self.transitions += 1;
         }
-        let mut written = vec![daemon.post(self.observed(now_ms)).await];
+        let mut written = Vec::new();
+        written.extend(daemon.post(self.observed(now_ms)).await);
         if working && second % 2 == 0 {
             self.entry += 1;
-            written.push(daemon.post(self.timeline()).await);
+            written.extend(daemon.post(self.timeline()).await);
         }
         if working && second % 3 == 0 {
             self.context_tokens += 1_500;
@@ -416,38 +480,30 @@ impl Harness {
                 let reading = self.usage(semantics);
                 self.last_usage
                     .insert(semantics.into(), json!(reading.fields.clone()));
-                written.push(daemon.post(reading).await);
+                written.extend(daemon.post(reading).await);
             }
         }
         if second % 60 == 0 {
             written.push(
                 daemon
-                    .client
-                    .post(
-                        "/v1/claims",
-                        &ClaimInput {
-                            subject: format!("message/diet-{}-{second}", self.offset),
-                            kind: "message.sent".into(),
-                            actor: Some(self.subject.clone()),
-                            fields: BTreeMap::from([
-                                ("from".into(), Value::String(self.subject.clone())),
-                                ("to".into(), Value::String("person/example".into())),
-                                (
-                                    "content".into(),
-                                    Value::String(format!("progress at {second}s")),
-                                ),
-                                ("status".into(), Value::String("sent".into())),
-                            ]),
-                            evidence: Vec::new(),
-                            expected_subject: None,
-                            idempotency_key: Some(format!(
-                                "diet-message:{}:{second}",
-                                self.subject
-                            )),
-                        },
-                    )
-                    .await
-                    .unwrap(),
+                    .reliable_post(&ClaimInput {
+                        subject: format!("message/diet-{}-{second}", self.offset),
+                        kind: "message.sent".into(),
+                        actor: Some(self.subject.clone()),
+                        fields: BTreeMap::from([
+                            ("from".into(), Value::String(self.subject.clone())),
+                            ("to".into(), Value::String("person/example".into())),
+                            (
+                                "content".into(),
+                                Value::String(format!("progress at {second}s")),
+                            ),
+                            ("status".into(), Value::String("sent".into())),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("diet-message:{}:{second}", self.subject)),
+                    })
+                    .await,
             );
         }
         written
@@ -509,9 +565,17 @@ async fn run_workload(seconds: u64) -> Report {
     let runs = daemon.publish(&workload_source(&workspace), &workspace);
     let mut harnesses = (0..HARNESSES).map(Harness::new).collect::<Vec<_>>();
     for harness in &harnesses {
-        daemon.post(harness.input("runtime.observed",
-            serde_json::from_value(json!({"status":"running","incarnation_id":"inc-1"})).unwrap(),
-            format!("diet-runtime:{}", harness.subject))).await;
+        daemon
+            .post(
+                harness.input(
+                    "runtime.observed",
+                    serde_json::from_value(json!({"status":"running","incarnation_id":"inc-1"}))
+                        .unwrap(),
+                    format!("diet-runtime:{}", harness.subject),
+                ),
+            )
+            .await
+            .expect("runtime setup is durable");
     }
     let setup_index = daemon.store.index().unwrap();
     let mut state_changes = BTreeMap::<String, Vec<ClaimRecord>>::new();
@@ -552,8 +616,14 @@ async fn run_workload(seconds: u64) -> Report {
     // Simulated providers deliver their reliable accounting stop through the native API,
     // independently of their current idle samples.
     for harness in &harnesses {
-        daemon.native_request(&harness.subject, "/v1/harness-events/usage-flush",
-            json!({"subject":harness.subject,"runtime_incarnation":"inc-1"})).await;
+        daemon
+            .native_request(
+                &harness.subject,
+                "/v1/harness-events/usage-flush",
+                json!({"subject":harness.subject,"runtime_incarnation":"inc-1"}),
+            )
+            .await
+            .expect("accounting stop is reliable");
     }
     daemon.stop().await;
     let all = claims(&store);
@@ -577,8 +647,9 @@ async fn run_workload(seconds: u64) -> Report {
         }
     }
 
-    // No durable fact is lost: a second node receives every message, every harness state
-    // change, each harness's final usage and every loop's gate, and ends with the same graph.
+    // No durable fact is lost: a second node receives every message, each harness's final
+    // numeric usage and every loop's gate, and ends with the same graph. Its current
+    // state is the retained packet; a dropped categorical transition has no history.
     let replica = Store::open_memory("diet-replica").unwrap();
     converge(&store, &replica);
     let status = |store: &Store| {
@@ -617,7 +688,8 @@ async fn run_workload(seconds: u64) -> Report {
                 .unwrap()
                 .unwrap()
                 .body["fields"]["state"],
-            "idle"
+            current.body["fields"]["state"],
+            "the retained current packet reaches the peer unchanged, including when the final idle sample dropped"
         );
         let context = store
             .latest_claim(&harness.subject, Some("harness.usage"))

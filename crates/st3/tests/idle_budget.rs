@@ -209,6 +209,7 @@ fn seat_driver(root: &Path, socket: &Path, index: usize) -> Child {
         std::fs::create_dir_all(root.join(directory)).unwrap();
     }
     let (runtime_id, _) = seat(index);
+    let error_log = std::fs::File::create(root.join("driver.stderr")).unwrap();
     st3::test_support::command(test_bin!("st3-fixture"))
         // Its own process group, so stopping the seat also stops the stand-in provider.
         .process_group(0)
@@ -229,7 +230,7 @@ fn seat_driver(root: &Path, socket: &Path, index: usize) -> Child {
         .args(["--", "sleep", "600"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(error_log))
         .spawn()
         .unwrap()
 }
@@ -318,7 +319,12 @@ async fn an_idle_daemon_stays_under_its_cpu_and_request_budget() {
     let socket = root.join("st3.sock");
     let server_socket = socket.clone();
     let server = tokio::spawn(async move {
-        let _ = st3::api::serve_unix(&server_socket, st3::api::router(state)).await;
+        // These are real native driver peers. Capture their kernel identity, as the
+        // installed daemon does, so current publication has its required seat binding.
+        let state_socket = state.state_dir.join("st3.sock");
+        st3::api::serve_unix_bound(&server_socket, &state_socket, st3::api::router(state))
+            .await
+            .unwrap();
     });
     let reconciler = Arc::new(Reconciler::new(
         store.clone(),
@@ -345,7 +351,9 @@ async fn an_idle_daemon_stays_under_its_cpu_and_request_budget() {
     for (index, seat) in seats.iter_mut().enumerate() {
         assert!(
             seat.try_wait().unwrap().is_none(),
-            "idle seat {index} exited during the warmup"
+            "idle seat {index} exited during the warmup: {}",
+            std::fs::read_to_string(root.join(format!("seat-{index}/driver.stderr")))
+                .unwrap_or_default()
         );
     }
 
