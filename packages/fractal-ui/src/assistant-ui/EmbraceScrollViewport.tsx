@@ -125,6 +125,8 @@ class ViewportController {
     const anchor = this.pressedAnchor
     if (viewport === null || anchor === undefined || !anchor.element.isConnected) return false
     this.writeTop(viewport.scrollTop + anchor.element.getBoundingClientRect().top - viewport.getBoundingClientRect().top - anchor.offset)
+    // Hand history back in the compensated coordinate system; a stale offset would undo the press scroll.
+    if (this.anchor?.element.isConnected) this.anchor.offset = this.anchor.element.getBoundingClientRect().top - viewport.getBoundingClientRect().top
     return true
   }
 
