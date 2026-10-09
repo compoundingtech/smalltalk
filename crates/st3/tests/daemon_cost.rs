@@ -1895,6 +1895,16 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         !event_page["items"].as_array().unwrap().is_empty(),
         "measure a populated event page, not a refused or empty traversal"
     );
+    // Received values must have a real declaration on the publishing host. Held load
+    // seats belong to bench-elsewhere, so use a dedicated local owner for this probe.
+    let current_intent = st3::parse_intent(
+        "version 2\nagent \"bench/cost/current\" { workspace \"/tmp\"; command \"true\" }\n",
+        NODE,
+    )
+    .unwrap();
+    store
+        .apply_internal(&current_intent, "cost-current-enrollment")
+        .unwrap();
     let current_source = Store::open_memory(NODE).unwrap();
     fixture.current_reports = (0..4)
         .map(|attempt| {
@@ -1904,7 +1914,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                 attempt,
                 "",
             );
-            input.subject = fixture.subjects.seats[0].clone();
+            input.subject = "agent/bench/cost/current".into();
             input.actor = Some(input.subject.clone());
             input.fields.insert("driver".into(), json!("codex"));
             input

@@ -480,6 +480,27 @@ impl ClientRelay {
         })
     }
 
+    pub(crate) fn current_hosts(&self) -> BTreeSet<String> {
+        let view = self.fleet_view();
+        let mut hosts = view
+            .members
+            .iter()
+            .filter(|member| member.state == "current")
+            .map(|member| member.name.clone())
+            .collect::<BTreeSet<_>>();
+        hosts.insert(self.node.clone());
+        if self.legacy {
+            for peer in &self.peers {
+                if !view.members.iter().any(|member| member.name == peer.name)
+                    && !view.legacy_removed.contains(&peer.name)
+                {
+                    hosts.insert(peer.name.clone());
+                }
+            }
+        }
+        hosts
+    }
+
     /// The fleet's observed up links, read again once the last reading is a few seconds old.
     fn observed_links(&self) -> Arc<[(String, String)]> {
         let Some(store) = &self.links else {

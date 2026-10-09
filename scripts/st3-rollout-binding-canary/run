@@ -27,7 +27,7 @@ def fields(node, kind):
         database = (node.root / "state/claims.sqlite3").as_uri() + "?mode=ro"
         with sqlite3.connect(database, uri=True) as connection:
             if not connection.execute(
-                    "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='latest_values'").fetchone():
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='latest_values'").fetchone():
                 return [row["body"].get("fields", row["body"]) for row in trace(node, SUBJECT)
                         if row.get("kind") == kind]
             rows = connection.execute(

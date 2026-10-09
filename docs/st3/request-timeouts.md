@@ -60,7 +60,11 @@ Replaceable current registers use a separate connection with zero busy timeout a
 transaction deadline. They never queue or retry: contention drops that sample. A register
 commit can briefly hold SQLite's write lock while a managed write attempts admission; budgeted
 callers can receive `database-busy` and retain their existing retry policy. Reads remain read-only.
-Durable peer errors and `replication_refusals` still use the managed writer.
+Durable peer errors and `replication_refusals` still use the managed writer. Bounded current-value
+housekeeping uses another zero-wait connection with the same 100 ms deadline: a pass inspects
+at most 64 register keys and retires at most 256 local history rows. An empty pass stays
+read-only. Obsolete seat and host payloads release capacity; semantic clocks retain a small
+tombstone per subject so removal cannot rewind a reader frontier.
 
 Each register commit uses its own `synchronous=FULL` flush. On an isolated test host, the native
 register probe measured 7.0–13.4 ms from `BEGIN IMMEDIATE` through `COMMIT` (including flush),
@@ -88,3 +92,13 @@ every write that arrived while the previous batch ran.
 Under `ST3_PROFILE_DIR`, a batched write's operation counts the time until the writer started
 its job as writer wait, and the job itself as writer hold. The batch's `COMMIT` shows under
 `(unlabeled st3-writer)`, whose statement count is the number of batches.
+
+## Restoring a database file with current registers
+
+A filesystem-copy restore preserves the old current-value epoch and can rewind workspace
+and transport counters. Before starting the restored daemon, delete only the
+`current-value-epoch` row from the offline database's `meta` table and ensure the host clock
+has moved forward. Open then creates a later epoch. Restart native producers with fresh
+runtime incarnations; restarting them alone does not recover workspace or transport values
+that peers already received. Ordinary reopen retains the epoch; signed-log restore creates
+a new one automatically.

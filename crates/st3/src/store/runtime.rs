@@ -32,6 +32,7 @@ pub struct SmalltalkRuntime {
     current_observation_revision: std::sync::atomic::AtomicU64,
     current_observation_kinds: [std::sync::atomic::AtomicU64; CURRENT_VALUE_KINDS.len()],
     pub(super) current_harness_freshness: std::sync::atomic::AtomicU64,
+    pub(super) current_value_refusals: std::sync::atomic::AtomicU64,
     pub(crate) actual_cache: Mutex<HashMap<String, (ActualCacheKey, Option<Value>)>>,
     /// Immutable placement ancestry, keyed by the selected declaration claim.
     pub(crate) placement_cache: Mutex<HashMap<String, Option<Arc<crate::placement::Fence>>>>,
@@ -185,6 +186,7 @@ impl Runtime for SmalltalkRuntime {
         connection.execute_batch(SCHEMA)?;
         connection.execute_batch(latest_values::SCHEMA)?;
         latest_values::initialize_epoch(connection)?;
+        latest_values::initialize_semantic_frontiers(connection)?;
         connection.execute_batch(arrangements::SCHEMA)?;
         usage_period::create_schema(connection)?;
         migrate_local_usage_seen(connection)?;
@@ -294,10 +296,10 @@ impl Runtime for SmalltalkRuntime {
             if semantic_changed {
                 self.current_observation_kinds[position]
                     .fetch_add(1, std::sync::atomic::Ordering::Release);
+                // Publish the aggregate only after a semantic change, including stale recovery.
+                self.current_observation_revision
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
             }
-            // Publish the aggregate after its kind, so an aggregate acquire observes that kind.
-            self.current_observation_revision
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
     }
 

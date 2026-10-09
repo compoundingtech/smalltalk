@@ -718,7 +718,38 @@ mod tests {
             })
             .unwrap();
         for at in 11..41 {
-            publish(at, "working");
+            // Capture the real read fence, then commit from another thread before its
+            // snapshot checks that fence. This reproduced the aggregate-restamp race.
+            let commits = windows.commits();
+            let store = state.store.clone();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let writing = barrier.clone();
+            let writer = std::thread::spawn(move || {
+                writing.wait();
+                store
+                    .append_claim(&ClaimInput {
+                        subject: "agent/heartbeat".into(),
+                        kind: "harness.observed".into(),
+                        actor: None,
+                        fields: serde_json::from_value(json!({"state":"working","driver":"codex",
+                        "incarnation_id":"one","observed_at_ms":at}))
+                        .unwrap(),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            });
+            barrier.wait();
+            writer.join().unwrap();
+            let concurrent = state
+                .store
+                .read_snapshot(|index| windows.revision(&state.store, index, "summary", commits))
+                .unwrap();
+            assert_eq!(
+                concurrent, summary,
+                "an unchanged heartbeat must not reject the captured read fence"
+            );
             for name in ["agents", "attention"] {
                 read(&windows, &state, &session, &request(name), 0, &count);
             }

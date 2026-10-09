@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS latest_values (
     actor TEXT, body TEXT NOT NULL,
     PRIMARY KEY(subject, kind, slot)
 );
+CREATE INDEX IF NOT EXISTS latest_values_kind_index ON latest_values(kind);
 CREATE INDEX IF NOT EXISTS latest_values_local_index ON latest_values(local_id);
 CREATE INDEX IF NOT EXISTS latest_values_agent_local_index ON latest_values(local_id)
 WHERE subject LIKE 'agent/%';
@@ -26,6 +27,18 @@ WHERE (kind='harness.observed' AND (
         AND json_extract(body, '$.fields.code')='provider-auth-expired');
 CREATE TABLE IF NOT EXISTS latest_readiness (
     subject TEXT PRIMARY KEY, incarnation TEXT NOT NULL, ready INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS current_value_frontiers (
+    subject TEXT PRIMARY KEY, revision INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS current_value_frontiers_revision ON current_value_frontiers(revision);
+CREATE INDEX IF NOT EXISTS current_value_frontiers_agents ON current_value_frontiers(revision)
+WHERE subject LIKE 'agent/%';
+CREATE VIEW IF NOT EXISTS current_value_revisions AS
+SELECT subject, revision AS local_id FROM current_value_frontiers;
+CREATE TABLE IF NOT EXISTS current_value_retirements (
+    subject TEXT NOT NULL, kind TEXT NOT NULL, cursor INTEGER NOT NULL,
+    cutoff INTEGER NOT NULL, PRIMARY KEY(subject,kind)
 );
 CREATE VIEW IF NOT EXISTS current_claims AS
 SELECT store_index, id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
@@ -286,6 +299,7 @@ pub(super) fn harness_sql(connection: &Connection, subject: &str, sql: &str) -> 
 #[cfg(test)]
 thread_local! {
     static CURRENT_TRANSACTION_ELAPSED: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+    static CURRENT_TRANSACTION_STEPS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Only this fresh connection's progress deadline can interrupt a current transaction.
@@ -298,9 +312,19 @@ fn current_transaction<T>(
     let expired = Arc::new(AtomicBool::new(false));
     let interrupted = expired.clone();
     let deadline = std::time::Instant::now() + crate::client::LATEST_VALUE_TIMEOUT;
+    #[cfg(test)]
+    let steps = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    #[cfg(test)]
+    let observed_steps = steps.clone();
+    #[cfg(test)]
+    let interval = CURRENT_TRANSACTION_STEPS.with(|value| if value.get().is_some() { 1 } else { 100 });
+    #[cfg(not(test))]
+    let interval = 100;
     connection.progress_handler(
-        100,
+        interval,
         Some(move || {
+            #[cfg(test)]
+            observed_steps.fetch_add(interval as u64, Ordering::Relaxed);
             let due = std::time::Instant::now() >= deadline;
             if due {
                 interrupted.store(true, Ordering::Release);
@@ -325,6 +349,10 @@ fn current_transaction<T>(
         let value = work(&tx)?;
         tx.commit().map_err(internal)?;
         #[cfg(test)]
+        CURRENT_TRANSACTION_STEPS.with(|value| {
+            if value.get().is_some() { value.set(Some(steps.load(Ordering::Relaxed))); }
+        });
+        #[cfg(test)]
         CURRENT_TRANSACTION_ELAPSED.with(|elapsed| {
             if elapsed.get().is_some() {
                 elapsed.set(Some(started.elapsed()));
@@ -348,6 +376,137 @@ fn current_transaction<T>(
 
 type LocalValue = (i64, String, String, Option<String>, u64);
 type ReceivedValue = (u64, String, i64, String, String, Option<String>);
+
+// Keep one small clock per observed subject, including a tombstone after collection. This
+// prevents a deleted value or a source restamp from rewinding an in-flight reader's key.
+fn seed_semantic_frontier(connection: &Connection, subject: &str) -> Result<(), St3Error> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO current_value_frontiers
+        SELECT subject,MAX(local_id) FROM latest_values WHERE subject=?1 GROUP BY subject",
+            [subject],
+        )
+        .map_err(internal)?;
+    Ok(())
+}
+
+fn record_semantic_frontier(
+    connection: &Connection,
+    subject: &str,
+    source_id: i64,
+    changed: bool,
+) -> Result<(), St3Error> {
+    if changed {
+        connection
+            .execute(
+                "INSERT INTO current_value_frontiers VALUES(?1,
+            max(?2,coalesce((SELECT MAX(revision) FROM current_value_frontiers),0)+1))
+            ON CONFLICT(subject) DO UPDATE SET revision=excluded.revision",
+                params![subject, source_id],
+            )
+            .map_err(internal)?;
+    }
+    Ok(())
+}
+
+pub(crate) struct CurrentMaintenance {
+    pub removed: usize,
+    pub history_visited: usize,
+    pub after: String,
+}
+
+/// Prime clocks for an older register database, without scanning claims or parsing payloads.
+/// Each transaction has at most 64 keys and the same 100 ms progress deadline.
+pub(super) fn initialize_semantic_frontiers(connection: &Connection) -> Result<()> {
+    let done: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key='current-value-frontiers')",
+        [],
+        |row| row.get(0),
+    )?;
+    if done {
+        return Ok(());
+    }
+    let mut after = (String::new(), String::new(), String::new());
+    loop {
+        let rows = connection
+            .prepare_cached(
+                "SELECT subject,kind,slot,local_id FROM latest_values
+            WHERE (subject,kind,slot)>(?1,?2,?3) ORDER BY subject,kind,slot LIMIT 64",
+            )?
+            .query_map(params![after.0, after.1, after.2], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.is_empty() {
+            break;
+        }
+        let deadline = std::time::Instant::now() + crate::client::LATEST_VALUE_TIMEOUT;
+        connection.progress_handler(100, Some(move || std::time::Instant::now() >= deadline));
+        let result = (|| -> Result<()> {
+            let tx =
+                Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
+            for (subject, _, _, id) in &rows {
+                tx.execute(
+                    "INSERT INTO current_value_frontiers VALUES(?1,?2)
+                    ON CONFLICT(subject) DO UPDATE SET revision=max(revision,excluded.revision)",
+                    params![subject, id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        connection.progress_handler(0, None::<fn() -> bool>);
+        result?;
+        let last = rows.last().unwrap();
+        after = (last.0.clone(), last.1.clone(), last.2.clone());
+    }
+    connection.execute(
+        "INSERT INTO meta(key,value) VALUES('current-value-frontiers','1')",
+        [],
+    )?;
+    Ok(())
+}
+
+struct CurrentKey {
+    subject: String,
+    kind: String,
+    slot: String,
+    origin: String,
+    local_id: i64,
+    source_id: String,
+}
+
+fn obsolete_key(
+    connection: &Connection,
+    key: &CurrentKey,
+    hosts: &BTreeSet<String>,
+) -> Result<bool, St3Error> {
+    if key.kind == "transport.observed" {
+        return Ok(!hosts.contains(&key.origin)
+            || !key
+                .subject
+                .strip_prefix("host/")
+                .is_some_and(|host| hosts.contains(host)));
+    }
+    let owner: Option<String> = connection
+        .query_row(
+            "SELECT json_extract(member,'$.host') FROM desired
+        WHERE subject=?1 AND kind='agent' AND member IS NOT NULL",
+            [&key.subject],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(internal)?;
+    // A still-declared seat keeps its one slot through a placement change; the existing
+    // host guard hides an old owner until the new owner replaces it. Only withdrawn
+    // declarations are garbage.
+    Ok(owner.is_none())
+}
 
 pub(super) fn append(
     graph: &GraphStore,
@@ -534,6 +693,7 @@ pub(super) fn append(
                     || stale_observation(&input.kind, &old["fields"], u128::from(*source_at), now)
                         != stale_observation(&input.kind, &json!(input.fields), now, now)
             });
+        seed_semantic_frontier(tx, &input.subject)?;
         let (mut local, _) = insert_local_observation_tx(tx, &graph.origin, &input, now)?;
         let epoch: String = tx
             .query_row(
@@ -587,31 +747,17 @@ pub(super) fn append(
             )
             .map_err(internal)?;
         }
-        // Only the first modern sample with a legacy slot retires legacy history.
-        // Replacements delete their single prior row below, without walking numeric usage.
-        if previous.is_none() && retired_slots != 0 {
-            let retired: Option<i64> = tx
-                .query_row(
-                    "SELECT MAX(id) FROM local_observations WHERE subject=?1 AND kind=?2 AND id!=?3
-         AND (?2!='harness.usage' OR json_extract(body,'$.fields.semantics')='context_occupancy')",
-                    params![input.subject, input.kind, sequence],
-                    |row| row.get(0),
-                )
-                .map_err(internal)?;
-            if let Some(retired) = retired {
-                retire_feed_through(tx, retired)?;
-            }
+        // Queue legacy history retirement; each background pass visits at most 256 rows.
+        // The current transaction never parses the retained numeric series.
+        if previous.is_none() || retired_slots != 0 {
             tx.execute(
-                "DELETE FROM local_observations WHERE subject=?1 AND kind=?2 AND id!=?3
-        AND (?2!='harness.usage' OR json_extract(body,'$.fields.semantics')='context_occupancy')",
-                params![
-                    input.subject,
-                    input.kind,
-                    local_observation_position(&local)
-                ],
+                "INSERT INTO current_value_retirements VALUES(?1,?2,0,?3)
+                ON CONFLICT(subject,kind) DO UPDATE SET cutoff=max(cutoff,excluded.cutoff)",
+                params![input.subject, input.kind, sequence - 1],
             )
             .map_err(internal)?;
         }
+        record_semantic_frontier(tx, &input.subject, sequence as i64, semantic_changed)?;
         if let Some((old_id, _, _, _, _)) = previous {
             retire_feed_through(tx, old_id)?;
             tx.execute("DELETE FROM local_observations WHERE id=?1", [old_id])
@@ -784,6 +930,168 @@ impl Store {
         self.graph.transport_links()
     }
 
+    /// Housekeeping is off the request path: inspect at most 64 keys and retire at most
+    /// 256 history rows. Empty passes never take SQLite's write lock.
+    pub(crate) fn maintain_current_values(
+        &self,
+        hosts: &BTreeSet<String>,
+        after: &str,
+    ) -> Result<CurrentMaintenance, St3Error> {
+        let (subject, kind, slot): (String, String, String) =
+            serde_json::from_str(after).unwrap_or_default();
+        let reader = self.readers.get();
+        let keys = reader
+            .prepare_cached(
+                "SELECT subject,kind,slot,origin,local_id,source_id
+            FROM latest_values WHERE (subject,kind,slot)>(?1,?2,?3)
+            ORDER BY subject,kind,slot LIMIT 64",
+            )
+            .map_err(internal)?
+            .query_map(params![subject, kind, slot], |row| {
+                Ok(CurrentKey {
+                    subject: row.get(0)?,
+                    kind: row.get(1)?,
+                    slot: row.get(2)?,
+                    origin: row.get(3)?,
+                    local_id: row.get(4)?,
+                    source_id: row.get(5)?,
+                })
+            })
+            .map_err(internal)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?;
+        let next = if keys.len() == 64 {
+            let key = keys.last().unwrap();
+            serde_json::to_string(&(&key.subject, &key.kind, &key.slot)).map_err(internal)?
+        } else {
+            String::new()
+        };
+        let mut obsolete = Vec::new();
+        for key in keys {
+            if obsolete_key(&reader, &key, hosts)? {
+                obsolete.push(key);
+            }
+        }
+        let job: Option<(String, String)> = reader
+            .query_row(
+                "SELECT subject,kind FROM current_value_retirements ORDER BY subject,kind LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        drop(reader);
+        if obsolete.is_empty() && job.is_none() {
+            return Ok(CurrentMaintenance {
+                removed: 0,
+                history_visited: 0,
+                after: next,
+            });
+        }
+        let mut connection = Connection::open_with_flags(
+            &self.graph.path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(internal)?;
+        smallclaims::sqlite::observe(&mut connection);
+        connection
+            .busy_timeout(std::time::Duration::ZERO)
+            .map_err(internal)?;
+        let (removed, history_visited, kinds) = current_transaction(&mut connection, |tx| {
+            let mut removed = 0;
+            let mut kinds = BTreeSet::new();
+            for key in &obsolete {
+                if !obsolete_key(tx, key, hosts)? {
+                    continue;
+                }
+                let count=tx.execute("DELETE FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3 AND source_id=?4",
+                    params![key.subject,key.kind,key.slot,key.source_id]).map_err(internal)?;
+                if count == 0 {
+                    continue;
+                }
+                retire_feed_through(tx, key.local_id)?;
+                tx.execute("DELETE FROM local_observations WHERE id=?1", [key.local_id])
+                    .map_err(internal)?;
+                if key.kind == "harness.observed" {
+                    tx.execute(
+                        "DELETE FROM latest_readiness WHERE subject=?1",
+                        [&key.subject],
+                    )
+                    .map_err(internal)?;
+                }
+                let clock: i64 = tx
+                    .query_row(
+                        "SELECT coalesce((SELECT seq FROM sqlite_sequence
+                    WHERE name='local_observations'),0)+1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(internal)?;
+                record_semantic_frontier(tx, &key.subject, clock, true)?;
+                kinds.insert(key.kind.clone());
+                removed += count;
+            }
+            let mut visited = 0;
+            if let Some((subject, kind)) = &job {
+                let bounds: Option<(i64, i64)> = tx
+                    .query_row(
+                        "SELECT cursor,cutoff FROM current_value_retirements
+                    WHERE subject=?1 AND kind=?2",
+                        params![subject, kind],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(internal)?;
+                if let Some((cursor, cutoff)) = bounds {
+                    let rows=tx.prepare_cached("SELECT id,body,EXISTS(SELECT 1 FROM latest_values v WHERE v.local_id=o.id)
+                        FROM local_observations o WHERE subject=?1 AND kind=?2 AND id>?3 AND id<=?4
+                        ORDER BY id LIMIT 256").map_err(internal)?
+                        .query_map(params![subject,kind,cursor,cutoff],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,bool>(2)?)))
+                        .map_err(internal)?.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)?;
+                    visited = rows.len();
+                    let mut delete = Vec::new();
+                    for (id, body, live) in &rows {
+                        if *live {
+                            continue;
+                        }
+                        if kind != "harness.usage"
+                            || serde_json::from_str::<Value>(body).map_err(internal)?["fields"]["semantics"]
+                                == "context_occupancy"
+                        {
+                            delete.push(*id);
+                        }
+                    }
+                    if let Some(last) = delete.iter().max() {
+                        retire_feed_through(tx, *last)?;
+                    }
+                    tx.execute("DELETE FROM local_observations WHERE id IN (SELECT value FROM json_each(?1))",
+                        [serde_json::to_string(&delete).map_err(internal)?]).map_err(internal)?;
+                    if visited < 256 {
+                        tx.execute(
+                            "DELETE FROM current_value_retirements WHERE subject=?1 AND kind=?2",
+                            params![subject, kind],
+                        )
+                        .map_err(internal)?;
+                    } else {
+                        tx.execute("UPDATE current_value_retirements SET cursor=?3 WHERE subject=?1 AND kind=?2",
+                            params![subject,kind,rows.last().unwrap().0]).map_err(internal)?;
+                    }
+                }
+            }
+            Ok((removed, visited, kinds))
+        })?;
+        for kind in kinds {
+            self.graph
+                .runtime
+                .current_observation_committed(&kind, true);
+        }
+        Ok(CurrentMaintenance {
+            removed,
+            history_visited,
+            after: next,
+        })
+    }
+
     pub(crate) fn own_transport_value(&self, peer: &str) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
         let id: Option<String> = connection.query_row(
@@ -797,6 +1105,26 @@ impl Store {
     /// A signed fleet sender supplies its own current observation. Imported registers never
     /// enter replication inventories, and an older delivery cannot overwrite a newer value.
     pub fn receive_current_value(&self, record: &ClaimRecord) -> Result<bool, St3Error> {
+        let view = self.fleet_view_sealed().map_err(internal)?;
+        let mut hosts = view
+            .members
+            .iter()
+            .filter(|member| member.state == "current")
+            .map(|member| member.name.clone())
+            .collect::<BTreeSet<_>>();
+        hosts.insert(self.origin().into());
+        if view.anchor.is_none() {
+            hosts.insert(record.origin.clone());
+        }
+        self.receive_current_value_for_hosts(record, &hosts)
+            .map(|outcome| outcome.0)
+    }
+
+    pub(crate) fn receive_current_value_for_hosts(
+        &self,
+        record: &ClaimRecord,
+        hosts: &BTreeSet<String>,
+    ) -> Result<(bool, bool), St3Error> {
         if record.accepted_at_unix_ms > now_ms().saturating_add(60_000) {
             return Err(St3Error::new(
                 "invalid-current-value",
@@ -849,10 +1177,11 @@ impl Store {
                         "current values require a declared seat on the publishing host",
                     ));
                 }
-            } else if !record.subject.starts_with("host/") {
+            } else if !record.subject.strip_prefix("host/").is_some_and(|host| hosts.contains(host))
+                || !hosts.contains(&record.origin) {
                 return Err(St3Error::new(
                     "invalid-current-value",
-                    "transport values require a host subject",
+                    "transport values require an active fleet host and observer",
                 ));
             }
             if record.subject.starts_with("agent/") {
@@ -938,7 +1267,7 @@ impl Store {
             // member floods host names or declarations have accumulated since retirement.
             if previous.is_none()
                 && tx
-                    .query_row("SELECT count(*) FROM latest_values", [], |row| {
+                    .query_row("SELECT count(*) FROM latest_values WHERE kind=?1", [&record.kind], |row| {
                         row.get::<_, u64>(0)
                     })
                     .map_err(internal)?
@@ -982,6 +1311,7 @@ impl Store {
                 expected_subject: None,
                 idempotency_key: None,
             };
+            seed_semantic_frontier(tx, &record.subject)?;
             let (local, _) =
                 insert_local_observation_tx(tx, &self.origin, &input, record.accepted_at_unix_ms)?;
             if let Some((_, _, old_id, _, _, _)) = previous {
@@ -989,6 +1319,7 @@ impl Store {
                 tx.execute("DELETE FROM local_observations WHERE id=?1", [old_id])
                     .map_err(internal)?;
             }
+            record_semantic_frontier(tx, &record.subject, local_observation_position(&local).unwrap() as i64, semantic_changed)?;
             tx.execute(
             "INSERT INTO latest_values VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
              ON CONFLICT(subject,kind,slot) DO UPDATE SET origin=excluded.origin,source_at=excluded.source_at,
@@ -998,13 +1329,20 @@ impl Store {
         ).map_err(internal)?;
             update_readiness(tx, &input)?;
             Ok(true)
+        }).inspect_err(|error| {
+            if error.code == "current-value-capacity" {
+                let count = self.smalltalk.current_value_refusals.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if count == 1 || count.is_multiple_of(100) {
+                    eprintln!("st3: current register capacity refused {} {} (refusal {count}); collector will reclaim obsolete keys", record.subject, record.kind);
+                }
+            }
         })?;
         if changed {
             self.graph
                 .runtime
                 .current_observation_committed(&record.kind, semantic_changed);
         }
-        Ok(changed)
+        Ok((changed, changed && semantic_changed))
     }
 }
 
@@ -1039,11 +1377,281 @@ mod tests {
             .unwrap();
     }
 
+    fn drain_maintenance(store: &Store) -> usize {
+        let hosts = BTreeSet::from([store.origin().to_owned()]);
+        let mut after = String::new();
+        let mut visited = 0;
+        for _ in 0..200 {
+            let batch = store.maintain_current_values(&hosts, &after).unwrap();
+            assert!(batch.removed <= 64 && batch.history_visited <= 256);
+            after = batch.after;
+            visited += batch.history_visited;
+            let jobs: u64 = store
+                .readers
+                .get()
+                .query_row("SELECT count(*) FROM current_value_retirements", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            if jobs == 0 {
+                return visited;
+            }
+        }
+        panic!("bounded retirement did not finish");
+    }
+
+    #[test]
+    fn first_context_sample_with_twenty_thousand_numeric_rows_has_bounded_request_work() {
+        let store = Store::open_memory("owner").unwrap();
+        declare(&store, "owner");
+        let mut input = state("idle", "one", 1);
+        input.kind = "harness.usage".into();
+        input.fields = serde_json::from_value(json!({"driver":"codex","incarnation_id":"one",
+            "semantics":"context_occupancy","context_used_tokens":10}))
+        .unwrap();
+        append_legacy_graph_observation_fenced(&store.graph, &input, 1, None).unwrap();
+        store
+            .connection
+            .write()
+            .execute(
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<20000)
+            INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+            SELECT 0,'agent/example/cedar','harness.usage',?1,1 FROM n",
+                [
+                    json!({"fields":{"semantics":"session_cumulative","total_tokens":1}})
+                        .to_string(),
+                ],
+            )
+            .unwrap();
+        CURRENT_TRANSACTION_STEPS.with(|v| v.set(Some(0)));
+        CURRENT_TRANSACTION_ELAPSED.with(|v| v.set(Some(std::time::Duration::ZERO)));
+        append(&store.graph, &input, 2, None).unwrap();
+        let steps = CURRENT_TRANSACTION_STEPS.with(|v| v.replace(None).unwrap());
+        let hold = CURRENT_TRANSACTION_ELAPSED.with(|v| v.replace(None).unwrap());
+        println!("20k first context: request VM steps={steps}, writer hold={hold:?}");
+        assert!(
+            steps > 0 && steps < 4000,
+            "first publication must not scan numeric history: {steps}"
+        );
+        assert!(hold < crate::client::LATEST_VALUE_TIMEOUT);
+        let revision = store.graph.runtime.current_observation_revision("");
+        let frontier = store.current_cache_revision().unwrap();
+        assert_eq!(drain_maintenance(&store), 20_001);
+        assert_eq!(
+            store.graph.runtime.current_observation_revision(""),
+            revision
+        );
+        assert_eq!(store.current_cache_revision().unwrap(), frontier);
+        let reader = store.readers.get();
+        let counts: (u64, u64) = reader
+            .query_row(
+                "SELECT
+            sum(json_extract(body,'$.fields.semantics')='session_cumulative'),
+            sum(json_extract(body,'$.fields.semantics')='context_occupancy')
+            FROM local_observations WHERE kind='harness.usage'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (20_000, 1));
+    }
+
+    #[test]
+    fn login_evidence_respects_newer_legacy_clearing_observations() {
+        let store = Store::open_memory("owner").unwrap();
+        let mut input = state("idle", "one", 1);
+        input.fields.insert("provider_auth".into(), json!(false));
+        append(&store.graph, &input, 1, None).unwrap();
+        assert!(
+            login_evidence_in_epoch(
+                &store.readers.get(),
+                &input.subject,
+                store.index().unwrap(),
+                "one",
+                "0"
+            )
+            .unwrap()
+        );
+        input.fields.insert("provider_auth".into(), json!(true));
+        store.append_legacy_claim(&input).unwrap();
+        assert!(
+            !login_evidence_in_epoch(
+                &store.readers.get(),
+                &input.subject,
+                store.index().unwrap(),
+                "one",
+                "0"
+            )
+            .unwrap()
+        );
+        input.fields.insert("provider_auth".into(), json!(false));
+        store.append_legacy_claim(&input).unwrap();
+        assert!(
+            login_evidence_in_epoch(
+                &store.readers.get(),
+                &input.subject,
+                store.index().unwrap(),
+                "one",
+                "0"
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn existing_registers_initialize_semantic_frontiers_in_bounded_pages() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("frontiers.sqlite3");
+        let baseline;
+        {
+            let store = Store::open(&path, "owner").unwrap();
+            for n in 0..130 {
+                let mut input = state("idle", "one", 1);
+                input.subject = format!("agent/old/{n}");
+                append(&store.graph, &input, 1, None).unwrap();
+            }
+            baseline = store.current_cache_revision().unwrap();
+            store
+                .connection
+                .write()
+                .execute_batch(
+                    "DELETE FROM current_value_frontiers;
+                DELETE FROM meta WHERE key='current-value-frontiers';",
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path, "owner").unwrap();
+        assert_eq!(store.current_cache_revision().unwrap(), baseline);
+        assert_eq!(
+            store
+                .readers
+                .get()
+                .query_row("SELECT count(*) FROM current_value_frontiers", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            130
+        );
+        let mut input = state("idle", "one", 1);
+        input.subject = "agent/old/0".into();
+        append(&store.graph, &input, 2, None).unwrap();
+        assert_eq!(store.current_cache_revision().unwrap(), baseline);
+        assert!(store.changed_current_agents(baseline).unwrap().is_empty());
+    }
+
+    #[test]
+    fn categorical_history_retires_without_a_legacy_slot() {
+        let store = Store::open_memory("owner").unwrap();
+        declare(&store, "owner");
+        let input = state("idle", "one", 1);
+        store.connection.write().execute("INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+            VALUES(0,?1,?2,?3,1)",params![input.subject,input.kind,json!({"fields":input.fields}).to_string()]).unwrap();
+        append(&store.graph, &input, 2, None).unwrap();
+        assert_eq!(drain_maintenance(&store), 1);
+        let remaining: u64 = store
+            .readers
+            .get()
+            .query_row(
+                "SELECT count(*) FROM local_observations WHERE kind='harness.observed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 1,
+            "the live register is protected while old history is collected"
+        );
+    }
+
+    #[test]
+    fn retired_register_capacity_is_reclaimed_for_a_live_seat() {
+        let source = Store::open_memory("owner").unwrap();
+        let peer = Store::open_memory("peer").unwrap();
+        declare(&peer, "owner");
+        peer.connection.write().execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<20000)
+            INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+            SELECT 0,CASE WHEN i<=10000 THEN 'agent/retired/'||i ELSE 'host/retired-'||(i-10000) END,
+                CASE WHEN i<=10000 THEN 'harness.observed' ELSE 'transport.observed' END,'{}',1 FROM n",[]).unwrap();
+        peer.connection
+            .write()
+            .execute(
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<10000)
+            INSERT INTO latest_values SELECT 'agent/retired/'||i,'harness.observed','','owner',1,
+            'retired/'||i,i,0,NULL,'{}' FROM n",
+                [],
+            )
+            .unwrap();
+        peer.connection.write().execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<10000)
+            INSERT INTO latest_values SELECT 'host/retired-'||i,'transport.observed','owner','owner',1,
+            'transport/'||i,10000+i,0,NULL,'{}' FROM n",[]).unwrap();
+        let hosts = BTreeSet::from(["owner".into(), "peer".into()]);
+        let record = source.append_claim(&state("idle", "one", 10)).unwrap();
+        assert_eq!(
+            peer.receive_current_value_for_hosts(&record, &hosts)
+                .unwrap_err()
+                .code,
+            "current-value-capacity"
+        );
+        assert_eq!(
+            peer.smalltalk
+                .current_value_refusals
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let batch = peer.maintain_current_values(&hosts, "").unwrap();
+        assert_eq!(batch.removed, 64);
+        assert!(
+            peer.receive_current_value_for_hosts(&record, &hosts)
+                .unwrap()
+                .0,
+            "transport keys reserve separate capacity and obsolete seat keys are reclaimed"
+        );
+        let frontier = peer.current_cache_revision().unwrap();
+        let mut after = batch.after;
+        let mut removed = batch.removed;
+        for _ in 0..400 {
+            let batch = peer.maintain_current_values(&hosts, &after).unwrap();
+            assert!(batch.removed <= 64);
+            removed += batch.removed;
+            after = batch.after;
+            if after.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(removed, 20_000);
+        assert_eq!(
+            peer.readers
+                .get()
+                .query_row("SELECT count(*) FROM latest_values", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(
+            peer.current_cache_revision().unwrap() > frontier,
+            "deletion must invalidate without rewinding clocks"
+        );
+        assert_eq!(
+            peer.readers
+                .get()
+                .query_row("SELECT count(*) FROM local_observations", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1,
+            "collection must preserve the live seat's feed row"
+        );
+        assert!(
+            peer.latest_claim(&record.subject, Some(&record.kind))
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[test]
     #[ignore = "whole-process SQLite counters: run this cost probe alone"]
     fn context_register_cost_is_flat_with_twenty_thousand_numeric_rows() {
         use smallclaims::sqlite::work;
         let store = Store::open_memory("owner").unwrap();
+        declare(&store, "owner");
         let mut input = state("idle", "one", 1);
         input.kind = "harness.usage".into();
         input.fields = serde_json::from_value(json!({"driver":"codex", "incarnation_id":"one",
@@ -1061,6 +1669,7 @@ mod tests {
         append_legacy_graph_observation_fenced(&store.graph, &input, 1, None).unwrap();
         seed(2_000);
         append(&store.graph, &input, 2, None).unwrap();
+        drain_maintenance(&store);
         let measure = |at| {
             let before = work::total();
             append(&store.graph, &input, at, None).unwrap();
@@ -1117,6 +1726,9 @@ mod tests {
             .runtime
             .current_observation_revision("harness.observed");
         let aggregate = store.graph.runtime.current_observation_revision("");
+        let frontier = store.current_cache_revision().unwrap();
+        let roster_frontier =
+            roster_local_frontier(&store.readers.get(), store.index().unwrap()).unwrap();
         let second = append(&store.graph, &state("working", "one", 20), 20, None)
             .unwrap()
             .0;
@@ -1130,7 +1742,16 @@ mod tests {
                 .current_observation_revision("harness.observed"),
             before
         );
-        assert!(store.graph.runtime.current_observation_revision("") > aggregate);
+        assert_eq!(
+            store.graph.runtime.current_observation_revision(""),
+            aggregate
+        );
+        assert_eq!(store.current_cache_revision().unwrap(), frontier);
+        assert_eq!(
+            roster_local_frontier(&store.readers.get(), store.index().unwrap()).unwrap(),
+            roster_frontier
+        );
+        assert!(store.changed_current_agents(frontier).unwrap().is_empty());
         assert!(peer.receive_current_value(&second).unwrap());
         assert_eq!(
             peer.graph
@@ -1197,7 +1818,7 @@ mod tests {
         peer.connection
             .write()
             .execute(
-                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<9999)
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<10000)
             INSERT INTO latest_values SELECT 'host/cap-'||i,'transport.observed','owner','owner',1,
             'cap/'||i,1,0,NULL,'{}' FROM n",
                 [],
@@ -1208,7 +1829,12 @@ mod tests {
         transport.kind = "transport.observed".into();
         transport.body = json!({"fields":{"status":"up"}});
         assert_eq!(
-            peer.receive_current_value(&transport).unwrap_err().code,
+            peer.receive_current_value_for_hosts(
+                &transport,
+                &BTreeSet::from(["owner".into(), "peer".into(), "new-peer".into()])
+            )
+            .unwrap_err()
+            .code,
             "current-value-capacity"
         );
         let next = source.append_claim(&state("working", "one", 20)).unwrap();

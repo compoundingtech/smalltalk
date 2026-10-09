@@ -216,6 +216,9 @@ agent "native-seat" {{
                 observed_states.add(card.get("harness_state"))
                 if card.get("harness_state") == "working":
                     (root / "ws/working-observed").touch()
+            checks["observed_states"] = sorted(state for state in observed_states if state)
+            checks["last_card_status"] = {name: card.get(name) for name in
+                ("harness_state", "observation", "incarnation_id", "host")}
             return card
         until(lambda: current_card().get("harness_state") == "idle", args.ready_seconds,
               "the current client card never showed idle")

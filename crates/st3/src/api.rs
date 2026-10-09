@@ -5628,6 +5628,55 @@ pub fn start_stopped_usage_flush(state: &AppState) {
     });
 }
 
+fn current_fleet_hosts(state: &AppState) -> BTreeSet<String> {
+    state.client_relay.as_ref().map_or_else(
+        || {
+            state
+                .configured_peers
+                .iter()
+                .cloned()
+                .chain(std::iter::once(state.node.clone()))
+                .collect()
+        },
+        |relay| relay.current_hosts(),
+    )
+}
+
+/// Retire obsolete register payloads and legacy history in bounded background passes.
+pub fn start_current_value_maintenance(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut after = String::new();
+        let mut last_warning = None;
+        loop {
+            let mut pause = Duration::from_secs(1);
+            let store = state.store.clone();
+            let hosts = current_fleet_hosts(&state);
+            let cursor = after.clone();
+            match blocking_action(move || store.maintain_current_values(&hosts, &cursor)).await {
+                Ok(batch) => {
+                    after = batch.after;
+                    if batch.history_visited != 0 {
+                        pause = Duration::from_millis(100);
+                    }
+                    if batch.removed != 0 {
+                        signal_local_change(&state);
+                    }
+                }
+                Err(error) => {
+                    if last_warning.is_none_or(|at: tokio::time::Instant| {
+                        at.elapsed() >= Duration::from_secs(30)
+                    }) {
+                        eprintln!("st3: current value maintenance deferred: {error:?}");
+                        last_warning = Some(tokio::time::Instant::now());
+                    }
+                }
+            }
+            tokio::time::sleep(pause).await;
+        }
+    });
+}
+
 /// The shortest pause between two roster refreshes. A refresh also pauses as long as it took,
 /// so refreshing never takes more than about half a core however often readers ask. Reads
 /// never wait for it: this bounds how stale a served roster can be, about a second plus a fold.
@@ -8049,7 +8098,9 @@ fn publish_transport_current(state: &AppState, peer: String) {
     let store = state.store.clone();
     tokio::spawn(async move {
         if let Ok(Some(record)) = blocking_store(move || store.own_transport_value(&peer)).await {
-            signal_local_change(&state);
+            if record.body["_semantic_transition"] != false {
+                signal_local_change(&state);
+            }
             if let Some(relay) = &state.client_relay {
                 relay.publish_current_value(record).await;
             }
@@ -11328,11 +11379,13 @@ async fn receive_current_value(
     State(state): State<AppState>,
     Json(record): Json<ClaimRecord>,
 ) -> Result<Json<Value>, ApiError> {
+    let hosts = current_fleet_hosts(&state);
     let store = state.store.clone();
     let transition =
         record.kind == "harness.observed" && record.body["fields"]["status_transition"] != false;
-    let changed = blocking_action(move || store.receive_current_value(&record)).await?;
-    if changed {
+    let (changed, semantic) =
+        blocking_action(move || store.receive_current_value_for_hosts(&record, &hosts)).await?;
+    if semantic {
         signal_local_change(&state);
         if transition {
             state.notify.notify_one();
@@ -11355,9 +11408,11 @@ async fn finish_claim_publication(
         && response.body["_source_epoch"].is_string()
     {
         if appended {
-            signal_local_change(state);
-            if kind == "harness.observed" && response.body["fields"]["status_transition"] != false {
-                state.notify.notify_one();
+            if response.body["_semantic_transition"] != false {
+                signal_local_change(state);
+                if kind == "harness.observed" && response.body["fields"]["status_transition"] != false {
+                    state.notify.notify_one();
+                }
             }
             if let Some(relay) = state.client_relay.clone() {
                 let record = response.clone();

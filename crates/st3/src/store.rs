@@ -987,7 +987,7 @@ fn subject_current_revision(connection: &Connection, subject: &str) -> Result<u6
         return Ok(0);
     }
     Ok(connection.query_row(
-        "SELECT COALESCE(MAX(local_id),0) FROM latest_values WHERE subject=?1",
+        "SELECT COALESCE(MAX(local_id),0) FROM current_value_revisions WHERE subject=?1",
         [subject],
         |row| row.get(0),
     )?)
@@ -998,7 +998,7 @@ fn subject_current_revisions(connection: &Connection, names: &BTreeSet<String>) 
     let mut revisions = BTreeMap::new();
     let mut statement = connection.prepare_cached(
         "SELECT v.subject,MAX(v.local_id) FROM json_each(?1) selected
-         CROSS JOIN latest_values v ON v.subject=selected.value GROUP BY v.subject",
+         CROSS JOIN current_value_revisions v ON v.subject=selected.value GROUP BY v.subject",
     )?;
     for chunk in agents.chunks(64) {
         for row in statement.query_map([serde_json::to_string(chunk)?], |row| {
@@ -2793,7 +2793,7 @@ pub fn runtime() -> Arc<dyn smallclaims::Runtime> {
 const ROSTER_LOCAL_FRONTIER: &str = "SELECT MAX(
  COALESCE((SELECT id FROM local_observations WHERE kind='harness.timeline'
  AND subject LIKE 'agent/%' AND after_store_index<=?1 ORDER BY id DESC LIMIT 1),0),
- COALESCE((SELECT MAX(local_id) FROM latest_values WHERE subject LIKE 'agent/%'),0))";
+ COALESCE((SELECT MAX(local_id) FROM current_value_revisions WHERE subject LIKE 'agent/%'),0))";
 
 /// One frontier read, inside the caller's SQLite snapshot when it holds one: the reader pool
 /// lends pinned reads the same connection. The partial frontier index keeps an old cut from
@@ -2905,7 +2905,7 @@ impl Store {
     fn refresh_current_caches(&self) -> Result<()> {
         let connection = self.readers.get();
         let current: u64 = connection.query_row(
-            "SELECT coalesce(max(local_id),0) FROM latest_values",
+            "SELECT coalesce(max(local_id),0) FROM current_value_revisions",
             [],
             |r| r.get(0),
         )?;
@@ -2916,7 +2916,7 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner);
         if *seen != current {
             let subjects = connection
-                .prepare_cached("SELECT DISTINCT subject FROM latest_values WHERE local_id>?1")?
+                .prepare_cached("SELECT DISTINCT subject FROM current_value_revisions WHERE local_id>?1")?
                 .query_map([*seen], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut cache = self
@@ -2937,7 +2937,7 @@ impl Store {
 
     fn current_cache_revision(&self) -> Result<u64> {
         Ok(self.readers.get().query_row(
-            "SELECT coalesce(max(local_id),0) FROM latest_values",
+            "SELECT coalesce(max(local_id),0) FROM current_value_revisions",
             [],
             |row| row.get(0),
         )?)
@@ -2945,7 +2945,7 @@ impl Store {
 
     fn changed_current_agents(&self, since: u64) -> Result<BTreeSet<String>> {
         Ok(self.readers.get().prepare_cached(
-            "SELECT DISTINCT subject FROM latest_values WHERE local_id>?1 AND subject LIKE 'agent/%'",
+            "SELECT DISTINCT subject FROM current_value_revisions WHERE local_id>?1 AND subject LIKE 'agent/%'",
         )?.query_map([since], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -22968,15 +22968,22 @@ fn login_evidence_in_epoch(
     runtime_accepted_at: &str,
 ) -> Result<bool> {
     let current: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM latest_values
+        "SELECT EXISTS(SELECT 1 FROM latest_values v
          WHERE subject=?1 AND kind='harness.observed'
          AND json_extract(body,'$.fields.incarnation_id')=?2
+         AND v.source_at>=coalesce((SELECT CAST(legacy.accepted_at_unix_ms AS INTEGER)
+             FROM main.claims legacy INDEXED BY claims_subject_kind_accepted_index
+             WHERE legacy.subject=v.subject AND legacy.kind=v.kind AND legacy.store_index<=?3
+             ORDER BY length(legacy.accepted_at_unix_ms) DESC,legacy.accepted_at_unix_ms DESC LIMIT 1),0)
          AND (json_type(body,'$.fields.provider_auth')='false'
              OR json_extract(body,'$.fields.reason')='providerAuth'
              OR json_extract(body,'$.fields.state')='needs-login'))",
-        params![subject, incarnation_id], |row| row.get(0),
+        params![subject, incarnation_id, at_index],
+        |row| row.get(0),
     )?;
-    if current { return Ok(true); }
+    if current {
+        return Ok(true);
+    }
     let sql = format!(
         "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_harness_login_candidate_index
            WHERE claims.subject=?1 AND (
@@ -22988,6 +22995,9 @@ fn login_evidence_in_epoch(
                    THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
              OR (kind='harness.diagnostic'
                AND json_extract(body, '$.fields.code')='provider-auth-expired'))
+           AND (kind='harness.diagnostic' OR NOT EXISTS (SELECT 1 FROM latest_values v
+                WHERE v.subject=claims.subject AND v.kind=claims.kind
+                    AND v.source_at>=CAST(claims.accepted_at_unix_ms AS INTEGER)))
            AND store_index<=?2
            AND ({INCARNATION_OF_CLAIM}=?3
                 OR (({INCARNATION_OF_CLAIM} IS NULL OR typeof({INCARNATION_OF_CLAIM})!='text')
@@ -22995,11 +23005,10 @@ fn login_evidence_in_epoch(
                          OR (length(claims.accepted_at_unix_ms)=length(?4)
                              AND claims.accepted_at_unix_ms>=?4)))))"
     );
-    Ok(connection
-        .prepare_cached(&sql)?
-        .query_row(params![subject, at_index, incarnation_id, runtime_accepted_at], |row| {
-            row.get(0)
-        })?)
+    Ok(connection.prepare_cached(&sql)?.query_row(
+        params![subject, at_index, incarnation_id, runtime_accepted_at],
+        |row| row.get(0),
+    )?)
 }
 
 /// `login_only` answers only whether the seat needs a login: it returns at once, before any

@@ -6161,6 +6161,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     // Nor does the first agents roster read fold every agent's card.
     st3::api::start_agent_roster(&state);
     st3::api::start_stopped_usage_flush(&state);
+    st3::api::start_current_value_maintenance(&state);
     startup.phase("bind-listeners");
     let bound = std::sync::atomic::AtomicUsize::new(0);
     let ready = || {

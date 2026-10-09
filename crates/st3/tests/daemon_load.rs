@@ -1223,6 +1223,7 @@ fn run(
         st3::api::start_operation_report(&state);
         // As the daemon starts: it folds the roster once and keeps it published.
         st3::api::start_agent_roster(&state);
+        st3::api::start_current_value_maintenance(&state);
         let server_socket = socket.clone();
         daemon.spawn(
             async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
@@ -2040,10 +2041,12 @@ async fn send_one(context: &Context, name: &str) -> Result<(), String> {
             match result {
                 Err(error)
                     if current
-                        && (error.code == "current-value-deadline"
-                            || error.code == "internal"
-                                && (error.message.contains("database is locked")
-                                    || error.message.contains("database table is locked"))) =>
+                        && (matches!(
+                            error.code,
+                            "current-value-deadline" | "database-busy" | "database-locked"
+                        ) || error.code == "internal"
+                            && (error.message.contains("database is locked")
+                                || error.message.contains("database table is locked"))) =>
                 {
                     context.current_dropped.fetch_add(1, Ordering::Relaxed);
                     Ok(())
