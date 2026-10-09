@@ -235,7 +235,7 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 
 | Resource | List and detail routes | Deterministic list order |
 |---|---|---|
-| Attention | `/attention`, `/attention/{id}` | priority descending, requested time ascending, ID |
+| Attention (alerts) | `/attention`, `/attention/{id}`; also `/alerts`, `/alerts/{id}` | priority descending, requested time ascending, ID |
 | Messages | `/messages`, `/messages/{id}` | sent time descending, ID |
 | Launches | `/launches`, `/launches/{id}` | updated time descending, ID |
 | Launch variants | `/launches/{id}/variants`, `/launches/{id}/variants/{variant_id}` | ordinal, ID |
@@ -581,6 +581,16 @@ Every attention resource carries its concrete `person_id`, original `source_id`,
 `attention_kind`, optional mission/run/step context, and currently meaningful typed actions. A
 client can therefore render a mixed inbox, navigate to the source, and act without recovering
 identity or graph context from prose.
+
+`alert` says whether the item is an alert: it blocks or waits on the person. Asks, human
+gates, launch and revision approvals, agent and custom requests, harness prompts and logins, and
+a broken gate the person published are alerts; an update, which asks nothing, is not. `conversation_id` names the agent whose
+conversation the item belongs to: the agent that asked, the agent whose work a gate reviews
+(else its run's requester), the launch's planner, the revision's proposer, or the seat itself.
+It is absent when no agent is behind the item. `conversation_ids` lists every conversation the item
+shows in, starting with `conversation_id`: a harness login alert is one alert per login directory
+and host, naming every seat that shares it, since one sign-in answers them all. Daemons that
+predate alerts omit these fields.
 
 A `fault` also carries `target_states`: for each target with a lifecycle (a mission, run,
 generation, step, or agent), its current `state` and, when known, the `since`

@@ -20,13 +20,14 @@ fn summary_home_working_machine_predicates_and_deadline() {
         "person-step",
         "agent-request",
         "harness-prompt",
+        "harness-login",
+        "fault",
         "custom.fixture",
     ] {
-        assert!(home_kind(kind));
+        assert!(crate::model::attention_is_alert(kind, false));
+        assert!(!crate::model::attention_is_alert(kind, true));
     }
-    for kind in ["unread-message", "fault", "unknown"] {
-        assert!(!home_kind(kind));
-    }
+    assert!(!crate::model::attention_is_alert("unread-message", false));
     let agent = json!({"state":"running","harness_state":"working","fault":null,"delivery":{"state":"current"}});
     assert!(working(&agent));
     for changed in [
@@ -435,7 +436,7 @@ fn summary_does_not_hydrate_thousands_of_unstarted_definitions() {
 }
 
 #[test]
-fn summary_unread_person_updates_count_on_home_until_read() {
+fn summary_counts_alerts_and_an_unread_update_is_not_one() {
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path());
     let source = r#"version 2
@@ -474,8 +475,19 @@ mission "summary-update-about" state="ready" {
             .unwrap(),
         )
         .unwrap();
+    let ask = state
+        .store
+        .ask_person(
+            &serde_json::from_value(json!({
+                "person":"person/avery","actor":"agent/summary-fixture.updater",
+                "title":"Choose a fixture","reason":"Only the person can choose.",
+                "new_run":"summary-ask","idempotency_key":"summary-ask"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let count = |person| {
-        state
+        let row = state
             .store
             .read_snapshot(|index| {
                 let now = client_now_ms();
@@ -489,6 +501,16 @@ mission "summary-update-about" state="ready" {
                     assert_eq!(item["attention_kind"], "person-step");
                     assert_eq!(item["update"]["type"], "update");
                     assert_eq!(item["state"], "open");
+                    assert_eq!(item["alert"], false);
+                    let asked = attention
+                        .iter()
+                        .find(|item| item["source_id"] == ask.subject)
+                        .unwrap();
+                    assert_eq!(asked["alert"], true);
+                    assert_eq!(
+                        asked["conversation_id"],
+                        "agent/summary-fixture.updater"
+                    );
                 }
                 native(
                     &state,
@@ -500,11 +522,12 @@ mission "summary-update-about" state="ready" {
                     None,
                 )
             })
-            .unwrap()[0]["needs_you"]
-            .as_u64()
-            .unwrap()
+            .unwrap()[0]
+            .clone();
+        assert_eq!(row["alerts"], row["needs_you"]);
+        row["alerts"].as_u64().unwrap()
     };
-    // Tier::Later affects display priority, not the accepted Home-count predicate.
+    // The ask is an alert; the unread update asks nothing, so it is not one.
     assert_eq!(count("person/avery"), 1);
     assert_eq!(count("person/other"), 0);
     state
@@ -526,7 +549,7 @@ mission "summary-update-about" state="ready" {
             false,
         )
         .unwrap();
-    assert_eq!(count("person/avery"), 0);
+    assert_eq!(count("person/avery"), 1);
 }
 
 #[test]

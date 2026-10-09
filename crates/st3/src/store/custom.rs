@@ -866,6 +866,9 @@ pub(super) fn attention_item(body: &Value, at: u128) -> Result<AttentionItemView
         launch_id: None,
         variant_id: None,
         message_id: None,
+        conversation: body["owner"]
+            .as_str()
+            .and_then(super::attention_snapshot::agent),
         title: a["title"].as_str().unwrap_or_default().into(),
         detail: a["detail"].as_str().unwrap_or_default().into(),
         request: None,

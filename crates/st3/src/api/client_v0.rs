@@ -42,7 +42,7 @@ pub(super) async fn request_latency(
 struct CollectionSubscribe {
     kind: String,
     id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "collection_name")]
     collection: String,
     limit: Option<usize>,
     person: Option<String>,
@@ -57,6 +57,13 @@ struct CollectionSubscribe {
     capability: Option<String>,
     /// A conversation subscription names an agent or a session.
     conversation: Option<String>,
+}
+
+/// A collection's name, with `alerts` read as `attention`: the same rows under the name a person
+/// reads. Clients that predate alerts keep subscribing to `attention`.
+fn collection_name<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    Ok(if name == "alerts" { "attention".into() } else { name })
 }
 
 struct CollectionSubscription {
@@ -2173,6 +2180,9 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         })
         .collect::<Vec<_>>();
     capabilities.push(json!({"id":"summary", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
+    // Attention rows say whether each is an alert and name its agent conversation; `alerts` names
+    // the attention collection and routes, and the summary counts alerts.
+    capabilities.push(json!({"id":"alerts", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"collections", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));

@@ -1063,10 +1063,16 @@ export type PersonUpdateEncoded = typeof PersonUpdate.Encoded
 export const Attention = /*#__PURE__*/ (() => Schema.Struct({
   "action_parameters": optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
   "actions": Schema.Array(Schema.Literals(["custom.reply","work.done","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"])),
+  /** Whether this item is an alert: it blocks or waits on its person (an ask, a human gate, a launch or revision approval, an agent or custom request, a harness prompt or login, or a broken gate the person published). An update is not one. Absent on daemons that predate alerts. */
+  "alert": optionalKey(Schema.Boolean).annotate({ description: "Whether this item is an alert: it blocks or waits on its person (an ask, a human gate, a launch or revision approval, an agent or custom request, a harness prompt or login, or a broken gate the person published). An update is not one. Absent on daemons that predate alerts." }),
   "attention_kind": Schema.Union([Schema.Literals(["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault"]), Schema.String.check(Schema.isPattern(new RegExp("^custom\\.[a-zA-Z0-9_.-]+$", "u")))]),
   "because": optionalKey(Schema.String),
   /** The mission step waiting on this ask, on an ask a mission step made; absent on a standalone ask. */
   "blocked": optionalKey(AttentionBlocked),
+  /** The agent whose conversation this item belongs to: the agent that asked, whose work a gate reviews, that planned the launch or proposed the revision, or the seat itself. Absent when no agent is behind it. */
+  "conversation_id": optionalKey(Id),
+  /** Every agent conversation this item shows in, starting with conversation_id. A harness login alert names every seat that shares the login, since one sign-in answers them all. */
+  "conversation_ids": optionalKey(Schema.Array(Id)).annotate({ description: "Every agent conversation this item shows in, starting with conversation_id. A harness login alert names every seat that shares the login, since one sign-in answers them all." }),
   /** Data-only registered reply form; absent on native attention. */
   "custom_form": optionalKey(Schema.Record(Schema.String, Schema.Unknown)).annotate({ description: "Data-only registered reply form; absent on native attention." }),
   "detail": Schema.String,
@@ -1797,10 +1803,13 @@ export const Summary = /*#__PURE__*/ (() => Schema.Struct({
   "active_missions": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   /** The published agents roster the agent counts came from, when a background refresher prepares it: its graph cut and when it was published. Absent when the counts come from this snapshot itself. */
   "agents_as_of": optionalKey(Schema.Struct({ "published_at": Timestamp, "store_index": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) })).annotate({ description: "The published agents roster the agent counts came from, when a background refresher prepares it: its graph cut and when it was published. Absent when the counts come from this snapshot itself." }),
+  /** Open alerts: items that block or wait on this person. Updates are not counted. Absent on daemons that predate alerts. */
+  "alerts": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))).annotate({ description: "Open alerts: items that block or wait on this person. Updates are not counted. Absent on daemons that predate alerts." }),
   "id": Id,
   "kind": Schema.Literal("summary"),
   "machines": SummaryMachines,
-  "needs_you": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** The alert count; an older daemon also counted unread updates. */
+  "needs_you": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).annotate({ description: "The alert count; an older daemon also counted unread updates." }),
   "operational": optionalKey(Operational),
   "person_id": Schema.OptionFromNullOr(Schema.String),
   "revision": Revision,

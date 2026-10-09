@@ -363,8 +363,12 @@ fn resource(item: &AttentionItemView) -> Result<Value> {
       "title":item.title,"detail":item.detail,"priority":item.priority,"state":"open",
       "requested_at":crate::api::client_timestamp(item.requested_at_unix_ms),"targets":item.targets,
       "actions":crate::api::client_attention_actions(&item.kind,item.review_mode.as_deref()),
-      "operational":{"layer":"current","actionable":true,"reasons":[]}});
+      "operational":{"layer":"current","actionable":true,"reasons":[]},"alert":item.is_alert()});
+    if item.conversation.is_some() {
+        row["conversation_ids"] = json!(item.conversations());
+    }
     for (name, value) in [
+        ("conversation_id", &item.conversation),
         ("requester_id", &item.requester_id),
         ("launch_id", &item.launch_id),
         ("variant_id", &item.variant_id),

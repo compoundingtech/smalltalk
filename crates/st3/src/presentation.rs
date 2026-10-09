@@ -1625,7 +1625,7 @@ mod tests {
             requester_id: None,
             launch_id: None,
             variant_id: None,
-            message_id: None,
+            message_id: None, conversation: None,
             title: "Fabric needs review".into(),
             detail: "The queue did not recover.".into(),
             mission: Some("mission/fabric".into()),
