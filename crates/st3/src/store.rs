@@ -7108,6 +7108,7 @@ impl Store {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Option<(Vec<MissionRunView>, Option<String>)>> {
+        anyhow::ensure!((1..=50).contains(&limit), "mission root page limit must be 1 through 50");
         let root = root.strip_prefix("mission-run/").unwrap_or(root);
         let connection = self.readers.get();
         let cursor = match after {
@@ -36004,6 +36005,7 @@ mission "summary-child" state="ready" {
             .mission_runs_for_root_page(&root.subject, Some("another-root"), 2)
             .unwrap()
             .is_none());
+        assert!(store.mission_runs_for_root_page(&root.subject, None, 0).is_err());
         assert_eq!(store.index().unwrap(), index, "pagination must remain a read");
         let plan = connection
             .prepare(
