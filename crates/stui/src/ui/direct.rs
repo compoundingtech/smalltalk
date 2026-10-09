@@ -134,10 +134,11 @@ async fn over_fabric(
                 "{owner} advertises no Fabric node, and no Fabric peer of this machine has its name"
             )
         })?;
+    let protocol = st3_terminal_direct::protocol(&fleet_id);
     let target = FabricTarget {
         fabric,
         peer,
-        protocol: st3_terminal_direct::protocol(&fleet_id),
+        protocol: protocol.clone(),
     };
     let request = RouteRequest::new(terminal.name, terminal.subject, terminal.incarnation);
     st3_terminal_direct::open_route(&target, &request)
@@ -145,7 +146,7 @@ async fn over_fabric(
         .map_err(|error| match error {
             RouteError::Refused(reason) => format!("{owner} refused the terminal: {reason}"),
             RouteError::Unreachable(reason) => format!(
-                "Fabric did not reach {owner}'s terminals: {reason} (is `st terminals expose-fabric` running there, and does it grant this machine?)"
+                "Fabric did not reach {owner}'s terminals: {reason}. `fabric probe {owner} {protocol}` says whether the peer is up and grants this machine; `st terminals expose-fabric` on {owner} serves it"
             ),
         })
 }
@@ -327,6 +328,102 @@ mod tests {
         let mut answer = [0_u8; 5];
         stream.read_exact(&mut answer).unwrap();
         assert_eq!(&answer, b"world");
+    }
+
+    /// Time the real attach path to a live seat, read only: the runtime read stui makes, the
+    /// route (local socket or Fabric), and the first screen of a PEEK, which sends no input and
+    /// resizes nothing. Run by hand against a real daemon and fleet:
+    /// `STUI_PROBE_SUBJECT=agent/... STUI_PROBE_PERSON=person/... cargo test -p stui
+    /// live_direct_probe -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "reads a live seat through the real daemon and Fabric"]
+    async fn live_direct_probe() {
+        let subject = std::env::var("STUI_PROBE_SUBJECT").expect("STUI_PROBE_SUBJECT");
+        let person = std::env::var("STUI_PROBE_PERSON").expect("STUI_PROBE_PERSON");
+        let runtime = std::env::var("STUI_PROBE_RUNTIME").expect("STUI_PROBE_RUNTIME");
+        let socket = st3_client::discover_unix_endpoint(
+            std::env::var_os("ST3_ENDPOINT").map(PathBuf::from),
+        )
+        .unwrap();
+        let client = Client::unix_as(&socket, person);
+        let started = Instant::now();
+        let envelope = client.runtimes_get(&runtime).await.unwrap();
+        let read = started.elapsed();
+        let st3_client::Resource::Runtime(found) = envelope.value else {
+            panic!("not a runtime")
+        };
+        let (name, incarnation, owner) = (
+            found.runtime_id.clone(),
+            found.incarnation_id.clone().expect("running incarnation"),
+            found.owner_host_id.clone(),
+        );
+        let opened_at = Instant::now();
+        let opened = open(
+            &client,
+            &Terminal {
+                subject: &subject,
+                name: &name,
+                incarnation: &incarnation,
+                owner: Some(&owner),
+                expected: None,
+            },
+        )
+        .await
+        .unwrap();
+        let routed = opened_at.elapsed();
+        let Opened::Stream { mut stream, .. } = opened else {
+            panic!("gateway")
+        };
+        stream.write_all(&pty_core::protocol::encode_peek(true, false)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let mut reader = pty_core::protocol::PacketReader::new();
+        let mut bytes = [0_u8; 65536];
+        let mut first = None;
+        while first.is_none() {
+            let count = stream.read(&mut bytes).unwrap();
+            assert!(count > 0, "the session closed before a screen");
+            first = reader
+                .feed(&bytes[..count])
+                .unwrap()
+                .into_iter()
+                .find(|packet| packet.type_ == pty_core::protocol::MessageType::Screen);
+        }
+        println!(
+            "PROBE direct subject={subject} owner={owner} runtime_read={read:?} route={routed:?} \
+             first_screen={:?} total={:?}",
+            opened_at.elapsed() - routed,
+            started.elapsed()
+        );
+        // The same seat through the client gateway, as stui attached before: the daemon relays.
+        let terminal = found.terminal_id.clone().expect("a terminal");
+        let gateway = Instant::now();
+        let mut relayed = client
+            .raw_terminal_peek(&terminal, &incarnation)
+            .await
+            .unwrap()
+            .stream;
+        let opened = gateway.elapsed();
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        relayed
+            .write_all(&pty_core::protocol::encode_peek(true, false))
+            .await
+            .unwrap();
+        let mut reader = pty_core::protocol::PacketReader::new();
+        let mut seen = false;
+        while !seen {
+            let count = relayed.read(&mut bytes).await.unwrap();
+            assert!(count > 0, "the gateway closed before a screen");
+            seen = reader
+                .feed(&bytes[..count])
+                .unwrap()
+                .iter()
+                .any(|packet| packet.type_ == pty_core::protocol::MessageType::Screen);
+        }
+        println!(
+            "PROBE gateway subject={subject} open={opened:?} first_screen={:?} total={:?}",
+            gateway.elapsed() - opened,
+            gateway.elapsed()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
