@@ -1,6 +1,6 @@
 /** Runtime-free workbench presentation. Conversation runtimes load with the thread surface. */
 export { AgentRow, StatusGlyph } from './composition/Sidebar.tsx'
-export { ThreadHeader, ResizableSplit } from './composition/Shell.tsx'
+export { ThreadHeader, ResizableSplit, TerminalDrawer } from './composition/Shell.tsx'
 export { DiffPanel } from './composition/DiffPanel.tsx'
 export { SidebarAgentRow, sidebarRowDescription } from './sidebar/SidebarAgentRow.tsx'
 export { SidebarStatus } from './sidebar/SidebarStatus.tsx'
