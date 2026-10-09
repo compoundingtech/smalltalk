@@ -50,16 +50,43 @@ pub(super) async fn bind(
     let bound = blocking_action(move || {
         if !cfg!(target_os = "linux") {
             return startup::bind_with_native_startup(&bind_state.store, &request, || {
-                startup::live_native_incarnation(&bind_state.store, &bind_state.node, &bind_state.pty_root, &peer, &request)
+                startup::live_native_incarnation(
+                    &bind_state.store,
+                    &bind_state.node,
+                    &bind_state.pty_root,
+                    &peer,
+                    &request,
+                )
             });
         }
-        if let Some(bound) = authority::with_argv_channel(&bind_state, &request, &peer, |member, validate| {
-            bind_state.store.bind_argv_mailbox_checked(&request, member, validate)
-        })? { return Ok(bound); }
-        authority::with_authority(&bind_state, &request, &peer, |owner, validate| {
-            bind_state.store.bind_mailbox_with_lease_checked(&request, Some(owner), validate)
+        if let Some(bound) =
+            authority::with_argv_channel(&bind_state, &request, &peer, |member, validate| {
+                bind_state
+                    .store
+                    .bind_argv_mailbox_checked(&request, member, validate)
+            })?
+        {
+            return Ok(bound);
+        }
+        let admitted =
+            authority::with_authority(&bind_state, &request, &peer, |owner, validate| {
+                bind_state
+                    .store
+                    .bind_mailbox_with_lease_checked(&request, Some(owner), validate)
+            });
+        // Successful admission never reads launch evidence again. The only repairable
+        // refusal is the graph's running observation; provider/capability refusals stay final.
+        startup::reclassify_native_startup(&bind_state.store, &request, admitted, || {
+            startup::live_native_incarnation(
+                &bind_state.store,
+                &bind_state.node,
+                &bind_state.pty_root,
+                &peer,
+                &request,
+            )
         })
-    }).await?;
+    })
+    .await?;
     signal_local_change(&state);
     Ok(Json(bound))
 }

@@ -627,8 +627,9 @@ impl Store {
             if let Some(runtime) = runtime {
                 let body: Value = serde_json::from_str(&runtime)?;
                 let fields = body.get("fields").unwrap_or(&body);
-                if fields["incarnation_id"].as_str() == Some(request.incarnation.as_str())
-                    && !matches!(fields["status"].as_str(), None | Some("starting"))
+                if fields["status"] == "running"
+                    || (fields["incarnation_id"].as_str() == Some(request.incarnation.as_str())
+                        && !matches!(fields["status"].as_str(), None | Some("starting")))
                 {
                     return Ok(false);
                 }

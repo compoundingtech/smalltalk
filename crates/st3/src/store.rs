@@ -22267,9 +22267,10 @@ fn check_mailbox_incarnation(
     // A runtime observation that does not name this incarnation describes something older: a
     // predecessor, or the daemon's own "exited" for a seat that died while no daemon watched,
     // which names no incarnation at all. Only an observation of this very incarnation is final.
-    let describes_another = fields.get("incarnation_id").and_then(Value::as_str)
-        != Some(fence.incarnation.as_str());
-    if !live && fence.epoch == 0
+    let describes_another =
+        fields.get("incarnation_id").and_then(Value::as_str) != Some(fence.incarnation.as_str());
+    if !live
+        && fence.epoch == 0
         && (describes_another
             || matches!(
                 fields.get("status").and_then(Value::as_str),
@@ -22309,9 +22310,20 @@ fn check_mailbox_incarnation(
             }
         }
     }
-    if !live
-        || mailbox_harness_ended(connection, &fence.subject, &fence.incarnation, &runtime_claim)
-            .map_err(internal)?
+    if !live {
+        return Err(St3Error::new(
+            "stale-mailbox-session",
+            "this is not the seat's live incarnation",
+        )
+        .with_detail("mailbox_runtime_pending", true));
+    }
+    if mailbox_harness_ended(
+        connection,
+        &fence.subject,
+        &fence.incarnation,
+        &runtime_claim,
+    )
+    .map_err(internal)?
     {
         return Err(St3Error::new(
             "stale-mailbox-session",

@@ -41,23 +41,58 @@ impl Fence {
     /// Initial allocation is idempotent under this random request token. Reexec and reconnect
     /// carry the returned epoch; neither the client's clock nor a lost response changes ownership.
     pub async fn bind(&mut self, client: &crate::client::Client) -> Result<()> {
+        self.bind_with_startup_timeout(client, std::time::Duration::from_secs(60))
+            .await
+    }
+
+    async fn bind_with_startup_timeout(
+        &mut self,
+        client: &crate::client::Client,
+        startup_timeout: std::time::Duration,
+    ) -> Result<()> {
         if self.epoch != 0 {
             return Ok(());
         }
+        let mut startup_deadline = None;
         loop {
-            match client.post("/v1/mailbox/bind", &*self).await {
+            let post = client.post("/v1/mailbox/bind", &*self);
+            let result = match startup_deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, post)
+                    .await
+                    .context("mailbox startup did not become ready before its deadline")?,
+                None => post.await,
+            };
+            match result {
                 Ok(bound) => {
                     *self = bound;
                     return Ok(());
                 }
-                Err(error)
-                    if crate::client::api_error_code(&error).is_some_and(|code| {
-                        !matches!(code, "internal" | "database-busy" | "database-locked" | "mailbox-session-starting" | "mailbox-authority-unavailable")
-                    }) =>
-                {
-                    return Err(error);
+                Err(error) => {
+                    let code = crate::client::api_error_code(&error);
+                    if code.is_some_and(|code| {
+                        !matches!(
+                            code,
+                            "internal"
+                                | "database-busy"
+                                | "database-locked"
+                                | "mailbox-session-starting"
+                                | "mailbox-authority-unavailable"
+                        )
+                    }) {
+                        return Err(error);
+                    }
+                    if code == Some("mailbox-session-starting") {
+                        startup_deadline
+                            .get_or_insert_with(|| tokio::time::Instant::now() + startup_timeout);
+                    }
+                    let pause = tokio::time::sleep(std::time::Duration::from_secs(1));
+                    match startup_deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline, pause)
+                            .await
+                            .context("mailbox startup did not become ready before its deadline")?,
+                        None => pause.await,
+                    }
                 }
-                Err(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
             }
         }
     }
@@ -270,6 +305,61 @@ pub(crate) mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn a_starting_bind_has_a_deadline_even_if_the_next_request_hangs() {
+        use axum::http::StatusCode;
+        use axum::{Json, Router, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for hang_after_first in [false, true] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let captured = attempts.clone();
+            let app = Router::new().route(
+                "/v1/mailbox/bind",
+                post(move || {
+                    let attempts = captured.clone();
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) > 0 && hang_after_first {
+                            std::future::pending::<()>().await;
+                        }
+                        (
+                            StatusCode::CONFLICT,
+                            Json(json!({"code":"mailbox-session-starting",
+                        "message":"running observation never lands","details":{}})),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let client = crate::client::Client::new(crate::client::Endpoint::Http(format!(
+                "http://{address}"
+            )));
+            let mut fence = Fence::new("agent/fixture", "incarnation/fixture", "delivery");
+            let token = fence.token.clone();
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                fence.bind_with_startup_timeout(&client, std::time::Duration::from_secs(2)),
+            )
+            .await
+            .expect("startup retry must finish")
+            .unwrap_err();
+            server.abort();
+            assert!(
+                error.to_string().contains("startup did not become ready"),
+                "{error}"
+            );
+            assert!(attempts.load(Ordering::SeqCst) >= 2);
+            assert_eq!(fence.epoch, 0);
+            assert_eq!(fence.token, token);
+        }
+    }
+
     fn claim(subject: &str, kind: &str, fields: Value, key: &str) -> ClaimInput {
         ClaimInput {
             subject: subject.into(),
