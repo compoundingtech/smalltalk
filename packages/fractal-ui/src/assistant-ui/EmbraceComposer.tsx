@@ -235,7 +235,7 @@ export function EmbraceComposer(props: EmbraceComposerProps) {
   }), [submissions, aui])
   const markUserEdit = () => {
     cause.current = 'user'
-    queueMicrotask(() => { if (cause.current === 'user') cause.current = 'programmatic' })
+    queueMicrotask(() => { if (cause.current === 'user') { observeDraft(); cause.current = 'programmatic' } })
   }
   const runtimeText = useAuiState(state => state.composer.text)
   const root = React.useRef<HTMLDivElement>(null)
@@ -333,7 +333,7 @@ export function EmbraceComposer(props: EmbraceComposerProps) {
       try {
         if (props.onRequestSubmit !== undefined) props.onRequestSubmit(modified)
         else aui.composer.send({ steer: false })
-      } finally { cause.current = 'programmatic' }
+      } finally { observeDraft(); cause.current = 'programmatic' }
     },
     style: [styles.adaptiveRoot, stacked ? styles.slab : props.variant === 'C3' ? styles.focusSlab : styles.pill, props.style],
     inputStyle: [styles.input, styles.growingEditor, props.inputStyle],
