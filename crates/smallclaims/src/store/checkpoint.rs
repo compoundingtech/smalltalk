@@ -570,8 +570,9 @@ pub fn answer_mismatches(
 ) -> Vec<String> {
     let mut mismatches = Vec::new();
     for (subject, before) in before {
-        let after = after.get(subject).cloned().unwrap_or(Value::Null);
-        let (Some(before), Some(after)) = (before.as_object(), after.as_object()) else {
+        let (Some(before), Some(after)) =
+            (before.as_object(), after.get(subject).and_then(Value::as_object))
+        else {
             mismatches.push(format!("{subject} all"));
             continue;
         };
@@ -590,6 +591,19 @@ pub fn answer_mismatches(
     mismatches
 }
 
+fn open_checkpoint_copy(copy: &Path) -> Result<Connection> {
+    let connection = Connection::open(copy)?;
+    projection_digest::register(&connection)?;
+    // This scratch transaction can rewrite most of the store twice. Its rollback journal
+    // belongs on disk, not in an allocation proportional to the database's size.
+    connection.execute_batch(&format!(
+        "PRAGMA foreign_keys = ON; PRAGMA journal_mode = DELETE;
+         PRAGMA cache_size = -{}; PRAGMA temp_store = FILE;",
+        crate::sqlite::READ_CACHE_KIB,
+    ))?;
+    Ok(connection)
+}
+
 /// Project a copy of the sealed set with and without the drop, and compare the graph and every
 /// reader answer. `copy` is a store file holding at least the sealed set; it is changed.
 pub fn prove_on_copy(
@@ -599,9 +613,7 @@ pub fn prove_on_copy(
     plan: &DropPlan,
 ) -> Result<CheckpointProof> {
     runtime.checkpoint_preflight()?;
-    let mut connection = Connection::open(copy)?;
-    projection_digest::register(&connection)?;
-    connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = MEMORY;")?;
+    let mut connection = open_checkpoint_copy(copy)?;
     let transaction = connection.transaction()?;
     // Keep only the sealed set.
     transaction.execute_batch(
@@ -714,19 +726,23 @@ pub fn prove_on_copy(
     Ok(proof)
 }
 
-/// The query for one window of records in the sealed-set read: the claim columns, the record's
-/// identity and state, and the canonical order's components as columns 14 to 20 (so the pages
-/// can be sorted together in Rust as `ORDER BY canonical` sorted them), then the record's
-/// position as column 21. It must be driven from `replica_records` by its rowid range; a plan
-/// that drives from `claims` would read every claim for every window.
+/// Compact identities and canonical sort keys for one sealed-record window. Claim bodies are
+/// read only after the envelope cut and canonical ordering have been resolved. The query must
+/// be driven from `replica_records` by its rowid range; driving from `claims` would read every
+/// claim for every window.
 pub fn sealed_records_page_sql() -> String {
     let order = super::canonical::components("claims").join(", ");
     format!(
-        "SELECT {CLAIM_COLUMNS}, records.writer, records.sequence, records.envelope_hash,
-                records.state, {order}, records.position
-         FROM claims JOIN batches ON batches.id=claims.batch_id
-         JOIN replica_records records ON records.claim_id=claims.id
-         WHERE records.rowid > ?1 AND records.rowid <= ?2 AND records.state<>'repaired'"
+        "SELECT {order}, records.writer, records.sequence, records.envelope_hash,
+                records.state, records.position
+         FROM replica_records records CROSS JOIN claims ON claims.id=records.claim_id
+         JOIN batches ON batches.id=claims.batch_id
+         JOIN replica_envelopes envelopes
+           ON envelopes.writer=records.writer AND envelopes.sequence=records.sequence
+             AND envelopes.envelope_hash=records.envelope_hash
+         WHERE records.rowid > ?1 AND records.rowid <= ?2 AND records.state<>'repaired'
+           AND envelopes.rowid <= ?4
+           AND CAST(envelopes.accepted_at_unix_ms AS INTEGER) < ?3"
     )
 }
 
@@ -753,12 +769,10 @@ impl Store {
     }
 
     /// `checkpoint_sealed_set_through`, reading `envelope_page` envelopes and `record_page`
-    /// records per read. Each page is a read of its own, so its snapshot ends with it and the WAL
-    /// can be checkpointed between pages; one transaction over the whole set pinned the WAL for
-    /// the 20 to 40 seconds a large store took. The set stays the same set: the envelopes are
-    /// those up to `seal_rowid`, and a claim is kept only if its envelope is among them, so what
-    /// arrives between pages is read and left out. Only a record changing state (a repair)
-    /// between two pages of one call could differ from a single snapshot.
+    /// records per query within one pinned snapshot. The pages bound working batches, not
+    /// transaction lifetimes: queued body IDs must survive a concurrent trim, and repairs,
+    /// protection and tombstones must describe the same captured set. Sealing happens before
+    /// the read snapshot starts. The WAL stays pinned until capture completes.
     pub fn checkpoint_sealed_set_paged(
         &self,
         cut_unix_ms: u128,
@@ -770,6 +784,20 @@ impl Store {
         // Seal only new batches. A full history scan under the writer stalls live requests
         // every time a checkpoint is reconsidered, even when no new envelope is needed.
         self.seal_local_batches()?;
+        self.read_snapshot(|_| {
+            self.checkpoint_sealed_set_snapshot(
+                cut_unix_ms, through_rowid, envelope_page, record_page,
+            )
+        })
+    }
+
+    fn checkpoint_sealed_set_snapshot(
+        &self,
+        cut_unix_ms: u128,
+        through_rowid: Option<i64>,
+        envelope_page: i64,
+        record_page: i64,
+    ) -> Result<SealedSet> {
         let seal_rowid: i64 = {
             let connection = self.readers.get();
             let high: i64 = connection.query_row(
@@ -831,49 +859,83 @@ impl Store {
         };
         // The canonical order, then the record's own identity, so a claim held by two records
         // (the same claim admitted from two envelopes) orders the same way every time.
-        type OrderKey = (i64, String, Option<String>, Option<i64>, String, i64, String, String, i64, String, i64);
-        let mut keyed: Vec<(OrderKey, ClaimRecord, EnvelopeKey, bool)> = Vec::new();
+        type OrderKey = (i64, String, Option<String>, Option<i64>, String, i64, String, String, u64, String, i64);
+        let cut = i64::try_from(cut_unix_ms)?;
+        let mut keyed: Vec<(OrderKey, bool)> = Vec::new();
         let mut after = first.saturating_sub(1);
         while after < last {
             let upto = after.saturating_add(record_page).min(last);
             let connection = self.readers.get();
             let page = connection
                 .prepare_cached(&records_sql)?
-                .query_map([after, upto], |row| {
+                .query_map(params![after, upto, cut, seal_rowid], |row| {
                     Ok((
                         (
-                            row.get(14)?,
-                            row.get(15)?,
-                            row.get(16)?,
-                            row.get(17)?,
-                            row.get(18)?,
-                            row.get(19)?,
-                            row.get(20)?,
-                            row.get(10)?,
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
                             row.get(11)?,
-                            row.get(12)?,
-                            row.get(21)?,
                         ),
-                        claim_from_row(row)?,
-                        EnvelopeKey {
-                            writer: row.get(10)?,
-                            sequence: row.get(11)?,
-                            envelope_hash: row.get(12)?,
-                        },
-                        row.get::<_, String>(13)? == "valid",
+                        row.get::<_, String>(10)? == "valid",
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             keyed.extend(page);
             after = upto;
         }
-        keyed.sort_by(|left, right| left.0.cmp(&right.0));
-        let claims: Vec<(ClaimRecord, EnvelopeKey, bool)> = keyed
-            .into_iter()
-            .map(|(_, claim, envelope, valid)| (claim, envelope, valid))
-            .collect();
-        // Read after the record pages, so it is at least as new as the claims: a claim that became
-        // protected while the pages were read is protected here, and the set errs toward keeping.
+        // Record identity completes the key, so equal keys are the same record. An unstable
+        // sort preserves the canonical order without a second array of sort scratch space.
+        keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut late = BTreeSet::new();
+        for (key, _) in &keyed {
+            if key.1.parse::<u128>().unwrap_or_default() >= cut_unix_ms {
+                late.insert(EnvelopeKey {
+                    writer: key.7.clone(),
+                    sequence: key.8,
+                    envelope_hash: key.9.clone(),
+                });
+            }
+        }
+        envelopes.retain(|envelope| !late.contains(&envelope.key));
+        let before = envelopes
+            .iter()
+            .map(|envelope| envelope.key.clone())
+            .collect::<BTreeSet<_>>();
+        let mut claims = Vec::new();
+        let mut records = keyed.into_iter().peekable();
+        let claim_sql = format!("SELECT {CLAIM_COLUMNS} FROM claims WHERE id=?1");
+        while records.peek().is_some() {
+            // Bound body loading by pages while inheriting the capture's pinned snapshot.
+            let connection = self.readers.get();
+            let mut statement = connection.prepare_cached(&claim_sql)?;
+            for _ in 0..record_page {
+                let Some((key, valid)) = records.next() else {
+                    break;
+                };
+                let envelope = EnvelopeKey {
+                    writer: key.7,
+                    sequence: key.8,
+                    envelope_hash: key.9,
+                };
+                if before.contains(&envelope) {
+                    claims.push(SealedClaim {
+                        claim: statement.query_row([&key.6], claim_from_row)?,
+                        envelope,
+                        valid,
+                        protected: false,
+                    });
+                }
+            }
+        }
+        // Protection and tombstones use the same snapshot as the bodies, rather than mixing
+        // a concurrent trim or repair with the already captured identities.
         let connection = self.readers.get();
         let protected = connection
             .prepare(
@@ -889,28 +951,9 @@ impl Store {
             .query_map([], |row| row.get::<_, Option<String>>(0))?
             .filter_map(|row| row.transpose())
             .collect::<rusqlite::Result<BTreeSet<_>>>()?;
-        let connection = self.readers.get();
-        let mut late = BTreeSet::new();
-        for (claim, envelope, _) in &claims {
-            if claim.accepted_at_unix_ms >= cut_unix_ms {
-                late.insert(envelope.clone());
-            }
+        for claim in &mut claims {
+            claim.protected = protected.contains(&claim.claim.id);
         }
-        envelopes.retain(|envelope| !late.contains(&envelope.key));
-        let before = envelopes
-            .iter()
-            .map(|envelope| envelope.key.clone())
-            .collect::<BTreeSet<_>>();
-        let claims = claims
-            .into_iter()
-            .filter(|(_, envelope, _)| before.contains(envelope))
-            .map(|(claim, envelope, valid)| SealedClaim {
-                protected: protected.contains(&claim.id),
-                claim,
-                envelope,
-                valid,
-            })
-            .collect();
         // Envelopes an earlier checkpoint dropped are still part of what this node seals.
         let envelope_tombstones = connection
             .prepare(
@@ -1169,5 +1212,40 @@ impl Store {
             retained_digest: plan.retained_digest,
             proof,
         })
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_copy_spills_rollback_and_temporary_pages_to_disk() {
+        let scratch = tempfile::tempdir().unwrap();
+        let copy = scratch.path().join("proof.sqlite3");
+        let mut connection = open_checkpoint_copy(&copy).unwrap();
+        assert_eq!(
+            connection.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0)).unwrap(),
+            "delete"
+        );
+        assert_eq!(
+            connection.query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0)).unwrap(),
+            -(crate::sqlite::READ_CACHE_KIB as i64)
+        );
+        assert_eq!(
+            connection.query_row("PRAGMA temp_store", [], |row| row.get::<_, i64>(0)).unwrap(),
+            1
+        );
+        connection.execute_batch(
+            "CREATE TABLE payload(body BLOB);
+             INSERT INTO payload VALUES (zeroblob(4 * 1024 * 1024));"
+        ).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction.execute("UPDATE payload SET body=randomblob(4 * 1024 * 1024)", []).unwrap();
+        assert!(
+            fs::metadata(scratch.path().join("proof.sqlite3-journal")).unwrap().len() > 4 * 1024 * 1024,
+            "the overwritten copy pages belong in a disk rollback journal"
+        );
+        transaction.rollback().unwrap();
     }
 }

@@ -20689,16 +20689,18 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute("DELETE FROM planning_candidates", [])?;
     transaction.execute("DELETE FROM planning_sessions", [])?;
     let mut statement = transaction.prepare(
-        &canonical_sql("SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+        &canonical_sql("SELECT id
          FROM claims WHERE kind >= 'planning-session.' AND kind < 'planning-session/'
          ORDER BY CANONICAL_ASC(claims)"),
     )?;
-    let claims = statement
-        .query_map([], claim_from_row)?
+    let claim_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
     clear_quarantined_claims_tx(transaction, "projection:planning")?;
-    for claim in claims {
+    for id in claim_ids {
+        let claim = claim_by_id_tx(transaction, &id)?
+            .context("a planning claim disappeared during replay")?;
         // A claim admission accepted but this projection cannot read, such as one from a faulty
         // or older producer, is quarantined alone instead of failing the whole graph.
         project_claim_isolated_tx(transaction, "projection:planning", &claim, || {
@@ -28465,6 +28467,7 @@ fn project_replicated_base_claims_with_progress(
         )
         .map_err(internal)?;
     clear_quarantined_claims_tx(transaction, "projection:base")?;
+
     progress(ReplayProgress {
         phase: "full-replay/base-claims",
         processed: Some(0),
@@ -28706,20 +28709,22 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
         };
         let mut statement = transaction
             .prepare(&canonical_sql(&format!(
-                "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
-                        claims.origin, claims.actor, claims.body, claims.predecessors,
-                        claims.accepted_at_unix_ms
+                "SELECT claims.id
                  FROM claims JOIN batches ON batches.id=claims.batch_id WHERE {filter}
                  ORDER BY CANONICAL_ASC(claims)"
             )))
             .map_err(internal)?;
-        let claims = statement
-            .query_map([], claim_from_row)
+        let claim_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
             .map_err(internal)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(internal)?;
         drop(statement);
-        for claim in claims {
+        for id in claim_ids {
+            let claim = claim_by_id_tx(transaction, &id)
+                .map_err(internal)?
+                .context("a mission run claim disappeared during replay")
+                .map_err(internal)?;
             project_claim_isolated_tx(transaction, "projection:runs", &claim, || match pass {
                 0 => project_mission_run_created(transaction, &claim),
                 1 => project_mission_run_update(transaction, &claim),

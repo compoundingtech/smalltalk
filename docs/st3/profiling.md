@@ -125,6 +125,24 @@ Capability admission seeks the attachment's indexed hash and its subject-head fe
 SQLite snapshot instead of decoding a bounded page of the whole fleet graph. Single-use CAS,
 session, person, and mode binding, expiry, and owner/incarnation checks remain unchanged.
 
+## Checkpoint scratch memory
+
+Checkpoint capture filters envelope cuts in SQLite and sorts only claim identities and canonical
+keys, then decodes retained bodies in bounded pages. Envelope identities, sort keys, bodies,
+protection and tombstones all come from one pinned read snapshot: a concurrent trim cannot
+remove a queued body's row halfway through capture. The WAL stays pinned until capture ends,
+so sustained writes can grow the WAL during that interval.
+Mission-run and planning replay retain the canonical list of IDs and load one claim body at a
+time. Base replay uses a temporary ID order and bounded body pages. Both close their ordering
+or body statements before projection savepoints.
+
+Proof copies use a disk rollback journal and temporary storage, with a fixed 2 MiB SQLite cache
+target. The scratch directory needs space for the database copy and its rollback journal.
+This does not change the sealed set, canonical ordering, proof digests, or reader-equivalence
+checks. Large retained sealed sets still consume memory; reader page-cache settings do not
+bound decoded claim bodies or allocator retention. Compare live allocations and SQLite's
+allocator counters with RSS before attributing an RSS plateau to retained read connections.
+
 ## Read connections and SQLite allocation
 
 Top-level API read queries admit before opening a connection or pinning a snapshot.
