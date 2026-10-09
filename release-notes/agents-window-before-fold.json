@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "none",
-    "detail": "Snapshot rows, display order, has-more behavior and existing HTTP cursors are unchanged. Status-filtered windows still filter the complete live-overlay result. Partial windows inherit their projection's queue lease deadline."
+    "detail": "Snapshot rows, display order, has-more behavior and existing HTTP cursors are unchanged. Status-filtered windows still filter the complete live-overlay result. Partial windows inherit their projection's queue lease deadline and retain their FIFO reader grant when selected-prefix cache coverage is valid."
   },
   "downtime": {
     "status": "none",

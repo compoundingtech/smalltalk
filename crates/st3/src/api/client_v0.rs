@@ -421,6 +421,11 @@ async fn collection_items_with_windows(
                                 return Ok(Err(super::agent_roster_not_ready()));
                             }
                             None if admitted => None,
+                            // A selected projection is sufficient for a warm unfiltered
+                            // window. Do not discard its FIFO reader grant merely because
+                            // no complete roster has been folded.
+                            None if status.is_none()
+                                && client_agent_window_is_cached(&store, index, limit)? => None,
                             None => return Ok(Ok(None)),
                         },
                     }
@@ -556,6 +561,16 @@ fn client_agent_window_cards(store: &Store, index: u64, limit: usize) -> anyhow:
         .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
     Ok((client_agent_cards_selected(store, false, index, &selected, true)?, has_more))
+}
+
+fn client_agent_window_is_cached(store: &Store, index: u64, limit: usize) -> anyhow::Result<bool> {
+    let Some(refs) = store.agent_page_refs_cached_at(index, false) else {
+        return Ok(false);
+    };
+    let selected = refs.iter().take(limit)
+        .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    Ok(store.agent_resources_cached_at(index, false, Some(&selected))?.is_some())
 }
 
 fn collection_window_label(collection: &str) -> &'static str {
