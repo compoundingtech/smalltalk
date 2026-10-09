@@ -75,6 +75,9 @@ pub(super) struct ReadFence {
 pub(super) struct Windows {
     commits: AtomicU64,
     revisions: Mutex<Revisions>,
+    /// Held while one socket weighs new commits, so sockets woken by the same commit wait for
+    /// its answer instead of each opening a snapshot to weigh it again.
+    weighing: Mutex<()>,
     observed: Mutex<Observed>,
     entries: Mutex<WindowEntries>,
     observer: Mutex<Option<smallclaims::sqlite::CommitObserver>>,
@@ -108,6 +111,7 @@ impl Windows {
         let windows = Arc::new(Self {
             commits: AtomicU64::new(0),
             revisions: Mutex::new(Revisions::default()),
+            weighing: Mutex::new(()),
             observed: Mutex::new(Observed {
                 index: store.index().unwrap_or(0),
                 local: 0,
@@ -256,6 +260,10 @@ impl Windows {
     }
 
     pub(super) fn changes(&self, store: &Store) -> anyhow::Result<[u64; 8]> {
+        let _weighing = self.weighing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(revisions) = self.current_changes(store) {
+            return Ok(revisions);
+        }
         let commits = self.commits();
         store.read_snapshot(|index| {
             let mut values = [0; 8];
