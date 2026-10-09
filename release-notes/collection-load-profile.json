@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Measure every held collection window under load with an opt-in daemon_load profile",
+  "replay": {"status": "none", "detail": "No claim replay or stored history changes."},
+  "schema": {"status": "none", "detail": "No database schema, version or stored data changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."},
+  "compatibility": {"status": "none", "detail": "Only the load test changes. ST_LOAD_PROFILE=collections-v1 has each of its 22 subscribers also hold missions, work, attention, summary, glasses and arrangements windows, each first snapshot timed against the roster's 300 ms budget. The default agents-v1 workload is unchanged, and a report compares only with baselines of its own profile."},
+  "downtime": {"status": "none", "detail": "No service interruption."},
+  "manual": {"status": "none", "detail": "No action is required."},
+  "recovery": {"status": "none", "detail": "Nothing to recover; the daemon is unchanged."}
+}
