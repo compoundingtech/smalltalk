@@ -197,6 +197,7 @@ impl Slice {
                 "CREATE TRIGGER main.slice_admit AFTER INSERT ON main.claims BEGIN
                    UPDATE ivm_install_sources SET available=0 WHERE name='{SOURCE}' AND
                      (NOT({width}) OR EXISTS(SELECT 1 FROM slice_images WHERE claim_id=NEW.id)
+                       OR EXISTS(SELECT 1 FROM slice_images WHERE store_index=NEW.store_index)
                        OR EXISTS(SELECT 1 FROM slice_output WHERE namespace=(SELECT namespace FROM ivm_install_roots WHERE view='{VIEW}') AND claim_id=NEW.id)
                        OR EXISTS(SELECT 1 FROM slice_limits WHERE id=1 AND
                        (retained_rows>=256 OR total_rows>=4096 OR
@@ -833,6 +834,67 @@ fn repair_delete_identity_schema_and_copied_file_refuse_old_pages() -> Result<()
     );
     assert!(replace.publish(&old_page).is_err());
     assert!(replace.ready_rows().is_err());
+    let (_index_root, index_replace) = fixture()?;
+    let indexed = append(&index_replace, "note/index-replaced")?;
+    let indexed_page = index_replace.capture()?.reduce()?;
+    let retained_before = index_replace.read(|db| {
+        Ok(db.query_row(
+            "SELECT retained_rows,retained_bytes,total_rows FROM main.slice_limits WHERE id=1",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, u64>(0)?,
+                    r.get::<_, u64>(1)?,
+                    r.get::<_, u64>(2)?,
+                ))
+            },
+        )?)
+    })?;
+    let new_id = "fixture-index-replacement";
+    index_replace.store.connection.batched(|tx| {
+        tx.execute("INSERT OR REPLACE INTO main.claims(store_index,id,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms)
+            SELECT store_index,?1,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms FROM main.claims WHERE id=?2",
+            params![new_id, indexed.id])?;
+        Ok::<_, anyhow::Error>(())
+    }).map_err(anyhow::Error::msg)??;
+    assert_eq!(
+        index_replace
+            .store
+            .claims_for("note/index-replaced", None)?[0]
+            .id,
+        new_id
+    );
+    index_replace.read(|db| {
+        assert_eq!(
+            db.query_row(
+                "SELECT claim_id FROM main.slice_images WHERE store_index=?1",
+                [indexed.store_index],
+                |r| r.get::<_, String>(0)
+            )?,
+            indexed.id
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT retained_rows,retained_bytes,total_rows FROM main.slice_limits WHERE id=1",
+                [],
+                |r| Ok((
+                    r.get::<_, u64>(0)?,
+                    r.get::<_, u64>(1)?,
+                    r.get::<_, u64>(2)?
+                ))
+            )?,
+            retained_before
+        );
+        assert!(!db.query_row(
+            "SELECT available FROM main.ivm_install_sources WHERE name=?1",
+            [SOURCE],
+            |r| r.get::<_, bool>(0)
+        )?);
+        Ok(())
+    })?;
+    assert!(index_replace.capture().is_err());
+    assert!(index_replace.publish(&indexed_page).is_err());
+    assert!(index_replace.ready_rows().is_err());
     let (_other, replaced) = fixture()?;
     append(&replaced, "note/epoch")?;
     let old = replaced.capture()?.reduce()?;
@@ -1152,4 +1214,12 @@ fn full_page_accounting_includes_metadata_and_physical_reader_writer_return() ->
     );
     assert_eq!(slice.ready_rows()?.len(), PAGE_ROWS);
     Ok(())
+}
+
+#[cfg(not(feature = "test-support"))]
+#[test]
+fn full_page_accounting_includes_metadata_and_physical_reader_writer_return() {
+    panic!(
+        "required page-work accounting is unavailable: build this target with --features test-support and require the named control with a positive statement count; missing instrumentation is not a passed or omitted prerequisite"
+    );
 }

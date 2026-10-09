@@ -46,6 +46,7 @@ the actual full claims PRIMARY KEY, `store_index`; `id` is UNIQUE, not the PK.
 The immutable image binds that native index to the claim-ID output key. Image
 bytes include the fixed eight-byte native index. Repeated ID admission via
 OR REPLACE fences before copying rather than conflicting with a retained image.
+The pre-copy fence covers both unique image keys: claim ID and store_index.
 
 INSERT admission and its reference/image either commit together or roll back
 together. Duplicate native admission must produce neither a second reference
@@ -208,8 +209,11 @@ reactor, route, thread candidate, card or health-source hunk is reserved.
 
 The first source slice is the additive real-Store fixture and bounded-input
 page adapter above, ready for exact review against this pinned base. Twelve
-normal tests (including the crash subprocess entry) and one test-support-only
-work-accounting test are authored, all UNRUN. The fixture physical read owner
+normal tests (including the crash subprocess entry) and one named work-accounting
+prerequisite are authored, all UNRUN. With test-support that prerequisite requires
+positive traced statements and unchanged 128-statement/50,000-VM ceilings;
+without test-support its same-name twin fails explicitly rather than disappearing.
+The fixture physical read owner
 refuses inherited pinned readers, checks idle acquisition/exit, removes
 cancellation before ROLLBACK, discards its exact reader on failed exit and
 returns clean errors/panics only after exit. This is private fixture logic, not
