@@ -15995,12 +15995,12 @@ mission "example/zero-run" state="ready" {
                 (page, scope.finish().statements)
             }
         };
-        append(40);
+        append(100);
 
         // Each event keeps its own cut: its timestamp and snapshot id are the single lookup's.
-        let (tail, _) = page(None, 40).await;
+        let (tail, _) = page(None, 100).await;
         let items = tail["items"].as_array().unwrap();
-        assert_eq!(items.len(), 40);
+        assert_eq!(items.len(), 100);
         for item in items {
             let sequence = item["sequence"].as_u64().unwrap();
             let single = client_snapshot_at(&state, sequence);
@@ -16011,13 +16011,19 @@ mission "example/zero-run" state="ready" {
         assert!(times.len() > 1, "events must not share one page time");
 
         // Statements stay flat as the page grows, and as unrelated history grows.
-        let (_, five) = page(None, 5).await;
-        let (_, forty) = page(None, 40).await;
-        eprintln!("events statements: 5 items {five}, 40 items {forty}");
-        assert_eq!(five, forty, "statements must not grow with the page size");
-        append(60);
-        let (_, grown) = page(None, 5).await;
-        assert_eq!(five, grown, "statements must not grow with history");
+        let mut counts = Vec::new();
+        for size in [10, 50, 100] {
+            counts.push(page(None, size).await.1);
+        }
+        eprintln!("events statements: 10/50/100 items {counts:?}");
+        assert!(counts.windows(2).all(|pair| pair[0] == pair[1]), "grew with page size: {counts:?}");
+        append(200);
+        let mut grown = Vec::new();
+        for size in [10, 50, 100] {
+            grown.push(page(None, size).await.1);
+        }
+        eprintln!("events statements after +200 claims of history: {grown:?}");
+        assert_eq!(counts, grown, "statements must not grow with history");
 
         // Walking forward in pages, with an append during the walk, yields each event once, in
         // order, with the same cuts.
