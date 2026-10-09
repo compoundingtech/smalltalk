@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::{SinkExt as _, StreamExt as _};
+use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use st3::api::AppState;
 use st3::model::{ClaimRecord, MemberSpec, MissionRunRequest};
@@ -468,19 +468,20 @@ async fn restart_waits_for_replacement_after_mailbox_disconnect() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let frame = socket.next().await.unwrap().unwrap();
-            if let tokio_tungstenite::tungstenite::Message::Text(raw) = frame {
-                if matches!(
+            if let tokio_tungstenite::tungstenite::Message::Text(raw) = frame
+                && matches!(
                     serde_json::from_str::<st3::mailbox::Frame>(&raw).unwrap(),
                     st3::mailbox::Frame::Mailbox { .. }
-                ) {
-                    break;
-                }
+                )
+            {
+                break;
             }
         }
     })
     .await
     .unwrap();
-    socket.close().await.unwrap();
+    socket.close(None).await.unwrap();
+    drop(socket);
     // The synthetic transport has no physical provider authority to publish a loss.
     // Install the same durable loss observation after disconnecting its real socket.
     let failure = fixture.store.append_claim(&st3::model::ClaimInput {
