@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Preserve monotonic ordered membership state across projection rebuild and heal",
+  "replay": {"status": "changed", "detail": "Every membership projection rebuild records the current host-local store frontier before replacing derived rows. Exposed membership state takes the maximum of its count-row index, repair watermark and rebuild watermark, so replaying older canonical claims cannot regress a lifecycle-updated frontier. Incremental and replayed shared authority remain identical."},
+  "schema": {"status": "changed", "detail": "Adds local_ordered_membership_rebuild_index bookkeeping to the existing local meta table. No table, index, numeric database schema version or shared projection layout changes."},
+  "rules": {"status": "none", "detail": "Checkpoint rules remain version 14. The local rebuild frontier is excluded from shared projection digests and checkpoint witnesses; no retention or drop policy changes."},
+  "compatibility": {"status": "none", "detail": "No wire models, generated clients, capability versions or pairing scopes change. The existing opaque host-local monotonic membership frontier now retains its promised meaning across rebuild and heal."},
+  "downtime": {"status": "none", "detail": "No additional replay or startup migration is required. An existing projection rebuild performs one transactional local meta upsert before clearing and rebuilding derived membership rows."},
+  "manual": {"status": "none", "detail": "No manual data migration is required. The required v1 placement migration and exclusive reader/writer cutover remain in the follow-up stacked PR above #1958."},
+  "recovery": {"status": "none", "detail": "No new recovery procedure is introduced. Rebuild/heal preserves the host-local invalidation frontier without treating it as canonical revision, cross-host ordering or checkpoint authority."}
+}
