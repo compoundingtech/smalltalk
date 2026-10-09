@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Commit signed local message admission and signature storage in one writer turn",
+  "replay": {
+    "status": "none",
+    "detail": "No graph replay or message/input replay is introduced. Existing action idempotency and the original signed message outcome remain authoritative."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, column, schema version or schema digest changes. The existing expected_claim_signatures staging row is now created and removed inside the message writer savepoint."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or numeric rules version change. Existing message validation, operation idempotency and projection remain on the same admission path."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Request, device signature, message and action result formats are unchanged. The API still verifies the device signature before storage. The signed phone path retains the original committed signature on retries and never acknowledges an uncommitted send."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal Operations binary deployment applies. Candidate restart-to-API durations and the actual connected phone submit-to-ACK/visible latency have not yet been measured by the existing incident measurement lead."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new operator or client configuration or cleanup is required. Existing truthful pending/error handling and retry keys remain applicable."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "A failed signed message admission rolls back both the message and its temporary expected signature in the same existing savepoint. Successful retries retain the first message and signature. The local action result remains durable before API acknowledgement; replication and recipient delivery remain separate facts."
+  }
+}

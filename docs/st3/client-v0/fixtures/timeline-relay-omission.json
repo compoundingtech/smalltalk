@@ -1,0 +1,267 @@
+{
+  "api_version": "st3.client.v0",
+  "request_id": "request/relay-omission",
+  "snapshot": {
+    "id": "snapshot/host-a/1842/2fc9",
+    "host_id": "host/host-a",
+    "store_index": 1842,
+    "projection_version": "client-projection.v0",
+    "created_at": "2026-09-20T12:00:00Z"
+  },
+  "value": {
+    "kind": "timeline-page",
+    "session_id": "session/relay-omission",
+    "items": [
+      {
+        "id": "timeline-entry/relay/1",
+        "sequence": 1,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "message",
+        "final": true,
+        "body": {
+          "message_id": "message/relay-minimal",
+          "reply_to": null
+        }
+      },
+      {
+        "id": "timeline-entry/relay/2",
+        "sequence": 2,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "message",
+        "final": true,
+        "body": {
+          "message_id": "message/relay-present",
+          "reply_to": "message/parent",
+          "from": "person/example",
+          "to": "agent/relay-fixture",
+          "title": "Present title"
+        }
+      },
+      {
+        "id": "timeline-entry/relay/3",
+        "sequence": 3,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "content",
+        "final": true,
+        "body": {
+          "media_type": "text/plain",
+          "text": "No attachment"
+        }
+      },
+      {
+        "id": "timeline-entry/relay/4",
+        "sequence": 4,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "content",
+        "final": true,
+        "body": {
+          "media_type": "image/png",
+          "attachment_id": "attachment/relay"
+        }
+      },
+      {
+        "id": "timeline-entry/relay/5",
+        "sequence": 5,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "content",
+        "final": true,
+        "body": {
+          "media_type": "text/plain",
+          "text": "Both supplied",
+          "attachment_id": "attachment/both"
+        }
+      },
+      {
+        "id": "timeline-entry/relay/6",
+        "sequence": 6,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "status",
+        "final": true,
+        "body": {
+          "status": "running"
+        }
+      },
+      {
+        "id": "timeline-entry/relay/7",
+        "sequence": 7,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "status",
+        "final": true,
+        "body": {
+          "status": "waiting",
+          "detail": "Explicit detail"
+        }
+      },
+      {
+        "id": "timeline-entry/relay/8",
+        "sequence": 8,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "usage",
+        "final": true,
+        "body": {
+          "semantics": "response",
+          "driver": "codex",
+          "total_tokens": 0,
+          "attribution": {
+            "agent_id": "agent/relay-fixture",
+            "mission_run_id": null,
+            "generation_id": null,
+            "step_id": null
+          }
+        }
+      },
+      {
+        "id": "timeline-entry/relay/9",
+        "sequence": 9,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "usage",
+        "final": true,
+        "body": {
+          "semantics": "response",
+          "driver": "omp",
+          "model": "test-model",
+          "input_tokens": 0,
+          "output_tokens": 1,
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "turn_id": "turn/relay",
+          "total_tokens": 1,
+          "context_used_tokens": 0,
+          "context_window_tokens": 100,
+          "context_used_percent": 0.5,
+          "compactions": 0,
+          "last_compaction_ms": 0,
+          "last_compaction_trigger": "manual",
+          "cost": 0.125,
+          "currency": "USD",
+          "attribution": {
+            "agent_id": "agent/relay-fixture",
+            "mission_run_id": "mission-run/test",
+            "generation_id": "run-generation/test",
+            "step_id": "work"
+          }
+        }
+      },
+      {
+        "id": "timeline-entry/relay/10",
+        "sequence": 10,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "redaction",
+        "final": true,
+        "body": {
+          "reason": "fixture-only",
+          "withheld_bytes": 0
+        }
+      },
+      {
+        "id": "timeline-entry/relay/11",
+        "sequence": 11,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "redaction",
+        "final": true,
+        "body": {
+          "reason": "fixture-only",
+          "withheld_bytes": 1,
+          "withheld_items": 0
+        }
+      },
+      {
+        "id": "timeline-entry/relay/12",
+        "sequence": 12,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "truncation",
+        "final": true,
+        "body": {
+          "reason": "response-limit",
+          "omitted_from_sequence": 20,
+          "omitted_to_sequence": 21
+        }
+      },
+      {
+        "id": "timeline-entry/relay/13",
+        "sequence": 13,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "truncation",
+        "final": true,
+        "body": {
+          "reason": "response-limit",
+          "omitted_from_sequence": 22,
+          "omitted_to_sequence": 23,
+          "continuation_cursor": "timeline-cursor/relay/22"
+        }
+      },
+      {
+        "id": "timeline-entry/relay/14",
+        "sequence": 14,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "future_record",
+        "final": true,
+        "body": {
+          "raw": {
+            "opaque": null,
+            "nested": [
+              0,
+              false,
+              "preserved"
+            ]
+          },
+          "future_field": "unparsed"
+        }
+      },
+      {
+        "id": "timeline-entry/relay/15",
+        "sequence": 15,
+        "revision": 2,
+        "timestamp": "2026-09-20T12:00:00Z",
+        "role": "system",
+        "type": "usage",
+        "final": true,
+        "body": {
+          "semantics": "context_occupancy",
+          "driver": "codex",
+          "compactions": 0,
+          "attribution": {
+            "agent_id": "agent/relay-fixture",
+            "mission_run_id": null,
+            "generation_id": null,
+            "step_id": null
+          }
+        }
+      }
+    ],
+    "page": {
+      "limit": 200,
+      "has_more": true,
+      "next_cursor": "timeline-cursor/relay/older",
+      "cursor_expires_at": "2026-09-20T12:10:00Z"
+    }
+  }
+}

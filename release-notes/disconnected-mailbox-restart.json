@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Allow authorized seat restart after mailbox channel loss",
+  "replay": {
+    "status": "none",
+    "detail": "Restart does not replay messages, inputs, tools or approvals, or acknowledge recovery of the old channel."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database table, index, migration or schema version change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or sealing changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The CLI waits through predecessor-incarnation faults after an accepted restart and reports only replacement faults or restart failure events referencing its exact request. Restart API and authority remain unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No automatic restart or additional deploy interruption; an explicitly requested restart retains its existing stop and launch behavior."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing authorized agents restart commands continue to work without a new force flag or permission."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No store recovery or rollback change; explicit restart fences the predecessor and does not clear its mailbox-loss fault as recovered."
+  }
+}

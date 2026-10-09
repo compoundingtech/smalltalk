@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -462,20 +463,61 @@ pub(crate) fn find_bound_transcript(
     driver: ExternalDriver,
     native_id: &str,
 ) -> Result<Option<ExternalSession>> {
-    let root = match driver {
-        ExternalDriver::Codex => home.join(".codex/sessions"),
-        ExternalDriver::Claude => home.join(".claude/projects"),
+    find_bound_transcript_with(home, driver, native_id, None, &[])
+}
+
+/// Whether `hint`, a path a seat's hook recorded, can be this session's Claude transcript:
+/// Claude's layout `<config>/projects/<encoded cwd>/<session>.jsonl`, spelled with no link in any
+/// part of it. A recorded path is data a seat wrote, so it never reaches a file outside a
+/// `projects` directory, or through a symlinked parent.
+fn claude_transcript_hint(hint: &Path, filename: &str) -> bool {
+    hint.is_absolute()
+        && hint.file_name().and_then(|name| name.to_str()) == Some(filename)
+        && hint
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "projects")
+        && hint.canonicalize().is_ok_and(|real| real == hint)
+        && std::fs::symlink_metadata(hint).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// `find_bound_transcript`, also looking where a Claude seat on its own login keeps transcripts.
+/// `hint` is the path Claude gave the SessionStart hook for this very session, which follows the
+/// seat's `CLAUDE_CONFIG_DIR` whatever account it runs on; it counts only if it names this
+/// session's file. `extra_roots` are further `projects` directories to search, such as the logins
+/// of declared accounts, for a seat whose binding recorded no path.
+pub(crate) fn find_bound_transcript_with(
+    home: &Path,
+    driver: ExternalDriver,
+    native_id: &str,
+    hint: Option<&Path>,
+    extra_roots: &[PathBuf],
+) -> Result<Option<ExternalSession>> {
+    let mut roots = match driver {
+        ExternalDriver::Codex => vec![home.join(".codex/sessions")],
+        ExternalDriver::Claude => vec![home.join(".claude/projects")],
         _ => return Ok(None),
     };
+    if driver == ExternalDriver::Claude {
+        roots.extend(extra_roots.iter().cloned());
+    }
     let filename = format!("{native_id}.jsonl");
     // Codex prefixes the session ID with the rollout time: `rollout-<time>-<id>.jsonl`.
     let codex_suffix = format!("-{filename}");
     let mut found: Option<SessionMetadata> = None;
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
+    if driver == ExternalDriver::Claude
+        && let Some(hint) = hint.filter(|hint| claude_transcript_hint(hint, &filename))
+        && let Ok(Some(metadata)) = read_metadata(driver, hint)
     {
+        found = Some(metadata);
+    }
+    for entry in roots.iter().flat_map(|root| {
+        WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+    }) {
         let Some(name) = entry.file_name().to_str() else {
             continue;
         };
@@ -1012,139 +1054,885 @@ pub(crate) fn normalized_record(
 /// the rest of the transcript. What it emits stays conservative: an unreadable line or an
 /// unrecognized record becomes a clearly-labelled `system` entry, never an entry attributed to
 /// the user or the agent. Only opening the file can fail the whole read.
-pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value>> {
-    if session.driver == ExternalDriver::OpenCode {
-        return normalized_opencode_timeline(session);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TimelineOrder {
+    Sequence,
+    TimestampSequence,
+}
+
+/// Native entries have rank 0; Small Talk messages have rank 1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TimelineKey {
+    pub(crate) timestamp: String,
+    pub(crate) sequence: u64,
+    pub(crate) rank: u8,
+    pub(crate) id: String,
+}
+
+impl TimelineKey {
+    pub(crate) fn cmp_in(&self, other: &Self, order: TimelineOrder) -> std::cmp::Ordering {
+        compare_timeline_positions(
+            (&self.timestamp, self.sequence, self.rank, &self.id),
+            (&other.timestamp, other.sequence, other.rank, &other.id),
+            order,
+        )
     }
-    let mut file = File::open(&session.transcript)
-        .with_context(|| format!("read transcript {}", session.transcript.display()))?;
-    let metadata = file.metadata()?;
-    let start = metadata.len().saturating_sub(MAX_TIMELINE_BYTES);
-    file.seek(SeekFrom::Start(start))?;
-    // Freeze a high-water mark: appends during this read belong to the next read.
-    let mut reader = BufReader::new(file.take(metadata.len() - start));
-    let mut read_error = None;
-    // Where each line starts in the file: an entry's identity, which must not change as the
-    // read window slides along a growing transcript.
-    let mut offset = start;
-    if start != 0 {
-        let mut partial = Vec::new();
-        match reader.read_until(b'\n', &mut partial) {
-            Ok(count) => offset += count as u64,
-            Err(error) => read_error = Some(error),
-        }
+}
+
+fn compare_timeline_positions(
+    left: (&str, u64, u8, &str),
+    right: (&str, u64, u8, &str),
+    order: TimelineOrder,
+) -> std::cmp::Ordering {
+    match order {
+        TimelineOrder::Sequence => (left.1, left.2, left.3).cmp(&(right.1, right.2, right.3)),
+        TimelineOrder::TimestampSequence => left.cmp(&right),
     }
-    // Each line keeps whether it ended with a newline: only the final, unterminated line can be
-    // a record the harness is still writing.
-    let mut lines = VecDeque::new();
-    while read_error.is_none() {
-        let mut buffer = Vec::new();
-        match reader.read_until(b'\n', &mut buffer) {
-            Ok(0) => break,
-            Ok(_) => {
-                let terminated = buffer.last() == Some(&b'\n');
-                if lines.len() == MAX_TIMELINE_LINES {
-                    lines.pop_front();
-                }
-                // Keep the original bytes, even if their encoding is unknown.
-                lines.push_back((
-                    buffer.clone(),
-                    terminated,
-                    offset,
-                    buffer.len() as u64,
-                    hex::encode(Sha256::digest(&buffer)),
-                ));
-                offset += buffer.len() as u64;
-                if !terminated {
-                    break;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => read_error = Some(error),
-        }
+}
+
+fn native_timeline_position(item: &Value) -> (&str, u64, u8, &str) {
+    (
+        item["timestamp"].as_str().unwrap_or_default(),
+        item["sequence"].as_u64().unwrap_or_default(),
+        0,
+        item["id"].as_str().unwrap_or_default(),
+    )
+}
+
+pub(crate) fn timeline_key(item: &Value, rank: u8) -> TimelineKey {
+    TimelineKey {
+        timestamp: item["timestamp"].as_str().unwrap_or_default().to_owned(),
+        sequence: item["sequence"].as_u64().unwrap_or_default(),
+        rank,
+        id: item["id"].as_str().unwrap_or_default().to_owned(),
     }
+}
+
+pub(crate) struct TimelineSlice {
+    /// Newest-first entries strictly before the supplied key.
+    pub(crate) items: Vec<Value>,
+    pub(crate) has_more: bool,
+    /// Source content generation: stable across appends, moved by every non-append rebuild.
+    pub(crate) generation: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn timeline_slice(
+    session: &ExternalSession,
+    order: TimelineOrder,
+    before: Option<&TimelineKey>,
+    limit: usize,
+) -> Result<TimelineSlice> {
+    let timeline = LineTimeline::acquire(session);
+    let mut held = timeline.hold();
+    held.slice(session, order, before, limit)
+}
+
+fn collect_timeline_slice<'a>(
+    committed: impl Iterator<Item = &'a Value>,
+    transient: impl Iterator<Item = &'a Value>,
+    order: TimelineOrder,
+    before: Option<&TimelineKey>,
+    limit: usize,
+    clone_output: impl Fn(&Value) -> Value,
+) -> TimelineSlice {
+    let is_before = |item: &&Value| {
+        before.is_none_or(|before| {
+            compare_timeline_positions(
+                native_timeline_position(item),
+                (&before.timestamp, before.sequence, before.rank, &before.id),
+                order,
+            )
+            .is_lt()
+        })
+    };
+    let mut committed = committed.filter(is_before).peekable();
+    let mut transient = transient.filter(is_before).peekable();
     let mut items = Vec::new();
-    if start != 0 || lines.len() == MAX_TIMELINE_LINES {
-        items.push(timeline_item(
-            0,
-            &timestamp(session.updated_at_unix_ms),
-            "system",
-            "truncation",
-            json!({
-                "reason": "the native transcript prefix is outside the bounded read window; not fetchable through this owner read",
-                "fetchable": false,
-                "limit_bytes": MAX_TIMELINE_BYTES,
-                "omitted_from_sequence": 0,
-                "omitted_to_sequence": 0
-            }),
-        ));
-    }
-    // An entry without its own timestamp takes its predecessor's, so it stays in place when
-    // the timeline is merged by time with Small Talk messages.
-    let mut last_timestamp = timestamp(session.started_at_unix_ms);
-    let mut next_free_sequence = 0_u64;
-    for (line_index, (line, _terminated, line_start, length, record_digest)) in
-        lines.into_iter().enumerate()
-    {
-        // A line's entries are numbered from where it starts in the file, so an entry keeps its
-        // ID however the read window slides; numbered by position in the window, every entry
-        // was renumbered as the transcript grew, and clients saw each one again as new. A line
-        // owns sixteen numbers per byte; a record with more parts than that pushes the
-        // following lines later instead of colliding with their entry IDs.
-        let sequence = line_start
-            .saturating_add(1)
-            .saturating_mul(16)
-            .max(next_free_sequence);
-        let first_new = items.len();
-        normalize_native_bytes(
-            session.driver,
-            &line,
-            sequence,
-            &last_timestamp,
-            line_index,
-            &mut items,
-        );
-        let locator = serde_json::to_value(NativeLocator::Jsonl {
-            offset: line_start,
-            length,
-            digest: record_digest,
-            sequence,
-            timestamp: last_timestamp.clone(),
-            line_index,
-        })?;
-        for item in &mut items[first_new..] {
-            item["_source"] = locator.clone();
+    while items.len() < limit {
+        let item = match (committed.peek(), transient.peek()) {
+            (Some(item), Some(tail))
+                if compare_timeline_positions(
+                    native_timeline_position(item),
+                    native_timeline_position(tail),
+                    order,
+                )
+                .is_lt() =>
+            {
+                transient.next()
+            }
+            (Some(_), _) => committed.next(),
+            (None, Some(_)) => transient.next(),
+            (None, None) => break,
+        };
+        if let Some(item) = item {
+            items.push(clone_output(item));
         }
-        if let Some(highest) = items[first_new..]
+    }
+    TimelineSlice {
+        items,
+        has_more: committed.peek().is_some() || transient.peek().is_some(),
+        generation: 0,
+    }
+}
+
+const MAX_FOLDED_TRANSCRIPTS: usize = 16;
+const MAX_FOLDED_SOURCE_BYTES: usize = 96 * 1024 * 1024;
+type SharedLineFold = Arc<Mutex<LineTimelineFold>>;
+type LineFoldCache = VecDeque<(PathBuf, ExternalDriver, SharedLineFold, usize)>;
+static LINE_FOLDS: LazyLock<Mutex<LineFoldCache>> = LazyLock::new(Mutex::default);
+
+/// Process-random epoch for timeline generations. A restart draws a fresh epoch, so page
+/// cursors bound to a generation never carry into another process, matching the cursor MAC
+/// key. Within one process, rebuild serials keep generations strictly increasing.
+static TIMELINE_GENERATION_EPOCH: LazyLock<u64> = LazyLock::new(|| {
+    let mut bytes = [0_u8; 8];
+    getrandom::fill(&mut bytes).expect("timeline generation epoch entropy");
+    // Clear the top bit so adding rebuild serials cannot wrap in any relevant lifetime.
+    u64::from_be_bytes(bytes) & (u64::MAX >> 1)
+});
+static TIMELINE_REBUILDS: AtomicU64 = AtomicU64::new(0);
+fn next_timeline_generation() -> u64 {
+    TIMELINE_GENERATION_EPOCH.wrapping_add(
+        TIMELINE_REBUILDS
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .saturating_add(1),
+    )
+}
+
+/// Test-only determinism hooks: park one transcript refresh mid-read and observe readers
+/// queued on a contended fold. Nothing here is compiled into release builds.
+#[cfg(test)]
+pub(crate) mod timeline_test_support {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, LazyLock, Mutex};
+
+    static FOLD_WAITERS: AtomicUsize = AtomicUsize::new(0);
+    static REFRESH_GATES: LazyLock<Mutex<HashMap<PathBuf, RefreshGate>>> =
+        LazyLock::new(Mutex::default);
+    static REFRESH_ARRIVED: Condvar = Condvar::new();
+
+    /// One gated transcript refresh: arrived once its reader parked, released to let it run.
+    struct RefreshGate {
+        arrived: bool,
+        released: bool,
+    }
+
+    /// Test hooks never propagate lock poison: a gate recovering its current state is always
+    /// sound, matching the fold's own poison recovery.
+    fn gates() -> std::sync::MutexGuard<'static, HashMap<PathBuf, RefreshGate>> {
+        REFRESH_GATES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Park the next refresh of `path` until `release_refresh(path)`, so a test controls
+    /// exactly when the fold's I/O completes while holding the fold. Gates are per path, so
+    /// parallel tests never release each other's readers.
+    pub(crate) fn arm_refresh(path: &Path) {
+        let mut gates = gates();
+        gates.insert(
+            path.to_owned(),
+            RefreshGate {
+                arrived: false,
+                released: false,
+            },
+        );
+        REFRESH_ARRIVED.notify_all();
+    }
+
+    pub(crate) fn wait_refresh_arrived(path: &Path) {
+        let mut gates = gates();
+        while !gates.get(path).is_some_and(|gate| gate.arrived) {
+            gates = REFRESH_ARRIVED
+                .wait(gates)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    pub(crate) fn release_refresh(path: &Path) {
+        let mut gates = gates();
+        if let Some(gate) = gates.get_mut(path) {
+            gate.released = true;
+        }
+        REFRESH_ARRIVED.notify_all();
+    }
+
+    pub(crate) fn gate_refresh(path: &Path) {
+        let mut gates = gates();
+        loop {
+            let Some(gate) = gates.get_mut(path) else {
+                return;
+            };
+            if gate.released {
+                return;
+            }
+            if !gate.arrived {
+                gate.arrived = true;
+                REFRESH_ARRIVED.notify_all();
+                continue;
+            }
+            gates = REFRESH_ARRIVED
+                .wait(gates)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    /// Block until `count` readers are parked on a contended fold. They are guaranteed to
+    /// arrive: the gated refresh holds that fold for as long as the test wants.
+    pub(crate) fn wait_fold_waiters(count: usize) {
+        while FOLD_WAITERS.load(Ordering::SeqCst) < count {
+            std::thread::yield_now();
+        }
+    }
+
+    pub(crate) fn enter_contended() {
+        FOLD_WAITERS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn leave_contended() {
+        FOLD_WAITERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn line_fold(session: &ExternalSession) -> SharedLineFold {
+    let mut folds = match LINE_FOLDS.lock() {
+        Ok(folds) => folds,
+        Err(error) => {
+            let mut folds = error.into_inner();
+            folds.clear();
+            LINE_FOLDS.clear_poison();
+            folds
+        }
+    };
+    let found = folds
+        .iter()
+        .position(|(path, driver, _, _)| path == &session.transcript && *driver == session.driver);
+    let entry = found
+        .and_then(|index| folds.remove(index))
+        .unwrap_or_else(|| {
+            (
+                session.transcript.clone(),
+                session.driver,
+                SharedLineFold::default(),
+                0,
+            )
+        });
+    let fold = Arc::clone(&entry.2);
+    folds.push_back(entry);
+    trim_line_folds(&mut folds, MAX_FOLDED_SOURCE_BYTES);
+    fold
+}
+
+fn account_line_fold(fold: &SharedLineFold, bytes: usize) {
+    let mut folds = match LINE_FOLDS.lock() {
+        Ok(folds) => folds,
+        Err(error) => {
+            let mut folds = error.into_inner();
+            folds.clear();
+            LINE_FOLDS.clear_poison();
+            folds
+        }
+    };
+    if let Some(index) = folds.iter().position(|entry| Arc::ptr_eq(&entry.2, fold)) {
+        let mut entry = folds.remove(index).expect("located fold");
+        entry.3 = bytes;
+        folds.push_back(entry);
+    }
+    trim_line_folds(&mut folds, MAX_FOLDED_SOURCE_BYTES);
+}
+
+fn trim_line_folds(folds: &mut LineFoldCache, budget: usize) {
+    folds.retain(|entry| entry.3 <= budget);
+    let mut bytes: usize = folds.iter().map(|entry| entry.3).sum();
+    while folds.len() > MAX_FOLDED_TRANSCRIPTS || bytes > budget {
+        if let Some(entry) = folds.pop_front() {
+            bytes -= entry.3;
+        }
+    }
+}
+
+fn lock_fold(fold: &SharedLineFold) -> std::sync::MutexGuard<'_, LineTimelineFold> {
+    if let Ok(state) = fold.try_lock() {
+        return state;
+    }
+    #[cfg(test)]
+    timeline_test_support::enter_contended();
+    let state = match fold.lock() {
+        Ok(state) => state,
+        Err(error) => {
+            let mut state = error.into_inner();
+            *state = LineTimelineFold::default();
+            fold.clear_poison();
+            state
+        }
+    };
+    #[cfg(test)]
+    timeline_test_support::leave_contended();
+    state
+}
+
+/// One transcript's bounded reader. Whole-source drivers (OpenCode) have no shared fold;
+/// line drivers share one, and `hold` waits for it before the caller takes any global read
+/// slot, so several viewers of one conversation queue on the fold instead of exhausting the
+/// bounded read budget an unrelated conversation still needs.
+pub(crate) struct LineTimeline {
+    fold: Option<SharedLineFold>,
+}
+
+impl LineTimeline {
+    /// Resolves the shared fold without locking it and without transcript I/O.
+    pub(crate) fn acquire(session: &ExternalSession) -> Self {
+        if session.driver == ExternalDriver::OpenCode {
+            return Self { fold: None };
+        }
+        Self {
+            fold: Some(line_fold(session)),
+        }
+    }
+
+    /// Blocks for the fold while holding no caller resource.
+    pub(crate) fn hold(&self) -> LineTimelineHeld<'_> {
+        LineTimelineHeld {
+            fold: self.fold.as_ref(),
+            guard: self.fold.as_ref().map(lock_fold),
+        }
+    }
+}
+
+pub(crate) struct LineTimelineHeld<'a> {
+    fold: Option<&'a SharedLineFold>,
+    guard: Option<std::sync::MutexGuard<'a, LineTimelineFold>>,
+}
+
+impl LineTimelineHeld<'_> {
+    pub(crate) fn read(&mut self, session: &ExternalSession) -> Result<Vec<Value>> {
+        match self.guard.as_mut() {
+            Some(state) => {
+                let result = state.read(session);
+                let fold = self.fold.expect("held fold state has its fold");
+                account_line_fold(fold, state.retained_source_bytes);
+                result
+            }
+            None => normalized_opencode_timeline(session),
+        }
+    }
+
+    pub(crate) fn slice(
+        &mut self,
+        session: &ExternalSession,
+        order: TimelineOrder,
+        before: Option<&TimelineKey>,
+        limit: usize,
+    ) -> Result<TimelineSlice> {
+        match self.guard.as_mut() {
+            Some(state) => {
+                let result = state.slice(session, order, before, limit);
+                let fold = self.fold.expect("held fold state has its fold");
+                account_line_fold(fold, state.retained_source_bytes);
+                result
+            }
+            None => opencode_timeline_slice(session, order, before, limit),
+        }
+    }
+}
+
+pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value>> {
+    let timeline = LineTimeline::acquire(session);
+    let mut held = timeline.hold();
+    held.read(session)
+}
+
+/// Volatile bounded fold of an append-only JSONL transcript. Replacement, shrinkage and a
+/// changed last complete record rebuild it and draw a new generation, expiring page cursors
+/// from the replaced content; pure appends keep the generation. Earlier edits are fenced by
+/// normalized_record on pinned content reads, rather than by scanning the entire transcript
+/// on every page.
+#[derive(Default)]
+pub(crate) struct LineTimelineFold {
+    identity: Option<FileIdentity>,
+    last_record: Option<(u64, usize, [u8; 32])>,
+    generation: u64,
+    consumed: u64,
+    observed_len: u64,
+    lines: VecDeque<FoldedLine>,
+    entries: BTreeMap<(String, u64, u8, String), (usize, usize)>,
+    sequence_entries: BTreeMap<(u64, u8, String), (usize, usize)>,
+    emitting_lines: BTreeSet<usize>,
+    next_line_number: usize,
+    seed_timestamp: String,
+    retained_source_bytes: usize,
+}
+
+struct FoldedLine {
+    start: u64,
+    /// Stable within this fold; translated to a window-relative index only on output.
+    number: usize,
+    bytes: Vec<u8>,
+    digest: [u8; 32],
+    locator: Option<NativeLocator>,
+    next_free_sequence: u64,
+    last_timestamp: String,
+    items: Vec<Value>,
+}
+
+impl FoldedLine {
+    fn new(start: u64, number: usize, bytes: Vec<u8>) -> Self {
+        Self {
+            start,
+            number,
+            digest: Sha256::digest(&bytes).into(),
+            bytes,
+            locator: None,
+            next_free_sequence: 0,
+            last_timestamp: String::new(),
+            items: Vec::new(),
+        }
+    }
+
+    fn normalize(
+        &mut self,
+        driver: ExternalDriver,
+        sequence: u64,
+        timestamp: &str,
+        line_number: usize,
+    ) -> Result<()> {
+        // Cached locators and diagnostics carry a stable fold ordinal, not an index
+        // that needs rewriting whenever the bounded window slides.
+        self.items.clear();
+        normalize_native_bytes(
+            driver,
+            &self.bytes,
+            sequence,
+            timestamp,
+            line_number,
+            &mut self.items,
+        );
+        let locator = NativeLocator::Jsonl {
+            offset: self.start,
+            length: self.bytes.len() as u64,
+            digest: hex::encode(self.digest),
+            sequence,
+            timestamp: timestamp.to_owned(),
+            line_index: line_number,
+        };
+        let source = serde_json::to_value(&locator)?;
+        for item in &mut self.items {
+            item["_source"] = source.clone();
+        }
+        self.locator = Some(locator);
+        self.next_free_sequence = self
+            .items
             .iter()
             .filter_map(|item| item["sequence"].as_u64())
             .max()
-        {
-            next_free_sequence = highest.saturating_add(1);
-        }
-        if let Some(stamp) = items[first_new..]
+            .map_or(sequence, |highest| highest.saturating_add(1));
+        self.last_timestamp = self
+            .items
             .last()
             .and_then(|item| item["timestamp"].as_str())
-        {
-            last_timestamp = stamp.to_owned();
+            .unwrap_or(timestamp)
+            .to_owned();
+        Ok(())
+    }
+}
+
+impl LineTimelineFold {
+    fn read(&mut self, session: &ExternalSession) -> Result<Vec<Value>> {
+        let mut transient = self.refresh(session)?;
+        transient.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
+        let mut transient = transient.iter().peekable();
+        let mut committed = self
+            .sequence_entries
+            .values()
+            .map(|&position| self.indexed_item(position))
+            .peekable();
+        let mut items = Vec::new();
+        // Native sequences are monotonic across records. Merge the small transient
+        // set instead of sorting the complete returned window.
+        loop {
+            let item = match (committed.peek(), transient.peek()) {
+                (Some(item), Some(tail))
+                    if tail["sequence"].as_u64().unwrap_or(u64::MAX)
+                        <= item["sequence"].as_u64().unwrap_or(u64::MAX) =>
+                {
+                    transient.next()
+                }
+                (Some(_), _) => committed.next(),
+                (None, Some(_)) => transient.next(),
+                (None, None) => break,
+            };
+            if let Some(item) = item {
+                items.push(self.clone_output(item));
+            }
+        }
+        Ok(items)
+    }
+
+    fn slice(
+        &mut self,
+        session: &ExternalSession,
+        order: TimelineOrder,
+        before: Option<&TimelineKey>,
+        limit: usize,
+    ) -> Result<TimelineSlice> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut transient = self.refresh(session)?;
+        transient.sort_by(|a, b| {
+            compare_timeline_positions(
+                native_timeline_position(a),
+                native_timeline_position(b),
+                order,
+            )
+        });
+        let mut slice = match order {
+            TimelineOrder::Sequence => {
+                let upper = before.map(|key| (key.sequence, key.rank, key.id.clone()));
+                let committed = self
+                    .sequence_entries
+                    .range::<(u64, u8, String), _>((
+                        Unbounded,
+                        upper.as_ref().map_or(Unbounded, Excluded),
+                    ))
+                    .rev()
+                    .map(|(_, &position)| self.indexed_item(position));
+                collect_timeline_slice(
+                    committed,
+                    transient.iter().rev(),
+                    order,
+                    before,
+                    limit,
+                    |item| self.clone_output(item),
+                )
+            }
+            TimelineOrder::TimestampSequence => {
+                let upper = before.map(|key| {
+                    (
+                        key.timestamp.clone(),
+                        key.sequence,
+                        key.rank,
+                        key.id.clone(),
+                    )
+                });
+                let committed = self
+                    .entries
+                    .range::<(String, u64, u8, String), _>((
+                        Unbounded,
+                        upper.as_ref().map_or(Unbounded, Excluded),
+                    ))
+                    .rev()
+                    .map(|(_, &position)| self.indexed_item(position));
+                collect_timeline_slice(
+                    committed,
+                    transient.iter().rev(),
+                    order,
+                    before,
+                    limit,
+                    |item| self.clone_output(item),
+                )
+            }
+        };
+        slice.generation = self.generation;
+        Ok(slice)
+    }
+
+    fn indexed_item(&self, (number, index): (usize, usize)) -> &Value {
+        let first = self
+            .lines
+            .front()
+            .expect("indexed entry has a retained line")
+            .number;
+        &self.lines[number - first].items[index]
+    }
+
+    fn clone_output(&self, item: &Value) -> Value {
+        let mut item = item.clone();
+        if let Some(number) = item["_source"]["line_index"].as_u64() {
+            let first = self
+                .lines
+                .front()
+                .map_or(self.next_line_number, |line| line.number);
+            let line_index = number - first as u64;
+            item["_source"]["line_index"] = json!(line_index);
+            if item["body"]["code"] == "native-line-unreadable" {
+                item["body"]["details"]["line_in_window"] = json!(line_index.saturating_add(1));
+            }
+        }
+        item
+    }
+
+    fn seed_before(&self, number: usize, fallback: &str) -> (u64, String) {
+        self.emitting_lines.range(..number).next_back().map_or_else(
+            || (0, fallback.to_owned()),
+            |number| {
+                let first = self
+                    .lines
+                    .front()
+                    .expect("emitting line is retained")
+                    .number;
+                let line = &self.lines[*number - first];
+                (line.next_free_sequence, line.last_timestamp.clone())
+            },
+        )
+    }
+
+    fn remove_entries(&mut self, items: &[Value]) {
+        for item in items {
+            let key = timeline_key(item, 0);
+            self.sequence_entries
+                .remove(&(key.sequence, key.rank, key.id.clone()));
+            self.entries
+                .remove(&(key.timestamp, key.sequence, key.rank, key.id));
         }
     }
-    if let Some(error) = read_error {
-        items.push(timeline_item(
-            next_free_sequence.max(16),
-            &last_timestamp,
-            "system",
-            "error",
-            json!({
-                "code": "native-transcript-read-failed",
-                "message": format!("st stopped reading the {} transcript early: {error}", session.driver.as_str()),
-                "retryable": true,
-                "details": {}
-            }),
-        ));
+
+    fn pop_front(&mut self) {
+        if let Some(line) = self.lines.pop_front() {
+            self.retained_source_bytes -= line.bytes.len();
+            self.emitting_lines.remove(&line.number);
+            self.remove_entries(&line.items);
+        }
     }
-    items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
-    Ok(items)
+
+    fn refresh(&mut self, session: &ExternalSession) -> Result<Vec<Value>> {
+        let mut file = File::open(&session.transcript)
+            .with_context(|| format!("read transcript {}", session.transcript.display()))?;
+        let metadata = file.metadata()?;
+        let len = metadata.len();
+        let window_start = len.saturating_sub(MAX_TIMELINE_BYTES);
+        let identity = file_identity(&metadata);
+        if !self.resumable(&identity, len, window_start, &mut file) {
+            // Any non-append change (replacement, shrink, edit, or a cold fold) draws a new
+            // generation, so outstanding page cursors stop applying their old boundary.
+            *self = Self {
+                identity: Some(identity),
+                consumed: window_start,
+                generation: next_timeline_generation(),
+                ..Self::default()
+            };
+        }
+        let first_new_number = self.next_line_number;
+        let previous_first = self.lines.front().map(|line| line.number);
+        file.seek(SeekFrom::Start(self.consumed))?;
+        // Appends beyond this high-water mark belong to the next refresh.
+        let mut reader = BufReader::new(file.take(len - self.consumed));
+        let mut read_error = None;
+        if self.consumed == window_start && window_start != 0 && self.lines.is_empty() {
+            let mut partial = Vec::new();
+            match reader.read_until(b'\n', &mut partial) {
+                Ok(count) => self.consumed += count as u64,
+                Err(error) => read_error = Some(error),
+            }
+        }
+        let mut tail = None;
+        while read_error.is_none() {
+            let mut buffer = Vec::new();
+            match reader.read_until(b'\n', &mut buffer) {
+                Ok(0) => break,
+                Ok(_) if buffer.last() == Some(&b'\n') => {
+                    #[cfg(test)]
+                    timeline_test_support::gate_refresh(session.transcript.as_path());
+                    let line = FoldedLine::new(self.consumed, self.next_line_number, buffer);
+                    self.next_line_number += 1;
+                    self.consumed += line.bytes.len() as u64;
+                    self.last_record = Some((line.start, line.bytes.len(), line.digest));
+                    self.retained_source_bytes += line.bytes.len();
+                    self.lines.push_back(line);
+                    while self.lines.len() > MAX_TIMELINE_LINES {
+                        self.pop_front();
+                    }
+                }
+                Ok(_) => {
+                    tail = Some(FoldedLine::new(
+                        self.consumed,
+                        self.next_line_number,
+                        buffer,
+                    ));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => read_error = Some(error),
+            }
+        }
+        while window_start != 0
+            && self
+                .lines
+                .front()
+                .is_some_and(|line| line.start <= window_start)
+        {
+            self.pop_front();
+        }
+        let output_cap = MAX_TIMELINE_LINES - usize::from(tail.is_some());
+        while self.lines.len() > output_cap {
+            self.pop_front();
+        }
+        let mut transient = Vec::new();
+        if window_start != 0 || self.lines.len() + usize::from(tail.is_some()) == MAX_TIMELINE_LINES
+        {
+            transient.push(timeline_item(
+                0, &timestamp(session.updated_at_unix_ms), "system", "truncation",
+                json!({
+                    "reason": "the native transcript prefix is outside the bounded read window; not fetchable through this owner read",
+                    "fetchable": false,
+                    "limit_bytes": MAX_TIMELINE_BYTES,
+                    "omitted_from_sequence": 0,
+                    "omitted_to_sequence": 0
+                }),
+            ));
+        }
+        let seed_timestamp = timestamp(session.started_at_unix_ms);
+        let first = self.lines.front().map(|line| line.number);
+        let new_index = first.map_or(0, |number| {
+            first_new_number
+                .saturating_sub(number)
+                .min(self.lines.len())
+        });
+        // Append-only reads begin at the newly added suffix. Eviction or a changed
+        // session seed can change inherited timestamps and sequence collisions, so
+        // replay only the affected prefix until its cached inputs converge.
+        let mut index = if first != previous_first || seed_timestamp != self.seed_timestamp {
+            0
+        } else {
+            new_index
+        };
+        let (mut next_free_sequence, mut last_timestamp) = if index == 0 {
+            (0, seed_timestamp.clone())
+        } else {
+            self.seed_before(first_new_number, &seed_timestamp)
+        };
+        while index < self.lines.len() {
+            if index < new_index {
+                // Omitted records carry neither an output nor a seed transition.
+                // Do not replay long runs of them when the initial seed changes.
+                index = self
+                    .emitting_lines
+                    .range(self.lines[index].number..first_new_number)
+                    .next()
+                    .map_or(new_index, |number| {
+                        *number - first.expect("replay has a retained line")
+                    });
+                if index == self.lines.len() {
+                    break;
+                }
+            }
+            let line = &mut self.lines[index];
+            let sequence = line
+                .start
+                .saturating_add(1)
+                .saturating_mul(16)
+                .max(next_free_sequence);
+            let unchanged = matches!(&line.locator, Some(NativeLocator::Jsonl {
+                sequence: old_sequence, timestamp: old_timestamp, ..
+            }) if *old_sequence == sequence && old_timestamp == &last_timestamp);
+            if unchanged && index < new_index {
+                // The remaining old suffix has identical inputs and outputs; jump
+                // directly to new records, including over runs of omitted records.
+                index = new_index;
+                (next_free_sequence, last_timestamp) =
+                    self.seed_before(first_new_number, &seed_timestamp);
+                continue;
+            }
+            for item in &line.items {
+                let key = timeline_key(item, 0);
+                self.sequence_entries
+                    .remove(&(key.sequence, key.rank, key.id.clone()));
+                self.entries
+                    .remove(&(key.timestamp, key.sequence, key.rank, key.id));
+            }
+            line.normalize(session.driver, sequence, &last_timestamp, line.number)?;
+            if line.items.is_empty() {
+                // An omitted record must not advance the oracle's sequence seed.
+                line.next_free_sequence = next_free_sequence;
+            }
+            if !line.items.is_empty() {
+                self.emitting_lines.insert(line.number);
+            }
+            for (item_index, item) in line.items.iter().enumerate() {
+                let key = timeline_key(item, 0);
+                self.sequence_entries.insert(
+                    (key.sequence, key.rank, key.id.clone()),
+                    (line.number, item_index),
+                );
+                self.entries.insert(
+                    (key.timestamp, key.sequence, key.rank, key.id),
+                    (line.number, item_index),
+                );
+            }
+            next_free_sequence = line.next_free_sequence;
+            last_timestamp.clone_from(&line.last_timestamp);
+            index += 1;
+        }
+        self.seed_timestamp = seed_timestamp;
+        if let Some(mut tail) = tail {
+            let sequence = tail
+                .start
+                .saturating_add(1)
+                .saturating_mul(16)
+                .max(next_free_sequence);
+            tail.normalize(session.driver, sequence, &last_timestamp, tail.number)?;
+            if !tail.items.is_empty() {
+                next_free_sequence = tail.next_free_sequence;
+            }
+            last_timestamp = tail.last_timestamp;
+            transient.extend(tail.items);
+        }
+        if let Some(error) = read_error {
+            transient.push(timeline_item(
+                next_free_sequence.max(16), &last_timestamp, "system", "error",
+                json!({
+                    "code": "native-transcript-read-failed",
+                    "message": format!("st stopped reading the {} transcript early: {error}", session.driver.as_str()),
+                    "retryable": true,
+                    "details": {}
+                }),
+            ));
+        }
+        self.observed_len = len;
+        Ok(transient)
+    }
+
+    fn resumable(
+        &self,
+        identity: &FileIdentity,
+        len: u64,
+        window_start: u64,
+        file: &mut File,
+    ) -> bool {
+        if self.identity.as_ref() != Some(identity)
+            || len < self.consumed
+            || len < self.observed_len
+            || self.consumed <= window_start
+        {
+            return false;
+        }
+        let Some((start, length, digest)) = self.last_record else {
+            return self.consumed == 0;
+        };
+        let mut record = vec![0; length];
+        file.seek(SeekFrom::Start(start)).is_ok()
+            && file.read_exact(&mut record).is_ok()
+            && <[u8; 32]>::from(Sha256::digest(&record)) == digest
+    }
+}
+
+#[cfg(unix)]
+type FileIdentity = (u64, u64);
+#[cfg(not(unix))]
+type FileIdentity = Option<SystemTime>;
+
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        (metadata.dev(), metadata.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.created().ok()
+    }
 }
 
 fn normalize_native_line(
@@ -2062,6 +2850,36 @@ const OPENCODE_MESSAGE_WINDOW_SQL: &str = "SELECT rowid, id, time_created, data 
  ) ORDER BY time_created, id";
 
 fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>> {
+    Ok(opencode_timeline(session)?.0)
+}
+
+fn opencode_timeline_slice(
+    session: &ExternalSession,
+    order: TimelineOrder,
+    before: Option<&TimelineKey>,
+    limit: usize,
+) -> Result<TimelineSlice> {
+    let (mut items, generation) = opencode_timeline(session)?;
+    items.sort_by(|a, b| {
+        compare_timeline_positions(
+            native_timeline_position(a),
+            native_timeline_position(b),
+            order,
+        )
+    });
+    let mut slice = collect_timeline_slice(
+        items.iter().rev(),
+        std::iter::empty(),
+        order,
+        before,
+        limit,
+        Value::clone,
+    );
+    slice.generation = generation;
+    Ok(slice)
+}
+
+fn opencode_timeline(session: &ExternalSession) -> Result<(Vec<Value>, u64)> {
     let connection = open_opencode_database(&session.transcript)?;
     let mut message_statement = connection.prepare(OPENCODE_MESSAGE_WINDOW_SQL)?;
     // Count only row identities, then stream native bytes. Never collect 4,097 payload rows.
@@ -2086,7 +2904,10 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
     let parts_unavailable = part_statement.is_none();
     let mut items = VecDeque::new();
     // Include the surrounding JSON array delimiters so this remains an exact bound on the
-    // serialized timeline, not just on its native payloads.
+    // serialized timeline, not just on its native payloads. The content generation folds
+    // exactly what this read can return, so any database change that alters the bounded
+    // timeline moves it.
+    let mut generation = Sha256::new();
     let mut serialized_bytes = 2_usize;
     let mut sequence = 1_u64;
     let mut last_created = session.started_at_unix_ms;
@@ -2099,6 +2920,7 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
         let at = timestamp(last_created);
         let row_bytes = sqlite_row_bytes(row, &[1, 2, 3])?;
         if row_bytes > MAX_TIMELINE_BYTES as usize {
+            generation.update(format!("oversized-message:{row_bytes}").as_bytes());
             let notice = oversized_sqlite_row(&mut sequence, &at, "message", row_bytes)?;
             extend_bounded_opencode_timeline(
                 &mut items,
@@ -2122,11 +2944,13 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
         };
         let mut additions = Vec::with_capacity(2);
         let entry_sequence = next_opencode_sequence(&mut sequence)?;
+        let row_digest = sqlite_message_digest(&id_bytes, &created_bytes, &encoded);
+        generation.update(row_digest.as_bytes());
         let mut record =
             opencode_message_record(&id_bytes, &created_bytes, &encoded, entry_sequence, &at);
         record["_source"] = serde_json::to_value(NativeLocator::SqliteMessage {
             message_row,
-            digest: sqlite_message_digest(&id_bytes, &created_bytes, &encoded),
+            digest: row_digest,
             sequence: entry_sequence,
             timestamp: at.clone(),
         })?;
@@ -2145,6 +2969,7 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             let part_row = row.get::<_, i64>(0)?;
             let row_bytes = sqlite_row_bytes(row, &[1, 2])?;
             if row_bytes > MAX_TIMELINE_BYTES as usize {
+                generation.update(format!("oversized-part:{row_bytes}").as_bytes());
                 let notice = oversized_sqlite_row(&mut sequence, &at, "part", row_bytes)?;
                 extend_bounded_opencode_timeline(
                     &mut items,
@@ -2169,7 +2994,11 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             let locator = serde_json::to_value(NativeLocator::Sqlite {
                 part_row,
                 message_row,
-                digest: sqlite_part_digest(&part_id, &encoded_part),
+                digest: {
+                    let part_digest = sqlite_part_digest(&part_id, &encoded_part);
+                    generation.update(part_digest.as_bytes());
+                    part_digest
+                },
                 message_digest: message_digest.clone(),
                 sequence: entry_sequence,
                 timestamp: at.clone(),
@@ -2207,6 +3036,14 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             vec![notice],
         );
     }
+    generation.update(
+        format!("truncated:{truncated}:count:{message_count}:parts:{parts_unavailable}").as_bytes(),
+    );
+    let generation = u64::from_be_bytes(
+        generation.finalize()[..8]
+            .try_into()
+            .expect("an 8-byte generation prefix"),
+    );
     if truncated {
         prepend_opencode_truncation(
             &mut items,
@@ -2226,7 +3063,10 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             ),
         );
     }
-    Ok(items.into_iter().map(|(item, _)| item).collect())
+    Ok((
+        items.into_iter().map(|(item, _)| item).collect(),
+        generation,
+    ))
 }
 
 // Inspect SQLite's borrowed cells before allocating any Rust payload copies. Numeric values
@@ -3936,6 +4776,65 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_claude_seat_on_any_account_is_found_by_the_path_claude_gave_its_hook() {
+        let home = tempfile::tempdir().unwrap();
+        // A recorded path must be spelled with no link, and a temporary directory may sit behind one.
+        let base = home.path().canonicalize().unwrap();
+        let line = |id: &str| {
+            format!(
+                r#"{{"sessionId":"{id}","timestamp":"2026-09-24T00:00:00Z","type":"user","message":{{"content":"hello"}}}}"#
+            )
+        };
+        // Two accounts, neither under ~/.claude, in directories st has never heard of.
+        let first = base.join("logins/first/projects/-work");
+        let second = base.join("elsewhere/second-login/projects/-work");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("on-first.jsonl"), line("on-first")).unwrap();
+        fs::write(second.join("on-second.jsonl"), line("on-second")).unwrap();
+        let find = |id: &str, hint: Option<&Path>, extra: &[PathBuf]| {
+            find_bound_transcript_with(home.path(), ExternalDriver::Claude, id, hint, extra)
+                .unwrap()
+        };
+        // Without the recorded path or a declared login, the default place misses.
+        assert!(find("on-second", None, &[]).is_none());
+        // The recorded path finds it, whichever account wrote it.
+        let hint = second.join("on-second.jsonl");
+        assert_eq!(
+            find("on-second", Some(&hint), &[]).unwrap().transcript,
+            hint
+        );
+        // A declared account's login directory finds a seat whose binding recorded no path.
+        let extra = [
+            base.join("logins/first/projects"),
+            base.join("elsewhere/second-login/projects"),
+        ];
+        assert_eq!(find("on-first", None, &extra).unwrap().transcript, first.join("on-first.jsonl"));
+        assert_eq!(find("on-second", None, &extra).unwrap().transcript, hint);
+        // A recorded path never stands in for a different session, a relative path, or a link.
+        assert!(find("on-first", Some(&hint), &[]).is_none());
+        assert!(find("on-second", Some(Path::new("on-second.jsonl")), &[]).is_none());
+        let link = base.join("link/on-second.jsonl");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&hint, &link).unwrap();
+        assert!(find("on-second", Some(&link), &[]).is_none());
+        // A correctly named file outside any projects directory is not Claude's session file,
+        // even though the binding names both the file and the session.
+        let stray = base.join("stray/-work");
+        fs::create_dir_all(&stray).unwrap();
+        fs::write(stray.join("on-stray.jsonl"), line("on-stray")).unwrap();
+        assert!(find("on-stray", Some(&stray.join("on-stray.jsonl")), &[]).is_none());
+        // A symlinked parent directory is followed by an open but not by a recorded path, even
+        // when the spelled path looks like <config>/projects/<cwd>/<session>.jsonl.
+        let aliased = base.join("aliased/projects/-work");
+        fs::create_dir_all(aliased.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&second, &aliased).unwrap();
+        let through_link = aliased.join("on-second.jsonl");
+        assert!(through_link.is_file());
+        assert!(find("on-second", Some(&through_link), &[]).is_none());
     }
 
     #[cfg(target_os = "linux")]
@@ -5658,5 +6557,757 @@ mod tests {
             panic!("known error envelope")
         };
         assert_eq!(body.blocks[0].metadata.as_ref(), Some(&metadata));
+    }
+
+    // Claude has no omitted record kinds: these fillers remain visible system entries.
+    const CLAUDE_WINDOW_FILLER: &str = "{\"type\":\"file-history-snapshot\"}\n";
+
+    fn chat_texts(timeline: &[Value]) -> Vec<&str> {
+        timeline
+            .iter()
+            .filter(|item| item["type"] == "content")
+            .filter(|item| matches!(item["role"].as_str(), Some("user" | "assistant")))
+            .filter_map(|item| item["body"]["text"].as_str())
+            .collect()
+    }
+
+    /// Independent bounded-reader oracle, retaining the upstream normalization inputs.
+    fn unfurled_timeline(session: &ExternalSession) -> Vec<Value> {
+        let bytes = fs::read(&session.transcript).unwrap();
+        let start = bytes.len().saturating_sub(MAX_TIMELINE_BYTES as usize);
+        let mut offset = start;
+        if start != 0 {
+            offset += bytes[start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len() - start, |index| index + 1);
+        }
+        let mut lines = VecDeque::new();
+        for line in bytes[offset..].split_inclusive(|byte| *byte == b'\n') {
+            if lines.len() == MAX_TIMELINE_LINES {
+                lines.pop_front();
+            }
+            lines.push_back((offset as u64, line));
+            offset += line.len();
+        }
+        let mut items = Vec::new();
+        if start != 0 || lines.len() == MAX_TIMELINE_LINES {
+            items.push(timeline_item(
+                0, &timestamp(session.updated_at_unix_ms), "system", "truncation",
+                json!({
+                    "reason": "the native transcript prefix is outside the bounded read window; not fetchable through this owner read",
+                    "fetchable": false, "limit_bytes": MAX_TIMELINE_BYTES,
+                    "omitted_from_sequence": 0, "omitted_to_sequence": 0
+                }),
+            ));
+        }
+        let mut last_timestamp = timestamp(session.started_at_unix_ms);
+        let mut next_free_sequence = 0;
+        for (line_index, (offset, bytes)) in lines.into_iter().enumerate() {
+            let sequence = offset
+                .saturating_add(1)
+                .saturating_mul(16)
+                .max(next_free_sequence);
+            let first = items.len();
+            normalize_native_bytes(
+                session.driver,
+                bytes,
+                sequence,
+                &last_timestamp,
+                line_index,
+                &mut items,
+            );
+            let source = serde_json::to_value(NativeLocator::Jsonl {
+                offset,
+                length: bytes.len() as u64,
+                digest: hex::encode(Sha256::digest(bytes)),
+                sequence,
+                timestamp: last_timestamp.clone(),
+                line_index,
+            })
+            .unwrap();
+            for item in &mut items[first..] {
+                item["_source"] = source.clone();
+            }
+            if let Some(highest) = items[first..]
+                .iter()
+                .filter_map(|item| item["sequence"].as_u64())
+                .max()
+            {
+                next_free_sequence = highest.saturating_add(1);
+            }
+            if let Some(stamp) = items[first..]
+                .last()
+                .and_then(|item| item["timestamp"].as_str())
+            {
+                last_timestamp = stamp.to_owned();
+            }
+        }
+        items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
+        items
+    }
+
+    // Window-transition tests compare every entry without the quadratic cost of
+    // paging and looking up each of thousands of visible filler records.
+    fn assert_fold_matches_upstream(session: &ExternalSession) -> Vec<Value> {
+        let expected = unfurled_timeline(session);
+        assert_eq!(normalized_timeline(session).unwrap(), expected);
+        expected
+    }
+
+    fn assert_timeline_slices(session: &ExternalSession) -> Vec<Value> {
+        let expected = assert_fold_matches_upstream(session);
+        for order in [TimelineOrder::Sequence, TimelineOrder::TimestampSequence] {
+            let mut ordered = expected.clone();
+            ordered.sort_by(|a, b| timeline_key(b, 0).cmp_in(&timeline_key(a, 0), order));
+            let mut walked = Vec::new();
+            let mut before = None;
+            loop {
+                let page = timeline_slice(session, order, before.as_ref(), 7).unwrap();
+                let end = ordered.len().min(walked.len() + 7);
+                assert_eq!(page.items, ordered[walked.len()..end]);
+                walked.extend(page.items);
+                assert_eq!(page.has_more, walked.len() < ordered.len());
+                if !page.has_more {
+                    break;
+                }
+                before = Some(timeline_key(walked.last().unwrap(), 0));
+            }
+            assert_eq!(walked, ordered);
+            let zero = timeline_slice(session, order, None, 0).unwrap();
+            assert!(zero.items.is_empty());
+            assert_eq!(zero.has_more, !ordered.is_empty());
+        }
+        expected
+    }
+
+    #[test]
+    fn incremental_fold_preserves_native_bytes_and_sources_for_all_line_drivers() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        for driver in [
+            ExternalDriver::Claude,
+            ExternalDriver::Codex,
+            ExternalDriver::Pi,
+            ExternalDriver::Omp,
+        ] {
+            let path = root.path().join(format!("{}.jsonl", driver.as_str()));
+            fs::write(
+                &path,
+                b"\n{\"type\":\"new-kind\",\"value\":{\"kept\":true}}\n",
+            )
+            .unwrap();
+            let session = transcript_session(driver, &path);
+            assert_timeline_slices(&session);
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(b"unreadable\xff\n{\"type\":").unwrap();
+            assert_timeline_slices(&session);
+            file.write_all(b"\"another-new-kind\",\"extra\":true}\n")
+                .unwrap();
+            let entries = assert_timeline_slices(&session);
+            for entry in &entries {
+                let locator = serde_json::from_value(entry["_source"].clone()).unwrap();
+                let record = normalized_record(&session, &locator).unwrap();
+                assert!(
+                    record
+                        .iter()
+                        .any(|item| item["id"] == entry["id"] && item["body"] == entry["body"])
+                );
+            }
+        }
+    }
+
+    fn codex_record(id: &str, text: &str) -> String {
+        format!(
+            "{}\n",
+            json!({"type":"response_item","timestamp":"2026-10-07T00:00:00Z",
+                "payload":{"type":"message","role":"assistant","id":id,
+                    "content":[{"type":"output_text","text":text}]}})
+        )
+    }
+
+    #[test]
+    fn timeline_generation_survives_appends_and_moves_on_in_place_rewrites() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("generation.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}{}",
+                codex_record("one", "one"),
+                codex_record("two", "two")
+            ),
+        )
+        .unwrap();
+        let session = transcript_session(ExternalDriver::Codex, &path);
+        let order = TimelineOrder::Sequence;
+        let first = timeline_slice(&session, order, None, 10).unwrap();
+        assert_eq!(texts(&first.items).len(), 2);
+        // A pure append keeps the generation, so an outstanding page cursor still applies.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{}", codex_record("three", "three")).unwrap();
+        let appended = timeline_slice(&session, order, None, 10).unwrap();
+        assert_eq!(appended.generation, first.generation);
+        // Same inode, truncated and rewritten: every basis input still matches.
+        fs::write(&path, codex_record("replaced", "replaced")).unwrap();
+        let replaced = timeline_slice(&session, order, None, 10).unwrap();
+        assert_ne!(replaced.generation, first.generation);
+        assert_eq!(texts(&replaced.items), ["replaced"]);
+        // A rewrite of the single retained record moves it again.
+        fs::write(&path, codex_record("edited", "edited")).unwrap();
+        let edited = timeline_slice(&session, order, None, 10).unwrap();
+        assert_ne!(edited.generation, replaced.generation);
+        assert_eq!(texts(&edited.items), ["edited"]);
+    }
+
+    #[test]
+    fn concurrent_append_during_a_parked_refresh_is_read_completely() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("parked.jsonl");
+        fs::write(&path, codex_record("one", "one")).unwrap();
+        timeline_test_support::arm_refresh(&path);
+        let reader = {
+            let session = transcript_session(ExternalDriver::Codex, &path);
+            std::thread::spawn(move || normalized_timeline(&session).unwrap())
+        };
+        timeline_test_support::wait_refresh_arrived(&path);
+        // The size was captured and the first record read, but EOF has not been checked.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{}", codex_record("two", "two")).unwrap();
+        timeline_test_support::release_refresh(&path);
+        let parked = reader.join().unwrap();
+        assert_eq!(texts(&parked), ["one"]);
+        let session = transcript_session(ExternalDriver::Codex, &path);
+        let after = timeline_slice(&session, TimelineOrder::Sequence, None, 10).unwrap();
+        assert_eq!(texts(&after.items), ["two", "one"]);
+    }
+
+    #[test]
+    fn opencode_timeline_generation_tracks_database_content() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = home.path().join(".local/share/opencode");
+        fs::create_dir_all(&parent).unwrap();
+        let database = parent.join("opencode.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE message (\
+                    id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, \
+                    time_updated INTEGER, data TEXT\
+                 );\
+                 CREATE TABLE part (\
+                    id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, \
+                    time_created INTEGER, time_updated INTEGER, data TEXT\
+                 );",
+            )
+            .unwrap();
+        let insert = |connection: &Connection, id: &str, created: i64| {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, 'ses_native', ?2, ?2, ?3)",
+                    params![id, created, r#"{"role":"assistant"}"#],
+                )
+                .unwrap();
+        };
+        insert(&connection, "msg_1", 1_700_000_000_000);
+        let external = ExternalSession {
+            id: external_session_id(ExternalDriver::OpenCode, "ses_native"),
+            revision: "revision".into(),
+            driver: ExternalDriver::OpenCode,
+            native_id: "ses_native".into(),
+            transcript: database,
+            codex_home: None,
+            cwd: None,
+            title: None,
+            started_at_unix_ms: 1_700_000_000_000,
+            updated_at_unix_ms: 1_700_000_001_000,
+            process: None,
+        };
+        let order = TimelineOrder::Sequence;
+        let first = timeline_slice(&external, order, None, 10).unwrap();
+        let again = timeline_slice(&external, order, None, 10).unwrap();
+        assert_eq!(first.generation, again.generation);
+        insert(&connection, "msg_2", 1_700_000_001_000);
+        drop(connection);
+        let changed = timeline_slice(&external, order, None, 10).unwrap();
+        assert_ne!(changed.generation, first.generation);
+    }
+
+    #[test]
+    fn incremental_fold_reseeds_cached_suffix_when_session_start_changes() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let head = json!({"type":"user","message":{"role":"user","content":"head"}});
+        let anchor = claude_line("user", "2026-09-30T10:00:00Z", "anchor");
+        fs::write(
+            &path,
+            format!("{CLAUDE_WINDOW_FILLER}{head}\n{anchor}\n{CLAUDE_WINDOW_FILLER}not JSON"),
+        )
+        .unwrap();
+        let mut session = transcript_session(ExternalDriver::Claude, &path);
+        session.started_at_unix_ms = 1000;
+        let before = assert_timeline_slices(&session);
+        session.started_at_unix_ms = 2000;
+        let after = assert_timeline_slices(&session);
+        assert_eq!(
+            after
+                .iter()
+                .find(|item| item["body"]["text"] == "head")
+                .unwrap()["timestamp"],
+            timestamp(2000),
+        );
+        assert_eq!(
+            before
+                .iter()
+                .find(|item| item["body"]["text"] == "anchor")
+                .unwrap()["id"],
+            after
+                .iter()
+                .find(|item| item["body"]["text"] == "anchor")
+                .unwrap()["id"],
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "\n{CLAUDE_WINDOW_FILLER}{head}\n").unwrap();
+        let appended = assert_timeline_slices(&session);
+        assert_eq!(
+            appended
+                .iter()
+                .rev()
+                .find(|item| item["body"]["text"] == "head")
+                .unwrap()["timestamp"],
+            "2026-09-30T10:00:00Z",
+        );
+    }
+
+    #[test]
+    fn a_cold_and_sliding_fold_seed_timestamp_from_the_retained_window() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let predecessor = claude_line("user", "2026-09-30T10:00:00Z", "omitted");
+        let head = json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"head"}]}});
+        fs::write(
+            &path,
+            format!(
+                "{predecessor}\n{}{head}\n",
+                CLAUDE_WINDOW_FILLER.repeat(MAX_TIMELINE_LINES - 2)
+            ),
+        )
+        .unwrap();
+        let mut session = transcript_session(ExternalDriver::Claude, &path);
+        session.started_at_unix_ms = 1000;
+        session.updated_at_unix_ms = 2000;
+        let before = assert_fold_matches_upstream(&session);
+        assert_eq!(
+            before
+                .iter()
+                .find(|item| item["body"]["text"] == "head")
+                .unwrap()["timestamp"],
+            "2026-09-30T10:00:00Z"
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(CLAUDE_WINDOW_FILLER.as_bytes()).unwrap();
+        let after = assert_fold_matches_upstream(&session);
+        assert_eq!(chat_texts(&after), ["head"]);
+        assert_eq!(
+            after
+                .iter()
+                .find(|item| item["body"]["text"] == "head")
+                .unwrap()["timestamp"],
+            timestamp(session.started_at_unix_ms)
+        );
+    }
+
+    #[test]
+    fn incremental_line_fold_matches_upstream_across_the_line_cap() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        fs::write(&path, CLAUDE_WINDOW_FILLER.repeat(MAX_TIMELINE_LINES - 3)).unwrap();
+        let mut session = transcript_session(ExternalDriver::Claude, &path);
+        session.started_at_unix_ms = 1000;
+        session.updated_at_unix_ms = 2000;
+        assert_fold_matches_upstream(&session);
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        for index in 0..8 {
+            writeln!(
+                file,
+                "{}",
+                claude_line("user", "2026-09-30T10:00:00Z", &format!("record-{index}"))
+            )
+            .unwrap();
+            assert_fold_matches_upstream(&session);
+        }
+        file.write_all(b"not JSON\xff\n").unwrap();
+        let before = assert_fold_matches_upstream(&session);
+        let old = before.iter().find(|item| item["type"] == "error").unwrap();
+        writeln!(
+            file,
+            "{}",
+            claude_line("user", "2026-09-30T10:00:01Z", "after error")
+        )
+        .unwrap();
+        let after = assert_fold_matches_upstream(&session);
+        let new = after.iter().find(|item| item["type"] == "error").unwrap();
+        assert_eq!(new["id"], old["id"]);
+        assert_eq!(new["_source"]["offset"], old["_source"]["offset"]);
+        assert_eq!(new["body"]["blocks"], old["body"]["blocks"]);
+        assert_eq!(
+            new["body"]["details"]["line_in_window"].as_u64().unwrap() + 1,
+            old["body"]["details"]["line_in_window"].as_u64().unwrap(),
+        );
+    }
+
+    #[test]
+    fn line_fold_rebuilds_after_rewrite_truncation_and_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let record = |text| claude_line("user", "2026-09-30T10:00:00Z", text);
+        let original = format!("{}\n{}\n", record("first"), record("last"));
+        fs::write(&path, &original).unwrap();
+        let session = transcript_session(ExternalDriver::Claude, &path);
+        assert_eq!(texts(&assert_timeline_slices(&session)), ["first", "last"]);
+        let identity = file_identity(&fs::metadata(&path).unwrap());
+        let rewritten = format!("{}\n{}\n", record("other"), record("edit"));
+        assert_eq!(original.len(), rewritten.len());
+        fs::write(&path, rewritten).unwrap();
+        assert_eq!(file_identity(&fs::metadata(&path).unwrap()), identity);
+        assert_eq!(texts(&assert_timeline_slices(&session)), ["other", "edit"]);
+        fs::write(&path, format!("{}\n", record("short"))).unwrap();
+        assert_eq!(texts(&assert_timeline_slices(&session)), ["short"]);
+        let replacement = root.path().join("replacement.jsonl");
+        fs::write(
+            &replacement,
+            format!("{}\n{}\n", record("replacement"), record("new")),
+        )
+        .unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        #[cfg(unix)]
+        assert_ne!(file_identity(&fs::metadata(&path).unwrap()), identity);
+        assert_eq!(
+            texts(&assert_timeline_slices(&session)),
+            ["replacement", "new"]
+        );
+    }
+
+    #[test]
+    fn parsed_and_torn_tails_are_refolded_with_pinned_record_sources() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let first = claude_line("user", "2026-09-30T10:00:00Z", "question");
+        let tail = claude_line("assistant", "2026-09-30T10:00:01Z", "answer");
+        fs::write(&path, format!("{first}\n{tail}")).unwrap();
+        let session = transcript_session(ExternalDriver::Claude, &path);
+        let writing = assert_timeline_slices(&session);
+        let changed = tail.replace("answer", "edited");
+        fs::write(&path, format!("{first}\n{changed}")).unwrap();
+        let edited = assert_timeline_slices(&session);
+        assert_eq!(texts(&edited), ["question", "edited"]);
+        assert_eq!(
+            edited.iter().map(|entry| &entry["id"]).collect::<Vec<_>>(),
+            writing.iter().map(|entry| &entry["id"]).collect::<Vec<_>>()
+        );
+        let locator = serde_json::from_value(edited.last().unwrap()["_source"].clone()).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file).unwrap();
+        let completed = assert_timeline_slices(&session);
+        assert_eq!(
+            completed.last().unwrap()["id"],
+            edited.last().unwrap()["id"]
+        );
+        assert_ne!(
+            completed.last().unwrap()["_source"],
+            edited.last().unwrap()["_source"]
+        );
+        assert_eq!(
+            normalized_record(&session, &locator)
+                .unwrap()
+                .last()
+                .unwrap()["body"],
+            edited.last().unwrap()["body"]
+        );
+        let completed_len = file.metadata().unwrap().len();
+        file.write_all(b"{\"type\":\"assistant\",\"message\":")
+            .unwrap();
+        let torn = assert_timeline_slices(&session);
+        assert_eq!(
+            torn.last().unwrap()["body"]["code"],
+            "native-line-unreadable"
+        );
+        file.write_all(
+            b"{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"repaired\"}]}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            texts(&assert_timeline_slices(&session)),
+            ["question", "edited", "repaired"]
+        );
+        file.set_len(completed_len).unwrap();
+        assert_eq!(assert_timeline_slices(&session), completed);
+    }
+
+    #[test]
+    fn removing_a_tail_restores_the_full_completed_line_window() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let first = claude_line("user", "2026-09-30T10:00:00Z", "first");
+        let tail = claude_line("assistant", "2026-09-30T10:00:01Z", "tail");
+        let completed = format!(
+            "{first}\n{}",
+            CLAUDE_WINDOW_FILLER.repeat(MAX_TIMELINE_LINES - 1)
+        );
+        fs::write(&path, format!("{completed}{tail}")).unwrap();
+        let session = transcript_session(ExternalDriver::Claude, &path);
+        assert_eq!(
+            chat_texts(&assert_fold_matches_upstream(&session)),
+            ["tail"]
+        );
+        fs::write(&path, completed).unwrap();
+        assert_eq!(
+            chat_texts(&assert_fold_matches_upstream(&session)),
+            ["first"]
+        );
+    }
+
+    #[test]
+    fn timeline_slices_preserve_each_order_with_truncation_and_mixed_timestamps() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let stamps = [
+            "2026-09-30T10:30:00+02:00",
+            "2026-09-30T10:00:00.000Z",
+            "2026-09-30T10:00:00Z",
+            "2026-09-30T09:00:00Z",
+        ];
+        let records = (0..23)
+            .map(|index| {
+                format!(
+                    "{}\n",
+                    claude_line(
+                        "user",
+                        stamps[index % stamps.len()],
+                        &format!("record-{index}")
+                    ),
+                )
+            })
+            .collect::<String>();
+        fs::write(
+            &path,
+            format!(
+                "{}{records}",
+                CLAUDE_WINDOW_FILLER.repeat(MAX_TIMELINE_LINES)
+            ),
+        )
+        .unwrap();
+        let session = transcript_session(ExternalDriver::Claude, &path);
+        assert_timeline_slices(&session);
+        let sequence = timeline_slice(&session, TimelineOrder::Sequence, None, usize::MAX).unwrap();
+        assert_eq!(sequence.items[0]["body"]["text"], "record-22");
+        assert_eq!(sequence.items.last().unwrap()["type"], "truncation");
+        let timed =
+            timeline_slice(&session, TimelineOrder::TimestampSequence, None, usize::MAX).unwrap();
+        assert_ne!(sequence.items, timed.items);
+        assert_eq!(timed.items[0]["timestamp"], stamps[0]);
+    }
+
+    #[test]
+    fn timeline_slices_and_entry_lookup_follow_byte_window_slides() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let records = |label: &str, count| {
+            (0..count)
+                .map(|index| {
+                    format!(
+                        "{}\n",
+                        claude_line("user", "2026-09-30T10:00:00Z", &format!("{label}-{index}")),
+                    )
+                })
+                .collect::<String>()
+        };
+        let prefix = records("old", 18);
+        let suffix = records("recent", 16);
+        let mut file = File::create(&path).unwrap();
+        file.write_all(prefix.as_bytes()).unwrap();
+        // A single omitted JSON record spans the window without expanded raw-text payloads.
+        let opening = b"{\"type\":\"file-history-snapshot\",\"padding\":\"";
+        let closing = b"\"}\n";
+        let padding = MAX_TIMELINE_BYTES as usize
+            - prefix.len()
+            - suffix.len()
+            - opening.len()
+            - closing.len();
+        file.write_all(opening).unwrap();
+        file.write_all(&vec![b' '; padding]).unwrap();
+        file.write_all(closing).unwrap();
+        file.write_all(suffix.as_bytes()).unwrap();
+        drop(file);
+        let session = transcript_session(ExternalDriver::Claude, &path);
+        let initial = assert_timeline_slices(&session);
+        let old = initial
+            .iter()
+            .find(|item| item["body"]["text"] == "old-0")
+            .unwrap();
+        let survivor = initial
+            .iter()
+            .find(|item| item["body"]["text"] == "recent-0")
+            .unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(records("appended", 16).as_bytes()).unwrap();
+        let slid = assert_timeline_slices(&session);
+        assert!(slid.iter().any(|item| item["type"] == "truncation"));
+        assert!(!slid.iter().any(|item| item["id"] == old["id"]));
+        let retained = slid
+            .iter()
+            .find(|item| item["id"] == survivor["id"])
+            .unwrap();
+        assert_eq!(retained["body"], survivor["body"]);
+        assert_eq!(retained["_source"]["offset"], survivor["_source"]["offset"]);
+        assert_ne!(
+            retained["_source"]["line_index"],
+            survivor["_source"]["line_index"]
+        );
+    }
+
+    #[test]
+    fn fold_cache_evicts_to_source_byte_and_transcript_budgets() {
+        let budget = 2 * (claude_line("user", "2026-09-30T10:00:00Z", "small").len() + 1);
+        let root = tempfile::tempdir().unwrap();
+        let mut cache = LineFoldCache::new();
+        let mut expected_bytes = 0;
+        for index in 0..4 {
+            let path = root.path().join(format!("{index}.jsonl"));
+            let text = if index == 3 {
+                "x".repeat(budget)
+            } else {
+                "small".into()
+            };
+            let record = format!("{}\n", claude_line("user", "2026-09-30T10:00:00Z", &text));
+            fs::write(&path, &record).unwrap();
+            let session = transcript_session(ExternalDriver::Claude, &path);
+            let fold = SharedLineFold::default();
+            let bytes = {
+                let mut state = match fold.lock() {
+                    Ok(state) => state,
+                    Err(error) => panic!("test fold poisoned: {error}"),
+                };
+                assert_eq!(texts(&state.read(&session).unwrap()), [text.as_str()]);
+                assert_eq!(state.retained_source_bytes, record.len());
+                state.retained_source_bytes
+            };
+            cache.push_back((path.clone(), session.driver, fold, bytes));
+            trim_line_folds(&mut cache, budget);
+            assert!(cache.iter().map(|entry| entry.3).sum::<usize>() <= budget);
+            if bytes > budget {
+                assert!(!cache.iter().any(|entry| entry.0 == path));
+                assert_eq!(
+                    cache.iter().map(|entry| entry.3).sum::<usize>(),
+                    expected_bytes
+                );
+            } else {
+                assert_eq!(cache.back().unwrap().0, path);
+                if index == 2 {
+                    assert_eq!(cache.front().unwrap().0, root.path().join("1.jsonl"));
+                }
+                expected_bytes = cache.iter().map(|entry| entry.3).sum();
+            }
+        }
+        cache.clear();
+        for index in 0..MAX_FOLDED_TRANSCRIPTS + 2 {
+            cache.push_back((
+                root.path().join(format!("{index}.jsonl")),
+                ExternalDriver::Claude,
+                SharedLineFold::default(),
+                0,
+            ));
+            trim_line_folds(&mut cache, budget);
+        }
+        assert_eq!(cache.len(), MAX_FOLDED_TRANSCRIPTS);
+        assert_eq!(cache.front().unwrap().0, root.path().join("2.jsonl"));
+    }
+
+    #[test]
+    #[ignore = "benchmark over a local corpus"]
+    fn conversation_ivm_bench() {
+        use std::io::Write as _;
+        let Ok(corpus) = std::env::var("ST_CONV_IVM_CORPUS") else {
+            return;
+        };
+        let median = |mut samples: Vec<f64>| {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        };
+        let ms = |start: Instant| start.elapsed().as_secs_f64() * 1000.0;
+        let text = fs::read(corpus).unwrap();
+        let base = text.len().saturating_sub(40 << 20);
+        let base = if base == 0 {
+            0
+        } else {
+            base + text[base..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .expect("corpus must contain complete records")
+                + 1
+        };
+        let text = &text[base..];
+        let mut cuts = text
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .map(|(index, _)| index + 1)
+            .collect::<Vec<_>>();
+        assert!(
+            cuts.len() >= 2,
+            "corpus must contain at least two complete records"
+        );
+        cuts = cuts.split_off(cuts.len().saturating_sub(17));
+        let root = tempfile::tempdir().unwrap();
+        let mut cold = Vec::new();
+        let mut incremental = Vec::new();
+        let mut first_page = Vec::new();
+        let mut items = 0;
+        for (run, window) in cuts.windows(2).enumerate() {
+            let path = root.path().join(format!("run-{run}.jsonl"));
+            fs::write(&path, &text[..window[0]]).unwrap();
+            let session = transcript_session(ExternalDriver::Omp, &path);
+            let start = Instant::now();
+            normalized_timeline(&session).unwrap();
+            cold.push(ms(start));
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&text[window[0]..window[1]]).unwrap();
+            let start = Instant::now();
+            let after = normalized_timeline(&session).unwrap();
+            incremental.push(ms(start));
+            items = after.len();
+            fs::write(&path, &text[..window[0]]).unwrap();
+            normalized_timeline(&session).unwrap();
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&text[window[0]..window[1]]).unwrap();
+            let start = Instant::now();
+            let page =
+                timeline_slice(&session, TimelineOrder::TimestampSequence, None, 200).unwrap();
+            first_page.push(ms(start));
+            let mut expected = after;
+            expected.sort_by(|a, b| {
+                timeline_key(b, 0).cmp_in(&timeline_key(a, 0), TimelineOrder::TimestampSequence)
+            });
+            expected.truncate(200);
+            assert_eq!(page.items, expected);
+            assert_eq!(page.has_more, items > 200);
+        }
+        eprintln!(
+            "corpus_bytes={} window_items={items} cold_p50_ms={:.3} cold_max_ms={:.3} incremental_p50_ms={:.3} incremental_max_ms={:.3} first_page200_after_append_p50_ms={:.3} first_page200_after_append_max_ms={:.3}",
+            text.len(),
+            median(cold.clone()),
+            cold.iter().copied().fold(0.0, f64::max),
+            median(incremental.clone()),
+            incremental.iter().copied().fold(0.0, f64::max),
+            median(first_page.clone()),
+            first_page.iter().copied().fold(0.0, f64::max),
+        );
     }
 }

@@ -45,10 +45,11 @@
     "MustAct": {"anyOf": [{"enum": ["you", "agent", "system", "blocked", "nobody"]}, {"type": "string"}], "description": "Who must act next on a mission or run."},
     "RunOutcomeStatus": {"anyOf": [{"enum": ["completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Terminal outcome of a finished run."},
     "AgentState": {"anyOf": [{"enum": ["desired", "starting", "running", "waiting", "stopped", "failed", "suspended"]}, {"type": "string"}], "description": "Desired/observed agent seat state. `suspended`: the seat was stopped at a quiet boundary and resumes its own native session; see `suspension`."},
+    "AgentLifecycle": {"anyOf": [{"enum": ["standing", "owner", "bounded"]}, {"type": "string"}], "description": "Declared agent lifecycle. Publication accepts standing, owner, or bounded; clients retain future values as Unknown."},
     "AgentReachability": {"anyOf": [{"enum": ["local", "remote", "unreachable", "unknown", "reachable", "indeterminate"]}, {"type": "string"}], "description": "Whether the daemon can currently reach the agent runtime."},
     "TimelineStatus": {"anyOf": [{"enum": ["queued", "running", "waiting", "completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Run status reported in a timeline `status` entry."},
     "ErrorCode": {"anyOf": [{"enum": ["attention-migrated", "arrangement-exists", "arrangement-folder-exists", "arrangement-retired", "arrangement-limit", "arrangement-folder-deleted", "arrangement-cycle", "arrangement-body-too-large", "arrangement-owner-forbidden", "invalid-arrangement-subject", "invalid-arrangement-action", "invalid-arrangement-operations", "invalid-arrangement-folder", "invalid-arrangement-name", "invalid-arrangement-key", "invalid-subject-reference", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "issuer-required", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "conversation-content-invalidated", "transcript-unavailable", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer."},
-    "UnknownResource": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "properties": {"kind": {"type": "string", "not": {"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "arrangement", "owned-set"]}}}}]},
+    "UnknownResource": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "properties": {"kind": {"type": "string", "not": {"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "arrangement", "owned-set", "summary"]}}}}]},
     "OwnedSet": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "claim", "receipt", "blockers", "members_status", "visibility"], "properties": {"kind": {"const": "owned-set"}, "claim": {"type": "string"}, "receipt": {"type": "object"}, "blockers": {"type": "array", "items": {"type": "string"}}, "members_status": {"type": "array", "items": {"type": "object"}}, "visibility": {"type": "object"}, "commit_status": {"type": ["object", "null"]}}}]},
     "GlassLayout": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["tabs"], "properties": {"tabs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/GlassTab"}}}}, {"type": "object", "additionalProperties": false, "required": ["split", "children"], "properties": {"split": {"enum": ["right", "below"]}, "ratio": {"type": "number", "minimum": 0.1, "maximum": 0.9, "description": "First child share; absent means 0.5. Requires glasses capability version 2."}, "children": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GlassLayout"}}}}]},
     "GlassTab": {"type": "object", "additionalProperties": false, "required": ["pane"], "properties": {"title": {"type": "string"}, "pane": {"type": "string", "minLength": 1}}},
@@ -90,7 +91,8 @@
         "host_id": { "$ref": "#/$defs/HostId" },
         "store_index": { "type": "integer", "minimum": 0 },
         "projection_version": { "const": "client-projection.v0" },
-        "created_at": { "$ref": "#/$defs/Timestamp" }
+        "created_at": { "$ref": "#/$defs/Timestamp" },
+        "published_at": { "$ref": "#/$defs/Timestamp", "description": "For rows a background refresher prepared, such as the agents roster: when it published them. They reflect `store_index`, and local activity up to this time." }
       }
     },
     "CanonicalNode": {
@@ -230,7 +232,7 @@
       "required": ["id", "kind", "revision", "updated_at"],
       "properties": {
         "id": { "$ref": "#/$defs/Id" },
-        "kind": {"anyOf": [{"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "arrangement"]}, {"type": "string"}], "description": "Resource family."},
+        "kind": {"anyOf": [{"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "arrangement", "summary"]}, {"type": "string"}], "description": "Resource family."},
         "revision": { "$ref": "#/$defs/Revision" },
         "updated_at": { "$ref": "#/$defs/Timestamp" },
         "operational": { "$ref": "#/$defs/Operational" }
@@ -1046,6 +1048,7 @@
             "handoff": {"oneOf": [{"$ref": "#/$defs/AgentHandoff"}, {"type": "null"}], "description": "Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes."},
             "rollout": { "type": ["object", "null"], "description": "Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons." },
             "workspace": { "type": ["string", "null"], "description": "The declared workspace on the owning host." },
+            "lifecycle": { "$ref": "#/$defs/AgentLifecycle", "description": "The selected agent declaration's optional KDL `lifecycle` child. Declared intent, not observed activity, runtime state, restart policy, or inferred ownership; omitted rather than null when undeclared. Absence means undeclared; a future string decodes as Unknown without discarding the row." },
             "checkout": { "oneOf": [{ "$ref": "#/$defs/AgentCheckout" }, { "type": "null" }], "description": "The requested Git worktree repository, base and branch. Present before launch; it does not assert that checkout succeeded." },
             "suspension": { "oneOf": [{ "$ref": "#/$defs/AgentSuspension" }, { "type": "null" }], "description": "The seat's latest suspend or resume and its phase. An older daemon omits the field." }
           }
@@ -1582,8 +1585,46 @@
         "sync": { "$ref": "#/$defs/SyncNotice" }
       }
     },
+    "Summary": {
+      "allOf": [
+        { "$ref": "#/$defs/ResourceHeader" },
+        {
+          "type": "object",
+          "required": ["kind", "person_id", "needs_you", "working_agents", "active_missions", "machines"],
+          "properties": {
+            "kind": { "const": "summary" },
+            "person_id": { "type": ["string", "null"] },
+            "needs_you": { "type": "integer", "minimum": 0 },
+            "working_agents": { "type": "integer", "minimum": 0 },
+            "active_missions": { "type": "integer", "minimum": 0 },
+            "machines": { "$ref": "#/$defs/SummaryMachines" },
+            "agents_as_of": {
+              "description": "The published agents roster the agent counts came from, when a background refresher prepares it: its graph cut and when it was published. Absent when the counts come from this snapshot itself.",
+              "type": "object",
+              "required": ["store_index", "published_at"],
+              "additionalProperties": false,
+              "properties": {
+                "store_index": { "type": "integer", "minimum": 0 },
+                "published_at": { "$ref": "#/$defs/Timestamp" }
+              }
+            }
+          }
+        }
+      ],
+      "description": "Complete current source counts, independent of list page limits. One summary/current resource per authorized subscription. Unavailable source coverage sends resync, never inferred zero counts."
+    },
+    "SummaryMachines": {
+      "type": "object",
+      "required": ["connected", "indirect", "offline"],
+      "additionalProperties": false,
+      "properties": {
+        "connected": { "type": "integer", "minimum": 0 },
+        "indirect": { "type": "integer", "minimum": 0 },
+        "offline": { "type": "integer", "minimum": 0 }
+      }
+    },
     "Resource": {
-      "oneOf": [{"$ref": "#/$defs/Attention"}, {"$ref": "#/$defs/Message"}, {"$ref": "#/$defs/Launch"}, {"$ref": "#/$defs/LaunchVariant"}, {"$ref": "#/$defs/LaunchDecision"}, {"$ref": "#/$defs/LaunchApproval"}, {"$ref": "#/$defs/Mission"}, {"$ref": "#/$defs/Work"}, {"$ref": "#/$defs/Agent"}, {"$ref": "#/$defs/Runtime"}, {"$ref": "#/$defs/Observer"}, {"$ref": "#/$defs/Subscription"}, {"$ref": "#/$defs/Lane"}, {"$ref": "#/$defs/Machine"}, {"$ref": "#/$defs/Device"}, {"$ref": "#/$defs/Operation"}, {"$ref": "#/$defs/History"}, {"$ref": "#/$defs/Session"}, {"$ref": "#/$defs/Glass"}, {"$ref": "#/$defs/Arrangement"}, {"$ref": "#/$defs/OwnedSet"}, {"$ref": "#/$defs/UnknownResource"}]
+      "oneOf": [{"$ref": "#/$defs/Summary"}, {"$ref": "#/$defs/Attention"}, {"$ref": "#/$defs/Message"}, {"$ref": "#/$defs/Launch"}, {"$ref": "#/$defs/LaunchVariant"}, {"$ref": "#/$defs/LaunchDecision"}, {"$ref": "#/$defs/LaunchApproval"}, {"$ref": "#/$defs/Mission"}, {"$ref": "#/$defs/Work"}, {"$ref": "#/$defs/Agent"}, {"$ref": "#/$defs/Runtime"}, {"$ref": "#/$defs/Observer"}, {"$ref": "#/$defs/Subscription"}, {"$ref": "#/$defs/Lane"}, {"$ref": "#/$defs/Machine"}, {"$ref": "#/$defs/Device"}, {"$ref": "#/$defs/Operation"}, {"$ref": "#/$defs/History"}, {"$ref": "#/$defs/Session"}, {"$ref": "#/$defs/Glass"}, {"$ref": "#/$defs/Arrangement"}, {"$ref": "#/$defs/OwnedSet"}, {"$ref": "#/$defs/UnknownResource"}]
     },
     "GoldenResourceSet": {
       "type": "array",
@@ -2367,7 +2408,7 @@
         "details": { "type": "object" }
       }
     },
-    "CollectionName": { "enum": ["missions", "attention", "agents", "work", "glasses", "arrangements"] },
+    "CollectionName": { "enum": ["missions", "attention", "agents", "work", "glasses", "arrangements", "summary"] },
     "CollectionCommand": {
       "oneOf": [
         {
@@ -2377,7 +2418,7 @@
           "properties": {
             "kind": { "const": "subscribe" },
             "id": { "type": "string", "minLength": 1, "maxLength": 128 },
-            "collection": { "enum": ["missions", "attention", "agents", "work", "glasses"] },
+            "collection": { "enum": ["missions", "attention", "agents", "work", "glasses", "summary"] },
             "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
             "person": { "type": ["string", "null"] },
             "actor": { "type": ["string", "null"] },

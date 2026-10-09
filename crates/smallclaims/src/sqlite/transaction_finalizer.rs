@@ -80,6 +80,8 @@ impl TransactionFinalizers {
 pub struct WriterTransaction<'connection> {
     transaction: Transaction<'connection>,
     finalizers: Arc<TransactionFinalizers>,
+    /// Declared last, so it records after COMMIT or the rollback on drop.
+    _timer: crate::windows::Timer,
 }
 
 impl<'connection> WriterTransaction<'connection> {
@@ -90,18 +92,27 @@ impl<'connection> WriterTransaction<'connection> {
         Self {
             transaction,
             finalizers,
+            _timer: crate::windows::Timer::start(crate::windows::StoreWork::WriteTransaction),
         }
     }
 
     /// Run bounded source maintenance in this transaction, then commit. Errors propagate
     /// with their original causes; SQLite storage errors remain downcastable.
     pub fn commit(self) -> Result<()> {
+        self.commit_checked(|| Ok(()))
+    }
+
+    /// A writer-owned scope may refuse immediately before COMMIT, after managed finalizers.
+    /// A check error drops/rolls back the transaction. It cannot cancel a completed COMMIT.
+    pub(super) fn commit_checked(self, check: impl FnOnce() -> Result<()>) -> Result<()> {
         ensure!(
             !self.transaction.is_autocommit(),
             "writer transaction was ended through raw SQL"
         );
         self.finalizers.run(&self.transaction)?;
+        check()?;
         self.transaction.commit()?;
+        crate::profile::managed_commit_succeeded();
         Ok(())
     }
 

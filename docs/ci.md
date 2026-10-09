@@ -445,6 +445,15 @@ with its own `/tmp`, and nothing the job started outlives it. The runner names a
 cache, use that Cargo home, and Cargo keeps its intermediate build files in a per-runner build
 directory, while sccache shares compiled crates between all runners and the Nix store is the
 machine's own. The machine's configuration lives in the private network repository.
+In GitHub Actions, both Rust dev shells use `scripts/ci-rustc-wrapper`: sccache's response-I/O
+fallback is enabled. A separate read-only `sccache --dist-status` preflight is bounded
+to 15 seconds (five seconds to finish terminating it). A recognized preflight startup
+error or timeout disables caching for the rest of that job with a warning, before any
+compiler request is submitted. Signal statuses are preserved. Once compilation starts,
+the wrapper executes sccache directly and never retries based on its stderr; the actual
+cache/compiler result is authoritative, and cache statistics are optional.
+The boundary guard's dependency-free synthetic workspace uses
+a fresh Cargo home and no compiler wrappers, stays offline, and prints Cargo stderr on failure.
 Cargo builds use the host's four-job limit. Workspace test shards explicitly use eight test
 threads, with the host's 14 GiB per-job memory limit. The repository variable `CI1_MIN_IDLE`
 can override admission; keep it at four when preserving CPU capacity for reserved lanes.
@@ -498,18 +507,24 @@ second: harness events, mailbox pages, claims, desired state, delivery holds, re
 renewals, status and work reads, and a person's reads), with the reconciler running and 30
 concurrent seat event long-polls. Quiet polls have a 31-second budget for their intentional
 30-second wait; mailbox WebSockets require authenticated native drivers and are excluded.
+The client usage endpoint has a dedicated 0.5-request/second scenario with a 300 ms p99 budget.
+Generated usage history contains cumulative response rollups for long-lived standing sessions
+with stable attribution, so this scenario exercises many observations per series and period
+baselines and totals rather than an empty report or one series per observation.
 It fails when
-a request's p99 or the daemon's CPU passes its budget, or is more than 20% worse than the worst of
-main's last five reports: one run's p99 on a shared runner can be twice the next run's, so a
-regression is what passes several. Each run downloads the newest five real reports from successful
+a request's p99 or the daemon's CPU passes its absolute budget, or exceeds twice the worst of
+main's last five reports and the corresponding slack below. The relative factor is 2x for both
+route p99 and average daemon CPU; every absolute budget still applies independently, including
+the 300 ms roster budgets and 2-core CPU ceiling. The wider relative tolerance accommodates
+variation on shared runners; a passing historical comparison does not establish a paired effect
+or attribute a difference to runner noise. Each run downloads the newest five real reports from successful
 main runs' `perf-load-logs` artifacts. PR runs never supply baselines. Relative latency comparisons start once five
 main reports exist; until then every path still checks its absolute p99 budget and every request
 error fails. CPU compares as soon as one main report exists, because it averages the whole run.
 Relative latency tolerates 5 ms of noise, or 50 ms when either path has fewer than 50 samples:
 those sparse p99s are effectively observed maxima. This bounded tolerance still catches large
 regressions on rare paths. CPU tolerates 0.05 cores. A PR without a main baseline fails as P0;
-a main bootstrap may check only absolute budgets and errors. The workload and its budgets are
-unchanged.
+a main bootstrap may check only absolute budgets and errors.
 
 Performance uses the small `.#perf` Nix shell and the opt-in `perf_load` test target (feature
 `perf-load`), which imports the same `daemon_load` and `daemon_bench` modules without compiling
@@ -690,7 +705,7 @@ queue it again. The merge train (`st lanes join smalltalk`) is retired.
 The ruleset (`.github/repo-settings.json`, generated from `repo-settings.json.genie.ts`, applied
 by an administrator and never by CI) requires the five checks from GitHub Actions with an empty
 bypass list, keeps the pull-request, deletion and force-push protections, and configures the queue:
-merge method MERGE, up to five entries build at once (see [Measured concurrency](#measured-concurrency)),
+merge method MERGE, a proposed three entries build at once (see [Merge overflow and daily Namespace minutes](#merge-overflow-and-daily-namespace-minutes)),
 up to five merge together, and a check that
 never reports fails its entry after 60 minutes. Repository settings enable native auto-merge and
 branch deletion after merge. Check the live settings against the file with `gh-check-settings`:
@@ -723,7 +738,7 @@ The TypeScript client job follows generator freshness and reuses its runner slot
 PR runs also start `perf-cost`, taking their initial peak to 56 vCPUs and 112 GiB. Main upkeep
 runs that check separately; its cache-fill jobs normally finish after their lookup-only probes.
 Five complete merge-queue groups need 240 vCPUs and 480 GiB, within the Linux pool limit;
-`max_entries_to_build` remains 5 in both the generated and live main rulesets.
+`max_entries_to_build` was 5 at this historical measurement; current capacity policy appears in [Merge overflow and daily Namespace minutes](#merge-overflow-and-daily-namespace-minutes).
 PRs, main pushes and other workloads share that capacity; Namespace queues jobs until resources
 are available. The `linux-gate` aggregate starts after the four stage jobs finish, so it does
 not add to the initial peak. macOS uses its own pool.
@@ -794,3 +809,98 @@ Use the PR Checks tab or `gh run view RUN_ID --log-failed`. The Linux job upload
 even on failure. Inspect each stage's log and timing, the selected suite and checked merge SHA.
 A passing retry is a flaky outcome in the nextest log. A queued Namespace job with no runner
 is infrastructure readiness, not a successful check; the merge queue keeps the entry waiting.
+
+During an outage, `CI_OUTAGE_FAST_QUEUE=on` skips optional Nix-cache saves and same-source build-snapshot publication on merge-group runs. Required checks, cache restores, the producer test archive, logs, cache coverage and PR/main cache publication continue. Set the variable back to `off` when Speed ends the outage; an unset variable also preserves normal publication. The earlier six-build incident guidance and automatic restore-to-two instruction are superseded by CI-speed-owned capacity tuning. The current source proposes three with Namespace overflow; the initial live trial returned to two after a measured PR wait exceeded five minutes. Preserve all other live ruleset fields when changing admission.
+
+## Merge overflow and daily Namespace minutes
+
+CI-speed owns live CI variables and queue capacity. Start with `max_entries_to_build=3`,
+merge sizes 1–5 and a five-minute batch wait; live HEADGREEN remains the incident's
+existing strategy. The generated ruleset's normal ALLGREEN strategy is unchanged.
+Change only the build-count field when tuning the live ruleset. This is capacity
+configuration, not proof of CI p90 <20 minutes, runner wait <5 minutes or queue-to-merge
+p90 <45 minutes.
+
+With `CI_MERGE_CI1` unset/off, the picker admits an entire group to `ci1-merge`
+only when five distinct online idle merge workers are available and, after borrowing
+mixed workers, two general workers remain for PRs. Priority-only workers are excluded.
+Otherwise all group workload jobs use Namespace. Admission is a snapshot, not an
+atomic reservation across simultaneous pickers. Missing/invalid status also overflows.
+`CI_MERGE_CI1=on` retains the explicit forced-local switch for supported incidents.
+PR/fork/priority routing is unchanged. No job is migrated after it starts.
+
+`CI_MERGE_NAMESPACE_PROFILE` may name an existing, verified Linux profile; unset
+uses the existing 8x16 stage labels and Linux profile for supporting jobs, including
+KVM. Profile controls and run affinity remain inline. The initial live choice is
+unset: the shared `linux-x86-64` profile historically limited parallel runners, so
+funnelling all large stages into it can queue them despite workspace headroom.
+Three groups can request roughly 144–168 vCPU / 288–336 GiB during overlap on
+Namespace, below the held 320-vCPU / 640-GiB workspace limit, with capacity shared
+by PRs and other work. Actual starts/waits decide later tuning, not those upper
+bounds alone. A dedicated capped profile requires an actual administrator receipt;
+this PR does not claim one was provisioned.
+
+`Namespace usage` runs at 03:05 UTC on GitHub-hosted capacity and reports the previous
+UTC day's observed Namespace job execution minutes, split by event (merge_group,
+pull_request and other events). Cos can read the job summary and its 30-day JSON
+artifact for the morning cost check. The report has a 120-minute timeout, but request
+count is bounded separately: at most 4,000 GitHub API requests. It reuses the existing
+`CI1_RUNNERS_READ_TOKEN` from the main-only picker, without a new secret. Standard
+PAT/installation tokens have a 5,000-request hourly primary limit; the 1,000/hour
+job-token fallback cannot cover this repository's measured volume. The reporter
+checks actual response rate-limit headers, refuses a limit below its budget, and
+records the observed limit, lowest remaining count and actual requests in JSON.
+The collector stops at 500 remaining requests to reserve shared quota for runner
+admission. Shared credential use can still exhaust available quota and must remain visible.
+`python3 scripts/ci-namespace-usage --date YYYY-MM-DD --output usage.json` also
+provides an on-demand report. It queries eight UTC creation days: the reporting
+day and seven prior days, so reruns of older runs are outside coverage. Each day
+is queried separately, recursively splitting saturated time ranges until each
+query is below GitHub's 1,000-result cap. A saturated one-second interval or
+changing search that reaches the cap while paging refuses completeness. Within this window it queries all attempts, includes
+failed/cancelled execution, deduplicates job IDs and clips executions across midnight.
+Every day total is explicitly a **daily lower bound**, never a complete-day or
+invoice total. “Complete window evidence” means only that this creation window
+was collected without known evidence gaps; it does not cover older-run reruns.
+The job identity must be an actual `nsc-runner-*`, rather than just a planned
+Namespace label. Queued/skipped jobs and queue cancellations with no runner or
+started step add no execution minutes. A started step with missing/ambiguous
+Namespace runner identity, or an actual Namespace runner with missing timestamps,
+makes summary/JSON totals explicitly partial and fails the report. Known local
+and GitHub-hosted execution stays excluded. API errors, exhausted request budgets
+or pagination limits retain collected JSON as partial lower-bound evidence before
+failing, rather than declaring zero usage. Pagination is not an atomic history snapshot.
+Totals are operational execution minutes, not invoice dollars or billable unit
+minutes: provisioning before the first job step and deleted GitHub history are
+outside this method. Use Namespace's billing view for an invoice; the report
+preserves raw job IDs/timestamps for reconciliation.
+
+Intake's read-only day counts for October 2–8 were 949, 1,222, 1,227, 1,437,
+1,126, 1,761 and 1,699 runs. The last day alone requires at least 1,699 jobs
+requests plus run-list pages; this invalidated the earlier 800-request/job-token
+design. The bounded 4,000-call design and earlier schedule allow this scale, but
+actual call count, credential capability and natural completion remain execution
+evidence, not a guaranteed bound on future repository volume.
+The initial historical collector ended naturally after 37m05s, scanning 14,135
+retained run records and 1,761 relevant runs. That requires at least 1,903 API
+calls (142 run-list pages plus at least one jobs page per relevant run); its exact
+request count was not instrumented. Its older identity gap makes its 38,979.28
+observed job minutes a lower bound, not current collector qualification. The new
+collector records exact request/rate evidence for its own natural outcome.
+
+The reporter makes only read-only GET requests to Actions run/job endpoints. The
+existing secret must permit those reads in addition to the picker's organization
+runner-list access; workflow job-token permissions do not restrict a PAT's actual
+scopes. Source alone cannot confirm the installed secret's scope or capability.
+A missing permission returns partial evidence rather than a complete total.
+See GitHub's [workflow-run search limits](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-repository)
+and [REST rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
+Each response must have fresh valid limit and remaining headers; earlier values
+never substitute for missing current quota evidence.
+
+One pinned corrected local-auth report ended naturally with exit 1 after 207.77s:
+234 attempted API calls, observed limit 5,000, minimum remaining 499, and the
+explicit reserve-reached error. It retained 4,836.67 observed minutes as partial
+window evidence. This confirms the quota-reserve behavior with local authentication,
+not the scheduled credential, full window, or a successful daily total. No automatic
+retry follows quota exhaustion.

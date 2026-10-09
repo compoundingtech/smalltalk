@@ -51,6 +51,10 @@ const SEAT_REQUESTS_PER_SECOND: f64 = 1.25;
 /// neither happens here.
 const PASS_BUDGET: u64 = 2;
 
+/// A small measurement control, separate from the seat and production load budgets.
+const CONTROL_WINDOW: Duration = Duration::from_secs(5);
+const CONTROL_QUIET: Duration = Duration::from_secs(1);
+
 /// A runtime that reports each idle seat as running and starts nothing.
 struct IdleRuntime {
     seats: Vec<(String, String)>,
@@ -272,6 +276,281 @@ fn delta(after: &BTreeMap<String, u64>, before: &BTreeMap<String, u64>) -> Vec<(
         .collect::<Vec<_>>();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     rows
+}
+
+struct CpuControlWindow {
+    cpu_before: Duration,
+    started: Instant,
+}
+
+impl CpuControlWindow {
+    fn start() -> Self {
+        Self {
+            cpu_before: process_cpu(),
+            started: Instant::now(),
+        }
+    }
+
+    fn finish(self) -> CpuControlSample {
+        let cpu_after = process_cpu();
+        CpuControlSample {
+            cpu_before: self.cpu_before,
+            cpu_after,
+            elapsed: self.started.elapsed(),
+        }
+    }
+}
+
+struct CpuControlSample {
+    cpu_before: Duration,
+    cpu_after: Duration,
+    elapsed: Duration,
+}
+
+impl CpuControlSample {
+    fn cores(&self) -> f64 {
+        self.cpu_after
+            .checked_sub(self.cpu_before)
+            .expect("process CPU counter went backwards")
+            .as_secs_f64()
+            / self.elapsed.as_secs_f64()
+    }
+
+    fn under_idle_budget(&self) -> bool {
+        // A missing/short window is not a passing idle sample.
+        self.elapsed >= CONTROL_WINDOW && self.cores() <= CPU_BUDGET
+    }
+
+    fn report(&self) -> Value {
+        json!({
+            "process_id": std::process::id(),
+            "monotonic_elapsed_seconds": self.elapsed.as_secs_f64(),
+            "process_cpu_before_seconds": self.cpu_before.as_secs_f64(),
+            "process_cpu_after_seconds": self.cpu_after.as_secs_f64(),
+            "process_cpu_delta_seconds": (self.cpu_after - self.cpu_before).as_secs_f64(),
+            "cores": self.cores(),
+            "cpu_unit": "process user+system CPU seconds / monotonic elapsed seconds",
+            "under_idle_budget": self.under_idle_budget(),
+        })
+    }
+}
+
+/// Drop also stops the injection if a control assertion fails.
+struct BusyControl {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<u64>>,
+}
+
+impl BusyControl {
+    fn start() -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let running = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut iterations = 0_u64;
+            while !running.load(std::sync::atomic::Ordering::Relaxed) {
+                iterations = iterations.wrapping_add(1);
+                std::hint::black_box(iterations);
+            }
+            iterations
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn finish(&mut self) -> u64 {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for BusyControl {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            let _ = self.finish();
+        }
+    }
+}
+
+/// The API, writer, reconciler and receipt consumer share one isolated process. The first
+/// interval has no seats, drivers, peers, missions, client requests or queued receipts. The
+/// second changes only a test-owned CPU burner: the same measurement must reject it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quiescent_daemon_cpu_control_accepts_idle_and_rejects_busy() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let startup = CpuControlWindow::start();
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), NODE).unwrap());
+    assert!(store.desired_subjects().unwrap().is_empty());
+    let notify = Arc::new(Notify::new());
+    let event_notify = watch::channel(0_u64).0;
+    let state_dir = root.path().join("daemon");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let receipts = st3::recorder::receipt_path(&state_dir);
+    std::fs::create_dir_all(&receipts).unwrap();
+    // Its removal proves the real receipt consumer completed an initial scan. Startup
+    // cleanup is reported separately; the spool must be empty before either CPU window.
+    let startup_spool_entry = receipts.join("idle-control.tmp");
+    std::fs::File::create(&startup_spool_entry)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(3_601))
+        .unwrap();
+    let state = AppState {
+        store: store.clone(),
+        notify: notify.clone(),
+        event_notify: event_notify.clone(),
+        node: NODE.into(),
+        state_dir,
+        pty_root: root.path().join("pty"),
+        pty_binary: PathBuf::from("pty"),
+        fleet_id: None,
+        configured_peers: Vec::new(),
+        client_relay: None,
+        native_session_home: None,
+        planner_default: st3::model::PlannerSpec::default(),
+    };
+    let ingesting = tokio::spawn(st3::recorder_receipts::run(
+        store.clone(),
+        receipts.clone(),
+        notify.clone(),
+        event_notify,
+    ));
+    let socket = root.path().join("st3.sock");
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, st3::api::router(state))
+            .await
+            .unwrap();
+    });
+    let reconciler = Arc::new(
+        Reconciler::new(
+            store.clone(),
+            Arc::new(IdleRuntime { seats: Vec::new() }),
+            NODE.into(),
+            notify,
+        )
+        .skipping_unneeded(true),
+    );
+    let initial_passes = counts(&st3::performance::snapshot(), "requests", |row| {
+        row["kind"].as_str().unwrap_or("?").to_owned()
+    })
+    .get("task reconcile-pass")
+    .copied()
+    .unwrap_or_default();
+    let reconciling = tokio::spawn(reconciler.supervise());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut stable_index = store.index().unwrap();
+    let mut stable_since = Instant::now();
+    loop {
+        assert!(!server.is_finished() && !reconciling.is_finished() && !ingesting.is_finished());
+        assert!(
+            Instant::now() < deadline,
+            "fixture never reached background readiness"
+        );
+        let index = store.index().unwrap();
+        if index != stable_index {
+            stable_index = index;
+            stable_since = Instant::now();
+        }
+        let passes = counts(&st3::performance::snapshot(), "requests", |row| {
+            row["kind"].as_str().unwrap_or("?").to_owned()
+        })
+        .get("task reconcile-pass")
+        .copied()
+        .unwrap_or_default();
+        let ready = passes > initial_passes
+            && !startup_spool_entry.exists()
+            && std::os::unix::net::UnixStream::connect(&socket).is_ok();
+        if !ready {
+            stable_since = Instant::now();
+        } else if stable_since.elapsed() >= CONTROL_QUIET {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let startup = startup.finish();
+    assert!(store.desired_subjects().unwrap().is_empty());
+    assert!(std::fs::read_dir(&receipts).unwrap().next().is_none());
+    let before = st3::performance::snapshot();
+    let idle = CpuControlWindow::start();
+    tokio::time::sleep(CONTROL_WINDOW).await;
+    let idle = idle.finish();
+    let after_idle = st3::performance::snapshot();
+    let mut burner = BusyControl::start();
+    let busy = CpuControlWindow::start();
+    tokio::time::sleep(CONTROL_WINDOW).await;
+    let iterations = burner.finish();
+    let busy = busy.finish();
+    let after_busy = st3::performance::snapshot();
+    let request_count = |report: &Value| report["request_count"].as_u64().unwrap();
+    let pass_count = |report: &Value| {
+        counts(report, "requests", |row| {
+            row["kind"].as_str().unwrap_or("?").to_owned()
+        })
+        .get("task reconcile-pass")
+        .copied()
+        .unwrap_or_default()
+    };
+    use sha2::Digest as _;
+    let mut startup_report = startup.report();
+    startup_report
+        .as_object_mut()
+        .unwrap()
+        .remove("under_idle_budget");
+    let report = json!({
+        "source_file": "crates/st3/tests/idle_budget.rs",
+        "compiled_source_sha256": format!("{:x}", sha2::Sha256::digest(include_bytes!("idle_budget.rs"))),
+        "ci_source_commit": std::env::var("GITHUB_SHA").ok(),
+        "scope": "API/reconciler/receipt integration process; not whole-fleet idle acceptance",
+        "population": {"seats": 0, "drivers": 0, "missions": 0, "peers": 0, "clients": 0, "queued_receipts": 0},
+        "minimum_window_seconds": CONTROL_WINDOW.as_secs_f64(),
+        "budget_cores": CPU_BUDGET,
+        "startup": startup_report,
+        "startup_spool_entries_removed": 1,
+        "idle_positive": idle.report(),
+        "busy_negative": busy.report(),
+        "injected_busy_threads": 1,
+        "injected_busy_iterations": iterations,
+        "idle_requests": request_count(&after_idle) - request_count(&before),
+        "busy_requests": request_count(&after_busy) - request_count(&after_idle),
+        "startup_reconcile_passes": pass_count(&before) - initial_passes,
+        "idle_reconcile_passes": pass_count(&after_idle) - pass_count(&before),
+        "busy_reconcile_passes": pass_count(&after_busy) - pass_count(&after_idle),
+        "store_index_before": stable_index,
+        "store_index_after": store.index().unwrap(),
+    });
+    eprintln!("idle CPU control: {report}");
+    assert!(!server.is_finished() && !reconciling.is_finished() && !ingesting.is_finished());
+    assert_eq!(
+        store.index().unwrap(),
+        stable_index,
+        "no-work fixture wrote during measurement"
+    );
+    assert_eq!(
+        request_count(&after_busy),
+        request_count(&before),
+        "no-work fixture received requests"
+    );
+    assert!(std::fs::read_dir(&receipts).unwrap().next().is_none());
+    assert!(idle.under_idle_budget(), "idle positive failed: {report}");
+    assert!(
+        iterations > 0 && busy.cpu_after > busy.cpu_before,
+        "busy injection did no measured work: {report}"
+    );
+    assert!(
+        busy.elapsed >= CONTROL_WINDOW,
+        "busy negative did not measure a full interval: {report}"
+    );
+    assert!(
+        !busy.under_idle_budget(),
+        "measurement accepted a busy process: {report}"
+    );
+    ingesting.abort();
+    reconciling.abort();
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

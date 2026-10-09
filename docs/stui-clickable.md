@@ -91,7 +91,7 @@ from the painted label, so a card's specific action stays visible in the footer.
 | `Link(url)` | Raw HTTP(S) or remembered markdown link copies complete URL; wrapped parts copy the same address | Message/subject context where applicable, otherwise copy-link action | Underline; copy link |
 | `Split(right)` | Home launcher controls split right/below (`Ctrl+V` / `Ctrl+X`) | Own action | Background; split right/below |
 | `Menu(action)` | Context-menu row runs existing action | Closes menu | Background; painted row action |
-| `GlassTab(group, tab)` | Shows tab; drag reorders, moves or splits | Tab menu | Background; show tab / drag to move or split |
+| `GlassTab(group, tab)` | Shows tab; drag reorders, moves or splits; middle press and release over the same tab closes via the existing tab-menu action | Tab menu | Background; show tab / drag to move or split / middle-click close |
 | `GlassAdd(group)` | `+` focuses group and opens new-tab palette (`Ctrl+T`) | Split context | Background; new tab |
 | `PaletteChoice(index)` | Palette result opens it | No menu | Background; open painted result |
 

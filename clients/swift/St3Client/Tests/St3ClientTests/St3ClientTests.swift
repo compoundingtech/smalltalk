@@ -110,6 +110,57 @@ final class St3ClientTests: XCTestCase {
         }
     }
 
+    func testAgentLifecycleKnownAndFutureKindsRoundTrip() throws {
+        for (raw, expected) in [
+            ("standing", AgentLifecycle.standing),
+            ("owner", AgentLifecycle.owner),
+            ("bounded", AgentLifecycle.bounded),
+            ("future-kind", AgentLifecycle.unknown("future-kind")),
+        ] {
+            let encoded = try JSONEncoder().encode(raw)
+            let decoded = try JSONDecoder().decode(AgentLifecycle.self, from: encoded)
+            XCTAssertEqual(decoded, expected)
+            XCTAssertEqual(try JSONEncoder().encode(decoded), encoded)
+        }
+    }
+
+    func testAgentLifecycleFutureKindPreservesRosterRow() throws {
+        let json = #"{"id":"agent/example","kind":"agent","revision":"r1","updated_at":"2026-10-08T12:00:00Z","name":"Example","state":"idle","reachability":"online","runtime_ids":[],"under":[],"lifecycle":"future-kind"}"#
+        let data = Data(json.utf8)
+        let agent = try JSONDecoder().decode(AgentResource.self, from: data)
+        XCTAssertEqual(agent.id, "agent/example")
+        XCTAssertEqual(agent.name, "Example")
+        XCTAssertEqual(agent.lifecycle, .unknown("future-kind"))
+
+        let roster = try JSONDecoder().decode([Resource].self, from: Data("[\(json)]".utf8))
+        XCTAssertEqual(roster.count, 1)
+        guard case .agent(let row) = roster[0] else { return XCTFail("agent discriminator lost") }
+        XCTAssertEqual(row.id, agent.id)
+        XCTAssertEqual(row.name, agent.name)
+        XCTAssertEqual(row.lifecycle, .unknown("future-kind"))
+
+        let again = try JSONDecoder().decode(Resource.self, from: JSONEncoder().encode(roster[0]))
+        guard case .agent(let roundTrip) = again else { return XCTFail("agent discriminator lost on round trip") }
+        XCTAssertEqual(roundTrip.id, agent.id)
+        XCTAssertEqual(roundTrip.lifecycle, .unknown("future-kind"))
+    }
+
+    func testAgentLifecycleKnownAndAbsentPreserveRosterRows() throws {
+        for (field, expected) in [
+            (#","lifecycle":"standing""#, Optional(AgentLifecycle.standing)),
+            (#","lifecycle":"owner""#, Optional(AgentLifecycle.owner)),
+            (#","lifecycle":"bounded""#, Optional(AgentLifecycle.bounded)),
+            ("", nil),
+            (#","lifecycle":null"#, nil),
+        ] {
+            let json = #"{"id":"agent/example","kind":"agent","revision":"r1","updated_at":"2026-10-08T12:00:00Z","name":"Example","state":"idle","reachability":"online","runtime_ids":[],"under":[]\#(field)}"#
+            let resource = try JSONDecoder().decode(Resource.self, from: Data(json.utf8))
+            guard case .agent(let agent) = resource else { return XCTFail("agent discriminator lost") }
+            XCTAssertEqual(agent.id, "agent/example")
+            XCTAssertEqual(agent.lifecycle, expected)
+        }
+    }
+
     func testDiscriminatedResourceFixturePreservesTypedDetailsAndVisualization() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }
@@ -182,6 +233,43 @@ final class St3ClientTests: XCTestCase {
         guard case .redaction = timeline.items[7].body else { return XCTFail("redaction lost") }
         guard case .truncation = timeline.items[8].body else { return XCTFail("truncation lost") }
         guard case .error = timeline.items[9].body else { return XCTFail("error body lost") }
+    }
+
+    func testRelayOmissionFixtureKeepsKnownBodiesAndOptionalValues() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/timeline-relay-omission.json"))
+        let wire = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let value = try XCTUnwrap(wire["value"] as? [String: Any])
+        let items = try XCTUnwrap(value["items"] as? [[String: Any]])
+        // Swift's current closed type enum has no future-record case. Preserve that existing
+        // contract here; the Rust relay and TypeScript controls cover the unknown raw body.
+        let known = items.filter { ($0["type"] as? String) != "future_record" }
+        for item in known {
+            let entry = try JSONDecoder().decode(TimelineEntry.self, from: JSONSerialization.data(withJSONObject: item))
+            let encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(entry)) as? [String: Any])
+            let originalBody = try XCTUnwrap(item["body"] as? [String: Any])
+            let encodedBody = try XCTUnwrap(encoded["body"] as? [String: Any])
+            // The existing Swift usage model does not expose cache_write_tokens or turn_id.
+            // Their wire preservation is tested by the Rust relay and TypeScript consumers;
+            // this check covers values this installed Swift model actually represents.
+            let unmodeled: Set<String>
+            if case .usage = entry.body { unmodeled = ["cache_write_tokens", "turn_id"] }
+            else { unmodeled = [] }
+            // Codable may omit explicitly nullable nils, without inventing absent fields.
+            for (key, original) in originalBody where !(original is NSNull) && key != "attribution" && !unmodeled.contains(key) {
+                XCTAssertEqual(encodedBody[key] as? NSObject, original as? NSObject, key)
+            }
+            for key in encodedBody.keys {
+                XCTAssertNotNil(originalBody[key], "invented field: \(key)")
+            }
+            XCTAssertEqual(encoded["id"] as? String, item["id"] as? String)
+            XCTAssertEqual(encoded["sequence"] as? Int, item["sequence"] as? Int)
+            XCTAssertEqual(encoded["revision"] as? Int, 2)
+        }
+        let minimal = try JSONDecoder().decode(TimelineEntry.self, from: JSONSerialization.data(withJSONObject: known[0]))
+        guard case .message(let body) = minimal.body else { return XCTFail("message body lost") }
+        XCTAssertNil(body.replyTo); XCTAssertNil(body.from); XCTAssertNil(body.to); XCTAssertNil(body.title)
     }
 
     func testAKindThisClientDoesNotKnowReadsAsUnknown() throws {

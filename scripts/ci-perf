@@ -38,10 +38,36 @@ summarize_load() {
 start=$SECONDS status=0
 case "$stage" in
   cost)
+    # Owned quarantine (merge-queue-flakes): retain the complete link-minutes oracle,
+    # run once without retries, and report its failure independently of cost results.
+    # Finish the isolated native case before process-wide cost measurements start.
+    link_start=$SECONDS link_status=0
+    cargo test -p st3 --features test-support --test integration --locked messaging_faults::link_minutes \
+      -- --exact --nocapture --test-threads 1 2>&1 | tee "$out/link-minutes.log" || link_status=$?
+    if [ "$link_status" -eq 0 ]; then
+      python3 - "$out/link-minutes.log" <<'PY' || link_status=$?
+from pathlib import Path
+import re
+import sys
+
+lines = Path(sys.argv[1]).read_text().splitlines()
+selections = [line for line in lines if re.fullmatch(r"running \d+ tests?", line)]
+summaries = [line for line in lines if line.startswith("test result:")]
+passing = r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in \d+(?:\.\d+)?s"
+# supervise_test reexecutes this one test under its guardian; the outer test only
+# checks the child's exit. Both harnesses must select and pass exactly one test.
+if selections != ["running 1 test", "running 1 test"] or len(summaries) != 2 or not all(re.fullmatch(passing, row) for row in summaries):
+    sys.exit("::error::link-minutes quarantine did not pass exactly one supervised case")
+PY
+    fi
+    link_result=passed
+    [ "$link_status" -eq 0 ] || link_result=failed
+    printf '%s %s\n' "$((SECONDS - link_start))" "$link_status" > "$out/link-minutes.time"
+    printf '| link-minutes quarantine (owner: merge-queue-flakes) | %s | %ss | %s |\n' "$link_result" "$((SECONDS - link_start))" "$link_status" >> "$GITHUB_STEP_SUMMARY"
+    status=$link_status
     rm -f "$out/cost.json"
-    # One cargo invocation builds and runs: a second one reruns a vendored build script and
-    # recompiles st3. The counts do not depend on the build's speed, so the job's lightly
-    # optimized build only makes the stores generate faster. The counts are the whole
+    # One st3 cargo invocation builds and runs. Counts do not depend on build speed, so
+    # the job's lightly optimized build only makes the stores generate faster. Counts are the whole
     # process's, so nothing else may run beside the check.
     ST_COST_REPORT="$out/cost.json" cargo test -p st3 --test integration --locked daemon_cost:: \
       -- --nocapture --test-threads 1 2>&1 | tee "$out/cost.log" || status=$?
@@ -51,6 +77,31 @@ case "$stage" in
       echo "::error::cost check produced no measurement report"
       status=1
     fi
+    # Keep real-network timing separate from the required deterministic retry controls.
+    # Run after cost measurement: no other test may contaminate its process-wide counts.
+    outbound_start=$SECONDS outbound_status=0
+    cargo test -p smallclaims --lib --locked \
+      sync::worker::tests::retry_tests::isolated_outbound_only_node_converges_after_two_minutes_and_four_hours \
+      -- --exact --nocapture --test-threads 1 2>&1 | tee "$out/outbound-only.log" || outbound_status=$?
+    if [ "$outbound_status" -eq 0 ]; then
+      python3 - "$out/outbound-only.log" <<'PY' || outbound_status=$?
+from pathlib import Path
+import re
+import sys
+
+lines = Path(sys.argv[1]).read_text().splitlines()
+selections = [line for line in lines if re.fullmatch(r"running \d+ tests?", line)]
+summaries = [line for line in lines if line.startswith("test result:")]
+passing = r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in \d+(?:\.\d+)?s"
+if selections != ["running 1 test"] or len(summaries) != 1 or not re.fullmatch(passing, summaries[0]):
+    sys.exit("::error::outbound-only timing check did not run exactly one passing test")
+PY
+    fi
+    outbound_result=passed
+    [ "$outbound_status" -eq 0 ] || outbound_result=failed
+    printf '%s %s\n' "$((SECONDS - outbound_start))" "$outbound_status" > "$out/outbound-only.time"
+    printf '| outbound-only timing | %s | %ss | %s |\n' "$outbound_result" "$((SECONDS - outbound_start))" "$outbound_status" >> "$GITHUB_STEP_SUMMARY"
+    if [ "$status" -eq 0 ]; then status=$outbound_status; fi
     ;;
   load)
     rm -f "$out/load.json"

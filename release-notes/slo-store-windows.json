@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep in-memory 1-minute, 5-minute and 1-hour windows of SQL statement, transaction and writer-hold times",
+  "replay": {
+    "status": "none",
+    "detail": "No claim, projection or replay change; the windows are process memory only."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, index or migration change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No API or protocol change in this part; the windows are not yet shown anywhere."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal restart on deploy; the windows start empty after each restart."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Nothing to configure."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swapping back to an older build drops only the in-memory windows."
+  }
+}

@@ -66,7 +66,7 @@ jobs:
     name: warm-tests
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -224,7 +224,7 @@ jobs:
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
-        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled())
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled() && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on'))
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
@@ -267,7 +267,7 @@ jobs:
     name: warm-clippy
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -403,7 +403,7 @@ jobs:
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
-        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled())
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled() && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on'))
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
@@ -446,7 +446,7 @@ jobs:
     name: warm-fleet-compat
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -582,7 +582,7 @@ jobs:
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
-        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled())
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled() && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on'))
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
@@ -625,7 +625,7 @@ jobs:
     name: warm-genie
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -729,7 +729,7 @@ jobs:
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
-        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled())
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled() && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on'))
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
@@ -772,7 +772,7 @@ jobs:
     name: warm-isolation-vm
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -908,7 +908,7 @@ jobs:
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
-        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled())
+        if: success() && (steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true') && (!cancelled() && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on'))
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
@@ -951,7 +951,7 @@ jobs:
     name: warm-typescript
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 10
@@ -992,7 +992,7 @@ jobs:
     name: perf-cost
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -1080,7 +1080,7 @@ jobs:
         shell: bash
         run: nix develop -c bash scripts/ci-perf cost
       - name: Save Nix outputs to the local Nix cache
-        if: success() && env.CI_LOCAL_CACHES != '1'
+        if: success() && env.CI_LOCAL_CACHES != '1' && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - name: Save main cargo-cache
         if: success() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && env.CI_LOCAL_CACHES != '1' && steps.cargo-cache.outputs.cache-hit != 'true'
@@ -1099,7 +1099,7 @@ jobs:
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
-        if: "!cancelled()"
+        if: "!cancelled() && (github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')"
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'

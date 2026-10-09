@@ -1273,7 +1273,10 @@ fn the_proof_passes_for_the_plan_and_fails_for_a_drop_a_reader_needs() {
     write_history(&store);
     let scratch = tempfile::tempdir().unwrap();
     let cut = now_ms() + 1_000;
+    let reclaim_before = allocator_reclaim_stats_for_test();
     let (plan, proof) = store.plan_checkpoint(cut, scratch.path()).unwrap();
+    assert_eq!(allocator_reclaim_stats_for_test().0 - reclaim_before.0, 1,
+        "nested plan/proof entrypoints reclaim once");
     assert!(proof.passed, "{proof:?}");
     assert_eq!(proof.graph_digest_before, proof.graph_digest);
     assert_eq!(proof.reader_digest_before, proof.reader_digest);
@@ -1302,8 +1305,11 @@ fn the_proof_passes_for_the_plan_and_fails_for_a_drop_a_reader_needs() {
     wrong.claims.push(claim_tombstone(newest));
     let copy = scratch.path().join("wrong.sqlite3");
     store.copy_store_to(&copy).unwrap();
+    let reclaim_before = allocator_reclaim_stats_for_test();
     let proof = prove_on_copy(&copy, &sealed, &wrong).unwrap();
     assert!(!proof.passed);
+    assert_eq!(allocator_reclaim_stats_for_test().0 - reclaim_before.0, 1,
+        "a reader-mismatch proof also reclaims once");
     assert!(
         proof
             .mismatches
@@ -1314,6 +1320,36 @@ fn the_proof_passes_for_the_plan_and_fails_for_a_drop_a_reader_needs() {
     );
     // The live store is never changed by a proof.
     assert_eq!(store.claims_for(AGENT, None).unwrap().len(), before);
+}
+
+#[test]
+fn allocator_reclamation_follows_checkpoint_plan_view_and_proof_errors_once() {
+    let store = Store::open_memory("alder").unwrap();
+    write_history(&store);
+    let scratch = tempfile::tempdir().unwrap();
+    let cut = now_ms() + 1_000;
+    let before = allocator_reclaim_stats_for_test();
+    let view = store.checkpoint_plan_view(cut, scratch.path()).unwrap();
+    assert!(view.proof.passed);
+    let after = allocator_reclaim_stats_for_test();
+    assert_eq!(after.0 - before.0, 1);
+    assert_eq!(after.1 - before.1, u64::from(cfg!(all(target_os = "linux", target_env = "gnu"))));
+
+    let sealed = store.checkpoint_sealed_set(cut).unwrap();
+    let plan = plan_drops(&sealed);
+    let blocked = scratch.path().join("not-a-directory");
+    std::fs::write(&blocked, b"occupied").unwrap();
+    let before = allocator_reclaim_stats_for_test();
+    assert!(store.prove_checkpoint_plan(&sealed, &plan, &blocked).is_err());
+    assert_eq!(allocator_reclaim_stats_for_test().0 - before.0, 1,
+        "copy preparation failure finishes its one reclamation attempt");
+
+    let invalid = scratch.path().join("not-a-store.sqlite3");
+    std::fs::write(&invalid, b"not a SQLite store").unwrap();
+    let before = allocator_reclaim_stats_for_test();
+    assert!(prove_on_copy(&invalid, &sealed, &plan).is_err());
+    assert_eq!(allocator_reclaim_stats_for_test().0 - before.0, 1,
+        "failed direct proof also finishes once");
 }
 
 #[test]
@@ -1888,6 +1924,130 @@ fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
 #[test]
 fn status_history_mixed_legacy_and_heartbeat_stamps_survive_both_checkpoint_cuts() {
     mixed_stamp_checkpoint_history(false, false, false, json!(false));
+}
+
+#[test]
+fn status_history_legacy_boundary_keeps_the_transition_that_makes_it_visible() {
+    legacy_boundary_checkpoint_history(199, None, false, false, false, false);
+}
+
+#[test]
+fn status_history_boundary_context_survives_caps_ties_and_recorded_stamps() {
+    for tail in [198, 200] {
+        legacy_boundary_checkpoint_history(tail, None, false, false, false, false);
+    }
+    legacy_boundary_checkpoint_history(199, Some(true), true, false, false, false);
+    legacy_boundary_checkpoint_history(199, None, true, false, false, false);
+}
+
+#[test]
+fn status_history_boundary_context_can_precede_the_seven_day_window() {
+    legacy_boundary_checkpoint_history(199, None, false, true, false, false);
+}
+
+#[test]
+fn status_history_boundary_context_is_kept_per_incarnation() {
+    legacy_boundary_checkpoint_history(198, None, false, false, true, false);
+}
+
+#[test]
+fn status_history_boundary_context_preserves_native_prompt_restoration() {
+    legacy_boundary_checkpoint_history(199, None, false, false, false, true);
+}
+
+fn legacy_boundary_checkpoint_history(tail: usize, stamp: Option<bool>, ties: bool,
+    before_window: bool, two_incarnations: bool, prompts: bool)
+{
+    let cuts = ["2026-10-04T00:00:00Z", "2026-10-05T00:00:00Z"].map(|cut| {
+        chrono::DateTime::parse_from_rfc3339(cut).unwrap().timestamp_millis() as u128
+    });
+    let store = Store::open_memory("cedar").unwrap();
+    let subject = "agent/cedar";
+    let witness_at = if before_window { cuts[0] - seat_status::WINDOW_MS - 1_000 }
+        else { cuts[0] - 5 * 60 * 60 * 1_000 };
+    let at = witness_at - 4 * 60 * 60 * 1_000;
+    let boundary_at = witness_at + 60_000;
+    let append = |kind: &str, fields: Value, time: u128| {
+        store.set_write_clock_at(time).unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        // Keep legacy unstamped sources verbatim instead of using today's stamp producer.
+        let claim = append_claim_tx(&transaction, &store.origin, subject, kind,
+            Some(subject), &json!({"fields":fields}), &[], None).unwrap();
+        transaction.commit().unwrap();
+        claim
+    };
+    let incarnations = if two_incarnations { vec!["one", "two"] } else { vec!["one"] };
+    let harness = |incarnation: &str, state: &str, time: u128, stamp: Option<bool>| {
+        let mut fields = json!({"state":state, "incarnation_id":incarnation, "observed_at_ms":time as u64});
+        if let Some(stamp) = stamp { fields["status_transition"] = json!(stamp); }
+        append("harness.observed", fields, time)
+    };
+    let diagnostic = |code: &str, time: u128| append("harness.diagnostic",
+        json!({"incarnation_id":"one", "code":code, "driver":"codex",
+            "reason":"fixture", "severity":"warning"}), time);
+    for incarnation in &incarnations {
+        append("runtime.observed", json!({
+            "status":"running", "runtime_id":"native", "incarnation_id":incarnation
+        }), at);
+        harness(incarnation, "idle", at + 1_000, Some(true));
+    }
+    if prompts { diagnostic("provider-trust-prompt", witness_at - 1_000); }
+    let predecessors = incarnations.iter().map(|incarnation|
+        harness(incarnation, "working", witness_at, None)).collect::<Vec<_>>();
+    if prompts { diagnostic("provider-auth-restored", witness_at + 1_000); }
+    let boundaries = incarnations.iter().map(|incarnation|
+        harness(incarnation, "idle", boundary_at, stamp)).collect::<Vec<_>>();
+    for index in 0..tail {
+        let incarnation = incarnations[index % incarnations.len()];
+        let round = index / incarnations.len();
+        harness(incarnation, if round % 2 == 0 { "working" } else { "idle" },
+            boundary_at + if ties { 0 } else { (index as u128 + 1) * 1_000 }, Some(true));
+    }
+    // Each cut reads the same fixed canonical sources, never the first cut's trimmed result.
+    for cut in cuts {
+        let connection = store.readers.get();
+        let (before, before_sources) = seat_status::history_at_with_sources(&connection, subject, cut, i64::MAX as u64).unwrap();
+        drop(connection);
+        if tail + incarnations.len() == seat_status::MAX_TRANSITIONS && cut == cuts[0] {
+            assert_eq!(before["items"].as_array().unwrap().len(), seat_status::MAX_TRANSITIONS);
+            assert_eq!(before_sources[0].claim, boundaries[0].id);
+        }
+        let sealed = store.checkpoint_sealed_set(cut).unwrap();
+        let plan = plan_drops(&sealed);
+        for boundary in &boundaries {
+            if before_sources.iter().any(|source| source.claim == boundary.id) {
+                assert!(!dropped(&plan).contains(&boundary.id));
+            }
+        }
+        if tail + incarnations.len() == seat_status::MAX_TRANSITIONS && !prompts && cut == cuts[0] {
+            for predecessor in &predecessors {
+                assert!(!dropped(&plan).contains(&predecessor.id), "boundary context must survive");
+            }
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let copy = scratch.path().join("checkpoint.sqlite3");
+        store.copy_store_to(&copy).unwrap();
+        let proof = prove_on_copy(&copy, &sealed, &plan).unwrap();
+        let mut connection = Connection::open(&copy).unwrap();
+        smallclaims::store::projection_digest::register(&connection).unwrap();
+        let transaction = connection.transaction().unwrap();
+        record_checkpoint_tombstones_tx(&transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims).unwrap();
+        delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
+        let (after, after_sources) = seat_status::history_at_with_sources(&transaction, subject, cut, i64::MAX as u64).unwrap();
+        let before_items = before["items"].as_array().unwrap();
+        let after_items = after["items"].as_array().unwrap();
+        let first_difference = (0..before_items.len().max(after_items.len()))
+            .find(|index| before_items.get(*index) != after_items.get(*index));
+        assert!(proof.passed, "legacy-boundary cut={cut} before_len={} after_len={} first_difference={first_difference:?} before_sources={:?} after_sources={:?} mismatches={:?}",
+            before_items.len(), after_items.len(),
+            before_sources.iter().take(3).map(|source| &source.claim).collect::<Vec<_>>(),
+            after_sources.iter().take(3).map(|source| &source.claim).collect::<Vec<_>>(), proof.mismatches);
+        assert_eq!(after["items"], before["items"]);
+        assert_eq!(after_sources.iter().map(|source| (&source.claim, &source.order)).collect::<Vec<_>>(),
+            before_sources.iter().map(|source| (&source.claim, &source.order)).collect::<Vec<_>>());
+        transaction.rollback().unwrap();
+    }
 }
 
 #[test]

@@ -221,7 +221,31 @@ public struct MissionWake: Codable, Sendable { public let assignee, assigneeStat
 public struct WorkLabel: Codable, Sendable { public let id, missionID, missionRunID, path, state, since: String; public let title, goal: String?; enum CodingKeys: String, CodingKey { case id, missionID = "mission_id", missionRunID = "mission_run_id", path, title, goal, state, since } }
 public struct WorkResource: Codable, Sendable { public let missionID: String?; public let id, kind, revision, updatedAt, missionRunID, generationID, definitionID, path, state: String; public let gateKind, title, assignedTo, lastProgress: String?; public let attempt: UInt; public let readinessEpoch: UInt64; public let claimant, claimIncarnation, blockedReason: String?; public let agentless: Bool?; public let claimExpiresAtUnixMS, executionStartedAtUnixMS, executionElapsedMS, timeoutMS: UInt64?; public let blockers, goals, constraints: [String]; public let personAnswers: [PersonAnswerRecord]?; public let usage: UsageSummary?; public let operational: Operational?; enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", missionID = "mission_id", missionRunID = "mission_run_id", generationID = "generation_id", definitionID = "definition_id", path, state, gateKind = "gate_kind", title, assignedTo = "assigned_to", lastProgress = "last_progress", attempt, readinessEpoch = "readiness_epoch", claimant, claimIncarnation = "claim_incarnation", agentless, claimExpiresAtUnixMS = "claim_expires_at_unix_ms", executionStartedAtUnixMS = "execution_started_at_unix_ms", executionElapsedMS = "execution_elapsed_ms", timeoutMS = "timeout_ms", blockedReason = "blocked_reason", blockers, goals, constraints, personAnswers = "person_answers", usage, operational } }
 public struct AgentRelationship: Codable, Sendable { public let agentID: String; public let reason: String?; enum CodingKeys: String, CodingKey { case agentID = "agent_id", reason } }
-public struct AgentResource: Codable, Sendable { public let id, kind, revision, updatedAt, name, state, reachability: String; public let runtimeIDs: [String]; public let ownerRunID, driver, harnessState, harnessErrorState, since, observation, blockedOn, ask, reason, hostID, lastActivityAt, silentSince, fault, incarnationID, currentSessionID: String?; public let currentWorkIDs, upcomingWorkIDs: [String]?; public let activeWorkCount, queuedWorkCount: UInt64?; public let nextWorkID: String?; public let currentWork, upcomingWork: [WorkLabel]?; public let nextWork: WorkLabel?; public let usage: UsageSummary?; public let under: [AgentRelationship]; public let delivery: AgentDelivery?; public let subagents: [AgentSubagent]?; public let suspension: AgentSuspension?; public let checkout: AgentCheckout?; public let workspace: String?; public let handoff: AgentHandoff?; public let rollout: JSONValue?; public let todo: AgentTodo?; public let operational: Operational?; enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", name, state, reachability, runtimeIDs = "runtime_ids", ownerRunID = "owner_run_id", driver, harnessState = "harness_state", harnessErrorState = "harness_error_state", since, observation, blockedOn = "blocked_on", ask, reason, hostID = "host_id", lastActivityAt = "last_activity_at", silentSince = "silent_since", fault, incarnationID = "incarnation_id", currentSessionID = "current_session_id", currentWorkIDs = "current_work_ids", activeWorkCount = "active_work_count", nextWorkID = "next_work_id", upcomingWorkIDs = "upcoming_work_ids", queuedWorkCount = "queued_work_count", currentWork = "current_work", nextWork = "next_work", upcomingWork = "upcoming_work", usage, under, delivery, subagents, suspension, checkout, workspace, handoff, rollout, todo, operational } }
+public struct AgentResource: Codable, Sendable { public let id, kind, revision, updatedAt, name, state, reachability: String; public let runtimeIDs: [String]; public let ownerRunID, driver, harnessState, harnessErrorState, since, observation, blockedOn, ask, reason, hostID, lastActivityAt, silentSince, fault, incarnationID, currentSessionID: String?; public let currentWorkIDs, upcomingWorkIDs: [String]?; public let activeWorkCount, queuedWorkCount: UInt64?; public let nextWorkID: String?; public let currentWork, upcomingWork: [WorkLabel]?; public let nextWork: WorkLabel?; public let usage: UsageSummary?; public let under: [AgentRelationship]; public let delivery: AgentDelivery?; public let subagents: [AgentSubagent]?; public let suspension: AgentSuspension?; public let checkout: AgentCheckout?; public let workspace: String?; public let lifecycle: AgentLifecycle?; public let handoff: AgentHandoff?; public let rollout: JSONValue?; public let todo: AgentTodo?; public let operational: Operational?; enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", name, state, reachability, runtimeIDs = "runtime_ids", ownerRunID = "owner_run_id", driver, harnessState = "harness_state", harnessErrorState = "harness_error_state", since, observation, blockedOn = "blocked_on", ask, reason, hostID = "host_id", lastActivityAt = "last_activity_at", silentSince = "silent_since", fault, incarnationID = "incarnation_id", currentSessionID = "current_session_id", currentWorkIDs = "current_work_ids", activeWorkCount = "active_work_count", nextWorkID = "next_work_id", upcomingWorkIDs = "upcoming_work_ids", queuedWorkCount = "queued_work_count", currentWork = "current_work", nextWork = "next_work", upcomingWork = "upcoming_work", usage, under, delivery, subagents, suspension, checkout, workspace, lifecycle, handoff, rollout, todo, operational } }
+/// Unknown lifecycle strings are preserved so newer roster rows remain readable.
+public enum AgentLifecycle: Codable, Sendable, Equatable {
+    case standing, owner, bounded
+    case unknown(String)
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = switch raw {
+        case "standing": .standing
+        case "owner": .owner
+        case "bounded": .bounded
+        default: .unknown(raw)
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        let raw = switch self {
+        case .standing: "standing"
+        case .owner: "owner"
+        case .bounded: "bounded"
+        case .unknown(let value): value
+        }
+        var container = encoder.singleValueContainer(); try container.encode(raw)
+    }
+}
 public struct AgentCheckout: Codable, Sendable { public let repository, base, branch: String }
 public struct AgentTodo: Codable, Sendable { public let snapshot: HarnessTodoSnapshot; public let claimID, acceptedAt: String; public let stale: Bool; enum CodingKeys: String, CodingKey { case snapshot, claimID = "claim_id", acceptedAt = "accepted_at", stale } }
 public struct HarnessTodoSnapshot: Codable, Sendable { public let harness, sessionID, incarnationID, observedAt, sourceOp: String; public let phases: [HarnessPhase]; public let totals: HarnessTodoTotals; public let truncated: Bool; enum CodingKeys: String, CodingKey { case harness, sessionID = "session_id", incarnationID = "incarnation_id", observedAt = "observed_at", sourceOp = "source_op", phases, totals, truncated } }
@@ -273,7 +297,22 @@ public struct OwnedSetResource: Codable, Sendable, Identifiable {
     public let commitStatus: JSONValue?
     enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", claim, receipt, visibility, blockers, membersStatus = "members_status", commitStatus = "commit_status" }
 }
+public struct SummaryMachines: Codable, Sendable { public let connected, indirect, offline: UInt64 }
+public struct SummaryAgentsAsOf: Codable, Sendable {
+    public let storeIndex: UInt64
+    public let publishedAt: String
+    enum CodingKeys: String, CodingKey { case storeIndex = "store_index", publishedAt = "published_at" }
+}
+public struct SummaryResource: Codable, Sendable, Identifiable {
+    public let id, kind, revision, updatedAt: String
+    public let personID: String?
+    public let needsYou, workingAgents, activeMissions: UInt64
+    public let machines: SummaryMachines
+    public let agentsAsOf: SummaryAgentsAsOf?
+    enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", personID = "person_id", needsYou = "needs_you", workingAgents = "working_agents", activeMissions = "active_missions", machines, agentsAsOf = "agents_as_of" }
+}
 public enum Resource: Codable, Sendable, Identifiable {
+    case summary(SummaryResource)
     case attention(AttentionResource), message(MessageResource), launch(LaunchResource), launchVariant(LaunchVariantResource), launchDecision(LaunchDecisionResource), launchApproval(LaunchApprovalResource), mission(MissionResource), work(WorkResource), agent(AgentResource), runtime(RuntimeResource), observer(ObserverResource), subscription(SubscriptionResource), lane(LaneResource), machine(MachineResource), device(DeviceResource), operation(OperationResource), history(HistoryResource), session(SessionResource), glass(GlassResource), ownedSet(OwnedSetResource)
     /// A kind this client does not know, from a member newer than it: kept whole so an older
     /// client skips it or shows it plainly instead of failing the page it came in.
@@ -282,6 +321,7 @@ public enum Resource: Codable, Sendable, Identifiable {
     private struct Discriminator: Decodable { let kind: String }
     public init(from decoder: Decoder) throws {
         switch try Discriminator(from: decoder).kind {
+        case "summary": self = .summary(try SummaryResource(from: decoder))
         case "attention": self = .attention(try AttentionResource(from: decoder))
         case "message": self = .message(try MessageResource(from: decoder))
         case "launch": self = .launch(try LaunchResource(from: decoder))
@@ -308,6 +348,7 @@ public enum Resource: Codable, Sendable, Identifiable {
     }
     public func encode(to encoder: Encoder) throws {
         switch self {
+        case .summary(let v): try v.encode(to: encoder)
         case .attention(let v): try v.encode(to: encoder)
         case .message(let v): try v.encode(to: encoder)
         case .launch(let v): try v.encode(to: encoder)
@@ -332,7 +373,7 @@ public enum Resource: Codable, Sendable, Identifiable {
         case .unknown(let v): try v.encode(to: encoder)
         }
     }
-    public var id: String { switch self { case .attention(let v): v.id; case .message(let v): v.id; case .launch(let v): v.id; case .launchVariant(let v): v.id; case .launchDecision(let v): v.id; case .launchApproval(let v): v.id; case .mission(let v): v.id; case .work(let v): v.id; case .agent(let v): v.id; case .runtime(let v): v.id; case .observer(let v): v.id; case .subscription(let v): v.id; case .lane(let v): v.id; case .machine(let v): v.id; case .device(let v): v.id; case .operation(let v): v.id; case .history(let v): v.id; case .session(let v): v.id; case .glass(let v): v.id; case .arrangement(let v): v.id; case .ownedSet(let v): v.id; case .unknown(let v): v.id } }
+    public var id: String { switch self { case .summary(let v): v.id; case .attention(let v): v.id; case .message(let v): v.id; case .launch(let v): v.id; case .launchVariant(let v): v.id; case .launchDecision(let v): v.id; case .launchApproval(let v): v.id; case .mission(let v): v.id; case .work(let v): v.id; case .agent(let v): v.id; case .runtime(let v): v.id; case .observer(let v): v.id; case .subscription(let v): v.id; case .lane(let v): v.id; case .machine(let v): v.id; case .device(let v): v.id; case .operation(let v): v.id; case .history(let v): v.id; case .session(let v): v.id; case .glass(let v): v.id; case .arrangement(let v): v.id; case .ownedSet(let v): v.id; case .unknown(let v): v.id } }
 }
 /// A resource of a kind this client does not model: its header, and every field as sent.
 public struct UnknownResource: Codable, Sendable, Identifiable {

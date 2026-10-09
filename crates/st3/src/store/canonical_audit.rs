@@ -52,6 +52,8 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_work_lease_renewals",
         "local_mailbox_owners",
         "local_mailbox_bindings",
+        "local_mailbox_argv_bindings",
+        "local_mailbox_leases",
         "unread_mail",
         "unread_mail_prefixes",
         "unread_mail_pending",
@@ -126,8 +128,13 @@ fn every_persistent_table_has_a_projection_scope() {
 #[test]
 fn native_mailbox_ownership_changes_no_shared_projection_digest() {
     let store = Store::open_memory("alder").unwrap();
+    let intent = crate::graph::parse_intent(
+        "version 2\nagent \"eval.worker\" { host \"alder\"; workspace \"/tmp\"; harness \"claude\" {} }", "alder",
+    ).unwrap();
+    store.apply_internal(&intent, "mailbox-audit").unwrap();
     crate::mailbox::tests::ready(&store, "session-1");
     let before = graph_digest(&store.readers.get()).unwrap();
+    let before_tables = projection_digest::tables(&store.readers.get()).unwrap();
     let first = crate::mailbox::Fence::new("agent/eval.worker", "session-1", "delivery");
     store.bind_mailbox(&first).unwrap();
     store
@@ -138,6 +145,33 @@ fn native_mailbox_ownership_changes_no_shared_projection_digest() {
         ))
         .unwrap();
     assert_eq!(before, graph_digest(&store.readers.get()).unwrap());
+    assert_eq!(before_tables, projection_digest::tables(&store.readers.get()).unwrap());
+    let authority = crate::mailbox::Authority {
+        provider: "claude".into(), session: "provider-1".into(), sequence: 1,
+        pid: std::process::id(),
+        process_token: st_runtime::process_start_token(std::process::id()).unwrap(),
+    };
+    let current = crate::mailbox::Fence::new("agent/eval.worker", "session-1", "title");
+    let bound = store.bind_mailbox_with_lease(&current, Some(&authority)).unwrap();
+    assert_eq!(store.mailbox_lease_authority(&bound).unwrap(), Some(authority));
+    assert_eq!(before, graph_digest(&store.readers.get()).unwrap());
+    assert_eq!(before_tables, projection_digest::tables(&store.readers.get()).unwrap());
+    let mut connection = store.connection.write();
+    let tx = connection.transaction().unwrap();
+    // Scope-only raw row control, not an authenticated argv admission fixture.
+    tx.execute("INSERT INTO local_mailbox_argv_bindings SELECT token,subject,component,incarnation,epoch,'{}' FROM local_mailbox_bindings WHERE token=?1",[&bound.token]).unwrap();
+    assert_eq!(before, graph_digest(&tx).unwrap());
+    assert_eq!(before_tables, projection_digest::tables(&tx).unwrap());
+    tx.execute("DELETE FROM local_mailbox_argv_bindings WHERE token=?1",[&bound.token]).unwrap();
+    assert_eq!(before, graph_digest(&tx).unwrap());
+    assert_eq!(before_tables, projection_digest::tables(&tx).unwrap());
+    tx.execute("UPDATE local_mailbox_leases SET revoked=1 WHERE subject=?1", [&bound.subject]).unwrap();
+    assert_eq!(before, graph_digest(&tx).unwrap());
+    assert_eq!(before_tables, projection_digest::tables(&tx).unwrap());
+    tx.execute("DELETE FROM local_mailbox_leases WHERE subject=?1", [&bound.subject]).unwrap();
+    assert_eq!(before, graph_digest(&tx).unwrap());
+    assert_eq!(before_tables, projection_digest::tables(&tx).unwrap());
+    tx.commit().unwrap();
 }
 
 pub(super) fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Read local conversation OPEN once and recheck idle subscriptions with indexed metadata",
+  "replay": {"status": "none", "detail": "No replay or stored payload change."},
+  "schema": {"status": "none", "detail": "Existing owner, message endpoint and local observation indexes are reused."},
+  "rules": {"status": "none", "detail": "No claim, retention or checkpoint rule change."},
+  "compatibility": {"status": "none", "detail": "Collection frames, newest 200-entry window, full content, paging and owner relay protocol are unchanged."},
+  "downtime": {"status": "none", "detail": "Normal rolling deployment with no added startup work."},
+  "manual": {"status": "none", "detail": "No user or operator action required."},
+  "recovery": {"status": "none", "detail": "Existing cursor-gap, resync and owner-unavailable handling remains in use."}
+}

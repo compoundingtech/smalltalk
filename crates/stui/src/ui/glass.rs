@@ -372,6 +372,23 @@ impl Glasses {
             .any(|tab| matches!(Pane::parse(&tab.pane), Some(Pane::Machine(_))))
     }
 
+    /// Whether a list or card of missions is on screen: a Missions list or a mission's card in a
+    /// shown tab, the palette (which offers every mission) or the sidebar's Missions section.
+    pub(crate) fn shows_missions(&self) -> bool {
+        if self.palette.is_some() || self.home || (self.sidebar.shown && self.sidebar.section == 2) {
+            return true;
+        }
+        let glass = self.glass();
+        (0..glass.layout.groups().len())
+            .filter_map(|index| glass.shown(index))
+            .any(|tab| {
+                matches!(
+                    Pane::parse(&tab.pane),
+                    Some(Pane::List(2) | Pane::Mission(_) | Pane::Declaration(_) | Pane::Home(_))
+                )
+            })
+    }
+
     pub(crate) fn shown_agents(&self) -> Vec<String> {
         let glass = self.glass();
         let count = glass.layout.groups().len();
@@ -553,6 +570,8 @@ enum Action {
     NewMission,
     /// Every conversation simplified, or in full again (Ctrl+P).
     ToggleSimple,
+    /// Agents open on their terminal, or on their conversation.
+    ToggleTerminalFirst,
     /// Ask for a name, for a glass to rename, make or copy.
     Name(Naming),
     /// A conversation where the query was said: open it, found at what was said.
@@ -839,6 +858,16 @@ impl Ui {
             "shift+o · tool calls to a line each, runs of them to one",
             "simplified simple full conversations tools compact".into(),
             Action::ToggleSimple,
+        ));
+        choices.push(start(
+            if self.terminal_first() {
+                "Open agents on their conversation".into()
+            } else {
+                "Open agents on their terminal".into()
+            },
+            "this device; the conversation is the default",
+            "terminal conversation default view open agents attach tui".into(),
+            Action::ToggleTerminalFirst,
         ));
         choices.extend(self.said_choices(name));
         let Some(glasses) = &self.glasses else {
@@ -1918,6 +1947,7 @@ impl Ui {
         let mut spans = vec![Span::styled(" ", bar(theme::strong(theme::ACCENT)))];
         let (glyph, word, color) = match &self.world.link {
             Link::Live if !self.world.diverged.is_empty() => ("⚠", "diverged", theme::RED),
+            Link::Live if !self.world.stale.is_empty() => ("◐", "stale", theme::YELLOW),
             Link::Live => ("●", "live", theme::GREEN),
             Link::Connecting => (self.spinner(), "connecting", theme::YELLOW),
             Link::Offline(_) => ("○", "offline", theme::RED),
@@ -1983,23 +2013,30 @@ impl Ui {
         );
         spans.push(Span::styled(working_text, bar(theme::fg(theme::WORKING))));
         // Missions with work open: running, waiting their turn, or waiting on someone.
-        let active = screens::mission_order(&self.world, false)
-            .iter()
-            .filter(|mission| {
-                matches!(
-                    mission.word,
-                    Word::Working
-                        | Word::Queued
-                        | Word::Decision
-                        | Word::Stalled
-                        | Word::Unstaffed
-                        | Word::Unclaimed
-                )
-            })
-            .count();
+        // The count comes from the mission rows: with the window not followed there is no count to
+        // show, and the bar says so rather than a stale number.
+        let active = (self.world.missions_followed && self.world.missions.ready().is_some()).then(|| {
+            screens::mission_order(&self.world, false)
+                .iter()
+                .filter(|mission| {
+                    matches!(
+                        mission.word,
+                        Word::Working
+                            | Word::Queued
+                            | Word::Decision
+                            | Word::Stalled
+                            | Word::Unstaffed
+                            | Word::Unclaimed
+                    )
+                })
+                .count()
+        });
         spans.push(Span::styled(" · ", bar(theme::dim())));
         x = area.x + Line::from(spans.clone()).width() as u16;
-        let active_text = format!("◇ {active} active");
+        let active_text = match active.or(self.world.active_missions) {
+            Some(active) => format!("◇ {active} active"),
+            None => "◇ missions".to_owned(),
+        };
         self.hit(
             Rect {
                 x,
@@ -2679,6 +2716,12 @@ impl Ui {
         self.glasses.as_ref().is_some_and(|glasses| glasses.home)
     }
 
+    /// Whether the missions window must be followed now: a mission list or card is on screen.
+    /// Without glasses (the classic layout) it always is, as before.
+    pub(crate) fn missions_wanted(&self) -> bool {
+        self.glasses.as_ref().is_none_or(|glasses| glasses.shows_missions())
+    }
+
     pub(crate) fn palette_open(&self) -> bool {
         self.glasses
             .as_ref()
@@ -2755,6 +2798,7 @@ impl Ui {
             Action::NewTerminal => self.open_new_terminal(),
             Action::NewMission => self.open_new_mission(),
             Action::ToggleSimple => self.toggle_simple(),
+            Action::ToggleTerminalFirst => self.toggle_terminal_first(),
             Action::Said { agent, query } => {
                 self.open_in_glass(Pane::Agent(Some(agent.clone())), how);
                 self.find_in(&agent, &query);
@@ -3671,6 +3715,12 @@ impl Ui {
         // A message box belongs to the pane it was opened in: once another pane or tab has the
         // focus, typing must not go on into a draft nobody can see (Nathan, 2026-10-07).
         if before != (self.tab, self.selected_id()) {
+            if self.terminal_first
+                && let Some(Pane::Agent(Some(id))) = self.focused_pane()
+                && id.starts_with("agent/")
+            {
+                self.attach_when = Some((id, Instant::now()));
+            }
             self.editing = false;
             self.chat = None;
             self.answering = None;
@@ -4043,6 +4093,43 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_first_device_attaches_an_agent_after_the_tab_stays_in_front() {
+        // Nathan, 2026-10-07: a setting for the terminal as the default view; the conversation
+        // stays the default, and flicking through tabs attaches nothing.
+        let mut ui = glass();
+        ui.live = true;
+        assert!(!ui.terminal_first(), "the conversation is the default");
+        ui.toggle_terminal_first();
+        assert!(ui.terminal_first());
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".to_owned())),
+            Open::Tab,
+        );
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/atlas/store-move".into())),
+            Open::Tab,
+        );
+        ui.effects.clear();
+        // Passing through the agent's tab: nothing attaches.
+        ui.show_tab(0);
+        ui.show_tab(1);
+        ui.step_default_view();
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+        // Staying on it does.
+        ui.show_tab(0);
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        ui.step_default_view();
+        assert!(
+            ui.effects.iter().any(|effect| matches!(effect, Effect::OpenTerminal { agent } if agent == "agent/example/atlas/builder")),
+            "{:?}",
+            ui.effects
+        );
+        // Switched back, the conversation is the default again.
+        ui.toggle_terminal_first();
+        assert!(!ui.terminal_first());
+    }
+
+    #[test]
     fn a_group_a_tab_was_dragged_out_of_still_shows_one_of_its_tabs() {
         // Nathan, 2026-10-04: after dragging a tab to a new place, the group with the other tabs
         // showed none of them.
@@ -4328,10 +4415,20 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::CloseTerminal))
         );
-        // Closing an attached terminal's tab lets it go too.
+        // Middle-closing an attached terminal's tab uses the same detach action.
         ctrl(&mut ui, ']');
         ui.effects.clear();
-        ui.close_tab();
+        screen(&ui);
+        let tab = ui.frame.borrow().hits.iter()
+            .find(|(_, hit)| matches!(hit, Hit::GlassTab(0, 0))).unwrap().0;
+        for kind in [MouseEventKind::Down(MouseButton::Middle), MouseEventKind::Up(MouseButton::Middle)] {
+            ui.mouse(crossterm::event::MouseEvent {
+                kind,
+                column: tab.x,
+                row: tab.y,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
         assert!(ui.terminal.is_none());
         assert!(
             ui.effects
@@ -5965,6 +6062,38 @@ mod tests {
         ui.open_in_glass(Pane::Home(Some(other.clone())), Open::Here);
         assert!(ui.home_open());
         assert_eq!(ui.attention_focus().as_deref(), Some(other.as_str()));
+    }
+
+    #[test]
+    fn the_missions_window_is_wanted_only_while_a_mission_list_or_card_is_on_screen() {
+        let mut ui = glass();
+        // A fresh glass shows one agent or nothing about missions: not wanted.
+        assert!(!ui.missions_wanted());
+        // The palette offers every mission; Now shows mission cards.
+        ctrl(&mut ui, 'k');
+        assert!(ui.missions_wanted(), "the palette lists missions");
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!ui.missions_wanted());
+        // A mission's card or the Missions list in a shown tab.
+        let mission = ui.world.missions.items()[0].id.clone();
+        ui.open_in_glass(Pane::Mission(Some(mission)), Open::Tab);
+        assert!(ui.missions_wanted(), "a mission card is on screen");
+        // The classic layout always follows, as before.
+        let classic = Ui::new(demo::world());
+        assert!(classic.missions_wanted());
+    }
+
+    #[test]
+    fn the_top_bar_says_missions_instead_of_a_count_it_does_not_have() {
+        let mut ui = glass();
+        let top = |ui: &Ui| screen(ui).lines().next().unwrap().to_owned();
+        assert!(top(&ui).contains("active"), "{}", top(&ui));
+        ui.world.missions_followed = false;
+        let bar = top(&ui);
+        assert!(bar.contains("◇ missions") && !bar.contains("active"), "{bar}");
+        // st's own count stands in for the rows it does not send.
+        ui.world.active_missions = Some(57);
+        assert!(top(&ui).contains("◇ 57 active"), "{}", top(&ui));
     }
 
     #[test]

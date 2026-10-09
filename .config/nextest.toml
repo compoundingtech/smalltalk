@@ -4,6 +4,9 @@ filter = 'package(st3) and test(/^messaging_faults::/)'
 priority = 100
 
 [profile.ci]
+# Owned quarantine: merge-queue-flakes runs link_minutes once in optional perf-cost.
+# Its full 10-second/native/authentication oracle stays unchanged while the signed
+# exchange retry-cap mismatch is repaired; every other messaging fault stays required.
 test-threads = 8
 fail-fast = false
 retries = { count = 2, backoff = "fixed", delay = "30s", jitter = false }
@@ -16,11 +19,15 @@ final-status-level = "flaky"
 # `transport_isolation` needs real systemd user scopes; the isolation-vm job runs it in a
 # NixOS VM. The cost check and the load test (`daemon_cost`, `daemon_load`) run in their own
 # perf jobs, so they never lengthen this one (scripts/ci-perf). See docs/ci.md.
+# The outbound-only real-network timing check also runs once in perf-cost. Its strict
+# convergence and redundant-connection windows stay separate from required deterministic
+# backoff and inbound/route interruption controls.
 # scripts/ci-nextest also omits entirely excluded st2 targets from Cargo's build selection;
 # keep its retained target list in sync when changing the binary-level exclusions below.
 default-filter = '''
 not (
-  (package(=st2) and (
+  (package(=st3) and test(/^messaging_faults::link_minutes$/))
+  or (package(=st2) and (
     kind(lib) or kind(bin)
     or binary(=event_e2e) or binary(=resource_profile_supervisor_e2e)
     or test(/^(catalog_[^:]*|eval_run_e2e|nomad_survival|resync[^:]*|supervisor_auto_archive|transport_isolation)::/)
@@ -28,6 +35,7 @@ not (
   or (package(=st-drivers) and kind(lib)
     and test(/^(catalog[^:]*|resync|resource_profile_supervisor)::/))
   or (package(=st3) and test(/^daemon_(cost|load)::/))
+  or (package(=smallclaims) and test(/^sync::worker::tests::retry_tests::isolated_outbound_only_node_converges_after_two_minutes_and_four_hours$/))
 )
 '''
 
@@ -47,4 +55,11 @@ priority = 100
 # Product action admission and restart races must fail visibly, rather than pass on retry.
 [[profile.ci.overrides]]
 filter = 'package(st3) and (test(/^action_coverage::/) or test(/^fleet::action_coverage_/))'
+retries = 0
+
+# Keep both measured control intervals visible even when the idle positive passes.
+# A CPU regression or a broken busy negative must remain a failure without retry.
+[[profile.ci.overrides]]
+filter = 'package(st3) and test(/^idle_budget::a_quiescent_daemon_cpu_control_accepts_idle_and_rejects_busy$/)'
+success-output = "immediate"
 retries = 0

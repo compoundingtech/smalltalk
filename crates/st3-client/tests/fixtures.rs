@@ -15,6 +15,37 @@ fn fixture(name: &str) -> Vec<u8> {
 fn decode<T: serde::de::DeserializeOwned>(name: &str) -> T {
     serde_json::from_slice(&fixture(name)).unwrap_or_else(|error| panic!("decode {name}: {error}"))
 }
+#[test]
+fn agent_lifecycle_future_value_keeps_the_roster_row() {
+    let row = serde_json::json!({
+        "kind": "agent", "id": "agent/example", "revision": "r1",
+        "updated_at": "2026-10-04T08:00:00Z", "name": "Example",
+        "state": "running", "reachability": "local", "runtime_ids": [],
+    });
+    for (value, expected) in [
+        ("standing", AgentLifecycle::Standing),
+        ("owner", AgentLifecycle::Owner),
+        ("bounded", AgentLifecycle::Bounded),
+        ("future-kind", AgentLifecycle::Unknown),
+    ] {
+        let mut declared = row.clone();
+        declared["lifecycle"] = serde_json::json!(value);
+        let page: Page = serde_json::from_value(serde_json::json!({
+            "kind": "page", "collection": "agents", "filters": {},
+            "items": [declared], "page": {"limit": 50, "has_more": false},
+        })).unwrap();
+        let [Resource::Agent(agent)] = page.items.as_slice() else {
+            panic!("lifecycle must not discard the agent row: {:?}", page.items);
+        };
+        assert_eq!(agent.header.id, "agent/example");
+        assert_eq!(agent.name, "Example");
+        assert_eq!(agent.lifecycle, Some(expected));
+    }
+    let absent: Agent = serde_json::from_value(row).unwrap();
+    assert_eq!(absent.lifecycle, None);
+    assert!(serde_json::to_value(absent).unwrap().get("lifecycle").is_none());
+}
+
 
 #[test]
 fn search_fixture_preserves_result_targets_and_incomplete_history() {
@@ -525,4 +556,16 @@ fn a_kind_this_client_does_not_know_reads_as_unknown_and_the_page_still_reads() 
         }))
         .is_err()
     );
+}
+
+#[test]
+fn relay_omission_fixture_round_trips_without_inventing_nonnullable_fields() {
+    let bytes = fixture("timeline-relay-omission.json");
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let typed: Envelope<TimelinePage> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(serde_json::to_value(&typed).unwrap(), raw);
+    let changes = serde_json::json!({"kind":"conversation-changes", "session_id":raw["value"]["session_id"],
+        "items":raw["value"]["items"], "next_cursor":"conversation-cursor/relay/next"});
+    let typed: ConversationChanges = serde_json::from_value(changes.clone()).unwrap();
+    assert_eq!(serde_json::to_value(typed).unwrap(), changes);
 }

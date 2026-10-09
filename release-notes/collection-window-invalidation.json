@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Collection sockets reread only the windows whose inputs changed, and published views only when they publish",
+  "replay": {"status": "none", "detail": "Collection refresh scheduling changes only; claim admission and replay are unchanged."},
+  "schema": {"status": "none", "detail": "Pending rereads and publication revisions are kept in memory. No database schema or persistent state changes."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged; no coordinated member upgrade is required."},
+  "compatibility": {"status": "none", "detail": "The collection protocol, authorization checks, snapshot fences, current-row diffs and reconnect behavior are unchanged. A commit rereads only the windows its claim kinds can change; a failed read retries its own window. Agents windows reread when the roster refresher publishes, which such a commit now asks it to do, rather than first rereading the roster already held. Unix sessions reread only clock-dependent windows (attention, missions, agents, summary) on the 30-second clock; paired sessions still reread every window so grant expiry is noticed."},
+  "downtime": {"status": "none", "detail": "No additional startup work or interruption beyond a normal daemon restart."},
+  "manual": {"status": "none", "detail": "No operator action or client configuration change is needed."},
+  "recovery": {"status": "none", "detail": "No persistent changes or new binary swap-back restrictions."}
+}

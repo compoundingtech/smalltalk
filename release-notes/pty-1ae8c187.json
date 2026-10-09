@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Align the pty pin with the source downstream builds already use",
+  "replay": {
+    "status": "none",
+    "detail": "No runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Default smalltalk builds move from pty b9d02f3 to 1ae8c187 (19 commits), which changes runtime behavior for terminal attachment in st3, stui and st-runtime: an attach resize now sends a single SIGWINCH and no longer sends the extra redraw nudge; wait_ready wakes differently on close and disconnect; registry listing reports effective and native roots and requires completeness per root; published terminal frames are immutable. Builds whose downstream flake already overrode pty to 1ae8c187 already run this code and see no change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action required; the aligned pins satisfy the existing evaluation-time assertion."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

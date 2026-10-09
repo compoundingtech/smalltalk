@@ -7,6 +7,13 @@ use std::cell::RefCell;
 pub(super) const STAGED_SUBJECTS_QUERY: &str =
     "SELECT DISTINCT subject FROM claims WHERE json_extract(body,'$.owned_set') IS NOT NULL";
 
+// One statement proves both absences in a current SQLite snapshot. Any receipt, including a
+// repaired or malformed one, conservatively requires the existing full authority evaluation.
+const EMPTY_DESIRED_AUTHORITY_QUERY: &str =
+    "SELECT NOT EXISTS(SELECT 1 FROM claims WHERE kind='owned-set.revised')
+        AND NOT EXISTS(SELECT 1 FROM claims WHERE subject=?1
+                       AND json_extract(body,'$.owned_set') IS NOT NULL)";
+
 struct SnapshotRows {
     connection: usize,
     rows: BTreeMap<Option<u64>, Vec<View>>,
@@ -509,6 +516,21 @@ pub(super) fn owner(
         ));
     }
     Ok(owners.into_iter().next())
+}
+
+/// The owning sets of every member at `at`, from one read of the set receipts. A member with
+/// more than one is what [`owner`] refuses as a conflict.
+pub(super) fn owners_at(
+    connection: &Connection,
+    at: Option<u64>,
+) -> Result<BTreeMap<String, BTreeSet<String>>, St3Error> {
+    let mut owners = BTreeMap::<String, BTreeSet<String>>::new();
+    for view in rows(connection, at)? {
+        for member in view.receipt.members.keys().chain(view.receipt.retired.keys()) {
+            owners.entry(member.clone()).or_default().insert(view.id.clone());
+        }
+    }
+    Ok(owners)
 }
 
 pub(super) fn refuse_unmanaged(connection: &Connection, member: &str) -> Result<(), St3Error> {
@@ -1277,6 +1299,9 @@ impl Store {
         if desired.is_empty() {
             return Ok(BTreeSet::new());
         }
+        for declaration in desired {
+            smallclaims::touched::note_read(|| declaration.subject.clone());
+        }
         self.read_snapshot(|_| {
             self.with_owned_set_snapshot_reads(|| {
                 let connection = self.readers.get();
@@ -1345,24 +1370,56 @@ impl Store {
         .map_err(internal)
     }
     /// Fence an external effect prepared from a declaration against the selected set.
+    /// Effect callers must enter outside an enclosing read snapshot and wait for this
+    /// method to return before writing or performing the effect.
     pub fn owned_desired_guard(&self, desired: &DesiredSubject) -> Result<(), St3Error> {
-        let connection = self.readers.get();
-        guard_member(&connection, &desired.subject)?;
-        if let Some(set) = owner(&connection, &desired.subject, None)? {
-            let view = selected(&connection, None)?
-                .into_iter()
-                .find(|v| v.id == set)
-                .ok_or_else(|| St3Error::new("owned-set-pending", "missing owning set"))?;
-            let members = effective_members(&connection, &view, None)?;
-            let member = members.get(&desired.subject);
-            if member.is_none_or(|(m, _, _)| m.revision != desired_revision(desired)) {
-                return Err(St3Error::new(
-                    "stale-set-member",
-                    "declaration changed since this effect was prepared",
-                ));
-            }
+        smallclaims::sqlite::debug_assert_no_pinned_read();
+        smallclaims::touched::note_read(|| "kind:owned-set.revised".into());
+        smallclaims::touched::note_read(|| desired.subject.clone());
+        let empty: bool = {
+            let connection = self.readers.get();
+            connection
+                .prepare_cached(EMPTY_DESIRED_AUTHORITY_QUERY)
+                .map_err(internal)?
+                .query_row([&desired.subject], |row| row.get(0))
+                .map_err(internal)?
+        };
+        if empty {
+            return Ok(());
         }
-        Ok(())
+        // A negative probe is not authorization. Start another current snapshot for the full
+        // fence and reuse receipt rows only within it, never across invocations or effects.
+        self.read_snapshot(|_| {
+            Ok(self.with_owned_set_snapshot_reads(|| {
+                let connection = self.readers.get();
+                if let Some(set) = owner(&connection, &desired.subject, None)? {
+                    let view = selected(&connection, None)?
+                        .into_iter()
+                        .find(|v| v.id == set)
+                        .ok_or_else(|| St3Error::new("owned-set-pending", "missing owning set"))?;
+                    if !view.blockers.is_empty() {
+                        return Err(St3Error::new("owned-set-pending", view.blockers.join("; ")));
+                    }
+                    let members = effective_members(&connection, &view, None)?;
+                    let member = members.get(&desired.subject);
+                    if member.is_none_or(|(m, _, _)| m.revision != desired_revision(desired)) {
+                        return Err(St3Error::new(
+                            "stale-set-member",
+                            "declaration changed since this effect was prepared",
+                        ));
+                    }
+                } else {
+                    let staged: bool = connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND json_extract(body,'$.owned_set') IS NOT NULL)",
+                        [&desired.subject], |row| row.get(0),
+                    ).map_err(internal)?;
+                    if staged {
+                        return Err(St3Error::new("owned-set-pending", "staged member awaits its owning set revision"));
+                    }
+                }
+                Ok(())
+            }))
+        }).map_err(internal)?
     }
     pub fn apply_owned_set(
         &self,

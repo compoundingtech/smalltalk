@@ -58,6 +58,13 @@ reaches a live store. If they match, the node publishes one `checkpoint.verified
 digests of the drops, the kept claims, the graph and the readers' answers. A node verifies a
 checkpoint once.
 
+Failed proof identities are recorded in the checkpoint's local detail. An identical input is
+not copied or replayed again, including after a restart or after switching away from and back
+to an earlier input. The identity includes the sealed claims and admission state, drop/retained
+and rules digests, protocol, and executable identity. A genuinely changed input waits at least
+ten minutes after the last failure before another proof. Normal later observations outside the
+sealed set do not invalidate this record; fixing a rule or reader changes its identity.
+
 The rules identity covers projection inputs and replay as well as retention. Version 11 includes
 `arrangements` and `arrangement_registers`, even when empty, and rebuilds them from sealed claims.
 Version 12 ages out the sekrets claims written before they became local observations.
@@ -91,8 +98,8 @@ that differs.
 order. A node that did not take part (it joined later, or was excused and came back) adopts the
 checkpoint instead; see [Trimming](#trimming).
 
-The daemon does this work in the background every ten minutes, on a thread that never holds the
-store's writer for long. `[checkpoint] enabled = false` in a node's config stops that node
+The daemon does this work in the background, sleeping ten minutes after each pass, on a thread
+that never holds the store's writer for long. `[checkpoint] enabled = false` in a node's config stops that node
 sealing, and since every participant must seal, that stops trimming for the whole fleet.
 
 ## What a rule may drop
@@ -379,6 +386,13 @@ blocked states older than that window, so trimming cannot reset `since`. Existin
 witnesses can retain other claims; the client read independently enforces its seven-day/200-item
 bound. Checkpoint tombstones make unprovable completeness explicit instead of treating deleted
 observations as evidence of continuity.
+
+Rules version 14 additionally retains the transition preceding the first visible entry for
+each incarnation in that bounded history, even when the witness predates seven days. A kept
+unstamped legacy row can otherwise stop emitting when trimming removes its preceding state:
+an older retained idle can replace a newer retained idle at the 200-item boundary. These
+context witnesses do not expand the reader's bound. The reader and preservation proof are
+unchanged; proof success and supported old-cut verification remain required.
 
 Rules version 10 also treats native credential refusal and recovery as observed status
 transitions within the same seven-day / 200-transition cap. It preserves the beginning

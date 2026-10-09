@@ -528,6 +528,11 @@ export const AgentId = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:agent)/[^
 export type AgentId = typeof AgentId.Type
 export type AgentIdEncoded = typeof AgentId.Encoded
 
+/** Declared agent lifecycle. Publication accepts standing, owner, or bounded; clients retain future values as Unknown. */
+export const AgentLifecycle = /*#__PURE__*/ (() => openEnum(["standing","owner","bounded"]).annotate({ identifier: "AgentLifecycle", description: "Declared agent lifecycle. Publication accepts standing, owner, or bounded; clients retain future values as Unknown." }))()
+export type AgentLifecycle = typeof AgentLifecycle.Type
+export type AgentLifecycleEncoded = typeof AgentLifecycle.Encoded
+
 /** Whether the daemon can currently reach the agent runtime. */
 export const AgentReachability = /*#__PURE__*/ (() => openEnum(["local","remote","unreachable","unknown","reachable","indeterminate"]).annotate({ identifier: "AgentReachability", description: "Whether the daemon can currently reach the agent runtime." }))()
 export type AgentReachability = typeof AgentReachability.Type
@@ -737,6 +742,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "incarnation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "kind": Schema.Literal("agent"),
   "last_activity_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
+  /** The selected agent declaration's optional KDL `lifecycle` child. Declared intent, not observed activity, runtime state, restart policy, or inferred ownership; omitted rather than null when undeclared. Absence means undeclared; a future string decodes as Unknown without discarding the row. */
+  "lifecycle": optionalKey(AgentLifecycle),
   "name": Schema.String,
   "next_work": Schema.OptionFromOptionalNullOr(WorkLabel, NULL_NONE),
   "next_work_id": Schema.OptionFromOptionalNullOr(Id, NULL_NONE),
@@ -1175,7 +1182,7 @@ export type ClientConnections = typeof ClientConnections.Type
 export type ClientConnectionsEncoded = typeof ClientConnections.Encoded
 
 export const CollectionCommand = /*#__PURE__*/ (() => Schema.Union([
-  Schema.Struct({ "actor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "collection": Schema.Literals(["missions","attention","agents","work","glasses"]), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "status": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }),
+  Schema.Struct({ "actor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "collection": Schema.Literals(["missions","attention","agents","work","glasses","summary"]), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "status": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }),
   Schema.Struct({ "collection": Schema.Literal("arrangements"), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": ArrangementPerson, /** Follow only this arrangement; its owner must equal person. */
 "subject": optionalKey(ArrangementId) }),
   Schema.Struct({ "capability": Schema.String, "collection": Schema.Literal("terminal"), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "incarnation": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "kind": Schema.Literal("subscribe"), "terminal": Id }),
@@ -1185,7 +1192,7 @@ export const CollectionCommand = /*#__PURE__*/ (() => Schema.Union([
 export type CollectionCommand = typeof CollectionCommand.Type
 export type CollectionCommandEncoded = typeof CollectionCommand.Encoded
 
-export const CollectionName = /*#__PURE__*/ (() => Schema.Literals(["missions","attention","agents","work","glasses","arrangements"]).annotate({ identifier: "CollectionName" }))()
+export const CollectionName = /*#__PURE__*/ (() => Schema.Literals(["missions","attention","agents","work","glasses","arrangements","summary"]).annotate({ identifier: "CollectionName" }))()
 export type CollectionName = typeof CollectionName.Type
 export type CollectionNameEncoded = typeof CollectionName.Encoded
 
@@ -1777,9 +1784,35 @@ export const Subscription = /*#__PURE__*/ (() => Schema.Struct({
 export type Subscription = typeof Subscription.Type
 export type SubscriptionEncoded = typeof Subscription.Encoded
 
+export const SummaryMachines = /*#__PURE__*/ (() => Schema.Struct({
+  "connected": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "indirect": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "offline": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "SummaryMachines" }))()
+export type SummaryMachines = typeof SummaryMachines.Type
+export type SummaryMachinesEncoded = typeof SummaryMachines.Encoded
+
+/** Complete current source counts, independent of list page limits. One summary/current resource per authorized subscription. Unavailable source coverage sends resync, never inferred zero counts. */
+export const Summary = /*#__PURE__*/ (() => Schema.Struct({
+  "active_missions": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** The published agents roster the agent counts came from, when a background refresher prepares it: its graph cut and when it was published. Absent when the counts come from this snapshot itself. */
+  "agents_as_of": optionalKey(Schema.Struct({ "published_at": Timestamp, "store_index": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) })).annotate({ description: "The published agents roster the agent counts came from, when a background refresher prepares it: its graph cut and when it was published. Absent when the counts come from this snapshot itself." }),
+  "id": Id,
+  "kind": Schema.Literal("summary"),
+  "machines": SummaryMachines,
+  "needs_you": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "operational": optionalKey(Operational),
+  "person_id": Schema.OptionFromNullOr(Schema.String),
+  "revision": Revision,
+  "updated_at": Timestamp,
+  "working_agents": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "Summary", description: "Complete current source counts, independent of list page limits. One summary/current resource per authorized subscription. Unavailable source coverage sends resync, never inferred zero counts." }))()
+export type Summary = typeof Summary.Type
+export type SummaryEncoded = typeof Summary.Encoded
+
 export const UnknownResource = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
-  "kind": unknownCase(["attention","message","launch","launch-variant","launch-decision","launch-approval","mission","work","agent","runtime","observer","subscription","lane","machine","device","operation","history","session","glass","arrangement","owned-set"]),
+  "kind": unknownCase(["attention","message","launch","launch-variant","launch-decision","launch-approval","mission","work","agent","runtime","observer","subscription","lane","machine","device","operation","history","session","glass","arrangement","owned-set","summary"]),
   "operational": optionalKey(Operational),
   "revision": Revision,
   "updated_at": Timestamp
@@ -1849,6 +1882,7 @@ export type Work = typeof Work.Type
 export type WorkEncoded = typeof Work.Encoded
 
 export const Resource = /*#__PURE__*/ (() => Schema.Union([
+  Summary,
   Attention,
   Message,
   Launch,
@@ -1881,6 +1915,8 @@ export const Snapshot = /*#__PURE__*/ (() => Schema.Struct({
   "host_id": HostId,
   "id": SnapshotId,
   "projection_version": Schema.Literal("client-projection.v0"),
+  /** For rows a background refresher prepared, such as the agents roster: when it published them. They reflect `store_index`, and local activity up to this time. */
+  "published_at": optionalKey(Timestamp),
   "store_index": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 }).annotate({ identifier: "Snapshot", description: "The complete projected state at one local store index and projection version." }))()
 export type Snapshot = typeof Snapshot.Type
@@ -2528,7 +2564,7 @@ export type PairingCompleteEncoded = typeof PairingComplete.Encoded
 export const ResourceHeader = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
   /** Resource family. */
-  "kind": openEnum(["attention","message","launch","launch-variant","launch-decision","launch-approval","mission","work","agent","runtime","observer","subscription","lane","machine","device","operation","history","session","glass","arrangement"]).annotate({ description: "Resource family." }),
+  "kind": openEnum(["attention","message","launch","launch-variant","launch-decision","launch-approval","mission","work","agent","runtime","observer","subscription","lane","machine","device","operation","history","session","glass","arrangement","summary"]).annotate({ description: "Resource family." }),
   "operational": optionalKey(Operational),
   "revision": Revision,
   "updated_at": Timestamp

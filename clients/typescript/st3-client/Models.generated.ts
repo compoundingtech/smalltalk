@@ -46,6 +46,7 @@ export type Agent = ResourceHeader & {
   incarnation_id?: string | null;
   kind: "agent";
   last_activity_at?: (Timestamp | null);
+  lifecycle?: AgentLifecycle;
   name: string;
   next_work?: (WorkLabel | null);
   next_work_id?: (Id | null);
@@ -119,6 +120,8 @@ export type AgentHandoff = {
 };
 
 export type AgentId = string;
+
+export type AgentLifecycle = ("standing" | "owner" | "bounded" | string);
 
 export type AgentMessageDay = {
   calibrated_messages: number;
@@ -529,7 +532,7 @@ export type ClientConnections = {
 
 export type CollectionCommand = ({
   actor?: string | null;
-  collection: "missions" | "attention" | "agents" | "work" | "glasses";
+  collection: "missions" | "attention" | "agents" | "work" | "glasses" | "summary";
   id: string;
   kind: "subscribe";
   limit?: number;
@@ -606,7 +609,7 @@ export type CollectionFrame = ({
   retryable?: boolean;
 });
 
-export type CollectionName = "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements";
+export type CollectionName = "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements" | "summary";
 
 export type ConversationChanges = {
   items: Array<TimelineEntry>;
@@ -1355,11 +1358,11 @@ export type RequestSubject = {
   url?: string;
 };
 
-export type Resource = (Attention | Message | Launch | LaunchVariant | LaunchDecision | LaunchApproval | Mission | Work | Agent | Runtime | Observer | Subscription | Lane | Machine | Device | Operation | History | Session | Glass | Arrangement | OwnedSet);
+export type Resource = (Summary | Attention | Message | Launch | LaunchVariant | LaunchDecision | LaunchApproval | Mission | Work | Agent | Runtime | Observer | Subscription | Lane | Machine | Device | Operation | History | Session | Glass | Arrangement | OwnedSet);
 
 export type ResourceHeader = {
   id: Id;
-  kind: ("attention" | "message" | "launch" | "launch-variant" | "launch-decision" | "launch-approval" | "mission" | "work" | "agent" | "runtime" | "observer" | "subscription" | "lane" | "machine" | "device" | "operation" | "history" | "session" | "glass" | "arrangement" | string);
+  kind: ("attention" | "message" | "launch" | "launch-variant" | "launch-decision" | "launch-approval" | "mission" | "work" | "agent" | "runtime" | "observer" | "subscription" | "lane" | "machine" | "device" | "operation" | "history" | "session" | "glass" | "arrangement" | "summary" | string);
   operational?: Operational;
   revision: Revision;
   updated_at: Timestamp;
@@ -1434,6 +1437,7 @@ export type Snapshot = {
   host_id: HostId;
   id: SnapshotId;
   projection_version: "client-projection.v0";
+  published_at?: Timestamp;
   store_index: number;
 };
 
@@ -1515,6 +1519,25 @@ export type SubscriptionSpec = {
   stopped: boolean;
   to: string;
   workspace?: string | null;
+};
+
+export type Summary = ResourceHeader & {
+  active_missions: number;
+  agents_as_of?: {
+  published_at: Timestamp;
+  store_index: number;
+};
+  kind: "summary";
+  machines: SummaryMachines;
+  needs_you: number;
+  person_id: string | null;
+  working_agents: number;
+};
+
+export type SummaryMachines = {
+  connected: number;
+  indirect: number;
+  offline: number;
 };
 
 export type SyncNotice = {

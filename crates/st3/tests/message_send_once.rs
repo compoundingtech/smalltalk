@@ -17,6 +17,7 @@ use tokio::sync::{Notify, watch};
 
 const WORKER: &str = "agent/example/worker";
 const PERSON: &str = "person/avery";
+const LEAD: &str = "agent/example/lead";
 
 /// An in-process daemon on its own socket, and the store behind it.
 async fn daemon(root: &Path) -> (PathBuf, Arc<Store>, tokio::task::JoinHandle<()>) {
@@ -256,7 +257,7 @@ async fn running_the_same_reply_twice_sends_one_reply() {
                 "--json",
                 "conversations",
                 "send",
-                PERSON,
+                LEAD,
                 "--from",
                 WORKER,
                 "--subject",
@@ -274,7 +275,7 @@ async fn running_the_same_reply_twice_sends_one_reply() {
         "reply",
         parent,
         "--from",
-        PERSON,
+        LEAD,
         "--body",
         "Yes, start now.",
     ];
@@ -538,5 +539,29 @@ async fn a_landed_send_succeeds_when_the_projection_cannot_be_refreshed() {
     assert!(warning.contains(&subject), "{warning}");
     assert!(warning.contains("st3-message:v1:"), "{warning}");
     proxy.abort();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_or_reply_to_a_person_is_refused_and_writes_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let (socket, store, server) = daemon(root.path()).await;
+    let asked = value(&st(&socket, &[], SEND).await);
+    let parent = asked["subject"].as_str().unwrap();
+    assert_eq!(message_count(&store), 1);
+    for args in [
+        vec!["--json", "conversations", "send", PERSON, "--from", WORKER, "--body", "Done."],
+        vec!["--json", "conversations", "reply", parent, "--from", WORKER, "--body", "Done."],
+    ] {
+        let refused = st(&socket, &[], &args).await;
+        assert!(!refused.status.success(), "{args:?}");
+        let text = stderr(&refused);
+        assert!(
+            text.contains("people do not have inboxes: print your answer in the chat"),
+            "{text}"
+        );
+        assert!(text.contains("work ask") && text.contains("work update"), "{text}");
+    }
+    assert_eq!(message_count(&store), 1, "a refused message was written");
     server.abort();
 }

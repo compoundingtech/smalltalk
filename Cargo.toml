@@ -11,6 +11,7 @@ members = [
   "crates/agent-spec",
   "crates/demo-resolver-wasm",
   "crates/smallclaims",
+  "crates/st-decision-fold",
   "crates/st-drivers",
   "crates/st-runtime",
   "crates/st-resource-protocol",
@@ -24,6 +25,7 @@ members = [
   "crates/st3-feed",
   "crates/st3-migrate",
   "crates/st3-schema",
+  "crates/st3-terminal-direct",
   "crates/st3-ui-model",
   "crates/stui",
 ]
@@ -42,6 +44,7 @@ default-members = [
   "crates/st3-feed",
   "crates/st3-migrate",
   "crates/st3-schema",
+  "crates/st3-terminal-direct",
   "crates/st3-ui-model",
   "crates/stui",
 ]

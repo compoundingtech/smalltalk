@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "stui attaches a terminal on its own host to the local PTY session and one on another fleet host over Fabric when Fabric reaches the owner, otherwise through the daemon's client gateway as before, and shows which route each attach used",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill, stored data or transcript change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Published schema, operations and contract digest are unchanged. The client reads the daemon's existing local-terminal and fleet-membership routes and accepts the core API error shape on them."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, retention or authority rule change. The person's terminal.read and terminal.control grants are checked before any Fabric dial, as st terminals attach checks them."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "stui on a machine with its own daemon tries Fabric (st3/pty/FLEET_ID) for a terminal on another host and falls back to the client gateway when Fabric cannot reach the owner, as before; no host has to expose terminals before stui ships. An owner that refuses the incarnation is never worked around. Each attach names its route in the terminal header and a notice: local PTY, Fabric to HOST, or via the daemon with Fabric's reason. An owner Fabric could not reach is not tried again for a minute. A newer stui against an older daemon on the same machine, one without the local-terminal route, treats a local terminal as remote and goes through the gateway until that daemon restarts onto the new build. Swift and TypeScript clients and the wire are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment; no data conversion or extra startup work."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required. A host that runs st terminals expose-fabric and grants st3/pty/FLEET_ID to the other fleet hosts' Fabric peers makes remote attaches faster; without it they use the gateway."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery, durable payload or initialization changes."
+  }
+}

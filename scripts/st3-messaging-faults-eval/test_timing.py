@@ -11,6 +11,30 @@ loader.exec_module(runner)
 
 
 class TimingTests(unittest.TestCase):
+    def test_replacement_barrier_requires_a_later_admitted_ready_owner(self):
+        old = {"pid": 10, "start_ticks": 100}
+        child = {"pid": 20, "start_ticks": 200}
+        baseline = {"subject": "agent/eval/fault-probe", "component": "delivery",
+                    "transport": "omp-channel", "ready": True, "incarnation": "seat",
+                    "pid": 10, "start_ticks": 100, "epoch": 1,
+                    "token_sha256": "old-binding", "sequence": 1}
+        good = {**baseline, **child, "epoch": 2, "token_sha256": "new-binding", "sequence": 2}
+        def check(row, process=child):
+            return runner.replacement_ready_report([baseline, row], baseline, old, process, "seat")
+        self.assertIsNone(check(baseline))  # Retained current beat from the killed child.
+        self.assertIsNone(runner.replacement_ready_report([baseline], baseline, old, child, "seat"))
+        for fields in ({"ready": False}, {"epoch": 1}, {"sequence": 1},
+                       {"token_sha256": "old-binding"}, {"incarnation": "previous"},
+                       {"component": "title"}, {"transport": "foreign"}, {"start_ticks": 199}):
+            with self.subTest(fields=fields):
+                self.assertIsNone(check({**good, **fields}))
+        self.assertIsNone(check(good, old))
+        self.assertEqual(good, check(good))
+        # PID reuse is distinct only when the daemon observed the same new birth identity.
+        reused = {"pid": 10, "start_ticks": 201}
+        self.assertEqual({**good, **reused}, check({**good, **reused}, reused))
+        self.assertIsNone(check({**good, **reused}, old))
+
     def test_recovery_does_not_use_fresh_mail_or_transport_probes_as_its_origin(self):
         timing = runner.recovery_timing("message/recovered", 1000, 900, "new-incarnation", [
             {"event": "request", "at_unix_ms": 999, "line": "POST /v1/peer/exchange HTTP/1.1"},

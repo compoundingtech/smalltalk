@@ -42,9 +42,10 @@ pub const HEAL_REPLAY_BACKOFF_MS: u128 = 10 * 60 * 1000;
 pub const HEAL_REPLAY_BACKOFF_MAX_MS: u128 = 24 * 60 * 60 * 1000;
 
 /// The claims a projection reads: every claim with its batch, except repaired originals.
-pub const PROJECTED_CLAIMS: &str = "FROM claims JOIN batches ON batches.id=claims.batch_id
+pub const PROJECTED_CLAIMS: &str = "FROM claims INDEXED BY claims_batch_claim_id
+     JOIN batches ON batches.id=claims.batch_id
      WHERE NOT EXISTS (
-         SELECT 1 FROM replica_records
+         SELECT 1 FROM replica_records INDEXED BY replica_records_repaired_claim
          WHERE replica_records.claim_id=claims.id AND replica_records.state='repaired'
      )";
 

@@ -1,5 +1,23 @@
 # Merge queue test flakes
 
+## Malformed OMP admission fixture
+
+`harness_admission::tests::malformed_probe_cannot_inherit_other_passing_evidence`
+could admit its synthetic child because the fixture published complete passing event
+and channel streams before appending the malformed event. The real probe accepts once
+all required evidence is present, so it could finish within that passing prefix.
+
+The fixture now assembles the malformed record into the event payload and atomically
+publishes each complete capture. Passing channel evidence can only appear after the
+complete malformed event stream is visible. The negative control holds the child alive
+after publication, forcing the old passing-prefix schedule independently of child exit.
+The passing-cache control uses the same hold and still admits valid evidence and reuses
+its cache. Production probe, identity, refusal and cache behavior are unchanged.
+
+The first hosted failure at source `9038d22e` and its later passing retry remain separate.
+The forced schedule qualifies the fixture defect; the hosted log does not retain the
+producer interleave needed to attribute that specific attempt.
+
 ## Terminal tab protocol observation
 
 `ui::terminal_tab::terminal_tab_protocols` appends Ctrl-B, Ctrl-A, Ctrl-B after each
@@ -129,3 +147,63 @@ quiescent differential and missing-read tests continue to exercise full-pass aud
 No production reconciler behavior changes. An attempted control before member
 classification was caught by the existing second change-feed refresh and did not
 reproduce the hosted mid-evaluation panic; it is not claimed as cause proof.
+
+## Terminal probe action publication
+
+Merge-group run 37736805982 at `c49892de8f5d44b842f08689e956fae8e98f410b`
+contains the earlier input-barrier fix, but its terminal protocol probe first
+attempt timed out waiting for image hiding: the last status retained a focused
+terminal and two image cells. The later passing retry remains separate evidence.
+The log does not retain the worker's output or the action file, so it does not
+establish the historical timeout's cause.
+
+The fixture has an independently reproducible publication race. Python creates
+`ui-action` before writing `hide` or `show`; the Rust worker immediately reads and
+removes any existing action file. If it reads a prefix, it panics on the unknown
+action and leaves the last status unchanged. A forced split-write control lets the
+real worker run while only the first byte has been written; the old publication
+path fails, while staging and renaming the complete file preserves both hide and
+show. Two title acknowledgements span a new worker loop during the partial write.
+
+The probe now publishes action files with rename, like its existing output
+requests. Production UI, input, image handling and PTY transport are unchanged.
+The original matrix, image lifecycle assertions and timeouts remain in force.
+## Replacement channel readiness
+
+The `messaging_faults::channel_killed` fixture formerly restored its blocked link
+as soon as the agent card's delivery state was `current`. That card can retain the
+killed channel's report for 45 seconds. The outer seat incarnation deliberately
+survives channel replacement, and the card omits the reporting PID and delivery
+epoch. A current card therefore does not establish replacement readiness.
+
+The fixture now records an accepted ready report from the old channel before the
+fault. After killing it, the link stays blocked until the daemon admits a later
+ready report from the replacement's PID and Linux process start ticks, under a
+new delivery epoch and binding identity in the same seat incarnation. The
+observation is enabled only in test-support builds, follows the durable mailbox
+ownership check and successful typed presence recording, and appends local evidence without a graph write or probe mail.
+Only a hash of the binding token is retained. Each predicate reads the ordinary
+card, then resamples the unique live child and its latest admitted ready report.
+No awaited operation separates the final tuple from link restoration.
+
+This is an isolated fixture witness from the unchanged reporting binary. The PID
+is report-supplied and birth ticks are sampled from `/proc`; the fence was current
+at its ownership check. The observation does not authenticate the PID as the
+stream peer or establish a perpetual ownership lease. A concurrent binding
+replacement without a new report requires a separate authoritative owner witness.
+
+Controls reject an old beat, a spawned child without a ready report, a not-ready
+report, mismatched birth identity, and stale or foreign binding data. Delayed
+card controls reject a later not-ready report or a dead/replaced child. Malformed
+typed reports neither replace a beat nor qualify recording. Durable
+mailbox controls independently reject superseded epochs, tokens, incarnations,
+and subjects before observing a report. The 10-second recovery limit, fixed
+duplicate-observation tails, native consumption and graph receipt checks, provider
+PID, shell and outer incarnation assertions remain unchanged.
+
+Merge-group run 37725762028 at `8bb7193f6041f09d10f6ec5623225bbdec31bc18`
+retained a 25,526 ms original-message delay, including 23 ms from staging to read.
+The readiness weakness is established by source review; its contribution to that
+historical delay and the missing earlier replication wake remain unqualified.
+Correcting this fixture barrier does not establish a historical peer-transport
+cause or acceptance of the separate replication retry change.

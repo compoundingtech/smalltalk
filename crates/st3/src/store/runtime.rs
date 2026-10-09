@@ -33,10 +33,29 @@ pub struct SmalltalkRuntime {
     pub(crate) agent_page_refs_cache: Mutex<VecDeque<AgentResourcesEntry>>,
     /// Acquire before opening a SQLite snapshot, never while pinning a WAL read mark.
     pub(crate) agent_resources_admission: Arc<tokio::sync::Mutex<()>>,
+    /// Set once a daemon keeps the complete roster published off the request path; readers
+    /// wake it instead of folding cards themselves.
+    pub(crate) agent_roster_refresh: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
+    /// When the oldest refresh request no refresh has answered yet was made, in Unix ms; 0
+    /// when none waits. A refresh clears it only once it publishes.
+    pub(crate) agent_roster_requested_at: std::sync::atomic::AtomicU64,
+    /// Whether the current overdue refresh request was already reported.
+    pub(crate) agent_roster_overdue_warned: std::sync::atomic::AtomicBool,
+    /// Whether a reader asked for the history roster since the refresher last folded it.
+    pub(crate) agent_roster_history_wanted: std::sync::atomic::AtomicBool,
+    /// Rosters assembled in chunks because no short fold could complete them, by why.
+    pub(crate) agent_roster_chunked: Mutex<BTreeMap<String, u64>>,
+    /// Counts complete current roster publications, same graph index or not, so collection
+    /// streams that read an earlier one reread the newer.
+    pub(crate) agent_roster_published: tokio::sync::watch::Sender<u64>,
+    /// Every other collection's published view revisions, for the same rereads.
+    pub(crate) published_views: published_views::PublishedViews,
     #[cfg(test)]
     pub(crate) agent_resources_builds: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(crate) agent_resources_refolded_cards: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) agent_resources_largest_fold: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -49,6 +68,8 @@ pub(crate) struct AgentResourcesEntry {
     /// Earliest wall-clock boundary in queue metadata; absent means no expiring work lease.
     pub(crate) valid_until_unix_ms: Option<u128>,
     pub(crate) items: Arc<Vec<Value>>,
+    /// When these rows were folded and published, in Unix ms: the roster's "as of".
+    pub(crate) published_at_unix_ms: u128,
 }
 
 impl SmalltalkRuntime {
@@ -151,6 +172,7 @@ impl Runtime for SmalltalkRuntime {
     fn create_schema(&self, connection: &Connection) -> Result<()> {
         connection.execute_batch(SCHEMA)?;
         connection.execute_batch(arrangements::SCHEMA)?;
+        usage_period::create_schema(connection)?;
         migrate_local_usage_seen(connection)?;
         backfill_message_index(connection)?;
         unread_mail::create_schema(connection)?;
@@ -335,6 +357,8 @@ impl Runtime for SmalltalkRuntime {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.agent_roster_published.send_modify(|revision| *revision += 1);
+        self.published_views.invalidate();
         self.agent_page_refs_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

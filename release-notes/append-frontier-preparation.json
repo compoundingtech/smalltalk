@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Reuse prepared SQL for the two per-append writer frontier reads.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, rebuild or startup work is added."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, column, index, metadata, migration or schema version changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Canonical ordering, checkpoints, retention and admission rules are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "The same frontier queries execute for every call with the current origin binding. Only their prepared statement handles use the writer connection existing bounded cache."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No operational step is introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No activation flag or operator action is needed."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No transaction, savepoint, rollback or writer return policy changes."
+  }
+}

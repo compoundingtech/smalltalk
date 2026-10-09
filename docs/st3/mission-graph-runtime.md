@@ -176,7 +176,10 @@ mission "MISSION_ID"
   timeout="2h"
   revisions="human-only"
   revision-reviewer="person/reviewer"
-  revision-cutover="when-idle" {
+  revision-cutover="when-idle"
+  report-to="agent/ops/watcher"
+  stalled-after="30m"
+  report-completed=#true {
   goal "One measurable mission goal."
   goal "An optional second goal."
   goal "An optional third goal."
@@ -220,6 +223,8 @@ The default active run limit is one. Bare `concurrent-runs` removes the limit. `
 When active revisions declare different limits, st uses the strictest limit. A lower limit does not cancel existing runs.
 
 An exact idempotent retry returns its existing run before the capacity check. A direct start error lists the active run subjects.
+
+`report-to`, `stalled-after` and `report-completed` are optional and opt the mission's runs into [run reports](#run-reports).
 
 `revisions="human-only"` is optional and inherited by child steps. `revision-reviewer` requires that protection.
 
@@ -1056,6 +1061,74 @@ step "wait-for-build" {
 The step is agentless and cannot name an agent. It completes when the named run completes. It fails when that run fails or is cancelled. Other steps order after it with `depends-on`. The value is a run ID or `mission-run/` subject, and it can use inputs.
 
 To make one run wait without changing its mission, start it with `after`. See [Starting after another run](kdl-lifecycle.md#starting-after-another-run).
+
+## Run reports
+
+A run tells nobody about itself unless its mission or its start names an agent:
+
+```kdl
+mission "release" state="ready" report-to="agent/ops/watcher" stalled-after="45m" {
+  goal "Publish the release."
+  step "build" { assigned-to "agent/ops/builder" }
+}
+```
+
+```sh
+st missions start release --report-to agent/ops/watcher --as person/operator
+```
+
+`--report-to` replaces the mission's `report-to` for that run, and `--report-completed` adds the
+completed event. Only an agent can be named. A person is reached through their own agent. The
+choice is recorded on the run's creation claim, so a later revision of the mission does not
+change who a running run reports to. A run with neither writes nothing extra and is never reported.
+
+A running run can be opted in, moved to another agent, or cleared without restarting it:
+
+```sh
+st missions report-to RUN --agent agent/ops/watcher --stalled-after 1h --as agent/ops/owner
+st missions report-to RUN --clear --as person/operator
+```
+
+Only a person or the agent that requested the run may change it, and only to an agent. Each
+call states the whole report, as `missions start --report-to` would: `--stalled-after` defaults
+to the mission's `stalled-after`, else 30 minutes, and the completed event is reported with
+`--report-completed` or when the mission asks for it. `--clear` reports the run to nobody, even
+when its mission names a reporter. The change is a `mission-run.report-to` claim on the run. Its
+latest one replaces what the creation claim recorded, and the creation claim itself is left
+alone, so declaring the run again as it was started is still a retry. A request that changes
+nothing writes nothing. The run reads it at its next evaluation. A stall is still measured from
+the run's last sign of life, so turning reports on for a run that is already quiet past its
+limit sends one `stalled` message, not one per pass. An event already reported to an earlier
+reporter is not sent again to a new one.
+
+The reporter gets one message from `daemon/runtime` for each of these events:
+
+| Event | When |
+| --- | --- |
+| failed | The run fails, including a mission `timeout`, and starts its cleanup. |
+| cancelled | The run is cancelled and starts its cleanup. |
+| stalled | The run has made no progress for `stalled-after` (30 minutes unless set). |
+| completed | The run completes, only with `report-completed`. |
+
+A stall is measured from the run's last sign of life: its last state change, any step's last
+change or progress record, and the end of any step's lease. A run in cleanup, and a run that
+still waits on `after`, cannot stall. A stalled run is not failed and can go on; if it makes progress and then goes
+quiet again, that is a new stall and a new message. The daemon keeps each run's stall limit as a
+deadline on that run's evaluation, so a quiet fleet does no work to watch for stalls.
+
+Each event is sent once, however many times the run is evaluated and across daemon restarts. A
+run with many failed steps sends one `failed` message that names them. The message names the run,
+its mission and the steps involved, and tells the reporter to look at the run with
+`st missions show`. It does not copy a failure reason, cancellation reason or step output, which
+can contain anything a step printed.
+
+A reporter that is also assigned a step in the run is told like any other. A reporter that is
+not a running agent, because it is undeclared, stopped or retired, is not messaged. The run gets
+a `report-to` fault that says so, once, and st looks again only when the run is next evaluated,
+so nothing loops. The fault is closed when the reporter is told, the run's report is cleared, or the run ends.
+
+A nested run reports only if its own mission asks. A run that is terminated because the run above
+it ended is reported through the run above it.
 
 ## Runtime sequence
 

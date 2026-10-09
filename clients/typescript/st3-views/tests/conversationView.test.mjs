@@ -207,6 +207,12 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   assert.deepEqual(bodies.map(body => [body.kind, body.text]), [['mail', 'is this a watcher?']]);
 }
 
+// Both the earlier delivery sentence and the current one are st's own notes, not words the person typed.
+for (const note of ["The person reads replies in st, not in the agent's session.", 'Answer the person in this conversation; people have no inbox, so do not reply with st.']) {
+  const turn = `<smalltalk-message id="e6" from="person/example" to="agent/example/quay" subject="(no subject)" sha256="00" graph="message/e6">\nis this a watcher?\n</smalltalk-message>\n${note}`;
+  assert.deepEqual(fromHarness(true, turn).map(body => [body.kind, body.text]), [['mail', 'is this a watcher?']]);
+}
+
 const exposed = '<analysis>invented-token</analysis><thinking>visible</thinking>';
 assert.equal(JSON.parse(conversationEntries([{id:'raw',timestamp:'2026-10-06T12:00:00Z',role:'assistant',type:'content',body:{text:exposed}}], new Map(), SHOW_EVERYTHING)[0].body.text).body.text, exposed);
 

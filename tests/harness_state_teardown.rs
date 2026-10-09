@@ -8,37 +8,23 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt as _;
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-
-fn executable(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-}
 
 #[test]
 fn stop_escalation_writes_the_terminal_record_before_sigkill() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
-    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    let host = st_drivers::run::detect_host();
+    let declaration = catalog.join("agents").join(&host).join("worker/agent.kdl");
     fs::create_dir_all(declaration.parent().unwrap()).unwrap();
     fs::write(
         &declaration,
-        r#"agent "worker" { host "h"; command "true" }"#,
+        format!(r#"agent "worker" {{ host "{host}"; command "true" }}"#),
     )
     .unwrap();
     let agent_dir = declaration.parent().unwrap().to_path_buf();
-    let bin = tmp.path().join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    executable(&bin.join("hostname"), "#!/bin/sh\necho h\n");
-    let path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
 
     // The provider ignores SIGTERM, so the wrapper's grace window expires and it must escalate.
     let mut wrapper = Command::new(test_env!("CARGO_BIN_EXE_st2"));
@@ -61,7 +47,6 @@ fn stop_escalation_writes_the_terminal_record_before_sigkill() {
             "trap '' TERM; : > \"$READY_MARKER\"; sleep 60",
         ])
         .env("READY_MARKER", tmp.path().join("provider-ready"))
-        .env("PATH", &path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -185,22 +170,15 @@ fn spawn_opencode_wrapper(
 ) -> (std::path::PathBuf, std::process::Child, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
-    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    let host = st_drivers::run::detect_host();
+    let declaration = catalog.join("agents").join(&host).join("worker/agent.kdl");
     fs::create_dir_all(declaration.parent().unwrap()).unwrap();
     fs::write(
         &declaration,
-        r#"agent "worker" { host "h"; command "true" }"#,
+        format!(r#"agent "worker" {{ host "{host}"; command "true" }}"#),
     )
     .unwrap();
     let agent_dir = declaration.parent().unwrap().to_path_buf();
-    let bin = tmp.path().join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    executable(&bin.join("hostname"), "#!/bin/sh\necho h\n");
-    let path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
     let mut wrapper = Command::new(test_env!("CARGO_BIN_EXE_st2"));
     wrapper
         .args(["--catalog"])
@@ -217,7 +195,6 @@ fn spawn_opencode_wrapper(
             "-c",
             provider_script,
         ])
-        .env("PATH", &path)
         .env("READY_MARKER", tmp.path().join("provider-ready"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())

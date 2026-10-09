@@ -41,7 +41,7 @@ fn append_receipt(store: &Store, sequence: u64, incomplete: bool) {
 }
 
 #[test]
-fn a_clean_cached_wake_fences_recovery_after_post_observe_revocation() {
+fn a_clean_cached_wake_preserves_fault_and_dependencies_after_authority_changes() {
     for (revoke, replacement) in [(false, false), (true, false), (true, true)] {
         let workspace = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -188,40 +188,114 @@ fn a_clean_cached_wake_fences_recovery_after_post_observe_revocation() {
         let after = store
             .claims_for(&declaration.subject, Some("runtime.reconcile-decision"))
             .unwrap();
-        if revoke {
-            assert_eq!(
-                after
-                    .iter()
-                    .map(|claim| claim.id.clone())
-                    .collect::<Vec<_>>(),
-                ids
-            );
-            assert_eq!(
-                store
-                    .member_reconcile_fault(&declaration.subject, None)
-                    .unwrap()
-                    .as_deref(),
-                Some(fault)
-            );
-            assert!(
-                reconciler.incremental.reads_of(&wake).is_empty(),
-                "rejected wake pruned without evaluation"
-            );
-        } else {
-            // Pin the retained reporting policy: a freshly authorized clean skip may recover.
-            assert_eq!(after.len(), decisions.len() + 1);
-            assert_eq!(
-                after.last().unwrap().body["fields"]["decision"],
-                "member-recovered"
-            );
-            assert_eq!(
-                store
-                    .member_reconcile_fault(&declaration.subject, None)
-                    .unwrap(),
-                None
-            );
-            assert_eq!(reconciler.incremental.reads_of(&wake), wake_reads);
-            assert_eq!(reconciler.incremental.next_due("wake:"), Some(u128::MAX));
+        // No evaluation means no success/recovery report, even while authority remains valid.
+        // A racing revocation/replacement likewise has no effect to fence in this pass. Its
+        // notification must retain the old dependencies for the next actual evaluation.
+        assert_eq!(
+            after
+                .iter()
+                .map(|claim| claim.id.clone())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(
+            store
+                .member_reconcile_fault(&declaration.subject, None)
+                .unwrap()
+                .as_deref(),
+            Some(fault)
+        );
+        assert_eq!(reconciler.incremental.reads_of(&wake), wake_reads);
+        assert_eq!(reconciler.incremental.next_due("wake:"), Some(u128::MAX));
+    }
+}
+
+#[test]
+fn evaluated_member_results_survive_a_clean_wake_and_remain_fenced() {
+    for revoke_recovery in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        publish_owned_member(&store, &workspace, "node", 10);
+        let runtime = Arc::new(FakeRuntime::default());
+        let mut reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let declaration = store.desired_subjects().unwrap().remove(0);
+        let member = declaration.member.as_ref().unwrap();
+        *runtime.ptys.lock().unwrap() = vec![RuntimeObservation {
+            runtime_id: member.runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("incumbent".into()),
+        }];
+        store
+            .append_claim(&ClaimInput {
+                subject: declaration.subject.clone(),
+                kind: "harness.observed".into(),
+                actor: Some(declaration.subject.clone()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("ready".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String("incumbent".into())),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        reconciler.skip_unneeded = true;
+        reconciler.reconcile_once().unwrap();
+        let wake = format!("wake:{}@incumbent", declaration.subject);
+        let member_item = format!("member:{}", declaration.subject);
+        let starts = runtime.starts.lock().unwrap().len();
+        for failed in [true, false] {
+            if failed {
+                fs::remove_dir_all(&workspace).unwrap();
+            } else {
+                fs::create_dir(&workspace).unwrap();
+            }
+            reconciler.incremental.observe(&store).unwrap();
+            reconciler.incremental.touch(&declaration.subject);
+            assert!(reconciler.incremental.needs(&member_item, now_ms()));
+            let cached_wake = wake.clone();
+            let changed = store.clone();
+            *reconciler.after_work_wake_observe.lock().unwrap() =
+                Some(Box::new(move |incremental, skip| {
+                    assert!(skip);
+                    let reads = incremental.reads_of(&cached_wake);
+                    assert!(!reads.is_empty());
+                    incremental.evaluated(&cached_wake, reads, Some(u128::MAX));
+                    if !failed && revoke_recovery {
+                        append_receipt(&changed, 20, true);
+                    }
+                    assert!(!incremental.needs(&cached_wake, now_ms()));
+                }));
+            reconciler.reconcile_once().unwrap();
+            let fault = store
+                .member_reconcile_fault(&declaration.subject, None)
+                .unwrap();
+            if failed || revoke_recovery {
+                assert!(
+                    fault
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("workspace")),
+                    "evaluated member fault must survive a clean wake"
+                );
+            } else {
+                assert!(
+                    fault.is_none(),
+                    "evaluated member success must recover through the fresh guard"
+                );
+            }
+            assert_eq!(runtime.starts.lock().unwrap().len(), starts);
+            assert!(runtime.stops.lock().unwrap().is_empty());
         }
     }
 }
@@ -628,11 +702,15 @@ fn a_cached_wake_checks_captured_authority_before_message_or_fresh_context_effec
 }
 
 fn publish_owned_member(store: &Store, workspace: &Path, host: &str, sequence: u64) {
-    use crate::store::owned_sets::{Options, Source};
     let intent = parse_intent(&format!(
         "version 2\nagent \"garden/orchard\" {{ host {host:?}; workspace {:?}; command {:?} }}\n",
         workspace.display().to_string(), format!("echo {sequence}"),
     ), "node").unwrap();
+    publish_owned_intent(store, &intent, sequence);
+}
+
+fn publish_owned_intent(store: &Store, intent: &crate::NormalizedIntent, sequence: u64) {
+    use crate::store::owned_sets::{Options, Source};
     let mut options = Options {
         set: "garden".into(),
         source: Source {
@@ -653,17 +731,133 @@ fn publish_owned_member(store: &Store, workspace: &Path, host: &str, sequence: u
         expected_subjects: BTreeMap::new(),
     };
     options.expected_subjects = store
-        .owned_set_preview(&intent, &options)
+        .owned_set_preview(intent, &options)
         .unwrap()
         .expected_subjects;
     store
         .apply_owned_set(
-            &intent,
+            intent,
             &options,
             &format!("set-{sequence}"),
             "person/operator",
         )
         .unwrap();
+}
+
+#[test]
+fn quiet_owned_pass_sql_budget() {
+    const CHILD: &str = "ST3_QUIET_OWNED_PASS_BUDGET_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "reconcile::tests::ownership_guard_tests::quiet_owned_pass_sql_budget",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("ST3_PROFILE_DIR")
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated SQL budget failed");
+        return;
+    }
+    let mut costs = Vec::new();
+    for count in [8, 64] {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let mut source = "version 2\n".to_owned();
+        for index in 0..count {
+            source.push_str(&format!("agent \"garden/worker-{index}\" {{ host \"node\"; workspace {:?}; command \"true\" }}\n", workspace.path().display().to_string()));
+        }
+        publish_owned_intent(&store, &parse_intent(&source, "node").unwrap(), 10);
+        let runtime = Arc::new(FakeRuntime::default());
+        let mut reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let declarations = store.desired_subjects().unwrap();
+        *runtime.ptys.lock().unwrap() = declarations
+            .iter()
+            .map(|declaration| RuntimeObservation {
+                runtime_id: declaration.member.as_ref().unwrap().runtime_id.clone(),
+                terminal: true,
+                status: "running".into(),
+                exit_code: None,
+                incarnation_id: Some("incumbent".into()),
+            })
+            .collect();
+        for declaration in &declarations {
+            store
+                .append_claim(&ClaimInput {
+                    subject: declaration.subject.clone(),
+                    kind: "harness.observed".into(),
+                    actor: Some(declaration.subject.clone()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String("ready".into())),
+                        ("driver".into(), Value::String("codex".into())),
+                        ("incarnation_id".into(), Value::String("incumbent".into())),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        reconciler.skip_unneeded = true;
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(reconciler.member_wakes.lock().unwrap().len(), count);
+        reconciler.incremental.observe(&store).unwrap();
+        // This budget measures a pass with no member/wake deadline armed. Keep the real read
+        // dependencies, including negative reads; due-work correctness has separate controls.
+        for declaration in &declarations {
+            for item in [
+                format!("member:{}", declaration.subject),
+                format!("wake:{}@incumbent", declaration.subject),
+            ] {
+                let reads = reconciler.incremental.reads_of(&item);
+                assert!(!reads.is_empty());
+                reconciler
+                    .incremental
+                    .evaluated(&item, reads, Some(u128::MAX));
+            }
+        }
+        let render_reads = reconciler.incremental.reads_of("render");
+        reconciler
+            .incremental
+            .evaluated("render", render_reads, None);
+        smallclaims::sqlite::histogram::take();
+        let before = smallclaims::sqlite::work::total();
+        reconciler.reconcile_once().unwrap();
+        let cost = smallclaims::sqlite::work::total() - before;
+        let receipt_reads: u64 = smallclaims::sqlite::histogram::take()
+            .iter()
+            .filter(|(sql, _)| sql.starts_with("SELECT id,subject,body,accepted_at_unix_ms FROM claims WHERE kind="))
+            .map(|(_, shape)| shape.count)
+            .sum();
+        eprintln!("quiet owned roster={count}: {cost:?}, receipt_reads={receipt_reads}");
+        assert!(
+            (1..=12).contains(&receipt_reads),
+            "quiet passes must not fence or prepare every unchanged member"
+        );
+        assert!(
+            cost.statements <= 600 && cost.vm_steps <= 30_000,
+            "quiet-pass absolute SQL work budget: {cost:?}"
+        );
+        assert!(runtime.stops.lock().unwrap().is_empty());
+        assert_eq!(runtime.starts.lock().unwrap().len(), count);
+        costs.push(cost);
+    }
+    assert!(
+        costs[1].statements <= costs[0].statements + 8 * (64 - 8) + 32,
+        "quiet SQL must not grow quadratically with owned members: {costs:?}"
+    );
+    assert!(
+        costs[1].vm_steps <= costs[0].vm_steps + 400 * (64 - 8),
+        "quiet VM work growth budget: {costs:?}"
+    );
 }
 
 #[test]
@@ -699,7 +893,7 @@ fn an_ownership_change_after_pass_selection_skips_without_a_member_fault() {
         let count = claims_after_publication.clone();
         let path = workspace.path().to_path_buf();
         *runtime.before_observe_exec.lock().unwrap() = Some(Box::new(move || {
-            // Exec polling is after pass eligibility/workspace/render and before member/away.
+            // Exec polling follows pass eligibility and precedes member preparation/evaluation.
             assert!(
                 updated
                     .owned_desired_subjects(&old)

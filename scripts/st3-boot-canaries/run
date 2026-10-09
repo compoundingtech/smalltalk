@@ -98,7 +98,10 @@ class Node:
         # binary. A link, because a debug st3 is hundreds of megabytes and /tmp is a small tmpfs.
         self.binary = root / "bin/st3"
         self.binary.symlink_to(binary)
-        for tool in ("pty", "git"):
+        # The Nix sandbox has no /usr/bin/env and only /bin/sh: the daemon's login shell runs `env -0`
+        # and the stand-ins run hooks with `bash -c`, so resolve both here, before PATH is narrowed
+        # to this directory plus /usr/bin:/bin.
+        for tool in ("pty", "git", "env", "bash"):
             executable = shutil.which(tool)
             if not executable:
                 raise SystemExit(f"{tool} must be on PATH")
@@ -353,9 +356,10 @@ def driver_processes(node):
     return rows
 
 
-def check_boundary(node, stopped=False):
+def check_boundary(node, stopped=False, processes=None):
     """A fresh seat's processes stay inside st's boundary."""
-    processes = node.seat_processes(with_environment=True)
+    if processes is None:
+        processes = node.seat_processes(with_environment=True)
     if stopped:
         if processes:
             fail("a parked seat still has live processes")
@@ -364,6 +368,22 @@ def check_boundary(node, stopped=False):
         violations = list(fresh_seat_findings(node.root, processes))
     if violations:
         fail("fresh seat boundary: " + "; ".join(violations))
+
+
+def replacement_processes(node, subject, previous_incarnation):
+    """One actual process sample containing the replacement seat's exact runtime fence."""
+    agent = (node.json("agents", "show", subject) or {}).get("value") or {}
+    incarnation = agent.get("incarnation_id")
+    if not incarnation or incarnation == previous_incarnation:
+        return None
+    processes = node.seat_processes(with_environment=True)
+    if not any(f"ST_AGENT={subject}" in environment
+               and f"ST3_INCARNATION={incarnation}" in environment
+               for _, _, environment in processes):
+        return None
+    # Inspect this entire sample, including any surviving old process: a generation barrier
+    # must not discard arbitrary launch/environment findings or resample an empty handoff.
+    return processes
 
 
 def wait_drained(spools, bound):
@@ -684,7 +704,10 @@ def claude_channel_parked(node, seats):
     node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
     early = node.json("conversations", "send", seat_subject("a"), "--from", "person/eval",
                       "--subject", "parked attachment probe", "--body", "mail while unattached")["subject"]
-    check_boundary(node)
+    processes = until(
+        lambda: replacement_processes(node, seat_subject("a"), seats.incarnations["a"]),
+        seats.bound, "the replacement generation never supplied fresh seat processes")
+    check_boundary(node, processes=processes)
     until(lambda: parked(node, seat_subject("a")), 180, "permanent channel failure never parked")
     until(lambda: "claude-channel-unattached" in json.dumps(seats.view("a")[0]),
           10, "parked channel failure lost its visible reason")
@@ -1029,6 +1052,54 @@ def self_test():
     finally:
         for path in made:
             shutil.rmtree(path, ignore_errors=True)
+    # The parked canary may observe the gap after the predecessor exits. Its barrier must
+    # wait for the replacement fence, while retaining every boundary finding in that sample.
+    class BoundaryNode:
+        incarnation = "old"
+        processes = []
+        def json(self, *args):
+            return {"value": {"incarnation_id": self.incarnation}}
+        def seat_processes(self, with_environment=False):
+            assert with_environment
+            return self.processes
+    node = BoundaryNode()
+    subject = "agent/fixture/seat"
+    old = (1, "st3 driver", [f"ST_AGENT={subject}", "ST3_INCARNATION=old"])
+    new = (2, "st3 driver", [f"ST_AGENT={subject}", "ST3_INCARNATION=new"])
+    node.processes = [old]
+    assert replacement_processes(node, subject, "old") is None
+    node.incarnation = "new"
+    node.processes = []
+    assert replacement_processes(node, subject, "old") is None
+    node.processes = [old]
+    assert replacement_processes(node, subject, "old") is None
+    foreign = (3, "st3 driver", ["ST_AGENT=agent/fixture/other", "ST3_INCARNATION=new"])
+    node.processes = [foreign]
+    assert replacement_processes(node, subject, "old") is None
+    try:
+        until(lambda: replacement_processes(node, subject, "old"), 0, "no replacement")
+    except Failure as error:
+        assert str(error) == "no replacement"
+    else:
+        raise AssertionError("missing replacement must fail within its finite bound")
+    unsafe_old = (1, "st2 driver", old[2])
+    node.processes = [unsafe_old, new]
+    sample = replacement_processes(node, subject, "old")
+    assert sample == node.processes
+    with tempfile.TemporaryDirectory(prefix="boundary-test-") as directory:
+        node.root = Path(directory)
+        try:
+            check_boundary(node, processes=sample)
+        except Failure as error:
+            assert "st2" in str(error)
+        else:
+            raise AssertionError("replacement must not erase another process boundary violation")
+        try:
+            check_boundary(node, processes=[])
+        except Failure as error:
+            assert "no fresh seat processes inspected" in str(error)
+        else:
+            raise AssertionError("empty inspection must remain a failure")
     print("ok")
     return 0
 

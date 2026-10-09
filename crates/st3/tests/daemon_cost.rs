@@ -71,9 +71,6 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
     // Runtimes read every runtime observation (3.8x for the list, 9.0x for one runtime).
     ("GET /v1/client/runtimes", 6.0),
     ("GET /v1/client/runtimes/{*id}", 14.0),
-    // Usage sums every usage claim of the period (6.1x).
-    ("GET /v1/client/usage", 9.5),
-    ("GET /v1/usage", 9.5),
     // Doctor checks the whole store, as it must (11.4x full-scan steps).
     ("GET /v1/doctor", 17.0),
     // Fleet and replication status count every replica record (9.7x).
@@ -315,6 +312,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
     (
         "POST /v1/mission-runs/{run}/outcome",
         "sets a run's outcome",
+    ),
+    (
+        "POST /v1/mission-runs/{run}/report-to",
+        "sets who a run reports to: one run row, two latest claims and one mission revision by key",
     ),
     (
         "POST /v1/revision-proposals/{proposal}/approve",
@@ -766,6 +767,10 @@ const PROBES: &[Probe] = &[
     get(
         "GET /v1/mission-runs",
         "/v1/mission-runs?mission={mission_name}",
+    ),
+    get(
+        "GET /v1/mission-runs/tree",
+        "/v1/mission-runs/tree?root={run}&limit=50",
     ),
     get(
         "GET /v1/mission-overview",

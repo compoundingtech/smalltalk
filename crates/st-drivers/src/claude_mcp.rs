@@ -340,7 +340,8 @@ fn initialize_response(request: &Value, server_name: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"result":{
         "protocolVersion": request.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
         "capabilities":{"tools":{},"experimental":{"claude/channel":{}}},
-        "serverInfo":{"name":server_name,"version":env!("CARGO_PKG_VERSION")}
+        "serverInfo":{"name":server_name,"version":env!("CARGO_PKG_VERSION")},
+        "instructions": crate::ding::CHANNEL_INSTRUCTIONS
     }})
 }
 
@@ -359,6 +360,20 @@ mod tests {
             initialize_response(&request, ST3_SERVER_NAME)["result"]["serverInfo"]["name"],
             "st3"
         );
+    }
+
+    #[test]
+    fn both_channels_tell_the_agent_to_answer_a_person_in_the_conversation() {
+        let request = json!({"jsonrpc":"2.0","id":7,"method":"initialize"});
+        for name in [LEGACY_SERVER_NAME, ST3_SERVER_NAME] {
+            let instructions = initialize_response(&request, name)["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(instructions.contains("answered in this conversation"));
+            assert!(instructions.contains("people have no inbox, so do not reply with st"));
+            assert!(instructions.contains("conversations reply"));
+        }
     }
 
     #[test]

@@ -120,7 +120,14 @@ agent "garden/worker" {{
     let listener_socket = socket.clone();
     let state_socket = root.path().join("state.sock");
     let server = tokio::spawn(async move {
-        st3::api::serve_unix_bound(&listener_socket, &state_socket, st3::api::router(state)).await
+        // This binding/history fixture has a synthetic runtime and no physical PTY.
+        // Exercise its already-admitted channel protocol; native authority has separate
+        // real-runtime controls using the production router.
+        st3::api::serve_unix_bound(
+            &listener_socket,
+            &state_socket,
+            st3::test_support::admitted_mailbox_protocol_router(state),
+        ).await
     });
     for _ in 0..100 {
         if socket.exists() {

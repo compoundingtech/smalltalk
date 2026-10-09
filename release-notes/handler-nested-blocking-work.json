@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Run synchronous store work on its existing blocking handler instead of waiting for a second pool slot",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, recovery or derived-data rebuild is introduced."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database, index, trigger or persisted format changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Admission, authority, checkpoint and retention rules are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "List/filter/get, API response and mutation acknowledgement shapes are unchanged. A multi-thread runtime executes nested synchronous work on the already-blocking handler, outside its block_on context. Read budgets and reader leases remain in use; current-thread runtimes retain the spawned path. Writes still wait for committed results and are not made cancellable. Existing profiling gains blocking/queue and blocking/work wall spans. Each nested callback keeps its panic error boundary, including best-effort fallbacks and handler cleanup. Nested reader loans can be reused; nested wrappers execute serially on the handler."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Only the normal binary restart is needed; no extra migration or startup phase. Production latency and restart timing remain unmeasured for this change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No configuration change, data repair or coordinated upgrade is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "The execution marker is thread-local and resets after each handler, including unwind. Binary swap-back uses the unchanged store."
+  }
+}

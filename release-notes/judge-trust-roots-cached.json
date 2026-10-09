@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Fold fleet membership for the verdict judge once per fleet change, not once per chunk",
+  "replay": {"status": "none", "detail": "No replay or rebuild, and no verdict changes. The judge reads the same trust roots; it just stops re-folding every fleet claim for each chunk."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers. It reads the fleet_generation counter that earlier changes added."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to recover: the cached roots are keyed by the fleet generation and are dropped with the process. They are read only at the start of a write transaction, before it writes, so a rolled-back transaction cannot leave a membership behind."}
+}

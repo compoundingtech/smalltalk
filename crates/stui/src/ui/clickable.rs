@@ -78,7 +78,7 @@ impl Ui {
             Hit::Link(_) => "copy link".into(),
             Hit::Split(true) => "split right [Ctrl+V]".into(),
             Hit::Split(false) => "split below [Ctrl+X]".into(),
-            Hit::GlassTab(..) => "show tab; drag to move/split".into(),
+            Hit::GlassTab(..) => "show tab; drag to move/split; middle-click closes".into(),
             Hit::GlassAdd(_) => "new tab [Ctrl+T]".into(),
             Hit::PaletteChoice(_) => format!("open {label}"),
         };
@@ -311,6 +311,33 @@ mod tests {
     }
 
     #[test]
+    fn middle_click_closes_only_on_release_over_the_pressed_tab() {
+        let mut ui = Ui::new(demo::world());
+        ui.glasses = Some(glass::Glasses::open(None, None));
+        let agent = ui.world.agents.items()[0].id.clone();
+        ui.open(&agent);
+        let other = ui.world.agents.items()[1].id.clone();
+        ui.open(&other);
+        draw(&ui);
+        let tab = target(&ui, |hit| matches!(hit, Hit::GlassTab(0, 1)));
+        let home = target(&ui, |hit| matches!(hit, Hit::GlassTab(0, 0)));
+        pointer(&mut ui, MouseEventKind::Down(MouseButton::Middle), tab.x, tab.y);
+        draw(&ui);
+        assert_eq!(target(&ui, |hit| matches!(hit, Hit::GlassTab(0, 1))), tab);
+        pointer(&mut ui, MouseEventKind::Up(MouseButton::Middle), home.x, home.y);
+        draw(&ui);
+        assert_eq!(target(&ui, |hit| matches!(hit, Hit::GlassTab(0, 1))), tab);
+        pointer(&mut ui, MouseEventKind::Up(MouseButton::Middle), tab.x, tab.y);
+        draw(&ui);
+        assert_eq!(target(&ui, |hit| matches!(hit, Hit::GlassTab(0, 1))), tab);
+        pointer(&mut ui, MouseEventKind::Down(MouseButton::Middle), tab.x, tab.y);
+        pointer(&mut ui, MouseEventKind::Up(MouseButton::Middle), tab.x, tab.y);
+        draw(&ui);
+        assert!(!ui.frame.borrow().hits.iter()
+            .any(|(_, hit)| matches!(hit, Hit::GlassTab(0, 1))));
+    }
+
+    #[test]
     fn message_hover_still_allows_text_selection_and_more_precise_links() {
         let mut ui = Ui::new(demo::world());
         let agent = ui.world.agents.items()[0].id.clone();
@@ -508,5 +535,27 @@ mod tests {
             }
         }
         panic!("missing reference");
+    }
+
+    #[test]
+    fn sweeping_the_pointer_over_every_cell_of_a_busy_conversation_never_panics() {
+        // Nathan, 2026-10-07: hovering messages seemed to crash stui.
+        for (width, height) in [(60, 20), (100, 30), (160, 48)] {
+            let mut ui = Ui::new(demo::world());
+            ui.glasses = Some(super::glass::Glasses::open(None, None));
+            ui.live = true;
+            ui.open_in_glass(
+                Pane::Agent(Some("agent/example/atlas/builder".to_owned())),
+                super::glass::Open::Tab,
+            );
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| ui.render(frame)).unwrap();
+            for y in 0..height {
+                for x in 0..width {
+                    pointer(&mut ui, MouseEventKind::Moved, x, y);
+                    terminal.draw(|frame| ui.render(frame)).unwrap();
+                }
+            }
+        }
     }
 }

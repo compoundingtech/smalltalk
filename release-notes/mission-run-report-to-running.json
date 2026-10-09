@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add st missions report-to: a person or a run's requester can opt a running run into report-to, change its reporter, or clear it",
+  "replay": {
+    "status": "none",
+    "detail": "No history is folded or rebuilt. A run's reporter is read while the run is evaluated: its latest mission-run.report-to claim, else its creation claim, as before."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes or triggers change. The claim vocabulary gains mission-run.report-to (system-only, state-transition, on mission-run) with optional report_to, stalled_after_ms and report_completed fields. The mission-run.created claim is unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and their digests are unchanged. The claim registry digest changes with the new kind, as with any vocabulary addition: members on different builds keep replicating claims and skip comparing projection maps until all are upgraded."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "st missions report-to RUN (--agent AGENT [--stalled-after DURATION] [--report-completed] | --clear) --as ACTOR and POST /v1/mission-runs/{run}/report-to are new. A member on an older build does not know the mission-run.report-to claim kind, so upgrade every member of a fleet before using the command. Runs that never use it are unaffected. Not tested against an older build."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No restart-specific work. Each evaluated run reads one more claim by an indexed lookup; no timers, scans or replays are added."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Opt-in only. The guide is in docs/st3/mission-graph-runtime.md under Run reports."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swap back to the previous binary at any time. A run then reports as its creation claim recorded, and a mission-run.report-to claim already written is not read."
+  }
+}
