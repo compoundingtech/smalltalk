@@ -11106,9 +11106,26 @@ async fn get_usage(
         ))
     })
     .await?;
-    Ok(Json(
-        json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages}),
-    ))
+    let mut report = json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages});
+    // The policy as the config file says now, so `st usage` shows which accounts it never stops.
+    if let Some(Ok(config)) = crate::config::reload_daemon_limits()
+        && let Some(policy) = crate::store::LimitsPolicy::from_config(&config)
+    {
+        for (row, limit) in report["limits"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+            .zip(&limits)
+        {
+            row["exempt"] = json!(policy.exempts(limit));
+        }
+        report["limits_policy"] = json!({
+            "stop_at_weekly_percent": config.stop_at_weekly_percent,
+            "exempt_accounts": config.exempt_accounts,
+            "exempt_harnesses": config.exempt_harnesses,
+        });
+    }
+    Ok(Json(report))
 }
 
 #[derive(Deserialize)]
