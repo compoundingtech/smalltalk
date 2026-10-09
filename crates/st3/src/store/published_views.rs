@@ -9,15 +9,25 @@ use super::*;
 pub(crate) const PUBLISHED_COLLECTIONS: [&str; 6] =
     ["missions", "work", "attention", "summary", "glasses", "arrangements"];
 
-/// Publication revisions, by position in [`PUBLISHED_COLLECTIONS`]. Zero means no refresher has
-/// published that view, so its windows still follow commits.
-pub(crate) type Revisions = [u64; PUBLISHED_COLLECTIONS.len()];
+/// One collection's publication state.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct View {
+    /// Rises with every publication, withdrawal and invalidation, and never goes back, so a
+    /// window can tell any later change from the one it read.
+    revision: u64,
+    /// Whether a refresher serves this view now. Until it does, and after it withdraws, the
+    /// collection's windows follow commits.
+    published: bool,
+}
+
+/// By position in [`PUBLISHED_COLLECTIONS`].
+pub(crate) type Revisions = [View; PUBLISHED_COLLECTIONS.len()];
 
 pub(crate) struct PublishedViews(tokio::sync::watch::Sender<Revisions>);
 
 impl Default for PublishedViews {
     fn default() -> Self {
-        Self(tokio::sync::watch::Sender::new([0; PUBLISHED_COLLECTIONS.len()]))
+        Self(tokio::sync::watch::Sender::new([View::default(); PUBLISHED_COLLECTIONS.len()]))
     }
 }
 
@@ -25,29 +35,43 @@ fn position(collection: &str) -> Option<usize> {
     PUBLISHED_COLLECTIONS.iter().position(|name| *name == collection)
 }
 
-/// The publication revision of `collection` in `revisions`; zero when none is published.
+/// The revision of `collection` in `revisions`; zero when it was never published.
 pub(crate) fn revision(revisions: &Revisions, collection: &str) -> u64 {
-    position(collection).map_or(0, |position| revisions[position])
+    position(collection).map_or(0, |position| revisions[position].revision)
 }
 
 impl PublishedViews {
-    /// Count one more publication of `collection`'s view, after the refresher has swapped it in.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the missions, work and attention refreshers call it"))]
-    pub(crate) fn publish(&self, collection: &str) {
+    fn change(&self, collection: &str, published: bool) {
         let Some(position) = position(collection) else {
             debug_assert!(false, "unknown published collection {collection}");
             return;
         };
-        self.0.send_modify(|revisions| revisions[position] += 1);
+        self.0.send_modify(|revisions| {
+            revisions[position].revision += 1;
+            revisions[position].published = published;
+        });
+    }
+
+    /// Count one more publication of `collection`'s view, after the refresher has swapped it in.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the missions, work and attention refreshers call it"))]
+    pub(crate) fn publish(&self, collection: &str) {
+        self.change(collection, true);
+    }
+
+    /// `collection`'s refresher no longer serves its view: its windows read it once more the
+    /// unpublished way, then follow commits again until the next publication.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the missions, work and attention refreshers call it"))]
+    pub(crate) fn withdraw(&self, collection: &str) {
+        self.change(collection, false);
     }
 
     /// Every published view was discarded, as on rollback or reopen: each window that reads one
-    /// rereads it. A view nobody published stays unpublished.
+    /// rereads it. A view nobody publishes stays as it is.
     pub(crate) fn invalidate(&self) {
         self.0.send_if_modified(|revisions| {
-            let published = revisions.iter().any(|revision| *revision > 0);
-            for revision in revisions.iter_mut().filter(|revision| **revision > 0) {
-                *revision += 1;
+            let published = revisions.iter().any(|view| view.published);
+            for view in revisions.iter_mut().filter(|view| view.published) {
+                view.revision += 1;
             }
             published
         });
@@ -58,7 +82,7 @@ impl PublishedViews {
     }
 
     pub(crate) fn published(&self, collection: &str) -> bool {
-        revision(&self.0.borrow(), collection) > 0
+        position(collection).is_some_and(|position| self.0.borrow()[position].published)
     }
 }
 
@@ -70,8 +94,15 @@ impl Store {
         self.smalltalk.published_views.publish(collection);
     }
 
-    /// Whether a refresher has published `collection`'s view: its windows then reread only when
-    /// it publishes again.
+    /// Say that `collection`'s refresher stopped serving its view, because it exited or keeps
+    /// failing: its windows go back to following commits until it publishes again.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the missions, work and attention refreshers call it"))]
+    pub(crate) fn withdraw_collection_view(&self, collection: &str) {
+        self.smalltalk.published_views.withdraw(collection);
+    }
+
+    /// Whether a refresher serves `collection`'s view: its windows then reread only when it
+    /// publishes again.
     pub(crate) fn collection_view_published(&self, collection: &str) -> bool {
         self.smalltalk.published_views.published(collection)
     }
@@ -102,5 +133,14 @@ mod tests {
         let revisions = *receiver.borrow_and_update();
         assert_eq!((revision(&revisions, "work"), revision(&revisions, "missions")), (3, 0));
         assert_eq!(revision(&revisions, "agents"), 0, "agents keep the roster signal");
+        // A withdrawal is a change every window sees, and the view follows commits again.
+        views.withdraw("work");
+        assert!(!views.published("work"));
+        assert_eq!(revision(&receiver.borrow_and_update(), "work"), 4);
+        views.invalidate();
+        assert!(!receiver.has_changed().unwrap(), "a withdrawn view has nothing to reread");
+        views.publish("work");
+        assert!(views.published("work"));
+        assert_eq!(revision(&receiver.borrow_and_update(), "work"), 5, "revisions never go back");
     }
 }

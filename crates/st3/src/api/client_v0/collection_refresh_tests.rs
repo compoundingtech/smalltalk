@@ -217,6 +217,19 @@ async fn a_published_view_rereads_when_it_publishes_and_not_on_commits() {
     assert_eq!(fixture.frame().await["id"], "work");
     fixture.quiet().await;
     assert_eq!(fixture.counts(), counts(&[("missions", 2), ("work", 3)]));
+    // A withdrawn view is read once more, then follows commits like any other window.
+    state.store.withdraw_collection_view("work");
+    assert_eq!(fixture.frame().await["id"], "work");
+    fixture.quiet().await;
+    assert_eq!(fixture.counts(), counts(&[("missions", 2), ("work", 4)]));
+    fixture.claim("agent/fixture-roster", "runtime.observed", json!({"status":"stopped"}));
+    let mut changed = BTreeSet::new();
+    for _ in 0..2 {
+        changed.insert(fixture.frame().await["id"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(changed, BTreeSet::from(["missions".to_owned(), "work".to_owned()]));
+    fixture.quiet().await;
+    assert_eq!(fixture.counts(), counts(&[("missions", 3), ("work", 5)]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
