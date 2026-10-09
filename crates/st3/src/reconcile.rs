@@ -5324,6 +5324,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         launch_member
             .environment
             .remove(crate::suspension::CONTINUE_PATH_ENV);
+        let selector_scope = crate::native_resume::selection_scope(member);
+        launch_member.environment.remove(crate::suspension::SELECTOR_SCOPE_ENV);
+        if let Some(scope) = &selector_scope {
+            launch_member.environment.insert(crate::suspension::SELECTOR_SCOPE_ENV.into(), scope.clone());
+        }
         let continued = if subject.kind == "agent"
             && !member
                 .environment
@@ -5335,6 +5340,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 &subject.subject,
                 harness,
                 launch_member.environment.get("ST3_ACCOUNT").map(String::as_str),
+                selector_scope.as_deref(),
             )?
         } else {
             None

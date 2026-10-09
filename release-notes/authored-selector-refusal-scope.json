@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Re-arm exact native continuation when an authored session selector is removed.",
+  "replay": {"status": "none", "detail": "Existing diagnostic claims are read directly; legacy authored refusals become stale when no authored selector remains."},
+  "schema": {"status": "changed", "detail": "Adds optional session_id and selector_scope fields to the harness.diagnostic claim schema. No database migration or index change."},
+  "rules": {"status": "changed", "detail": "Diagnostic admission now permits the two optional continuation fields. Existing claims remain valid; actor authority is unchanged."},
+  "compatibility": {"status": "changed", "detail": "Authored-selector refusals are scoped to the selector; intrinsic and provider refusals remain permanent and use a distinct typed operation identity."},
+  "manual": {"status": "none", "detail": "Remove the authored selector to allow exact continuation of the recorded binding. Fresh-context and account precedence remain unchanged."},
+  "recovery": {"status": "changed", "detail": "A later permanent failure cannot collide with a stale legacy refusal. Roll forward: older claim validators do not admit diagnostics carrying the new optional fields."},
+  "downtime": {"status": "unknown", "detail": "Normal daemon upgrade restart; interruption duration has not been measured."}
+}
