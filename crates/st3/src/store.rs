@@ -528,6 +528,8 @@ CREATE TABLE IF NOT EXISTS mission_runs (
     updated_at_unix_ms TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS mission_runs_mission_index ON mission_runs(mission_id, created_at_unix_ms);
+CREATE INDEX IF NOT EXISTS mission_runs_root_page_index
+ON mission_runs(root_run_id, created_at_unix_ms, id);
 -- The runs that have not finished, a few of every run a fleet has made. The predicate is
 -- OPEN_MISSION_RUN, which queries repeat so the planner uses this index.
 CREATE INDEX IF NOT EXISTS mission_runs_open_index ON mission_runs(created_at_unix_ms, id)
@@ -7098,20 +7100,70 @@ impl Store {
             .query_map([root], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
-            .map(|id| {
-                // The legacy tree consumes step state, summaries and queue order, not
-                // each worker's wake, timing and harness presentation histories.
-                let mut view = mission_run_steps_view_tx(&connection, &id, true)?;
-                enrich_run_step_queues_tx(&connection, &mut view)?;
-                // Keep the run-level fields of the existing tree response.
-                view.provenance =
-                    crate::provenance::read(&connection, &view.mission, &view.revision)?;
-                view.loops = loop_run_views_tx(&connection, &view)?;
-                view.outcome = mission_run_outcome_tx(&connection, &view)?;
-                note_run_view_reads(&view);
-                Ok(view)
-            })
+            .map(|id| mission_root_tree_run_tx(&connection, &id))
             .collect()
+    }
+
+    /// Seek one bounded page of a root graph. The legacy all-descendants reader remains for
+    /// callers that explicitly need the complete graph; human presentation uses this page.
+    /// A missing cursor means the named run was retired or belongs to another root.
+    pub fn mission_runs_for_root_page(
+        &self,
+        root: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Option<(Vec<MissionRunView>, Option<String>)>> {
+        anyhow::ensure!((1..=50).contains(&limit), "mission root page limit must be 1 through 50");
+        let root = root.strip_prefix("mission-run/").unwrap_or(root);
+        let connection = self.readers.get();
+        let cursor = match after {
+            Some(after) => {
+                let after = after.strip_prefix("mission-run/").unwrap_or(after);
+                let created = connection
+                    .query_row(
+                        "SELECT created_at_unix_ms FROM mission_runs
+                         WHERE id=?1 AND root_run_id=?2",
+                        params![after, root],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let Some(created) = created else {
+                    return Ok(None);
+                };
+                Some((created, after.to_owned()))
+            }
+            None => None,
+        };
+        let ids = if let Some((created, id)) = cursor {
+            connection
+                .prepare_cached(
+                    "SELECT id FROM mission_runs INDEXED BY mission_runs_root_page_index
+                     WHERE root_run_id=?1 AND (created_at_unix_ms,id)>(?2,?3)
+                     ORDER BY created_at_unix_ms,id LIMIT ?4",
+                )?
+                .query_map(params![root, created, id, limit.saturating_add(1)], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            connection
+                .prepare_cached(
+                    "SELECT id FROM mission_runs INDEXED BY mission_runs_root_page_index
+                     WHERE root_run_id=?1 ORDER BY created_at_unix_ms,id LIMIT ?2",
+                )?
+                .query_map(params![root, limit.saturating_add(1)], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let has_more = ids.len() > limit;
+        let next = has_more.then(|| ids[limit - 1].clone());
+        let runs = ids
+            .into_iter()
+            .take(limit)
+            .map(|id| mission_root_tree_run_tx(&connection, &id))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some((runs, next)))
     }
 
     /// When a loop first executed: a worker's first claim, or the creation of a round
@@ -32439,6 +32491,18 @@ fn cancel_descendant_mission_runs_tx(
     Ok(claim_ids)
 }
 
+fn mission_root_tree_run_tx(connection: &Connection, id: &str) -> Result<MissionRunView> {
+    // The human tree consumes step state, summaries and queue order, not each worker's wake,
+    // timing and harness presentation histories.
+    let mut view = mission_run_steps_view_tx(connection, id, true)?;
+    enrich_run_step_queues_tx(connection, &mut view)?;
+    view.provenance = crate::provenance::read(connection, &view.mission, &view.revision)?;
+    view.loops = loop_run_views_tx(connection, &view)?;
+    view.outcome = mission_run_outcome_tx(connection, &view)?;
+    note_run_view_reads(&view);
+    Ok(view)
+}
+
 fn mission_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Result<MissionRunView> {
     mission_run_view_with_enrichment_tx(connection, run_id, true)
 }
@@ -35933,6 +35997,42 @@ mission "summary-child" state="ready" {
         };
         assert_eq!(tree_fields(&tree), tree_fields(&full));
 
+        let (first, cursor) = store
+            .mission_runs_for_root_page(&root.subject, None, 2)
+            .unwrap()
+            .unwrap();
+        let (last, end) = store
+            .mission_runs_for_root_page(&root.subject, cursor.as_deref(), 2)
+            .unwrap()
+            .unwrap();
+        assert!(cursor.is_some());
+        assert!(end.is_none());
+        assert_eq!(
+            serde_json::to_value(first.into_iter().chain(last).collect::<Vec<_>>()).unwrap(),
+            serde_json::to_value(&tree).unwrap(),
+            "paged human tree preserves every selected state, gate, summary and order"
+        );
+        assert!(store
+            .mission_runs_for_root_page(&root.subject, Some("another-root"), 2)
+            .unwrap()
+            .is_none());
+        assert!(store.mission_runs_for_root_page(&root.subject, None, 0).is_err());
+        assert_eq!(store.index().unwrap(), index, "pagination must remain a read");
+        let plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id FROM mission_runs INDEXED BY mission_runs_root_page_index
+                 WHERE root_run_id=?1 AND (created_at_unix_ms,id)>(?2,?3)
+                 ORDER BY created_at_unix_ms,id LIMIT 3",
+            )
+            .unwrap()
+            .query_map(params![root.id, "0", "cursor"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("mission_runs_root_page_index"), "{plan}");
+        assert!(!plan.contains("SCAN") && !plan.contains("TEMP B-TREE"), "{plan}");
+
         // Only a finished root accepts a user-set outcome. Exercise that separately
         // after checking active descendants and their expired leases above.
         store
@@ -35956,6 +36056,105 @@ mission "summary-child" state="ready" {
             finished.outcome,
             store.mission_run(&root.id).unwrap().unwrap().outcome
         );
+    }
+
+    #[test]
+    fn mission_root_page_seeks_across_equal_time_ties_and_rejects_retired_cursor() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(
+            &store,
+            r#"version 2
+mission "page-root" state="ready" {
+  goal "Show one bounded page of a large root."
+  step "work" { agentless }
+}
+"#,
+            "page-root",
+        );
+        let root = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "page-root".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "page-root-run".into(),
+            })
+            .unwrap();
+        // Invented rows isolate equal-time cursor order from admission scheduling.
+        // They share a valid revision but have no steps, so hydration stays inexpensive.
+        let connection = store.connection.write();
+        for index in 0..51 {
+            let id = format!("page-child-{index:03}");
+            let generation = format!("page-generation-{index:03}");
+            connection
+                .execute(
+                    "INSERT INTO mission_runs
+                     SELECT ?1,mission_id,initial_revision,?2,root_revision,
+                            root_run_id,parent_step_run,workspace,requester,inputs,mode,status,
+                            phase,created_at_unix_ms,updated_at_unix_ms
+                     FROM mission_runs WHERE id=?3",
+                    params![id, generation, root.id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO run_generations
+                     SELECT ?1,?2,revision,NULL,status,actor,reason,
+                            created_at_unix_ms,updated_at_unix_ms
+                     FROM run_generations
+                     WHERE id=(SELECT current_generation_id FROM mission_runs WHERE id=?3)",
+                    params![generation, id, root.id],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        store
+            .connection
+            .write()
+            .execute(
+                "INSERT INTO mission_runs
+                 SELECT 'page-other',mission_id,initial_revision,current_generation_id,
+                        root_revision,'another-root',parent_step_run,workspace,requester,inputs,
+                        mode,status,phase,created_at_unix_ms,updated_at_unix_ms
+                 FROM mission_runs WHERE id=?1",
+                [&root.id],
+            )
+            .unwrap();
+        assert!(store
+            .mission_runs_for_root_page(&root.subject, Some("page-other"), 50)
+            .unwrap()
+            .is_none());
+        let expected = store.mission_runs_for_root(&root.subject).unwrap();
+        let (first, cursor) = store
+            .mission_runs_for_root_page(&root.subject, None, 50)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.len(), 50);
+        let cursor = cursor.expect("51st run requires continuation");
+        let (last, end) = store
+            .mission_runs_for_root_page(&root.subject, Some(&cursor), 50)
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.len(), 2);
+        assert!(end.is_none());
+        assert_eq!(
+            first.into_iter().chain(last).map(|run| run.subject).collect::<Vec<_>>(),
+            expected.into_iter().map(|run| run.subject).collect::<Vec<_>>()
+        );
+        let connection = store.connection.write();
+        connection
+            .execute("DELETE FROM run_generations WHERE run_id=?1", [&cursor])
+            .unwrap();
+        connection
+            .execute("DELETE FROM mission_runs WHERE id=?1", [&cursor])
+            .unwrap();
+        drop(connection);
+        assert!(store
+            .mission_runs_for_root_page(&root.subject, Some(&cursor), 50)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
