@@ -26,7 +26,7 @@ def good_xml():
 
 
 def good_raw():
-    return '\n'.join(f'PASS [0.1s] ({index}/13) smallclaims {name}' for index, name in enumerate(NAMES, 1)) + '\nSummary [1.3s] 13 tests run: 13 passed, 100 skipped\n'
+    return '\n'.join(f'PASS [0.1s] ({index:2d}/13) smallclaims {name}' for index, name in enumerate(NAMES, 1)) + '\nSummary [1.3s] 13 tests run: 13 passed, 100 skipped\n'
 
 
 class EvidenceTests(unittest.TestCase):
@@ -56,15 +56,15 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError): v.results(ET.tostring(good_xml()), good_raw(), SELECTION, exit_code)
 
     def test_actual_counter_format(self):
-        # Normal retained nextest 0.9.140 initial output includes (i/total).
+        # Normal nextest 0.9.140 right-aligns current to decimal width(total): ( 1/13).
         self.assertTrue(v.results(ET.tostring(good_xml()), good_raw(), SELECTION, 0)['qualified'])
-        for raw in [good_raw().replace('(1/13)', '(2/13)'),
-                    good_raw().replace('(1/13)', '(0/13)'),
-                    good_raw().replace('(1/13)', '(14/13)'),
+        for raw in [good_raw().replace('( 1/13)', '( 2/13)'),
+                    good_raw().replace('( 1/13)', '( 0/13)'),
+                    good_raw().replace('( 1/13)', '(14/13)'),
                     good_raw().replace('/13)', '/14)'),
-                    good_raw().replace('(1/13)', '(1/x)'),
-                    good_raw().replace('(1/13)', '(1/13'),
-                    good_raw().replace('(1/13)', ''),
+                    good_raw().replace('( 1/13)', '(1/x)'),
+                    good_raw().replace('( 1/13)', '(1/13'),
+                    good_raw().replace('( 1/13)', ''),
                     good_raw() + 'PASS [0.1s] (bad) smallclaims extra\n']:
             with self.subTest(raw=raw[:90]):
                 with self.assertRaises(ValueError): v.results(ET.tostring(good_xml()), raw, SELECTION, 0)

@@ -81,7 +81,7 @@ def results(xml_text, raw, selection, exit_code):
         require(all(child.tag in ('system-out', 'system-err') for child in case), 'failure/skip/retry/unknown result tag')
     # Use only nextest's status rows and terminal summary, never libtest summary text.
     status_lines = re.findall(r'^\s*PASS\b[^\n]*$', raw, re.M)
-    rows = re.findall(r'^\s*PASS\s+\[[^\]\n]+\]\s+\((\d+)/13\)\s+(\S+)\s+(\S+)\s*$', raw, re.M)
+    rows = re.findall(r'^\s*PASS\s+\[[^\]\n]+\]\s+\([ \t]*(\d+)/13\)\s+(\S+)\s+(\S+)\s*$', raw, re.M)
     require(len(status_lines) == len(rows) == 13, 'missing/malformed/extra raw initial PASS rows')
     counters = [int(counter) for counter, _, _ in rows]
     require(sorted(counters) == list(range(1, 14)), 'missing/duplicate raw execution counter')
