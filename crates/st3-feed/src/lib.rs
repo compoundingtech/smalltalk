@@ -300,7 +300,7 @@ pub async fn run_members_with(
             {
                 Ended::Closed => return,
                 Ended::Dropped(reason) => {
-                    if updates.send(link_lost(client, &reason).await).is_err() {
+                    if updates.send(link_lost(client, remote, &reason).await).is_err() {
                         return;
                     }
                     if let Some(current) = following.as_mut() {
@@ -318,7 +318,7 @@ pub async fn run_members_with(
                 }
             }
         } else if updates
-            .send(link_lost(&clients[member % clients.len()], &reason).await)
+            .send(link_lost(&clients[member % clients.len()], remote, &reason).await)
             .is_err()
         {
             return;
@@ -364,10 +364,15 @@ pub async fn run_members_with(
 /// What a lost stream means. st is offline only when a fresh request to it also fails; when it
 /// answers, only the stream is being replaced (a slow or failed read of another machine shows on
 /// the view that waits for it, not as the whole link going down).
-async fn link_lost(client: &Client, reason: &str) -> Update {
-    let answered = tokio::time::timeout(PROBE_WAIT, client.capabilities())
-        .await
-        .is_ok_and(|outcome| outcome.is_ok());
+///
+/// Only a daemon on this machine is probed: each request to its socket connects afresh. A paired
+/// device's gateway is reached over HTTP connections that can be pooled and outlive the route
+/// that carried them, so an answer there proves nothing about the stream; it stays offline.
+async fn link_lost(client: &Client, remote: bool, reason: &str) -> Update {
+    let answered = !remote
+        && tokio::time::timeout(PROBE_WAIT, client.capabilities())
+            .await
+            .is_ok_and(|outcome| outcome.is_ok());
     connection_log(reason, answered);
     if answered {
         Update::Degraded(reason.to_owned())
@@ -1592,6 +1597,7 @@ mod tests {
 
         let answering = link_lost(
             &Client::unix_as(&socket, "person/avery"),
+            false,
             "st stopped answering",
         )
         .await;
@@ -1599,10 +1605,22 @@ mod tests {
             matches!(&answering, Update::Degraded(reason) if reason == "st stopped answering"),
             "st answered, so only its stream is replaced: {answering:?}"
         );
+        // A paired device's gateway is never probed: its answer would prove nothing.
+        let remote = link_lost(
+            &Client::unix_as(&socket, "person/avery"),
+            true,
+            "the member stopped answering",
+        )
+        .await;
+        assert!(
+            matches!(&remote, Update::Offline(_)),
+            "a lost remote stream is offline: {remote:?}"
+        );
         server.abort();
         let _ = server.await;
         let gone = link_lost(
             &Client::unix_as(root.path().join("absent.sock"), "person/avery"),
+            false,
             "st closed the connection",
         )
         .await;
