@@ -44651,7 +44651,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            17
+            st3_schema::STORAGE_VERSION
         );
         assert_eq!(
             connection
@@ -44725,7 +44725,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            17
+            st3_schema::STORAGE_VERSION
         );
     }
 
