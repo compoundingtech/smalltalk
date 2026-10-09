@@ -1219,6 +1219,8 @@ fn run(
         st3::api::start_operation_report(&state);
         // As the daemon starts: it folds the roster once and keeps it published.
         st3::api::start_agent_roster(&state);
+        // And the attention, summary, glasses and arrangements views.
+        st3::api::start_attention_list(&state);
         let server_socket = socket.clone();
         daemon.spawn(
             async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
