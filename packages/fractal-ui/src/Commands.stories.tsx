@@ -187,7 +187,15 @@ export const CompositionAndInputs: Story = { play: async ({ canvasElement }) => 
   await expect(canvas.getByRole('log')).toHaveTextContent('Message sent')
 } }
 export const CompositionAndInputsLight: Story = { ...CompositionAndInputs, args: { scheme: 'light' } }
-export const AllStates: Story = { ...DisabledCommand }
+export const AllStates: Story = { ...DisabledCommand, play: async context => {
+  await DisabledCommand.play?.(context)
+  await userEvent.click(within(context.canvasElement).getByRole('button', { name: 'Find command' }))
+  const page = dialog(context.canvasElement)
+  await expect(page.getAllByRole('menuitem')).toHaveLength(5)
+  await expect(page.getByRole('menuitem', { name: /Toggle right panel/ })).not.toHaveAttribute('aria-disabled', 'true')
+  await expect(page.getByRole('menuitem', { name: /Publish review/ })).toHaveAttribute('aria-disabled', 'true')
+  await expect(page.getByText('Write a message first.')).toBeVisible()
+} }
 const styles = stylex.create({
   root: { minHeight: '100vh', boxSizing: 'border-box', backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, fontSize: t.uiSize },
   tools: { display: 'flex', gap: s.lg, padding: s.xl },
