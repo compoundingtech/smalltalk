@@ -29,6 +29,11 @@
 //! - `ST_LOAD_REPORT` writes the steady report there, for the next comparison; the explicit
 //!   upgrade-under-load report is saved in its sibling `upgrade` directory. Both cases keep
 //!   the same workload, budgets and baseline. Migration setup/completion is reported separately.
+//! - `ST_LOAD_PROFILE=collections-v1` has each of the 22 subscribers also hold missions, work,
+//!   attention, summary, glasses and arrangements windows on its socket, as an attached stui or
+//!   phone does. Each window's first snapshot has the roster's 300 ms budget. The default,
+//!   `agents-v1`, holds the agents roster only. A report compares only with main's reports of
+//!   its own profile.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::net::UnixStream;
@@ -80,6 +85,46 @@ const ROSTER_LIMIT: usize = 200;
 const ROSTER_SNAPSHOT: &str = "agents roster snapshot";
 const ROSTER_CONNECT_SNAPSHOT: &str = "agents roster connect+snapshot";
 const ROSTER_BUDGET: Duration = Duration::from_millis(300);
+
+/// The windows besides the agents roster that each subscriber holds in the collections profile.
+const COLLECTION_WINDOWS: &[&str] =
+    &["missions", "work", "attention", "summary", "glasses", "arrangements"];
+/// The person whose collections the subscribers read.
+const OPERATOR: &str = "person/bench-operator";
+
+/// Which windows the subscribers hold. Reports of one profile never compare with another's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum LoadProfile {
+    #[default]
+    #[serde(rename = "agents-v1")]
+    Agents,
+    #[serde(rename = "collections-v1")]
+    Collections,
+}
+
+impl LoadProfile {
+    fn from_env() -> Self {
+        match std::env::var("ST_LOAD_PROFILE").as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("agents-v1") => Self::Agents,
+            Ok("collections-v1") => Self::Collections,
+            Ok(other) => panic!("ST_LOAD_PROFILE must be agents-v1 or collections-v1, not {other}"),
+            Err(error) => panic!("ST_LOAD_PROFILE: {error}"),
+        }
+    }
+
+    /// The windows each subscriber holds beside the agents roster.
+    fn windows(self) -> &'static [&'static str] {
+        match self {
+            Self::Agents => &[],
+            Self::Collections => COLLECTION_WINDOWS,
+        }
+    }
+}
+
+/// The names a collection window's first snapshot is timed under.
+fn snapshot_names(collection: &str) -> [String; 2] {
+    [format!("{collection} snapshot"), format!("{collection} connect+snapshot")]
+}
 
 /// The statements a cold full roster rebuild may run per agent card. Main ran about 23 per card
 /// on 2026-10-08, reading each agent's inputs one agent at a time; reading them a chunk of
@@ -142,6 +187,8 @@ const PERSON_READS: &[(&str, u64)] = &[
 /// The report a run writes and the next run compares with.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Report {
+    #[serde(default)]
+    profile: LoadProfile,
     scale: f64,
     claims: u64,
     seconds: f64,
@@ -157,6 +204,12 @@ struct Report {
     /// is every card refolded rather than only the changed ones.
     #[serde(default)]
     roster_full_folds: BTreeMap<String, u64>,
+    /// In the collections profile, the subscribers whose window of each other collection
+    /// received a valid first snapshot, and the change frames each collection's windows applied.
+    #[serde(default)]
+    collection_subscribers: BTreeMap<String, usize>,
+    #[serde(default)]
+    collection_change_frames: BTreeMap<String, usize>,
     #[serde(default)]
     regime: String,
     #[serde(default)]
@@ -336,7 +389,7 @@ fn a_cold_roster_rebuild_reads_the_fleet_in_few_statements() {
 fn report_failures(report: &Report) -> Vec<String> {
     let mut failures = absolute_failures(report);
     if let Some(baseline) = std::env::var_os("ST_LOAD_BASELINE") {
-        match worst_of(Path::new(&baseline)) {
+        match worst_of(Path::new(&baseline), report.profile) {
             Some(baseline) => failures.extend(compare(report, &baseline)),
             None => println!(
                 "no baseline at {}; only the budgets apply",
@@ -385,6 +438,19 @@ fn absolute_failures(report: &Report) -> Vec<String> {
             ));
         }
     }
+    for &collection in report.profile.windows() {
+        let correct = report.collection_subscribers.get(collection).copied().unwrap_or(0);
+        if correct != ROSTER_SUBSCRIBERS {
+            failures.push(format!(
+                "only {correct} of {ROSTER_SUBSCRIBERS} subscribers received a valid {collection} snapshot"
+            ));
+        }
+        for name in snapshot_names(collection) {
+            if report.paths.get(&name).map_or(0, |path| path.count) != ROSTER_SUBSCRIBERS {
+                failures.push(format!("{name}: expected {ROSTER_SUBSCRIBERS} timed snapshots"));
+            }
+        }
+    }
     if report.daemon_cores > CPU_BUDGET {
         failures.push(format!(
             "the daemon used {:.2} cores, over its {CPU_BUDGET} budget",
@@ -405,8 +471,9 @@ fn absolute_failures(report: &Report) -> Vec<String> {
 
 /// Main's reports at `path`, a report or a directory of them, combined into the worst of each:
 /// one run's p99 on a shared runner moves by half or more from the next's, so a regression is
-/// what passes the worst of several runs.
-fn worst_of(path: &Path) -> Option<Baseline> {
+/// what passes the worst of several runs. Only reports of `profile` count: holding more windows
+/// costs more, so another profile's numbers say nothing about a regression.
+fn worst_of(path: &Path, profile: LoadProfile) -> Option<Baseline> {
     let files = if path.is_dir() {
         std::fs::read_dir(path)
             .ok()?
@@ -422,6 +489,7 @@ fn worst_of(path: &Path) -> Option<Baseline> {
     let reports = files
         .iter()
         .filter_map(|file| serde_json::from_slice::<Report>(&std::fs::read(file).ok()?).ok())
+        .filter(|report| report.profile == profile)
         .collect::<Vec<_>>();
     let mut worst = Report::default();
     for report in &reports {
@@ -681,7 +749,7 @@ fn latency_needs_five_main_runs_but_cpu_compares_during_bootstrap() {
             serde_json::to_vec(&baseline.report).unwrap(),
         )
         .unwrap();
-        assert_eq!(worst_of(directory.path()).unwrap().runs, run + 1);
+        assert_eq!(worst_of(directory.path(), LoadProfile::Agents).unwrap().runs, run + 1);
     }
 }
 
@@ -830,8 +898,8 @@ fn print(report: &Report) {
     }
 
     println!(
-        "\n== load test: scale {}, {} claims, {:.0}s, daemon {:.2} cores",
-        report.scale, report.claims, report.seconds, report.daemon_cores
+        "\n== load test: {:?} profile, scale {}, {} claims, {:.0}s, daemon {:.2} cores",
+        report.profile, report.scale, report.claims, report.seconds, report.daemon_cores
     );
     println!(
         "agents roster: {}/{} concurrent subscribers with correct snapshots; {} validated change frames; window limit {}",
@@ -843,6 +911,13 @@ fn print(report: &Report) {
         full_folds as f64 * 60.0 / report.seconds.max(1.0),
         report.roster_full_folds
     );
+    for &collection in report.profile.windows() {
+        println!(
+            "{collection}: {}/{ROSTER_SUBSCRIBERS} subscribers with valid snapshots; {} validated change frames",
+            report.collection_subscribers.get(collection).copied().unwrap_or(0),
+            report.collection_change_frames.get(collection).copied().unwrap_or(0),
+        );
+    }
     println!(
         "{:<28} {:>7} {:>8} {:>8} {:>8} {:>8}",
         "request", "n", "p50 ms", "p99 ms", "max ms", "budget"
@@ -887,10 +962,66 @@ fn upgrade_reports_stay_separate_from_the_unchanged_steady_baseline() {
         serde_json::to_vec(&upgrade).unwrap(),
     )
     .unwrap();
-    let baseline = worst_of(root.path()).unwrap();
+    let baseline = worst_of(root.path(), LoadProfile::Agents).unwrap();
     assert_eq!(baseline.runs, 1);
     assert_eq!(baseline.report.daemon_cores, 1.0);
     assert_eq!(baseline.report.paths["claim"].p99_ms, 10.0);
+}
+
+#[test]
+fn a_report_compares_only_with_reports_of_its_own_profile() {
+    let root = tempfile::tempdir().unwrap();
+    // Reports written before profiles existed are the roster-only workload.
+    let legacy = json!({"scale": 1.0, "claims": 1, "seconds": 1.0, "daemon_cores": 1.0,
+        "paths": {}, "failed": {}});
+    std::fs::write(root.path().join("legacy.json"), legacy.to_string()).unwrap();
+    let collections = Report {
+        profile: LoadProfile::Collections,
+        daemon_cores: 3.0,
+        ..Report::default()
+    };
+    std::fs::write(
+        root.path().join("collections.json"),
+        serde_json::to_vec(&collections).unwrap(),
+    )
+    .unwrap();
+    let agents = worst_of(root.path(), LoadProfile::Agents).unwrap();
+    assert_eq!((agents.runs, agents.report.daemon_cores), (1, 1.0));
+    let held = worst_of(root.path(), LoadProfile::Collections).unwrap();
+    assert_eq!((held.runs, held.report.daemon_cores), (1, 3.0));
+    std::fs::remove_file(root.path().join("collections.json")).unwrap();
+    assert!(worst_of(root.path(), LoadProfile::Collections).is_none());
+}
+
+#[test]
+fn every_held_window_needs_a_timed_snapshot_per_subscriber_within_the_roster_budget() {
+    let budgets = BTreeMap::new();
+    let mut report = Report {
+        profile: LoadProfile::Collections,
+        roster_subscribers: ROSTER_SUBSCRIBERS,
+        long_poll_seats: SEATS,
+        ..Report::default()
+    };
+    for name in [ROSTER_SNAPSHOT, ROSTER_CONNECT_SNAPSHOT] {
+        report.paths.insert(name.into(), PathReport { count: ROSTER_SUBSCRIBERS, ..PathReport::default() });
+    }
+    for load in MIX {
+        report.paths.insert(load.name.into(), PathReport { count: 1, ..PathReport::default() });
+    }
+    for &collection in COLLECTION_WINDOWS {
+        report.collection_subscribers.insert(collection.into(), ROSTER_SUBSCRIBERS);
+        for name in snapshot_names(collection) {
+            assert_eq!(budget(&budgets, &name), ROSTER_BUDGET);
+            report.paths.insert(name, PathReport { count: ROSTER_SUBSCRIBERS, ..PathReport::default() });
+        }
+    }
+    assert_eq!(absolute_failures(&report), Vec::<String>::new());
+    report.collection_subscribers.insert("work".into(), ROSTER_SUBSCRIBERS - 1);
+    report.paths.get_mut("missions snapshot").unwrap().count -= 1;
+    assert_eq!(absolute_failures(&report).len(), 2);
+    // The roster-only profile asks for no other window.
+    report.profile = LoadProfile::Agents;
+    assert_eq!(absolute_failures(&report), Vec::<String>::new());
 }
 
 /// Everything a request needs.
@@ -1035,6 +1166,7 @@ fn run(
     duration: Duration,
     regime: LoadRegime,
 ) -> Report {
+    let profile = LoadProfile::from_env();
     let work = tempfile::tempdir().unwrap();
     let root = work.path();
     let database = root.join("state/claims.sqlite3");
@@ -1167,6 +1299,8 @@ fn run(
     let long_poll_seats = Arc::new(AtomicUsize::new(0));
     let mut roster_subscribers = 0;
     let roster_change_frames = Arc::new(AtomicUsize::new(0));
+    let mut collection_subscribers = BTreeMap::<String, usize>::new();
+    let collection_change_frames = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
     let migration_pending_at_load_start = context.store.event_payload_migration_pending().unwrap();
     if matches!(regime, LoadRegime::Steady) {
         assert!(!migration_pending_at_load_start);
@@ -1305,20 +1439,23 @@ fn run(
             }));
         }
         let barrier = Arc::new(Barrier::new(ROSTER_SUBSCRIBERS));
-        let (snapshots, mut initial) = mpsc::channel(ROSTER_SUBSCRIBERS);
+        let (snapshots, mut initial) =
+            mpsc::channel(ROSTER_SUBSCRIBERS * (1 + profile.windows().len()));
         let mut subscribers = Vec::new();
         for subscriber in 0..ROSTER_SUBSCRIBERS {
-            let client = st3_client::Client::unix_as(&socket, "person/bench-operator");
-            let (barrier, stopped, snapshots, failed, changes) = (
+            let client = st3_client::Client::unix_as(&socket, OPERATOR);
+            let (barrier, stopped, snapshots, failed, changes, collection_changes) = (
                 barrier.clone(),
                 stopped.clone(),
                 snapshots.clone(),
                 failed.clone(),
                 roster_change_frames.clone(),
+                collection_change_frames.clone(),
             );
             subscribers.push(tokio::spawn(async move {
                 if let Err(error) = roster_subscriber(
                     client, subscriber, barrier, stopped, snapshots, changes,
+                    collection_changes, profile,
                 )
                 .await
                 {
@@ -1333,7 +1470,17 @@ fn run(
         drop(snapshots);
         let mut captured = Vec::with_capacity(ROSTER_SUBSCRIBERS);
         while let Some(snapshot) = initial.recv().await {
-            captured.push(snapshot);
+            if snapshot.collection == "agents" {
+                captured.push(snapshot);
+                continue;
+            }
+            // The subscriber validated its typed rows and window; only the roster has an HTTP
+            // oracle whose membership holds still under this load.
+            *collection_subscribers.entry(snapshot.collection.into()).or_default() += 1;
+            let [subscription, connection] = snapshot_names(snapshot.collection);
+            let mut timings = timings.lock().unwrap();
+            timings.entry(subscription).or_default().push(snapshot.subscription);
+            timings.entry(connection).or_default().push(snapshot.connection);
         }
         // Capture every initial frame before reading the oracle: HTTP and WS share the roster
         // projection. Compare stable membership/declaration fields, not concurrently changing
@@ -1454,7 +1601,9 @@ fn run(
         .collect();
     load.shutdown_timeout(Duration::from_secs(5));
     let failed = std::mem::take(&mut *failed.lock().unwrap());
+    let collection_change_frames = std::mem::take(&mut *collection_change_frames.lock().unwrap());
     Report {
+        profile,
         scale,
         claims,
         seconds: elapsed,
@@ -1463,6 +1612,8 @@ fn run(
         roster_subscribers,
         roster_change_frames: roster_change_frames.load(Ordering::Relaxed),
         roster_full_folds,
+        collection_subscribers,
+        collection_change_frames,
         regime: regime.name().into(),
         actual_ci_checkout: std::env::var("GITHUB_SHA").ok(),
         event_migration,
@@ -1475,10 +1626,19 @@ fn run(
     }
 }
 
-struct RosterSnapshot {
+struct WindowSnapshot {
+    collection: &'static str,
     frame: Value,
     subscription: Duration,
     connection: Duration,
+}
+
+/// One subscriber's window: what it holds, its fence, and when it subscribed.
+struct HeldWindow {
+    collection: &'static str,
+    rows: BTreeSet<String>,
+    index: Option<u64>,
+    subscribed: Instant,
 }
 
 async fn roster_subscriber(
@@ -1486,8 +1646,10 @@ async fn roster_subscriber(
     subscriber: usize,
     barrier: Arc<Barrier>,
     mut stopped: watch::Receiver<bool>,
-    snapshots: mpsc::Sender<RosterSnapshot>,
+    snapshots: mpsc::Sender<WindowSnapshot>,
     changes: Arc<AtomicUsize>,
+    collection_changes: Arc<Mutex<BTreeMap<String, usize>>>,
+    profile: LoadProfile,
 ) -> Result<(), String> {
     // Start handshakes together, then send subscriptions together once every handshake has
     // completed (or failed). Even a failed connector reaches the second barrier.
@@ -1498,34 +1660,36 @@ async fn roster_subscriber(
     let mut stream = opened
         .map_err(|_| "WebSocket handshake timed out".to_owned())?
         .map_err(|error| error.to_string())?;
-    let id = format!("load-roster-{subscriber}");
     let outcome = async {
-        let subscription = Instant::now();
-        let frame = tokio::time::timeout(Duration::from_secs(30), async {
-            stream
-                .subscribe(&id, "agents", ROSTER_LIMIT, None, None)
-                .await
-                .map_err(|error| error.to_string())?;
-            stream
-                .next()
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "WebSocket closed before its snapshot".to_owned())
-        })
-        .await
-        .map_err(|_| "initial snapshot timed out".to_owned())??;
-        let mut rows = BTreeSet::new();
-        let mut index = apply_roster_frame(&frame, &id, true, &mut rows)?;
-        snapshots
-            .send(RosterSnapshot {
-                frame,
-                subscription: subscription.elapsed(),
-                connection: connection.elapsed(),
-            })
-            .await
-            .map_err(|_| "snapshot collector stopped".to_owned())?;
-        // The collector can now finish without waiting for the held subscriptions to close.
-        drop(snapshots);
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut windows = BTreeMap::new();
+        // The roster first, then every other window this profile holds, each timed from its
+        // own subscribe command, as a client opening several tabs sends them.
+        for collection in std::iter::once("agents").chain(profile.windows().iter().copied()) {
+            let id = if collection == "agents" {
+                format!("load-roster-{subscriber}")
+            } else {
+                format!("load-{collection}-{subscriber}")
+            };
+            let subscribed = Instant::now();
+            let sent = match collection {
+                "summary" => stream.subscribe(&id, collection, 1, None, None).await,
+                "glasses" => stream.subscribe_glasses(&id).await,
+                "arrangements" => {
+                    stream.subscribe_arrangements(&id, OPERATOR, ROSTER_LIMIT, None).await
+                }
+                _ => stream.subscribe(&id, collection, ROSTER_LIMIT, None, None).await,
+            };
+            sent.map_err(|error| format!("{collection}: {error}"))?;
+            windows.insert(
+                id,
+                HeldWindow { collection, rows: BTreeSet::new(), index: None, subscribed },
+            );
+        }
+        let mut awaiting = windows.len();
+        // The collector can finish once every first snapshot is in, without waiting for the
+        // held subscriptions to close.
+        let mut snapshots = Some(snapshots);
         loop {
             tokio::select! {
                 result = stopped.changed() => {
@@ -1534,16 +1698,45 @@ async fn roster_subscriber(
                         break;
                     }
                 }
+                _ = tokio::time::sleep_until(initial_deadline), if awaiting > 0 => {
+                    let missing = windows.values().filter(|window| window.index.is_none())
+                        .map(|window| window.collection).collect::<Vec<_>>();
+                    return Err(format!("initial snapshot timed out: {missing:?}"));
+                }
                 frame = stream.next() => {
                     let frame = frame
                         .map_err(|error| error.to_string())?
                         .ok_or_else(|| "WebSocket closed during the workload".to_owned())?;
-                    let next = apply_roster_frame(&frame, &id, false, &mut rows)?;
-                    if next < index {
-                        return Err("roster snapshot index moved backward".into());
+                    let id = frame["id"].as_str().unwrap_or_default().to_owned();
+                    let window = windows.get_mut(&id)
+                        .ok_or_else(|| format!("frame for no held window: {frame}"))?;
+                    let initial = window.index.is_none();
+                    let next = apply_window_frame(window.collection, &frame, &id, initial, &mut window.rows)?;
+                    if window.index.is_some_and(|index| next < index) {
+                        return Err(format!("{} snapshot index moved backward", window.collection));
                     }
-                    index = next;
-                    changes.fetch_add(1, Ordering::Relaxed);
+                    window.index = Some(next);
+                    if initial {
+                        let sender = snapshots.as_ref().expect("a first snapshot still awaited");
+                        sender
+                            .send(WindowSnapshot {
+                                collection: window.collection,
+                                frame,
+                                subscription: window.subscribed.elapsed(),
+                                connection: connection.elapsed(),
+                            })
+                            .await
+                            .map_err(|_| "snapshot collector stopped".to_owned())?;
+                        awaiting -= 1;
+                        if awaiting == 0 {
+                            snapshots = None;
+                        }
+                    } else if window.collection == "agents" {
+                        changes.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        *collection_changes.lock().unwrap()
+                            .entry(window.collection.into()).or_default() += 1;
+                    }
                 }
             }
         }
@@ -1575,6 +1768,38 @@ fn roster_row_ids(items: &Value) -> Result<BTreeSet<String>, String> {
     Ok(ids)
 }
 
+/// Validate typed rows of the windows the load holds: real agent, mission and work cards, and an
+/// ID for every other collection's row.
+fn window_row_ids(collection: &str, items: &Value) -> Result<BTreeSet<String>, String> {
+    if collection == "agents" {
+        return roster_row_ids(items);
+    }
+    let items = items
+        .as_array()
+        .ok_or_else(|| format!("{collection} rows are not an array"))?;
+    let mut ids = BTreeSet::new();
+    for item in items {
+        let id = match collection {
+            "missions" => <st3_client::Mission as serde::Deserialize>::deserialize(item)
+                .map_err(|error| format!("invalid mission card: {error}"))?
+                .header
+                .id,
+            "work" => <st3_client::Work as serde::Deserialize>::deserialize(item)
+                .map_err(|error| format!("invalid work card: {error}"))?
+                .header
+                .id,
+            _ => item["id"].as_str().unwrap_or_default().to_owned(),
+        };
+        if id.is_empty() {
+            return Err(format!("{collection} row has no ID"));
+        }
+        if !ids.insert(id) {
+            return Err(format!("{collection} contains duplicate rows"));
+        }
+    }
+    Ok(ids)
+}
+
 /// Reconstruct each subscriber's window as changes arrive; invalid removals/order are failures.
 fn apply_roster_frame(
     frame: &Value,
@@ -1582,26 +1807,37 @@ fn apply_roster_frame(
     initial: bool,
     rows: &mut BTreeSet<String>,
 ) -> Result<u64, String> {
+    apply_window_frame("agents", frame, id, initial, rows)
+}
+
+fn apply_window_frame(
+    collection: &str,
+    frame: &Value,
+    id: &str,
+    initial: bool,
+    rows: &mut BTreeSet<String>,
+) -> Result<u64, String> {
     let kind = if initial { "snapshot" } else { "changes" };
-    if frame["kind"] != kind || frame["id"] != id || frame["collection"] != "agents" {
-        return Err(format!("expected agents {kind} for {id}, received {frame}"));
+    if frame["kind"] != kind || frame["id"] != id || frame["collection"] != collection {
+        return Err(format!("expected {collection} {kind} for {id}, received {frame}"));
     }
     let snapshot = <st3_client::Snapshot as serde::Deserialize>::deserialize(&frame["snapshot"])
-        .map_err(|error| format!("invalid roster snapshot fence: {error}"))?;
+        .map_err(|error| format!("invalid {collection} snapshot fence: {error}"))?;
     if frame["has_more"].as_bool().is_none() {
-        return Err("roster has no pagination flag".into());
+        return Err(format!("{collection} has no pagination flag"));
     }
     let order: Vec<String> =
         <Vec<String> as serde::Deserialize>::deserialize(&frame["order"])
-            .map_err(|error| format!("invalid roster order: {error}"))?;
+            .map_err(|error| format!("invalid {collection} order: {error}"))?;
     let ordered = order.iter().cloned().collect::<BTreeSet<_>>();
     if order.len() > ROSTER_LIMIT || ordered.len() != order.len() {
-        return Err("roster order exceeds its window or contains duplicates".into());
+        return Err(format!("{collection} order exceeds its window or contains duplicates"));
     }
     if initial {
-        *rows = roster_row_ids(&frame["items"])?;
-        if rows.is_empty() {
-            return Err("the generated roster snapshot is empty".into());
+        *rows = window_row_ids(collection, &frame["items"])?;
+        // The generated store has agents, missions and open work; the rest may be empty.
+        if rows.is_empty() && matches!(collection, "agents" | "missions" | "work") {
+            return Err(format!("the generated {collection} snapshot is empty"));
         }
         let item_order = frame["items"]
             .as_array()
@@ -1614,16 +1850,16 @@ fn apply_roster_frame(
         }
     } else {
         let removes = <Vec<String> as serde::Deserialize>::deserialize(&frame["removes"])
-            .map_err(|error| format!("invalid roster removals: {error}"))?;
+            .map_err(|error| format!("invalid {collection} removals: {error}"))?;
         for removed in removes {
             if !rows.remove(&removed) {
-                return Err("roster removed an agent outside its previous window".into());
+                return Err(format!("{collection} removed a row outside its previous window"));
             }
         }
-        rows.extend(roster_row_ids(&frame["upserts"])?);
+        rows.extend(window_row_ids(collection, &frame["upserts"])?);
     }
     if *rows != ordered {
-        return Err("roster rows disagree with their reconstructed window".into());
+        return Err(format!("{collection} rows disagree with their reconstructed window"));
     }
     Ok(snapshot.store_index)
 }
@@ -1700,6 +1936,32 @@ fn roster_frames_require_correct_cards_membership_and_snapshot_before_changes() 
     assert!(rows.is_empty());
     change["removes"] = json!(["agent/bench/not-in-window"]);
     assert!(apply_roster_frame(&change, "load-roster-0", false, &mut rows).is_err());
+}
+
+#[test]
+fn held_windows_require_typed_rows_and_their_own_collection() {
+    let frame = |collection: &str, items: Value| {
+        let order = items.as_array().unwrap().iter().map(|item| item["id"].clone()).collect::<Vec<_>>();
+        json!({
+            "kind": "snapshot", "id": "load-x-0", "collection": collection,
+            "snapshot": {
+                "id": "snapshot/load", "host_id": "host/bench", "store_index": 3,
+                "projection_version": "client-projection.v0", "created_at": "2026-10-01T00:00:00Z"
+            },
+            "items": items, "order": order, "has_more": false
+        })
+    };
+    // Optional windows may start empty; the generated store always has missions and work.
+    assert_eq!(apply_window_frame("glasses", &frame("glasses", json!([])), "load-x-0", true, &mut BTreeSet::new()), Ok(3));
+    assert!(apply_window_frame("missions", &frame("missions", json!([])), "load-x-0", true, &mut BTreeSet::new()).is_err());
+    assert!(apply_window_frame("work", &frame("missions", json!([])), "load-x-0", true, &mut BTreeSet::new()).is_err());
+    // A row that is not a mission card is not a mission snapshot.
+    let untyped = frame("missions", json!([{"id": "mission/bench/one", "kind": "mission"}]));
+    assert!(apply_window_frame("missions", &untyped, "load-x-0", true, &mut BTreeSet::new()).is_err());
+    let summary = frame("summary", json!([{"id": "summary/current", "kind": "summary"}]));
+    let mut rows = BTreeSet::new();
+    assert_eq!(apply_window_frame("summary", &summary, "load-x-0", true, &mut rows), Ok(3));
+    assert_eq!(rows, BTreeSet::from(["summary/current".to_owned()]));
 }
 
 /// One request of the kind `name`, and the name to record it under when that is more exact.
@@ -1866,7 +2128,11 @@ fn budget(budgets: &BTreeMap<&str, Duration>, name: &str) -> Duration {
     if name == LONG_POLL {
         return Duration::from_secs(31);
     }
-    if matches!(name, ROSTER_SNAPSHOT | ROSTER_CONNECT_SNAPSHOT) {
+    if matches!(name, ROSTER_SNAPSHOT | ROSTER_CONNECT_SNAPSHOT)
+        || COLLECTION_WINDOWS
+            .iter()
+            .any(|collection| snapshot_names(collection).iter().any(|snapshot| snapshot == name))
+    {
         return ROSTER_BUDGET;
     }
     if let Some(route) = name.strip_prefix("person read ") {
