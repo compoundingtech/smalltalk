@@ -9,7 +9,8 @@ import {
   Virtualizer,
 } from 'react-aria-components'
 
-import { readScrollAnchor, saveScrollAnchor, ScrollController } from './embrace-virtual/ScrollController'
+import { ScrollController } from './embrace-virtual/ScrollController'
+import type { FollowState } from './embrace-virtual/FollowController'
 import { accentTokens, tokens } from './embrace-tokens.stylex'
 
 export interface EmbraceVirtualConversationProps<T extends { readonly id: string }> {
@@ -20,9 +21,11 @@ export interface EmbraceVirtualConversationProps<T extends { readonly id: string
   readonly style?: React.CSSProperties
   /** Source transcript's initial estimate; measured heights remain authoritative. */
   readonly estimatedRowHeight?: number
-  /** Changing keys resets the scroll controller to that conversation's saved mode. */
+  /** Changing conversations opens at the live edge. */
   readonly anchorKey?: string
-  /** Opt in to workshop-local storage; isolated stories start in follow mode by default. */
+  /** A changed own-send key resumes following. */
+  readonly scrollToBottomKey?: string
+  /** @deprecated Accepted during the host migration; conversation opens no longer restore old anchors. */
   readonly persistAnchor?: boolean
 }
 
@@ -34,7 +37,7 @@ export interface EmbraceVirtualConversationProps<T extends { readonly id: string
 export function EmbraceVirtualConversation<T extends { readonly id: string }>(
   props: EmbraceVirtualConversationProps<T>,
 ) {
-  return <VirtualConversationBody key={`${props.persistAnchor ?? false}:${props.anchorKey ?? 'story'}`} {...props} />
+  return <VirtualConversationBody key={props.anchorKey ?? 'story'} {...props} />
 }
 
 function VirtualConversationBody<T extends { readonly id: string }>({
@@ -43,20 +46,17 @@ function VirtualConversationBody<T extends { readonly id: string }>({
   className,
   style,
   estimatedRowHeight = 160,
-  anchorKey = 'story',
-  persistAnchor = false,
+  scrollToBottomKey,
 }: EmbraceVirtualConversationProps<T>) {
   // Keep the actual instance so the source controller reads public row geometry.
   const [layout] = React.useState(() => new ListLayout())
-  const [unread, setUnread] = React.useState(false)
-  const [scroll] = React.useState(() => new ScrollController({
-    layout,
-    initial: persistAnchor ? readScrollAnchor(anchorKey) : { _tag: 'Following' },
-    save: (anchor) => {
-      if (persistAnchor) saveScrollAnchor(anchorKey, anchor)
-    },
-    setUnread,
-  }))
+  const [followState, setFollowState] = React.useState<FollowState>({ _tag: 'Attached' })
+  const [scroll] = React.useState(() => new ScrollController({ layout, onStateChange: setFollowState }))
+  const previousCommand = React.useRef(scrollToBottomKey)
+  React.useLayoutEffect(() => {
+    if (scrollToBottomKey !== undefined && scrollToBottomKey !== previousCommand.current) scroll.jump()
+    previousCommand.current = scrollToBottomKey
+  }, [scroll, scrollToBottomKey])
   React.useLayoutEffect(() => scroll.afterRowsChange(items), [scroll, items])
   const layoutOptions = React.useMemo(() => ({ estimatedRowHeight }), [estimatedRowHeight])
   const indexById = React.useMemo(() => {
@@ -89,7 +89,8 @@ function VirtualConversationBody<T extends { readonly id: string }>({
           {renderRow}
         </GridList>
       </Virtualizer>
-      {unread ? (
+      <span role="status" aria-live="polite" {...stylex.props(styles.announcement)}>{followState._tag === 'Detached' ? 'Reading earlier messages. Jump to latest is available.' : ''}</span>
+      {followState._tag === 'Detached' ? (
         <div {...stylex.props(styles.jump)}>
           <Button onPress={scroll.jump} {...stylex.props(styles.jumpButton)}>
             New messages ↓
@@ -145,11 +146,8 @@ const styles = stylex.create({
     display: 'flow-root',
     minWidth: 0,
   },
-  jump: {
-    position: 'absolute',
-    bottom: '12px',
-    alignSelf: 'center',
-  },
+  announcement: { position: 'absolute', width: 1, height: 1, overflow: 'hidden', clipPath: 'inset(50%)', whiteSpace: 'nowrap' },
+  jump: { flexShrink: 0, marginBlock: '12px', alignSelf: 'center' },
   jumpButton: {
     minHeight: '28px',
     paddingInline: '12px',
@@ -163,5 +161,6 @@ const styles = stylex.create({
     fontSize: '12px',
     cursor: 'pointer',
     outlineColor: accentTokens.accent,
+    ':focus-visible': { outlineWidth: 2, outlineStyle: 'solid', outlineOffset: 2 },
   },
 })

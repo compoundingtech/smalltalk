@@ -27,6 +27,7 @@ export const FollowingAndAnchored: Story = { play: async ({ canvasElement }) => 
   await frame()
   await expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeLessThanOrEqual(1)
   viewport.focus()
+  viewport.dispatchEvent(new WheelEvent('wheel', { deltaY: -240 }))
   viewport.scrollTop = 240
   viewport.dispatchEvent(new Event('scroll'))
   await frame()

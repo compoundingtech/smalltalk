@@ -102,28 +102,30 @@ export const SameRowsDuringPress: Story = { play: async ({ canvasElement }) => {
 } }
 export const SameRowsDuringPressLight: Story = { ...SameRowsDuringPress, args: { scheme: 'light' } }
 
-/** A genuinely new row during the press still lets Retry take the click; the jump appears only after release. */
+/** Growth during a row press preserves Retry; release resumes the attached live edge without a pill. */
 export const NewRowDuringPress: Story = { play: async ({ canvasElement }) => {
-  const { canvas, jump, retries } = await ready(canvasElement)
+  const { viewport, canvas, jump, retries } = await ready(canvasElement)
   await pressAcross(canvas.getByRole('button', { name: 'Retry' }), async () => {
     canvas.getByRole('button', { name: 'Append agent reply' }).click()
     await settleFrames()
     await expect(jump, 'jump revealed during the press').not.toBeVisible()
   })
   await waitFor(() => expect(retries).toHaveTextContent('1'))
-  await waitFor(() => expect(jump).toBeVisible())
+  await settleFrames()
+  await expect(jump).not.toBeVisible()
+  await expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeLessThanOrEqual(2)
   await expect(retries).toHaveTextContent('1')
 } }
 export const NewRowDuringPressLight: Story = { ...NewRowDuringPress, args: { scheme: 'light' } }
 
-/** A scrolled-up reader is not told about rows that were already there. */
+/** Detaching exposes the one jump action even before any new content arrives. */
 export const SameRowsScrolledUp: Story = { play: async ({ canvasElement }) => {
   const { viewport, canvas, jump } = await ready(canvasElement)
   await readerScrollsUp(viewport)
   await userEvent.click(canvas.getByRole('button', { name: 'Republish snapshot' }))
   await settleFrames()
-  await expect(jump, 'same rows marked unread').not.toBeVisible()
-  // Positive control: a new row still marks unread.
+  await expect(jump, 'detached reader needs the jump action').toBeVisible()
+  // A republished snapshot or append does not create a second action.
   await userEvent.click(canvas.getByRole('button', { name: 'Append agent reply' }))
   await waitFor(() => expect(jump).toBeVisible())
 } }
@@ -136,17 +138,19 @@ async function readerScrollsUp(viewport: HTMLElement) {
 }
 const pointer = (target: Element, type: 'pointerdown' | 'pointerup', pointerId: number, pointerType: 'mouse' | 'touch') => target.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, composed: true, pointerId, pointerType, isPrimary: pointerType === 'mouse', button: 0, buttons: type === 'pointerdown' ? 1 : 0, width: 1, height: 1, pressure: type === 'pointerdown' ? 0.5 : 0 }))
 
-/** A press whose release the page never sees (the window blurs) does not keep the jump hidden. */
+/** A window blur releases press compensation and resumes attached pinning, without a jump pill. */
 export const BlurEndsPress: Story = { play: async ({ canvasElement }) => {
-  const { canvas, jump } = await ready(canvasElement)
+  const { viewport, canvas, jump } = await ready(canvasElement)
   pointer(canvas.getByRole('button', { name: 'Retry' }), 'pointerdown', 1, 'mouse')
   window.dispatchEvent(new Event('blur'))
   canvas.getByRole('button', { name: 'Append agent reply' }).click()
-  await waitFor(() => expect(jump, 'jump latched hidden after the window blurred').toBeVisible())
+  await settleFrames()
+  await expect(jump).not.toBeVisible()
+  await expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeLessThanOrEqual(2)
 } }
 export const BlurEndsPressLight: Story = { ...BlurEndsPress, args: { scheme: 'light' } }
 
-/** With two pointers down, releasing one keeps the dock still; the reveal waits for the last release. */
+/** Two active pointers defer press release; neither pointerdown detaches live following. */
 export const SecondPointerHoldsDock: Story = { play: async ({ canvasElement }) => {
   const { viewport, canvas, jump } = await ready(canvasElement)
   const retry = canvas.getByRole('button', { name: 'Retry' })
@@ -158,7 +162,9 @@ export const SecondPointerHoldsDock: Story = { play: async ({ canvasElement }) =
   await settleFrames()
   await expect(jump, 'jump revealed while a second pointer is down').not.toBeVisible()
   pointer(viewport, 'pointerup', 2, 'touch')
-  await waitFor(() => expect(jump).toBeVisible())
+  await settleFrames()
+  await expect(jump).not.toBeVisible()
+  await expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeLessThanOrEqual(2)
 } }
 export const SecondPointerHoldsDockLight: Story = { ...SecondPointerHoldsDock, args: { scheme: 'light' } }
 
@@ -200,7 +206,7 @@ export const InsertAbovePressedRow: Story = { play: async ({ canvasElement }) =>
   })
   await waitFor(() => expect(retries).toHaveTextContent('1'))
   await expect(Math.abs(row.getBoundingClientRect().top - top), 'pressed row snapped on release').toBeLessThanOrEqual(1)
-  await waitFor(() => expect(jump).toBeVisible())
+  await expect(jump).not.toBeVisible()
   await settleFrames()
   await expect(retries).toHaveTextContent('1')
   await expect(Math.abs(row.getBoundingClientRect().top - top), 'history anchor undid compensation after the dock settled').toBeLessThanOrEqual(1)
