@@ -136,7 +136,7 @@ fn fold(store: &Store) -> (Arc<Publication<MissionRows>>, bool) {
     let publication = list.newest().expect("a published list");
     assert_eq!(publication.cut, store.index().unwrap(), "published at the current cut");
     let expected = oracle(store);
-    assert_eq!(rows(&*publication), expected, "the published rows are the direct fold's");
+    assert_eq!(rows(&publication), expected, "the published rows are the direct fold's");
     let (fresh, _) = fold_missions(store, None, now).unwrap().unwrap();
     assert_eq!(rows(&fresh), expected, "a fold from nothing agrees");
     // Every window a socket holds is the direct read's, including its bound and continuation.
@@ -232,7 +232,7 @@ fn published_missions_match_the_direct_fold_through_work_leases_failure_and_reti
     drop(store);
     let store = Store::open(&root.path().join("graph.db"), "cedar").unwrap();
     let (reopened, _) = fold(&store);
-    assert_eq!(rows(&*reopened), rows(&*publication));
+    assert_eq!(rows(&reopened), rows(&publication));
 }
 
 #[test]
