@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Permit one earlier signed retry for a recently successful plain HTTP peer",
+  "replay": {"status": "none", "detail": "Envelope receipt, duplicate handling, projection and replay are unchanged."},
+  "schema": {"status": "none", "detail": "No durable table, index or data-format changes; retry credit is private task-local state."},
+  "rules": {"status": "none", "detail": "No claim or checkpoint rule changes."},
+  "compatibility": {"status": "changed", "detail": "A qualifying peer may receive one additional off-cadence signed exchange after a typed before-header plain HTTP transport failure and a successful HEAD. This does not change authentication, member refusal, signed overload or Fabric grant checks. HTTPS and unclassified failures use the existing retry path."},
+  "downtime": {"status": "none", "detail": "No migration or additional service interruption beyond a normal binary swap."},
+  "manual": {"status": "none", "detail": "No new configuration or manual action."},
+  "recovery": {"status": "changed", "detail": "The opportunity starts absent, expires within five monotonic minutes of a complete successful signed exchange, and is spent before export. A failed advance resumes the original capped absolute retry deadline and ordinary backoff count; a new signed overload cooldown may extend that deadline. Restart discards credit. Authentication, membership and route changes refuse further advanced submissions. This source draft does not certify ten-second recovery or remove quarantine."}
+}
