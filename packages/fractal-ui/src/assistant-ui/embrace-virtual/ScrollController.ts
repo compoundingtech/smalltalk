@@ -244,22 +244,28 @@ export class ScrollController {
   }
 }
 
-/** Workshop-local storage; independent of the app's state registry. */
+/**
+ * Workshop-local storage; independent of the app's state registry. A missing, unreadable or
+ * malformed value resumes following instead of throwing out of render.
+ */
 export function readScrollAnchor(key: string): ScrollAnchor {
   if (typeof window === 'undefined') return { _tag: 'Following' }
-  const raw = window.localStorage.getItem(`fractal-ui.embrace:${key}:conversation.anchor`)
-  if (raw === null) return { _tag: 'Following' }
-  const value: unknown = JSON.parse(raw)
-  if (typeof value === 'object' && value !== null && '_tag' in value) {
-    if (value._tag === 'Following') return { _tag: 'Following' }
-    if (
-      value._tag === 'Reading' &&
-      'entry' in value && (value.entry === null || typeof value.entry === 'string') &&
-      'offset' in value && typeof value.offset === 'number' && Number.isFinite(value.offset) &&
-      'scrollTop' in value && typeof value.scrollTop === 'number' && Number.isFinite(value.scrollTop)
-    ) return { _tag: 'Reading', entry: value.entry, offset: value.offset, scrollTop: value.scrollTop }
+  let value: unknown
+  try {
+    const raw = window.localStorage.getItem(`fractal-ui.embrace:${key}:conversation.anchor`)
+    if (raw === null) return { _tag: 'Following' }
+    value = JSON.parse(raw)
+  } catch {
+    return { _tag: 'Following' }
   }
-  throw new TypeError('Invalid persisted transcript scroll anchor')
+  if (
+    typeof value === 'object' && value !== null && '_tag' in value &&
+    value._tag === 'Reading' &&
+    'entry' in value && (value.entry === null || typeof value.entry === 'string') &&
+    'offset' in value && typeof value.offset === 'number' && Number.isFinite(value.offset) &&
+    'scrollTop' in value && typeof value.scrollTop === 'number' && Number.isFinite(value.scrollTop)
+  ) return { _tag: 'Reading', entry: value.entry, offset: value.offset, scrollTop: value.scrollTop }
+  return { _tag: 'Following' }
 }
 
 export function saveScrollAnchor(key: string, anchor: ScrollAnchor) {
