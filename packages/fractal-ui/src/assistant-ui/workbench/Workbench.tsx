@@ -56,7 +56,7 @@ import { WorkbenchPresentationContext, type WorkbenchAppearance, type WorkbenchP
 export interface WorkbenchProps {
   layout: WorkbenchLayout
   resources: WorkbenchResources
-  /** Device-local workspace id; keys the persisted ratios and active tabs. */
+  /** Device-local workspace id; scopes persisted ratios, active tabs, and each pane's composer draft. */
   workspaceId?: string
   scheme?: 'dark' | 'light'
   style?: stylex.StyleXArray<stylex.CompiledStyles>
@@ -139,7 +139,7 @@ export function Workbench({ layout, resources, workspaceId = 'default', scheme =
         <PaneSlotsProvider value={panes.slots}>
         <LayoutNode node={layout} path="0" layout={currentLayout} workspaceId={workspaceId} resources={resources} renderPane={renderPane} hideSingleTabBar={hideSingleTabBar} focusedPaneKey={focusedPaneKey ?? localFocus} onPaneSelect={selectPane} onLayoutChange={onLayoutChange === undefined ? undefined : changeLayout} onRatioCommit={onRatioCommit} />
         </PaneSlotsProvider>
-        <PaneLayer visible={panes.visible} canClose={node => onLayoutChange !== undefined && !hideSingleTabBar && node.tabs.length === 1 && appearance?.chrome !== 'P2'} render={pane => <PaneHost pane={pane} resources={resources} renderPane={renderPane} />} />
+        <PaneLayer visible={panes.visible} canClose={node => onLayoutChange !== undefined && !hideSingleTabBar && node.tabs.length === 1 && appearance?.chrome !== 'P2'} render={pane => <PaneHost pane={pane} resources={resources} workspaceId={workspaceId} renderPane={renderPane} />} />
       </div>
       </ViewportStoreContext.Provider>
       </WorkbenchPresentationContext.Provider>
@@ -336,17 +336,16 @@ function TabGroupNode({ node, path, layout, workspaceId, resources, hideSingleTa
       if (surviving.has(vacated)) continue
       registry.set(splitRatioFamily(`${workspaceId}:${vacated}`), defaultRatio)
     }
-    // Focus follows the exact pane that takes the space (its group path and displayed key), never a URI
-    // another view of the same resource may share.
+    // Capture the displayed host before promotion. Its persistent element moves with the pane;
+    // focus must not depend on the old group's path or the replacement tab provider's timing.
     const workbench = groupElement.current?.closest('[data-testid="workbench"]')
-    const neighbourPath = findGroupPath(sibling, undefined, parentPath)!
-    const shownKey = workbench?.querySelector<HTMLElement>(`[data-layout-path="${findGroupPath(sibling, undefined, siblingPath)}"] [data-pane-key]`)?.dataset.paneKey
-    const neighbourKey = shownKey ?? layoutPaneKeys(sibling)[0]!
+    const neighbour = workbench?.querySelector<HTMLElement>(`[data-layout-path="${findGroupPath(sibling, undefined, siblingPath)}"] [data-pane-key]`)
+    const neighbourKey = neighbour?.dataset.paneKey ?? layoutPaneKeys(sibling)[0]!
     change(next)
     onPaneSelect?.(neighbourKey)
     requestAnimationFrame(() => {
-      const neighbour = workbench?.querySelector<HTMLElement>(`[data-layout-path="${neighbourPath}"] [data-pane-key="${CSS.escape(neighbourKey)}"]`)
-      neighbour?.querySelector<HTMLElement>('[data-testid="composer-input"], [tabindex="0"], button')?.focus({ preventScroll: true })
+      const host = neighbour ?? workbench?.querySelector<HTMLElement>(`[data-pane-key="${CSS.escape(neighbourKey)}"]`)
+      host?.querySelector<HTMLElement>('[data-testid="composer-input"], [tabindex="0"], button')?.focus({ preventScroll: true })
     })
   }
 
@@ -373,7 +372,7 @@ function TabGroupNode({ node, path, layout, workspaceId, resources, hideSingleTa
   if (hideSingleTabBar && node.tabs.length === 1) {
     return (
       <AgentDropSurface path={path} labelPrefix={workspaceId} onOpen={openAgent} isDisabled={onLayoutChange === undefined}>
-      <div data-testid="tab-group" data-layout-path={path} {...stylex.props(styles.group)}>
+      <div ref={groupElement} data-testid="tab-group" data-layout-path={path} {...stylex.props(styles.group)}>
         <PaneSlot pane={activePane} path={path} />
       </div>
       </AgentDropSurface>
@@ -398,6 +397,7 @@ function TabGroupNode({ node, path, layout, workspaceId, resources, hideSingleTa
   return (
     <AgentDropSurface path={path} labelPrefix={workspaceId} onOpen={openAgent} isDisabled={onLayoutChange === undefined}>
     <Tabs
+      ref={groupElement}
       selectedKey={active}
       onSelectionChange={key => select(String(key))}
       aria-label="Workspace panes"
@@ -457,7 +457,7 @@ const nextThreadPane = (): WorkbenchPane => {
 }
 
 /** Generic pane host: maps a pane key to its resource kind; `renderPane` wins when it returns a node. */
-export const PaneHost = React.memo(function PaneHost({ pane, resources, renderPane }: { pane: WorkbenchPane; resources: WorkbenchResources; renderPane?: (pane: WorkbenchPane) => React.ReactNode }) {
+export const PaneHost = React.memo(function PaneHost({ pane, resources, workspaceId = 'default', renderPane }: { pane: WorkbenchPane; resources: WorkbenchResources; workspaceId?: string; renderPane?: (pane: WorkbenchPane) => React.ReactNode }) {
   React.useLayoutEffect(() => {
     if (developmentMeasurements !== undefined) incrDebug(`Mounts.Pane.${paneKey(pane)}`)
   }, [pane])
@@ -469,7 +469,7 @@ export const PaneHost = React.memo(function PaneHost({ pane, resources, renderPa
   return (
     <RenderProfiler id={`Pane.${paneKey(pane)}`}>
     <div data-pane-kind={kind} data-pane-uri={pane.uri} data-pane-key={paneKey(pane)} {...stylex.props(styles.pane)}>
-      {kind === 'thread' ? <ThreadPane pane={pane} resources={resources} />
+      {kind === 'thread' ? <ThreadPane pane={pane} resources={resources} workspaceId={workspaceId} />
         : kind === 'diff' ? <DiffPane pane={pane} resources={resources} />
         : <PlaceholderPane pane={pane} />}
     </div>
@@ -477,19 +477,19 @@ export const PaneHost = React.memo(function PaneHost({ pane, resources, renderPa
   )
 })
 
-function ThreadPane({ pane, resources }: { pane: WorkbenchPane; resources: WorkbenchResources }) {
-  const { appearance, describePane } = React.useContext(WorkbenchPresentationContext)
+function ThreadPane({ pane, resources, workspaceId }: { pane: WorkbenchPane; resources: WorkbenchResources; workspaceId: string }) {
+  const { appearance, landmarkContext, describePane } = React.useContext(WorkbenchPresentationContext)
   const thread = resources.threads.get(pane.uri)
   const controls = resources.threadControls?.get(pane.uri)
   if (thread === undefined) return <PlaceholderPane pane={pane} message="This thread is not available on this device." />
   const title = describePane?.(pane).title ?? thread.title ?? paneTitle(pane)
   return <EmbraceRuntimeProvider options={thread.runtime}>
     <div data-thread-width={appearance?.width} {...stylex.props(styles.threadFrame, appearance?.width === 'W1' && fillTheme)}>
-      <Transcript {...thread.transcript} title={title} viewportKey={paneKey(pane)} />
+      <Transcript {...thread.transcript} title={title} viewportKey={paneKey(pane)} landmarkContext={`${landmarkContext ?? workspaceId}, ${paneKey(pane)}`} />
     </div>
     <div data-testid="workbench-composer-dock" {...stylex.props(styles.composerDock, dockTheme)}>
       <div {...stylex.props(styles.composerLane)}>
-        <Composer agent={title} running={thread.runtime.isRunning === true} folder={controls?.folder} branch={controls?.branch} onSend={controls?.onSend} onSteer={controls?.onSteer} onStop={controls?.onStop} draftKey={`workbench.${paneKey(pane)}`} />
+        <Composer agent={title} running={thread.runtime.isRunning === true} folder={controls?.folder} branch={controls?.branch} onSend={controls?.onSend} onSteer={controls?.onSteer} onStop={controls?.onStop} draftKey={`workbench.${workspaceId}.${paneKey(pane)}`} />
       </div>
     </div>
   </EmbraceRuntimeProvider>

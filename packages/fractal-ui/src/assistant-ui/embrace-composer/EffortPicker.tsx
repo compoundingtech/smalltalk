@@ -28,9 +28,12 @@ export function EffortPicker({ control, value, pinned, onChange, onPinnedChange,
   const selected = value !== undefined && control.values.includes(value) ? value : control.default
   return <div {...stylex.props(styles.group)}>
     <MenuTrigger>
-      <Button aria-label="Select effort" {...stylex.props(styles.button, compact && styles.buttonCompact)}>
-        {compact ? <><Icon name="clock" size={12} /><RenderProfiler id="EffortValue"><span title={`Effort: ${effortLabel(selected)}`}>{effortLabel(selected)}</span></RenderProfiler></> : <><RenderProfiler id="EffortValue"><span>Effort: {effortLabel(selected)}</span></RenderProfiler><Icon name="chevron-down" size={12} /></>}
-      </Button>
+      <TooltipTrigger delay={150} closeDelay={0}>
+        <Button aria-label={`Select effort: ${effortLabel(selected)}`} {...stylex.props(styles.button, compact && styles.buttonCompact)}>
+          {compact ? <><Icon name="clock" size={12} /><RenderProfiler id="EffortValue"><span>{effortLabel(selected)}</span></RenderProfiler></> : <><RenderProfiler id="EffortValue"><span>Effort: {effortLabel(selected)}</span></RenderProfiler><Icon name="chevron-down" size={12} /></>}
+        </Button>
+        <Tooltip {...stylex.props(styles.popup)}>Effort: {effortLabel(selected)}</Tooltip>
+      </TooltipTrigger>
       <Popover {...stylex.props(styles.popup)}>
         <Menu aria-label="Message effort" onAction={key => { if (key === pinItemId) onPinnedChange(!pinned); else onChange(String(key)) }}>
           <MenuSection selectionMode="single" selectedKeys={[selected]} shouldCloseOnSelect={false}>

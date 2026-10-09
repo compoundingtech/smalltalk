@@ -53,6 +53,9 @@ export function ComposerSession({ draftKey, ...props }: ComposerSessionProps & {
 }
 function ComposerSessionBody({ draftKey, layout, runningBehavior, mentions, targeting, initialDraft, initialTokenDraft, initialImage, recipients, models, limitedMentions, allMentions, mentionHints, failure, offline, effortControl = unknownEffort, queuedEffort }: ComposerSessionProps & { readonly draftKey: string }) {
   const aui = useAui()
+  // Client snapshots commit with React; send handlers must preserve metadata
+  // written by TokenField's bridge earlier in the same event.
+  const composerStateNow = () => aui.composer.__internal_getRuntime?.().getState() ?? aui.composer().getState()
   const running = useAuiState(state => state.thread.isRunning)
   const runtimeText = useAuiState(state => state.composer.text)
   const [saved] = React.useState(() => {
@@ -73,13 +76,13 @@ function ComposerSessionBody({ draftKey, layout, runningBehavior, mentions, targ
   React.useLayoutEffect(() => {
     const composer = aui.composer()
     composer.setText(saved.text)
-    const runConfig = composer.getState().runConfig
+    const runConfig = composerStateNow().runConfig
     composer.setRunConfig({ ...runConfig, custom: { ...runConfig.custom, explorerTarget: initialTarget.current } })
     if (initialImage !== undefined) void composer.addAttachment(initialImage)
     let timer: number | undefined
     let lastPersisted: string | null = null
     const persist = () => {
-      const text = composer.getState().text
+      const text = composerStateNow().text
       const next = tokens.current.text === text ? tokens.current : { text }
       const encoded = Schema.encodeSync(savedDraftJson)(next)
       if (encoded === lastPersisted) return
@@ -94,15 +97,15 @@ function ComposerSessionBody({ draftKey, layout, runningBehavior, mentions, targ
     setTokenSnapshot({ draft, runtimeText: serialized.content })
   }, [])
   const writeTarget = (next: ComposerTarget) => {
-    const runConfig = aui.composer().getState().runConfig
+    const runConfig = composerStateNow().runConfig
     aui.composer().setRunConfig({ ...runConfig, custom: { ...runConfig.custom, explorerTarget: next } })
     setTarget(next)
   }
   const send = (steer: boolean) => {
     setAsk(false)
     const composer = aui.composer()
-    if (!composer.getState().canSend || offline) return
-    const runConfig = composer.getState().runConfig
+    if (!composerStateNow().canSend || offline) return
+    const runConfig = composerStateNow().runConfig
     const selected = effortControl.state === 'supported'
       ? effort !== undefined && effortControl.values.includes(effort) ? effort : effortControl.default
       : undefined
@@ -112,10 +115,10 @@ function ComposerSessionBody({ draftKey, layout, runningBehavior, mentions, targ
     if (!effortPinned) setEffort(undefined)
   }
   const requestSubmit = (modified: boolean) => {
-    if (!aui.composer().getState().canSend) return
+    if (!composerStateNow().canSend) return
     if (mentions === 'M1') {
-      const runConfig = aui.composer().getState().runConfig
-      aui.composer().setRunConfig({ ...runConfig, custom: { ...runConfig.custom, embraceDraft: { content: aui.composer().getState().text, mentions: [], commands: [] } } })
+      const state = composerStateNow()
+      aui.composer().setRunConfig({ ...state.runConfig, custom: { ...state.runConfig.custom, embraceDraft: { content: state.text, mentions: [], commands: [] } } })
     }
     if (running && runningBehavior === 'R3') { setAsk(true); return }
     send(running && (runningBehavior === 'R1' ? modified : !modified))
