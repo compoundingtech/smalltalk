@@ -265,9 +265,8 @@ impl Connection {
                     phase,
                     "preceding-connection",
                     duration(from, to),
-                    0,
+                    (0, "unix"),
                     "",
-                    "unix",
                     0,
                 );
             }
@@ -363,11 +362,11 @@ impl Inner {
         phase: Phase,
         state: &str,
         elapsed_us: u64,
-        attempt: u8,
+        attempt: (u8, &str),
         binding: &str,
-        transport: &str,
         http_status: u16,
     ) {
+        let (attempt, transport) = attempt;
         let Ok(sequence) = self
             .records
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -465,9 +464,8 @@ impl Trace {
             phase,
             if safe { kind } else { "identity-not-recorded" },
             0,
-            self.1,
+            (self.1, self.2),
             if safe { value } else { "" },
-            self.2,
             0,
         );
     }
@@ -478,22 +476,27 @@ impl Trace {
             Phase::Authenticate,
             "completed",
             elapsed,
-            self.1,
+            (self.1, self.2),
             "",
-            self.2,
             0,
         );
     }
 
     pub(crate) fn http_status(&self, status: u16) {
         self.0
-            .emit(Phase::Headers, "status", 0, self.1, "", self.2, status);
+            .emit(Phase::Headers, "status", 0, (self.1, self.2), "", status);
     }
 
     pub(crate) fn bind(&self, digest: &str) {
         if valid_digest(digest) {
-            self.0
-                .emit(Phase::RequestBinding, "bound", 0, self.1, digest, self.2, 0);
+            self.0.emit(
+                Phase::RequestBinding,
+                "bound",
+                0,
+                (self.1, self.2),
+                digest,
+                0,
+            );
         }
     }
 
@@ -505,16 +508,15 @@ impl Trace {
                 Phase::ResponseBinding,
                 "response-id",
                 0,
-                self.1,
+                (self.1, "unix"),
                 id,
-                "unix",
                 0,
             );
         }
     }
 
     pub(crate) fn span(&self, phase: Phase) -> Span {
-        self.0.emit(phase, "started", 0, self.1, "", self.2, 0);
+        self.0.emit(phase, "started", 0, (self.1, self.2), "", 0);
         Span {
             trace: Some(self.clone()),
             phase,
@@ -605,9 +607,8 @@ impl Span {
                     Outcome::Panicked => "panicked",
                 },
                 micros(started),
-                trace.1,
+                (trace.1, trace.2),
                 "",
-                trace.2,
                 0,
             );
         }
