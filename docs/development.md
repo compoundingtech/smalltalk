@@ -199,6 +199,24 @@ memoized, so a switch never re-renders a retained transcript. The panes are port
 outside the workspace's shell context providers. Those providers change on every switch, and
 React would otherwise walk every retained fiber looking for consumers.
 
+`node apps/fractal-web/scripts/switch-budget-proof.mjs [--turns=100] [--baseline]` builds a
+production bundle with a synthetic three-agent fixture
+(`apps/fractal-web/scripts/switch-budget-fixture.tsx`). The fixture's turns contain markdown,
+lists and TypeScript fences, and it serves first pages after a fixed 120 ms delay. The script
+drives Chrome through `playwright-cli` and times each switch from the roster click (capture
+phase) to the paint that first shows the selected, visible lane with turns and no placeholder
+(rAF, then a MessageChannel task). It takes two first opens (B3: the 300 ms budget, including
+the synthetic server wait, reported as click to request, request to frame and frame to
+paint), then nine untraced switches back (B2: the median must stay under 50 ms). A separate
+traced pass reports where the time goes. `--baseline` prints without failing. The numbers
+depend on host load, so compare runs interleaved on the same host.
+`--regression=notice` checks that Usage and Terminal notices are exposed by real browser
+hit-testing after opening a transcript. `--regression=keyboard` holds the deferred hide,
+then checks that the covered composer loses focus, cannot regain it, leaves the accessibility
+tree and cannot send its retained draft on Enter. Its synthetic send port records attempted
+sends and refuses them without contacting a gateway. Both regressions fail independently of
+the timing gate.
+
 ## Fractal web captured changes
 
 The Changes panel reuses `source.conversation(agentRef)`: its live source follows
