@@ -406,9 +406,13 @@ impl Slice {
     }
 
     fn capture(&self) -> Result<OwnedPage> {
+        self.capture_with_inputs(PAGE_ROWS, PAGE_ROWS * REFERENCE_BYTES)
+    }
+
+    fn capture_with_inputs(&self, input_rows: usize, input_bytes: usize) -> Result<OwnedPage> {
         self.read(|db| {
             self.check(db)?;
-            let mut page=self.installer.prepare_live_bounded(db,VIEW,limits(),PAGE_ROWS,PAGE_ROWS*REFERENCE_BYTES)?;
+            let mut page=self.installer.prepare_live_bounded(db,VIEW,limits(),input_rows,input_bytes)?;
             ensure!(page.rows().len()<=PAGE_ROWS,"fixture input fanout exceeded");
             page.capture_table(db,"slice_output")?;
             page.capture_table(db,"slice_coverage")?;
@@ -678,6 +682,161 @@ fn owned_page_newer_input_foreground_interleave_and_consumed_prefix_reclamation(
         "a stale prepared prefix must not double-apply"
     );
     assert_eq!(slice.tuple()?.4, 3);
+    Ok(())
+}
+
+#[test]
+fn cumulative_reference_bytes_stop_before_next_input_and_exact_retry_preserves_old_budget()
+-> Result<()> {
+    let (_root, slice) = fixture()?;
+    append(&slice, "note/byte-first")?;
+    append(&slice, "note/byte-second")?;
+    let sizes = slice.read(|db| {
+        let mut statement = db.prepare(
+            "SELECT bytes FROM main.ivm_install_journal WHERE source=?1 ORDER BY revision LIMIT 2",
+        )?;
+        Ok(statement
+            .query_map([SOURCE], |r| r.get::<_, usize>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    })?;
+    assert_eq!(sizes.len(), 2);
+    assert!(sizes[0] > 1 && sizes[1] <= sizes[0] && sizes[0] <= REFERENCE_BYTES);
+    let before = slice.tuple()?;
+    assert!(slice.capture_with_inputs(PAGE_ROWS, sizes[0] - 1).is_err());
+    assert_eq!(slice.tuple()?, before);
+    slice.read(|db| {
+        slice.check(db)?;
+        let mut old = slice.installer.prepare_live(
+            db,
+            VIEW,
+            PublicationLimits {
+                rows: PAGE_ROWS,
+                bytes: sizes[0],
+                tables: 2,
+            },
+        )?;
+        assert_eq!(old.rows().len(), 1);
+        assert_eq!(old.position().revision, 1);
+        old.capture_table(db, "slice_output")?;
+        assert!(
+            old.upsert(
+                "slice_output",
+                vec![
+                    Sql::Text("id".into()),
+                    Sql::Text("subject".into()),
+                    Sql::Text("kind".into()),
+                    Sql::Text("digest".into())
+                ]
+            )
+            .is_err(),
+            "original prepare_live must still charge references to its combined byte budget"
+        );
+        assert_eq!(
+            slice
+                .installer
+                .prepare_live(db, VIEW, limits())?
+                .rows()
+                .len(),
+            2
+        );
+        Ok(())
+    })?;
+    let owned = slice.capture_with_inputs(PAGE_ROWS, sizes[0])?;
+    assert_eq!(owned.images.len(), 1);
+    assert_eq!(owned.prepared.position().revision, 1);
+    let page = owned.reduce()?;
+    slice.publish(&page)?;
+    assert_eq!(slice.tuple()?, (2, 1, 2, 2, 1));
+    assert!(slice.ready_rows().is_err());
+    let after_first = slice.tuple()?;
+    assert!(slice.publish(&page).is_err());
+    assert_eq!(slice.tuple()?, after_first);
+    let second = slice.capture_with_inputs(PAGE_ROWS, sizes[1])?;
+    assert_eq!(second.images.len(), 1);
+    assert_eq!(second.prepared.position().revision, 2);
+    slice.publish(&second.reduce()?)?;
+    assert_eq!(slice.ready_rows()?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn witnessed_output_dml_then_coverage_failure_rolls_back_before_prefix_and_exact_retry()
+-> Result<()> {
+    use rusqlite::hooks::{Action, AuthAction, AuthContext, Authorization};
+    let (_root, slice) = fixture()?;
+    append(&slice, "note/in-turn-failure")?;
+    let page = slice.capture()?.reduce()?;
+    let before = slice.tuple()?;
+    let wrote_output = Arc::new(AtomicBool::new(false));
+    let refused_coverage = Arc::new(AtomicBool::new(false));
+    {
+        let mut writer = slice.store.connection.write_background();
+        // Plain supplies no WriterObserver/authorizer. These hooks belong only to this
+        // fixture fault, do no SQL, and are removed before returning the loan.
+        let wrote = wrote_output.clone();
+        writer.update_hook(Some(
+            move |action: Action, database: &str, table: &str, _| {
+                if action == Action::SQLITE_INSERT && database == "main" && table == "slice_output"
+                {
+                    wrote.store(true, Ordering::Release);
+                }
+            },
+        ));
+        let wrote = wrote_output.clone();
+        let refused = refused_coverage.clone();
+        writer.authorizer(Some(move |cx: AuthContext<'_>| {
+            if matches!(
+                cx.action,
+                AuthAction::Insert {
+                    table_name: "slice_coverage"
+                }
+            ) && cx.database_name == Some("main")
+                && wrote.load(Ordering::Acquire)
+            {
+                refused.store(true, Ordering::Release);
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        }));
+        let result = (|| -> Result<()> {
+            let tx = writer.transaction()?;
+            slice.installer.publish_prepared(&tx, &page, 1)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        writer.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        writer.update_hook(None::<fn(Action, &str, &str, i64)>);
+        assert!(result.is_err());
+        assert!(
+            writer.is_autocommit(),
+            "fault must resolve the fixture outer transaction"
+        );
+    }
+    assert!(
+        wrote_output.load(Ordering::Acquire),
+        "outside-SQL witness must observe actual output DML"
+    );
+    assert!(
+        refused_coverage.load(Ordering::Acquire),
+        "fault must occur after that DML and before coverage/P"
+    );
+    assert_eq!(slice.tuple()?, before);
+    assert!(slice.ready_rows().is_err());
+    slice.read(|db| {
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM main.slice_coverage WHERE through<>0",
+                [],
+                |r| r.get::<_, u64>(0)
+            )?,
+            0
+        );
+        Ok(())
+    })?;
+    slice.publish(&page)?;
+    assert_eq!(slice.tuple()?, (1, 1, 1, 1, 1));
+    assert_eq!(slice.ready_rows()?.len(), 1);
     Ok(())
 }
 

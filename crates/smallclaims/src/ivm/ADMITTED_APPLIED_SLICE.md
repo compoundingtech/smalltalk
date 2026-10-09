@@ -208,11 +208,16 @@ post-success commit counter lines stay its owner’s. No st3 Runtime/constructor
 reactor, route, thread candidate, card or health-source hunk is reserved.
 
 The first source slice is the additive real-Store fixture and bounded-input
-page adapter above, ready for exact review against this pinned base. Twelve
+page adapter above, ready for exact review against this pinned base. Fourteen
 normal tests (including the crash subprocess entry) and one named work-accounting
 prerequisite are authored, all UNRUN. With test-support that prerequisite requires
 positive traced statements and unchanged 128-statement/50,000-VM ceilings;
 without test-support its same-name twin fails explicitly rather than disappearing.
+The byte-bound control admits exactly one fitting reference while leaving the
+next individually small reference pending, refuses a one-byte-short bound,
+and checks the original selection/combined accounting. The in-turn fault control
+uses fixture-owned hooks with an outside-SQL atomic witness of actual output DML,
+then refuses coverage insertion before P; rollback and exact retry are checked.
 The fixture physical read owner
 refuses inherited pinned readers, checks idle acquisition/exit, removes
 cancellation before ROLLBACK, discards its exact reader on failed exit and
