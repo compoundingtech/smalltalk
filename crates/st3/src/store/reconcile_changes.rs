@@ -140,6 +140,14 @@ mod tests {
             VALUES(0,?1,'harness.observed','{}',1)", [format!("agent/{number}")]).unwrap();
     }
 
+    fn json_body_with_bytes(bytes: usize) -> String {
+        // Preserve the exact payload size while satisfying the production JSON indexes.
+        assert!(bytes >= 2);
+        let body = serde_json::to_string(&"x".repeat(bytes - 2)).unwrap();
+        assert_eq!(body.len(), bytes);
+        body
+    }
+
     #[test]
     fn empty_discovery_is_one_statement_and_does_not_hold_a_snapshot() {
         let store = Store::open_memory("node").unwrap();
@@ -197,7 +205,7 @@ mod tests {
             (CHANGE_BYTES as usize, true),
         ] {
             let store = Store::open_memory("node").unwrap();
-            claim(&store.connection.write(), 1, &"x".repeat(bytes));
+            claim(&store.connection.write(), 1, &json_body_with_bytes(bytes));
             // 10-byte subject + 17-byte kind + 13-byte actor = 40 bytes beyond the body.
             let observed = store.reconcile_changes_since(0, 0).unwrap();
             assert_eq!(observed.invalidate_all, overflow);
@@ -286,13 +294,15 @@ mod tests {
                 } else {
                     local(&store.connection.write(), 1);
                 }
+                let wide_cell = if column == "body" {
+                    json_body_with_bytes(2 * CHANGE_BYTES as usize)
+                } else {
+                    "x".repeat(2 * CHANGE_BYTES as usize)
+                };
                 store
                     .connection
                     .write()
-                    .execute(
-                        &format!("UPDATE {table} SET {column}=?1"),
-                        [&"x".repeat(2 * CHANGE_BYTES as usize)],
-                    )
+                    .execute(&format!("UPDATE {table} SET {column}=?1"), [&wide_cell])
                     .unwrap();
                 store
                     .read_snapshot(|_| {
