@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Increase the default SQLite reader page-cache target from 2 MiB to 8 MiB",
+  "replay": {"status": "none", "detail": "No claim replay or projection rebuild is introduced."},
+  "schema": {"status": "none", "detail": "No database tables, indexes, migrations or schema version change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule or digest change; no coordinated member upgrade is required."},
+  "compatibility": {"status": "none", "detail": "No client, protocol or pairing contract change. The existing SMALLCLAIMS_READ_CACHE_KIB override remains supported."},
+  "downtime": {"status": "none", "detail": "No additional restart or first-open work is introduced. The process reads the cache override once; a normal daemon restart applies a changed environment setting. End-to-end restart latency was not measured."},
+  "manual": {"status": "changed", "detail": "Without an override, 128 retained idle readers now have about 1 GiB of nominal SQLite page-cache targets rather than 256 MiB. The writer adds 32 MiB, and the existing 512 MiB doctor reserve gives a 1568 MiB planning envelope, exceeding a 1 GiB service cap. Targets are advisory, not an RSS limit, and concurrent reader count is not capped. Memory-constrained installations can set SMALLCLAIMS_READ_CACHE_KIB=2048 in the daemon environment before restarting, or adjust their service memory limit. See docs/st3/profiling.md."},
+  "recovery": {"status": "none", "detail": "No persistent state is changed. Restoring SMALLCLAIMS_READ_CACHE_KIB=2048 or swapping back the binary restores the earlier cache target on restart; no database recovery is required."}
+}

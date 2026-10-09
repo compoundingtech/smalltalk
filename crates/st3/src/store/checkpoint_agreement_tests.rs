@@ -1174,3 +1174,94 @@ fn v9_v10_seals_wait_for_matching_rules_before_verifying() {
     assert_eq!(stable_cuts(&alder), [cut]);
     assert_eq!(stable_cuts(&birch), [cut]);
 }
+
+#[test]
+fn stale_rule_seals_do_not_end_excusal_until_normal_matching_runtime_reentry() {
+    let scratch = tempfile::tempdir().unwrap();
+    let first = context(scratch.path(), 0);
+    let [alder, birch] = ["alder", "birch"].map(|name| Store::open_memory(name).unwrap());
+    observe(&alder, 2);
+    observe(&birch, 2);
+    sync(&[&alder, &birch]);
+    alder.excuse_checkpoint_writer(&CheckpointExcuseRequest {
+        writer:"birch".into(), reason:"old runtime is away".into(), actor:"person/operator".into(),
+    }).unwrap();
+    sync(&[&alder, &birch]);
+    let cut = newest_due_cut(first.now_unix_ms);
+    let sealed = birch.checkpoint_sealed_identities(cut, None).unwrap();
+    birch.publish_seal(&checkpoint_name(cut), &SealTerms {
+        cut_unix_ms:cut, participants:names(&["alder", "birch"]),
+        sealed_digest:sealed.digest.clone(), rules_digest:"rules13".into(),
+    }, &sealed, None).unwrap();
+    sync(&[&alder, &birch]);
+    let status = alder.checkpoint_status(first.now_unix_ms, &[]).unwrap();
+    assert_eq!(status.excused, names(&["birch"]));
+    assert_eq!(status.participants, names(&["alder"]));
+    let actions = step(&alder, &first);
+    let CheckpointAction::Sealed { participants, .. } = &actions[0] else { panic!("{actions:?}") };
+    assert_eq!(participants, &names(&["alder"]));
+    assert_eq!(kinds(&step(&alder, &first)), ["verified"]);
+    sync(&[&alder, &birch]);
+    assert_eq!(kinds(&step(&alder, &first)), ["trimmed"]);
+    let next = CheckpointContext { now_unix_ms:first.now_unix_ms + DAY_MS, ..first };
+    let actions = step(&birch, &next);
+    if kinds(&actions).contains(&"manifest-needed") {
+        let need = birch.checkpoint_manifest_need().unwrap().unwrap();
+        let manifest = alder.checkpoint_manifest(&need.checkpoint, need.cut_unix_ms).unwrap();
+        assert_eq!(kinds(&birch.adopt_checkpoint(&manifest).unwrap()), ["trimmed"]);
+        assert_eq!(kinds(&step(&birch, &next)), ["sealed"]);
+    } else {
+        assert!(kinds(&actions).contains(&"trimmed"), "{actions:?}");
+        assert!(kinds(&actions).contains(&"sealed"), "{actions:?}");
+    }
+    sync(&[&alder, &birch]);
+    let status = alder.checkpoint_status(next.now_unix_ms, &[]).unwrap();
+    assert!(status.excused.is_empty());
+    assert_eq!(status.participants, names(&["alder", "birch"]));
+}
+
+#[test]
+fn the_agent_card_fold_matches_per_subject_reductions_after_a_trim() {
+    let scratch = tempfile::tempdir().unwrap();
+    let context = context(scratch.path(), 0);
+    let [alder, birch] = ["alder", "birch"].map(|name| Store::open_memory(name).unwrap());
+    for (store, seat) in [(&alder, "agent/alder.keeper"), (&birch, "agent/birch.keeper")] {
+        for (kind, fields) in [
+            ("runtime.observed", json!({"status": "running", "runtime_id": seat,
+                "incarnation_id": "keeper-1"})),
+            ("harness.observed", json!({"state": "working", "driver": "omp",
+                "incarnation_id": "keeper-1"})),
+            ("harness.observed", json!({"state": "idle", "driver": "omp",
+                "incarnation_id": "keeper-1"})),
+            ("runtime.observed", json!({"status": "stopped", "runtime_id": seat,
+                "incarnation_id": "keeper-1"})),
+            ("runtime.observed", json!({"status": "running", "runtime_id": seat,
+                "incarnation_id": "keeper-2"})),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: seat.into(),
+                    kind: kind.into(),
+                    actor: Some(seat.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+    }
+    sync(&[&alder, &birch]);
+    let mut trimmed = false;
+    for _ in 0..4 {
+        for node in [&alder, &birch] {
+            trimmed |= kinds(&step(node, &context)).contains(&"trimmed");
+        }
+        sync(&[&alder, &birch]);
+    }
+    assert!(trimmed, "the fixture reached a trim");
+    for node in [&alder, &birch] {
+        let indexes = (0..=node.index().unwrap()).collect::<Vec<_>>();
+        super::card_fold_tests::assert_card_fold_parity(node, &indexes);
+    }
+}

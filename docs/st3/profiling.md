@@ -4,6 +4,27 @@ A daemon that answers slowly is usually waiting, not computing: for the store's 
 one of its read connections, or for SQLite. The daemon can account for its own time so that a slow
 request names what it waited for and who held it.
 
+`GET /v1/client/request-latency` reports completed response-envelope timings without enabling
+profiling. Its `routes` array retains mixed route totals (`scope: "route"`) and adds independent
+`scope: "work-action"` rows for POST claim, renew, progress, complete, fail, release and extend.
+An action row has a static route such as `/v1/work/renew/{*subject}`, `method: "POST"` and
+`action: "renew"`; it retains no subject, body or token. Action samples are subsets of the mixed
+route totals, so do not add counts across scopes. The seven action buckets are independent of the
+256 general-route limit.
+
+Each row's `count` is its completed-response count since this process started, including error
+responses. Percentiles use its last at most 512 completions (`recent_count`), in whole milliseconds.
+Renew and claim have separate counts and percentile samples. `duration_scope: "response-envelope"`
+includes handler queueing, request work, durable admission and envelope serialization; it does not
+subtract writer wait or report only a hierarchy component. This is server completion time, not
+network delivery time. Abandoned and still-running requests have no sample. Existing long-poll
+route durations include deliberate waiting.
+
+For a deployed latency receipt, retain the process/source identity and before/after count delta.
+A low-volume tail can include requests from before the measurement window, and a restart resets
+these in-memory counters. The endpoint alone supplies no queue-versus-work breakdown; the phase
+profiling below supplies that context separately.
+
 Person-ask reconciliation checks for retained `work.person-asked` claims on a read connection
 after importing legacy asks. When there are none, it skips the writer queue so an empty stage
 does not delay the rest of the reconcile pass behind unrelated writes. When asks exist, their
@@ -128,7 +149,7 @@ Reads take an idle connection or open another when all retained connections are 
 pool retains up to 128 idle connections by default; `SMALLCLAIMS_MAX_IDLE_READ_CONNECTIONS`
 overrides that retention ceiling. It does not cap concurrent connections or make reads wait
 for an available slot. Nested reads and pinned snapshots keep their existing behavior.
-Each reader requests a fixed 2 MiB page-cache target by default. Set
+Each reader requests a fixed 8 MiB page-cache target by default. Set
 `SMALLCLAIMS_READ_CACHE_KIB` in the **daemon's** environment to override it in KiB; positive
 integers through 2,147,483,647 are accepted, and invalid or zero values use the default.
 The value is read once per process. Retention still defaults to 128, preserving schema and
@@ -293,9 +314,14 @@ cross-thread pinned snapshot dependencies (#1381).
 
 The doctor planning envelope uses the larger of current open readers and idle retention,
 multiplied by the per-reader target, plus the writer's 32 MiB target and a 512 MiB reserve for
-schema/statements, projections, tasks and allocator overhead. At defaults this is 800 MiB,
-leaving 224 MiB beyond that reserve under a 1 GiB service cap. The reserve is a planning
-allowance, not an enforced limit or a guarantee for every graph or workload. On Linux, doctor
+schema/statements, projections, tasks and allocator overhead. At defaults this is 1,568 MiB:
+1 GiB for 128 retained reader caches, 32 MiB for the writer and the 512 MiB reserve.
+The 1 GiB cap used in diagnostic examples is illustrative, not the service default:
+the Home Manager module defaults `memoryMax` to `"8G"` and installations can override it.
+For an installation limited to 1 GiB, set `SMALLCLAIMS_READ_CACHE_KIB=2048` to restore
+the 800 MiB planning envelope, or adjust its service limit.
+The reserve is a planning allowance, not an enforced limit or a guarantee for every graph
+or workload. On Linux, doctor
 locates the daemon's own cgroup v2 mount and checks `memory.max` and `memory.events` in that
 cgroup and its visible ancestors. It warns when the tightest limit is below the planning
 envelope, any `max` counter records pressure, or the files cannot be inspected. Ancestor

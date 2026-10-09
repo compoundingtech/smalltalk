@@ -96,11 +96,18 @@ impl<'connection> WriterTransaction<'connection> {
     /// Run bounded source maintenance in this transaction, then commit. Errors propagate
     /// with their original causes; SQLite storage errors remain downcastable.
     pub fn commit(self) -> Result<()> {
+        self.commit_checked(|| Ok(()))
+    }
+
+    /// A writer-owned scope may refuse immediately before COMMIT, after managed finalizers.
+    /// A check error drops/rolls back the transaction. It cannot cancel a completed COMMIT.
+    pub(super) fn commit_checked(self, check: impl FnOnce() -> Result<()>) -> Result<()> {
         ensure!(
             !self.transaction.is_autocommit(),
             "writer transaction was ended through raw SQL"
         );
         self.finalizers.run(&self.transaction)?;
+        check()?;
         self.transaction.commit()?;
         Ok(())
     }

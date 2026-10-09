@@ -5,7 +5,7 @@ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import SegmentedControl from '@react-native-segmented-control/segmented-control';
 import { saidRows, type SaidRow } from '../conversationSearch';
 import { AGENT_LEGEND, agentGlyph, agentRows, agentSections, agentTreeLines, filterAgentRows, harnessColor, UNMANAGED_GROUP, type AgentRowView, type TreeLine } from '../agentsView';
-import { Banners, Empty, StatusLine, useDebugScroll, useListsOnFocus, useRefresh } from '../chrome';
+import { Banners, Empty, StatusLine, useDebugScroll, useListsOnFocus, useMissionsOnFocus, useRefresh } from '../chrome';
 import { ContextMenu, type MenuAction } from '../menu';
 import type { RootParams } from '../navigation';
 import { sessionDetail } from '@smalltalk/st3-views';
@@ -25,6 +25,7 @@ export function AgentsScreen() {
   const { data, gatewayHost, truncated, hasSynced, loadErrors, treeView, setTreeView, status, actions } = useStore();
   const navigation = useNavigation<NativeStackNavigationProp<RootParams>>();
   useListsOnFocus(['sessions']);
+  useMissionsOnFocus();
   const refresh = useRefresh(['sessions']);
   const list = useRef<SectionList<AgentRowView>>(null), tree = useRef<FlatList<TreeLine>>(null);
   useDebugScroll(list as never);

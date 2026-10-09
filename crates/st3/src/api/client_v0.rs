@@ -61,6 +61,9 @@ struct CollectionSubscription {
     cursor: Option<collection_ivm::Delivered>,
     order: Vec<String>,
     has_more: bool,
+    /// The roster publication revision when this window's last read began. An agents window
+    /// rereads once a later roster is published, even at the same graph index.
+    roster_revision: u64,
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
@@ -243,7 +246,11 @@ async fn collection_items_with_windows(
     let arrangement_window = collection == "arrangements";
     let mut admitted = collection != "agents";
     let (snapshot, mut items, mut has_more) = loop {
-        let roster_admission = if matches!(collection.as_str(), "agents" | "summary") && admitted {
+        // Summary reads the published roster once a refresher keeps one; only a store without
+        // one folds it here, behind the shared admission.
+        let roster_admission = if admitted && (collection == "agents"
+            || collection == "summary" && !state.store.agent_roster_refresher_running())
+        {
             Some(state.store.admit_agent_resources().await)
         } else {
             None
@@ -263,6 +270,7 @@ async fn collection_items_with_windows(
         let (result, read_permit, admission) = super::blocking_store(move || {
         // The worker owns both guards until its physical snapshot finishes, including
         // after caller cancellation. A miss returns them without allocating shared guards.
+        let mut admission = admission;
         let result = crate::profile::task(collection_window_label(&collection), || {
             let _roster_admission = roster_admission;
             let store = state.store.clone();
@@ -292,16 +300,47 @@ async fn collection_items_with_windows(
                     Ok(current) => current,
                     Err(error) => return Ok(Err(error)),
                 };
-                let snapshot = client_snapshot_at(&state, index);
-                let at = snapshot.created_at.clone();
-                let cached_agents = if collection == "agents" && !admitted {
-                    let Some(cards) = store.agent_resources_cached_at(index, false, None)? else {
-                        return Ok(Ok(None));
-                    };
-                    Some(cards)
+                // A miss of this exact cut serves the newest published roster under that
+                // roster's own snapshot, past the window cache, and wakes its refresher.
+                // Every served roster says when it was published.
+                let mut published = None;
+                let mut published_at = None;
+                let cached_agents = if collection == "agents" {
+                    match store.agent_resources_published_at(index, false, None)? {
+                        Some((cards, at)) => {
+                            published_at = Some(at);
+                            Some(cards)
+                        }
+                        // Before the first complete roster, an unfiltered window can come
+                        // from the head the refresher publishes first.
+                        None => match store.published_agent_roster(index, false).or_else(|| {
+                            status.is_none().then(|| store.published_agent_roster_head(index, limit + 1))
+                                .flatten().map(|(cut, _, head, at)| (cut, Arc::new(head), at))
+                        }) {
+                            Some((cut, cards, at)) => {
+                                store.request_agent_roster_refresh();
+                                published = Some(cut);
+                                published_at = Some(at);
+                                Some(cards)
+                            }
+                            // A daemon's readers never fold the roster: until its refresher
+                            // has published one, the window is not ready yet.
+                            None if store.agent_roster_refresher_running() => {
+                                store.request_agent_roster_refresh();
+                                return Ok(Err(super::agent_roster_not_ready()));
+                            }
+                            None if admitted => None,
+                            None => return Ok(Ok(None)),
+                        },
+                    }
                 } else {
                     None
                 };
+                let snapshot = match published_at {
+                    Some(at) => super::roster_snapshot(&state, published.unwrap_or(index), at),
+                    None => client_snapshot_at(&state, index),
+                };
+                let at = snapshot.created_at.clone();
                 let compute = || {
                     let mut items = match collection.as_str() {
                         "summary" => {
@@ -334,10 +373,18 @@ async fn collection_items_with_windows(
                         "attention" => {
                             client_attention_resources_at(&store, person.as_deref(), false, now)?
                         }
-                        "agents" => match &cached_agents {
-                            Some(cards) => (**cards).clone(),
-                            None => client_agent_resources_cached(&store, false, index)?,
-                        },
+                        "agents" => {
+                            // Unfiltered windows keep one row past the limit for `has_more`.
+                            let keep = if status.is_none() { limit + 1 } else { usize::MAX };
+                            match &cached_agents {
+                                Some(cards) => cards.iter().take(keep).cloned().collect(),
+                                None => {
+                                    let mut cards = client_agent_resources_cached(&store, false, index)?;
+                                    cards.truncate(keep);
+                                    cards
+                                }
+                            }
+                        }
                         "work" => client_work_resources(
                             &store,
                             actor.as_deref(),
@@ -360,7 +407,7 @@ async fn collection_items_with_windows(
                     items.truncate(limit);
                     Ok((items, has_more))
                 };
-                let (mut items, mut has_more) = match &windows {
+                let (mut items, mut has_more) = match windows.as_ref().filter(|_| published.is_none()) {
                     Some(windows) => windows.read(
                         &state,
                         &current,
@@ -376,6 +423,9 @@ async fn collection_items_with_windows(
                     None => compute()?,
                 };
                 if collection == "agents" {
+                    // The window's shared rows are in hand; each reader's live overlay runs
+                    // beside the others instead of behind them.
+                    drop(admission.take());
                     overlay_agent_resources(&store, &mut items, &at)?;
                     if let Some(status) = &status {
                         items.retain(|item| item["state"].as_str() == Some(status.as_str()));
@@ -757,6 +807,68 @@ async fn conversation_changes_value(
     conversation_changes_local(state, session, session_id, after, wait_ms).await
 }
 
+/// Capture the first page and its replay boundary with one timeline read. The graph and local
+/// frontiers precede the read, so a concurrent append remains replayable after this page.
+async fn conversation_open_value(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    remote: Option<&str>,
+) -> Result<(Value, Value), ApiError> {
+    if remote.is_some() {
+        // Existing owners relay the two public reads. Keep mixed-build relay compatibility.
+        let start = conversation_changes_value(state, session, session_id, remote, None, 0).await?;
+        let page = conversation_page(state, session, session_id, remote).await?;
+        return Ok((start, page));
+    }
+    let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
+    crate::api::read_deadline::spawn_blocking(move || {
+        conversation_open_local(&state, &session, &session_id)
+    }).await.map_err(ApiError::internal)?
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_CONVERSATION_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_CONVERSATION_PAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn conversation_open_local(
+    state: &AppState, session: &ClientSession, session_id: &str,
+) -> Result<(Value, Value), ApiError> {
+    // Local rows follow a graph position. Capture their high-water first: a row newer than
+    // the graph cut must never be excluded from both this page and its replay cursor.
+    let local_position = local_latest_position(state)?;
+    let snapshot = new_client_snapshot(state);
+    #[cfg(test)]
+    AFTER_CONVERSATION_SNAPSHOT.with(|pause| {
+        if let Some(pause) = pause.borrow_mut().take() { pause(); }
+    });
+    let mark = ConversationMark::new(state, session_id)?;
+    #[cfg(test)]
+    BEFORE_CONVERSATION_PAGE.with(|pause| {
+        if let Some(pause) = pause.borrow_mut().take() { pause(); }
+    });
+    let page = timeline_value(
+        state, &snapshot, session, session_id,
+        &ClientListQuery { limit: Some(200), ..Default::default() },
+    )?.0;
+    let native = native_latest_sequence(&page);
+    let cursor = conversation_cursor(
+        state, session_id, snapshot.store_index, local_position, native,
+    );
+    remember_cursor(&cursor, mark.transcript_seen);
+    Ok((json!({"next_cursor":cursor}), page))
+}
+
+fn native_latest_sequence(page: &Value) -> u64 {
+    page["items"].as_array().into_iter().flatten()
+        .filter(|item| item["id"].as_str()
+            .is_some_and(|id| id.starts_with("timeline-entry/native-")))
+        .filter_map(|item| item["sequence"].as_u64())
+        .max().unwrap_or(0)
+}
+
 /// Follow one conversation for a collection socket: its newest page, then each change, until
 /// the socket stops listening. A change the server can no longer replay sends the page again.
 fn conversation_stream_error(id: &str, error: &ApiError) -> Value {
@@ -776,24 +888,8 @@ async fn follow_conversation(
     let remote = remote.as_deref();
     let failed = |error: &ApiError| conversation_stream_error(&id, error);
     loop {
-        // The cursor first, so nothing that lands while the page is read is lost.
-        let start = match conversation_changes_value(&state, &session, &session_id, remote, None, 0)
-            .await
-        {
-            Ok(start) => start,
-            Err(error) => {
-                if client_error_retryable(error.status, Some(&error.code)) {
-                    // Say why, so a client showing its last copy can say that copy is stale.
-                    if outbox.send((id.clone(), generation, json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true, "code":error.code, "message":error.message}))).is_err() { return; }
-                    tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
-                    continue;
-                }
-                let _ = outbox.send((id.clone(), generation, failed(&error)));
-                return;
-            }
-        };
-        let page = match conversation_page(&state, &session, &session_id, remote).await {
-            Ok(page) => page,
+        let (start, page) = match conversation_open_value(&state, &session, &session_id, remote).await {
+            Ok(opened) => opened,
             Err(error) => {
                 if client_error_retryable(error.status, Some(&error.code)) {
                     // Say why, so a client showing its last copy can say that copy is stale.
@@ -985,6 +1081,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     // the next loop and is reflected in a following change frame.
     let mut ivm_notices = sources.as_ref().map(|sources| sources.subscribe());
     let mut changed = state.event_notify.subscribe();
+    let mut roster = state.store.subscribe_agent_roster();
     let windows = collection_windows::Windows::attach(&state.store);
     let mut window_revisions = [0; 8];
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
@@ -1101,7 +1198,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         }
                         refresh.push(request.id.clone());
                         // Collection results and conversation frames share the same generation fence.
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, request });
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, request });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
@@ -1181,6 +1278,15 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
                 refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
             }
+            result = roster.changed(), if !command_waiting => {
+                if result.is_err() { return; }
+                // A window read before this roster was published rereads it.
+                let published = *roster.borrow_and_update();
+                reread_due |= subscriptions.values().any(|s| s.ivm.is_none()
+                    && s.request.collection == "agents" && s.roster_revision < published);
+                if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
+            }
             () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && (reread_due || subscriptions.values().any(|s| s.ivm.is_some() && s.dirty && s.reading.is_none())) => {
                 refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none() && reread_due || s.ivm.is_some() && s.dirty && s.reading.is_none()).map(|(id, _)| id.clone()));
                 last_reread = tokio::time::Instant::now();
@@ -1243,6 +1349,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 continue;
             }
             subscription.dirty = false;
+            subscription.roster_revision = *roster.borrow();
             let (cancel, canceled) = tokio::sync::oneshot::channel::<()>();
             subscription.reading = Some(cancel);
             let request = subscription.request.clone();
@@ -4181,7 +4288,9 @@ pub(super) async fn agent_queue(
     let store = state.store.clone();
     let lookup = agent.clone();
     let queue = blocking_store(move || {
-        if store.latest_claim(&lookup, None)?.is_none() {
+        // Only existence matters here. Reading the newest full claim sorts and decodes
+        // the agent's entire observation history before an otherwise empty queue read.
+        if store.latest_claim_id(&lookup)?.is_none() {
             return Ok(None);
         }
         store.seat_queue(&lookup).map(Some)
@@ -5084,6 +5193,10 @@ fn timeline_first_page(
     session_id: String,
     query: &ClientListQuery,
 ) -> Result<Json<Value>, ApiError> {
+    #[cfg(test)]
+    if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
+        *rebuilds.entry(session_id.to_owned()).or_default() += 1;
+    }
     let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
         .map_err(ApiError::internal)?;
     let Some((owner, incarnation, _)) = managed else {
@@ -5631,15 +5744,18 @@ fn conversation_read_now_unbounded(
     session_id: &str,
     after: Option<&str>,
 ) -> Result<Value, ApiError> {
-    #[cfg(test)]
-    if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
-        *rebuilds.entry(session_id.to_owned()).or_default() += 1;
-    }
     let snapshot = new_client_snapshot(state);
     let query = ClientListQuery { limit: Some(200), ..Default::default() };
     let page = match conversation_blocks::source(state, session_id) {
         // Replay selects only its newest bounded projection, including for OpenCode.
-        Ok(source) => native_slice_page(state, &snapshot, session, session_id, &query, &source),
+        Ok(source) => {
+            // Native replay bypasses timeline_first_page after the incremental-fold cutover.
+            #[cfg(test)]
+            if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
+                *rebuilds.entry(session_id.to_owned()).or_default() += 1;
+            }
+            native_slice_page(state, &snapshot, session, session_id, &query, &source)
+        },
         Err(_) => timeline_value(state, &snapshot, session, session_id, &query),
     }?.0;
     let all = page["items"]
@@ -5655,13 +5771,7 @@ fn conversation_read_now_unbounded(
         .filter_map(|item| item["sequence"].as_u64());
     let native_latest = native_sequences.clone().max().unwrap_or(0);
     let native_oldest = native_sequences.min();
-    let local_latest = state
-        .store
-        .local_observations_tail(1)
-        .map_err(ApiError::internal)?
-        .first()
-        .and_then(crate::store::local_observation_position)
-        .unwrap_or(0);
+    let local_latest = local_latest_position(state)?;
     let position = after
         .map(|cursor| conversation_position(state, session_id, cursor))
         .transpose()?;
@@ -5866,7 +5976,7 @@ fn issued_transcript(cursor: &str) -> Option<TranscriptSeen> {
     issued_cursors().lock().ok()?.1.get(cursor).copied()
 }
 
-/// How many times each session's timeline was rebuilt for a change read, for the budget test.
+/// First-page builds for initial OPEN and reactive changes, counted by the work-budget tests.
 #[cfg(test)]
 fn timeline_rebuilds() -> &'static std::sync::Mutex<HashMap<String, u64>> {
     static REBUILDS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> =
@@ -5918,43 +6028,15 @@ impl ConversationMark {
     }
 
     fn changed_unbounded(&mut self, state: &AppState) -> Result<bool, ApiError> {
-        let mut changed = false;
         let index = state.store.index().map_err(ApiError::internal)?;
-        if index > self.store_index {
-            let claims = state
-                .store
-                .claims_page(
-                    None,
-                    None,
-                    self.store_index,
-                    index.checked_add(1),
-                    false,
-                    10_000,
-                )
-                .map_err(ApiError::internal)?
-                .claims;
-            // A burst too large to scan is treated as a change.
-            changed |= claims.len() >= 10_000
-                || claims.iter().any(|claim| {
-                    let fields = claim.body.get("fields").unwrap_or(&claim.body);
-                    Some(claim.subject.as_str()) == self.owner.as_deref()
-                        || (claim.kind == "message.sent"
-                            && ["from", "to"].iter().any(|side| {
-                                fields.get(*side).and_then(Value::as_str) == self.owner.as_deref()
-                            }))
-                });
-            self.store_index = index;
-        }
         let local = local_latest_position(state)?;
-        if local > self.local_position {
-            changed |= state
-                .store
-                .local_observations_after(self.local_position, 10_000)
-                .map_err(ApiError::internal)?
-                .iter()
-                .any(|claim| Some(claim.subject.as_str()) == self.owner.as_deref());
-            self.local_position = local;
-        }
+        let mut changed = self.owner.as_deref().map(|owner| {
+            state.store.conversation_changed_at(
+                owner, self.store_index, index, self.local_position, local,
+            )
+        }).transpose().map_err(ApiError::internal)?.unwrap_or(false);
+        self.store_index = index;
+        self.local_position = local;
         let seen = transcript_seen(self.transcript.as_deref());
         if seen != self.transcript_seen {
             changed = true;
@@ -5965,13 +6047,7 @@ impl ConversationMark {
 }
 
 fn local_latest_position(state: &AppState) -> Result<u64, ApiError> {
-    Ok(state
-        .store
-        .local_observations_tail(1)
-        .map_err(ApiError::internal)?
-        .first()
-        .and_then(crate::store::local_observation_position)
-        .unwrap_or(0))
+    state.store.conversation_local_position().map_err(ApiError::internal)
 }
 
 async fn conversation_changes_local(
@@ -10341,6 +10417,193 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
 
+    fn agent_queue_history_fixture(root: &std::path::Path, observations: usize) -> AppState {
+        let state = test_state(root);
+        let agent = "agent/queue-history";
+        let seed = state.store.append_claim(&ClaimInput {
+            subject: agent.into(),
+            kind: "harness.observed".into(),
+            actor: Some(agent.into()),
+            fields: BTreeMap::from([("state".into(), json!("idle"))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        }).unwrap();
+        let mut connection = state.store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        transaction.execute(
+            "WITH RECURSIVE numbers(n) AS (
+                SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<?1
+             )
+             INSERT INTO claims(id,batch_id,subject,kind,origin,actor,body,
+                                predecessors,accepted_at_unix_ms)
+             SELECT printf('queue-history-%08d',n),c.batch_id,c.subject,c.kind,c.origin,
+                    c.actor,c.body,c.predecessors,CAST(n AS TEXT)
+             FROM numbers CROSS JOIN claims c WHERE c.id=?2",
+            rusqlite::params![observations, seed.id],
+        ).unwrap();
+        // Model native wire positions, rather than making the synthetic single batch
+        // exercise the separate legacy-position fallback.
+        transaction.execute(
+            "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,
+                                         raw,state,claim_id,updated_at_unix_ms)
+             SELECT id,origin,1,'queue-history-fixture',store_index,X'','valid',id,'1'
+             FROM claims WHERE id LIKE 'queue-history-%'",
+            [],
+        ).unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        state
+    }
+
+    fn old_agent_queue_value(store: &Store, agent: &str) -> Option<Value> {
+        // Retain the exact previous handler's read as the equivalence/timing oracle.
+        store.latest_claim(agent, None).unwrap()?;
+        Some(agent_queue_value(&store.seat_queue(agent).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn agent_queue_history_preserves_output_and_missing_agent() {
+        let root = tempfile::tempdir().unwrap();
+        let state = agent_queue_history_fixture(root.path(), 1024);
+        for id in ["agent/queue-history", "queue-history"] {
+            let Json(actual) = agent_queue(State(state.clone()), AxumPath(id.into())).await.unwrap();
+            assert_eq!(Some(actual), old_agent_queue_value(&state.store, "agent/queue-history"));
+        }
+        assert!(old_agent_queue_value(&state.store, "agent/absent").is_none());
+        assert_eq!(
+            agent_queue(State(state), AxumPath("absent".into())).await.unwrap_err().status,
+            StatusCode::NOT_FOUND,
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_queue_nonempty_matches_previous_handler() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let source = r#"
+version 2
+mission "queue-parity" state="ready" {
+  concurrent-runs
+  goal "Keep the complete queue response unchanged."
+  step "work" { assigned-to "agent/example/queue-parity" }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, &state.node).unwrap();
+        let planned = state.store.mission(&intent, IntentInput {
+            kdl: source.into(),
+            source_name: None,
+        }).unwrap();
+        state.store.apply(&intent, &planned.subject_tokens, "queue-parity-fixture").unwrap();
+        let agent = "agent/example/queue-parity";
+        state.store.append_claim(&ClaimInput {
+            subject: agent.into(),
+            kind: "harness.observed".into(),
+            actor: Some(agent.into()),
+            fields: BTreeMap::from([("state".into(), json!("idle"))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        }).unwrap();
+        for index in 0..2 {
+            let run = state.store.create_mission_run(&MissionRunRequest {
+                mission: "queue-parity".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/alex".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: format!("queue-parity-run-{index}"),
+            }).unwrap();
+            if index == 0 {
+                state.store.set_step_state(&run.steps[0].subject, "ready", None).unwrap();
+            } else {
+                state.store.move_seat_queue_run(&crate::model::SeatQueueMoveRequest {
+                    agent: agent.into(),
+                    run: run.subject.clone(),
+                    placement: "top".into(),
+                    anchor: None,
+                    reason: Some("Exercise move history parity.".into()),
+                    actor: "person/alex".into(),
+                    idempotency_key: "queue-parity-move".into(),
+                }).unwrap();
+            }
+        }
+        let expected = old_agent_queue_value(&state.store, agent).unwrap();
+        assert_eq!(expected["runs"].as_array().unwrap().len(), 2);
+        assert!(expected["next_work_id"].is_string());
+        assert_eq!(expected["move_count"], 1);
+        assert_eq!(expected["moves"].as_array().unwrap().len(), 1);
+        let Json(actual) = agent_queue(State(state), AxumPath(agent.into())).await.unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated before/after queue-history measurement"]
+    async fn agent_queue_history_cost() {
+        use std::time::Instant;
+        for observations in [4096, 32768, 262144] {
+            let root = tempfile::tempdir().unwrap();
+            let state = agent_queue_history_fixture(root.path(), observations);
+            let agent = "agent/queue-history";
+            let expected = old_agent_queue_value(&state.store, agent).unwrap();
+            {
+                use smallclaims::store::{CLAIM_COLUMNS, CANONICAL_ORDER_DESC};
+                let connection = state.store.connection.write();
+                let before_sql = format!(
+                    "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+                     WHERE claims.subject=?1 AND ?2 IS NULL ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+                );
+                let after_sql = smallclaims::store::canonical_sql(smallclaims::store::LATEST_CLAIM_QUERY);
+                let mut before = connection.prepare(&before_sql).unwrap();
+                let old_id: String = before.query_row(
+                    rusqlite::params![agent, Option::<String>::None], |row| row.get(0),
+                ).unwrap();
+                let mut after = connection.prepare(&after_sql).unwrap();
+                let new_id: String = after.query_row([agent], |row| row.get(0)).unwrap();
+                assert_eq!(old_id, new_id);
+                let before_steps = before.get_status(rusqlite::StatementStatus::VmStep);
+                let after_steps = after.get_status(rusqlite::StatementStatus::VmStep);
+                assert!(after_steps * 10 < before_steps);
+                println!("agent queue existence profile: observations={observations} before_vm_steps={before_steps} after_vm_steps={after_steps}");
+                for (label, sql) in [("before", before_sql), ("after", after_sql)] {
+                    let mut statement = connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                    let parameters = if label == "before" {
+                        vec![rusqlite::types::Value::Text(agent.into()), rusqlite::types::Value::Null]
+                    } else {
+                        vec![rusqlite::types::Value::Text(agent.into())]
+                    };
+                    let plan = statement.query_map(rusqlite::params_from_iter(parameters), |row| {
+                        row.get::<_, String>(3)
+                    }).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                    println!("agent queue existence {label} plan: {}", plan.join("; "));
+                }
+            }
+            let mut old = Vec::new();
+            let mut new = Vec::new();
+            // Alternate order to avoid assigning all cold reads to one implementation.
+            for sample in 0..10 {
+                for before in if sample % 2 == 0 { [true, false] } else { [false, true] } {
+                    let start = Instant::now();
+                    let actual = if before {
+                        old_agent_queue_value(&state.store, agent).unwrap()
+                    } else {
+                        agent_queue(State(state.clone()), AxumPath(agent.into())).await.unwrap().0
+                    };
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    assert_eq!(actual, expected);
+                    if before { old.push(elapsed); } else { new.push(elapsed); }
+                }
+            }
+            old.sort_by(f64::total_cmp);
+            new.sort_by(f64::total_cmp);
+            println!(
+                "agent queue history: observations={observations} samples=10 before_p50_ms={:.3} before_p95_ms={:.3} after_p50_ms={:.3} after_p95_ms={:.3}",
+                (old[4] + old[5]) / 2.0, old[9], (new[4] + new[5]) / 2.0, new[9],
+            );
+        }
+    }
+
     #[tokio::test]
     async fn collections_socket_ping_pong_does_not_read_held_windows() {
         use futures_util::{SinkExt as _, StreamExt as _};
@@ -10689,6 +10952,369 @@ mod tests {
                 assert_eq!(state.store.index().unwrap(), index, "local activity must not advance the graph");
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_readers_serve_the_published_cut_while_a_refresh_waits() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/published-roster";
+        let append = |kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        append("runtime.observed", json!({"status":"running",
+            "runtime_id":"published-roster", "incarnation_id":"one"}));
+        let first = state.store.index().unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.expect("the daemon publishes its roster as it starts").unwrap();
+        assert_eq!(state.store.published_agent_roster(first, false).unwrap().0, first);
+        // Hold the next refresh back: readers must answer from the publication without it.
+        let refresh = state.store.admit_agent_resources().await;
+        append("harness.observed", json!({"state":"working", "driver":"codex",
+            "incarnation_id":"one"}));
+        let current = state.store.index().unwrap();
+        assert!(current > first);
+
+        let app = axum::Router::new().route("/stream", axum::routing::get({
+            let state = state.clone();
+            move |upgrade: WebSocketUpgrade| {
+                let state = state.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        let windows = collection_windows::Windows::attach(&state.store);
+                        collection_stream_socket_with_reader(
+                            socket, state, ClientSession::local(None).unwrap(), None,
+                            move |state, session, request, permit| {
+                                let windows = windows.clone();
+                                async move {
+                                    collection_items_with_windows(
+                                        &state, &session, &request, permit, windows,
+                                    ).await
+                                }
+                            },
+                        )
+                    })
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"kind":"subscribe",
+            "id":"roster", "collection":"agents", "limit":200}).to_string().into())).await.unwrap();
+        let mut next = async |within: Duration| -> Value {
+            let frame = tokio::time::timeout(within, socket.next()).await
+                .expect("a roster frame").unwrap().unwrap();
+            serde_json::from_str(frame.to_text().unwrap()).unwrap()
+        };
+        let snapshot = next(Duration::from_secs(1)).await;
+        assert_eq!(snapshot["kind"], "snapshot", "{snapshot}");
+        assert_eq!(snapshot["snapshot"]["store_index"], first, "rows keep their own cut");
+        assert!(snapshot["snapshot"]["published_at"].is_string(), "{snapshot}");
+        assert_eq!(snapshot["items"][0]["id"], subject);
+        assert!(snapshot["items"][0]["harness_state"].is_null(), "{snapshot}");
+
+        // A first page answers at once from the newest publication rather than folding.
+        let (Extension(page_snapshot), Json(page)) = tokio::time::timeout(Duration::from_millis(500),
+            client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+                Query(ClientListQuery::default())))
+            .await.expect("an HTTP page must not wait for the held refresh").unwrap();
+        assert_eq!(page_snapshot.store_index, first);
+        assert_eq!(page_snapshot.published_at.as_deref(), snapshot["snapshot"]["published_at"].as_str());
+        assert_eq!(page.items, snapshot["items"].as_array().unwrap().clone());
+
+        // The refresh the readers asked for publishes the current cut; the stream rereads it.
+        drop(refresh);
+        let changes = next(Duration::from_secs(10)).await;
+        assert_eq!(changes["kind"], "changes", "{changes}");
+        assert_eq!(changes["snapshot"]["store_index"], current);
+        assert_eq!(changes["upserts"][0]["harness_state"], "working", "{changes}");
+        let (Extension(page_snapshot), Json(page)) = client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(ClientListQuery::default()))
+            .await.unwrap();
+        assert_eq!(page_snapshot.store_index, current);
+        assert_eq!(page.items, changes["upserts"].as_array().unwrap().clone());
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_pages_ask_for_a_refresh_after_local_activity_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/local-page";
+        for (kind, fields) in [
+            ("runtime.observed", json!({"status":"running", "runtime_id":"local-page", "incarnation_id":"one"})),
+            ("harness.observed", json!({"state":"working", "driver":"codex", "incarnation_id":"one"})),
+        ] {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let index = state.store.index().unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+        let page = || client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery::default()));
+        let (_, Json(before)) = page().await.unwrap();
+        assert!(before.items[0]["last_activity_at"].is_null());
+
+        // Local activity alone: no claim, so the graph index stays put.
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "harness.timeline".into(), actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({"operation":"append",
+                "entry_id":"local-page", "source_id":"fixture/local-page",
+                "sequence":1, "revision":1, "role":"assistant", "entry_type":"message",
+                "final":true, "driver":"codex", "incarnation_id":"one",
+                "observed_at_unix_ms":client_now_ms(), "body":{"text":"local activity"}})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        assert_eq!(state.store.index().unwrap(), index);
+        let revision = *published.borrow_and_update();
+        // This page still shows the published roster, and asks for a newer one.
+        let (_, Json(stale)) = page().await.unwrap();
+        assert!(stale.items[0]["last_activity_at"].is_null());
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|now| *now > revision))
+            .await.expect("a page asks the refresher for local activity").unwrap();
+        let (snapshot, Json(after)) = page().await.unwrap();
+        assert_eq!(snapshot.0.store_index, index);
+        assert!(!after.items[0]["last_activity_at"].is_null(), "{:?}", after.items[0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_stream_rereads_a_same_index_publication_after_local_activity() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/local-roster";
+        let append = |kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        append("runtime.observed", json!({"status":"running",
+            "runtime_id":"local-roster", "incarnation_id":"one"}));
+        append("harness.observed", json!({"state":"working", "driver":"codex",
+            "incarnation_id":"one"}));
+        let index = state.store.index().unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+
+        let app = axum::Router::new().route("/stream", axum::routing::get({
+            let state = state.clone();
+            move |upgrade: WebSocketUpgrade| {
+                let state = state.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        let windows = collection_windows::Windows::attach(&state.store);
+                        collection_stream_socket_with_reader(
+                            socket, state, ClientSession::local(None).unwrap(), None,
+                            move |state, session, request, permit| {
+                                let windows = windows.clone();
+                                async move {
+                                    collection_items_with_windows(
+                                        &state, &session, &request, permit, windows,
+                                    ).await
+                                }
+                            },
+                        )
+                    })
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"kind":"subscribe",
+            "id":"roster", "collection":"agents", "limit":200}).to_string().into())).await.unwrap();
+        let mut next = async |within: Duration| -> Value {
+            let frame = tokio::time::timeout(within, socket.next()).await
+                .expect("a roster frame").unwrap().unwrap();
+            serde_json::from_str(frame.to_text().unwrap()).unwrap()
+        };
+        let snapshot = next(Duration::from_secs(5)).await;
+        assert_eq!(snapshot["kind"], "snapshot", "{snapshot}");
+        assert!(snapshot["items"][0]["last_activity_at"].is_null(), "{snapshot}");
+
+        // Local activity changes the card without advancing the graph. The stream rereads the
+        // same-index publication while the refresh is held, and receives nothing new.
+        let refresh = state.store.admit_agent_resources().await;
+        let revision = *published.borrow_and_update();
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "harness.timeline".into(),
+            actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({"operation":"append",
+                "entry_id":"local-activity", "source_id":"fixture/local-activity",
+                "sequence":1, "revision":1, "role":"assistant", "entry_type":"message",
+                "final":true, "driver":"codex", "incarnation_id":"one",
+                "observed_at_unix_ms":client_now_ms(), "body":{"text":"local activity"}})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        assert_eq!(state.store.index().unwrap(), index, "local activity must not advance the graph");
+        state.event_notify.send_modify(|_| {});
+        tokio::time::sleep(COLLECTION_REREAD_INTERVAL + Duration::from_millis(500)).await;
+        assert_eq!(*published.borrow(), revision, "the held refresh has not published");
+
+        // The refresh replaces the roster at the same graph index; the stream catches up.
+        drop(refresh);
+        let changes = next(Duration::from_secs(10)).await;
+        assert_eq!(changes["kind"], "changes", "{changes}");
+        assert_eq!(changes["snapshot"]["store_index"], index);
+        assert!(!changes["upserts"][0]["last_activity_at"].is_null(), "{changes}");
+        assert!(*published.borrow() > revision);
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_history_and_continuations_answer_from_publications_only() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        for agent in ["page-a", "page-b", "page-c"] {
+            state.store.append_claim(&ClaimInput {
+                subject: format!("agent/{agent}"), kind: "runtime.observed".into(), actor: None,
+                fields: serde_json::from_value(json!({"status":"running", "runtime_id":agent,
+                    "incarnation_id":"one"})).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+        let list = |query: ClientListQuery| client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(query));
+
+        // A history page is folded by the refresher on request, never by the read: at once it
+        // is not ready, and a read asking for a fresh roster waits for the refresher.
+        let builds = state.store.agent_resources_builds_for_test();
+        let not_ready = list(ClientListQuery { history: true, ..ClientListQuery::default() })
+            .await.unwrap_err();
+        assert_eq!(not_ready.code, "agent-roster-not-ready");
+        let (Extension(history_snapshot), Json(history)) = tokio::time::timeout(
+            Duration::from_secs(5),
+            list(ClientListQuery { history: true, fresh: true, ..ClientListQuery::default() }),
+        ).await.unwrap().unwrap();
+        assert_eq!(history.items.len(), 3);
+        assert!(history_snapshot.published_at.is_some());
+        assert!(state.store.agent_resources_builds_for_test() > builds, "the refresher folded it");
+
+        // A continuation reads the publication at its first page's cut.
+        let (Extension(first_snapshot), Json(first)) =
+            list(ClientListQuery { limit: Some(2), ..ClientListQuery::default() }).await.unwrap();
+        let cursor = first.page.next_cursor.clone().expect("a second page");
+        let continue_query = ClientListQuery { cursor: Some(cursor), limit: Some(2), ..ClientListQuery::default() };
+        let (Extension(next_snapshot), Json(next)) = client_agents(State(state.clone()),
+            Extension(first_snapshot.clone()), Query(continue_query.clone())).await.unwrap();
+        assert_eq!(next.items.len(), 1);
+        assert_eq!(next_snapshot.store_index, first_snapshot.store_index);
+        assert!(next_snapshot.published_at.is_some());
+
+        // Once that roster is no longer published, the continuation restarts; it never folds.
+        // Holding the refresher back keeps it from republishing that cut meanwhile.
+        let _refresh = state.store.admit_agent_resources().await;
+        state.store.forget_current_views();
+        let builds = state.store.agent_resources_builds_for_test();
+        let expired = client_agents(State(state.clone()), Extension(first_snapshot),
+            Query(continue_query)).await.unwrap_err();
+        assert_eq!(expired.code, "page-cursor-expired");
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_summary_reads_the_publication_without_roster_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/summary-roster".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"summary-roster", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+        // A slow refresh holds the roster admission; summary must not queue behind it.
+        let _refresh = state.store.admit_agent_resources().await;
+        let request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe", "id":"summary", "collection":"summary",
+        })).unwrap();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let (_, items, _) = tokio::time::timeout(Duration::from_secs(2),
+            collection_items_with_windows(&state, &ClientSession::local(None).unwrap(), &request,
+                semaphore.acquire_owned().await.unwrap(),
+                collection_windows::Windows::attach(&state.store)))
+            .await.expect("summary must not wait for the roster admission").unwrap();
+        assert_eq!(items[0]["kind"], "summary");
+        // The agent counts name the published roster they came from.
+        let (cut, _, published_at) = state.store.published_agent_roster(state.store.index().unwrap(), false).unwrap();
+        assert_eq!(items[0]["agents_as_of"]["store_index"], cut);
+        assert_eq!(items[0]["agents_as_of"]["published_at"], client_timestamp(published_at));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_roster_head_answers_windows_and_first_pages_before_every_card() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        for agent in ["head-a", "head-b", "head-c"] {
+            state.store.append_claim(&ClaimInput {
+                subject: format!("agent/{agent}"), kind: "runtime.observed".into(), actor: None,
+                fields: serde_json::from_value(json!({"status":"running", "runtime_id":agent,
+                    "incarnation_id":"one"})).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let index = state.store.index().unwrap();
+        let request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe", "id":"head", "collection":"agents", "limit":2,
+        })).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let query = ClientListQuery { limit: Some(2), ..ClientListQuery::default() };
+        // What every card folded at this cut answers.
+        let window = collection_items_with_windows(&state, &session, &request,
+            semaphore.clone().acquire_owned().await.unwrap(),
+            collection_windows::Windows::attach(&state.store)).await.unwrap();
+        let (_, Json(page)) = client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(query.clone())).await.unwrap();
+        assert!(window.2 && page.page.has_more);
+
+        // A daemon whose refresher has so far published only the head.
+        state.store.forget_current_views();
+        let _wake = state.store.start_agent_roster_refresher().unwrap();
+        state.store.read_snapshot(|index| crate::api::client_agent_roster_head(&state.store, index))
+            .unwrap();
+        assert!(state.store.published_agent_roster(index, false).is_none());
+        let builds = state.store.agent_resources_builds_for_test();
+        let from_head = collection_items_with_windows(&state, &session, &request,
+            semaphore.acquire_owned().await.unwrap(), None).await.unwrap();
+        assert_eq!(from_head.0.store_index, index);
+        assert_eq!((&from_head.1, from_head.2), (&window.1, window.2));
+        let (_, Json(head_page)) = client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(query)).await.unwrap();
+        assert_eq!(head_page.items, page.items);
+        assert!(head_page.page.has_more && head_page.page.next_cursor.is_some());
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds, "no card folded");
     }
 
     #[tokio::test]
@@ -14806,6 +15432,149 @@ mission "example/zero-run" state="ready" {
             .unwrap()
             .0;
         assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn conversation_open_budget_reads_one_page_then_sends_only_the_appended_native_record() {
+        for lines in [3, 360] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_state_named(root.path(), &format!("open-budget-{lines}"));
+            let owner = format!("agent/open-budget-{lines}");
+            let incarnation = "123:2026-09-25T15:11:54.870Z";
+            let native = format!("open-native-{lines}");
+            let path = root.path().join("session.jsonl");
+            let message = |index| json!({"type":"message", "id":format!("answer-{index}"),
+                "timestamp":"2026-09-25T15:12:00Z", "message":{"role":"assistant",
+                    "content":[{"type":"text", "text":format!("answer {index} {}", "x".repeat(512))}]}});
+            let mut transcript = format!("{}\n", json!({"type":"session", "id":native,
+                "timestamp":"2026-09-25T15:11:54Z", "cwd":root.path()}));
+            for index in 0..lines { transcript.push_str(&format!("{}\n", message(index))); }
+            std::fs::write(&path, transcript).unwrap();
+            for (kind, fields) in [
+                ("runtime.observed", json!({"status":"running", "runtime_id":"open-runtime", "incarnation_id":incarnation})),
+                ("harness.observed", json!({"state":"idle", "driver":"omp", "incarnation_id":incarnation})),
+                ("harness.session-file", json!({"harness":"omp", "agent":owner, "incarnation_id":incarnation, "session_id":native, "path":path})),
+            ] {
+                state.store.append_claim(&ClaimInput {
+                    subject: owner.clone(), kind: kind.into(), actor: Some(owner.clone()),
+                    fields: serde_json::from_value(fields).unwrap(), evidence: vec![],
+                    expected_subject: None, idempotency_key: None,
+                }).unwrap();
+            }
+            let session_id = managed_session_id(&owner, incarnation);
+            let session = ClientSession::local(Some("person/example")).unwrap();
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let follower = tokio::spawn(follow_conversation(
+                state.clone(), session, "chat".into(), 1, session_id.clone(), None, sender,
+            ));
+            let (_, _, frame) = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
+            assert_eq!(frame["replace"], true, "{frame}");
+            assert_collection_frame_conforms(&frame);
+            assert_eq!(frame["items"].as_array().unwrap().len(), (lines * 2).min(200));
+            assert_eq!(frame["has_more"], lines * 2 > 200);
+            assert!(frame_bytes(&frame) <= CLIENT_MAX_RESPONSE_BYTES);
+            let rebuilds = || timeline_rebuilds().lock().unwrap().get(&session_id).copied().unwrap_or(0);
+            assert_eq!(rebuilds(), 1, "OPEN must not fold an empty baseline before its page");
+            // Change the source after the first frame. The next frame is a delta, not a reload.
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, "{}", message(lines)).unwrap();
+            drop(file);
+            signal_changed(&state);
+            let (_, _, delta) = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
+            assert_eq!(delta["replace"], false, "{delta}");
+            assert_eq!(delta["items"].as_array().unwrap().len(), 2, "{delta}");
+            assert!(delta["items"].as_array().unwrap().iter().any(|item|
+                item["body"]["text"].as_str().is_some_and(|text| text.starts_with(&format!("answer {lines} ")))));
+            assert_eq!(rebuilds(), 2);
+            assert_collection_frame_conforms(&delta);
+            follower.abort();
+            let _ = follower.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_open_cursor_replays_a_message_committed_during_the_initial_read() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "open-race");
+        let owner = "agent/open-race";
+        let incarnation = "open-race-runtime:i1";
+        state.store.append_claim(&ClaimInput {
+            subject: owner.into(), kind: "runtime.observed".into(), actor: Some(owner.into()),
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":"open-race-runtime", "incarnation_id":incarnation})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let session_id = managed_session_id(owner, incarnation);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let writer = state.clone();
+        let target = session_id.clone();
+        BEFORE_CONVERSATION_PAGE.with(|pause| {
+            *pause.borrow_mut() = Some(Box::new(move || {
+                writer.store.append_claim(&ClaimInput {
+                    subject: "message/open-race".into(), kind: "message.sent".into(), actor: Some("person/example".into()),
+                    fields: serde_json::from_value(json!({"from":"person/example", "to":owner,
+                        "session_id":target, "status":"sent", "content":"committed during OPEN"})).unwrap(),
+                    evidence: vec![], expected_subject: None, idempotency_key: None,
+                }).unwrap();
+            }));
+        });
+        let (start, page) = conversation_open_local(&state, &session, &session_id).unwrap();
+        assert!(!page["items"].as_array().unwrap().iter().any(|item| item["body"]["text"] == "committed during OPEN"));
+        let delta = conversation_changes_local(&state, &session, &session_id, start["next_cursor"].as_str(), 0).await.unwrap();
+        assert!(delta["items"].as_array().unwrap().iter().any(|item| item["body"]["text"] == "committed during OPEN"), "{delta}");
+    }
+
+    #[tokio::test]
+    async fn conversation_open_replays_local_rows_that_follow_a_newer_graph_cut() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "open-local-frontier");
+        let owner = "agent/open-local-frontier";
+        let incarnation = "local-frontier-runtime:i1";
+        state.store.append_claim(&ClaimInput {
+            subject: owner.into(), kind: "runtime.observed".into(), actor: Some(owner.into()),
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":"local-frontier-runtime", "incarnation_id":incarnation})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let session_id = managed_session_id(owner, incarnation);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let writer = state.clone();
+        AFTER_CONVERSATION_SNAPSHOT.with(|pause| {
+            *pause.borrow_mut() = Some(Box::new(move || {
+                // The unrelated commit advances the graph, so the following local row is
+                // outside the first page's graph cut, even though the later mark can see it.
+                writer.store.append_claim(&ClaimInput {
+                    subject: "message/unrelated-local-frontier".into(), kind: "message.sent".into(),
+                    actor: Some("person/other".into()),
+                    fields: serde_json::from_value(json!({"from":"person/other", "to":"agent/other",
+                        "status":"sent", "content":"unrelated commit"})).unwrap(),
+                    evidence: vec![], expected_subject: None, idempotency_key: None,
+                }).unwrap();
+                writer.store.append_local_observations_for_test(&[ClaimInput {
+                    subject: owner.into(), kind: "harness.timeline".into(), actor: Some(owner.into()),
+                    fields: serde_json::from_value(json!({"operation":"append",
+                        "entry_id":"timeline-entry/open-local-frontier", "sequence":1,
+                        "revision":1, "role":"assistant", "entry_type":"content", "final":true,
+                        "body":{"media_type":"text/plain", "text":"local row across graph cut"},
+                        "driver":"codex", "incarnation_id":incarnation})).unwrap(),
+                    evidence: vec![], expected_subject: None, idempotency_key: None,
+                }]);
+            }));
+        });
+        let (start, page) = conversation_open_local(&state, &session, &session_id).unwrap();
+        let contains_local = |value: &Value| value["items"].as_array().unwrap().iter()
+            .any(|item| item["id"] == "timeline-entry/open-local-frontier");
+        assert!(!contains_local(&page));
+        let cursor = start["next_cursor"].as_str().unwrap();
+        let (graph, local, native) = conversation_position(&state, &session_id, cursor).unwrap();
+        let latest_local = local_latest_position(&state).unwrap();
+        assert!(latest_local > local);
+        // Control: the former post-snapshot local high-water silently skips this exact row.
+        let skipped = conversation_cursor(&state, &session_id, graph, latest_local, native);
+        remember_cursor(&skipped, issued_transcript(cursor).unwrap());
+        let lost = conversation_changes_local(&state, &session, &session_id, Some(&skipped), 0).await.unwrap();
+        assert!(!contains_local(&lost));
+        let replay = conversation_changes_local(&state, &session, &session_id, Some(cursor), 0).await.unwrap();
+        assert!(contains_local(&replay), "{replay}");
     }
 
     #[tokio::test]

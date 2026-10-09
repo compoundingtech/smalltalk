@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Publish malformed OMP fixture evidence before it can appear passing",
+  "replay": { "status": "none", "detail": "Only synthetic admission fixture publication and its tests change; replay is unchanged." },
+  "schema": { "status": "none", "detail": "No database schema, migration or stored admission record format changes." },
+  "rules": { "status": "none", "detail": "No checkpoint or fleet rules change." },
+  "compatibility": { "status": "none", "detail": "Production harness admission, identity, probe and cache contracts are unchanged." },
+  "downtime": { "status": "none", "detail": "The fixture correction requires no service interruption." },
+  "manual": { "status": "none", "detail": "No operator action or starting-state transition is required." },
+  "recovery": { "status": "none", "detail": "No production recovery or swap-back behavior changes." }
+}

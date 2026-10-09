@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Repair only operation receipts affected by successful replicated record repairs",
+  "replay": {
+    "status": "none",
+    "detail": "Record repair no longer deletes and recreates the complete operations table. It canonically refreshes the original, preceding replacement and new replacement operation dependencies after successful savepoints. No full replay or read-path repair is added."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No DDL, indexes, schema version, trigger, immutable claim or signature changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Canonical receipt selection, conflict state, checkpoint tombstone exclusions, runtime repair authority and complete digest coverage remain unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client or peer wire changes. Savepoint rollback, repair health reporting and the managed commit-before-ACK boundary are preserved. The public per-repair helper retains its return type."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal binary restart only. Whole recorded-repair selection and history within affected operations remain work limits; this change does not establish production latency acceptance or make all heal work bounded."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No live heal, replay, reset, policy action or manual database operation is requested. Unrelated damaged operation rows are not silently rebuilt by a record repair."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Older binaries read the unchanged data and resume the former global operation rebuild. No migration or irreversible format change is introduced."
+  }
+}

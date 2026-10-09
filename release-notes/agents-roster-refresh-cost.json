@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Refresh the agents roster only when a reader holds an older one, and count full refolds by cause",
+  "replay": {"status": "none", "detail": "No claim replay or stored history changes."},
+  "schema": {"status": "none", "detail": "No database schema, version or stored data changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."},
+  "compatibility": {"status": "none", "detail": "Responses are unchanged. The background refresher pauses at least 250 ms between refreshes, skips a refresh when the newest roster is already current, and an HTTP page at the current cut no longer asks for one. A fresh=true read waits for the next refresh."},
+  "downtime": {"status": "none", "detail": "No additional service interruption or startup migration is required."},
+  "manual": {"status": "none", "detail": "No action is required."},
+  "recovery": {"status": "none", "detail": "Only volatile in-memory caches and counters change."}
+}

@@ -12,7 +12,6 @@
 use super::*;
 use smallclaims::store::checkpoint::DAY_MS;
 use smallclaims::store::checkpoint::*;
-use smallclaims::store::checkpoint_agreement::*;
 
 /// The rule engine's version. It is part of the rules digest, so nodes agree on a checkpoint only
 /// when they run the same rules. Version 5 leaves repaired originals out of the sealed set and
@@ -1019,7 +1018,12 @@ impl Store {
         };
         let checkpoint = checkpoint_name(cut);
         let seals = newest_seals(&claims, &checkpoint);
-        let Some((writer, terms)) = seals.first_key_value() else {
+        let (current, _) = self.checkpoint_participants(&claims, &[])?;
+        let runtime_rules = rules_digest();
+        let reference = seals.iter().find(|(writer, terms)| {
+            current.contains(*writer) && terms.rules_digest == runtime_rules
+        }).or_else(|| seals.iter().find(|(writer, _)| current.contains(*writer)));
+        let Some((writer, terms)) = reference else {
             return Ok(Vec::new());
         };
         let first_waiting = newest_stable.map_or_else(
@@ -1037,8 +1041,6 @@ impl Store {
         if as_of < since + CHECKPOINT_ATTENTION_AFTER_MS {
             return Ok(Vec::new());
         }
-        let left = self.checkpoint_left_writers()?;
-        let current = participants(&BTreeSet::new(), &left, &claims);
         let waiting = terms
             .participants
             .intersection(&current)

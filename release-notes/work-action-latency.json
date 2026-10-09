@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Report separate completed-response latency denominators for known work actions",
+  "replay": {
+    "status": "none",
+    "detail": "Request timing remains in memory; no source, projection or replay changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No persisted tables, indexes or migrations."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No admission, authority, ordering, lease or durable acknowledgement changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The existing request-latency routes array retains aggregate rows and fields, adds scope/duration_scope/population metadata and separate POST work-action rows with static action keys. Consumers must select scope=work-action for a renew denominator and must not sum overlapping route/action scopes. Applies from all preceding binaries; no intermediate migration."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal binary rollout; no backfill."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator steps required. Metric consumers can select the documented action scope."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Counters reset on process restart; ordinary binary rollback restores aggregate-only telemetry without changing durable state."
+  }
+}

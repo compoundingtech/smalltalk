@@ -269,3 +269,159 @@ into `Environment=` lines alongside the existing `PATH`/`PTY_ROOT` serialization
    subscriber; correlated diagnostics migrated; otelite assertions extended to logs.
 
 Each PR lands CI-green independently; PR2/PR3 depend on PR1's plumbing only.
+
+## st3
+
+This section specifies the st3 core mechanism (O11Y-R10–R18). The st2 sections above retain
+their own process model. The design source is [#1580](https://github.com/compoundingtech/smalltalk/issues/1580).
+
+```text
+process tracing ── AlwaysOn ── batch span processor ───────────┐
+metric instruments ── periodic reader ────────────────────────┼── SDK threads ── OTLP/HTTP JSON
+tracing events ── correlated log bridge ── batch processor ───┘
+hook signals ── daemon observations exporter ────────────────────────────────── OTLP/HTTP JSON
+```
+
+### Pipeline and identity
+
+`crates/st3/src/otel.rs` owns SDK initialization, resource construction, and shutdown.
+The tracer provider uses `Sampler::AlwaysOn` and a plain SDK `BatchSpanProcessor` to export
+every span, including spans with an unsampled remote parent. There is no in-process sampler
+or span buffer beyond the SDK batch queue. The pipeline uses the crate versions and
+blocking-only OTLP feature set listed above.
+The batch queue is bounded below the SDK defaults because O11Y-R18 also caps daemon RSS:
+`max_queue_size` 256 and `max_export_batch_size` 256, with the SDK's default
+`scheduled_delay` (5 s, `OTEL_BSP_SCHEDULE_DELAY`). The SDK's 2048/512 defaults measured
++60 MiB RSS at saturation (queue of `SpanData` plus the exporter's in-flight OTLP/JSON
+batch and reqwest buffers); 256/256 keeps the worst case — one in-flight batch of at most
+the queue's spans — inside the +32 MiB budget. A 64-span batch measured within the RSS
+budget but its four-times-higher POST rate alone exceeded the +2% CPU/request budget at
+saturation, so the batch equals the queue. The `BatchConfigBuilder` setters override the
+environment, so `span_batch_config` re-applies `OTEL_BSP_MAX_QUEUE_SIZE` and
+`OTEL_BSP_MAX_EXPORT_BATCH_SIZE` explicitly — those variables keep working. A full queue
+drops spans; the SDK counts the drops and reports the first drop plus the shutdown total
+through its internal `otel_warn` diagnostics (`BatchSpanProcessor.SpanDroppingStarted`),
+which the stderr layer prints. There is no exported drop counter in this PR.
+Trace, metric, and log exporters use SDK-owned threads; none export on the daemon's
+`new_current_thread` request reactor. The log bridge uses
+`experimental_use_tracing_span_context` to attach the active trace and span ids, and
+exports INFO-and-above only: per-request framework events are DEBUG and stay on stderr,
+so a healthy daemon exports no log stream, while WARN/ERROR diagnostics still export.
+
+With no `OTEL_EXPORTER_OTLP_ENDPOINT`, initialization builds no telemetry subscriber,
+SDK providers, exporters, or threads. An atomic enabled gate returns before span construction.
+Local stderr diagnostics remain available. Standard `OTEL_*` environment variables configure
+export. `OTEL_SDK_DISABLED=true` (case-insensitive) selects this disabled path for every st3
+unit. `ST3_CLI_OTEL=off` selects it for the CLI only.
+
+| Process unit | `service.name` | Shutdown budget |
+| --- | --- | --- |
+| `st up` daemon | `st-daemon` | 5 s |
+| `peer::run_worker` replication worker | `st-replication-worker` | 5 s |
+| One-shot CLI | `st-cli` | 50 ms when export is enabled |
+| Driver hook | `st-hook` via daemon observations exporter; no direct SDK export | No collector flush in the hook |
+| `driver claude-statusline` | None; `telemetry::local_only()` | No pipeline |
+
+`crates/st3/src/telemetry.rs` remains the hook path. Hooks hand signals to the daemon and
+never contact a collector. The observations exporter emits hook spans and hook invocation
+metrics as `st-hook`; observation logs and usage metrics retain `st-daemon`. The statusline
+cadence exemption remains the DQ-C13 rule above.
+
+The shared resource contains `service.name`, `service.version` from
+`st_drivers::version::machine_version()`, a random per-process `service.instance.id`,
+`host.name`, and `st3.node`. The observations exporter in `crates/st3/src/otlp.rs` uses this
+resource builder, including the version: hook spans and invocation metrics are `st-hook`,
+observation logs and usage metrics are `st-daemon`. The bare `st` service name is retired.
+The platform edge supplies fleet-owned attributes.
+Flush and shutdown share one process-unit deadline across all three providers; an unreachable
+collector cannot extend it.
+
+Agent shells export the endpoint globally, and agent loops call the CLI thousands of times
+per hour. A hung collector must not delay each call. After the CLI root ends, when export is
+enabled, the CLI always waits at most 50 ms for a detached helper to flush and shut down all
+providers. This is one hard deadline, not a separate budget per provider.
+The daemon and replication worker retain their 5 s deadline.
+
+A CLI flush timeout or an export error returned by provider `force_flush` or `shutdown`
+records the failure time in `otel-cli-backoff`. The file is in `$XDG_RUNTIME_DIR/st3/` when
+`XDG_RUNTIME_DIR` is set; otherwise it is in `$XDG_STATE_HOME/st3/`, with
+`~/.local/state/st3/` as the fallback when `XDG_STATE_HOME` is unset. CLI initialization
+reads this small file once, without locks or waits. If the current time is before the failure
+time plus 300 s, it selects the disabled path before creating the pipeline. Missing or corrupt
+files do not disable telemetry. Writers use a temporary file and atomic rename; readers
+tolerate concurrent writers. This negative cache does not affect the daemon or replication
+worker.
+
+### Collector sampling policy
+
+The local collector applies tail sampling keyed by trace id (O11Y-R16), keeping a trace if
+any span has status `ERROR`, a local root lasts more than 1 second, or the root came from a
+sampled caller. It keeps a deterministic trace-id ratio of 1% of the remaining traces.
+
+The sampled-caller signal is `st.parent.sampled`: because st3 exports every span with
+AlwaysOn, every exported span carries the sampled flag, and the collector cannot recover the
+caller's decision from trace flags. Server root spans set `st.parent.sampled` to the remote
+parent's sampled flag whenever a remote parent exists; the collector policy keys on that
+attribute. The decision wait must be long enough for the daemon's SDK batch delay and
+delivery of the completed root and its spans. RED metrics are exported independently and
+are never sampled.
+
+### Metric naming and cardinality
+
+The repository-local st3 instrument namespace uses lowercase dot-separated names under
+`st3.`; HTTP instruments use the OpenTelemetry `http.server` namespace. Duration instruments
+end in `.duration` and use seconds. Depth, size, and age gauges describe saturation. Examples
+are `http.server.request.duration`, `st3.writer.wait.duration`, and `st3.fifo.depth`.
+Do not append Prometheus `_total` or `_seconds` suffixes to these OTLP instrument names.
+
+Label vocabularies are closed enums or bounded fleet membership. Unknown user-provided
+values map to `other`; routes are matched templates, not raw paths.
+
+| Label axis | Bound or vocabulary |
+| --- | --- |
+| `st3.client.class` | `cli`, `stui`, `fractal`, `web`, `replication-worker`, `omp-channel`, `hook`, `other` |
+| HTTP route, method, status class | Registered templates, methods, and status classes |
+| `claim_family` | Top-level registered kind segment, else `other` |
+| Reconcile `task` | `pass`, `deadline` |
+| Wake `cause`, FIFO `queue`, startup `phase`, replication `result` | Closed registries |
+| Replication `peer` | Fleet node membership |
+
+The instrument/label cross-products must total at most 2,000 active series per daemon.
+An enumeration test checks the budget, including histogram expansion. Duration buckets are
+`0.001`, `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`,
+`30`, and `60` seconds.
+
+### Attribute and context policy
+
+Agent, session, message, terminal, attachment, and lease ids are span attributes only:
+never metric labels or `span.label`. Capabilities and capability hashes never enter traces,
+metrics, or logs. Span names and labels use bounded operation vocabulary. Existing
+`profile::Op` and `profile::task` labels supply that vocabulary where available.
+
+W3C `traceparent` and `tracestate` are the wire context, not hash-derived identities.
+HTTP and WebSocket upgrade requests carry context; peer context belongs inside the
+`FleetAuth`-signed header set. Concrete propagation and instrumentation surfaces not
+specified by this core are recorded in [open questions](open-questions.md#st3).
+
+### Proof and overhead
+
+The core receiver proof uses `otelite` to inspect trace, metric, and correlated log export,
+process identity and version, and the unset-endpoint no-export control. Trace proofs cover
+export of fast roots and spans with unsampled remote parents; metrics record independently.
+The CLI shutdown helper is tested with an exporter that never returns from shutdown:
+the caller reports a receive timeout and writes the negative cache within the 50 ms
+deadline plus 200 ms of scheduling/filesystem tolerance. The process-level black-hole
+collector proof checks successful and failed commands exit within 10 s despite a 30 s
+exporter timeout, write the cache, and make no new collector connection on the next
+call within the backoff window. It does not compare whole-process timing medians.
+
+Copied-store measurements compare endpoint-unset execution with an enabled `otelite` sink.
+They cover daemon CPU, p99 request latency, RSS, and collector-sampled export rate against O11Y-R18.
+The core mechanism does not claim request-tree or client/peer round-trip coverage until
+those instrumentation surfaces exist.
+
+### Design questions
+
+The review questions and their resolution criteria are
+[ST3-O11Y-DQ01–DQ05](open-questions.md#st3): service naming, VRS placement, signed peer
+context, sampling location, and profiler ownership.

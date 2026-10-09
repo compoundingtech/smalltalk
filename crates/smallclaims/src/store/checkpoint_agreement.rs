@@ -7,7 +7,8 @@
 //! the same claims reaches the same answer, whatever order they arrived in.
 
 use super::checkpoint::{
-    CheckpointProof, DropPlan, SealedIdentities, checkpoint_name, newest_due_cut,
+    CheckpointProof, DropPlan, SealedIdentities, SealedSet, checkpoint_name, digest_field,
+    drop_digest, newest_due_cut,
 };
 use super::*;
 
@@ -22,6 +23,10 @@ pub const DAY_MS: u128 = 86_400_000;
 
 /// A checkpoint that is still not stable this long after it became due asks a person to act.
 pub const CHECKPOINT_ATTENTION_AFTER_MS: u128 = 3 * DAY_MS;
+
+/// A changed proof input may be attempted ten minutes after the last failed proof. An input
+/// already proved unsafe is never attempted again, even after this backoff or a restart.
+pub const CHECKPOINT_PROOF_BACKOFF_MS: u128 = 10 * 60 * 1_000;
 
 /// The build a seal or verification names, so status can say which build holds a checkpoint up.
 /// `CARGO_PKG_VERSION` alone is the same on every node today.
@@ -139,6 +144,22 @@ pub struct Certificate {
 /// canonical order. A writer that comes back and seals ends its own excusal. An excusal that
 /// is not a person's counts for nothing.
 pub fn excused_writers(claims: &[CheckpointClaim]) -> BTreeSet<String> {
+    excused_writers_with_rules(claims, None)
+}
+
+/// The runtime's excusals end only when a returning writer can seal or verify with the same
+/// rules. A stale build's checkpoint work remains visible but cannot resume participation.
+pub fn excused_writers_for_rules(
+    claims: &[CheckpointClaim],
+    rules_digest: &str,
+) -> BTreeSet<String> {
+    excused_writers_with_rules(claims, Some(rules_digest))
+}
+
+fn excused_writers_with_rules(
+    claims: &[CheckpointClaim],
+    rules_digest: Option<&str>,
+) -> BTreeSet<String> {
     let mut excused = BTreeSet::new();
     for claim in claims {
         if claim.kind == CHECKPOINT_EXCUSED {
@@ -149,7 +170,16 @@ pub fn excused_writers(claims: &[CheckpointClaim]) -> BTreeSet<String> {
             if by_person && let Some(writer) = claim.text("writer") {
                 excused.insert(writer.to_owned());
             }
-        } else if claim.is_checkpoint_work() {
+        } else if excused.contains(&claim.writer)
+            && claim.is_checkpoint_work()
+            && rules_digest.is_none_or(|rules| {
+                claim.seal_terms().is_some_and(|terms| {
+                    terms.rules_digest == rules && terms.participants.contains(&claim.writer)
+                }) || claim.verified_terms().is_some_and(|terms| {
+                    terms.rules_digest == rules && terms.participants.contains(&claim.writer)
+                })
+            })
+        {
             excused.remove(&claim.writer);
         }
     }
@@ -166,6 +196,26 @@ pub fn participants(
     claims: &[CheckpointClaim],
 ) -> BTreeSet<String> {
     let excused = excused_writers(claims);
+    participants_with_excusals(known, left, claims, &excused)
+}
+
+/// Participant selection for a runtime whose rules must match a returning writer's work.
+pub fn participants_for_rules(
+    known: &BTreeSet<String>,
+    left: &BTreeSet<String>,
+    claims: &[CheckpointClaim],
+    rules_digest: &str,
+) -> BTreeSet<String> {
+    let excused = excused_writers_for_rules(claims, rules_digest);
+    participants_with_excusals(known, left, claims, &excused)
+}
+
+fn participants_with_excusals(
+    known: &BTreeSet<String>,
+    left: &BTreeSet<String>,
+    claims: &[CheckpointClaim],
+    excused: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let named = claims
         .iter()
         .filter(|claim| claim.is_checkpoint_work())
@@ -412,6 +462,80 @@ pub fn verification_difference(ours: &VerifiedTerms, theirs: &VerifiedTerms) -> 
     .join(", ")
 }
 
+#[derive(Default, Serialize, Deserialize)]
+struct FailedProofInputs {
+    inputs: BTreeSet<String>,
+    last_failed_at_unix_ms: u128,
+}
+
+impl FailedProofInputs {
+    fn in_backoff(&self, now_unix_ms: u128) -> bool {
+        !self.inputs.is_empty()
+            && now_unix_ms < self.last_failed_at_unix_ms.saturating_add(CHECKPOINT_PROOF_BACKOFF_MS)
+    }
+}
+
+/// Release labels can be just the package version. Hash the actual running code once, rather
+/// than making a reader/projection fix depend on somebody remembering to bump a rules version.
+/// On Linux the proc link still names this process's binary after an atomic deployment replaces
+/// its path. Never silently reuse a failed result if executable identity cannot be established.
+fn checkpoint_executable_digest() -> Result<&'static str> {
+    use std::io::Read as _;
+    static DIGEST: std::sync::LazyLock<std::result::Result<String, String>> = std::sync::LazyLock::new(|| {
+        let hash = || -> Result<String> {
+            #[cfg(target_os = "linux")]
+            let path = PathBuf::from("/proc/self/exe");
+            #[cfg(not(target_os = "linux"))]
+            let path = std::env::current_exe()?;
+            let mut executable = fs::File::open(path)?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1_024];
+            loop {
+                let read = executable.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+            }
+            Ok(hex::encode(digest.finalize()))
+        };
+        hash().map_err(|error| format!("{error:#}"))
+    });
+    DIGEST.as_ref().map(String::as_str)
+        .map_err(|error| anyhow::anyhow!("checkpoint executable identity unavailable: {error}"))
+}
+
+/// Envelope identities cover immutable claim content, but not admission state or the
+/// materialized tombstones left by earlier trims. Include that closure and canonical claim
+/// order as well as the plan. A build change may fix reader/projection semantics without
+/// changing the drop rules. Rowids, live projections and later claims are not proof inputs.
+fn proof_input_digest(sealed: &SealedSet, plan: &DropPlan) -> Result<String> {
+    let mut digest = Sha256::new();
+    digest.update(b"smallclaims-checkpoint-proof-input-v1\0");
+    digest.update(CHECKPOINT_PROTOCOL.to_be_bytes());
+    digest.update(sealed.cut_unix_ms.to_be_bytes());
+    let build = checkpoint_build();
+    let tombstones = drop_digest(&sealed.envelope_tombstones, &sealed.claim_tombstones);
+    for field in [
+        plan.sealed_digest.as_str(),
+        plan.drop_digest.as_str(),
+        plan.retained_digest.as_str(),
+        plan.rules_digest.as_str(),
+        build.as_str(),
+        checkpoint_executable_digest()?,
+        tombstones.as_str(),
+    ] {
+        digest_field(&mut digest, Some(field));
+    }
+    digest.update((sealed.claims.len() as u64).to_be_bytes());
+    for claim in &sealed.claims {
+        digest_field(&mut digest, Some(&claim.claim.id));
+        digest.update(claim.claim.accepted_at_unix_ms.to_be_bytes());
+        digest.update([u8::from(claim.valid)]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
 /// The agent that asks for attention about checkpoints on this node.
 
 impl Store {
@@ -501,7 +625,15 @@ impl Store {
     ) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
         let known = self.checkpoint_known_writers(configured_peers)?;
         let left = self.checkpoint_left_writers()?;
-        Ok((participants(&known, &left, claims), left))
+        Ok((
+            participants_for_rules(
+                &known,
+                &left,
+                claims,
+                &self.runtime.checkpoint_rules_digest(),
+            ),
+            left,
+        ))
     }
 
     /// Record that this node sealed or verified a checkpoint. From here on it never writes a
@@ -620,6 +752,61 @@ impl Store {
         )
     }
 
+    fn checkpoint_failed_proof_inputs(&self, checkpoint: &str) -> Result<FailedProofInputs> {
+        let detail: Option<String> = self.readers.get().query_row(
+            "SELECT detail FROM checkpoints WHERE id=?1",
+            [checkpoint],
+            |row| row.get(0),
+        ).optional()?;
+        let detail: Value = serde_json::from_str(detail.as_deref().unwrap_or("{}"))?;
+        detail.get("proof_failures").cloned()
+            .map(serde_json::from_value).transpose()
+            .map(|failures| failures.unwrap_or_default())
+            .map_err(Into::into)
+    }
+
+    fn record_failed_checkpoint_proof(
+        &self,
+        checkpoint: &str,
+        sealed: &SealedSet,
+        plan: &DropPlan,
+        input_digest: String,
+        failed_at_unix_ms: u128,
+    ) -> Result<()> {
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction()?;
+        let detail: Option<String> = transaction.query_row(
+            "SELECT detail FROM checkpoints WHERE id=?1",
+            [checkpoint],
+            |row| row.get(0),
+        ).optional()?;
+        let mut detail: Value = serde_json::from_str(detail.as_deref().unwrap_or("{}"))?;
+        let mut failures: FailedProofInputs = detail.get("proof_failures").cloned()
+            .map(serde_json::from_value).transpose()?.unwrap_or_default();
+        failures.inputs.insert(input_digest);
+        failures.last_failed_at_unix_ms = failures.last_failed_at_unix_ms.max(failed_at_unix_ms);
+        detail.as_object_mut().ok_or_else(|| anyhow::anyhow!("checkpoint detail is not an object"))?
+            .insert("proof_failures".into(), serde_json::to_value(failures)?);
+        transaction.execute(
+            "INSERT INTO checkpoints(id, cut_unix_ms, state, seal_rowid, sealed_digest,
+                                     drop_digest, detail, updated_at_unix_ms)
+             VALUES (?1, ?2, 'sealed', ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET detail=excluded.detail,
+                 updated_at_unix_ms=excluded.updated_at_unix_ms",
+            params![
+                checkpoint,
+                i64::try_from(sealed.cut_unix_ms)?,
+                sealed.seal_rowid,
+                plan.sealed_digest,
+                plan.drop_digest,
+                detail.to_string(),
+                i64::try_from(now_ms())?,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// One pass of checkpoint work: seal the newest due checkpoint, or verify it once every
     /// participant's seal matches. A node that is catching up with a peer does nothing, since
     /// what it holds before the cut is still changing. Call it after exchanges and every few
@@ -717,13 +904,31 @@ impl Store {
             // The normal step publishes replacement terms before attempting proof again.
             return Ok(());
         }
-        let (sealed, plan, proof) =
-            self.plan_checkpoint_through(terms.cut_unix_ms, Some(seal_rowid), &context.scratch)?;
+        let failures = self.checkpoint_failed_proof_inputs(checkpoint)?;
+        if failures.in_backoff(context.now_unix_ms) {
+            return Ok(());
+        }
+        let sealed = self.checkpoint_sealed_set_through(terms.cut_unix_ms, Some(seal_rowid))?;
+        let plan = self.runtime.plan_checkpoint_drops(&sealed);
         if plan.sealed_digest != terms.sealed_digest {
             // Something before the cut arrived since the seal; the next pass seals again.
             return Ok(());
         }
+        // A checkpoint with no failures needs no failure identity unless its proof fails.
+        let input_digest = if failures.inputs.is_empty() {
+            None
+        } else {
+            Some(proof_input_digest(&sealed, &plan)?)
+        };
+        if input_digest.as_ref().is_some_and(|input| failures.inputs.contains(input)) {
+            return Ok(());
+        }
+        let proof = self.prove_checkpoint_plan(&sealed, &plan, &context.scratch)?;
         if !proof.passed {
+            let input_digest = match input_digest {
+                Some(input) => input,
+                None => proof_input_digest(&sealed, &plan)?,
+            };
             self.append_claim(&ClaimInput {
                 subject: format!("daemon/{}", self.origin),
                 kind: "daemon.diagnostic".into(),
@@ -734,7 +939,7 @@ impl Store {
                     (
                         "reason".into(),
                         json!(format!(
-                            "dropping {} claims before {checkpoint} would change {}",
+                            "dropping {} claims before {checkpoint} would change {} (proof input {input_digest})",
                             plan.claims.len(),
                             proof.mismatches.join("; ")
                         )),
@@ -744,10 +949,13 @@ impl Store {
                 expected_subject: None,
                 idempotency_key: Some(format!(
                     "checkpoint-proof-failed:{}:{checkpoint}:{}",
-                    self.origin, plan.drop_digest
+                    self.origin, input_digest
                 )),
             })
             .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
+            self.record_failed_checkpoint_proof(
+                checkpoint, &sealed, &plan, input_digest, context.now_unix_ms,
+            )?;
             actions.push(CheckpointAction::ProofFailed {
                 checkpoint: checkpoint.to_owned(),
                 mismatches: proof.mismatches,
@@ -919,7 +1127,7 @@ impl Store {
             trimmed,
             halted: self.checkpoint_halted()?,
             pending,
-            excused: excused_writers(&claims),
+            excused: excused_writers_for_rules(&claims, &self.runtime.checkpoint_rules_digest()),
             participants,
             left,
         })

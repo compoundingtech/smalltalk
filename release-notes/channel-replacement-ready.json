@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Require an admitted replacement-channel ready report before restoring the fault link",
+  "replay": {
+    "status": "none",
+    "detail": "Only fixture readiness and test-support observation change; ordinary production behavior is unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Only fixture readiness and test-support observation change; ordinary production behavior is unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Only fixture readiness and test-support observation change; ordinary production behavior is unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only fixture readiness and test-support observation change; ordinary production behavior is unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Only fixture readiness and test-support observation change; ordinary production behavior is unchanged."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Only fixture readiness and test-support observation change; ordinary production behavior is unchanged."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Only fixture readiness and test-support observation change; ordinary production behavior is unchanged."
+  }
+}
