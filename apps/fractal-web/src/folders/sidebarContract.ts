@@ -21,6 +21,8 @@ export type SidebarRowStatus = { readonly _tag: 'Pending' } | { readonly _tag: '
 export type SidebarCreateFolder = { readonly parent: string | null; readonly target?: SidebarMoveTarget; readonly name: string; readonly withAgent?: string }
 export type AgentFoldersProps = {
   readonly tree: readonly SidebarNode[]
+  /** Canonical, unfiltered projection for ordering; the kit defaults to tree when omitted. */
+  readonly orderingTree?: readonly SidebarNode[]
   readonly canDrop: (items: readonly [string], target: SidebarMoveTarget) => SidebarDropVerdict
   readonly onMove: (intent: SidebarMove) => void
   readonly onCreateFolder: (intent: SidebarCreateFolder) => void
