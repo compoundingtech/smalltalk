@@ -2,7 +2,47 @@ use super::*;
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
 use rusqlite::{Connection, params};
-use std::sync::Barrier;
+use std::sync::{Barrier, Mutex};
+
+// Only explicitly tracked fixture stores are counted. Other parallel tests cannot
+// affect this admission-order control, and the registration is removed on drop.
+static SNAPSHOT_CONSTRUCTIONS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+pub(in crate::api) fn note_snapshot_construction(state: &AppState) {
+    if let Some(count) = SNAPSHOT_CONSTRUCTIONS
+        .lock()
+        .unwrap()
+        .get_mut(&(Arc::as_ptr(&state.store) as usize))
+    {
+        *count += 1;
+    }
+}
+
+struct SnapshotConstructions(usize);
+
+impl SnapshotConstructions {
+    fn track(state: &AppState) -> Self {
+        let key = Arc::as_ptr(&state.store) as usize;
+        assert!(
+            SNAPSHOT_CONSTRUCTIONS
+                .lock()
+                .unwrap()
+                .insert(key, 0)
+                .is_none()
+        );
+        Self(key)
+    }
+
+    fn count(&self) -> usize {
+        SNAPSHOT_CONSTRUCTIONS.lock().unwrap()[&self.0]
+    }
+}
+
+impl Drop for SnapshotConstructions {
+    fn drop(&mut self) {
+        SNAPSHOT_CONSTRUCTIONS.lock().unwrap().remove(&self.0);
+    }
+}
 
 // These controls measure whole-router global SQL counters; keep their isolated stores
 // sequential without changing the host's RUST_TEST_THREADS or global clock.
@@ -78,6 +118,20 @@ async fn get(state: &AppState, path: &str) -> (StatusCode, Value) {
         .await
         .unwrap();
     (status, serde_json::from_slice(&body).unwrap())
+}
+
+async fn head_status(state: &AppState, path: &str) -> StatusCode {
+    super::super::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
 }
 
 fn selected(state: &AppState, kind: &str, id: &str, snapshot: &ClientSnapshot) -> Option<Value> {
@@ -327,6 +381,98 @@ async fn refuses(state: &AppState, path: &str, code: &str) -> Value {
 }
 
 #[tokio::test]
+async fn detail_router_admits_timestamp_and_host_before_any_snapshot_construction() {
+    let _serial = SERIAL.acquire().await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let state = fixture(root.path());
+    let connection = Connection::open(root.path().join("graph.db")).unwrap();
+    crate::store::configure_projection_writer(&connection).unwrap();
+    let (position, accepted): (u64, String) = connection
+        .query_row(
+            "SELECT store_index,accepted_at_unix_ms FROM claims ORDER BY store_index DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let snapshots = SnapshotConstructions::track(&state);
+    // The latest claim is a subscription state, not the selected observer state.
+    // Both routes must guard this envelope input before the initial snapshot helper.
+    for collection in ["observers", "subscriptions"] {
+        let subject = if collection == "observers" {
+            OBSERVER
+        } else {
+            SUBSCRIPTION
+        };
+        let path = format!("/v1/client/{collection}/{subject}");
+        connection
+            .execute(
+                "UPDATE claims SET accepted_at_unix_ms=?2 WHERE store_index=?1",
+                params![position, "0".repeat(280_000)],
+            )
+            .unwrap();
+        refuses(&state, &path, "projection-detail-too-large").await;
+        assert_eq!(
+            head_status(&state, &path).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            snapshots.count(),
+            0,
+            "oversize timestamp was formatted before admission"
+        );
+        for invalid in ["X'80'", "CAST(X'80' AS TEXT)", "'invalid'"] {
+            connection
+                .execute(
+                    &format!(
+                        "UPDATE claims SET accepted_at_unix_ms={invalid} WHERE store_index=?1"
+                    ),
+                    [position],
+                )
+                .unwrap();
+            refuses(&state, &path, "projection-detail-invalid-source").await;
+            assert_eq!(
+                snapshots.count(),
+                0,
+                "invalid timestamp reached snapshot construction"
+            );
+        }
+        connection
+            .execute(
+                "UPDATE claims SET accepted_at_unix_ms=?2 WHERE store_index=?1",
+                params![position, accepted],
+            )
+            .unwrap();
+        let mut oversized_host = state.clone();
+        oversized_host.node = "h".repeat(4097);
+        refuses(&oversized_host, &path, "projection-detail-too-large").await;
+        assert_eq!(
+            head_status(&oversized_host, &path).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            snapshots.count(),
+            0,
+            "oversize host was formatted before admission"
+        );
+    }
+    // A successful detail constructs exactly the guarded response snapshot, which
+    // still appears in the wire envelope. Other routes keep admission snapshots.
+    let (status, value) = get(&state, &format!("/v1/client/observers/{OBSERVER}")).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(snapshots.count(), 1);
+    assert_eq!(value["snapshot"]["store_index"], position);
+    assert!(
+        value["snapshot"]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("snapshot/")
+    );
+    let (status, _) = get(&state, "/v1/client/observers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(snapshots.count() > 1, "list admission remains unchanged");
+}
+
+#[tokio::test]
 async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
     let _serial = SERIAL.acquire().await.unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -390,6 +536,41 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
             .execute_batch(&format!("DROP TRIGGER \"{}\"", name.replace('"', "\"\"")))
             .unwrap();
     }
+    // Kind eligibility must not materialize an oversized wrong-kind row before
+    // returning absent/fallback. A raw candidate refusing admission never falls
+    // through to the otherwise valid prefixed declaration.
+    connection.execute(
+        "INSERT INTO desired SELECT 'detail/watch/source','agent',revision,claim_id,body,NULL,NULL,NULL,NULL FROM desired WHERE subject=?1",
+        [OBSERVER],
+    ).unwrap();
+    let raw_path = "/v1/client/observers/detail/watch/source";
+    assert_eq!(
+        get(&state, raw_path).await.0,
+        StatusCode::OK,
+        "ordinary wrong-kind raw ID falls back"
+    );
+    connection
+        .execute(
+            "UPDATE desired SET kind=?2 WHERE subject=?1",
+            params!["detail/watch/source", huge],
+        )
+        .unwrap();
+    refuses(&state, raw_path, "projection-detail-too-large").await;
+    for value in ["X'80'", "CAST(X'80' AS TEXT)"] {
+        connection
+            .execute(
+                &format!("UPDATE desired SET kind={value} WHERE subject=?1"),
+                ["detail/watch/source"],
+            )
+            .unwrap();
+        refuses(&state, raw_path, "projection-detail-invalid-source").await;
+    }
+    connection
+        .execute(
+            "DELETE FROM desired WHERE subject='detail/watch/source'",
+            [],
+        )
+        .unwrap();
     for value in ["X'80'", "CAST(X'80' AS TEXT)", "'{'"] {
         let original: String = connection
             .query_row(
@@ -627,12 +808,19 @@ async fn detail_seek_plans_and_metadata_bytecodes_use_indexed_headers() {
     let connection = Connection::open(root.path().join("graph.db")).unwrap();
     crate::store::configure_projection_writer(&connection).unwrap();
     use crate::store::observer_subscription_detail::{
-        DECLARATION_METADATA_SQL, SNAPSHOT_METADATA_SQL, STATE_METADATA_SQL,
+        DECLARATION_KIND_METADATA_SQL, DECLARATION_METADATA_SQL, SNAPSHOT_METADATA_SQL,
+        STATE_METADATA_SQL,
     };
-    for (sql, table, body_column) in [
-        (DECLARATION_METADATA_SQL, "desired", 4),
-        (STATE_METADATA_SQL, "claims", 7),
-        (SNAPSHOT_METADATA_SQL, "claims", 9),
+    let state_index_root: i64 = connection.query_row(
+        "SELECT rootpage FROM sqlite_master WHERE type='index' AND name='claims_subject_kind_index'",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    for (sql, table) in [
+        (DECLARATION_KIND_METADATA_SQL, "desired"),
+        (DECLARATION_METADATA_SQL, "desired"),
+        (STATE_METADATA_SQL, "claims"),
+        (SNAPSHOT_METADATA_SQL, "claims"),
     ] {
         let mut query = connection
             .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -661,24 +849,34 @@ async fn detail_seek_plans_and_metadata_bytecodes_use_indexed_headers() {
                 "{plan:?}"
             );
         }
-        // The bundled SQLite emits a metadata-only OP_Column for octet_length/typeof
-        // on direct stored columns. It must not materialize the source body first.
+        // Audit every OP_Column, including kind, revision, owners and timestamps.
+        // Only the composite index's integer store_index may use an ordinary
+        // column read; every variable-width source field needs byte/type flags.
         let mut query = connection.prepare(&format!("EXPLAIN {sql}")).unwrap();
         let mut rows = query.raw_query();
+        let mut cursor_roots = BTreeMap::new();
         let mut flags = Vec::new();
         while let Some(row) = rows.next().unwrap() {
-            if row.get::<_, String>(1).unwrap() == "Column"
-                && row.get::<_, i64>(3).unwrap() == body_column
-            {
-                flags.push(row.get::<_, u8>(6).unwrap());
+            let opcode = row.get::<_, String>(1).unwrap();
+            let cursor = row.get::<_, i64>(2).unwrap();
+            let column = row.get::<_, i64>(3).unwrap();
+            if opcode == "OpenRead" {
+                cursor_roots.insert(cursor, column);
+            }
+            if opcode == "Column" {
+                let flag = row.get::<_, u8>(6).unwrap();
+                let integer_index_position = sql == STATE_METADATA_SQL
+                    && cursor_roots.get(&cursor) == Some(&state_index_root)
+                    && column == 2;
+                assert!(
+                    matches!(flag & 0xc0, 0x80 | 0xc0) || integer_index_position,
+                    "unguarded source OP_Column cursor={cursor} column={column} p5={flag} in {sql}"
+                );
+                flags.push((cursor, column, flag));
             }
         }
         // EXPLAIN p5 is column 6; P2 (stored column number) is column 3.
         assert!(!flags.is_empty(), "no metadata column in {sql}");
-        assert!(
-            flags.iter().all(|flag| flag & 0xc0 != 0),
-            "source payload copied by metadata program: {flags:?}"
-        );
         eprintln!("detail query plan={plan:?} metadata OP_Column p5={flags:?}");
     }
     let snapshot = state

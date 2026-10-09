@@ -18,7 +18,7 @@ mod summary;
 #[cfg(test)]
 mod stream_start_tests;
 #[cfg(test)]
-mod observer_subscription_detail_tests;
+pub(super) mod observer_subscription_detail_tests;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";

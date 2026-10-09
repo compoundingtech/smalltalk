@@ -8,17 +8,21 @@ pub(crate) const SNAPSHOT_METADATA_SQL: &str =
                     typeof(accepted_at_unix_ms)='text'
              FROM claims WHERE store_index<=?1 ORDER BY store_index DESC LIMIT 1";
 
+pub(crate) const DECLARATION_KIND_METADATA_SQL: &str =
+    "SELECT octet_length(kind), typeof(kind)='text'
+             FROM desired WHERE subject=?1";
+
 pub(crate) const DECLARATION_METADATA_SQL: &str =
-    "SELECT octet_length(subject) + octet_length(kind) + octet_length(revision)
+    "SELECT octet_length(subject) + octet_length(revision)
                     + octet_length(body) + coalesce(octet_length(owner_run),0)
                     + coalesce(octet_length(owner_generation),0)
                     + coalesce(octet_length(owner_step),0),
-                    typeof(subject)='text' AND typeof(kind)='text'
+                    typeof(subject)='text'
                     AND typeof(revision)='text' AND typeof(body)='text'
                     AND typeof(owner_run) IN ('null','text')
                     AND typeof(owner_generation) IN ('null','text')
                     AND typeof(owner_step) IN ('null','text')
-             FROM desired WHERE subject=?1 AND (kind=?2 OR (kind='stop' AND ?3))";
+             FROM desired WHERE subject=?1";
 
 pub(crate) const STATE_METADATA_SQL: &str =
     "SELECT store_index, octet_length(body) + octet_length(accepted_at_unix_ms),
@@ -72,6 +76,7 @@ impl Store {
             valid_metadata(valid)?;
             // The guarded validation and client_snapshot_at each copy this column.
             budget.charge(bytes.saturating_mul(2))?;
+            smallclaims::read_budget::check()?;
             connection
                 .prepare_cached("SELECT accepted_at_unix_ms FROM claims WHERE store_index=?1")?
                 .query_row([position], |row| decode_time(row.get(0)?, 0))
@@ -88,14 +93,33 @@ impl Store {
     ) -> Result<Option<DetailDeclaration>> {
         smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
-        // Wrong-kind rows do not copy/decode payloads. Stops are admitted by the same
-        // subject-prefix rule as observer_subscription_resources.
-        let stop = subject.starts_with(&format!("{kind}/"));
+        // Do not compare kind in SQL before admitting its direct-column width/type:
+        // an ordinary OP_Column comparison can fetch an oversized wrong-kind value.
+        // All phases share the caller's pinned cut and cumulative raw/fallback budget.
+        let kind_metadata: Option<(i64, bool)> = connection
+            .prepare_cached(DECLARATION_KIND_METADATA_SQL)?
+            .query_row([subject], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        let Some((kind_bytes, kind_valid)) = kind_metadata else {
+            return Ok(None);
+        };
+        valid_metadata(kind_valid)?;
+        budget.charge(kind_bytes)?;
+        smallclaims::read_budget::check()?;
+        let stored_kind: String = connection
+            .prepare_cached("SELECT kind FROM desired WHERE subject=?1")?
+            .query_row([subject], |row| row.get(0))
+            .map_err(detail_read_error)?;
+        // Ordinary wrong kinds remain absent without reading the rest of the row.
+        // Stops retain the existing subject-prefix admission rule.
+        if stored_kind != kind
+            && !(stored_kind == "stop" && subject.starts_with(&format!("{kind}/")))
+        {
+            return Ok(None);
+        }
         let metadata: Option<(i64, bool)> = connection
             .prepare_cached(DECLARATION_METADATA_SQL)?
-            .query_row(params![subject, kind, stop], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
+            .query_row([subject], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?;
         let Some((bytes, valid)) = metadata else {
             return Ok(None);
@@ -105,22 +129,22 @@ impl Store {
         smallclaims::read_budget::check()?;
         connection
             .prepare_cached(
-                "SELECT kind, revision, body, owner_run, owner_generation, owner_step
+                "SELECT revision, body, owner_run, owner_generation, owner_step
              FROM desired WHERE subject=?1",
             )?
             .query_row([subject], |row| {
-                let body = row.get::<_, String>(2)?;
+                let body = row.get::<_, String>(1)?;
                 Ok(DetailDeclaration {
                     desired: DesiredSubject {
                         subject: subject.into(),
-                        kind: row.get(0)?,
-                        desired: decode_body(&body, 2)?,
+                        kind: stored_kind.clone(),
+                        desired: decode_body(&body, 1)?,
                         member: None, // Neither item renderer consumes membership.
-                        owner_run: row.get(3)?,
-                        owner_generation: row.get(4)?,
-                        owner_step: row.get(5)?,
+                        owner_run: row.get(2)?,
+                        owner_generation: row.get(3)?,
+                        owner_step: row.get(4)?,
                     },
-                    revision: row.get(1)?,
+                    revision: row.get(0)?,
                 })
             })
             .optional()
