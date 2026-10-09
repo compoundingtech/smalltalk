@@ -1959,6 +1959,33 @@ async fn cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_rest
         .mission_run("example/cli-work/coverage-cli-run")
         .unwrap()
         .unwrap();
+    cli_value(
+        daemon
+            .cli(
+                PERSON,
+                &[
+                    "missions",
+                    "report-to",
+                    &run.subject,
+                    "--agent",
+                    "agent/example/watcher",
+                    "--stalled-after",
+                    "1h",
+                    "--as",
+                    PERSON,
+                ],
+            )
+            .await,
+    );
+    daemon.restart().await;
+    let report = daemon
+        .store()
+        .latest_claim(&run.subject, Some("mission-run.report-to"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.actor.as_deref(), Some(PERSON));
+    assert_eq!(report.body["fields"]["report_to"], "agent/example/watcher");
+    assert_eq!(report.body["fields"]["stalled_after_ms"], 3_600_000);
     let step = &run.steps[0].subject;
     daemon.store().set_step_state(step, "ready", None).unwrap();
     // An unclaimed step must still reject an obsolete caller incarnation without writes.

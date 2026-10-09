@@ -1941,11 +1941,11 @@ struct MissionReportToArgs {
     agent: Option<String>,
     /// How long the run may go without progress before it counts as stalled, such as `1h`.
     /// Defaults to the mission's `stalled-after`, else 30 minutes.
-    #[arg(long, value_name = "DURATION", requires = "agent")]
+    #[arg(long, value_name = "DURATION", requires = "agent", conflicts_with = "clear")]
     #[arg(value_parser = parse_stalled_after)]
     stalled_after: Option<u64>,
     /// Also tell the agent when the run completes.
-    #[arg(long, requires = "agent")]
+    #[arg(long, requires = "agent", conflicts_with = "clear")]
     report_completed: bool,
     /// Report this run to nobody, whatever its mission or start named.
     #[arg(long)]
