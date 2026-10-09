@@ -24,6 +24,41 @@ The client package pins TypeScript 6.0.3 and Effect 4.0.0-rc.118 in its own deve
 
 To verify generated files against the Rust generator, also run `cargo run -p st3-client-codegen -- --check`. The sibling [`st3-views`](../st3-views/README.md) package shares the phone's view models with other TypeScript clients. CI checks the generated client, shared views and iOS consumers together. To run these checks locally, install the locked dependencies in this package, `clients/typescript/st3-views` and `apps/ios`, then run `bash scripts/ci-typescript-client`.
 
+## Active span propagation
+
+Fractal, web, and React Native callers can pass their active span context without
+adding a runtime dependency to this SDK. For example, an app already using
+`@opentelemetry/api` can configure:
+
+```ts
+import { context, trace } from '@opentelemetry/api'
+import { St3Client } from '@smalltalk/st3-client'
+
+const client = new St3Client({
+  baseUrl: daemonUrl,
+  traceContext: () => {
+    const span = trace.getSpan(context.active())?.spanContext()
+    if (!span) return undefined
+    return {
+      traceparent: `00-${span.traceId}-${span.spanId}-${span.traceFlags.toString(16).padStart(2, '0')}`,
+      tracestate: span.traceState?.serialize(),
+    }
+  },
+})
+```
+
+The synchronous callback is read once per HTTP request or WebSocket open, not at
+client construction, so each call continues the currently active span. An absent
+callback or `undefined` result sends no trace headers. Invalid `traceparent`
+values (non-lowercase W3C format, version `ff`, or zero trace/span IDs) suppress
+both headers. `tracestate` is forwarded verbatim; the SDK never adds `st=c`.
+A daemon with trace propagation records `st.parent.sampled` for a sampled
+incoming parent without an `st` tracestate entry, so the collector can honour
+external app sampling decisions. Daemons without trace propagation ignore both
+headers.
+Web streams require a header-capable `socket` factory: the browser's native
+WebSocket API cannot set these headers.
+
 ## Rich Effect schemas
 
 Import `@smalltalk/st3-client/schema` (or `Schema.generated.ts` directly) for Effect 4 `Schema.Struct` codecs and their `typeof X.Type` decoded types. Rich consumers must provide the pinned `effect@4.0.0-rc.118` peer dependency. The raw client entry point does not import Effect, so existing fetch/Expo consumers need no dependency or API migration.
