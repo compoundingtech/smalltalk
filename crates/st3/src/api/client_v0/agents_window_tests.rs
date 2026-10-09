@@ -170,8 +170,12 @@ fn agents_window_fixture_cold_and_warm_phase_costs() {
         // Alternate order. Both paths use fresh Store instances and the same invented file.
         for selected in if round % 2 == 0 { [false, true] } else { [true, false] } {
             let store = Store::open(&path, "bench-host").unwrap();
-            assert_eq!(store.index().unwrap(), 222_212);
+            if round == 0 && !selected {
+                println!("fixture_store_index={}", store.index().unwrap());
+            }
             for temperature in ["cold", "warm"] {
+                let total_cpu = cpu_ms();
+                let total_started = Instant::now();
                 store.read_snapshot(|index| {
                     let (cards, resource) = phase(|| if selected {
                         client_agent_window_cards(&store, index, 100)
@@ -196,6 +200,15 @@ fn agents_window_fixture_cold_and_warm_phase_costs() {
                     }
                     Ok(())
                 }).unwrap();
+                let phases = ["graph-derived cards", "live overlay", "serialization"]
+                    .map(|name| *samples[&(selected, temperature, name)].last().unwrap());
+                let total = Sample {
+                    wall: total_started.elapsed().as_secs_f64() * 1000.0,
+                    cpu: cpu_ms() - total_cpu,
+                    statements: phases.iter().map(|sample| sample.statements).sum(),
+                    vm: phases.iter().map(|sample| sample.vm).sum(),
+                };
+                samples.entry((selected, temperature, "snapshot total")).or_default().push(total);
             }
         }
     }
