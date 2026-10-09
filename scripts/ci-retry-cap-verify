@@ -80,9 +80,14 @@ def results(xml_text, raw, selection, exit_code):
         require(float(case.get('time')) >= 0, 'invalid per-name time')
         require(all(child.tag in ('system-out', 'system-err') for child in case), 'failure/skip/retry/unknown result tag')
     # Use only nextest's status rows and terminal summary, never libtest summary text.
-    rows = re.findall(r'^\s*PASS\s+\[[^\]\n]+\]\s+(\S+)\s+(\S+)\s*$', raw, re.M)
-    require(len(rows) == 13 and len(set(rows)) == 13, 'missing/duplicate raw initial PASS rows')
-    require({(selection['binary_id'], name) for name in names} == set(rows), 'raw/JUnit named result mismatch')
+    status_lines = re.findall(r'^\s*PASS\b[^\n]*$', raw, re.M)
+    rows = re.findall(r'^\s*PASS\s+\[[^\]\n]+\]\s+\((\d+)/13\)\s+(\S+)\s+(\S+)\s*$', raw, re.M)
+    require(len(status_lines) == len(rows) == 13, 'missing/malformed/extra raw initial PASS rows')
+    counters = [int(counter) for counter, _, _ in rows]
+    require(sorted(counters) == list(range(1, 14)), 'missing/duplicate raw execution counter')
+    named = [(binary, name) for _, binary, name in rows]
+    require(len(set(named)) == 13, 'duplicate raw initial PASS name')
+    require({(selection['binary_id'], name) for name in names} == set(named), 'raw/JUnit named result mismatch')
     require(not re.search(r'^\s*(?:TRY\s+\d+|RETRY|FLAKY|LEAK|FAIL|ABORT|SKIP|TIMEOUT)\b', raw, re.M), 'noninitial or negative raw outcome')
     summaries = re.findall(r'^\s*Summary\s+\[[^\]\n]+\]\s+13 tests run: 13 passed(?:, \d+ skipped)?\s*$', raw, re.M)
     require(len(summaries) == 1, 'missing/ambiguous exact 13/13 terminal summary')

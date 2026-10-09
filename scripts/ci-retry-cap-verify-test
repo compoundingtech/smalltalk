@@ -26,7 +26,7 @@ def good_xml():
 
 
 def good_raw():
-    return '\n'.join('PASS [0.1s] smallclaims ' + name for name in NAMES) + '\nSummary [1.3s] 13 tests run: 13 passed, 100 skipped\n'
+    return '\n'.join(f'PASS [0.1s] ({index}/13) smallclaims {name}' for index, name in enumerate(NAMES, 1)) + '\nSummary [1.3s] 13 tests run: 13 passed, 100 skipped\n'
 
 
 class EvidenceTests(unittest.TestCase):
@@ -54,6 +54,20 @@ class EvidenceTests(unittest.TestCase):
         for exit_code in [1, 101, 130, 143, -9]:
             with self.subTest(exit_code=exit_code):
                 with self.assertRaises(ValueError): v.results(ET.tostring(good_xml()), good_raw(), SELECTION, exit_code)
+
+    def test_actual_counter_format(self):
+        # Normal retained nextest 0.9.140 initial output includes (i/total).
+        self.assertTrue(v.results(ET.tostring(good_xml()), good_raw(), SELECTION, 0)['qualified'])
+        for raw in [good_raw().replace('(1/13)', '(2/13)'),
+                    good_raw().replace('(1/13)', '(0/13)'),
+                    good_raw().replace('(1/13)', '(14/13)'),
+                    good_raw().replace('/13)', '/14)'),
+                    good_raw().replace('(1/13)', '(1/x)'),
+                    good_raw().replace('(1/13)', '(1/13'),
+                    good_raw().replace('(1/13)', ''),
+                    good_raw() + 'PASS [0.1s] (bad) smallclaims extra\n']:
+            with self.subTest(raw=raw[:90]):
+                with self.assertRaises(ValueError): v.results(ET.tostring(good_xml()), raw, SELECTION, 0)
 
     def test_inventory_refuses_wrong_selection(self):
         with tempfile.TemporaryDirectory() as directory:
