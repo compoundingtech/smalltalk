@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::DesiredSubject;
 use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
 use std::collections::BTreeSet;
@@ -16,6 +17,8 @@ mod summary;
 
 #[cfg(test)]
 mod stream_start_tests;
+#[cfg(test)]
+mod observer_subscription_detail_tests;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -3063,6 +3066,81 @@ fn runtime_resources_from_status(
     Ok(values)
 }
 
+fn observer_subscription_spec(
+    desired: &DesiredSubject,
+    kind: &str,
+    history: bool,
+) -> anyhow::Result<Option<Value>> {
+    if desired.kind != kind
+        && !(desired.kind == "stop" && desired.subject.starts_with(&format!("{kind}/")))
+    {
+        return Ok(None);
+    }
+    let spec = if kind == "observer" {
+        let Some(spec) = crate::graph::observer_spec(&desired.desired) else {
+            return Ok(None);
+        };
+        serde_json::to_value(spec)?
+    } else {
+        let Some(spec) = crate::graph::subscription_spec(&desired.desired) else {
+            return Ok(None);
+        };
+        serde_json::to_value(spec)?
+    };
+    if !history
+        && spec
+            .get("stopped")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    Ok(Some(spec))
+}
+
+fn observer_subscription_resource(
+    desired: DesiredSubject,
+    kind: &str,
+    spec: Value,
+    revision: String,
+    claim: Option<(Value, u128)>,
+    snapshot: &ClientSnapshot,
+) -> Value {
+    let stopped = spec
+        .get("stopped")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let observed_state = claim
+        .as_ref()
+        .and_then(|(body, _)| body.pointer("/fields/state"))
+        .and_then(Value::as_str);
+    let state_name = if stopped {
+        "stopped"
+    } else {
+        observed_state.unwrap_or("pending")
+    };
+    let updated_at = claim
+        .as_ref()
+        .map(|(_, at)| client_timestamp(*at))
+        .unwrap_or_else(|| snapshot.created_at.clone());
+    json!({
+        "id": desired.subject,
+        "kind": kind,
+        "revision": revision,
+        "updated_at": updated_at,
+        "state": state_name,
+        "spec": spec,
+        "owner_run_id": desired.owner_run,
+        "owner_generation_id": desired.owner_generation,
+        "owner_step_id": desired.owner_step,
+        "operational": {
+            "layer": if stopped { "history" } else { "current" },
+            "actionable": !stopped,
+            "reasons": if stopped { vec!["stopped"] } else { Vec::<&str>::new() }
+        }
+    })
+}
+
 fn observer_subscription_resources(
     state: &AppState,
     kind: &str,
@@ -3071,29 +3149,9 @@ fn observer_subscription_resources(
 ) -> anyhow::Result<Vec<Value>> {
     let mut values = Vec::new();
     for desired in state.store.desired_subjects()? {
-        if desired.kind != kind
-            && !(desired.kind == "stop" && desired.subject.starts_with(&format!("{kind}/")))
-        {
+        let Some(spec) = observer_subscription_spec(&desired, kind, history)? else {
             continue;
-        }
-        let spec = if kind == "observer" {
-            let Some(spec) = crate::graph::observer_spec(&desired.desired) else {
-                continue;
-            };
-            serde_json::to_value(spec)?
-        } else {
-            let Some(spec) = crate::graph::subscription_spec(&desired.desired) else {
-                continue;
-            };
-            serde_json::to_value(spec)?
         };
-        let stopped = spec
-            .get("stopped")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if stopped && !history {
-            continue;
-        }
         let claim_kind = if kind == "observer" {
             "observer.state"
         } else {
@@ -3110,45 +3168,127 @@ fn observer_subscription_resources(
             )?
             .claims
             .into_iter()
-            .next();
-        let observed_state = claim
-            .as_ref()
-            .and_then(|claim| claim.body.pointer("/fields/state"))
-            .and_then(Value::as_str);
-        let state_name = if stopped {
-            "stopped"
-        } else {
-            observed_state.unwrap_or("pending")
-        };
+            .next()
+            .map(|claim| (claim.body, claim.accepted_at_unix_ms));
         let revision = state
             .store
             .selected_desired_revision(&desired.subject)?
             .unwrap_or_else(|| "unknown".into());
-        let updated_at = claim
-            .as_ref()
-            .map(|claim| client_timestamp(claim.accepted_at_unix_ms))
-            .unwrap_or_else(|| snapshot.created_at.clone());
-        values.push(json!({
-            "id": desired.subject,
-            "kind": kind,
-            "revision": revision,
-            "updated_at": updated_at,
-            "state": state_name,
-            "spec": spec,
-            "owner_run_id": desired.owner_run,
-            "owner_generation_id": desired.owner_generation,
-            "owner_step_id": desired.owner_step,
-            "operational": {
-                "layer": if stopped { "history" } else { "current" },
-                "actionable": !stopped,
-                "reasons": if stopped { vec!["stopped"] } else { Vec::<&str>::new() }
-            }
-        }));
+        values.push(observer_subscription_resource(
+            desired, kind, spec, revision, claim, snapshot,
+        ));
     }
     values.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
     Ok(values)
 }
 
+/// The raw ID has priority over the prefixed fallback, just as client_detail does.
+/// Call inside read_snapshot; declaration, revision, state and envelope share that cut.
+fn observer_subscription_detail_at(
+    state: &AppState,
+    kind: &str,
+    id: &str,
+    snapshot: &ClientSnapshot,
+    budget: &mut crate::store::observer_subscription_detail::DetailBudget,
+) -> anyhow::Result<Option<Value>> {
+    use crate::store::observer_subscription_detail::MAX_DETAIL_KEY_BYTES;
+    if id.len() > MAX_DETAIL_KEY_BYTES
+        || (!id.starts_with(&format!("{kind}/"))
+            && id.len() + kind.len() + 1 > MAX_DETAIL_KEY_BYTES)
+    {
+        return Err(St3Error::new(
+            "projection-detail-too-large",
+            "observer/subscription detail ID exceeds the 4096 byte key budget",
+        )
+        .into());
+    }
+    let prefixed = client_detail_id(kind, id);
+    for subject in [id, prefixed.as_str()]
+        .into_iter()
+        .take(if id == prefixed { 1 } else { 2 })
+    {
+        let Some(declaration) = state
+            .store
+            .observer_subscription_detail_declaration(subject, kind, budget)?
+        else {
+            continue;
+        };
+        let Some(spec) = observer_subscription_spec(&declaration.desired, kind, true)? else {
+            continue;
+        };
+        let claim_kind = if kind == "observer" {
+            "observer.state"
+        } else {
+            "subscription.state"
+        };
+        let claim = state.store.observer_subscription_detail_state(
+            subject,
+            claim_kind,
+            snapshot.store_index,
+            budget,
+        )?;
+        smallclaims::read_budget::check()?;
+        let value = observer_subscription_resource(
+            declaration.desired,
+            kind,
+            spec,
+            declaration.revision,
+            claim,
+            snapshot,
+        );
+        // Source bytes bound JSON decoding and rendering; escaping can enlarge the output.
+        // Refuse the complete item rather than truncate any field or fall back to a list.
+        if serde_json::to_vec(&value)?.len() + serde_json::to_vec(snapshot)?.len() > 512 * 1024 {
+            return Err(St3Error::new(
+                "projection-detail-too-large",
+                "observer/subscription detail output exceeds the 512 KiB response budget",
+            )
+            .into());
+        }
+        smallclaims::read_budget::check()?;
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
+async fn observer_subscription_detail(
+    state: AppState,
+    kind: &'static str,
+    id: String,
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
+    let (snapshot, value) = super::blocking_store(move || {
+        state.store.clone().read_snapshot(|index| {
+            use crate::store::observer_subscription_detail::{DetailBudget, MAX_DETAIL_KEY_BYTES};
+            if state.node.len() > MAX_DETAIL_KEY_BYTES {
+                return Err(St3Error::new(
+                    "projection-detail-too-large",
+                    "observer/subscription detail host metadata exceeds the 4096 byte budget",
+                )
+                .into());
+            }
+            let mut budget = DetailBudget::new();
+            // Bound the snapshot's host/ID/fingerprint inputs before formatting them.
+            // Numeric position, timestamp and fixed JSON header overhead fit in 128 bytes.
+            budget.charge((3 * state.node.len() + CLIENT_PROJECTION_VERSION.len() + 128) as i64)?;
+            state
+                .store
+                .observer_subscription_detail_snapshot_guard(index, &mut budget)?;
+            let snapshot = client_snapshot_at(&state, index);
+            let value = state.store.with_owned_set_snapshot_reads(|| {
+                observer_subscription_detail_at(&state, kind, &id, &snapshot, &mut budget)
+            })?;
+            let value = value.ok_or_else(|| {
+                St3Error::new(
+                    "not-found",
+                    format!("{kind} `{}` does not exist", client_detail_id(kind, &id)),
+                )
+            })?;
+            Ok((snapshot, value))
+        })
+    })
+    .await?;
+    Ok((Extension(snapshot), Json(value)))
+}
 /// Every open lane, or every declared lane with history, in client form.
 pub(super) async fn lanes(
     State(state): State<AppState>,
@@ -3242,17 +3382,11 @@ pub(super) async fn observers(
 
 pub(super) async fn observer_detail(
     State(state): State<AppState>,
-    Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
     require_scope(&session, "read.projections")?;
-    client_detail(
-        observer_subscription_resources(&state, "observer", true, &snapshot)
-            .map_err(ApiError::internal)?,
-        "observer",
-        &id,
-    )
+    observer_subscription_detail(state, "observer", id).await
 }
 
 pub(super) async fn subscriptions(
@@ -3269,17 +3403,11 @@ pub(super) async fn subscriptions(
 
 pub(super) async fn subscription_detail(
     State(state): State<AppState>,
-    Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
     require_scope(&session, "read.projections")?;
-    client_detail(
-        observer_subscription_resources(&state, "subscription", true, &snapshot)
-            .map_err(ApiError::internal)?,
-        "subscription",
-        &id,
-    )
+    observer_subscription_detail(state, "subscription", id).await
 }
 
 fn machine_resources(

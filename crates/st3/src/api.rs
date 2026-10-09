@@ -1364,6 +1364,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "invalid-subject-reference"
         | "stale-fence"
         | "timeline-history-incomplete"
+        | "projection-detail-too-large"
+        | "projection-detail-invalid-source"
         | "cursor-gap"
         | "page-cursor-expired"
         | "rate-limited"

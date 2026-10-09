@@ -1,5 +1,6 @@
 pub mod custom;
 pub mod declarations;
+pub(crate) mod observer_subscription_detail;
 mod glass_heads;
 mod arrangements;
 #[cfg(test)]
