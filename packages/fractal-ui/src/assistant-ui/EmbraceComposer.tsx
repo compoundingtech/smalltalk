@@ -56,6 +56,8 @@ export interface EmbraceComposerProps {
   readonly showQueue?: boolean
   /** Capability gate that does not make an offline draft read-only. */
   readonly sendDisabled?: boolean
+  /** Overrides the empty-field guidance; keyboard instructions stay in the footer, never here. */
+  readonly placeholder?: string
 }
 
 const styles = stylex.create({
@@ -294,7 +296,7 @@ export function EmbraceComposerToolbar({ target, recipients, models, onTargetCha
   </>
 }
 
-function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestSubmit, submitLabel, submitIcon, inputStyle, fieldStyle, footerStyle, input, actions }: EmbraceComposerProps) {
+function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestSubmit, submitLabel, submitIcon, inputStyle, fieldStyle, footerStyle, input, actions, placeholder = 'Message, @ mentions and / commands as text' }: EmbraceComposerProps) {
   const isDisabled = useAuiState((s) => s.thread.isDisabled)
   const readOnly = disabledReason !== undefined || isDisabled
   const helpId = React.useId()
@@ -321,7 +323,7 @@ function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestS
       }}
     >
       <div {...stylex.props(styles.fieldWrap, fieldStyle)}>
-      {runtimeText === '' ? <span id={guidanceId} data-testid="composer-placeholder" {...stylex.props(styles.placeholder)}>Message, @ mentions and / commands as text</span> : null}
+      {runtimeText === '' ? <span id={guidanceId} data-testid="composer-placeholder" {...stylex.props(styles.placeholder)}>{placeholder}</span> : null}
       {input !== undefined ? input(inputStyle ?? styles.input, [helpId, runtimeText === '' ? guidanceId : undefined].filter(Boolean).join(' ')) : <ComposerPrimitive.Input
         aria-label={targetLabel === undefined ? 'Message' : `Message to ${targetLabel}`}
         aria-describedby={[helpId, runtimeText === '' ? guidanceId : undefined].filter(Boolean).join(' ')}
@@ -355,6 +357,7 @@ function TokenComposer({
   variant, history = emptyHistory, tokenHistory, targetLabel, disabledReason, cancelUnavailableReason, maxContentBytes, toolbar,
   mentionCandidates = emptyCandidates, mentionHints, commands = defaultCommands,
   tokenDraft, onTokenDraftChange, onSendDraft, renderToken, style, onRequestSubmit, submitLabel, submitIcon, inputStyle, fieldStyle, footerStyle, showQueue = true, sendDisabled = false,
+  placeholder = 'Message, @ to mention, / for commands',
 }: EmbraceComposerProps) {
   const aui = useAui()
   const composerStateNow = () => aui.composer.__internal_getRuntime?.().getState() ?? aui.composer.getState()
@@ -517,7 +520,7 @@ function TokenComposer({
               }
             }}
           >
-            {isEmpty ? <span id={guidanceId} data-testid="composer-placeholder" {...stylex.props(styles.placeholder)}>Message, @ to mention, / for commands</span> : null}
+            {isEmpty ? <span id={guidanceId} data-testid="composer-placeholder" {...stylex.props(styles.placeholder)}>{placeholder}</span> : null}
             <TokenInput<Draft>
               ref={inputRef}
               className={() => stylex.props(styles.input, inputStyle).className ?? ''}
