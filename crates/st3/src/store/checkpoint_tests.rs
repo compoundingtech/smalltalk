@@ -1524,7 +1524,10 @@ fn the_proof_passes_for_the_plan_and_fails_for_a_drop_a_reader_needs() {
     write_history(&store);
     let scratch = tempfile::tempdir().unwrap();
     let cut = now_ms() + 1_000;
+    let reclaim_before = allocator_reclaim_stats_for_test();
     let (plan, proof) = store.plan_checkpoint(cut, scratch.path()).unwrap();
+    assert_eq!(allocator_reclaim_stats_for_test().0 - reclaim_before.0, 1,
+        "nested plan/proof entrypoints reclaim once");
     assert!(proof.passed, "{proof:?}");
     assert_eq!(proof.graph_digest_before, proof.graph_digest);
     assert_eq!(proof.reader_digest_before, proof.reader_digest);
@@ -1553,8 +1556,11 @@ fn the_proof_passes_for_the_plan_and_fails_for_a_drop_a_reader_needs() {
     wrong.claims.push(claim_tombstone(newest));
     let copy = scratch.path().join("wrong.sqlite3");
     store.copy_store_to(&copy).unwrap();
+    let reclaim_before = allocator_reclaim_stats_for_test();
     let proof = prove_on_copy(&copy, &sealed, &wrong).unwrap();
     assert!(!proof.passed);
+    assert_eq!(allocator_reclaim_stats_for_test().0 - reclaim_before.0, 1,
+        "a reader-mismatch proof also reclaims once");
     assert!(
         proof
             .mismatches
@@ -1565,6 +1571,36 @@ fn the_proof_passes_for_the_plan_and_fails_for_a_drop_a_reader_needs() {
     );
     // The live store is never changed by a proof.
     assert_eq!(store.claims_for(AGENT, None).unwrap().len(), before);
+}
+
+#[test]
+fn allocator_reclamation_follows_checkpoint_plan_view_and_proof_errors_once() {
+    let store = Store::open_memory("alder").unwrap();
+    write_history(&store);
+    let scratch = tempfile::tempdir().unwrap();
+    let cut = now_ms() + 1_000;
+    let before = allocator_reclaim_stats_for_test();
+    let view = store.checkpoint_plan_view(cut, scratch.path()).unwrap();
+    assert!(view.proof.passed);
+    let after = allocator_reclaim_stats_for_test();
+    assert_eq!(after.0 - before.0, 1);
+    assert_eq!(after.1 - before.1, u64::from(cfg!(all(target_os = "linux", target_env = "gnu"))));
+
+    let sealed = store.checkpoint_sealed_set(cut).unwrap();
+    let plan = plan_drops(&sealed);
+    let blocked = scratch.path().join("not-a-directory");
+    std::fs::write(&blocked, b"occupied").unwrap();
+    let before = allocator_reclaim_stats_for_test();
+    assert!(store.prove_checkpoint_plan(&sealed, &plan, &blocked).is_err());
+    assert_eq!(allocator_reclaim_stats_for_test().0 - before.0, 1,
+        "copy preparation failure finishes its one reclamation attempt");
+
+    let invalid = scratch.path().join("not-a-store.sqlite3");
+    std::fs::write(&invalid, b"not a SQLite store").unwrap();
+    let before = allocator_reclaim_stats_for_test();
+    assert!(prove_on_copy(&invalid, &sealed, &plan).is_err());
+    assert_eq!(allocator_reclaim_stats_for_test().0 - before.0, 1,
+        "failed direct proof also finishes once");
 }
 
 #[test]

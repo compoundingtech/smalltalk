@@ -58,6 +58,10 @@ pub(super) struct Prepared {
 }
 
 impl Prepared {
+    pub(super) fn try_admit(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.entry.admission.clone().try_lock_owned().ok()
+    }
+
     pub(super) async fn admit(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.entry.admission.clone().lock_owned().await
     }
@@ -75,6 +79,9 @@ pub(super) struct ReadFence {
 pub(super) struct Windows {
     commits: AtomicU64,
     revisions: Mutex<Revisions>,
+    /// Held while one socket weighs new commits, so sockets woken by the same commit wait for
+    /// its answer instead of each opening a snapshot to weigh it again.
+    weighing: Mutex<()>,
     observed: Mutex<Observed>,
     entries: Mutex<WindowEntries>,
     observer: Mutex<Option<smallclaims::sqlite::CommitObserver>>,
@@ -108,6 +115,7 @@ impl Windows {
         let windows = Arc::new(Self {
             commits: AtomicU64::new(0),
             revisions: Mutex::new(Revisions::default()),
+            weighing: Mutex::new(()),
             observed: Mutex::new(Observed {
                 index: store.index().unwrap_or(0),
                 local: 0,
@@ -243,7 +251,26 @@ impl Windows {
             .map(|position| revisions.values[position]))
     }
 
+    /// Every collection's revision, when another socket already weighed the newest commit: then
+    /// no snapshot or worker is needed. `None` means [`Self::changes`] must weigh it.
+    pub(super) fn current_changes(&self, store: &Store) -> Option<[u64; 8]> {
+        let commits = self.commits();
+        let index = store.index().ok()?;
+        let revisions = self
+            .revisions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (revisions.commits == commits && revisions.index == index).then_some(revisions.values)
+    }
+
+    /// Weigh the commits since the last look, once for every socket on this store. Call it only
+    /// from a socket's own blocking worker, never from a request path that holds a read budget:
+    /// a waiter on `weighing` must not hold a reader the weigher needs (#2019's bounded pool).
     pub(super) fn changes(&self, store: &Store) -> anyhow::Result<[u64; 8]> {
+        let _weighing = self.weighing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(revisions) = self.current_changes(store) {
+            return Ok(revisions);
+        }
         let commits = self.commits();
         store.read_snapshot(|index| {
             let mut values = [0; 8];
@@ -277,7 +304,7 @@ impl Windows {
         }).to_string()
     }
 
-    /// Reserve and await admission before opening SQLite or scheduling a blocking worker.
+    /// Reserve a window before gate admission and its physical SQLite query.
     pub(super) fn prepare(
         &self,
         state: &AppState,
@@ -293,7 +320,7 @@ impl Windows {
         Some(Prepared { key, entry })
     }
 
-    /// Called inside the authorized SQLite snapshot after async admission. Cache mutexes
+    /// Called inside the authorized SQLite snapshot after gate admission. Cache mutexes
     /// hold only Arc loads/stores; computation, serialization and deep clones run outside them.
     pub(super) fn read(
         &self,
@@ -315,6 +342,11 @@ impl Windows {
             compute()
         };
         if request.collection == "summary" { return compute(); }
+        // A published view is already the shared copy, and it can be published anew without a
+        // commit (a deadline passing): caching it by commit revision would serve the older one.
+        if state.store.collection_view_published(&request.collection) {
+            return compute();
+        }
         let Some(prepared) = prepared else {
             return compute();
         };
@@ -469,6 +501,39 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 2);
         assert_ne!(read(200), first, "expiry is exclusive even within the same clock period");
         assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn shared_windows_leave_published_views_to_their_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let missions = request("missions");
+        let count = AtomicUsize::new(0);
+        let first = read(&windows, &state, &session, &missions, 0, &count);
+        assert_eq!(read(&windows, &state, &session, &missions, 0, &count), first);
+        assert_eq!(count.load(Ordering::SeqCst), 1, "an unpublished window is shared by revision");
+        // Once a refresher publishes the view, every read serves its newest publication.
+        state.store.publish_collection_view("missions");
+        assert_ne!(read(&windows, &state, &session, &missions, 0, &count), first);
+        assert_ne!(read(&windows, &state, &session, &missions, 0, &count), first);
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn shared_windows_weigh_each_commit_once_for_every_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let weighed = windows.changes(&state.store).unwrap();
+        assert_eq!(windows.current_changes(&state.store), Some(weighed));
+        diagnostic(&state);
+        assert_eq!(windows.current_changes(&state.store), None, "a new commit must be weighed");
+        let after = windows.changes(&state.store).unwrap();
+        assert!(!Windows::changed("missions", &weighed, &after), "a diagnostic changes no mission");
+        assert!(Windows::changed("summary", &weighed, &after), "summary weighs every commit");
+        assert_eq!(windows.current_changes(&state.store), Some(after));
     }
 
     #[test]
@@ -893,17 +958,34 @@ mod tests {
         physical.abort(); // a started physical worker still owns admission
         let second = windows.prepare(&state, &session, &query).unwrap();
         let mut waiter = Box::pin(second.admit());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
-                .await
-                .is_err()
-        );
+        assert!(futures_util::poll!(&mut waiter).is_pending());
         // Drop the canceled async waiter: it has never opened a snapshot or a worker.
         drop(waiter);
-        assert!(second.entry.admission.clone().try_lock_owned().is_err());
+        assert!(second.try_admit().is_none());
         release.send(()).unwrap();
         physical.await.unwrap();
         let _guard = second.admit().await;
+    }
+
+    #[tokio::test]
+    async fn collection_window_try_admission_cannot_discard_a_queued_followers_grant() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let query = request("missions");
+        let first = windows.prepare(&state, &session, &query).unwrap();
+        let second = windows.prepare(&state, &session, &query).unwrap();
+        let holder = first.try_admit().unwrap();
+        let mut follower = Box::pin(second.admit());
+        assert!(futures_util::poll!(&mut follower).is_pending());
+        assert!(first.try_admit().is_none());
+        drop(holder);
+        assert!(first.try_admit().is_none(), "the queued follower owns the reserved grant");
+        let granted = follower.await;
+        assert!(first.try_admit().is_none());
+        drop(granted);
+        assert!(first.try_admit().is_some());
     }
 
     #[test]

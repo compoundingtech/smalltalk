@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Bound daily Namespace API usage and distinguish queue cancellations from incomplete executed evidence.",
+  "replay": {
+    "status": "none",
+    "detail": "CI metadata reporting only: explicit seven-day rerun look-back and 800-request cap retain partial lower-bound evidence; no runtime, database or resource-policy change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI metadata reporting only: explicit seven-day rerun look-back and 800-request cap retain partial lower-bound evidence; no runtime, database or resource-policy change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI metadata reporting only: explicit seven-day rerun look-back and 800-request cap retain partial lower-bound evidence; no runtime, database or resource-policy change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI metadata reporting only: explicit seven-day rerun look-back and 800-request cap retain partial lower-bound evidence; no runtime, database or resource-policy change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI metadata reporting only: explicit seven-day rerun look-back and 800-request cap retain partial lower-bound evidence; no runtime, database or resource-policy change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "CI metadata reporting only: explicit seven-day rerun look-back and 800-request cap retain partial lower-bound evidence; no runtime, database or resource-policy change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "CI metadata reporting only: explicit seven-day rerun look-back and 800-request cap retain partial lower-bound evidence; no runtime, database or resource-policy change."
+  }
+}

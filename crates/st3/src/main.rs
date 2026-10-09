@@ -27,7 +27,7 @@ use st3::model::{
     LaunchStartRequest, MessageLifecycleRequest, MessagePage, MessageSendReceipt,
     MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
     MissionResponse, MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest,
-    MissionRunView, MissionSpec, MissionState, OperationalRepairApplyRequest,
+    MissionRunReportRequest, MissionRunReportView, MissionRunView, MissionSpec, MissionState, OperationalRepairApplyRequest,
     OperationalRepairPlan, OperationalRepairResult, PersonAskRequest, PersonStepResponse,
     PlannerSpec, PlanningApprovalRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
     PlanningSessionView, ReplicaRecordView, ReplicationPeerStatus, ReplicationRepairRequest,
@@ -64,7 +64,7 @@ mod presentation;
 use presentation::{
     OutputStyle, follow_snapshot, glance, mission_run_signature, relative_time,
     render_attention_show, render_generation, render_generations, render_host_facts,
-    render_human_value, render_mission_run, render_revision_proposal, render_step_run,
+    render_human_value, render_mission_run_page, render_revision_proposal, render_step_run,
     shell_argument,
 };
 
@@ -1757,6 +1757,11 @@ enum MissionViewCommand {
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
     Cancel(MissionCancelArgs),
+    /// Change who a running run tells when it fails, is cancelled or stalls, or clear it.
+    ///
+    /// Takes effect at the run's next evaluation. A stall is measured from the run's last sign
+    /// of life, so turning this on for a run that is already quiet reports it at most once.
+    ReportTo(MissionReportToArgs),
     /// Set a finished run's outcome to completed, failed, or cancelled, with a reason.
     Outcome(MissionOutcomeArgs),
     /// Retire a mission so it leaves the lists and cannot start; publishing it again brings it back.
@@ -1788,6 +1793,12 @@ struct MissionShowArgs {
     /// Follow until finished or stopped; retry timeouts and wait up to 5min for an unreachable daemon.
     #[arg(long)]
     follow: bool,
+    /// Continue the human root tree after the preceding page's cursor.
+    #[arg(long, conflicts_with = "follow")]
+    cursor: Option<String>,
+    /// Maximum root runs to include in one human tree page.
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
 }
 
 #[derive(Args)]
@@ -1921,6 +1932,38 @@ struct MissionCancelArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
+}
+
+#[derive(Args)]
+#[command(group = clap::ArgGroup::new("reporter").required(true).args(["agent", "clear"]))]
+struct MissionReportToArgs {
+    /// Exact mission-run subject of a running run.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
+    mission_run: String,
+    /// The agent to tell, replacing whoever the run reports to now. A person is reached
+    /// through their own agent.
+    #[arg(long, value_name = "AGENT")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
+    agent: Option<String>,
+    /// How long the run may go without progress before it counts as stalled, such as `1h`.
+    /// Defaults to the mission's `stalled-after`, else 30 minutes.
+    #[arg(long, value_name = "DURATION", requires = "agent", conflicts_with = "clear")]
+    #[arg(value_parser = parse_stalled_after)]
+    stalled_after: Option<u64>,
+    /// Also tell the agent when the run completes.
+    #[arg(long, requires = "agent", conflicts_with = "clear")]
+    report_completed: bool,
+    /// Report this run to nobody, whatever its mission or start named.
+    #[arg(long)]
+    clear: bool,
+    /// A person, or the agent that requested the run.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: String,
+}
+
+fn parse_stalled_after(value: &str) -> Result<u64, String> {
+    st3::graph::parse_duration(value, true).map_err(|error| error.to_string())
 }
 
 #[derive(Args)]
@@ -5247,6 +5290,7 @@ fn guard_mutating_cli_actor(
             MissionViewCommand::Start(args) => Some(args.actor.as_str()),
             MissionViewCommand::Cancel(args) => Some(args.actor.as_str()),
             MissionViewCommand::Outcome(args) => Some(args.actor.as_str()),
+            MissionViewCommand::ReportTo(args) => Some(args.actor.as_str()),
             MissionViewCommand::Retire(args) => Some(args.actor.as_str()),
             MissionViewCommand::Release(args) | MissionViewCommand::CancelRequest(args) => {
                 Some(args.actor.as_str())
@@ -5610,25 +5654,119 @@ fn raise_open_file_limit() {
     }
 }
 
-fn select_private_gateway(config: &mut Config, private_state: bool, private_socket: bool) {
+#[derive(Debug)]
+struct PrivateGatewayCollision {
+    derived: PathBuf,
+}
+
+impl std::fmt::Display for PrivateGatewayCollision {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            output,
+            "pass --client-gateway-socket; the derived private gateway {} equals the shared default gateway",
+            self.derived.display()
+        )
+    }
+}
+
+impl std::error::Error for PrivateGatewayCollision {}
+
+fn gateway_path_for_comparison(socket: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let socket = std::path::absolute(socket)?;
+    let parent = socket.parent().context("gateway socket has no parent")?;
+    let mut ancestor = parent;
+    let mut resolved = loop {
+        match fs::canonicalize(ancestor) {
+            Ok(resolved) => break resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor
+                    .parent()
+                    .context("gateway socket has no existing ancestor")?;
+            }
+            Err(error) => return Err(error).context("resolve gateway socket parent"),
+        }
+    };
+    let mut missing_depth = 0_usize;
+    for component in parent.strip_prefix(ancestor)?.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+                if missing_depth > 0 {
+                    missing_depth -= 1;
+                } else {
+                    // Walk from the physical ancestor, not the lexical symlink location.
+                    resolved = fs::canonicalize(&resolved)
+                        .context("resolve gateway socket ancestor after ..")?;
+                }
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                if missing_depth > 0 {
+                    missing_depth += 1;
+                    continue;
+                }
+                // A .. can return to an existing directory; resolve symlinks again there.
+                match fs::canonicalize(&resolved) {
+                    Ok(path) => resolved = path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match fs::symlink_metadata(&resolved) {
+                            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                                missing_depth = 1;
+                            }
+                            Ok(_) => {
+                                return Err(error).context("resolve existing gateway socket ancestor");
+                            }
+                            Err(error) => {
+                                return Err(error).context("inspect gateway socket ancestor");
+                            }
+                        }
+                    }
+                    Err(error) => return Err(error).context("resolve gateway socket ancestor"),
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                anyhow::bail!("gateway socket suffix must be relative");
+            }
+        }
+    }
+    Ok(resolved.join(
+        socket
+            .file_name()
+            .context("gateway socket has no file name")?,
+    ))
+}
+
+fn select_private_gateway(
+    config: &mut Config,
+    private_state: bool,
+    private_socket: bool,
+) -> Result<()> {
     if !(private_state || private_socket) {
-        return;
+        return Ok(());
     }
-    let defaults = Config::default();
-    if config.state_dir == defaults.state_dir && config.socket == defaults.socket {
-        return;
-    }
-    let parent = if private_socket {
+    let parent = if private_state {
+        Some(config.state_dir.as_path())
+    } else {
         config
             .socket
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
-    } else {
-        Some(config.state_dir.as_path())
     };
     config.client_gateway_socket = parent
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("st3-client.sock");
+    if gateway_path_for_comparison(&config.client_gateway_socket)?
+        == gateway_path_for_comparison(&Config::default().client_gateway_socket)?
+    {
+        return Err(PrivateGatewayCollision {
+            derived: config.client_gateway_socket.clone(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5640,26 +5778,113 @@ mod private_gateway_tests {
         let mut config = Config::default();
         let default_gateway = config.client_gateway_socket.clone();
         config.state_dir = "/tmp/private-state".into();
-        select_private_gateway(&mut config, true, false);
+        select_private_gateway(&mut config, true, false).unwrap();
         assert_eq!(
             config.client_gateway_socket,
             PathBuf::from("/tmp/private-state/st3-client.sock")
         );
         config.socket = "/tmp/private-socket/api.sock".into();
-        select_private_gateway(&mut config, true, true);
+        select_private_gateway(&mut config, true, true).unwrap();
+        assert_eq!(
+            config.client_gateway_socket,
+            PathBuf::from("/tmp/private-state/st3-client.sock")
+        );
+        assert_ne!(config.client_gateway_socket, default_gateway);
+        select_private_gateway(&mut config, false, true).unwrap();
         assert_eq!(
             config.client_gateway_socket,
             PathBuf::from("/tmp/private-socket/st3-client.sock")
         );
-        assert_ne!(config.client_gateway_socket, default_gateway);
     }
 
     #[test]
     fn default_daemon_keeps_its_default_gateway() {
         let mut config = Config::default();
         let gateway = config.client_gateway_socket.clone();
-        select_private_gateway(&mut config, false, false);
+        select_private_gateway(&mut config, false, false).unwrap();
         assert_eq!(config.client_gateway_socket, gateway);
+    }
+
+    #[test]
+    fn private_socket_in_runtime_dir_refuses_shared_default_gateway() {
+        let mut config = Config::default();
+        config.socket = config.socket.with_file_name("private-st.sock");
+        let error = select_private_gateway(&mut config, false, true).unwrap_err();
+        let collision = error.downcast_ref::<PrivateGatewayCollision>().unwrap();
+        assert_eq!(collision.derived, Config::default().client_gateway_socket);
+        assert!(error.to_string().contains("pass --client-gateway-socket"));
+    }
+
+    #[test]
+    fn private_state_takes_priority_over_runtime_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.state_dir = root.path().join("private-state");
+        config.socket = config.socket.with_file_name("private-st.sock");
+        select_private_gateway(&mut config, true, true).unwrap();
+        assert_eq!(
+            config.client_gateway_socket,
+            config.state_dir.join("st3-client.sock")
+        );
+        assert!(!config.state_dir.exists());
+    }
+
+    #[test]
+    fn gateway_comparison_resolves_symlinked_runtime_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&runtime, &alias).unwrap();
+        assert_eq!(
+            gateway_path_for_comparison(&runtime.join("st3-client.sock")).unwrap(),
+            gateway_path_for_comparison(&alias.join("st3-client.sock")).unwrap()
+        );
+        assert!(!runtime.join("st3-client.sock").exists());
+    }
+
+    #[test]
+    fn gateway_comparison_resolves_ancestor_above_missing_runtime_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert_eq!(
+            gateway_path_for_comparison(&real.join("missing/run/st3-client.sock")).unwrap(),
+            gateway_path_for_comparison(&alias.join("missing/run/st3-client.sock")).unwrap()
+        );
+        assert!(!real.join("missing").exists());
+    }
+
+    #[test]
+    fn gateway_comparison_normalizes_missing_suffix_after_resolving_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir_all(real.join("deep")).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(real.join("deep"), &alias).unwrap();
+        let target = real.join("run/st3-client.sock");
+        for path in [
+            alias.join("missing/../../run/st3-client.sock"),
+            alias.join("./missing/.././../run/st3-client.sock"),
+            alias.join("missing/../other/../../run/st3-client.sock"),
+        ] {
+            assert_eq!(
+                gateway_path_for_comparison(&path).unwrap(),
+                gateway_path_for_comparison(&target).unwrap()
+            );
+        }
+        // After canceling a missing component, resolve an existing symlink before parent traversal.
+        std::os::unix::fs::symlink(real.join("deep"), real.join("link")).unwrap();
+        assert_eq!(
+            gateway_path_for_comparison(&real.join("missing/../link/../run/st3-client.sock"))
+                .unwrap(),
+            gateway_path_for_comparison(&target).unwrap()
+        );
+        assert!(!real.join("deep/missing").exists());
+        assert!(!real.join("missing").exists());
+        assert!(!real.join("run").exists());
     }
 }
 
@@ -5685,7 +5910,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.client_gateway_socket = socket;
     }
     if !explicit_gateway {
-        select_private_gateway(&mut config, private_state, private_socket);
+        select_private_gateway(&mut config, private_state, private_socket)?;
     }
     if let Some(peer_listen) = args.peer_listen {
         config.peer_listen = Some(peer_listen);
@@ -5854,7 +6079,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         event_notify.clone(),
         recorder.map(|installation| installation.directory),
     )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()).with_person(config.person.clone()));
-    tokio::spawn(reconciler.supervise());
+    reconciler.set_max_passes_per_minute(config.reconcile.max_passes_per_minute)?;
+    tokio::spawn(reconciler.clone().supervise());
     // A start no longer rebuilds the operation projection; check it once the API serves.
     tokio::spawn({
         let store = store.clone();
@@ -5873,7 +6099,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     tokio::spawn(st3::profile::watch_runtime_lag());
     // The policy reads `[limits]` again on every pass, so an edit applies without a restart.
     st3::config::set_daemon_config(args_config.as_deref());
-    tokio::spawn(enforce_account_limits(store.clone(), config.limits.clone()));
+    tokio::spawn(enforce_account_limits(store.clone(), config.limits.clone(), reconciler));
     recycle_idle_wal(config.state_dir.join("claims.sqlite3"), Arc::downgrade(&store));
     let _contention_retry = retry_projection_contention(Arc::downgrade(&store), notify.clone(), event_notify.clone(), config.state_dir.clone());
     tokio::spawn(convert_envelope_payloads(store.clone()));
@@ -6451,6 +6677,11 @@ async fn run_mission_view(
             )
         }
         MissionViewCommand::Show(args) => {
+            anyhow::ensure!((1..=50).contains(&args.limit), "mission tree limit must be 1 through 50");
+            anyhow::ensure!(
+                !json_output || args.cursor.is_none(),
+                "--cursor continues the human tree; omit --json"
+            );
             let client = if args.follow {
                 client.clone().with_follow_retry()
             } else {
@@ -6488,17 +6719,18 @@ async fn run_mission_view(
                 ))
                 .await?;
             if args.follow {
-                return follow_mission_run(client, run, 0, json_output).await;
+                return follow_mission_run(client, run, 0, json_output, args.limit).await;
             }
             if json_output {
                 return print_value(&run, true);
             }
-            let runs = load_mission_run_tree(client, &run).await?;
+            let page = load_mission_run_tree(client, &run, args.cursor.as_deref(), args.limit).await?;
             let now = current_unix_ms()?;
             print!(
                 "{}",
-                render_mission_run(&run, &runs, OutputStyle::stdout(), now)
+                render_mission_run_page(&run, &page.runs, OutputStyle::stdout(), now)
             );
+            print_mission_tree_continuation(&run, &page, args.limit);
             // A daemon without lanes answers 404; the run itself is still shown.
             if let Ok(lanes) = client
                 .get::<Vec<st3::model::LaneView>>(&format!(
@@ -6522,6 +6754,9 @@ async fn run_mission_view(
         }
         MissionViewCommand::Outcome(args) => {
             set_mission_run_outcome(client, args, json_output).await
+        }
+        MissionViewCommand::ReportTo(args) => {
+            set_mission_run_report(client, args, json_output).await
         }
         MissionViewCommand::Retire(args) => retire_mission(client, args, json_output).await,
         MissionViewCommand::Queued { agent } => {
@@ -6856,6 +7091,59 @@ async fn set_mission_run_outcome(
     }
 }
 
+async fn set_mission_run_report(
+    client: &Client,
+    args: MissionReportToArgs,
+    json_output: bool,
+) -> Result<()> {
+    let id = args
+        .mission_run
+        .strip_prefix("mission-run/")
+        .unwrap_or(&args.mission_run);
+    let subject = format!("mission-run/{id}");
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    let report: MissionRunReportView = client
+        .post(
+            &format!("/v1/mission-runs/{}/report-to", urlencoding::encode(&subject)),
+            &MissionRunReportRequest {
+                actor: args.actor,
+                report_to: args.agent,
+                stalled_after_ms: args.stalled_after,
+                report_completed: args.report_completed,
+                idempotency_key: format!("mission-report-to:{subject}:{nonce}"),
+            },
+        )
+        .await?;
+    if json_output {
+        return print_value(&report, true);
+    }
+    let unchanged = if report.changed { "" } else { " (unchanged)" };
+    match &report.report_to {
+        Some(agent) => println!(
+            "{} reports to {agent}: failed, cancelled, stalled after {}{}{unchanged}",
+            report.run,
+            whole_duration(report.stalled_after_ms.unwrap_or_default()),
+            if report.report_completed {
+                ", completed"
+            } else {
+                ""
+            },
+        ),
+        None => println!("{} reports to nobody{unchanged}", report.run),
+    }
+    Ok(())
+}
+
+/// `ms` in its largest whole unit: `90s`, `45m`, `2h`.
+fn whole_duration(ms: u64) -> String {
+    match ms {
+        ms if ms >= 3_600_000 && ms % 3_600_000 == 0 => format!("{}h", ms / 3_600_000),
+        ms if ms >= 60_000 && ms % 60_000 == 0 => format!("{}m", ms / 60_000),
+        ms if ms % 1_000 == 0 => format!("{}s", ms / 1_000),
+        ms => format!("{ms}ms"),
+    }
+}
+
 async fn retire_mission(client: &Client, args: MissionRetireArgs, json_output: bool) -> Result<()> {
     let id = args
         .mission
@@ -6973,7 +7261,7 @@ async fn start_mission_run(
     if !json_output {
         print!("{}", cli_help::mission_next_steps(&started));
     }
-    follow_mission_run(client, started, response.store_index, json_output).await
+    follow_mission_run(client, started, response.store_index, json_output, 50).await
 }
 
 fn mission_start_run_id(mission_id: &str, requested: Option<&str>) -> String {
@@ -7127,6 +7415,7 @@ async fn follow_mission_run(
     run: MissionRunView,
     _cursor: u64,
     json_output: bool,
+    limit: usize,
 ) -> Result<()> {
     let interactive = std::io::stdout().is_terminal();
     let _screen = if !json_output && interactive {
@@ -7135,7 +7424,7 @@ async fn follow_mission_run(
         None
     };
     follow_mission_run_to(
-        client, run, json_output, interactive, OutputStyle::stdout(), &mut std::io::stdout(),
+        client, run, json_output, interactive, limit, OutputStyle::stdout(), &mut std::io::stdout(),
     ).await
 }
 
@@ -7144,6 +7433,7 @@ async fn follow_mission_run_to(
     mut run: MissionRunView,
     json_output: bool,
     interactive: bool,
+    limit: usize,
     style: OutputStyle,
     output: &mut impl std::io::Write,
 ) -> Result<()> {
@@ -7151,10 +7441,30 @@ async fn follow_mission_run_to(
     let client = &client;
     let mut prior = String::new();
     loop {
-        let runs = load_mission_run_tree(client, &run).await?;
-        let summary = mission_run_signature(&runs)?;
-        if summary != prior && !json_output {
-            let frame = render_mission_run(&run, &runs, style, current_unix_ms()?);
+        let page = if json_output {
+            None
+        } else {
+            Some(load_mission_run_tree(client, &run, None, limit).await?)
+        };
+        let summary = if let Some(page) = &page {
+            format!(
+                "{}:{}:{:?}:{}",
+                run.updated_at_unix_ms,
+                page.has_more,
+                page.next_cursor,
+                mission_run_signature(&page.runs)?
+            )
+        } else {
+            String::new()
+        };
+        if summary != prior && let Some(page) = &page {
+            let mut frame = render_mission_run_page(&run, &page.runs, style, current_unix_ms()?);
+            if let Some(cursor) = &page.next_cursor {
+                frame.push_str(&format!(
+                    "\nTREE      More runs follow; st missions show {} --cursor {cursor} --limit {limit}\n",
+                    run.subject,
+                ));
+            }
             write!(
                 output,
                 "{}",
@@ -7191,19 +7501,33 @@ async fn follow_mission_run_to(
 async fn load_mission_run_tree(
     client: &Client,
     selected: &MissionRunView,
-) -> Result<Vec<MissionRunView>> {
-    let runs: Vec<MissionRunView> = client
-        .get(&format!(
-            "/v1/mission-runs?root={}",
-            urlencoding::encode(&selected.root_mission_run)
-        ))
-        .await?;
-    anyhow::ensure!(
-        runs.iter().any(|run| run.subject == selected.subject),
-        "mission run `{}` is absent from its root graph",
-        selected.subject
+    after: Option<&str>,
+    limit: usize,
+) -> Result<st3::model::MissionRunTreePage> {
+    let mut query = format!(
+        "/v1/mission-runs/tree?root={}&limit={limit}",
+        urlencoding::encode(&selected.root_mission_run)
     );
-    Ok(runs)
+    if let Some(after) = after {
+        query.push_str("&after=");
+        query.push_str(&urlencoding::encode(after));
+    }
+    client
+        .get(&query)
+        .await
+}
+
+fn print_mission_tree_continuation(
+    selected: &MissionRunView,
+    page: &st3::model::MissionRunTreePage,
+    limit: usize,
+) {
+    if let Some(cursor) = &page.next_cursor {
+        println!(
+            "\nTREE      More runs follow; st missions show {} --cursor {cursor} --limit {limit}",
+            selected.subject,
+        );
+    }
 }
 
 fn mission_run_follow_succeeded(status: &str) -> bool {
@@ -23125,26 +23449,29 @@ fn idempotency(kdl: &str, tokens: &BTreeMap<String, Vec<String>>) -> String {
 /// never replicate, so this never changes what any peer holds.
 /// Apply this node's `[limits]` policy every two minutes: stop the seats it hosts on an account
 /// past its weekly limit, and notify operations once per weekly window.
-async fn enforce_account_limits(store: Arc<Store>, started_with: st3::config::LimitsConfig) {
+async fn enforce_account_limits(store: Arc<Store>, started_with: st3::config::LimitsConfig, reconciler: Arc<Reconciler>) {
     const LIMITS_INTERVAL: Duration = Duration::from_secs(2 * 60);
     let mut limits = started_with;
     let mut last_error = None::<String>;
     loop {
         // A config file that is missing, cannot be read or does not validate keeps the last
         // good policy. The reason is logged when it changes, not on every pass.
-        let reloaded = tokio::task::spawn_blocking(st3::config::reload_daemon_limits)
+        let reloaded = tokio::task::spawn_blocking(st3::config::reload_daemon_policies)
             .await
             .ok()
             .flatten();
         match reloaded {
-            Some(Ok(reloaded)) => {
+            Some(Ok((reloaded, reconcile))) => {
+                // Validation already passed; preserve last-start history while changing the rate.
+                reconciler.set_max_passes_per_minute(reconcile.max_passes_per_minute)
+                    .expect("validated reconcile cap");
                 limits = reloaded;
                 last_error = None;
             }
             Some(Err(error)) => {
                 let error = format!("{error:#}");
                 if last_error.as_ref() != Some(&error) {
-                    eprintln!("st3: limits policy keeps its last config: {error}");
+                    eprintln!("st3: daemon policies keep their last config: {error}");
                     last_error = Some(error);
                 }
             }
@@ -27659,6 +27986,55 @@ mod tests {
     }
 
     #[test]
+    fn missions_report_to_names_an_agent_or_clears_and_options_need_an_agent() {
+        let parse = |extra: &[&str]| {
+            let mut words = vec!["st3", "missions", "report-to", "mission-run/release/demo/3"];
+            words.extend_from_slice(extra);
+            words.extend_from_slice(&["--as", "agent/ops/owner"]);
+            Cli::try_parse_from(words)
+        };
+        let Command::Missions {
+            command: MissionViewCommand::ReportTo(args),
+        } = parse(&[
+            "--agent",
+            "agent/ops/watcher",
+            "--stalled-after",
+            "1h",
+            "--report-completed",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("the report-to command did not parse");
+        };
+        assert_eq!(args.agent.as_deref(), Some("agent/ops/watcher"));
+        assert_eq!(args.stalled_after, Some(3_600_000));
+        assert!(args.report_completed);
+        assert!(!args.clear);
+        assert_eq!(whole_duration(3_600_000), "1h");
+        assert_eq!(whole_duration(45 * 60_000), "45m");
+        assert!(parse(&["--clear"]).is_ok());
+        for (extra, why) in [
+            (&[][..], "it names an agent or clears"),
+            (&["--agent", "agent/ops/watcher", "--clear"][..], "not both"),
+            (
+                &["--clear", "--stalled-after", "1h"][..],
+                "a limit needs an agent",
+            ),
+            (
+                &["--clear", "--report-completed"][..],
+                "completion needs an agent",
+            ),
+            (
+                &["--agent", "agent/ops/watcher", "--stalled-after", "0m"][..],
+                "a limit is positive",
+            ),
+        ] {
+            assert!(parse(extra).is_err(), "{why}");
+        }
+    }
+
+    #[test]
     fn apply_accepts_plain_files_and_requires_owned_source_flags_together() {
         let plain = [
             "st",
@@ -27868,6 +28244,24 @@ mod tests {
         };
         assert_eq!(args.mission_or_run, "mission-run/release/demo");
         assert!(args.follow);
+        assert_eq!(args.limit, 50);
+        assert!(args.cursor.is_none());
+        let continued = Cli::try_parse_from([
+            "st3", "missions", "show", "mission-run/release/demo", "--cursor", "child-run",
+            "--limit", "20",
+        ])
+        .unwrap();
+        let Command::Missions {
+            command: MissionViewCommand::Show(continued),
+        } = continued.command else {
+            panic!("mission show pagination did not parse");
+        };
+        assert_eq!(continued.cursor.as_deref(), Some("child-run"));
+        assert_eq!(continued.limit, 20);
+        assert!(Cli::try_parse_from([
+            "st3", "missions", "show", "mission-run/release/demo", "--follow", "--cursor", "child-run",
+        ])
+        .is_err());
     }
 
     #[test]

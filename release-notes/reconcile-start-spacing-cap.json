@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Space background reconciliation starts with a reloadable default30-per-minute cap",
+  "replay": {
+    "status": "none",
+    "detail": "No claim/projection replay or input/effect/authority change; every selected pass still reads current state and uses existing effect fences."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table/index/migration change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules/digests unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Background startup/notification/deadline/changed-repeat starts share a monotonic last-start gate, default2s spacing. Pending notification/current-state invalidations are retained; long passes earn no catch-up burst. Default remaining-gap delay is at most2s before one pass, plus processing; multi-pass convergence adds multiple gaps. This delays step-ready mission evaluation, seat preparation/start, due work wakes and recovery/urgent reactions. Independent authority/lease/runtime fences and due bookkeeping remain. Manual reconcile_once controls are not background scheduling."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No extra migration or restart beyond normal source deployment; no live rollout assigned."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Optional [reconcile] max_passes_per_minute=30, valid1..600. Existing daemon two-minute config reload updates effective rate without a build/restart, preserving prior-start history. Missing/malformed/invalid config retains last good policies and logs changed errors; startup rejects invalid values. Persisting the new nondefault setting requires removing that section before rollback to older strict config readers."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Supervisor restarts keep last-start history on the same Reconciler. Cancellation of an async wait reserves no start. The30x0.4\u224812CPU-seconds/min estimate is unmeasured; no saving or production budget accepted."
+  }
+}

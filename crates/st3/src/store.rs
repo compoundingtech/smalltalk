@@ -6,6 +6,8 @@ mod arrangements;
 mod arrangements_tests;
 #[cfg(test)]
 mod authored_pull_requests_tests;
+#[cfg(test)]
+mod schedule_active_run_tests;
 mod glasses;
 pub(crate) mod mailbox_wakes;
 mod mailbox_changes;
@@ -50,7 +52,7 @@ use crate::model::{
     FaultView, HumanReviewView, IntentInput, LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS,
     MessageView, MissionDefinitionView, MissionInputKind, MissionOutputView, MissionResponse,
     MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunOutcomeView,
-    MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
+    MissionRunReportView, MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
     OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult,
     PlannedAction, PlannerSpec, PlanningCandidateView, PlanningPreviewView,
     PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
@@ -154,6 +156,7 @@ pub mod agent_view;
 mod conversation_reads;
 mod usage_period;
 mod runtime;
+pub(crate) mod published_views;
 #[cfg(test)]
 mod tombstones_tests;
 pub use runtime::SmalltalkRuntime;
@@ -530,6 +533,8 @@ CREATE TABLE IF NOT EXISTS mission_runs (
     updated_at_unix_ms TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS mission_runs_mission_index ON mission_runs(mission_id, created_at_unix_ms);
+CREATE INDEX IF NOT EXISTS mission_runs_root_page_index
+ON mission_runs(root_run_id, created_at_unix_ms, id);
 -- The runs that have not finished, a few of every run a fleet has made. The predicate is
 -- OPEN_MISSION_RUN, which queries repeat so the planner uses this index.
 CREATE INDEX IF NOT EXISTS mission_runs_open_index ON mission_runs(created_at_unix_ms, id)
@@ -3036,6 +3041,11 @@ impl Store {
             .query_row(AGENT_STATUS_INDEX_QUERY, [snapshot_index], |row| row.get(0))
             .optional()?
             .unwrap_or_default())
+    }
+
+    /// Never waits; multi-gate readers release unrelated guards before queuing on a miss.
+    pub(crate) fn try_admit_agent_resources(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.smalltalk.agent_resources_admission.clone().try_lock_owned().ok()
     }
 
     /// One physical roster reader across HTTP pages and differently authorized WS windows.
@@ -6077,6 +6087,149 @@ impl Store {
         Ok(view)
     }
 
+    /// Change who a running run reports to, or clear it, as `missions start --report-to` would
+    /// have set it: the mission's own `stalled-after` and `report-completed` apply unless the
+    /// request names a limit. Only a person or the agent that requested the run may. It is a
+    /// claim of its own on the run, so the creation claim keeps what the run started with and a
+    /// repeated declaration of the run still compares with it. A request that changes nothing
+    /// writes nothing.
+    pub fn set_mission_run_report(
+        &self,
+        run: &str,
+        actor: &str,
+        report_to: Option<&str>,
+        stalled_after_ms: Option<u64>,
+        report_completed: bool,
+        idempotency_key: &str,
+    ) -> Result<MissionRunReportView, St3Error> {
+        if let Some(response) = self
+            .cached_idempotency_response(idempotency_key)
+            .map_err(smallclaims::error::typed)?
+        {
+            return Ok(response);
+        }
+        match report_to {
+            None if stalled_after_ms.is_some() || report_completed => {
+                return Err(St3Error::new(
+                    "report-without-recipient",
+                    "a stall limit or completion report needs a `report-to` agent",
+                ));
+            }
+            None => {}
+            Some(report_to) => crate::mission::validate_report_to(report_to)?,
+        }
+        if stalled_after_ms == Some(0) {
+            return Err(St3Error::new(
+                "invalid-stalled-after",
+                "stalled-after must be greater than zero",
+            ));
+        }
+        let actor = normalize_actor(actor, "agent");
+        let run_id = run.strip_prefix("mission-run/").unwrap_or(run);
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction().map_err(internal)?;
+        if let Some(response) =
+            smallclaims::store::idempotency::cached_response(&transaction, idempotency_key)?
+        {
+            return serde_json::from_str(&response).map_err(internal);
+        }
+        let current = mission_run_header_tx(&transaction, run_id)
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-mission-run",
+                    format!("mission run `mission-run/{run_id}` does not exist"),
+                )
+            })?;
+        if current.phase == "terminal" {
+            return Err(St3Error::new(
+                "mission-run-not-running",
+                format!(
+                    "mission run `{}` has finished as {}; only a running run takes a reporter",
+                    current.subject, current.status
+                ),
+            ));
+        }
+        if !actor.starts_with("person/") && actor != current.requester {
+            return Err(St3Error::new(
+                "run-report-authority-denied",
+                format!(
+                    "only a person or the run's requester `{}` may change who `{}` reports to",
+                    current.requester, current.subject
+                ),
+            ));
+        }
+        let desired = match report_to {
+            None => None,
+            Some(report_to) => {
+                let mission = mission_revision_spec_tx(
+                    &transaction,
+                    current
+                        .mission
+                        .strip_prefix("mission/")
+                        .unwrap_or(&current.mission),
+                    &current.revision,
+                )?;
+                Some((
+                    report_to.to_owned(),
+                    stalled_after_ms
+                        .or(mission.as_ref().and_then(|mission| mission.stalled_after_ms))
+                        .unwrap_or(crate::mission::DEFAULT_STALLED_AFTER_MS),
+                    report_completed
+                        || mission.as_ref().is_some_and(|mission| mission.report_completed),
+                ))
+            }
+        };
+        let changed = desired != current_run_report_tx(&transaction, &current.subject)?;
+        if changed {
+            let mut fields = serde_json::Map::new();
+            if let Some((report_to, stalled_after_ms, completed)) = &desired {
+                fields.insert("report_to".into(), json!(report_to));
+                fields.insert("stalled_after_ms".into(), json!(stalled_after_ms));
+                if *completed {
+                    fields.insert("report_completed".into(), json!(true));
+                }
+            }
+            append_receipt_claim_tx(
+                &transaction,
+                &self.origin,
+                &current.subject,
+                RUN_REPORT_KIND,
+                Some(&actor),
+                &json!({ "fields": fields }),
+                &[],
+                None,
+                idempotency_key,
+            )
+            .map_err(internal)?;
+        }
+        let (report_to, stalled_after_ms, report_completed) = match desired {
+            Some((report_to, stalled_after_ms, completed)) => {
+                (Some(report_to), Some(stalled_after_ms), completed)
+            }
+            None => (None, None, false),
+        };
+        let view = MissionRunReportView {
+            run: current.subject,
+            report_to,
+            stalled_after_ms,
+            report_completed,
+            changed,
+        };
+        transaction
+            .execute(
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
+                params![
+                    opaque_cache_key(idempotency_key),
+                    serde_json::to_string(&view).map_err(internal)?
+                ],
+            )
+            .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
+        Ok(view)
+    }
+
     /// Retire a published mission: publish its current definition again as `retired`, so it
     /// leaves the mission lists and cannot start, while every revision and run stays in its
     /// history. The publication names who retired it. Publishing a ready revision brings the
@@ -7096,20 +7249,70 @@ impl Store {
             .query_map([root], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
-            .map(|id| {
-                // The legacy tree consumes step state, summaries and queue order, not
-                // each worker's wake, timing and harness presentation histories.
-                let mut view = mission_run_steps_view_tx(&connection, &id, true)?;
-                enrich_run_step_queues_tx(&connection, &mut view)?;
-                // Keep the run-level fields of the existing tree response.
-                view.provenance =
-                    crate::provenance::read(&connection, &view.mission, &view.revision)?;
-                view.loops = loop_run_views_tx(&connection, &view)?;
-                view.outcome = mission_run_outcome_tx(&connection, &view)?;
-                note_run_view_reads(&view);
-                Ok(view)
-            })
+            .map(|id| mission_root_tree_run_tx(&connection, &id))
             .collect()
+    }
+
+    /// Seek one bounded page of a root graph. The legacy all-descendants reader remains for
+    /// callers that explicitly need the complete graph; human presentation uses this page.
+    /// A missing cursor means the named run was retired or belongs to another root.
+    pub fn mission_runs_for_root_page(
+        &self,
+        root: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Option<(Vec<MissionRunView>, Option<String>)>> {
+        anyhow::ensure!((1..=50).contains(&limit), "mission root page limit must be 1 through 50");
+        let root = root.strip_prefix("mission-run/").unwrap_or(root);
+        let connection = self.readers.get();
+        let cursor = match after {
+            Some(after) => {
+                let after = after.strip_prefix("mission-run/").unwrap_or(after);
+                let created = connection
+                    .query_row(
+                        "SELECT created_at_unix_ms FROM mission_runs
+                         WHERE id=?1 AND root_run_id=?2",
+                        params![after, root],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let Some(created) = created else {
+                    return Ok(None);
+                };
+                Some((created, after.to_owned()))
+            }
+            None => None,
+        };
+        let ids = if let Some((created, id)) = cursor {
+            connection
+                .prepare_cached(
+                    "SELECT id FROM mission_runs INDEXED BY mission_runs_root_page_index
+                     WHERE root_run_id=?1 AND (created_at_unix_ms,id)>(?2,?3)
+                     ORDER BY created_at_unix_ms,id LIMIT ?4",
+                )?
+                .query_map(params![root, created, id, limit.saturating_add(1)], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            connection
+                .prepare_cached(
+                    "SELECT id FROM mission_runs INDEXED BY mission_runs_root_page_index
+                     WHERE root_run_id=?1 ORDER BY created_at_unix_ms,id LIMIT ?2",
+                )?
+                .query_map(params![root, limit.saturating_add(1)], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let has_more = ids.len() > limit;
+        let next = has_more.then(|| ids[limit - 1].clone());
+        let runs = ids
+            .into_iter()
+            .take(limit)
+            .map(|id| mission_root_tree_run_tx(&connection, &id))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some((runs, next)))
     }
 
     /// When a loop first executed: a worker's first claim, or the creation of a round
@@ -11379,6 +11582,31 @@ impl Store {
         self.smalltalk.forget_views();
     }
 
+    /// Append a claim in a write transaction that then rolls back, as a failed write does.
+    #[cfg(test)]
+    pub(crate) fn roll_back_claim_for_test(&self, input: &ClaimInput) {
+        let mut writer = self.connection.write();
+        let transaction = writer.transaction().unwrap();
+        append_claim_tx(&transaction, &self.origin, &input.subject, &input.kind,
+            input.actor.as_deref(), &json!({"fields": input.fields}), &input.evidence, None)
+            .unwrap();
+        transaction.rollback().unwrap();
+    }
+
+    /// Drop the history an agreed checkpoint at `cut` would drop on this node.
+    #[cfg(test)]
+    pub(crate) fn trim_checkpoint_for_test(&self, cut: u128) -> usize {
+        let plan = plan_drops(&self.checkpoint_sealed_set(cut).unwrap());
+        let mut writer = self.connection.write();
+        let transaction = writer.transaction().unwrap();
+        use smallclaims::store::checkpoint::{checkpoint_name, delete_dropped_rows_tx, record_checkpoint_tombstones_tx};
+        record_checkpoint_tombstones_tx(&transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims)
+            .unwrap();
+        delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
+        transaction.commit().unwrap();
+        plan.claims.len()
+    }
+
     /// Only fields consumed by agent cards, retaining the full reducer's membership,
     /// reachability and operational annotation. Never use this for a public status response.
     pub(crate) fn agent_card_status_at(
@@ -11459,63 +11687,73 @@ impl Store {
         store_index: u64,
         include_history: bool,
     ) -> Result<StatusResponse> {
-        let subjects = if include_history {
-            subjects
-        } else {
-            self.current_view_candidates(&self.readers.get(), subjects, store_index, true)?
-        };
-        if subjects.len() <= 64 {
-            return self.status_at_view_for_names(
-                None,
-                None,
-                Some(store_index),
-                include_history,
-                Some(subjects),
-            );
-        }
-        // Divide a large bounded projection across a few threads, each reading its slice on its
-        // own connection at the same store index, then merge in subject order.
-        let subjects = subjects.into_iter().collect::<Vec<_>>();
-        let chunk_size = subjects.len().div_ceil(STATUS_WORKERS);
-        let profile = crate::profile::current();
-        let read_budget = smallclaims::read_budget::current();
-        let parts = std::thread::scope(|scope| {
-            subjects
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
-                    let profile = profile.clone();
-                    let read_budget = read_budget.clone();
-                    scope.spawn(move || {
-                        let _entered = crate::profile::enter(profile.as_ref());
-                        let read = || self.status_at_view_for_names(
+        self.readers.request_read(|| {
+            let subjects = if include_history {
+                subjects
+            } else {
+                self.current_view_candidates(&self.readers.get(), subjects, store_index, true)?
+            };
+            if subjects.len() <= 64 {
+                return self.status_at_view_for_names(
+                    None, None, Some(store_index), include_history, Some(subjects),
+                );
+            }
+            // The caller keeps its loan and reduces the LAST slice on it, so a full
+            // four-way split uses three extra permits and no extra connection for the
+            // parent. Other slices must never wait for admission: when a permit is
+            // unavailable they also reduce inline on that same loan. Slices stay in
+            // subject order regardless of which ones execute in parallel.
+            enum Part<'scope> {
+                Worker(std::thread::ScopedJoinHandle<'scope, Result<StatusResponse>>),
+                Inline(Result<StatusResponse>),
+            }
+            let subjects = subjects.into_iter().collect::<Vec<_>>();
+            let chunk_size = subjects.len().div_ceil(STATUS_WORKERS);
+            let profile = crate::profile::current();
+            let read_budget = smallclaims::read_budget::current();
+            let parts = std::thread::scope(|scope| {
+                subjects
+                    .chunks(chunk_size)
+                    .enumerate()
+                    .map(|(position, chunk)| {
+                        let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
+                        let read = move || self.status_at_view_for_names(
                             None, None, Some(store_index), include_history, Some(names),
                         );
-                        if let Some(budget) = read_budget {
-                            smallclaims::read_budget::with(Some(budget), || {
-                                self.readers.request_read(read)?
-                            })
+                        let last = position + 1 == subjects.len().div_ceil(chunk_size);
+                        if !last && let Some(permit) = self.readers.try_admit_read() {
+                            let profile = profile.clone();
+                            let read_budget = read_budget.clone();
+                            Part::Worker(scope.spawn(move || {
+                                let _entered = crate::profile::enter(profile.as_ref());
+                                smallclaims::read_budget::with(read_budget, || {
+                                    self.readers.request_read_with_permit(permit, read)?
+                                })
+                            }))
                         } else {
-                            read()
+                            Part::Inline(read())
                         }
                     })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|worker| worker.join().expect("status projection worker panicked"))
-                .collect::<Vec<_>>()
-        });
-        let mut merged = StatusResponse {
-            store_index,
-            subjects: Vec::new(),
-            pending_actions: Vec::new(),
-        };
-        for part in parts {
-            let part = part?;
-            merged.subjects.extend(part.subjects);
-            merged.pending_actions.extend(part.pending_actions);
-        }
-        Ok(merged)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|part| match part {
+                        Part::Worker(worker) => worker.join().expect("status projection worker panicked"),
+                        Part::Inline(result) => result,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let mut merged = StatusResponse {
+                store_index,
+                subjects: Vec::new(),
+                pending_actions: Vec::new(),
+            };
+            for part in parts {
+                let part = part?;
+                merged.subjects.extend(part.subjects);
+                merged.pending_actions.extend(part.pending_actions);
+            }
+            Ok(merged)
+        })?
     }
 
     fn status_at_view(
@@ -12690,11 +12928,7 @@ impl Store {
 
     pub fn unread_mail_count_before(&self, before_unix_ms: u128) -> Result<u64> {
         smallclaims::touched::note_read(|| "kind:message.sent".to_owned());
-        if PINNED_READER.with(|slot| {
-            slot.borrow()
-                .as_ref()
-                .is_some_and(|(pool, _)| *pool == self.readers.key())
-        }) {
+        if self.readers.has_pinned_reader() {
             return unread_mail::count_in_snapshot(&self.readers.get(), before_unix_ms);
         }
         let mut connection = self.connection.write();
@@ -15379,17 +15613,27 @@ impl Store {
             .map_err(Into::into)
     }
 
+    // Expose the bare primary key for a seek, retaining the original equality as the
+    // prefix/type/collation filter. Byte slicing preserves embedded NULs; the second
+    // key also preserves SQLite blob-valued IDs without scanning other runs. The
+    // prefix byte length follows the database encoding.
+    const SCHEDULE_ACTIVE_STARTED_RUN_QUERY: &str = "SELECT EXISTS(
+        SELECT 1 FROM claims AS started
+        JOIN mission_runs AS run
+          ON run.id IN (
+               CAST(substr(CAST(json_extract(started.body, '$.fields.mission_run') AS BLOB), length(CAST('mission-run/' AS BLOB))+1) AS TEXT),
+               substr(CAST(json_extract(started.body, '$.fields.mission_run') AS BLOB), length(CAST('mission-run/' AS BLOB))+1)
+             )
+         AND json_extract(started.body, '$.fields.mission_run')='mission-run/' || run.id
+        WHERE started.subject=?1 AND started.kind='schedule.work-started'
+          AND run.status NOT IN ('completed','cancelled','failed')
+    )";
+
     pub fn schedule_has_active_started_run(&self, subject: &str) -> Result<bool> {
         let connection = self.readers.get();
         connection
             .query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM claims AS started
-                   JOIN mission_runs AS run
-                     ON json_extract(started.body, '$.fields.mission_run')='mission-run/' || run.id
-                   WHERE started.subject=?1 AND started.kind='schedule.work-started'
-                     AND run.status NOT IN ('completed','cancelled','failed')
-                 )",
+                Self::SCHEDULE_ACTIVE_STARTED_RUN_QUERY,
                 [subject],
                 |row| row.get(0),
             )
@@ -17882,17 +18126,7 @@ fn requested_run_report(
     connection: &Connection,
     creation: &crate::model::MissionRunCreation,
 ) -> Result<Option<(String, bool)>, St3Error> {
-    let mission = connection
-        .query_row(
-            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
-            params![creation.mission, creation.revision],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(internal)?
-        .map(|body| serde_json::from_str::<MissionSpec>(&body))
-        .transpose()
-        .map_err(internal)?;
+    let mission = mission_revision_spec_tx(connection, &creation.mission, &creation.revision)?;
     Ok(mission.and_then(|mission| {
         resolved_run_report(
             &mission,
@@ -17918,6 +18152,58 @@ fn mission_run_report_tx(
         )
         .optional()
         .map(|row| row.and_then(|(report_to, completed)| Some((report_to?, completed))))
+        .map_err(internal)
+}
+
+/// The claim that changes who a run reports to after it started. Its latest one replaces what
+/// the creation claim recorded; one with no `report_to` means the run reports to nobody.
+pub(crate) const RUN_REPORT_KIND: &str = "mission-run.report-to";
+
+/// The agent, stall limit and completion report that a report claim or a creation claim
+/// records, or `None` when it names no agent.
+pub(crate) fn run_report_fields(body: &Value) -> Option<(String, u64, bool)> {
+    let fields = body.get("fields").unwrap_or(body);
+    Some((
+        fields.get("report_to")?.as_str()?.to_owned(),
+        fields
+            .get("stalled_after_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(crate::mission::DEFAULT_STALLED_AFTER_MS),
+        fields
+            .get("report_completed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    ))
+}
+
+/// Who a run reports to now: its latest report claim, else its creation claim.
+fn current_run_report_tx(
+    transaction: &Transaction<'_>,
+    run: &str,
+) -> Result<Option<(String, u64, bool)>, St3Error> {
+    let claim = match latest_claim_of_kind_tx(transaction, run, RUN_REPORT_KIND)? {
+        Some(claim) => Some(claim),
+        None => latest_claim_of_kind_tx(transaction, run, "mission-run.created")?,
+    };
+    Ok(claim.and_then(|claim| run_report_fields(&claim.body)))
+}
+
+/// One published revision of a mission, if this store holds it.
+fn mission_revision_spec_tx(
+    connection: &Connection,
+    mission: &str,
+    revision: &str,
+) -> Result<Option<MissionSpec>, St3Error> {
+    connection
+        .query_row(
+            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![mission, revision],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .map(|body| serde_json::from_str::<MissionSpec>(&body))
+        .transpose()
         .map_err(internal)
 }
 
@@ -32436,6 +32722,18 @@ fn cancel_descendant_mission_runs_tx(
     Ok(claim_ids)
 }
 
+fn mission_root_tree_run_tx(connection: &Connection, id: &str) -> Result<MissionRunView> {
+    // The human tree consumes step state, summaries and queue order, not each worker's wake,
+    // timing and harness presentation histories.
+    let mut view = mission_run_steps_view_tx(connection, id, true)?;
+    enrich_run_step_queues_tx(connection, &mut view)?;
+    view.provenance = crate::provenance::read(connection, &view.mission, &view.revision)?;
+    view.loops = loop_run_views_tx(connection, &view)?;
+    view.outcome = mission_run_outcome_tx(connection, &view)?;
+    note_run_view_reads(&view);
+    Ok(view)
+}
+
 fn mission_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Result<MissionRunView> {
     mission_run_view_with_enrichment_tx(connection, run_id, true)
 }
@@ -35930,6 +36228,42 @@ mission "summary-child" state="ready" {
         };
         assert_eq!(tree_fields(&tree), tree_fields(&full));
 
+        let (first, cursor) = store
+            .mission_runs_for_root_page(&root.subject, None, 2)
+            .unwrap()
+            .unwrap();
+        let (last, end) = store
+            .mission_runs_for_root_page(&root.subject, cursor.as_deref(), 2)
+            .unwrap()
+            .unwrap();
+        assert!(cursor.is_some());
+        assert!(end.is_none());
+        assert_eq!(
+            serde_json::to_value(first.into_iter().chain(last).collect::<Vec<_>>()).unwrap(),
+            serde_json::to_value(&tree).unwrap(),
+            "paged human tree preserves every selected state, gate, summary and order"
+        );
+        assert!(store
+            .mission_runs_for_root_page(&root.subject, Some("another-root"), 2)
+            .unwrap()
+            .is_none());
+        assert!(store.mission_runs_for_root_page(&root.subject, None, 0).is_err());
+        assert_eq!(store.index().unwrap(), index, "pagination must remain a read");
+        let plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id FROM mission_runs INDEXED BY mission_runs_root_page_index
+                 WHERE root_run_id=?1 AND (created_at_unix_ms,id)>(?2,?3)
+                 ORDER BY created_at_unix_ms,id LIMIT 3",
+            )
+            .unwrap()
+            .query_map(params![root.id, "0", "cursor"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("mission_runs_root_page_index"), "{plan}");
+        assert!(!plan.contains("SCAN") && !plan.contains("TEMP B-TREE"), "{plan}");
+
         // Only a finished root accepts a user-set outcome. Exercise that separately
         // after checking active descendants and their expired leases above.
         store
@@ -35953,6 +36287,105 @@ mission "summary-child" state="ready" {
             finished.outcome,
             store.mission_run(&root.id).unwrap().unwrap().outcome
         );
+    }
+
+    #[test]
+    fn mission_root_page_seeks_across_equal_time_ties_and_rejects_retired_cursor() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(
+            &store,
+            r#"version 2
+mission "page-root" state="ready" {
+  goal "Show one bounded page of a large root."
+  step "work" { agentless }
+}
+"#,
+            "page-root",
+        );
+        let root = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "page-root".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "page-root-run".into(),
+            })
+            .unwrap();
+        // Invented rows isolate equal-time cursor order from admission scheduling.
+        // They share a valid revision but have no steps, so hydration stays inexpensive.
+        let connection = store.connection.write();
+        for index in 0..51 {
+            let id = format!("page-child-{index:03}");
+            let generation = format!("page-generation-{index:03}");
+            connection
+                .execute(
+                    "INSERT INTO mission_runs
+                     SELECT ?1,mission_id,initial_revision,?2,root_revision,
+                            root_run_id,parent_step_run,workspace,requester,inputs,mode,status,
+                            phase,created_at_unix_ms,updated_at_unix_ms
+                     FROM mission_runs WHERE id=?3",
+                    params![id, generation, root.id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO run_generations
+                     SELECT ?1,?2,revision,NULL,status,actor,reason,
+                            created_at_unix_ms,updated_at_unix_ms
+                     FROM run_generations
+                     WHERE id=(SELECT current_generation_id FROM mission_runs WHERE id=?3)",
+                    params![generation, id, root.id],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        store
+            .connection
+            .write()
+            .execute(
+                "INSERT INTO mission_runs
+                 SELECT 'page-other',mission_id,initial_revision,current_generation_id,
+                        root_revision,'another-root',parent_step_run,workspace,requester,inputs,
+                        mode,status,phase,created_at_unix_ms,updated_at_unix_ms
+                 FROM mission_runs WHERE id=?1",
+                [&root.id],
+            )
+            .unwrap();
+        assert!(store
+            .mission_runs_for_root_page(&root.subject, Some("page-other"), 50)
+            .unwrap()
+            .is_none());
+        let expected = store.mission_runs_for_root(&root.subject).unwrap();
+        let (first, cursor) = store
+            .mission_runs_for_root_page(&root.subject, None, 50)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.len(), 50);
+        let cursor = cursor.expect("51st run requires continuation");
+        let (last, end) = store
+            .mission_runs_for_root_page(&root.subject, Some(&cursor), 50)
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.len(), 2);
+        assert!(end.is_none());
+        assert_eq!(
+            first.into_iter().chain(last).map(|run| run.subject).collect::<Vec<_>>(),
+            expected.into_iter().map(|run| run.subject).collect::<Vec<_>>()
+        );
+        let connection = store.connection.write();
+        connection
+            .execute("DELETE FROM run_generations WHERE run_id=?1", [&cursor])
+            .unwrap();
+        connection
+            .execute("DELETE FROM mission_runs WHERE id=?1", [&cursor])
+            .unwrap();
+        drop(connection);
+        assert!(store
+            .mission_runs_for_root_page(&root.subject, Some(&cursor), 50)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -37306,6 +37739,93 @@ mission "card-owner" state="ready" {
         assert_eq!(result.subjects.len(), 65);
         assert!(!eligible.expired());
         assert!(store.readers.get().is_autocommit());
+    }
+
+    #[test]
+    fn bound_one_nested_large_status_reuses_its_snapshot_reader() {
+        let store = Arc::new(smallclaims::sqlite::with_read_limit_for_test(
+            1, || Store::open_memory("node").unwrap(),
+        ));
+        let names = (0..80).map(|n| format!("agent/admitted/seat-{n:03}"))
+            .collect::<BTreeSet<_>>();
+        for name in &names {
+            observe_runtime(&store, name, "running", "incarnation");
+        }
+        let budget = smallclaims::read_budget::ReadBudget::new(
+            "/nested-status", std::time::Duration::from_secs(15),
+        );
+        let worker_budget = budget.clone();
+        let worker_store = store.clone();
+        let expected = names.iter().cloned().collect::<Vec<_>>();
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = smallclaims::read_budget::with(Some(worker_budget), || {
+                worker_store.readers.request_read(|| {
+                    worker_store.read_snapshot(|cut| {
+                        worker_store.readers.request_read(|| {
+                            worker_store.status_for_subject_names_at(names, cut, true)
+                        })?
+                    })
+                })?
+            });
+            done.send(result).unwrap();
+        });
+        let completed = finished.recv_timeout(std::time::Duration::from_secs(5));
+        if completed.is_err() {
+            budget.cancel();
+        }
+        let result = completed.expect("bound-one nested status fanout deadlocked").unwrap();
+        worker.join().unwrap();
+        assert_eq!(result.subjects.iter().map(|subject| subject.subject.clone())
+            .collect::<Vec<_>>(), expected);
+        assert_eq!(store.readers.usage().peak, 1);
+        assert_eq!(store.readers.usage().idle, 1);
+        assert!(!budget.expired());
+    }
+
+    #[test]
+    fn admitted_status_fanout_and_inline_reduction_have_identical_values_and_digests() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("status.sqlite3");
+        let inline = smallclaims::sqlite::with_read_limit_for_test(
+            1, || Store::open(&path, "node").unwrap(),
+        );
+        let names = (0..80).map(|n| format!("agent/admitted/seat-{n:03}"))
+            .collect::<BTreeSet<_>>();
+        for name in &names {
+            observe_runtime(&inline, name, "stopped", "old");
+            observe_runtime(&inline, name, "running", "current");
+        }
+        // Two fresh pools over the same real claims keep provenance and accepted times
+        // identical, making the entire serialized result (not a normalized subset) comparable.
+        let parallel = smallclaims::sqlite::with_read_limit_for_test(
+            32, || Store::open(&path, "node").unwrap(),
+        );
+        let cut = inline.index().unwrap();
+        assert_eq!(parallel.index().unwrap(), cut);
+        for history in [false, true] {
+            let values = [&inline, &parallel].map(|store| {
+                let budget = smallclaims::read_budget::ReadBudget::new(
+                    "/admitted-status", std::time::Duration::from_secs(15),
+                );
+                let result = smallclaims::read_budget::with(Some(budget), || {
+                    store.readers.request_read(|| {
+                        store.status_for_subject_names_at(names.clone(), cut, history)
+                    })
+                }).unwrap().unwrap();
+                assert_eq!(result.subjects.len(), names.len());
+                assert!(result.subjects.windows(2).all(|pair| pair[0].subject < pair[1].subject));
+                serde_json::to_value(result).unwrap()
+            });
+            assert_eq!(values[0], values[1]);
+            let digests = values.map(|value| {
+                hex::encode(Sha256::digest(serde_json::to_vec(&value).unwrap()))
+            });
+            assert_eq!(digests[0], digests[1]);
+        }
+        assert_eq!(inline.readers.usage().peak, 1);
+        assert!(parallel.readers.usage().peak > 1);
+        assert!(parallel.readers.usage().peak <= 32);
     }
 
     #[test]
@@ -41114,6 +41634,162 @@ version 2
             let (_, same) = declare(run, mission, extra);
             assert!(same.blockers.is_empty(), "{run}: {:?}", same.blockers);
         }
+    }
+
+    #[test]
+    fn a_running_runs_reporter_changes_by_its_own_claim_and_leaves_creation_alone() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let watched = publish_mission(
+            &store,
+            "version 2\nmission \"watched\" state=\"ready\" report-to=\"agent/ops/mission-reporter\" stalled-after=\"15m\" { concurrent-runs; goal \"Watched.\"; step \"work\" { agentless } }",
+            "publish-watched",
+        );
+        let source = format!(
+            "version 2\nmission-run \"watched/1\" {{\n  mission \"mission/{}@{}\"\n  workspace {:?}\n  requester \"agent/ops/owner\"\n}}\n",
+            watched.id,
+            watched.revision,
+            workspace.path().display().to_string(),
+        );
+        let declare = || {
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let preview = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source.clone(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            (intent, preview)
+        };
+        let (intent, preview) = declare();
+        store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                "start-watched-1",
+                Some("agent/ops/owner"),
+            )
+            .unwrap();
+        let run = "mission-run/watched/1";
+        let created = store
+            .latest_claim(run, Some("mission-run.created"))
+            .unwrap()
+            .unwrap();
+        let reports = || store.claims_for(run, Some(RUN_REPORT_KIND)).unwrap().len();
+        let code = |result: Result<MissionRunReportView, St3Error>| result.unwrap_err().code;
+
+        // Only a person or the agent that requested the run may change it, and only to an
+        // agent; a limit or completion means nothing without one.
+        assert_eq!(
+            code(store.set_mission_run_report(
+                run,
+                "agent/ops/stranger",
+                Some("agent/ops/watcher"),
+                None,
+                false,
+                "stranger",
+            )),
+            "run-report-authority-denied"
+        );
+        assert_eq!(
+            code(store.set_mission_run_report(
+                run,
+                "person/operator",
+                Some("person/operator"),
+                None,
+                false,
+                "person-reporter",
+            )),
+            "invalid-report-to"
+        );
+        assert_eq!(
+            code(store.set_mission_run_report(
+                run,
+                "person/operator",
+                None,
+                Some(60_000),
+                false,
+                "limit-alone",
+            )),
+            "report-without-recipient"
+        );
+        assert_eq!(reports(), 0);
+
+        // The requester names a watcher; the mission's own limit applies unless one is named.
+        let changed = store
+            .set_mission_run_report(
+                run,
+                "agent/ops/owner",
+                Some("agent/ops/watcher"),
+                None,
+                false,
+                "owner-sets",
+            )
+            .unwrap();
+        assert!(changed.changed);
+        assert_eq!(changed.report_to.as_deref(), Some("agent/ops/watcher"));
+        assert_eq!(changed.stalled_after_ms, Some(15 * 60_000));
+        assert!(!changed.report_completed);
+        // Asking for what it already is writes nothing.
+        let again = store
+            .set_mission_run_report(
+                run,
+                "person/operator",
+                Some("agent/ops/watcher"),
+                None,
+                false,
+                "person-repeats",
+            )
+            .unwrap();
+        assert!(!again.changed);
+        assert_eq!(reports(), 1);
+        let limited = store
+            .set_mission_run_report(
+                run,
+                "person/operator",
+                Some("agent/ops/watcher"),
+                Some(60 * 60_000),
+                true,
+                "person-limits",
+            )
+            .unwrap();
+        assert_eq!(limited.stalled_after_ms, Some(60 * 60_000));
+        assert!(limited.report_completed);
+        let latest = store
+            .latest_claim(run, Some(RUN_REPORT_KIND))
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.actor.as_deref(), Some("person/operator"));
+        assert_eq!(
+            run_report_fields(&latest.body),
+            Some(("agent/ops/watcher".into(), 60 * 60_000, true))
+        );
+
+        // Clearing reports to nobody, even though the mission names a reporter.
+        let cleared = store
+            .set_mission_run_report(run, "agent/ops/owner", None, None, false, "owner-clears")
+            .unwrap();
+        assert!(cleared.changed);
+        assert_eq!(cleared.report_to, None);
+        let latest = store
+            .latest_claim(run, Some(RUN_REPORT_KIND))
+            .unwrap()
+            .unwrap();
+        assert_eq!(run_report_fields(&latest.body), None);
+        assert_eq!(reports(), 3);
+
+        // The creation claim is what the run started with, so declaring the run again exactly
+        // as it was started is still a retry.
+        let still = store
+            .latest_claim(run, Some("mission-run.created"))
+            .unwrap()
+            .unwrap();
+        assert_eq!((still.id, still.body), (created.id, created.body));
+        let (_, redeclared) = declare();
+        assert!(redeclared.blockers.is_empty(), "{:?}", redeclared.blockers);
     }
 
     #[test]
