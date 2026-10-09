@@ -20,11 +20,12 @@ const COLLECTIONS: [&str; 8] = [
     "summary-missions",
 ];
 
-/// Registers affect live seat overlays, not durable mission/work or descriptor windows.
+/// Registers affect live seat overlays; occupancy can also establish a work usage value.
 fn register_affects(collection: &str, kind: &str) -> bool {
     match collection {
         "agents" | "summary" => true,
         "attention" => kind == "harness.observed",
+        "work" => kind == "harness.usage",
         _ => false,
     }
 }

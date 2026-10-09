@@ -251,6 +251,24 @@ async fn local_and_received_status_registers_reread_agents_without_missions_or_w
         fixture.counts(),
         counts(&[("agents", 4), ("missions", 2), ("work", 2)])
     );
+    // Even without numeric usage, the first occupancy reading establishes a work usage
+    // value. Its window must refresh, while mission cards still have no register input.
+    fixture.claim(
+        "agent/fixture-roster",
+        "harness.usage",
+        json!({"semantics":"context_occupancy", "incarnation_id":"one",
+            "context_used_tokens":12}),
+    );
+    let mut changed = BTreeSet::new();
+    for _ in 0..2 {
+        changed.insert(fixture.frame().await["id"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(changed, BTreeSet::from(["agents".into(), "work".into()]));
+    fixture.quiet().await;
+    assert_eq!(
+        fixture.counts(),
+        counts(&[("agents", 5), ("missions", 2), ("work", 3)])
+    );
 }
 
 #[tokio::test]
