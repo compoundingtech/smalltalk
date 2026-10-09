@@ -2246,9 +2246,9 @@ mod tests {
     fn initial_subject_waits_for_live_inventory_and_opens_only_once() {
         for spaces in [false, true] {
             let mut world = super::super::demo::world();
-            let mut expert = world.agents.items()[0].clone();
-            expert.id = "agent/st/expert".into();
-            expert.name = "Expert".into();
+            let mut assistant = world.agents.items()[0].clone();
+            assistant.id = "agent/st/assistant".into();
+            assistant.name = "Smalltalk Assistant".into();
             let other = world.agents.items()[0].id.clone();
             let mut ui = Ui::new(world.clone());
             if spaces {
@@ -2257,14 +2257,14 @@ mod tests {
                 ui.open_home();
             }
             let before = ui.focus();
-            let mut requested = Some(expert.id.clone());
+            let mut requested = Some(assistant.id.clone());
             focus_initial_subject(&mut ui, &mut requested, false, true);
             assert_eq!(
                 ui.focus(), before,
                 "waiting inventory must not open another agent"
             );
             assert!(requested.is_some());
-            world.agents = Load::Ready(vec![world.agents.items()[0].clone(), expert.clone()]);
+            world.agents = Load::Ready(vec![world.agents.items()[0].clone(), assistant.clone()]);
             ui.set_world(world.clone());
             let before = ui.focus();
             focus_initial_subject(&mut ui, &mut requested, false, true);
@@ -2273,8 +2273,8 @@ mod tests {
                 "cached inventory must not consume the request"
             );
             focus_initial_subject(&mut ui, &mut requested, true, true);
-            assert_eq!(ui.focus(), (1, Some(expert.id.clone())));
-            assert_eq!(ui.live_conversations()[0], expert.id);
+            assert_eq!(ui.focus(), (1, Some(assistant.id.clone())));
+            assert_eq!(ui.live_conversations()[0], assistant.id);
             assert!(!ui.home_open());
             assert!(requested.is_none());
             ui.open(&other);
@@ -2290,7 +2290,7 @@ mod tests {
     #[test]
     fn initial_subject_is_cancelled_by_navigation_or_a_missing_live_agent() {
         let mut ui = Ui::new(super::super::demo::world());
-        let mut missing = Some("agent/st/expert".to_owned());
+        let mut missing = Some("agent/st/assistant".to_owned());
         let before = ui.focus();
         focus_initial_subject(&mut ui, &mut missing, true, true);
         assert!(missing.is_none());

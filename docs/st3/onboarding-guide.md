@@ -1,7 +1,7 @@
 # The Smalltalk guide
 
 Smalltalk runs agents as durable seats and records missions, messages and decisions
-in a graph. This guide is bundled into the executable so the expert can help on a
+in a graph. This guide is bundled into the executable so the Assistant can help on a
 machine without a source checkout. Its version is pinned by the onboarding mission.
 
 ## Check the installation
@@ -40,7 +40,7 @@ the agent read the message; use the recorded receipt.
 doing and where it works. `st agents restart` recovers a stuck harness while keeping
 its declaration. `st agents stop` leaves it stopped until explicitly started.
 Suspend and resume preserve a quiet seat's native conversation on the same machine;
-they refuse busy seats. The built-in expert stays available after onboarding, and
+they refuse busy seats. The built-in Smalltalk Assistant stays available after onboarding, and
 setup does not resurrect it after the person stops it. `st setup --onboarding`
 explicitly starts another onboarding run.
 
@@ -90,7 +90,7 @@ is a recovery action, not proof that a problem was fixed: check the new incarnat
 and its read receipt. Never assume a machine name, a published release, a paired
 device, a successful installation, or a completed mission from a command attempt.
 
-Message agent/st/expert for later questions, and use `st --help` and nested command
+Message agent/st/assistant for later questions, and use `st --help` and nested command
 help for the installed build's current syntax. This curated guide draws on the
 repository's getting-started, talking-to-agents, seat-lifecycle, mission graph runtime
 and troubleshooting guides; it does not require a checkout to read them.

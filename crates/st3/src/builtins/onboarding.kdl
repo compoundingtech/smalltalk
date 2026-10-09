@@ -1,7 +1,7 @@
 version 2
 mission "st/onboarding" state="ready" {
   goal "Learn to see agents, give them work, and answer their questions from Home."
-  assigned-to "agent/st/expert"
+  assigned-to "agent/st/assistant"
   baseline "the bundled guide is available" {
     document "@GUIDE@"
   }
@@ -41,6 +41,6 @@ mission "st/onboarding" state="ready" {
   }
   step "wrap-up" {
     depends-on { step "github" completed }
-    goal "List the checked work and objects that now exist, explain messaging agent/st/expert again, and point to @GUIDE@ and st --help. Finish the run and remain available for future messages."
+    goal "List the checked work and objects that now exist, explain messaging agent/st/assistant again, and point to @GUIDE@ and st --help. Finish the run and remain available for future messages."
   }
 }

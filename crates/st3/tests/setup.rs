@@ -603,7 +603,7 @@ fn plain_st_first_run_asks_names_starts_daemon_and_opens_home() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn onboarding_publication_is_graph_decided_and_preserves_stopped_expert() {
+async fn onboarding_publication_is_graph_decided_and_preserves_stopped_assistant() {
     if st3::test_support::supervise_test() {
         return;
     }
@@ -689,7 +689,7 @@ async fn onboarding_publication_is_graph_decided_and_preserves_stopped_expert() 
     let initial = store.mission_run("st/onboarding").unwrap().unwrap();
     assert_eq!(initial.requester, "person/ada");
     let token = store
-        .selected_desired_token("agent/st/expert")
+        .selected_desired_token("agent/st/assistant")
         .unwrap()
         .unwrap();
     let claim: st3::model::ClaimRecord = client
@@ -698,12 +698,12 @@ async fn onboarding_publication_is_graph_decided_and_preserves_stopped_expert() 
         .unwrap();
     assert_eq!(claim.actor.as_deref(), Some("person/ada"));
     let declarations = store.desired_subjects().unwrap();
-    let expert = declarations
+    let assistant = declarations
         .iter()
-        .find(|subject| subject.subject == "agent/st/expert")
+        .find(|subject| subject.subject == "agent/st/assistant")
         .unwrap();
     assert!(
-        serde_json::to_string(expert)
+        serde_json::to_string(assistant)
             .unwrap()
             .contains("--dangerously-bypass-approvals-and-sandbox")
     );
@@ -722,9 +722,9 @@ async fn onboarding_publication_is_graph_decided_and_preserves_stopped_expert() 
             .any(|constraint| constraint.contains(&guides.items[0].hash))
     );
     let mut stop = fixture.cli();
-    stop.args(["agents", "stop", "agent/st/expert", "--as", "person/ada"]);
+    stop.args(["agents", "stop", "agent/st/assistant", "--as", "person/ada"]);
     success(&run(stop).await);
-    let stopped = store.selected_desired_token("agent/st/expert").unwrap();
+    let stopped = store.selected_desired_token("agent/st/assistant").unwrap();
     let mut cancel = fixture.cli();
     cancel.args([
         "missions",
@@ -748,13 +748,13 @@ async fn onboarding_publication_is_graph_decided_and_preserves_stopped_expert() 
     let index = store.index().unwrap();
     success(&run(setup()).await);
     assert_eq!(
-        store.selected_desired_token("agent/st/expert").unwrap(),
+        store.selected_desired_token("agent/st/assistant").unwrap(),
         stopped
     );
     assert_eq!(
         store.index().unwrap(),
         index,
-        "ordinary setup must not resurrect the expert or restart finished onboarding"
+        "ordinary setup must not resurrect the Assistant or restart finished onboarding"
     );
     let mut rerun = setup();
     rerun.arg("--onboarding");
@@ -765,7 +765,7 @@ async fn onboarding_publication_is_graph_decided_and_preserves_stopped_expert() 
         .unwrap();
     assert_eq!(history["total_runs"], 2);
     assert_ne!(
-        store.selected_desired_token("agent/st/expert").unwrap(),
+        store.selected_desired_token("agent/st/assistant").unwrap(),
         stopped
     );
     server.abort();

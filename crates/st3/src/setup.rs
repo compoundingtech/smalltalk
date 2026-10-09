@@ -43,7 +43,7 @@ pub struct SetupArgs {
     /// Install the user-owned Claude channel (default: true; never installs policy).
     #[arg(long, action = clap::ArgAction::Set)]
     pub claude_channel: Option<bool>,
-    /// Start onboarding again, including a stopped built-in expert.
+    /// Start onboarding again, including a stopped built-in Smalltalk Assistant.
     #[arg(long)]
     pub onboarding: bool,
 }

@@ -10,7 +10,7 @@ curl -fsSL https://raw.githubusercontent.com/compoundingtech/smalltalk/main/inst
 
 The installer selects your platform, verifies the downloaded archive and opens `st`.
 On the first run, choose your name and this machine's name, accept the background
-service, and choose an installed coding harness. The built-in expert guides you
+service, and choose an installed coding harness. The built-in Smalltalk Assistant guides you
 through your first mission and stays available afterward.
 
 After quitting the interface with **Ctrl+Q**, open it again:
@@ -27,7 +27,7 @@ installed, `st` still opens; install a supported harness and run `st setup` late
 Neither GitHub nor `gh` is required. Native macOS build and installer tests run in CI;
 clean-machine app, launchd and permission setup still need a manual rehearsal.
 
-**[Get started](docs/getting-started.md)** covers first-run questions, the expert,
+**[Get started](docs/getting-started.md)** covers first-run questions, the Smalltalk Assistant,
 installation choices and background services. Each person currently runs their own
 fleet; start with one machine and add others when you need them.
 
