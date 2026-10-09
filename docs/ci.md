@@ -50,12 +50,18 @@ use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggreg
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once.
 
-All Linux Namespace jobs use run affinity and the same inline `job.priority=1`: required
-Workspace jobs, optional benchmarks, manual Performance controls, main upkeep and releases.
-Using one class prevents a continuous stream of required jobs from overtaking older performance
-requests. Run affinity ensures that a runner started for a request is assigned to that run,
-so GitHub cannot hand it to a newer run with the same shape. Local `ci1-priority` and `ci1-merge`
-reservations continue to select only the primary test shard.
+Required Workspace checks for PRs and merge groups use Namespace `job.priority=1`.
+Optional Performance and `perf-cost`, manual controls, main upkeep and releases retain
+priority 2. Required PR checks must finish before a PR can enter the merge queue; merge-first
+ordering previously allowed new merge jobs to overtake these prerequisites. This policy orders
+waiting jobs and neither preempts running work nor reserves capacity. The picker, local pools,
+runner shapes, run affinity and required checks are unchanged.
+
+The 2026-10-09 investigation retained a PR build waiting 55.1 minutes at priority 2 before
+15.7 minutes of execution; two sampled merge builds at priority 1 waited 0.3 and 1.7 minutes.
+One 116.6-minute PR had 41.0 minutes of producer wait and 28.8 minutes of shard wait.
+This motivates queue ordering; it does not establish a cache or compiler defect, nor promise
+that the 20-minute run SLO is met under overload.
 
 Profile labels carry affinity inline, for example
 `namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}`.
@@ -64,12 +70,10 @@ Shape labels retain `-with-features` and a separate
 separate `namespace-features:` label with profiles; see the
 [Runner Controls syntax](https://namespace.so/docs/solutions/github-actions/runner-controls).
 
-The queue still shares the existing Linux limit of 320 vCPUs / 640 GiB and must drain its older
-backlog. Queue time is measured separately from execution time; the shared class removes
-indefinite overtaking, rather than promising a fixed start time under arbitrary overload.
-An already queued job retains the labels from its immutable workflow revision. Recover old
-unprioritized controls with label-only revisions and new dispatches, preserving their source,
-fixtures and budgets; retain completed failures as evidence. See Namespace's
+The documented Linux limit is 320 vCPUs / 640 GiB; this change does not increase it.
+Queue time is measured separately from execution time. Already queued jobs retain the labels
+from their immutable workflow revision and finish naturally; this change does not rerun them.
+Optional jobs remain subject to capacity after required checks. See Namespace's
 [job ordering and priority controls](https://namespace.so/docs/solutions/github-actions/runner-controls/job-ordering).
 
 `scripts/ci-linux STAGE` runs one stage:

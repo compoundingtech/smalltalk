@@ -7,7 +7,8 @@ import {
 } from '../../repos/effect-utils/genie/external.ts'
 
 // Profiles require controls inline; namespace-features labels apply only to shape labels.
-// Namespace serves queued merge-group jobs before PR, optional and manual jobs.
+// Generic workflows retain merge-first ordering. Required Workspace PR checks use
+// the first class too, through namespaceLabels below, rather than sharing benchmarks.
 // This orders waiting jobs; it does not preempt active jobs or reserve a runner.
 const linuxJobPriority = "${{ github.event_name == 'merge_group' && 1 || 2 }}"
 export const linuxRunnerProfile = `namespace-profile-linux-x86-64;job.priority=${linuxJobPriority}`
@@ -169,13 +170,15 @@ const mergeCi1Labels = `github.event_name == 'merge_group' && (vars.CI_MERGE_CI1
 const pickedOr = (namespaceLabels: string, output = 'ci1') =>
   `\${{ fromJSON(${mergeCi1Labels} || (github.event_name != 'merge_group' && needs.${pickRunnerJobId}.outputs.${output}) || ${namespaceLabels}) }}`
 
-// Keep run affinity within each event class. Merge groups take the first Namespace
-// queue class; optional/manual and PR work retain the same second class.
+// Required PR and merge checks share the first class. PR checks are prerequisites
+// for the merge queue: serving every new merge ahead of them can starve that input.
+// Optional/manual work retains linuxJobPriority and the second class.
+const workspaceJobPriority = "(github.event_name == 'merge_group' || github.event_name == 'pull_request') && 1 || 2"
 // Set this repository variable only after a runner administrator has provisioned
 // the profile with the existing image/cache and left it capacity outside the PR pool.
-// An unset variable retains the existing shapes with merge-first queue ordering.
+// An unset variable retains the existing shapes and Workspace priority policy.
 const namespaceLabels = (labels: readonly string[]) =>
-  `github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('${JSON.stringify(labels).replaceAll('${{ github.run_id }}', '{0}').replaceAll(linuxJobPriority, '{1}')}', github.run_id, github.event_name == 'merge_group' && 1 || 2)`
+  `github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('${JSON.stringify(labels).replaceAll('${{ github.run_id }}', '{0}').replaceAll(linuxJobPriority, '{1}')}', github.run_id, ${workspaceJobPriority})`
 /** `runs-on` for a stage job: picked ci1, else the shared Namespace queue class. */
 export const linuxStageRunsOn = pickedOr(
   namespaceLabels(linuxStageRunner),
