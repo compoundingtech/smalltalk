@@ -850,6 +850,13 @@
           assert pkgs.lib.hasInfix ''person = "person/ada"'' rendered.xdg.configFile."st3/config.toml".text;
           assert pkgs.lib.hasInfix "/tmp/smalltalk-test.sock" args;
           assert pkgs.lib.hasInfix "--pty-binary" args;
+          # service.rs passes the shared runtime gateway explicitly, even with --state-dir.
+          # Assert the rendered command: %%t would be a literal path, not a systemd specifier.
+          assert (if pkgs.stdenv.hostPlatform.isLinux then
+            pkgs.lib.hasInfix ''"--client-gateway-socket" "%t/st3-client.sock"'' args
+            && !(pkgs.lib.hasInfix "%%t/st3-client.sock" args)
+          else
+            pkgs.lib.hasInfix "--client-gateway-socket ${rendered.services.smalltalk.stateDir}/run/st3-client.sock" args);
           assert (if pkgs.stdenv.hostPlatform.isLinux then
             pkgs.lib.hasPrefix ''"${stableExecutable}" '' args
           else
