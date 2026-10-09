@@ -467,23 +467,29 @@ pub(super) fn prepare(
     Ok(items)
 }
 
-/// Test-only count of native bodies `prepare_one` has prepared. A first frame must prepare
-/// only its own page (plus the has-more probe), never a whole window it will discard.
+/// Test-only count of native bodies `prepare_one` has prepared for one watched session. A
+/// first frame must prepare only its own page (plus the has-more probe), never a whole window
+/// it will discard. Scoped by session so parallel tests cannot move the count.
 #[cfg(test)]
-static PREPARED_BODIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PREPARED_BODIES: std::sync::Mutex<Option<(String, usize)>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
-pub(super) fn reset_prepared_bodies() {
-    PREPARED_BODIES.store(0, std::sync::atomic::Ordering::SeqCst);
+fn prepared_bodies_slot() -> std::sync::MutexGuard<'static, Option<(String, usize)>> {
+    PREPARED_BODIES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Starts counting preparations for `session_id` from zero.
+#[cfg(test)]
+pub(super) fn reset_prepared_bodies(session_id: &str) {
+    *prepared_bodies_slot() = Some((session_id.to_owned(), 0));
 }
 
 #[cfg(test)]
 pub(super) fn prepared_bodies() -> usize {
-    PREPARED_BODIES.load(std::sync::atomic::Ordering::SeqCst)
+    prepared_bodies_slot().as_ref().map_or(0, |(_, count)| *count)
 }
 
-/// Serializes tests that measure or run native preparation, so a parallel test cannot
-/// move the shared count between their reads.
+/// Serializes the tests that watch the count, since only one session is watched at a time.
 #[cfg(test)]
 pub(super) fn prepared_counter_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -498,7 +504,11 @@ pub(super) fn prepare_one(
     item: &mut Value,
 ) -> Result<(), ApiError> {
     #[cfg(test)]
-    PREPARED_BODIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Some((watched, count)) = prepared_bodies_slot().as_mut()
+        && watched == session_id
+    {
+        *count += 1;
+    }
     let original = item.clone();
     let body = item["body"]
         .as_object_mut()
