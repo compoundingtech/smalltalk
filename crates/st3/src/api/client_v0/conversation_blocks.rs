@@ -467,6 +467,35 @@ pub(super) fn prepare(
     Ok(items)
 }
 
+/// Test-only count of native bodies `prepare_one` has prepared for one watched session. A
+/// first frame must prepare only its own page (plus the has-more probe), never a whole window
+/// it will discard. Scoped by session so parallel tests cannot move the count.
+#[cfg(test)]
+static PREPARED_BODIES: std::sync::Mutex<Option<(String, usize)>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn prepared_bodies_slot() -> std::sync::MutexGuard<'static, Option<(String, usize)>> {
+    PREPARED_BODIES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Starts counting preparations for `session_id` from zero.
+#[cfg(test)]
+pub(super) fn reset_prepared_bodies(session_id: &str) {
+    *prepared_bodies_slot() = Some((session_id.to_owned(), 0));
+}
+
+#[cfg(test)]
+pub(super) fn prepared_bodies() -> usize {
+    prepared_bodies_slot().as_ref().map_or(0, |(_, count)| *count)
+}
+
+/// Serializes the tests that watch the count, since only one session is watched at a time.
+#[cfg(test)]
+pub(super) fn prepared_counter_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(super) fn prepare_one(
     source: &ExternalSession,
     session: &ClientSession,
@@ -474,6 +503,12 @@ pub(super) fn prepare_one(
     basis: &str,
     item: &mut Value,
 ) -> Result<(), ApiError> {
+    #[cfg(test)]
+    if let Some((watched, count)) = prepared_bodies_slot().as_mut()
+        && watched == session_id
+    {
+        *count += 1;
+    }
     let original = item.clone();
     let body = item["body"]
         .as_object_mut()

@@ -120,6 +120,15 @@ A conversation is one more subscription too. Name an agent or a session:
 {"kind":"subscribe","id":"talk","collection":"conversation","conversation":"agent/ID"}
 ```
 
+The first frame carries the conversation's newest 200 entries, or fewer when the subscribe
+names an optional `limit` (1 through 200). A replacement frame with `has_more: true` also
+carries `older_cursor`: pass it to `GET /v1/client/sessions/{id}/timeline?cursor=…` for the
+entries just before the frame's oldest entry, then follow that response's `page.next_cursor`.
+A client that pages this way can ask for a small first frame, such as `"limit":20`. When a
+replacement frame has older history, later deltas carry only new entries and revisions of
+entries from that frame onward; a revision of an older entry shows up when the client pages
+back through `older_cursor`.
+
 An agent's conversation is its current session's timeline with the Smalltalk to or from the agent
 joined in. The first `conversation` frame carries `id`, `collection` (`conversation`),
 `session_id`, `replace: true`, the newest page of timeline `items`, and `has_more`. Later frames

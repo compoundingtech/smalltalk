@@ -1133,8 +1133,10 @@ async fn receive_client_read(
                 cursor,
             } => {
                 anyhow::ensure!((1..=200).contains(&limit), "the timeline limit is invalid");
+                // A cursor carries its own page size. The relayed limit is a required field
+                // that a gateway fills with its default, so it only sizes a first page.
                 let value = client
-                    .timeline(&session_id, cursor.as_deref(), Some(limit))
+                    .timeline(&session_id, cursor.as_deref(), cursor.is_none().then_some(limit))
                     .await?
                     .value;
                 Ok(serde_json::to_value(value)?)
@@ -1582,6 +1584,58 @@ fn smalltalk_routes() -> Router<PeerState> {
             post(receive_client_read).layer(DefaultBodyLimit::max(16_384)),
         )
         .route(RAW_TERMINAL_PATH, get(receive_raw_terminal))
+}
+
+/// Serve a two-member conversation relay for tests: an owner answering relayed client
+/// reads through the peer listener, and a gateway whose client relay reaches that owner.
+/// Returns the gateway's client socket once both members answer.
+#[cfg(test)]
+pub(crate) async fn serve_conversation_relay_pair(
+    owner: crate::api::AppState,
+    gateway: &mut crate::api::AppState,
+    root: &Path,
+) -> Result<PathBuf> {
+    use smallclaims::sync::{FleetContext, peer_router};
+    use std::os::unix::fs::PermissionsExt as _;
+    let owner_socket = root.join("owner-st3.sock");
+    let served_owner = owner_socket.clone();
+    let owner_app = crate::api::router(owner);
+    tokio::spawn(async move { crate::api::serve_unix(&served_owner, owner_app).await });
+    let peer = PeerState::new(
+        MainBackend::new(owner_socket.to_path_buf()),
+        "conversation-owner".into(),
+        FleetAuth::test("fleet-test", &[7; 32]),
+        FleetContext::legacy(BTreeSet::from(["conversation-gateway".into()])),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+    let secret = root.join("fleet-secret");
+    fs::write(&secret, [7_u8; 32])?;
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600))?;
+    gateway.client_relay = ClientRelay::from_config(&Config {
+        node: "conversation-gateway".into(),
+        fleet_id: Some("fleet-test".into()),
+        shared_secret_file: Some(secret),
+        peers: vec![PeerConfig {
+            name: "conversation-owner".into(),
+            url: format!("http://{address}"),
+        }],
+        ..Default::default()
+    })?;
+    let gateway_socket = root.join("gateway-st3.sock");
+    let served_gateway = gateway_socket.clone();
+    let gateway_app = crate::api::router(gateway.clone());
+    tokio::spawn(async move { crate::api::serve_unix(&served_gateway, gateway_app).await });
+    for socket in [&owner_socket, &gateway_socket] {
+        for _ in 0..200 {
+            if tokio::net::UnixStream::connect(socket).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    Ok(gateway_socket)
 }
 
 /// Run the replication worker: sync this node's store, through its daemon, with the fleet.
