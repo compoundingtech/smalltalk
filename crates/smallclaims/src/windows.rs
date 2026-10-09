@@ -120,6 +120,11 @@ impl Series {
                 ring.resize(slots, Slot::default());
             }
             let slot = &mut ring[(epoch % slots as u64) as usize];
+            // A sample taken before another thread took the lock can be older than the slot's
+            // contents; it is a whole ring older than them, so it is outside the window.
+            if slot.histogram.count > 0 && slot.epoch > epoch {
+                continue;
+            }
             if slot.epoch != epoch || slot.histogram.count == 0 {
                 *slot = Slot {
                     epoch,
@@ -416,6 +421,19 @@ mod tests {
         series.record(at(7_200 + 3_600), Duration::from_millis(7), false);
         assert_eq!(count(&series, 7_200 + 3_600, "1h"), 1);
         assert_eq!(series.snapshot(at(7_200 + 3_600))["1h"]["max_ms"], 7.0);
+    }
+
+    #[test]
+    fn a_late_older_sample_never_replaces_a_newer_slot() {
+        let mut series = Series::default();
+        series.record(at(20_000), Duration::from_millis(300), true);
+        // 120 s older: the same 1-minute slot a ring later, a different 5-minute slot.
+        series.record(at(20_000 - 120), Duration::from_millis(2), false);
+        let report = series.snapshot(at(20_000));
+        assert_eq!(report["1m"]["count"], 1);
+        assert_eq!(report["1m"]["max_ms"], 300.0);
+        assert_eq!(report["5m"]["count"], 2);
+        assert_eq!(report["1h"]["count"], 2);
     }
 
     #[test]
