@@ -48,6 +48,8 @@ pub struct SmalltalkRuntime {
     /// Counts complete current roster publications, same graph index or not, so collection
     /// streams that read an earlier one reread the newer.
     pub(crate) agent_roster_published: tokio::sync::watch::Sender<u64>,
+    /// Every other collection's published view revisions, for the same rereads.
+    pub(crate) published_views: published_views::PublishedViews,
     #[cfg(test)]
     pub(crate) agent_resources_builds: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -356,6 +358,7 @@ impl Runtime for SmalltalkRuntime {
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
         self.agent_roster_published.send_modify(|revision| *revision += 1);
+        self.published_views.invalidate();
         self.agent_page_refs_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

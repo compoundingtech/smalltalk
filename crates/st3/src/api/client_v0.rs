@@ -10,6 +10,8 @@ pub(super) mod arrangements;
 pub(super) mod conversation_blocks;
 mod collection_windows;
 mod collection_ivm;
+#[cfg(test)]
+mod collection_refresh_tests;
 mod summary;
 
 #[cfg(test)]
@@ -70,6 +72,8 @@ struct CollectionSubscription {
     /// The roster publication revision when this window's last read began. An agents window
     /// rereads once a later roster is published, even at the same graph index.
     roster_revision: u64,
+    /// The same for every other published view: its revision when this window's last read began.
+    view_revision: u64,
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
@@ -95,6 +99,12 @@ const COLLECTION_REREAD_INTERVAL: Duration = Duration::from_millis(1_500);
 const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 const COLLECTION_PING_INTERVAL: Duration = Duration::from_secs(8);
 const COLLECTION_SEND_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Whether a collection's rows change as time passes without a claim: attention grace periods,
+/// mission and work-queue leases, and the summary counts made of them.
+fn collection_follows_clock(collection: &str) -> bool {
+    matches!(collection, "attention" | "missions" | "agents" | "summary")
+}
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
@@ -1195,6 +1205,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     let mut ivm_notices = sources.as_ref().map(|sources| sources.subscribe());
     let mut changed = state.event_notify.subscribe();
     let mut roster = state.store.subscribe_agent_roster();
+    let mut views = state.store.subscribe_collection_views();
     let windows = collection_windows::Windows::attach(&state.store);
     let mut window_revisions = [0; 8];
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
@@ -1202,7 +1213,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     let mut conversations = ConversationFollowers::default();
     let (conversation_outbox, mut conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, u64, Value)>();
-    // The commits already weighed for a reread, whether one is due, and when the last ran.
+    // The commits already weighed, the windows due for a reread, and when the last reread ran.
     let mut attention_clock = tokio::time::interval_at(
         tokio::time::Instant::now() + ATTENTION_CLOCK_INTERVAL,
         ATTENTION_CLOCK_INTERVAL,
@@ -1214,7 +1225,10 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     );
     ping_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut weighed = state.store.index().unwrap_or_default();
-    let mut reread_due = false;
+    let mut reread_due = BTreeSet::<String>::new();
+    // Whether a commit may have changed the agents roster since its refresher was last asked
+    // to publish. Asking is paced like a reread: before, a stale reread asked for it.
+    let mut roster_wanted = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
     let mut reads = futures_util::stream::FuturesUnordered::new();
     let read_slots = Arc::new(tokio::sync::Semaphore::new(COLLECTION_MAX_SUBSCRIPTIONS));
@@ -1250,6 +1264,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         if request.kind == "unsubscribe" {
                             if let Some(presence) = &presence { presence.unfollow(&request.id); }
                             subscriptions.remove(&request.id);
+                            reread_due.remove(&request.id);
                             terminals.remove(&request.id);
                             conversations.stop(&request.id);
                             break 'command;
@@ -1269,6 +1284,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         }
                         // A subscription with a held ID replaces it.
                         subscriptions.remove(&request.id);
+                        reread_due.remove(&request.id);
                         terminals.remove(&request.id);
                         conversations.stop(&request.id);
                         // Allocate a fresh token for every accepted subscribe, including terminal
@@ -1311,7 +1327,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         }
                         refresh.push(request.id.clone());
                         // Collection results and conversation frames share the same generation fence.
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, request });
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, view_revision: 0, request });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
@@ -1331,9 +1347,9 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                     Refreshed::Current => {}
                     Refreshed::Retry => {
                         if subscription.ivm.is_some() { subscription.dirty = true; }
-                        else { reread_due = true; }
+                        else { reread_due.insert(id.clone()); }
                     }
-                    Refreshed::Dropped => { subscriptions.remove(&id); }
+                    Refreshed::Dropped => { subscriptions.remove(&id); reread_due.remove(&id); }
                     Refreshed::Closed => return,
                 }
             }
@@ -1359,55 +1375,98 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
             }
             result = changed.changed(), if !command_waiting => {
                 if result.is_err() { return; }
-                // Weigh only the commits since the last look: a reread is due when one of them
-                // can change a held window.
+                // Weigh only the commits since the last look: a window is due for a reread when
+                // one of them can change it. A published view rereads when it publishes instead;
+                // a commit that can change the agents roster asks its refresher to publish.
                 let index = state.store.index().unwrap_or(weighed);
-                if subscriptions.values().all(|s| s.ivm.is_some()) {
+                let roster_refresher = state.store.agent_roster_refresher_running();
+                let followed = |s: &CollectionSubscription| s.ivm.is_none()
+                    && !state.store.collection_view_published(&s.request.collection);
+                if !subscriptions.values().any(followed) {
                     weighed = index;
                     continue;
                 }
+                let mut affected = BTreeSet::<String>::new();
                 if let Some(windows) = &windows {
+                    // Sockets on one store share the revisions: the first to look weighs a commit.
+                    let current = windows.current_changes(&state.store);
                     let (windows, store) = (windows.clone(), state.store.clone());
-                    match blocking_store(move || crate::profile::task("stream collection/invalidation", || windows.changes(&store))).await {
+                    let revisions = match current {
+                        Some(revisions) => Ok(revisions),
+                        None => blocking_store(move || crate::profile::task("stream collection/invalidation", || windows.changes(&store))).await,
+                    };
+                    match revisions {
                         Ok(revisions) => {
-                            reread_due |= subscriptions.values().filter(|s| s.ivm.is_none()).any(|subscription| collection_windows::Windows::changed(&subscription.request.collection, &window_revisions, &revisions));
+                            affected.extend(subscriptions.iter().filter(|(_, s)| followed(s)
+                                && collection_windows::Windows::changed(&s.request.collection, &window_revisions, &revisions))
+                                .map(|(id, _)| id.clone()));
                             window_revisions = revisions;
                         }
-                        Err(_) => { reread_due = true; }
+                        Err(_) => affected.extend(subscriptions.iter().filter(|(_, s)| followed(s)).map(|(id, _)| id.clone())),
                     }
                     weighed = index;
                 } else if index > weighed {
                     let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims);
                     let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses") && state.store.glasses_changed(weighed, index).unwrap_or(true);
                     let arrangements_changed = subscriptions.values().any(|s| s.request.collection == "arrangements") && state.store.arrangements_changed(weighed, index).unwrap_or(true);
-                    reread_due |= glasses_changed || arrangements_changed || match claims {
-                        Err(_) => true,
-                        Ok(claims) => claims.len() >= 10_000 || subscriptions.values().filter(|s| s.ivm.is_none()).any(|subscription| {
-                            claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
-                        }),
-                    };
+                    affected.extend(subscriptions.iter().filter(|(_, s)| followed(s) && (
+                        (glasses_changed && s.request.collection == "glasses")
+                        || (arrangements_changed && s.request.collection == "arrangements")
+                        || match &claims {
+                            Err(_) => true,
+                            Ok(claims) => claims.len() >= 10_000
+                                || claims.iter().any(|claim| !collection_ignores(&s.request.collection, &claim.kind)),
+                        }
+                    )).map(|(id, _)| id.clone()));
                     weighed = index;
                 }
-                if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
+                // Reading the roster before its refresher publishes would serve the one already
+                // held, and read it again once the newer one arrives.
+                let (roster_windows, others): (Vec<_>, Vec<_>) = affected.into_iter().partition(|id| roster_refresher
+                    && subscriptions.get(id).is_some_and(|s| s.request.collection == "agents"));
+                roster_wanted |= !roster_windows.is_empty();
+                reread_due.extend(others);
+                if reread_due.is_empty() && !roster_wanted || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                if std::mem::take(&mut roster_wanted) {
+                    state.store.request_agent_roster_refresh();
+                    last_reread = tokio::time::Instant::now();
+                }
+                refresh.extend(reread_due.iter().cloned());
             }
             result = roster.changed(), if !command_waiting => {
                 if result.is_err() { return; }
                 // A window read before this roster was published rereads it.
                 let published = *roster.borrow_and_update();
-                reread_due |= subscriptions.values().any(|s| s.ivm.is_none()
-                    && s.request.collection == "agents" && s.roster_revision < published);
-                if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
+                reread_due.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                    && s.request.collection == "agents" && s.roster_revision < published)
+                    .map(|(id, _)| id.clone()));
+                if reread_due.is_empty() || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                refresh.extend(reread_due.iter().cloned());
             }
-            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && (reread_due || subscriptions.values().any(|s| s.ivm.is_some() && s.dirty && s.reading.is_none())) => {
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none() && reread_due || s.ivm.is_some() && s.dirty && s.reading.is_none()).map(|(id, _)| id.clone()));
+            result = views.changed(), if !command_waiting => {
+                if result.is_err() { return; }
+                // The same for every other published view.
+                let published = *views.borrow_and_update();
+                reread_due.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                    && s.view_revision < crate::store::published_views::revision(&published, &s.request.collection))
+                    .map(|(id, _)| id.clone()));
+                if reread_due.is_empty() || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                refresh.extend(reread_due.iter().cloned());
+            }
+            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && (!reread_due.is_empty() || roster_wanted || subscriptions.values().any(|s| s.ivm.is_some() && s.dirty && s.reading.is_none())) => {
+                if std::mem::take(&mut roster_wanted) { state.store.request_agent_roster_refresh(); }
+                refresh.extend(reread_due.iter().cloned());
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_some() && s.dirty && s.reading.is_none()).map(|(id, _)| id.clone()));
                 last_reread = tokio::time::Instant::now();
             }
             _ = attention_clock.tick(), if !command_waiting && !subscriptions.is_empty() => {
-                // Pairing expiry and mission lease state can change without a claim. Stable
-                // rows remain reusable; authority and local overlays are rechecked on reads.
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
+                // Grace periods, leases and queue deadlines pass without a claim, and so does a
+                // paired grant's expiry. Stable rows remain reusable; authority and local
+                // overlays are rechecked on reads.
+                let paired = session.transport != "unix";
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                    && (paired || collection_follows_clock(&s.request.collection)))
+                    .map(|(id, _)| id.clone()));
             }
             _ = ping_clock.tick() => {
                 // Protocol liveness never schedules an authorized window read.
@@ -1445,12 +1504,14 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
         if refresh.is_empty() {
             continue;
         }
+        // Rereads are paced together: reading any due window, or every held window (as a lone
+        // new subscription does), starts the next interval.
         let legacy_windows = subscriptions.values().filter(|s| s.ivm.is_none()).count();
         let refreshed_legacy = refresh.iter().filter(|id| subscriptions.get(*id).is_some_and(|s| s.ivm.is_none())).count();
-        if legacy_windows > 0 && refreshed_legacy == legacy_windows {
-            reread_due = false;
+        if refresh.iter().any(|id| reread_due.contains(id)) || legacy_windows > 0 && refreshed_legacy == legacy_windows {
             last_reread = tokio::time::Instant::now();
         }
+        reread_due.retain(|id| !refresh.contains(id));
         // Keep admission, conversation and terminal delivery live while each window reads.
         // Replaced/unsubscribed windows are fenced by their subscription generation.
         for id in refresh {
@@ -1463,6 +1524,8 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
             }
             subscription.dirty = false;
             subscription.roster_revision = *roster.borrow();
+            subscription.view_revision =
+                crate::store::published_views::revision(&views.borrow(), &subscription.request.collection);
             let (cancel, canceled) = tokio::sync::oneshot::channel::<()>();
             subscription.reading = Some(cancel);
             let request = subscription.request.clone();
@@ -12367,8 +12430,8 @@ mission "queue-parity" state="ready" {
                                         entered.send(()).unwrap();
                                         held.notified().await;
                                     } else if request.id == "probe" && probe.fetch_add(1, Ordering::SeqCst) > 0 {
-                                        // A second work read can only come from the all-window
-                                        // commit refresh; the same pass marks held dirty.
+                                        // This mission publication changes both work and missions;
+                                        // the same commit refresh marks held dirty.
                                         refreshed.send(()).unwrap();
                                     }
                                     result
