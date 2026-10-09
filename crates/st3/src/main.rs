@@ -4618,7 +4618,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    run_cli(cli)
+    run_cli(
+        cli,
+        matches.subcommand_name().expect("a subcommand was parsed"),
+    )
 }
 
 /// Export the runtime fence before any provider or runtime worker thread starts. Fresh
@@ -4770,11 +4773,35 @@ fn record_daemon_commands(args: &UpArgs) {
 }
 
 #[tokio::main]
-async fn run_cli(cli: Cli) -> ExitCode {
+async fn run_cli(cli: Cli, command_name: &str) -> ExitCode {
     if matches!(&cli.command, Command::Driver(_)) {
         st3::telemetry::local_only();
     }
-    match run(cli).await {
+    let _telemetry = (!matches!(
+        &cli.command,
+        Command::Driver(_) | Command::Up(_) | Command::ReplicationWorker(_)
+    ))
+    .then(|| st3::otel::Telemetry::init(st3::otel::Unit::Cli, None));
+    let command_span = if st3::otel::export_enabled() {
+        tracing::info_span!("st3.cli.command", span.label = command_name)
+    } else {
+        tracing::Span::none()
+    };
+    let result = {
+        use tracing::Instrument as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let result = run(cli).instrument(command_span.clone()).await;
+        if result.as_ref().is_err_and(|error| {
+            !error
+                .downcast_ref::<CommandExit>()
+                .is_some_and(|exit| exit.0 == 0)
+        }) {
+            command_span.set_status(opentelemetry::trace::Status::error("command failed"));
+        }
+        result
+    };
+    drop(command_span);
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             if let Some(exit) = error.downcast_ref::<CommandExit>() {
@@ -4941,7 +4968,7 @@ async fn run(cli: Cli) -> Result<()> {
         let code = st3::sekrets::cli::run(args, cli.json).await?;
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
-        std::process::exit(code);
+        return Err(CommandExit(code as u8).into());
     }
     if let Command::Admission { command } = cli.command {
         return run_admission(command, cli.json);
@@ -4974,7 +5001,11 @@ async fn run(cli: Cli) -> Result<()> {
         }
         config.apply_fleet_file()?;
         st3::node_identity::resolve(&mut config)?;
-        return st3::peer::run_worker(config).await;
+        let mut telemetry =
+            st3::otel::Telemetry::init(st3::otel::Unit::ReplicationWorker, Some(&config.node));
+        let result = st3::peer::run_worker(config).await;
+        telemetry.shutdown();
+        return result;
     }
     let config = Config::load_unvalidated(None)?;
     let endpoint = cli
@@ -5664,6 +5695,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     }
     config.apply_fleet_file()?;
     let _state_identity = st3::node_identity::acquire(&mut config)?;
+    let mut telemetry = st3::otel::Telemetry::init(st3::otel::Unit::Daemon, Some(&config.node));
     config.validate()?;
     st3::resource::configure_github(&config)?;
     validate_unix_socket_path(&config.socket, "--socket")?;
@@ -5913,6 +5945,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         ),
         st3::api::serve_unix_with_ready(&client_gateway_socket, fabric_router(state), ready),
     )?;
+    telemetry.shutdown();
     Ok(())
 }
 
