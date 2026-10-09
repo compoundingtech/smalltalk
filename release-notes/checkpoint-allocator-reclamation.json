@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Return unused glibc heap pages once after checkpoint application and proof completion",
+  "replay": {"status": "none", "detail": "No claim replay or projection changes."},
+  "schema": {"status": "none", "detail": "No database or durable format changes."},
+  "rules": {"status": "none", "detail": "Checkpoint drop rules, proof answers, certificates, and durable acknowledgements are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Linux glibc builds make one best-effort malloc_trim(0) call after an actual checkpoint application or proof finishes, including unsuccessful completion. Nested entrypoints defer it until outer temporary inputs and SQLite guards have dropped. Other platforms are a no-op."},
+  "downtime": {"status": "none", "detail": "No migration or additional downtime is required."},
+  "manual": {"status": "none", "detail": "No setting is needed. Reclamation is not periodic and is absent from ordinary reads and idle WAL maintenance. It releases only unused allocator pages, not live caches or application data, and does not enforce a memory limit."},
+  "recovery": {"status": "none", "detail": "Reclamation is best-effort and does not change operation results. Binary swap-back needs no migration and restores the previous allocator-retention behavior."}
+}

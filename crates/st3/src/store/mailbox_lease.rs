@@ -1294,10 +1294,9 @@ impl Store {
             smallclaims::read_budget::check()?;
             Ok(faults)
             };
-            // Keep the authoritative existing snapshot; otherwise request_read acquires
-            // through try_get, which fails closed instead of waiting for a returned reader.
-            let pinned = smallclaims::sqlite::PINNED_READER.with(|slot|
-                slot.borrow().as_ref().is_some_and(|(key, _)| *key == self.readers.key()));
+            // Keep the authoritative existing snapshot; otherwise acquire cancellable
+            // admission before the fallible reader checkout.
+            let pinned = self.readers.has_pinned_reader();
             let result = if pinned { read() } else {
                 self.readers.request_read(read).and_then(|result| result)
             };

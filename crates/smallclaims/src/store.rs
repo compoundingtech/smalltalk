@@ -32,8 +32,8 @@ use crate::hash::{
 };
 use crate::replication::*;
 use crate::sqlite::{
-    CommitObserver, PINNED_READER, PinnedRead, ReadPool, SQLITE_COMMIT_NANOS, SQLITE_COMMITS,
-    SQLITE_NANOS, STATEMENT_CACHE_CAPACITY, WriterConnection,
+    CommitObserver, PinnedRead, ReadPool, SQLITE_COMMIT_NANOS, SQLITE_COMMITS, SQLITE_NANOS,
+    STATEMENT_CACHE_CAPACITY, WriterConnection,
 };
 
 #[cfg(test)]
@@ -52,6 +52,7 @@ pub use binary_payloads::PayloadConversion;
 pub mod canonical;
 pub mod checkpoint;
 pub mod checkpoint_agreement;
+mod checkpoint_completion;
 pub mod checkpoint_trim;
 pub mod document_index;
 pub mod heal;
@@ -1565,24 +1566,22 @@ pub fn insert_claim(
 /// writer floor this store took when it joined under a name the fleet had used before.
 pub fn next_replica_sequence(transaction: &Transaction<'_>, origin: &str) -> Result<u64> {
     transaction
-        .query_row(
+        .prepare_cached(
             "SELECT MAX(
                  COALESCE((SELECT MAX(replica_sequence) FROM batches WHERE origin=?1), 0),
                  COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='writer_floor/' || ?1), 0)
              ) + 1",
-            [origin],
-            |row| row.get(0),
-        )
+        )?
+        .query_row([origin], |row| row.get(0))
         .map_err(Into::into)
 }
 
 pub fn previous_batch_hash(transaction: &Transaction<'_>, origin: &str) -> Result<Option<String>> {
     transaction
-        .query_row(
+        .prepare_cached(
             "SELECT hash FROM batches WHERE origin=?1 ORDER BY replica_sequence DESC LIMIT 1",
-            [origin],
-            |row| row.get(0),
-        )
+        )?
+        .query_row([origin], |row| row.get(0))
         .optional()
         .map_err(Into::into)
 }
@@ -4829,7 +4828,8 @@ impl Store {
 
     /// Run `read` with every read this thread makes through the store seeing one SQLite
     /// snapshot, and give it that snapshot's store index. Rows read inside always match the
-    /// index, however many commits land meanwhile. A nested call joins the outer snapshot.
+    /// index, however many commits land meanwhile. A nested call joins the outer snapshot,
+    /// even below another store's snapshot.
     /// The latest claim of a subject, or of one kind of it, in canonical order.
     pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
         crate::touched::note_read(|| subject.to_owned());
@@ -4888,8 +4888,11 @@ impl Store {
     #[track_caller]
     pub fn read_snapshot<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {
         let key = self.readers.key();
-        if PINNED_READER.with(|slot| slot.borrow().as_ref().is_some_and(|(pool, _)| *pool == key)) {
-            let index = current_index(&self.readers.get())?;
+        // Reentry joins this thread's existing snapshot of this store, even when another
+        // store's pin is newer: that connection is already inside its read transaction, so
+        // BEGINning it again is both wrong and refused by SQLite.
+        if let Some(connection) = crate::sqlite::pinned_reader_for(key) {
+            let index = current_index(&connection)?;
             return read(index);
         }
         // The snapshot's own entry: the guard below is lent out and dropped at once.
@@ -4897,9 +4900,9 @@ impl Store {
         let mut guard = self.readers.get();
         // Declared first so it drops last: on every exit it ends the transaction, releases the
         // pin, and returns the connection to the pool.
-        let pinned = PinnedRead {
+        let mut pinned = PinnedRead {
             pool: &self.readers,
-            previous: PINNED_READER.with(|slot| slot.borrow_mut().take()),
+            registered: false,
             connection: Some(match guard.connection.take() {
                 Some(connection) => Rc::new(connection),
                 None => guard.pinned.take().expect("a request loan holds its connection"),
@@ -4914,7 +4917,8 @@ impl Store {
         // The first read starts the snapshot; every later read in `read` sees the same one.
         let index = current_index(&connection)?;
         live.snapshot_started(&connection);
-        PINNED_READER.with(|slot| *slot.borrow_mut() = Some((key, connection)));
+        crate::sqlite::push_pinned_reader(key, connection);
+        pinned.registered = true;
         read(index)
     }
 

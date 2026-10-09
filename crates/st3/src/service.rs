@@ -1047,6 +1047,7 @@ mod tests {
             github: crate::config::GithubConfig::default(),
             checkpoint: crate::config::CheckpointConfig::default(),
             limits: crate::config::LimitsConfig::default(),
+            reconcile: crate::config::ReconcileConfig::default(),
             fleet: None,
         };
         let spec = ServiceSpec::new("/usr/bin/st3", config, 1024)?;
