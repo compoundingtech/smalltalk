@@ -145,6 +145,54 @@ The exported legacy Folio, Relay and Orbit palettes also avoid green: `good` is 
 
 The shared diff tint assertion identifies a token through its causal effect on both the row wash and gutter, letting the browser resolve CSS layers, specificity and conditional rules. It restores exact inline styles and verifies computed paint restoration after each probe. Every dark/light tint story also rejects the original neutral pre-tint paint and an equal-blue wash backed by an unrelated variable, then verifies the restored positive result.
 
+### Interactive terminal presentation
+
+`TerminalSurface`, `TerminalDrawer`, `resolveTerminalColor`, `createTerminalPalette`
+and their prop types are exported from the package root and `assistant-ui/shell`.
+The surface renders the generated `TerminalScreen` DOM lines/runs; it has no
+JavaScript terminal emulator, client actions, network transport, or PTY ownership.
+The host owns subscriptions, grants, incarnation fences, resize actions and process
+lifecycle. The drawer accepts one `screen` and `connection` per agent, with no tabs.
+`open`, `height` and `onHeight` are controlled; Close calls `onDetach` then `onToggle`,
+not `onKill`. Ending the process requires the destructive confirmation dialog.
+
+`onInput(data)` receives plain strings containing valid UTF-8 escape sequences,
+never base64. The kit alone encodes application cursor/keypad modes, normalizes
+CRLF/LF paste newlines to CR and adds bracketed-paste delimiters when requested.
+`onPaste` is an observation callback, not a second input owner. The app sends the
+received string as terminal input mode `raw` after obtaining a fresh fence. Focus
+events are forwarded only when the screen requests them. Shift+Tab leaves the
+surface; Tab otherwise sends a terminal tab. Input is refused for `readOnly`, null
+screens and any non-live connection. `readOnlyReason` is announced and describes
+why control is not available. Ended/unavailable states carry a human `reason` and
+host-provided `onRecover` action (`recoveryLabel` can override its label).
+
+Font metrics use `floor(width / (sizePx * advanceEm))` columns and
+`floor(height / lineHeightPx)` rows, with a minimum of one and duplicate size
+suppression. The default is mono 13/20, advance 0.6; hosts with different fonts must
+supply their measured advance. The optional `handleRef` exposes focus, measurement,
+copySelection and clearSelection. Selection preserves wide-character text and joins
+wrapped lines. `onCopy` observes the same text as native clipboard copy.
+
+Scrollback is **local**, bounded to 1000 lines by default (0 means current screen
+only), and never claimed to be PTY history. Only matched upward screen shifts are
+retained; switching terminal/incarnation or entering alternate-screen clears it.
+The visible note reports dropped local lines and projected truncation.
+
+**Deliberate palette deviation:** ANSI green/bright-green use the addition-blue
+family (`diffAddTint`: dark #7295ed, light #4269df) with distinct luminance steps.
+The resolver applies the same remap to every non-neutral indexed/truecolor hue in
+90–160 degrees. Cyan is shifted out of teal, and normal/bright blue remain
+luminance-separated. This intentionally differs from faithful ANSI greens.
+Reduced-motion users get a solid cursor rather than requested blinking.
+
+`Terminal.stories.tsx` covers input, paste, focus, metrics, wide/wrapped selection,
+local history, palette and rendered paint, denied input, recovery, SSR, imports,
+cursor and drawer lifecycle in both themes. Each scenario exposes `defect`, a
+negative-control fixture/behavior that must make that scenario's play fail.
+Null-screen SSR renders a static connection placeholder; screen SSR renders DOM
+runs without accessing browser globals.
+
 ## Clean-room note
 
 The original kit's behavior references are listed below. The gated workbench/composer additions reuse our independently authored internal review route at `98a270d4e58a44e4c4625cf1956ad09dbabfc1a7`, with the reviewed tint cutover from `35b6922a1559b4b3bcd78b672cb6b707c5d1e108`; their host/runtime boundaries are adapted to this kit as described above. This provenance is not a claim that the later additions were authored without consulting our own source.
@@ -160,6 +208,6 @@ Per direction, the metaphor and the behavior it emphasizes are:
 - **Relay**, a dispatch desk: mineral surfaces, teal signals, squared 2 px geometry, compact rows, 90 ms linear motion. It emphasizes keyboard-reachable actions, discoverable commands and visible execution outcomes.
 - **Orbit**, a navigation instrument: indigo layers, amber bearings, 14/20 px curves, roomier spacing, 240 ms settling motion. It emphasizes keeping context while moving between threads, review and execution, and text-labeled attention.
 
-All displayed content is newly written synthetic data. The terminal is a read-only fixture, not an emulator. Nothing contacts a filesystem, network service, model or provider.
+All displayed content is newly written synthetic data. Workbench terminal fixtures remain read-only; the separately exported interactive terminal is a DOM screen renderer, not an emulator. Nothing in the kit contacts a filesystem, network service, model or provider.
 
 This note records provenance practice. It is not legal clearance or an independent originality certification.

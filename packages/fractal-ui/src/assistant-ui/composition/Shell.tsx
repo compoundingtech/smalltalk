@@ -174,16 +174,6 @@ export function ThreadHeader({
 }
 
 
-export function TerminalDrawer({ lines, open, height, onHeight }: { lines: readonly string[]; open: boolean; height: number; onHeight: (value: number) => void }) {
-  if (!open) return null
-  return <section aria-label="Terminal drawer" data-testid="terminal-drawer" style={{ height }} {...stylex.props(styles.drawer)}>
-    <div {...stylex.props(styles.drawerHead)}><span {...stylex.props(styles.drawerLabel)}>terminal</span><span {...stylex.props(styles.drawerHint)}>Drag the header edge, or focus it and use ↑/↓</span></div>
-    <div {...stylex.props(styles.drawerBody)}>
-      {lines.map((line, index) => <div key={index} {...stylex.props(styles.drawerLine)}>{line}</div>)}
-    </div>
-    <label {...stylex.props(styles.drawerRangeLabel)}>height<input type="range" aria-label="Drawer height" min={120} max={480} value={height} onChange={event => onHeight(Number(event.target.value))} {...stylex.props(styles.drawerRange)} /></label>
-  </section>
-}
 
 const styles = stylex.create({
   splitVertical: { width: 1, alignSelf: 'stretch', backgroundColor: c.borderStrong, cursor: 'col-resize', position: 'relative', flexShrink: 0, touchAction: 'none', '::after': { content: '""', position: 'absolute', insetInline: -3, insetBlock: 0 }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: -1 } },
@@ -198,12 +188,4 @@ const styles = stylex.create({
   outlineXs: { height: g.controlSm, display: 'inline-flex', alignItems: 'center', paddingInline: 6, borderWidth: 1, borderStyle: 'solid', borderColor: c.borderStrong, backgroundColor: 'rgba(255, 255, 255, 0.025)', color: c.fg, borderRadius: r.control, fontSize: t.metaSize, lineHeight: t.metaLeading, fontWeight: t.weightMedium, cursor: 'pointer', ':hover': { backgroundColor: c.rowHover }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: 1 } },
   ghostMd: { width: 28, height: 28, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderWidth: 0, backgroundColor: 'transparent', color: c.fgMuted, borderRadius: r.control, cursor: 'pointer', fontSize: t.uiSize, transition: 'background-color 150ms ease, color 150ms ease', ':hover': { backgroundColor: c.rowHover, color: c.fg }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: 1 } },
   ghostOn: { color: c.fg, backgroundColor: c.rowHover },
-  drawer: { display: 'flex', flexDirection: 'column', borderTopWidth: 1, borderTopStyle: 'solid', borderTopColor: c.borderStrong, backgroundColor: c.canvas, flexShrink: 0, minHeight: 0 },
-  drawerHead: { height: 32, display: 'flex', alignItems: 'center', gap: 12, paddingInline: 12 },
-  drawerLabel: { fontSize: t.metaSize, lineHeight: t.metaLeading, color: c.fgMuted, fontWeight: t.weightMedium },
-  drawerHint: { fontSize: t.metaSize, lineHeight: t.metaLeading, color: c.fgFaint, marginInlineStart: 'auto' },
-  drawerBody: { paddingInline: 12, paddingBottom: 4, overflowY: 'auto', fontFamily: t.fontMono, fontSize: t.codeSize, lineHeight: '20px', whiteSpace: 'pre-wrap' },
-  drawerLine: { color: c.fgMuted },
-  drawerRangeLabel: { display: 'flex', alignItems: 'center', gap: 8, marginInline: 12, marginBottom: 8, fontSize: t.metaSize, lineHeight: t.metaLeading, color: c.fgFaint },
-  drawerRange: { accentColor: c.primary, flexGrow: 1 },
 })

@@ -1,3 +1,7 @@
+export { TerminalSurface } from './assistant-ui/terminal/TerminalSurface'
+export { TerminalDrawer } from './assistant-ui/terminal/TerminalDrawer'
+export { resolveTerminalColor, createTerminalPalette } from './assistant-ui/terminal/terminal-palette'
+export type { TerminalSurfaceProps, TerminalSurfaceHandle, TerminalDrawerProps, TerminalPalette, TerminalFont, TerminalConnection, TerminalColorInput, TerminalScreen } from './assistant-ui/terminal/terminal-types'
 import * as React from 'react'
 import * as Aria from 'react-aria-components'
 
