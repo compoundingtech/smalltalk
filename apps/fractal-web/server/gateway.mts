@@ -1,10 +1,15 @@
 import { request } from 'node:http'
 import type { IncomingHttpHeaders, IncomingMessage, OutgoingHttpHeaders, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
+import { pipeline } from 'node:stream'
+import { constants, createBrotliCompress, createGzip } from 'node:zlib'
 import { Context, Effect, Layer } from 'effect'
 import type { Tracer } from 'effect'
 import { BoundaryError, reject } from './boundary.mts'
 import { spanOptions, traceparent } from './tracing.mts'
+import { encodingQualities } from './static.mts'
+
+const responseCodings = ['br', 'gzip', 'identity'] as const
 
 const hopHeaders = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'])
 export const cleanHeaders = (headers: IncomingHttpHeaders, upgrade = false): OutgoingHttpHeaders => {
@@ -40,7 +45,7 @@ const makeGateway = ({ socketPath, host, authorization, timeoutMs }: { socketPat
       let settled = false
       const cleanup = () => {
         req.off('aborted', aborted); req.unpipe(upstream)
-        reply?.off('error', error); reply?.off('aborted', aborted); reply?.off('end', end); reply?.off('close', closed)
+        reply?.off('error', error); reply?.off('aborted', aborted); reply?.off('close', closed)
       }
       const fail = (cause?: unknown) => {
         if (settled) return
@@ -59,9 +64,37 @@ const makeGateway = ({ socketPath, host, authorization, timeoutMs }: { socketPat
         ...cleanHeaders(req.headers), host, authorization, traceparent: traceparent(span),
       }, agent: false }, (incoming) => {
         reply = incoming
-        res.writeHead(incoming.statusCode ?? 502, cleanHeaders(incoming.headers))
-        incoming.once('error', error); incoming.once('aborted', aborted); incoming.once('end', end); incoming.once('close', closed)
-        incoming.pipe(res)
+        const headers = cleanHeaders(incoming.headers)
+        const json = req.method === 'GET' && incoming.statusCode === 200
+          && /^application\/json(?:;|$)/i.test(String(headers['content-type'] ?? ''))
+          && headers['content-encoding'] === undefined && req.headers.range === undefined
+          && !/\bno-transform\b/i.test(String(headers['cache-control'] ?? ''))
+        let coding: typeof responseCodings[number] = 'identity'
+        if (json) {
+          const qualities = encodingQualities(req.headers['accept-encoding'])
+          coding = responseCodings.reduce((best, candidate) => qualities[candidate] > qualities[best] ? candidate : best)
+          headers.vary = headers.vary === undefined ? 'Accept-Encoding' : `${headers.vary}, Accept-Encoding`
+          if (qualities[coding] === 0) {
+            incoming.destroy()
+            res.setHeader('vary', headers.vary)
+            reject(res, 406, 'Not acceptable\n')
+            settled = true; cleanup(); resume(Effect.succeed(406))
+            return
+          }
+          if (coding !== 'identity') {
+            delete headers['content-length']
+            headers['content-encoding'] = coding
+            if (typeof headers.etag === 'string' && !headers.etag.startsWith('W/')) headers.etag = `W/${headers.etag}`
+          }
+        }
+        res.writeHead(incoming.statusCode ?? 502, headers)
+        incoming.once('error', error); incoming.once('aborted', aborted); incoming.once('close', closed)
+        const complete = (cause: NodeJS.ErrnoException | null) => cause === null ? end() : fail(cause)
+        if (coding === 'br') pipeline(incoming, createBrotliCompress({
+          params: { [constants.BROTLI_PARAM_QUALITY]: 4 }, flush: constants.BROTLI_OPERATION_FLUSH,
+        }), res, complete)
+        else if (coding === 'gzip') pipeline(incoming, createGzip({ flush: constants.Z_SYNC_FLUSH }), res, complete)
+        else pipeline(incoming, res, complete)
       })
       upstream.on('error', error)
       upstream.once('close', () => { upstream.off('error', error); if (!settled && !reply?.complete) fail() })
