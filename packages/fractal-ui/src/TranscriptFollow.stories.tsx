@@ -16,6 +16,7 @@ function FollowStory({ scheme = 'dark', virtual = false }: { scheme?: Scheme; vi
   const [chunks, setChunks] = React.useState(0)
   const [streaming, setStreaming] = React.useState(false)
   const [expanded, setExpanded] = React.useState(false)
+  const [toolExpanded, setToolExpanded] = React.useState(false)
   const [older, setOlder] = React.useState(false)
   const [thread, setThread] = React.useState('one')
   const [send, setSend] = React.useState(0)
@@ -26,7 +27,7 @@ function FollowStory({ scheme = 'dark', virtual = false }: { scheme?: Scheme; vi
     ...Array.from({ length: 40 }, (_, index) => ({ id: `entry-${index}`, text: `Message ${index + 1}: the transcript follows the live conversation unless the reader chooses to read earlier messages.` })),
     { id: 'latest', text: `Latest reply in conversation ${thread}.\n${'Observed streaming chunk adds a new line to the conversation.\n'.repeat(chunks)}` },
   ], [chunks, older, thread])
-  const renderRow = (row: typeof rows[number]) => <article data-item-id={row.id} {...stylex.props(styles.row)}>{row.text}{row.id === 'latest' && <><img src={image} alt="Conversation attachment" {...stylex.props(styles.image, expanded && styles.expandedImage)} /><Button {...stylex.props(styles.button)} onPress={() => setInspections(value => value + 1)}>Inspect latest</Button><span> Inspected {inspections} times</span></>}</article>
+  const renderRow = (row: typeof rows[number]) => <article data-item-id={row.id} {...stylex.props(styles.row)}>{row.text}{row.id === 'latest' && <><img src={image} alt="Conversation attachment" {...stylex.props(styles.image, expanded && styles.expandedImage)} /><Button {...stylex.props(styles.button)} onPress={() => setInspections(value => value + 1)}>Inspect latest</Button><span> Inspected {inspections} times</span>{toolExpanded && <pre>{'Observed tool output: completed one measured operation.\n'.repeat(24)}</pre>}</>}</article>
   return <ViewportStoreContext.Provider value={store}><main {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}>
     <div {...stylex.props(styles.toolbar)}>
       <Button isDisabled={streaming} {...stylex.props(styles.button)} onPress={async () => {
@@ -35,6 +36,7 @@ function FollowStory({ scheme = 'dark', virtual = false }: { scheme?: Scheme; vi
         setStreaming(false)
       }}>Stream 50 chunks</Button>
       <Button {...stylex.props(styles.button)} onPress={() => setExpanded(true)}>Expand image</Button>
+      <Button {...stylex.props(styles.button)} onPress={() => setToolExpanded(true)}>Expand tool</Button>
       <Button {...stylex.props(styles.button)} onPress={() => setOlder(true)}>Insert earlier history</Button>
       <Button {...stylex.props(styles.button)} onPress={() => setSend(value => value + 1)}>Send own message</Button>
       <Button {...stylex.props(styles.button)} onPress={() => setThread(value => value === 'one' ? 'two' : 'one')}>Switch thread</Button>
@@ -183,6 +185,16 @@ export const NoPillAtBottomStreamingLight: Story = { ...NoPillAtBottomStreaming,
 export const ThreadSwitchBackAtBottomLight: Story = { ...ThreadSwitchBackAtBottom, args: { scheme: 'light' } }
 export const KeyboardReattachesLight: Story = { ...KeyboardReattaches, args: { scheme: 'light' } }
 export const ProgrammaticScrollDoesNotDetachLight: Story = { ...ProgrammaticScrollDoesNotDetach, args: { scheme: 'light' } }
+export const PinnedToolExpansion: Story = { play: async ({ canvasElement }) => {
+  const { canvas, viewport } = await ready(canvasElement)
+  await userEvent.click(canvas.getByRole('button', { name: 'Inspect latest' }))
+  const before = viewport.scrollHeight
+  await userEvent.click(canvas.getByRole('button', { name: 'Expand tool' }))
+  await waitFor(() => expect(viewport.scrollHeight - before).toBeGreaterThan(200))
+  await frame()
+  await expectAttached(canvasElement, viewport)
+} }
+export const PinnedToolExpansionLight: Story = { ...PinnedToolExpansion, args: { scheme: 'light' } }
 export const VirtualPinnedStreaming: Story = { ...PinnedStreaming, args: { virtual: true } }
 export const VirtualScrollUpDetaches: Story = { ...ScrollUpDetaches, args: { virtual: true } }
 const styles = stylex.create({

@@ -237,6 +237,6 @@ export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({
 const styles = stylex.create({
   frame: { display: 'flex', flexDirection: 'column', flex: '1 1 0', minHeight: 0, minWidth: 0 },
   // A visible jump control gets its own dock, never covering a reader's current line.
-  jump: { flexShrink: 0, marginInline: 'auto', marginBlock: spaceVars.md, paddingBlock: spaceVars.xs, paddingInline: spaceVars.md, borderRadius: radiusVars.full, borderWidth: spaceVars.hairline, borderStyle: 'solid', borderColor: borderVars.borderStrong, backgroundColor: surfaceVars.raised, color: textVars.fg, fontSize: typeVars.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: spaceVars.xxs, outlineStyle: 'solid', outlineColor: borderVars.borderStrong, outlineOffset: spaceVars.xxs } },
+  jump: { flexShrink: 0, marginInline: 'auto', marginBlock: spaceVars.md, paddingBlock: spaceVars.xs, paddingInline: spaceVars.md, borderRadius: radiusVars.full, borderWidth: spaceVars.hairline, borderStyle: 'solid', borderColor: borderVars.borderStrong, backgroundColor: surfaceVars.raised, color: textVars.fg, fontSize: typeVars.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: spaceVars.xs2, outlineStyle: 'solid', outlineColor: borderVars.borderStrong, outlineOffset: spaceVars.xs2 } },
   announcement: { position: 'absolute', width: 1, height: 1, overflow: 'hidden', clipPath: 'inset(50%)', whiteSpace: 'nowrap' },
 })

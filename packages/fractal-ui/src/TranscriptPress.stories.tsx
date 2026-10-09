@@ -213,6 +213,33 @@ export const InsertAbovePressedRow: Story = { play: async ({ canvasElement }) =>
 } }
 export const InsertAbovePressedRowLight: Story = { ...InsertAbovePressedRow, args: { scheme: 'light' } }
 
+/** A detached press hands its compensated coordinates back to the history anchor on release. */
+export const DetachedInsertAbovePressedRow: Story = { play: async ({ canvasElement }) => {
+  const { viewport, canvas, jump, retries } = await ready(canvasElement)
+  for (let reply = 0; reply < 5; reply++) {
+    await userEvent.click(canvas.getByRole('button', { name: 'Append agent reply' }))
+    await settleFrames()
+  }
+  const retry = canvas.getByRole('button', { name: 'Retry' })
+  const row = retry.closest<HTMLElement>('[data-testid="user-message"]')!
+  viewport.dispatchEvent(new WheelEvent('wheel', { deltaY: -viewport.scrollHeight }))
+  viewport.scrollTop += row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - viewport.clientHeight / 2
+  await settleFrames()
+  await expect(jump).toBeVisible()
+  const top = row.getBoundingClientRect().top
+  await pressAcross(retry, async () => {
+    await settleFrames()
+    canvas.getByRole('button', { name: 'Insert reply above failed send' }).click()
+    await settleFrames()
+    await expect(Math.abs(row.getBoundingClientRect().top - top)).toBeLessThanOrEqual(1)
+  })
+  await waitFor(() => expect(retries).toHaveTextContent('1'))
+  await settleFrames()
+  await expect(jump).toBeVisible()
+  await expect(Math.abs(row.getBoundingClientRect().top - top), 'detached history anchor undid press compensation').toBeLessThanOrEqual(1)
+} }
+export const DetachedInsertAbovePressedRowLight: Story = { ...DetachedInsertAbovePressedRow, args: { scheme: 'light' } }
+
 /** Wheel scrolling during a press gives the reader ownership; compensation stays off. */
 export const ScrollDuringPress: Story = { play: async ({ canvasElement }) => {
   const { viewport, canvas } = await ready(canvasElement)
