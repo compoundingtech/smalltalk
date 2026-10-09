@@ -182,6 +182,7 @@ impl Store {
 
     /// Follows the revision of attention publications, so a stream that read an earlier one
     /// rereads the newer.
+    #[cfg(test)]
     pub(crate) fn subscribe_attention_list(&self) -> tokio::sync::watch::Receiver<u64> {
         self.smalltalk.attention_list.revision.subscribe()
     }
