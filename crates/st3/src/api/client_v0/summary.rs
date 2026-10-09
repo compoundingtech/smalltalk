@@ -217,7 +217,11 @@ pub(in crate::api) fn refresh_published(state: &AppState, idle_ms: u64) -> anyho
             rows,
         })
     })?;
-    Ok(state.store.publish_summary(generation, publication))
+    let changed = state.store.publish_summary(generation, publication);
+    if changed {
+        state.store.publish_collection_view("summary");
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
