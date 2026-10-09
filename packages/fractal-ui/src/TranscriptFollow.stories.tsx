@@ -7,6 +7,7 @@ import { EmbraceScrollViewport, ViewportStore, ViewportStoreContext } from './as
 import { EmbraceVirtualConversation } from './assistant-ui/EmbraceVirtualConversation'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
+import { darkTheme as virtualDarkTheme } from './assistant-ui/embrace-theme'
 import { surfaceVars as surface, textVars as ink, borderVars as border, accentVars as accent, spaceVars as s, typeVars as t, geometryVars as g, radiusVars as r } from './assistant-ui/composition-tokens.stylex'
 
 const frame = () => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
@@ -37,7 +38,7 @@ function FollowStory({ scheme = 'dark', virtual = false }: { scheme?: Scheme; vi
     <p data-follow-anchor {...stylex.props(styles.paragraph)}>{row.text}</p>
     {row.id === 'latest' && <><img src={image} alt="Conversation attachment" {...stylex.props(styles.image, expanded && styles.expandedImage)} /><Button {...stylex.props(styles.button)} onPress={() => setInspections(value => value + 1)}>Inspect latest</Button><span> Inspected {inspections} times</span>{toolExpanded && <pre>{'Observed tool output: completed one measured operation.\n'.repeat(24)}</pre>}</>}
   </article>
-  return <ViewportStoreContext.Provider value={store}><main ref={root} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}>
+  return <ViewportStoreContext.Provider value={store}><main ref={root} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme, virtual && scheme === 'dark' && virtualDarkTheme)}>
     <div {...stylex.props(styles.toolbar)}>
       <Button isDisabled={streaming} {...stylex.props(styles.button)} onPress={async () => {
         setStreaming(true)
@@ -76,6 +77,7 @@ async function ready(canvasElement: HTMLElement) {
   const viewport = canvas.getByTestId('transcript-scroll')
   await frame()
   await waitFor(() => expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeLessThanOrEqual(2))
+  await waitFor(() => expect(getComputedStyle(canvas.getByRole('button', { name: 'Inspect latest' })).pointerEvents).not.toBe('none'))
   return { canvas, viewport }
 }
 async function scrollByReader(viewport: HTMLElement, top: number, key?: string) {
@@ -232,10 +234,11 @@ export const ThreadSwitch: Story = { play: async ({ canvasElement }) => {
   await userEvent.click(canvas.getByRole('button', { name: 'Switch thread' }))
   await frame()
   const returned = Array.from(canvas.getByTestId('transcript-scroll').querySelectorAll<HTMLElement>('[data-follow-anchor]')).find(node => node.textContent === text)!
-  await expect(Math.abs(returned.getBoundingClientRect().top - viewport.getBoundingClientRect().top - offset)).toBeLessThanOrEqual(2)
+  const restoredViewport = canvas.getByTestId('transcript-scroll')
+  await expect(Math.abs(returned.getBoundingClientRect().top - restoredViewport.getBoundingClientRect().top - offset)).toBeLessThanOrEqual(2)
   const jump = await waitFor(() => canvas.getByRole('button', { name: jumpName }))
   await userEvent.click(jump)
-  await expectAttached(canvasElement, viewport)
+  await expectAttached(canvasElement, restoredViewport)
   await userEvent.click(canvas.getByRole('button', { name: 'Switch thread' }))
   await frame()
   await userEvent.click(canvas.getByRole('button', { name: 'Switch thread' }))

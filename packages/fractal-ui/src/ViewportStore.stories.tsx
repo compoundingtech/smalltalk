@@ -7,9 +7,9 @@ import { EmbraceScrollViewport, ViewportStore, ViewportStoreContext, type Viewpo
 import { EmbraceVirtualConversation } from './assistant-ui/EmbraceVirtualConversation'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
+import { darkTheme as virtualDarkTheme } from './assistant-ui/embrace-theme'
 import { surfaceVars as surface, textVars as ink, borderVars as border, accentVars as accent, spaceVars as s, typeVars as t, geometryVars as g } from './assistant-ui/composition-tokens.stylex'
 
-// This package targets ES2022; Promise.withResolvers is not part of its declared library.
 const frame = () => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
 function StoreStory({ scheme = 'dark', virtual = false }: { scheme?: Scheme; virtual?: boolean }) {
   const [store] = React.useState(() => new ViewportStore())
@@ -20,7 +20,7 @@ function StoreStory({ scheme = 'dark', virtual = false }: { scheme?: Scheme; vir
   const rows = React.useMemo(() => Array.from({ length: 80 }, (_, index) => ({ id: `entry-${index}`, text: `Reading entry ${index + 1}: browser-local positions remain stable while another tab shares a newer position.` })), [])
   React.useLayoutEffect(() => store.subscribe(() => setNotifications(value => value + 1)), [store])
   const renderRow = (row: typeof rows[number]) => <article data-item-id={row.id} {...stylex.props(styles.row)}><p data-follow-anchor {...stylex.props(styles.paragraph)}>{row.text}</p></article>
-  return <ViewportStoreContext.Provider value={store}><main {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}>
+  return <ViewportStoreContext.Provider value={store}><main {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme, virtual && scheme === 'dark' && virtualDarkTheme)}>
     <div {...stylex.props(styles.toolbar)}>
       <Button {...stylex.props(styles.button)} onPress={() => setCaptured(store.snapshot())}>Capture active position</Button>
       <Button {...stylex.props(styles.button)} onPress={() => {
