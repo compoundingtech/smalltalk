@@ -1512,9 +1512,9 @@ mod tests {
             ("tool_result", "content"),
             ("tool_result", "content"),
         ]) {
-            assert_eq!(event.payload["entry_type"], kind);
+            assert_eq!(event.payload["entryType"], kind);
             assert_eq!(event.payload["operation"], "append");
-            assert_eq!(event.payload["final_entry"], true);
+            assert_eq!(event.payload["finalEntry"], true);
             assert_eq!(
                 event.payload["body"][payload],
                 json!({
@@ -1566,7 +1566,7 @@ mod tests {
         assert_eq!(timeline.len(), 6);
         let notices: Vec<_> = timeline
             .iter()
-            .filter(|event| event.payload["entry_type"] == "redaction")
+            .filter(|event| event.payload["entryType"] == "redaction")
             .collect();
         assert_eq!(notices.len(), 3);
         assert!(
