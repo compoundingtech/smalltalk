@@ -245,6 +245,6 @@ pub fn synthetic_mailbox_protocol_router(state: crate::api::AppState, subject: &
 pub fn append_legacy_claim(
     store: &crate::store::Store,
     input: &crate::model::ClaimInput,
-) -> Result<crate::model::ClaimRecord, smallclaims::error::St3Error> {
+) -> Result<crate::model::ClaimRecord, crate::St3Error> {
     store.append_legacy_claim(input)
 }
