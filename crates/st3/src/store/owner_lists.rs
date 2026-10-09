@@ -16,8 +16,6 @@ pub(crate) enum OwnerView {
 }
 
 impl OwnerView {
-    pub(crate) const ALL: [Self; 2] = [Self::Glasses, Self::Arrangements];
-
     pub(crate) fn collection(self) -> &'static str {
         match self {
             Self::Glasses => "glasses",

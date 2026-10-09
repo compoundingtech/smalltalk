@@ -39,6 +39,14 @@ pub fn start_attention_list(state: &AppState) {
     let mut changed = state.event_notify.subscribe();
     let mut roster = state.store.subscribe_agent_roster();
     tokio::spawn(async move {
+        // However this task ends, its views stop being served: windows read for themselves.
+        struct Stopped(Arc<Store>);
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                self.0.stop_attention_list_refresher();
+            }
+        }
+        let _stopped = Stopped(store.clone());
         let idle = ATTENTION_LIST_IDLE.as_millis() as u64;
         loop {
             let started = tokio::time::Instant::now();
@@ -55,8 +63,11 @@ pub fn start_attention_list(state: &AppState) {
                     ("attention", crate::performance::task("attention/refresh", || {
                         if attention { refresh_attention_list(&reader) } else { Ok(()) }
                     })),
-                    ("glasses and arrangements", crate::performance::task("person-views/refresh", || {
-                        refresh_owner_lists(&reader)
+                    ("glasses", crate::performance::task("person-views/refresh", || {
+                        refresh_owner_list(&reader, OwnerView::Glasses)
+                    })),
+                    ("arrangements", crate::performance::task("person-views/refresh", || {
+                        refresh_owner_list(&reader, OwnerView::Arrangements)
                     })),
                     ("summary", crate::performance::task("summary/refresh", || {
                         super::client_v0::summary::refresh_published(
@@ -71,12 +82,18 @@ pub fn start_attention_list(state: &AppState) {
             match refreshed {
                 Ok(results) => {
                     for (view, result) in results {
-                        if let Err(error) = result {
+                        if let Err(error) = &result {
                             eprintln!("st3: {view} view refresh failed: {error:#}");
                         }
+                        store.note_view_refreshed(view, result.is_ok());
                     }
                 }
-                Err(error) => eprintln!("st3: published view refresh stopped: {error}"),
+                Err(error) => {
+                    eprintln!("st3: published view refresh stopped: {error}");
+                    for view in crate::store::attention_list::PUBLISHED_VIEWS {
+                        store.note_view_refreshed(view, false);
+                    }
+                }
             }
             tokio::time::sleep(started.elapsed().max(ATTENTION_LIST_REFRESH_PAUSE)).await;
             // A glasses or arrangements window rereads only when its view publishes, so every
@@ -153,13 +170,11 @@ pub(crate) fn refresh_attention_list(store: &Store) -> anyhow::Result<()> {
     })
 }
 
-/// Publish every person's glasses and arrangements at the current cut, each in its own short
-/// snapshot, reading again only the people whose rows may have changed.
-pub(crate) fn refresh_owner_lists(store: &Store) -> anyhow::Result<()> {
-    for view in OwnerView::ALL {
-        if store.refresh_owner_list(view, client_now_ms())? {
-            store.publish_collection_view(view.collection());
-        }
+/// Publish every person's rows of `view` (glasses or arrangements) at the current cut in one
+/// short snapshot, reading again only the people whose rows may have changed.
+pub(crate) fn refresh_owner_list(store: &Store, view: OwnerView) -> anyhow::Result<()> {
+    if store.refresh_owner_list(view, client_now_ms())? {
+        store.publish_collection_view(view.collection());
     }
     Ok(())
 }
