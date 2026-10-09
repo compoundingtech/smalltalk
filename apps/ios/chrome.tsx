@@ -57,6 +57,13 @@ export function useListsOnFocus(keys: readonly OnDemand[]) {
   }, [status, loadLists, joined]));
 }
 
+/** A screen that shows missions (a list, a card, or names of missions) asks for their window while it
+ * is in front: it is large, so it is not followed otherwise. */
+export function useMissionsOnFocus() {
+  const { feed } = useStore();
+  useFocusEffect(useCallback(() => feed?.watchMissions(), [feed]));
+}
+
 /**
  * Native pull to refresh (UIRefreshControl). The windows are live already, so a pull reads the
  * screen's on-demand lists again, or opens a fresh socket when offline.

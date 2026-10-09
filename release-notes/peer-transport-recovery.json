@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Speed one signed retry within the recent authenticated peer’s 30-second recovery window",
+  "replay": {
+    "status": "none",
+    "detail": "No graph replay or admission-format change. A request whose response headers were lost can be retried through the existing idempotent replication receive path; an isolated accepted-but-lost-response control verifies one stored claim after the retry."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, migrations or persisted recovery credit. Credit is local per-peer process memory and starts absent after restart."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules/digests or coordinated member upgrade. Existing overload, membership removal and Fabric refusal cooldown policy remains in force."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Within five minutes of a successful authenticated outbound HTTP exchange, a route with genuinely newer local authority can use one jittered early signed attempt after a typed pre-headers transport failure and bounded HEAD probe. This speeds a recent peer's existing 30-second retry cap toward a probe interval of roughly 3\u20134 seconds. The five-minute epoch/probe eligibility is unchanged, and rate-limited probes continue throughout eligible retry waits without a ten-probe cutoff; hour-scale absence retries are unchanged. Older-peer HEAD 405 is transport-only. Mixed versions retain wire/client/harness contracts and differ in recent recovery speed. Retained watch failures remain historically unattributed; no native field or deployed performance acceptance is claimed."
+  },
+  "downtime": {
+    "status": "changed",
+    "detail": "For peers inside the five-minute authenticated epoch, recovery can resume from the existing 30-second cap after roughly 3\u20134 seconds of bounded probe plus jitter. Absences outside the five-minute eligibility window keep prior quiet backoff and do not obtain renewed credit. Existing successful-HEAD deadline caps remain active during eligible longer waits. Early failure retains the original retry deadline and accumulated counter. Original 10000 ms native read oracle unchanged; live restart-to-API/health and field recovery have not been measured."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No additional manual step, fleet coordination, configuration or store change for installations using the existing replication worker. Normal binary upgrade applies."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "A successful authenticated outbound exchange arms one in-memory allowance for that route/auth epoch. Route/auth changes invalidate it; cancellation or timeout after spending cannot refund it. Swapping back restores the prior retry timing without reversing a migration; no replay or native acceptance follows from a swap. Operator-visible local worker phases include recovery-granted, recovery-consumed and recovery-refused-cause/no-pending/route/spent; these are bounded progress observations, not delivery or live stack proof."
+  }
+}

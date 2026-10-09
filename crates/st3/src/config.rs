@@ -107,6 +107,11 @@ pub struct LimitsConfig {
     pub stop_at_weekly_percent: u32,
     /// Seats never stopped, such as the seat that coordinates the fleet.
     pub keep: Vec<String>,
+    /// Accounts whose seats are never stopped, by the name `st usage` shows: the declared
+    /// account (`ada/codex`) or the provider's label. A seat started later on one is covered too.
+    pub exempt_accounts: Vec<String>,
+    /// Harnesses (`claude`, `codex`) whose seats are never stopped, whatever their account.
+    pub exempt_harnesses: Vec<String>,
     /// The operations agent that receives one message per account window.
     pub notify: Option<String>,
     /// Legacy setting, accepted for migration but never used for person delivery.
@@ -121,6 +126,8 @@ impl Default for LimitsConfig {
             enabled: false,
             stop_at_weekly_percent: 95,
             keep: Vec::new(),
+            exempt_accounts: Vec::new(),
+            exempt_harnesses: Vec::new(),
             notify: None,
             ask: None,
             fresh: "1h".into(),
@@ -136,6 +143,67 @@ impl LimitsConfig {
     pub fn fresh_ms(&self) -> Result<u64> {
         parse_duration_ms(&self.fresh, "limits.fresh")
     }
+
+    /// Check an enabled policy. A disabled one is not read, so it may be half written.
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        self.fresh_ms()?;
+        anyhow::ensure!(
+            (1..=100).contains(&self.stop_at_weekly_percent),
+            "limits.stop_at_weekly_percent must be between 1 and 100"
+        );
+        anyhow::ensure!(
+            self.keep.iter().all(|seat| seat.starts_with("agent/")),
+            "limits.keep lists agent/... subjects"
+        );
+        anyhow::ensure!(
+            self.exempt_accounts
+                .iter()
+                .chain(&self.exempt_harnesses)
+                .all(|name| !name.is_empty() && !name.chars().any(char::is_whitespace)),
+            "limits.exempt_accounts and limits.exempt_harnesses list names without spaces"
+        );
+        anyhow::ensure!(
+            self.notify.as_deref().is_some_and(|agent| {
+                agent.starts_with("agent/")
+                    && agent.split('/').skip(1).all(|part| !part.is_empty())
+                    && !agent.chars().any(char::is_whitespace)
+            }),
+            "limits needs an operations agent: set limits.notify to agent/... (limits.ask and person never receive raw limit events)"
+        );
+        Ok(())
+    }
+}
+
+/// The config file the running daemon was started with, so its `[limits]` can be read again.
+static DAEMON_CONFIG: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Remember the daemon's config file. `None` is the default path.
+pub fn set_daemon_config(path: Option<&Path>) {
+    let _ = DAEMON_CONFIG.set(path.map(Path::to_path_buf));
+}
+
+/// The daemon's `[limits]` as the config file says now, so an edit applies without a restart.
+/// `None` outside a daemon.
+pub fn reload_daemon_limits() -> Option<Result<LimitsConfig>> {
+    let path = DAEMON_CONFIG.get()?;
+    Some(read_limits(path.as_deref()))
+}
+
+/// `[limits]` from a config file that must exist: a file that is missing for a moment must not
+/// read as the default, which has the policy off.
+fn read_limits(path: Option<&Path>) -> Result<LimitsConfig> {
+    let selected = path.map(Path::to_path_buf).unwrap_or_else(Config::default_path);
+    anyhow::ensure!(
+        selected.exists(),
+        "st config {} is missing",
+        selected.display()
+    );
+    let limits = Config::load_unvalidated(Some(&selected))?.limits;
+    limits.validate()?;
+    Ok(limits)
 }
 
 /// Observations of `local` retention stay on the node that made them. The daemon trims
@@ -359,28 +427,7 @@ impl Config {
         if let Some(otlp) = &self.observations.otlp {
             otlp.validate()?;
         }
-        if self.limits.enabled {
-            self.limits.fresh_ms()?;
-            anyhow::ensure!(
-                (1..=100).contains(&self.limits.stop_at_weekly_percent),
-                "limits.stop_at_weekly_percent must be between 1 and 100"
-            );
-            anyhow::ensure!(
-                self.limits
-                    .keep
-                    .iter()
-                    .all(|seat| seat.starts_with("agent/")),
-                "limits.keep lists agent/... subjects"
-            );
-            anyhow::ensure!(
-                self.limits.notify.as_deref().is_some_and(|agent| {
-                    agent.starts_with("agent/")
-                        && agent.split('/').skip(1).all(|part| !part.is_empty())
-                        && !agent.chars().any(char::is_whitespace)
-                }),
-                "limits needs an operations agent: set limits.notify to agent/... (limits.ask and person never receive raw limit events)"
-            );
-        }
+        self.limits.validate()?;
         anyhow::ensure!(
             self.person.as_deref().is_none_or(|person| {
                 person.starts_with("person/")
@@ -592,6 +639,40 @@ sekrets_profile = "nathan/daemon-gh"
         );
         assert!(error.contains("--client-gateway-socket"), "{error}");
         assert!(error.contains("XDG_RUNTIME_DIR"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_config_file_is_an_error_not_a_disabled_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let error = read_limits(Some(&path)).unwrap_err().to_string();
+        assert!(error.contains("is missing"), "{error}");
+        fs::write(
+            &path,
+            "person = \"person/avery\"\n[limits]\nenabled = true\nnotify = \"agent/example/operations\"\n",
+        )
+        .unwrap();
+        assert!(read_limits(Some(&path)).unwrap().enabled);
+        fs::remove_file(&path).unwrap();
+        assert!(read_limits(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn the_limits_policy_names_exempt_accounts_and_harnesses() {
+        let config: Config = toml::from_str(
+            "person = \"person/avery\"\n[limits]\nenabled = true\nnotify = \"agent/example/operations\"\n\
+             exempt_accounts = [\"ada/codex\"]\nexempt_harnesses = [\"codex\"]\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.limits.exempt_accounts, ["ada/codex"]);
+        assert_eq!(config.limits.exempt_harnesses, ["codex"]);
+        assert!(Config::default().limits.exempt_accounts.is_empty());
+        let mut invalid = config.clone();
+        invalid.limits.exempt_accounts = vec!["ada codex".into()];
+        assert!(invalid.validate().is_err());
+        invalid.limits.exempt_accounts = vec![String::new()];
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

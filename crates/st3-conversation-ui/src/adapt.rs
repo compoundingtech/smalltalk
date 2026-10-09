@@ -572,6 +572,17 @@ const BOOKKEEPING_RECORDS: &[&str] = &[
     "world_state",
 ];
 
+/// A record Claude writes about its own session, in kinds that keep appearing (instructions,
+/// session context, prompt snapshots, deferred tools, credential organisation, hook summaries):
+/// an attachment, a system record or a transcript entry that no renderer knows by name. Claude's
+/// own screen shows none of them as conversation, so they are bookkeeping as a class, not one
+/// name at a time.
+fn claude_context_record(text: &str) -> bool {
+    ["attachment", "system", "entry"]
+        .iter()
+        .any(|kind| text.starts_with(&format!("[unrecognized claude {kind} `")))
+}
+
 fn is_bookkeeping(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> bool {
     let TimelineBody::Content(content) = &entry.body else {
         return false;
@@ -600,7 +611,8 @@ fn is_bookkeeping(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> bo
                 && shown.into_iter().all(|block| {
                     block.kind == "unknown"
                         && (BOOKKEEPING_RECORDS.contains(&block.source_type.as_str())
-                            || omp_bookkeeping(block))
+                            || omp_bookkeeping(block)
+                            || claude_context_record(content.text.as_deref().unwrap_or("")))
                 })
         }
         _ => false,
@@ -982,9 +994,11 @@ fn ping_id(line: &str) -> Option<&str> {
         .filter(|id| id.starts_with("message/"))
 }
 
-/// The lines st adds beside a delivery for the agent (st-drivers `ding`): where the person reads
-/// replies, and that a message was dictated.
+/// The lines st adds beside a delivery for the agent (st-drivers `ding`): how to answer the
+/// person, and that a message was dictated. The earlier sentence stays recognized for agents that
+/// still carry it in their history.
 const ST_DELIVERY_NOTES: &[&str] = &[
+    "Answer the person in this conversation; people have no inbox, so do not reply with st.",
     "The person reads replies in st, not in the agent's session.",
     "(dictated by voice; it may contain transcription mistakes)",
 ];

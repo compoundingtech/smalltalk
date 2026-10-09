@@ -210,10 +210,13 @@ fn claim_row(connection: &Connection, claim_id: &str) -> Result<Option<ClaimRow>
         .optional()?)
 }
 
-/// The trust roots: `(host/NAME, key)` for every member incarnation fleet membership admits, and
-/// this node's own key.
-fn roots(connection: &Connection, origin: &str) -> Result<BTreeSet<(String, String)>> {
-    let mut roots = fleet_membership_tx(connection)?
+/// The member incarnations fleet membership admits, as `(host/NAME, key)`. A fold of every fleet
+/// claim: hundreds of statements, and on a large store tens of milliseconds to seconds of the
+/// writer each time.
+fn member_roots(connection: &Connection) -> Result<BTreeSet<(String, String)>> {
+    #[cfg(test)]
+    MEMBER_ROOT_FOLDS.with(|folds| folds.set(folds.get() + 1));
+    Ok(fleet_membership_tx(connection)?
         .incarnations()
         .map(|incarnation| {
             (
@@ -221,11 +224,57 @@ fn roots(connection: &Connection, origin: &str) -> Result<BTreeSet<(String, Stri
                 incarnation.member_key.clone(),
             )
         })
-        .collect::<BTreeSet<_>>();
-    if let Some(own) = fleet_meta(connection, OWN_NODE_KEY)? {
-        roots.insert((format!("host/{origin}"), own));
+        .collect::<BTreeSet<_>>())
+}
+
+// Per thread, so tests running side by side cannot count each other's folds.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MEMBER_ROOT_FOLDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Store {
+    /// The trust roots: `(host/NAME, key)` for every member incarnation fleet membership admits,
+    /// and this node's own key. The membership part is folded again only when `fleet_generation`
+    /// moved: it is a function of the fleet claims, their envelopes' signatures and the anchor,
+    /// and triggers advance the generation whenever any of them changes.
+    ///
+    /// Call it before the transaction writes anything: the generation and the fold are then read
+    /// from the same committed snapshot, so a cached pair is always consistent. A transaction that
+    /// had already changed fleet claims could cache a membership its rollback would undo.
+    pub(crate) fn trust_roots(
+        &self,
+        connection: &Connection,
+        origin: &str,
+    ) -> Result<BTreeSet<(String, String)>> {
+        let generation: i64 = connection.query_row(
+            "SELECT value FROM fleet_generation WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let cached = self
+            .roots_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|(folded_at, _)| *folded_at == generation)
+            .map(|(_, roots)| roots.clone());
+        let mut roots = match cached {
+            Some(roots) => roots,
+            None => {
+                let roots = member_roots(connection)?;
+                *self
+                    .roots_cache
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some((generation, roots.clone()));
+                roots
+            }
+        };
+        if let Some(own) = fleet_meta(connection, OWN_NODE_KEY)? {
+            roots.insert((format!("host/{origin}"), own));
+        }
+        Ok(roots)
     }
-    Ok(roots)
 }
 
 /// Answers for one claim being judged: every question about order is about claims before it.
@@ -898,7 +947,7 @@ impl Store {
         if check_roots {
             let mut connection = self.connection.write();
             let transaction = connection.transaction()?;
-            let roots = roots(&transaction, &self.origin)?;
+            let roots = self.trust_roots(&transaction, &self.origin)?;
             let roots_digest = crate::hash::canonical_hash(&roots)?;
             if fleet_meta(&transaction, VERDICT_ROOTS)?.as_deref() != Some(roots_digest.as_str()) {
                 queue_linked_tx(&transaction, "root")?;
@@ -914,7 +963,7 @@ impl Store {
             let mut connection = self.connection.write();
             let transaction = connection
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let roots = roots(&transaction, &self.origin)?;
+            let roots = self.trust_roots(&transaction, &self.origin)?;
             let fresh = transaction
                 .prepare_cached("SELECT claim_id FROM claim_verdict_fresh LIMIT ?1")?
                 .query_map([JUDGE_CHUNK as i64], |row| row.get::<_, String>(0))?

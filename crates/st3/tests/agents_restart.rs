@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use st3::api::AppState;
 use st3::model::{ClaimRecord, MemberSpec, MissionRunRequest};
@@ -149,6 +150,15 @@ impl Fixture {
     }
 
     async fn launching(shape: Shape, launch: &str, restart: &str) -> (Self, String) {
+        Self::launching_with_router(shape, launch, restart, st3::api::router).await
+    }
+
+    async fn launching_with_router(
+        shape: Shape,
+        launch: &str,
+        restart: &str,
+        make_router: impl FnOnce(AppState) -> axum::Router,
+    ) -> (Self, String) {
         let mission = shape != Shape::TopLevel;
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(&root.path().join("graph.db"), "restart-test").unwrap());
@@ -240,7 +250,7 @@ impl Fixture {
             planner_default: Default::default(),
         };
         let socket = root.path().join("st3.sock");
-        let router = st3::api::router(state.clone());
+        let router = make_router(state.clone());
         let server = tokio::spawn(async move { st3::api::serve_unix(&socket, router).await });
         for _ in 0..100 {
             if root.path().join("st3.sock").exists() {
@@ -405,6 +415,154 @@ async fn restarts_mission_seat_without_redeclaring_it() {
         return;
     }
     restarts_preserving_declaration(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_waits_for_replacement_after_mailbox_disconnect() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let old_card_read = Arc::new(Notify::new());
+    let observed = old_card_read.clone();
+    let old_card = Arc::new(Mutex::new(None));
+    let captured = old_card.clone();
+    let (fixture, subject) = Fixture::launching_with_router(
+        Shape::TopLevel,
+        r#"command "sleep 1000""#,
+        "never",
+        move |state| {
+            st3::test_support::synthetic_mailbox_protocol_router(state, "agent/example/worker")
+                .layer(axum::middleware::from_fn(
+                    move |request: axum::extract::Request, next: axum::middleware::Next| {
+                        let observed = observed.clone();
+                        let captured = captured.clone();
+                        async move {
+                            let card = request.uri().path().starts_with("/v1/client/agents/");
+                            let response = next.run(request).await;
+                            if card && captured.lock().unwrap().is_none() {
+                                let (parts, body) = response.into_parts();
+                                let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                                *captured.lock().unwrap() =
+                                    Some(serde_json::from_slice::<Value>(&bytes).unwrap());
+                                observed.notify_one();
+                                axum::response::Response::from_parts(
+                                    parts,
+                                    axum::body::Body::from(bytes),
+                                )
+                            } else {
+                                response
+                            }
+                        }
+                    },
+                ))
+        },
+    )
+    .await;
+    let token = fixture.store.selected_desired_token(&subject).unwrap();
+    let fence = st3::test_support::bind_fixture_mailbox(
+        &fixture.store,
+        &st3::mailbox::Fence::new(&subject, "fixture:1", "delivery"),
+    )
+    .unwrap();
+    let mut socket = fixture.client().open_mailbox(&fence).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = socket.next().await.unwrap().unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Text(raw) = frame
+                && matches!(
+                    serde_json::from_str::<st3::mailbox::Frame>(&raw).unwrap(),
+                    st3::mailbox::Frame::Mailbox { .. }
+                )
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    socket.close(None).await.unwrap();
+    drop(socket);
+    // The synthetic transport has no physical provider authority to publish a loss.
+    // Install the same durable loss observation after disconnecting its real socket.
+    let failure = fixture.store.append_claim(&st3::model::ClaimInput {
+        subject: subject.clone(), kind: "operational.failure".into(),
+        actor: Some("daemon/runtime".into()),
+        fields: serde_json::from_value(json!({"condition":"mailbox-channel-lost",
+            "incarnation":"fixture:1", "reason":"admitted mailbox channel disconnected",
+            "reviewer":"person/avery", "title":"Mailbox lost", "severity":"error", "targets":[subject]})).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    st3::test_support::check_fixture_mailbox(&fixture.store, &fence).unwrap();
+
+    let socket_path = fixture.root.path().join("st3.sock");
+    let command = cli(
+        &socket_path,
+        &subject,
+        "agent/example/operator",
+        "3s",
+    );
+    let mut driver = None;
+    let drive_after_old_card = async {
+        // No reconciliation can replace the runtime until the CLI has received an
+        // actual card response containing the old incarnation's loss fault.
+        old_card_read.notified().await;
+        let card = old_card.lock().unwrap().as_ref().unwrap().clone();
+        assert_eq!(card["value"]["incarnation_id"], "fixture:1");
+        assert_eq!(
+            card["value"]["fault"],
+            "admitted mailbox channel disconnected"
+        );
+        // An unrelated restart outcome must not settle this accepted request.
+        fixture
+            .store
+            .append_claim(&st3::model::ClaimInput {
+                subject: subject.clone(),
+                kind: "runtime.action.failed".into(),
+                actor: Some("agent/example/operator".into()),
+                fields: serde_json::from_value(
+                    json!({"action":"restart", "reason":"unrelated restart failure"}),
+                )
+                .unwrap(),
+                evidence: vec![failure.id.clone()],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        driver = Some(fixture.drive());
+    };
+    let (output, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(command, drive_after_old_card)
+    })
+    .await
+    .unwrap();
+    let driver = driver.unwrap();
+    driver.abort();
+    let _ = driver.await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let agent: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(agent["incarnation_id"], "fixture:2");
+    assert_eq!(agent["state"], "running");
+    assert_eq!(*fixture.runtime.stops.lock().unwrap(), ["fixture:1"]);
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 2);
+    assert_eq!(
+        token,
+        fixture.store.selected_desired_token(&subject).unwrap()
+    );
+    assert!(st3::test_support::check_fixture_mailbox(&fixture.store, &fence).is_err());
+    let events = fixture
+        .store
+        .events_after(failure.store_index, Some(&subject))
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "operational.recovered"),
+        "a restart must not manufacture recovery of the old channel"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1845,7 +2003,7 @@ async fn a_failed_explicit_retry_is_completed_parked_and_visible_until_a_new_req
             "{reason}"
         );
         // `st agents show` and clients consume the same agents read, including this fault.
-        let agents: Value = fixture.client().get("/v1/client/agents").await.unwrap();
+        let agents: Value = fixture.client().get("/v1/client/agents?fresh=true").await.unwrap();
         let agent = agents["items"]
             .as_array()
             .unwrap()

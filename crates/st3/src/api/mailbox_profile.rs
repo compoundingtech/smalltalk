@@ -64,7 +64,7 @@ async fn daemon(root: &Path) {
                 |State(state): State<AppState>,
                  Query(fence): Query<Fence>,
                  websocket: WebSocketUpgrade| async move {
-                    websocket.on_upgrade(move |socket| stream(state, fence, socket))
+                    websocket.on_upgrade(move |socket| stream_with_reader(state, fence, socket, raw_snapshot))
                 },
             ),
         )

@@ -99,21 +99,46 @@ fn searchable_text(value: &Value, output: &mut String) {
     }
 }
 
-fn refresh(
-    state: &AppState,
-    session: &ClientSession,
-    held: &HeldIndex,
-    runtime: &tokio::runtime::Handle,
-) -> anyhow::Result<()> {
-    let snapshot = new_client_snapshot(state);
-    let old = held.lock().unwrap().stamps.clone();
-    let old_sizes = held.lock().unwrap().sizes.clone();
+/// A conversation considered in the original per-source budget order.
+struct Source {
+    id: String,
+    owner: String,
+    remote: Option<String>,
+    /// Whether the previous stamp matches and the source is owner-local, so its old
+    /// entries may be kept without fetching when they still fit the budget.
+    stamp_unchanged: bool,
+    /// The previous `(bytes, entries)` size, defaulting to zero when unknown.
+    old_size: (usize, usize),
+}
+
+struct Inventory {
+    snapshot: ClientSnapshot,
+    stamps: BTreeMap<String, String>,
+    sizes: BTreeMap<String, (usize, usize)>,
+    changed: Vec<(String, Vec<SearchEntry>)>,
+    sources: Vec<Source>,
+    budget: usize,
+    slots: usize,
+    incomplete: Vec<String>,
+    old: BTreeMap<String, String>,
+}
+
+/// The store-reading half of a refresh: one snapshot, mail entries, per-source stamps,
+/// and candidate sources. Runs inside one admitted reader scope.
+fn inventory(
+    state: AppState,
+    session: ClientSession,
+    old: BTreeMap<String, String>,
+    old_sizes: BTreeMap<String, (usize, usize)>,
+) -> anyhow::Result<Inventory> {
+    let snapshot = new_client_snapshot(&state);
     let mut sizes = BTreeMap::new();
     let mut budget = TEXT_BYTES;
     let mut slots = ENTRIES;
     let mut stamps = BTreeMap::new();
     let mut changed = Vec::new();
     let mut incomplete = Vec::new();
+    let mut sources = Vec::new();
     // Messages are immutable text. Their access rule is the same private from/to rule as
     // the messages projection, including archived messages and the person's sent mail.
     let mail_stamp = state
@@ -184,7 +209,12 @@ fn refresh(
             continue;
         };
         let owner = resource["owner_id"].as_str().unwrap_or_default();
-        let remote = match conversation_owner_host(state, session, id) {
+        let remote = match conversation_owner_host(
+            &state,
+            &session,
+            id,
+            owner.starts_with("agent/").then_some(owner),
+        ) {
             Ok(remote) => remote,
             Err(error) => {
                 incomplete.push(format!("{id}: {}", error.message));
@@ -209,7 +239,7 @@ fn refresh(
             )?);
             // Driver claims can be quiet while a native transcript grows.
             if let Some(transcript) = managed_transcript(
-                state,
+                &state,
                 owner,
                 resource["runtime_incarnation"].as_str().unwrap_or_default(),
             )
@@ -237,103 +267,244 @@ fn refresh(
             stamp.push_str(&snapshot.id);
         }
         stamps.insert(id.to_owned(), stamp.clone());
-        if budget == 0 || slots == 0 {
-            incomplete.push(format!("{id}: search index budget reached"));
-            stamps.remove(id);
-            continue;
-        }
-        if remote.is_none() && old.get(id) == Some(&stamp) {
-            let size = old_sizes.get(id).copied().unwrap_or_default();
-            if size.0 <= budget && size.1 <= slots {
-                budget -= size.0;
-                slots -= size.1;
-                sizes.insert(id.to_owned(), size);
+        // Budget order matters: the exhausted check and unchanged-skip happen per source,
+        // in this order, after earlier sources consumed their share. Inventory records
+        // the candidates; `refresh` applies that original ordering.
+        sources.push(Source {
+            id: id.to_owned(),
+            owner: owner.to_owned(),
+            stamp_unchanged: remote.is_none() && old.get(id) == Some(&stamp),
+            remote,
+            old_size: old_sizes.get(id).copied().unwrap_or_default(),
+        });
+    }
+    Ok(Inventory { snapshot, stamps, sizes, changed, sources, budget, slots, incomplete, old })
+}
+
+/// Fetch every page of one owner-local conversation inside one admitted reader scope.
+/// Returns its entries, the budget they consumed, per-source warnings, and whether the
+/// source became unavailable (its old entries must then be dropped).
+fn local_pages(
+    state: AppState,
+    snapshot: ClientSnapshot,
+    session: ClientSession,
+    id: String,
+    owner: String,
+    start_budget: usize,
+    start_slots: usize,
+) -> (Vec<SearchEntry>, (usize, usize), Vec<String>, bool) {
+    let mut budget = start_budget;
+    let mut slots = start_slots;
+    let mut query = ClientListQuery {
+        limit: Some(200),
+        ..Default::default()
+    };
+    let mut entries = Vec::new();
+    let mut incomplete = Vec::new();
+    let mut unavailable = false;
+    loop {
+        let page = match timeline_value(&state, &snapshot, &session, &id, &query) {
+            Ok(Json(page)) => page,
+            Err(error) => {
+                incomplete.push(format!("{id}: {}: {}", error.code, error.message));
+                unavailable = true;
+                break;
+            }
+        };
+        for item in page["items"].as_array().into_iter().flatten().rev() {
+            let kind = item["type"].as_str().unwrap_or_default();
+            if matches!(kind, "truncation" | "redaction" | "error") {
+                incomplete.push(format!("{id}: {kind}"));
+            }
+            // A Small Talk message has its canonical mailbox hit; avoid indexing its
+            // duplicated title and content again through each seat's transcript.
+            if !matches!(kind, "content" | "tool_call" | "tool_result") {
                 continue;
             }
+            let mut text = String::new();
+            searchable_text(&item["body"], &mut text);
+            if text.trim().is_empty() {
+                continue;
+            }
+            if text.len() > budget || slots == 0 {
+                incomplete.push(format!("{id}: search index budget reached"));
+                continue;
+            }
+            budget -= text.len();
+            slots -= 1;
+            entries.push(SearchEntry {
+                conversation_id: id.clone(),
+                entry_id: item["id"].as_str().unwrap_or_default().into(),
+                agent_id: owner.starts_with("agent/").then(|| owner.clone()),
+                timestamp: item["timestamp"].as_str().unwrap_or_default().into(),
+                entry_type: kind.into(),
+                text,
+            });
         }
-        let mut query = ClientListQuery {
-            limit: Some(200),
-            ..Default::default()
-        };
-        let mut entries = Vec::new();
-        let mut unavailable = false;
+        query.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+        if query.cursor.is_some() && (budget == 0 || slots == 0) {
+            incomplete.push(format!("{id}: search index budget reached"));
+            break;
+        }
+        if query.cursor.is_none() {
+            break;
+        }
+    }
+    (entries, (start_budget - budget, start_slots - slots), incomplete, unavailable)
+}
+
+fn refresh(
+    state: &AppState,
+    session: &ClientSession,
+    held: &HeldIndex,
+    runtime: &tokio::runtime::Handle,
+) -> anyhow::Result<()> {
+    let old = held.lock().unwrap().stamps.clone();
+    let old_sizes = held.lock().unwrap().sizes.clone();
+    // The inventory reads take reader admission first; the remote page fetches below wait
+    // for their owners without holding any reader, and each local conversation re-admits
+    // for its own pages. The search index's own lock is taken only after both.
+    let (inventory_state, inventory_session) = (state.clone(), session.clone());
+    let admission_store = state.store.clone();
+    let Inventory {
+        snapshot,
+        mut stamps,
+        mut sizes,
+        mut changed,
+        sources,
+        mut budget,
+        mut slots,
+        mut incomplete,
+        old,
+    } = runtime
+        .block_on(crate::api::read_deadline::store_read(&admission_store, move || {
+            inventory(inventory_state, inventory_session, old, old_sizes)
+        }))
+        .map_err(anyhow::Error::from)??;
+    for source in sources {
+        let Source { id, owner, remote, stamp_unchanged, old_size } = source;
+        // Original per-source order: exhausted check, unchanged-skip, then fetch with
+        // this source's start counters captured immediately before it.
+        if budget == 0 || slots == 0 {
+            incomplete.push(format!("{id}: search index budget reached"));
+            stamps.remove(&id);
+            continue;
+        }
+        if stamp_unchanged && old_size.0 <= budget && old_size.1 <= slots {
+            budget -= old_size.0;
+            slots -= old_size.1;
+            sizes.insert(id.clone(), old_size);
+            continue;
+        }
         let start_budget = budget;
         let start_slots = slots;
-        loop {
-            let read = if let Some(remote) = &remote {
-                runtime
+        let mut entries = Vec::new();
+        let mut unavailable = false;
+        if let Some(remote) = &remote {
+            let mut query = ClientListQuery {
+                limit: Some(200),
+                ..Default::default()
+            };
+            loop {
+                let read = runtime
                     .block_on(state.client_relay.as_ref().expect("checked relay").read(
                         remote,
                         &crate::peer::ClientReadRequest {
                             authority_actor: session.authority_actor.clone(),
                             relay: None,
                             request: crate::peer::ClientReadOperation::Timeline {
-                                session_id: id.to_owned(),
+                                session_id: id.clone(),
                                 limit: 200,
                                 cursor: query.cursor.clone(),
                             },
                         },
                     ))
-                    .map_err(|error| remote_read_error(remote, error))
-            } else {
-                timeline_value(state, &snapshot, session, id, &query).map(|Json(page)| page)
-            };
-            let page = match read {
-                Ok(page) => page,
-                Err(error) => {
-                    incomplete.push(format!("{id}: {}: {}", error.code, error.message));
-                    unavailable = true;
+                    .map_err(|error| remote_read_error(remote, error));
+                let page = match read {
+                    Ok(page) => page,
+                    Err(error) => {
+                        incomplete.push(format!("{id}: {}: {}", error.code, error.message));
+                        unavailable = true;
+                        break;
+                    }
+                };
+                for item in page["items"].as_array().into_iter().flatten().rev() {
+                    let kind = item["type"].as_str().unwrap_or_default();
+                    if matches!(kind, "truncation" | "redaction" | "error") {
+                        incomplete.push(format!("{id}: {kind}"));
+                    }
+                    // A Small Talk message has its canonical mailbox hit; avoid indexing its
+                    // duplicated title and content again through each seat's transcript.
+                    if !matches!(kind, "content" | "tool_call" | "tool_result") {
+                        continue;
+                    }
+                    let mut text = String::new();
+                    searchable_text(&item["body"], &mut text);
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    if text.len() > budget || slots == 0 {
+                        incomplete.push(format!("{id}: search index budget reached"));
+                        continue;
+                    }
+                    budget -= text.len();
+                    slots -= 1;
+                    entries.push(SearchEntry {
+                        conversation_id: id.clone(),
+                        entry_id: item["id"].as_str().unwrap_or_default().into(),
+                        agent_id: owner.starts_with("agent/").then(|| owner.clone()),
+                        timestamp: item["timestamp"].as_str().unwrap_or_default().into(),
+                        entry_type: kind.into(),
+                        text,
+                    });
+                }
+                query.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+                if query.cursor.is_some() && (budget == 0 || slots == 0) {
+                    incomplete.push(format!("{id}: search index budget reached"));
                     break;
                 }
-            };
-            for item in page["items"].as_array().into_iter().flatten().rev() {
-                let kind = item["type"].as_str().unwrap_or_default();
-                if matches!(kind, "truncation" | "redaction" | "error") {
-                    incomplete.push(format!("{id}: {kind}"));
+                if query.cursor.is_none() {
+                    break;
                 }
-                // A Small Talk message has its canonical mailbox hit; avoid indexing its
-                // duplicated title and content again through each seat's transcript.
-                if !matches!(kind, "content" | "tool_call" | "tool_result") {
-                    continue;
-                }
-                let mut text = String::new();
-                searchable_text(&item["body"], &mut text);
-                if text.trim().is_empty() {
-                    continue;
-                }
-                if text.len() > budget || slots == 0 {
-                    incomplete.push(format!("{id}: search index budget reached"));
-                    continue;
-                }
-                budget -= text.len();
-                slots -= 1;
-                entries.push(SearchEntry {
-                    conversation_id: id.to_owned(),
-                    entry_id: item["id"].as_str().unwrap_or_default().into(),
-                    agent_id: owner.starts_with("agent/").then(|| owner.to_owned()),
-                    timestamp: item["timestamp"].as_str().unwrap_or_default().into(),
-                    entry_type: kind.into(),
-                    text,
-                });
             }
-            query.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
-            if query.cursor.is_some() && (budget == 0 || slots == 0) {
-                incomplete.push(format!("{id}: search index budget reached"));
-                break;
-            }
-            if query.cursor.is_none() {
-                break;
+        } else {
+            let (local_state, local_session, local_snapshot) =
+                (state.clone(), session.clone(), snapshot.clone());
+            let (local_id, local_owner) = (id.clone(), owner.clone());
+            let admission_store = state.store.clone();
+            let fetch_budget = start_budget;
+            let fetch_slots = start_slots;
+            let (fetched, used, notes, failed) = runtime
+                .block_on(crate::api::read_deadline::store_read(&admission_store, move || {
+                    local_pages(
+                        local_state,
+                        local_snapshot,
+                        local_session,
+                        local_id,
+                        local_owner,
+                        fetch_budget,
+                        fetch_slots,
+                    )
+                }))
+                .map_err(anyhow::Error::from)?;
+            entries = fetched;
+            incomplete.extend(notes);
+            unavailable = failed;
+            if !unavailable {
+                budget -= used.0;
+                slots -= used.1;
             }
         }
-        // Never leave old searchable text behind after a source becomes unavailable.
+        // Never leave old searchable text behind after a source becomes unavailable, and
+        // never let its half-fetched pages keep budget an earlier failure already paid.
         if unavailable {
             entries.clear();
-            stamps.remove(id);
+            stamps.remove(&id);
             budget = start_budget;
             slots = start_slots;
         }
-        sizes.insert(id.to_owned(), (start_budget - budget, start_slots - slots));
-        changed.push((id.to_owned(), entries));
+        sizes.insert(id.clone(), (start_budget - budget, start_slots - slots));
+        changed.push((id, entries));
     }
     let mut index = held.lock().unwrap();
     for source in old.keys().filter(|source| !stamps.contains_key(*source)) {
@@ -787,5 +958,75 @@ mod tests {
         assert_eq!(hits["items"].as_array().unwrap().len(), 1, "{hits}");
         assert_eq!(hits["items"][0]["entry_id"], expected["id"]);
         assert_eq!(hits["items"][0]["conversation_id"], native.id);
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_original_budget_order_across_mail_and_multiple_local_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::tests::state(root.path());
+        claim(
+            &state,
+            "message/one",
+            "message.sent",
+            json!({"from":"agent/scribe", "to":"person/alex", "content":"alpha mail body"}),
+        );
+        for (agent, runtime, marker) in [
+            ("agent/scribe", "scribe", "first orchid note"),
+            ("agent/poet", "poet", "second orchid note"),
+        ] {
+            let incarnation = format!("{runtime}:i1");
+            claim(
+                &state,
+                agent,
+                "runtime.observed",
+                json!({"status":"running", "runtime_id":runtime, "incarnation_id":incarnation, "terminal":false}),
+            );
+            claim(
+                &state,
+                agent,
+                "harness.timeline",
+                json!({"operation":"append", "entry_id":format!("timeline-entry/{runtime}"),
+                "revision":1, "role":"assistant", "entry_type":"content", "final":true,
+                "body":{"media_type":"text/plain", "text":marker},
+                "incarnation_id":format!("{runtime}:i1"), "sequence":1, "driver":"test"}),
+            );
+        }
+        rebuild(&state, "person/alex").await;
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let held = index_for(&state, &session).unwrap();
+        let (first_sizes, first_stamps, first_revision, first_incomplete) = {
+            let index = held.lock().unwrap();
+            (
+                index.sizes.clone(),
+                index.stamps.clone(),
+                index.revision.clone(),
+                index.incomplete.clone(),
+            )
+        };
+        // Mail plus both local conversations hold nonzero, individually recorded sizes.
+        assert!(first_sizes["mail"].0 > 0, "{first_sizes:?}");
+        let local_sizes: Vec<_> = first_sizes
+            .iter()
+            .filter(|(source, _)| source.as_str() != "mail")
+            .collect();
+        assert_eq!(local_sizes.len(), 2, "{first_sizes:?}");
+        assert!(local_sizes.iter().all(|(_, size)| size.0 > 0 && size.1 > 0));
+        assert!(
+            !first_incomplete
+                .iter()
+                .any(|warning| warning.contains("budget reached")),
+            "{first_incomplete:?}"
+        );
+        // Nothing changed: the second refresh skips every local source, keeping each
+        // source's recorded size, stamp set, and index revision exactly.
+        rebuild(&state, "person/alex").await;
+        {
+            let index = held.lock().unwrap();
+            assert_eq!(index.sizes, first_sizes);
+            assert_eq!(index.stamps, first_stamps);
+            assert_eq!(index.revision, first_revision);
+        }
+        let both = read(&state, "person/alex", query("orchid", 200)).await.unwrap();
+        assert_eq!(both["items"].as_array().unwrap().len(), 2, "{both}");
     }
 }

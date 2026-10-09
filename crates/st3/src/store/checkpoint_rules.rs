@@ -12,7 +12,6 @@
 use super::*;
 use smallclaims::store::checkpoint::DAY_MS;
 use smallclaims::store::checkpoint::*;
-use smallclaims::store::checkpoint_agreement::*;
 
 /// The rule engine's version. It is part of the rules digest, so nodes agree on a checkpoint only
 /// when they run the same rules. Version 5 leaves repaired originals out of the sealed set and
@@ -27,7 +26,8 @@ use smallclaims::store::checkpoint_agreement::*;
 /// Version 11 includes arrangement tables in the graph proof and rebuilds them during replay.
 /// Version 12 ages out the sekrets claims written before they became local observations.
 /// Version 13 retains status transitions selected by the reader after filtering stamped heartbeats.
-pub const RULES_VERSION: u32 = 13;
+/// Version 14 retains the predecessor of each incarnation's first visible status transition.
+pub const RULES_VERSION: u32 = 14;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -66,7 +66,7 @@ pub(crate) const REQUEST_CLOSERS: [&str; 3] = [
 /// A canonical description of every rule. The rules digest hashes it with `RULES_VERSION`.
 pub(crate) const RULES_DESCRIPTION: &str = "\
 harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field,current-native-auth-run-start
-seat.status-history slot=subject sources=exclude-status_transition-false-or-numeric-zero-heartbeats keep=last-200-transition-including-native-auth-and-runtime-reset-sources-within-7d-before-cut,current-state-run-start
+seat.status-history slot=subject sources=exclude-status_transition-false-or-numeric-zero-heartbeats keep=last-200-transition-including-native-auth-and-runtime-reset-sources-within-7d-before-cut,previous-transition-per-visible-incarnation-even-before-window,current-state-run-start
 harness.timeline slot=subject,incarnation_id keep=newest min-age-before-cut=5d
 loop.state slot=subject keep=first-and-last-of-each-run-of-status-and-round,first-with-items
 subscription.mission-deferred slot=subject,request keep=all-while-open,newest
@@ -464,9 +464,29 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
     for members in status_seats.values() {
         let sources = members.iter().map(|index| &claims[*index].claim).collect::<Vec<_>>();
         let positions = seat_status::transition_positions(&sources);
-        for position in positions.into_iter().rev()
+        let mut kept_positions = positions.iter().copied().rev()
             .filter(|position| seat_status::observation_time(sources[*position]) >= cut.saturating_sub(seat_status::WINDOW_MS))
-            .take(seat_status::MAX_TRANSITIONS) {
+            .take(seat_status::MAX_TRANSITIONS).collect::<BTreeSet<_>>();
+        // An unstamped boundary row emits only because its preceding effective state differs.
+        // Keeping the row alone can suppress it and expose an older retained transition instead.
+        // Preserve that context separately for each incarnation represented in the bounded read;
+        // the witness may fall outside the seven-day window. The reader still caps its answer.
+        let mut previous = BTreeMap::new();
+        let mut witnessed = BTreeSet::new();
+        for position in positions {
+            let source = sources[position];
+            let source_fields = source.body.get("fields").unwrap_or(&source.body);
+            let Some(incarnation) = source_fields.get("incarnation_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if kept_positions.contains(&position) && witnessed.insert(incarnation)
+                && let Some(predecessor) = previous.get(incarnation)
+            {
+                kept_positions.insert(*predecessor);
+            }
+            previous.insert(incarnation, position);
+        }
+        for position in kept_positions {
             status_keep.insert(members[position]);
             // A restored prompt exposes the most recent underlying harness state. Its source
             // can be hidden while the prompt is active, but still witnesses this transition.
@@ -998,7 +1018,12 @@ impl Store {
         };
         let checkpoint = checkpoint_name(cut);
         let seals = newest_seals(&claims, &checkpoint);
-        let Some((writer, terms)) = seals.first_key_value() else {
+        let (current, _) = self.checkpoint_participants(&claims, &[])?;
+        let runtime_rules = rules_digest();
+        let reference = seals.iter().find(|(writer, terms)| {
+            current.contains(*writer) && terms.rules_digest == runtime_rules
+        }).or_else(|| seals.iter().find(|(writer, _)| current.contains(*writer)));
+        let Some((writer, terms)) = reference else {
             return Ok(Vec::new());
         };
         let first_waiting = newest_stable.map_or_else(
@@ -1016,8 +1041,6 @@ impl Store {
         if as_of < since + CHECKPOINT_ATTENTION_AFTER_MS {
             return Ok(Vec::new());
         }
-        let left = self.checkpoint_left_writers()?;
-        let current = participants(&BTreeSet::new(), &left, &claims);
         let waiting = terms
             .participants
             .intersection(&current)

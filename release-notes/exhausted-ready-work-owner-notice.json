@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Send exhausted ready-work faults to their owning agent once",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild. Existing exhaustion diagnostics gain a keyed operational fault when their selected ready step is evaluated."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and canonical folds are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Uses existing operational.failure and fault-message contracts. No queue selection, wake resend, recipient permission or five-minute budget change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "None."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "The existing fault owner gets one actionable message for the step attempt, ready epoch and incarnation. The current fault disappears when the step is claimed, completed, released, reassigned or cancelled, or the seat stops or restarts. Historical evidence stays retained."
+  }
+}

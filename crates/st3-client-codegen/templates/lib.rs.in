@@ -1199,6 +1199,22 @@ impl Client {
         self.list_internal_with_filters("agents", cursor, limit, history, &[("status", status)])
             .await
     }
+    /// The agents list as of this request: the daemon waits briefly for a roster at least as
+    /// new as the request instead of answering from the newest one it has published.
+    pub async fn agents_list_fresh(
+        &self,
+        status: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        let mut filters = vec![("fresh", "true")];
+        if let Some(status) = status {
+            filters.push(("status", status));
+        }
+        self.list_internal_with_filters("agents", cursor, limit, history, &filters)
+            .await
+    }
     /// List only native sessions that are not already managed by st3.
     pub async fn sessions_list_native(
         &self,

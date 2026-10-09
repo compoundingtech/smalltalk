@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Read heal claim identities through covering indexes instead of retained payload pages",
+  "replay": {
+    "status": "none",
+    "detail": "This change adds indexes and selects them in heal range/subject queries; it does not invoke or change graph replay or recovery frontiers."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Schema version stays 17. Existing stores build claims_batch_claim_id(batch_id,id) and replica_records_repaired_claim(claim_id) WHERE state='repaired' during their first open with this build. Construction scans retained claims/records once; subsequent opens reuse the indexes. SQLite maintains the indexes on accepted writes, repair-state updates and deletion. No rows or existing indexes are removed."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, retention, ordering, digest domains, fleet coordination or admitted/repaired claim semantics change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, harness, scope, admission or replication protocol field changes. The retained pre-change SQL is an answer oracle for indexed reads; peers compare the same writer/sequence/claim digests."
+  },
+  "downtime": {
+    "status": "changed",
+    "detail": "For a populated schema-17 store missing these indexes, the first restart waits for index construction before store opening completes. Fleet-sized construction time and restart-to-API/health are unmeasured. Later reopens do not rebuild them. This change does not add a replay or a separate service restart."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "The normal store-open path builds both indexes automatically. Existing identities, claims, raw records and checkpoint state are preserved; no manual repair or data rewrite is required."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Swapping back to an otherwise supported schema-17 binary retains the extra indexes; a binary swap does not remove them or their write-maintenance cost. The pre-change query still returns the same identities. No new destructive migration or replay is introduced; use the existing normal upgrade/recovery lifecycle."
+  }
+}

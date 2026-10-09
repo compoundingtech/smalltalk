@@ -9,13 +9,15 @@ const STORES: usize = 64;
 const WINDOWS: usize = 64;
 const SESSION_WINDOWS: usize = 16;
 const KIND_LIMIT: usize = 10_000;
-const COLLECTIONS: [&str; 6] = [
+const COLLECTIONS: [&str; 8] = [
     "missions",
     "attention",
     "agents",
     "work",
     "glasses",
     "arrangements",
+    "summary",
+    "summary-missions",
 ];
 
 #[derive(Default)]
@@ -23,7 +25,7 @@ struct Revisions {
     index: u64,
     commits: u64,
     local: u64,
-    values: [u64; 6],
+    values: [u64; 8],
 }
 
 struct Cached {
@@ -56,6 +58,10 @@ pub(super) struct Prepared {
 }
 
 impl Prepared {
+    pub(super) fn try_admit(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.entry.admission.clone().try_lock_owned().ok()
+    }
+
     pub(super) async fn admit(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.entry.admission.clone().lock_owned().await
     }
@@ -241,10 +247,10 @@ impl Windows {
             .map(|position| revisions.values[position]))
     }
 
-    pub(super) fn changes(&self, store: &Store) -> anyhow::Result<[u64; 6]> {
+    pub(super) fn changes(&self, store: &Store) -> anyhow::Result<[u64; 8]> {
         let commits = self.commits();
         store.read_snapshot(|index| {
-            let mut values = [0; 6];
+            let mut values = [0; 8];
             for (position, collection) in COLLECTIONS.iter().enumerate() {
                 values[position] = self
                     .revision(store, index, collection, commits)?
@@ -256,7 +262,7 @@ impl Windows {
         })
     }
 
-    pub(super) fn changed(collection: &str, before: &[u64; 6], after: &[u64; 6]) -> bool {
+    pub(super) fn changed(collection: &str, before: &[u64; 8], after: &[u64; 8]) -> bool {
         COLLECTIONS
             .iter()
             .position(|name| *name == collection)
@@ -275,7 +281,7 @@ impl Windows {
         }).to_string()
     }
 
-    /// Reserve and await admission before opening SQLite or scheduling a blocking worker.
+    /// Reserve a window before gate admission and its physical SQLite query.
     pub(super) fn prepare(
         &self,
         state: &AppState,
@@ -291,7 +297,7 @@ impl Windows {
         Some(Prepared { key, entry })
     }
 
-    /// Called inside the authorized SQLite snapshot after async admission. Cache mutexes
+    /// Called inside the authorized SQLite snapshot after gate admission. Cache mutexes
     /// hold only Arc loads/stores; computation, serialization and deep clones run outside them.
     pub(super) fn read(
         &self,
@@ -312,6 +318,7 @@ impl Windows {
             self.builds.fetch_add(1, Ordering::SeqCst);
             compute()
         };
+        if request.collection == "summary" { return compute(); }
         let Some(prepared) = prepared else {
             return compute();
         };
@@ -333,7 +340,7 @@ impl Windows {
         // Attention and mission previews have wall-clock grace/expiry inputs. Agents receive live local overlays
         // below the cache. The period is shared across sockets, including their initial ticks.
         let period = match request.collection.as_str() {
-            "attention" | "missions" => now / ATTENTION_CLOCK_INTERVAL.as_millis(),
+            "attention" | "missions" | "summary" | "summary-missions" => now / ATTENTION_CLOCK_INTERVAL.as_millis(),
             // Work's deterministic selected projection time is itself an input, even if a
             // claim kind does not otherwise change its rows (elapsed budgets/lease expiry).
             "work" => state.store.projection_time_at(index)?,
@@ -349,12 +356,17 @@ impl Windows {
             && cached.revision == revision
             && cached.period == period
             && cached.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
+            && (request.collection != "summary-missions" || cached.items.first()
+                .and_then(|v| v["evaluated_at"].as_str()).and_then(|s| s.parse::<u128>().ok())
+                .is_some_and(|evaluated| evaluated <= now))
         {
             return Ok((cached.items.clone(), cached.has_more));
         }
         let (items, has_more) = compute()?;
         let valid_until_unix_ms = if request.collection == "agents" {
             state.store.agent_roster_valid_until(index)
+        } else if request.collection == "summary-missions" {
+            items.first().and_then(|v| v["valid_until"].as_str()).map(str::parse).transpose()?
         } else {
             None
         };
@@ -435,6 +447,32 @@ mod tests {
                 idempotency_key: None,
             })
             .unwrap();
+    }
+
+    #[test]
+    fn shared_windows_summary_inputs_observe_deadline_and_clock_regression() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let request = request("summary-missions");
+        let count = AtomicUsize::new(0);
+        let read = |now| {
+            let prepared = windows.prepare(&state, &session, &request);
+            let commits = windows.commits();
+            state.store.read_snapshot(|index| {
+                windows.read(&state, &session, &request, ReadFence {index, now, commits, prepared}, || {
+                    let n = count.fetch_add(1, Ordering::SeqCst);
+                    Ok((vec![json!({"evaluated_at":now.to_string(),"valid_until":"200","missions":[],"build":n})], false))
+                }).map(|(rows, _)| rows)
+            }).unwrap()
+        };
+        let first = read(100);
+        assert_eq!(read(199), first);
+        assert_ne!(read(99), first, "backward clocks cannot reuse future inputs");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_ne!(read(200), first, "expiry is exclusive even within the same clock period");
+        assert_eq!(count.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -859,17 +897,34 @@ mod tests {
         physical.abort(); // a started physical worker still owns admission
         let second = windows.prepare(&state, &session, &query).unwrap();
         let mut waiter = Box::pin(second.admit());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
-                .await
-                .is_err()
-        );
+        assert!(futures_util::poll!(&mut waiter).is_pending());
         // Drop the canceled async waiter: it has never opened a snapshot or a worker.
         drop(waiter);
-        assert!(second.entry.admission.clone().try_lock_owned().is_err());
+        assert!(second.try_admit().is_none());
         release.send(()).unwrap();
         physical.await.unwrap();
         let _guard = second.admit().await;
+    }
+
+    #[tokio::test]
+    async fn collection_window_try_admission_cannot_discard_a_queued_followers_grant() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let query = request("missions");
+        let first = windows.prepare(&state, &session, &query).unwrap();
+        let second = windows.prepare(&state, &session, &query).unwrap();
+        let holder = first.try_admit().unwrap();
+        let mut follower = Box::pin(second.admit());
+        assert!(futures_util::poll!(&mut follower).is_pending());
+        assert!(first.try_admit().is_none());
+        drop(holder);
+        assert!(first.try_admit().is_none(), "the queued follower owns the reserved grant");
+        let granted = follower.await;
+        assert!(first.try_admit().is_none());
+        drop(granted);
+        assert!(first.try_admit().is_some());
     }
 
     #[test]

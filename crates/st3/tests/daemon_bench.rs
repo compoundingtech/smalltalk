@@ -93,6 +93,7 @@ const READS: &[(&str, &str)] = &[
     ("attention list", "/v1/attention"),
     ("replication status", "/v1/replication/status"),
     ("usage", "/v1/usage"),
+    ("client usage", "/v1/client/usage"),
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -200,6 +201,7 @@ const PERSON_READS: &[(&str, &str)] = &[
     ("messages", "/v1/client/messages"),
     ("message read", "/v1/messages/read/{message}"),
     ("terminals", "/v1/client/terminals"),
+    ("client usage", "/v1/client/usage"),
 ];
 
 /// The load test that runs with every other test: thirty seats and a busy writer against a
@@ -663,13 +665,21 @@ pub(crate) fn fleet_subjects(store: &Store, seats: usize) -> Subjects {
             subjects.steps.push(step.subject.clone());
         }
     }
+    // Held seats have real desired bindings, on the remote host the benchmark never starts.
+    // An orphaned lease can then return to ready and be reclaimed through normal admission.
+    let mut source = "version 2\n".to_owned();
+    for seat in 0..seats {
+        source.push_str(&format!(
+            "agent \"bench/seat-{seat}\" {{\n  host \"bench-elsewhere\"\n  workspace \"/srv/bench/seat-{seat}\"\n  harness \"claude\" {{ }}\n}}\n"
+        ));
+    }
     // Each seat holds a step of its own, in a mission published for the benchmark.
-    let mut source = r#"version 2
-mission "bench/fleet" state="ready" {
+    source.push_str(
+        r#"mission "bench/fleet" state="ready" {
   goal "Keep one step leased per seat."
   concurrent-runs max=1000000
-"#
-    .to_owned();
+"#,
+    );
     for seat in 0..seats {
         source.push_str(&format!(
             "  step \"hold-{seat}\" {{ assigned-to \"agent/bench/seat-{seat}\" }}\n"
@@ -686,7 +696,9 @@ mission "bench/fleet" state="ready" {
             },
         )
         .unwrap();
-    let _ = store.apply(&intent, &planned.subject_tokens, "bench-fleet-mission");
+    store
+        .apply(&intent, &planned.subject_tokens, "bench-fleet-mission")
+        .unwrap();
     let run = store
         .create_mission_run(&MissionRunRequest {
             mission: "bench/fleet".into(),
@@ -734,6 +746,113 @@ mission "bench/fleet" state="ready" {
         .map(|seat| format!("agent/bench/seat-{seat}"))
         .collect();
     subjects
+}
+
+#[tokio::test]
+async fn held_seats_can_reclaim_after_orphan_repair() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open_memory(NODE).unwrap());
+    let subjects = fleet_subjects(&store, 2);
+    let run = store.step_run(&subjects.held[0].1).unwrap().unwrap().run;
+    let desired = store.desired_subjects_named(&subjects.seats).unwrap();
+    assert_eq!(desired.len(), subjects.seats.len());
+    assert!(desired.iter().all(|agent| {
+        agent.kind == "agent"
+            && agent
+                .member
+                .as_ref()
+                .is_some_and(|member| member.host == "bench-elsewhere")
+    }));
+    for (agent, step, incarnation) in &subjects.held {
+        assert_eq!(store.step_run(step).unwrap().unwrap().status, "claimed");
+        let mut exited = claim_input("runtime.observed", &format!("held-exited-{agent}"), 0, "");
+        exited.subject = agent.clone();
+        exited.actor = Some(agent.clone());
+        exited.fields.insert("status".into(), json!("exited"));
+        exited
+            .fields
+            .insert("incarnation_id".into(), json!(incarnation));
+        store.append_claim(&exited).unwrap();
+        assert!(
+            store
+                .work_claim_is_orphaned(&store.step_run(step).unwrap().unwrap())
+                .unwrap()
+        );
+    }
+    let state = root.path().join("state");
+    let pty = stub_pty(root.path());
+    let (events, _) = watch::channel(0_u64);
+    let reconciler = st3::reconcile::Reconciler::native(
+        store.clone(),
+        &state,
+        Some(&root.path().join("pty")),
+        &pty,
+        NODE.into(),
+        root.path().join("st3.sock").display().to_string(),
+        Arc::new(Notify::new()),
+        events,
+        None,
+    )
+    .unwrap();
+    reconciler.reconcile_once().unwrap();
+    for (_, step, _) in &subjects.held {
+        assert_eq!(store.step_run(step).unwrap().unwrap().status, "orphaned");
+    }
+    reconciler.reconcile_once().unwrap();
+    reconciler.reconcile_once().unwrap();
+    for (agent, step, incarnation) in &subjects.held {
+        let ready = store.step_run(step).unwrap().unwrap();
+        assert_eq!(ready.status, "ready");
+        assert!(ready.claimant.is_none());
+        let incarnation = format!("{incarnation}-restarted");
+        let mut running = claim_input(
+            "runtime.observed",
+            &format!("held-restarted-{agent}"),
+            0,
+            "",
+        );
+        running.subject = agent.clone();
+        running.actor = Some(agent.clone());
+        running.fields.insert("status".into(), json!("running"));
+        running
+            .fields
+            .insert("incarnation_id".into(), json!(incarnation));
+        store.append_claim(&running).unwrap();
+        let mut request = WorkRequest {
+            actor: Some(agent.clone()),
+            incarnation: Some(incarnation.clone()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: format!("held-reclaim-{agent}"),
+        };
+        assert!(
+            store
+                .work_action(step, "renew", &request)
+                .unwrap_err()
+                .message
+                .contains("active lease")
+        );
+        assert_eq!(
+            store.work_action(step, "claim", &request).unwrap().status,
+            "claimed"
+        );
+        request.idempotency_key = format!("held-renew-{agent}");
+        let renewed = store.work_action(step, "renew", &request).unwrap();
+        assert_eq!(renewed.status, "claimed");
+        assert_eq!(renewed.claimant.as_deref(), Some(agent.as_str()));
+        assert_eq!(
+            renewed.claim_incarnation.as_deref(),
+            Some(incarnation.as_str())
+        );
+    }
+    assert!(
+        store
+            .claims_for_subject_kind_at(&run, "operational.failure", None, false, 1)
+            .unwrap()
+            .claims
+            .is_empty()
+    );
 }
 
 fn short(error: &anyhow::Error) -> String {
@@ -1425,6 +1544,28 @@ fn generate(store: &Store, prefix: &str, scale: f64) {
                 }
                 "harness.timeline" => {
                     fields.insert("sequence".into(), Value::from(written as u64));
+                }
+                "harness.usage" => {
+                    // These are long-lived standing sessions, not a different mission step
+                    // on every observation. Changing synthetic ownership would turn each
+                    // cumulative reading into its own series and erase the history workload.
+                    fields.remove("owner_run");
+                    fields.remove("owner_step");
+                    let sample = *index / *subjects;
+                    let at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                    fields.extend(BTreeMap::from([
+                        ("semantics".into(), json!("response_rollup")),
+                        ("incarnation_id".into(), json!(format!("bench-{prefix}-usage"))),
+                        ("observed_at_unix_ms".into(), json!(at.saturating_sub(86_400_000).saturating_add(sample as u64 * 600_000))),
+                        ("total_tokens".into(), json!(sample as u64 * 1000)),
+                        ("input_tokens".into(), json!(sample as u64 * 800)),
+                        ("output_tokens".into(), json!(sample as u64 * 200)),
+                        ("cost_microusd".into(), json!(sample as u64 * 2000)),
+                        ("model".into(), json!("fixture-model")),
+                        ("account".into(), json!("fixture-account")),
+                        ("host".into(), json!(prefix)),
+                    ]));
                 }
                 _ => {}
             }

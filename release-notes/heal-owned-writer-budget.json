@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add opt-in managed writer transaction budgets and scoped test accounting without activating heal repair.",
+  "replay": {"status": "none", "detail": "No replay, heal, receive or repair route adopts this API. Existing full replay and its writer-hold gap remain unchanged. The following owner must explicitly qualify a complete repair/publication contract."},
+  "schema": {"status": "none", "detail": "No persistent schema, trigger, index or schema-version change."},
+  "rules": {"status": "none", "detail": "No checkpoint retention, proof, ordering, rules digest or seal change."},
+  "compatibility": {"status": "changed", "detail": "Additive Rust API for explicitly owned busy/progress policies and a managed BEGIN/prepare/work/finalizer/COMMIT budget. Existing constructors retain their handlers and refuse budgeting as unknown. Raw hook setters require explicit ownership invalidation; this is an owner contract, not unsafe handler introspection. Test-support scopes count completed statement work on their thread, including guard-return callbacks, independently of transaction interruption."},
+  "downtime": {"status": "unknown", "detail": "No extra startup gate. Normal deployment restarts still apply; restart-to-API/health and writer/read latency were not measured. Cooperative SQL interruption does not impose a hard fsync, rollback, Rust callback, queue wait or guard-return observer wall cap."},
+  "manual": {"status": "none", "detail": "No operator action or new production configuration. Handler ownership and any later runtime adoption are explicit source changes."},
+  "recovery": {"status": "none", "detail": "No new durable representation. Budget failure before COMMIT rolls back; a successful COMMIT is never reported as cancelled because later elapsed time or policy restoration failed. Failed restoration or unresolved rollback closes the writer to prevent reuse."}
+}

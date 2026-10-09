@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Answer agents first pages at once from the newest published roster; waiting for a roster at least as new as the request is opt-in",
+  "replay": {"status": "none", "detail": "No claim replay or stored history changes."},
+  "schema": {"status": "none", "detail": "No database schema, version or stored data changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."},
+  "compatibility": {"status": "changed", "detail": "GET /v1/client/agents first pages answer immediately from the newest published roster, with its cut and published_at, instead of waiting up to a second. A client that must see what was written before its read passes fresh=true. st agents ls and tree do; the Rust client gains agents_list_fresh. Older clients keep working and read instantly."},
+  "downtime": {"status": "none", "detail": "No additional service interruption or startup migration is required."},
+  "manual": {"status": "none", "detail": "No action is required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes; reverting restores the bounded wait on every first page."}
+}

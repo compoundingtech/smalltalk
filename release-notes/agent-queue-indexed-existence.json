@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Make per-agent queue reads avoid sorting and decoding observation history for the existence check.",
+  "replay": {"status": "none", "detail": "Queue joins and canonical move replay are unchanged; no claims are replayed during deployment."},
+  "schema": {"status": "none", "detail": "Reuses the existing indexed newest-claim ID lookup. No tables, indexes, migrations or database version changes."},
+  "rules": {"status": "none", "detail": "No claim rules or compatibility digest changes."},
+  "compatibility": {"status": "none", "detail": "The agent-queue HTTP response and missing-agent behavior are unchanged for a web client. No schema or generated-client change."},
+  "downtime": {"status": "none", "detail": "Normal deployment restart only; no backfill or startup work."},
+  "manual": {"status": "none", "detail": "No manual action required."},
+  "recovery": {"status": "none", "detail": "All queue data remains derived from current store reads, without a new cache. Rollback needs no data conversion."}
+}

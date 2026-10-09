@@ -19,6 +19,7 @@ use tokio::sync::{Notify, watch};
 
 const SUBJECT: &str = "agent/eval.codex-bootstrap";
 const RUNTIME: &str = "codex-bootstrap";
+const TERMINAL: &str = "pty/person/eval/019a0000-0000-7000-8000-000000000001";
 
 fn runtime_claim(store: &Store, status: &str, incarnation: Option<&str>) {
     let mut fields = BTreeMap::from([
@@ -57,6 +58,70 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
     if st3::test_support::supervise_test() {
         return;
     }
+    delivery_recovery_control(false, false, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mailbox_reconnect_preserves_provider_and_consumes_queued_mail_once() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    delivery_recovery_control(true, false, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bound_cold_codex_promotes_custody_delivers_once_and_returns_to_its_shell() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    delivery_recovery_control(true, true, Some(CompletionControl { order: "before", failure: false, rejection: None })).await;
+}
+
+#[derive(Clone, Copy)]
+struct CompletionControl {
+    order: &'static str,
+    failure: bool,
+    rejection: Option<&'static str>,
+}
+
+macro_rules! codex_completion_control {
+    ($name:ident, $order:literal, $failure:literal, $rejection:expr) => {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn $name() {
+            if st3::test_support::supervise_test() { return; }
+            delivery_recovery_control(true, true, Some(CompletionControl {
+                order: $order, failure: $failure, rejection: $rejection,
+            })).await;
+        }
+    };
+}
+
+codex_completion_control!(bound_codex_success_after_join_keeps_its_shell, "after", false, None);
+codex_completion_control!(bound_codex_failure_before_join_keeps_failure, "before", true, None);
+codex_completion_control!(bound_codex_failure_after_join_keeps_failure, "after", true, None);
+codex_completion_control!(bound_codex_foreign_token_after_terminal_stays_fenced, "before", false, Some("token"));
+codex_completion_control!(bound_codex_foreign_runtime_after_terminal_stays_fenced, "before", false, Some("runtime"));
+codex_completion_control!(bound_codex_foreign_invocation_after_terminal_stays_fenced, "before", false, Some("invocation"));
+
+fn lease_evidence(root: &Path) -> Value {
+    use sha2::{Digest as _, Sha256};
+    let connection = rusqlite::Connection::open(root.join("claims.sqlite3")).unwrap();
+    connection.query_row(
+        "SELECT provider,session,sequence,pid,process_token,token,epoch FROM local_mailbox_leases WHERE subject=?1 AND component='delivery'",
+        [SUBJECT], |row| {
+            let token: String = row.get(5)?;
+            Ok(json!({"provider":row.get::<_,String>(0)?,"session":row.get::<_,String>(1)?,
+                "sequence":row.get::<_,u64>(2)?,"pid":row.get::<_,u32>(3)?,"process_token":row.get::<_,String>(4)?,
+                "binding_hash":hex::encode(Sha256::digest(token.as_bytes())),"epoch":row.get::<_,u64>(6)?}))
+        },
+    ).unwrap()
+}
+
+async fn delivery_recovery_control(
+    mailbox_loss: bool,
+    bound_shell: bool,
+    completion: Option<CompletionControl>,
+) {
     use std::sync::atomic::AtomicBool;
     let path = std::env::var_os("PATH").unwrap_or_default();
     let on_path = |name: &str| {
@@ -64,12 +129,14 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
             .map(|dir| dir.join(name))
             .find(|p| p.is_file())
     };
-    let (Some(pty), Some(python)) = (on_path("pty"), on_path("python3")) else {
+    let (Some(pty), Some(python), Some(bash)) =
+        (on_path("pty"), on_path("python3"), on_path("bash"))
+    else {
         assert!(
             std::env::var_os("CI").is_none(),
-            "CI must provide pty and python3"
+            "CI must provide pty, python3 and bash"
         );
-        eprintln!("skipped: the delayed delivery proof needs pty and python3");
+        eprintln!("skipped: the delayed delivery proof needs pty, python3 and bash");
         return;
     };
     let root_path = tempfile::tempdir().unwrap().keep();
@@ -83,16 +150,53 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
     // Real driver publications run concurrently with views and mailbox reads. Use the
     // daemon's WAL storage; shared-memory fixtures return SQLITE_LOCKED on that mix.
     let store = Arc::new(Store::open(&root.join("claims.sqlite3"), "bootstrap").unwrap());
-    let source = format!(
+    let mut source = format!(
         "version 2\nagent \"eval.codex-bootstrap\" {{ host \"bootstrap\"; workspace {:?}; harness \"codex\" {{}} }}",
         root,
     );
-    store
-        .apply_internal(
-            &st3::graph::parse_intent(&source, "bootstrap").unwrap(),
-            "delayed-control",
+    if bound_shell {
+        source.push_str(&format!(
+            "\nterminal {:?} {{ command \"shell\"; restart \"never\"; }}\n",
+            TERMINAL.strip_prefix("pty/").unwrap(),
+        ));
+    }
+    if mailbox_loss {
+        source.push_str(&format!("\nmission \"mailbox-recovery\" state=\"ready\" {{ goal \"Keep queued work while a real native mailbox is deaf.\"; step \"queued\" {{ assigned-to \"{SUBJECT}\" }} }}\n"));
+    }
+    let intent = st3::graph::parse_intent(&source, "bootstrap").unwrap();
+    let plan = store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source,
+                source_name: None,
+            },
         )
         .unwrap();
+    store
+        .apply_as(
+            &intent,
+            &plan.subject_tokens,
+            "delayed-control",
+            Some("person/eval"),
+        )
+        .unwrap();
+    let queued = mailbox_loss.then(|| {
+        let run = store
+            .create_mission_run(&st3::model::MissionRunRequest {
+                mission: "mailbox-recovery".into(),
+                revision: None,
+                workspace: root.to_string_lossy().into_owned(),
+                requester: Some("person/eval".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "mailbox-recovery-run".into(),
+            })
+            .unwrap();
+        let subject = run.steps[0].subject.clone();
+        store.set_step_state(&subject, "ready", None).unwrap();
+        subject
+    });
     runtime_claim(&store, "starting", None);
     let delayed = Arc::new(AtomicBool::new(false));
     let reads = Arc::new(AtomicUsize::new(0));
@@ -112,18 +216,39 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
     };
     let delay = delayed.clone();
     let read_count = reads.clone();
+    let bootstrap_custody = Arc::new(std::sync::Mutex::new(None));
+    let capture = bootstrap_custody.clone();
+    let capture_root = root_path.clone();
     let app = st3::api::router(state).layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let delay = delay.clone();
             let read_count = read_count.clone();
+            let capture = capture.clone();
+            let capture_root = capture_root.clone();
             async move {
+                let bind = request.uri().path() == "/v1/mailbox/bind";
                 if request.uri().path() == "/v1/delivery/hold" && request.method() == "GET" {
                     read_count.fetch_add(1, Ordering::SeqCst);
                     if delay.load(Ordering::SeqCst) {
                         tokio::time::sleep(Duration::from_millis(350)).await;
                     }
                 }
-                next.run(request).await
+                let response = next.run(request).await;
+                if bind {
+                    let (parts, body) = response.into_parts();
+                    let bytes = to_bytes(body, 1024 * 1024).await.unwrap();
+                    if parts.status.is_success() {
+                        *capture.lock().unwrap() = Some(lease_evidence(&capture_root));
+                    } else {
+                        eprintln!(
+                            "isolated Codex bind refusal: {} {}",
+                            parts.status,
+                            String::from_utf8_lossy(&bytes)
+                        );
+                    }
+                    return axum::response::Response::from_parts(parts, Body::from(bytes));
+                }
+                response
             }
         },
     ));
@@ -155,11 +280,14 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
         .unwrap();
     let binary = binary_dir.path().join("st3-fixture");
     std::fs::copy(test_env!("CARGO_BIN_EXE_st3-fixture"), &binary).unwrap();
-    let environment = BTreeMap::from([
+    let mut environment = BTreeMap::from([
         ("HOME", root.to_string_lossy().into_owned()),
         ("PATH", path.to_string_lossy().into_owned()),
         ("ST_AGENT", SUBJECT.to_owned()),
-        ("ST3_SUBJECT", SUBJECT.to_owned()),
+        (
+            "ST3_SUBJECT",
+            if bound_shell { TERMINAL } else { SUBJECT }.to_owned(),
+        ),
         ("ST3_BIN", binary.to_string_lossy().into_owned()),
         ("ST3_ENDPOINT", socket.to_string_lossy().into_owned()),
         (
@@ -168,6 +296,12 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
         ),
         ("ST3_MAILBOX_TRANSPORT", "push".to_owned()),
     ]);
+    let barrier = root.join("completion-control");
+    if let Some(control) = completion {
+        std::fs::create_dir(&barrier).unwrap();
+        std::fs::write(barrier.join("order"), control.order).unwrap();
+        environment.insert("ST3_FIXTURE_TERMINAL_COMPLETION", barrier.to_string_lossy().into_owned());
+    }
     let launch_root = root.to_owned();
     let result = tokio::task::spawn_blocking(move || {
         let mut command = std::process::Command::new(pty);
@@ -180,16 +314,18 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
                 "--tag",
                 "keep=true",
                 "--tag",
-                &format!("st3.subject={SUBJECT}"),
+                &format!("st3.subject={}", if bound_shell { TERMINAL } else { SUBJECT }),
             ]);
         for (key, value) in environment {
             command.arg("--env").arg(format!("{key}={value}"));
         }
+        if bound_shell {
+            command.args(["--", bash.to_str().unwrap(), "--noprofile", "--norc", "-c",
+                "while [ ! -e \"$HOME/launch-bound-codex\" ]; do sleep 0.02; done; \"$ST3_BIN\" driver codex --subject \"$ST_AGENT\" -- \"$HOME/provider\"; printf '%s' \"$?\" > \"$HOME/driver-returned\"; while :; do sleep 1; done"]);
+        } else {
+            command.arg("--").arg(binary).args(["driver", "codex", "--subject", SUBJECT, "--"]).arg(provider);
+        }
         command
-            .arg("--")
-            .arg(binary)
-            .args(["driver", "codex", "--subject", SUBJECT, "--"])
-            .arg(provider)
             .output()
             .unwrap()
     })
@@ -200,28 +336,78 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    until(
-        || {
-            store
-                .latest_claim(SUBJECT, Some("harness.observed"))
-                .unwrap()
-                .is_some()
-        },
-        "the driver did not publish startup",
-    )
-    .await;
+    if !bound_shell {
+        until(
+            || {
+                store
+                    .latest_claim(SUBJECT, Some("harness.observed"))
+                    .unwrap()
+                    .is_some()
+            },
+            "the driver did not publish startup",
+        )
+        .await;
+    }
     let observation = runtime
         .snapshot()
         .unwrap()
         .into_iter()
         .find(|p| p.name == RUNTIME)
         .unwrap();
-    let incarnation = format!(
+    let physical_incarnation = format!(
         "{}:{}",
         observation.pid.unwrap(),
         observation.created_at.unwrap()
     );
+    let shell_pid = if bound_shell {
+        let stats: Value = serde_json::from_str(
+            &pty_core::registry::with_root(&root.join("pty"), || {
+                pty_client::query_status_json(RUNTIME, pty_client::STATS_TIMEOUT)
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stats["daemon"]["pid"].as_u64(),
+            observation.pid.map(u64::from)
+        );
+        assert_eq!(stats["process"]["alive"], true);
+        stats["process"]["pid"].as_u64().unwrap() as u32
+    } else {
+        observation.pid.unwrap()
+    };
+    let shell_generation = st_runtime::process_start_token(shell_pid).unwrap();
+    let incarnation = if bound_shell {
+        let invocation = "019a0000-0000-7000-8000-000000000004";
+        let source = format!(
+            "version 2\nagent \"eval.codex-bootstrap\" {{ harness \"codex\" {{}}; bind-terminal {TERMINAL:?} incarnation={physical_incarnation:?} id={invocation:?}; }}"
+        );
+        let intent = st3::graph::parse_intent(&source, "bootstrap").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                st3::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &plan.subject_tokens,
+                "bind-cold-codex",
+                Some("person/eval"),
+            )
+            .unwrap();
+        format!("{physical_incarnation}:bound:{invocation}")
+    } else {
+        physical_incarnation.clone()
+    };
     runtime_claim(&store, "running", Some(&incarnation));
+    if bound_shell {
+        std::fs::write(root.join("launch-bound-codex"), b"launch").unwrap();
+    }
     let client = st3::client::Client::unix(&socket);
     // The in-process API and fixture driver have different executable inodes. Establish
     // the healthy assessment first, so recovery must restore it exactly, including that
@@ -232,7 +418,13 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
             .get(&format!("/v1/client/agents/{SUBJECT}"))
             .await
             .unwrap();
-        if agent["delivery"]["state"] == "outdated" {
+        if agent["delivery"]["state"] == "outdated"
+            && lease_evidence(root)["sequence"].as_u64().unwrap() > 0
+            && matches!(
+                agent["harness_state"].as_str(),
+                Some("ready" | "idle" | "working")
+            )
+        {
             break agent;
         }
         assert!(
@@ -241,7 +433,47 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    delayed.store(true, Ordering::SeqCst);
+    let lease = lease_evidence(root);
+    assert!(lease["sequence"].as_u64().unwrap() > 0);
+    assert_eq!(lease["provider"], "codex");
+    let bootstrap = bootstrap_custody.lock().unwrap().clone().unwrap();
+    assert_eq!(bootstrap["sequence"], 0);
+    for field in ["pid", "process_token", "binding_hash", "epoch"] {
+        assert_eq!(lease[field], bootstrap[field], "promotion changed {field}");
+    }
+    if mailbox_loss {
+        st3::test_support::hold_fixture_mailbox(&store, SUBJECT, true);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let agent: Value = client
+                .get(&format!("/v1/client/agents/{SUBJECT}"))
+                .await
+                .unwrap();
+            if agent["fault"].is_string() {
+                assert_eq!(agent["driver"], "codex");
+                assert_eq!(agent["state"], "waiting");
+                assert_eq!(agent["harness_state"], "indeterminate");
+                assert_eq!(agent["next_work_id"].as_str(), queued.as_deref());
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "mailbox loss remained invisible: {agent}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let failures = store
+            .claims_for(SUBJECT, Some("operational.failure"))
+            .unwrap();
+        let fault = failures
+            .iter()
+            .find(|claim| claim.body["fields"]["condition"] == "mailbox-channel-lost")
+            .unwrap();
+        assert_eq!(fault.body["fields"]["reviewer"], "person/eval");
+        assert_eq!(fault.body["fields"]["incarnation"], incarnation);
+    } else {
+        delayed.store(true, Ordering::SeqCst);
+    }
     // Idle drivers do not poll control. Unread native mail must make the failed read visible.
     let receipt: st3::model::MessageSendReceipt = client
         .post(
@@ -260,24 +492,26 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let agent: Value = client
-            .get(&format!("/v1/client/agents/{SUBJECT}"))
-            .await
-            .unwrap();
-        if agent["delivery"]["state"] == "stale"
-            && agent["delivery"]["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.starts_with("delivery-control-unavailable:"))
-        {
-            assert_eq!(agent["state"], "waiting");
-            break;
+    if !mailbox_loss {
+        loop {
+            let agent: Value = client
+                .get(&format!("/v1/client/agents/{SUBJECT}"))
+                .await
+                .unwrap();
+            if agent["delivery"]["state"] == "stale"
+                && agent["delivery"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.starts_with("delivery-control-unavailable:"))
+            {
+                assert_eq!(agent["state"], "waiting");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "held seat lost its visible reason: {agent}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "held seat lost its visible reason: {agent}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let reference = receipt.message.subject;
     let receipts = root.join("receipts-agent-eval-codex-bootstrap.jsonl");
@@ -295,25 +529,64 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
             .count()
     };
     // Observe several further reads: healthy mailbox traffic cannot clear the block.
-    let before = reads.load(Ordering::SeqCst);
-    until(
-        || reads.load(Ordering::SeqCst) >= before + 4,
-        "control reads stopped retrying",
-    )
-    .await;
-    assert_eq!(offers(), 0, "a delayed response authorized native input");
-    let delivery: Value = client
-        .get(&format!("/v1/messages/delivery/{reference}"))
-        .await
-        .unwrap();
-    assert_eq!(delivery["delivery"]["state"], "waiting");
-    assert!(
-        delivery["delivery"]["reason"]
-            .as_str()
+    if !mailbox_loss {
+        let before = reads.load(Ordering::SeqCst);
+        until(
+            || reads.load(Ordering::SeqCst) >= before + 4,
+            "control reads stopped retrying",
+        )
+        .await;
+        assert_eq!(offers(), 0, "a delayed response authorized native input");
+        let delivery: Value = client
+            .get(&format!("/v1/messages/delivery/{reference}"))
+            .await
+            .unwrap();
+        assert_eq!(delivery["delivery"]["state"], "waiting");
+        assert!(
+            delivery["delivery"]["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("delivery-control-unavailable:")
+        );
+        delayed.store(false, Ordering::SeqCst);
+    } else {
+        let before = store
+            .claims_for(SUBJECT, Some("operational.failure"))
             .unwrap()
-            .starts_with("delivery-control-unavailable:")
-    );
-    delayed.store(false, Ordering::SeqCst);
+            .len();
+        store
+            .append_claim(&ClaimInput {
+                subject: SUBJECT.into(),
+                kind: "harness.observed".into(),
+                actor: Some(SUBJECT.into()),
+                fields: serde_json::from_value(
+                    json!({"state":"ready","driver":"codex","incarnation_id":incarnation}),
+                )
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: Some("superficial-mailbox-ready".into()),
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(offers(), 0, "a deaf mailbox handed input to the provider");
+        assert_eq!(
+            store
+                .claims_for(SUBJECT, Some("operational.failure"))
+                .unwrap()
+                .len(),
+            before
+        );
+        let agent: Value = client
+            .get(&format!("/v1/client/agents/{SUBJECT}"))
+            .await
+            .unwrap();
+        assert!(
+            agent["fault"].is_string(),
+            "superficial readiness erased the loss"
+        );
+        st3::test_support::hold_fixture_mailbox(&store, SUBJECT, false);
+    }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let status = store.message(&reference).unwrap().unwrap().status;
@@ -340,7 +613,8 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
             .get(&format!("/v1/client/agents/{SUBJECT}"))
             .await
             .unwrap();
-        if agent["delivery"]["state"] == healthy["delivery"]["state"]
+        if agent["fault"].is_null()
+            && agent["delivery"]["state"] == healthy["delivery"]["state"]
             && agent["delivery"]["reason"] == healthy["delivery"]["reason"]
         {
             break;
@@ -369,9 +643,162 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
             "duplicate {kind}"
         );
     }
+    if mailbox_loss {
+        assert_eq!(
+            lease_evidence(root),
+            lease,
+            "mailbox reconnect replaced the provider or capability"
+        );
+        let observation = runtime
+            .snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == RUNTIME)
+            .unwrap();
+        assert_eq!(
+            format!(
+                "{}:{}",
+                observation.pid.unwrap(),
+                observation.created_at.unwrap()
+            ),
+            physical_incarnation
+        );
+        let recovered = store
+            .claims_for(SUBJECT, Some("operational.recovered"))
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        let agent: Value = client
+            .get(&format!("/v1/client/agents/{SUBJECT}"))
+            .await
+            .unwrap();
+        assert_eq!(agent["driver"], "codex");
+        assert_eq!(agent["next_work_id"].as_str(), queued.as_deref());
+        std::fs::write(
+            root.join("mailbox-recovery-evidence.json"),
+            serde_json::to_vec_pretty(&json!({
+                "incarnation":incarnation,"lease":lease,"message":reference,"offers":offers(),
+                "recovered":recovered[0],"agent":agent,"queued_work":queued,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        eprintln!(
+            "isolated authenticated mailbox recovery: {}",
+            root.display()
+        );
+    }
+    if bound_shell {
+        assert_ne!(
+            lease["pid"].as_u64().unwrap(),
+            u64::from(shell_pid),
+            "bootstrap must admit the wrapper child, not the shell"
+        );
+        let ready: Value = std::fs::read_to_string(&receipts)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|row| row["event"] == "tui-ready")
+            .expect("original provider reached native readiness");
+        let pid = ready["pid"].as_u64().unwrap() as u32;
+        // Terminate only this model-free fixture's TUI; the wrapper's owned native exit
+        // must return to the same surviving physical shell.
+        assert!(
+            std::fs::read_to_string(format!("/proc/{pid}/environ"))
+                .unwrap()
+                .contains(root.to_str().unwrap())
+        );
+        let signal = if completion.is_some_and(|control| control.failure) { libc::SIGKILL } else { libc::SIGTERM };
+        assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0);
+        let mut terminal_result = Value::Null;
+        if let Some(control) = completion {
+            until(|| barrier.join("provider-return.json").exists(), "Codex provider result was not retained").await;
+            terminal_result = serde_json::from_slice(&std::fs::read(barrier.join("provider-return.json")).unwrap()).unwrap();
+            assert_eq!(terminal_result["ok"], !control.failure, "{terminal_result}");
+            until(|| barrier.join("observation-drained").exists(), "live Codex drain did not defer its owned terminal event").await;
+            assert_eq!(std::fs::read_to_string(barrier.join("observation-drained")).unwrap(), "deferred");
+            if control.order == "after" { std::fs::write(barrier.join("release-provider"), b"go").unwrap(); }
+            until(|| barrier.join("join-phase").exists(), "Codex JoinHandle phase was not observed").await;
+            assert_eq!(std::fs::read_to_string(barrier.join("join-phase")).unwrap(),
+                if control.order == "after" { "finished" } else { "pending" });
+            let latest = store.latest_claim(SUBJECT, Some("harness.observed")).unwrap().unwrap();
+            assert_ne!(latest.body["fields"]["state"], "ended", "terminal graph publication must wait for the task disposition");
+            let retained = lease_evidence(root);
+            assert_eq!(retained, lease, "completion does not reissue custody");
+            match control.rejection {
+                Some("token") => {
+                    let request = st3::mailbox::Fence::new(SUBJECT, &incarnation, "delivery");
+                    st3::test_support::bind_fixture_mailbox(&store, &request).unwrap();
+                }
+                Some("runtime") => {
+                    store.append_claim(&ClaimInput {
+                        subject: SUBJECT.into(), kind: "runtime.observed".into(), actor: Some("daemon/runtime".into()),
+                        fields: BTreeMap::from([("status".into(), json!("running")), ("incarnation_id".into(), json!("replacement-runtime"))]),
+                        evidence: vec![], expected_subject: None, idempotency_key: None,
+                    }).unwrap();
+                }
+                Some("invocation") => {
+                    let source = format!("version 2\nagent \"eval.codex-bootstrap\" {{ harness \"codex\" {{}}; bind-terminal {TERMINAL:?} incarnation={physical_incarnation:?} id=\"019a0000-0000-7000-8000-000000000005\"; }}");
+                    let intent = st3::graph::parse_intent(&source, "bootstrap").unwrap();
+                    let plan = store.mission(&intent, st3::model::IntentInput { kdl: source, source_name: None }).unwrap();
+                    store.apply_as(&intent, &plan.subject_tokens, "replace-codex-invocation", Some("person/eval")).unwrap();
+                }
+                None => {},
+                Some(other) => panic!("unknown completion rejection {other}"),
+            }
+            std::fs::write(barrier.join("poll-driver"), b"go").unwrap();
+            if control.order == "before" && control.rejection.is_none() {
+                std::fs::write(barrier.join("release-provider"), b"go").unwrap();
+            }
+            if control.rejection.is_some() {
+                // Prove the foreign fence is fatal while the provider JoinHandle is
+                // pending, then release the blocking fixture worker for shutdown.
+                until(|| barrier.join("fence-received").exists(), "foreign Codex fence was not accepted").await;
+                assert_eq!(std::fs::read_to_string(barrier.join("fence-received")).unwrap(), "pending");
+                std::fs::write(barrier.join("release-provider"), b"go").unwrap();
+            }
+        }
+        until(
+            || root.join("driver-returned").exists(),
+            "the bound wrapper did not return to its shell",
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(root.join("driver-returned")).unwrap(),
+            if completion.is_some_and(|control| control.failure || control.rejection.is_some()) { "2" } else { "0" }
+        );
+        if let Some(control) = completion {
+            if control.failure {
+                assert!(store.claims_for(SUBJECT, Some("harness.diagnostic")).unwrap().iter()
+                    .any(|claim| claim.body["fields"]["code"] == "codex-driver-failed"));
+            }
+            assert_eq!(offers(), 1, "terminal disposition must not replay native mail");
+            std::fs::write(root.join("codex-completion-evidence.json"), serde_json::to_vec_pretty(&json!({
+                "order":control.order,"failed_provider":control.failure,"foreign_fence":control.rejection,
+                "provider_result":terminal_result,"wrapper_exit":std::fs::read_to_string(root.join("driver-returned")).unwrap(),
+                "join_phase":std::fs::read_to_string(barrier.join("join-phase")).unwrap(),
+                "original_lease":lease,"offers":offers(),"same_shell_pid":shell_pid,"same_shell_birth":shell_generation,
+            })).unwrap()).unwrap();
+        }
+        assert_eq!(
+            st_runtime::process_start_token(shell_pid).unwrap(),
+            shell_generation
+        );
+        assert_eq!(
+            runtime
+                .snapshot()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.name == RUNTIME)
+                .unwrap()
+                .status,
+            "running"
+        );
+    }
     server.abort();
     drop(_cleanup);
-    std::fs::remove_dir_all(root).unwrap();
+    if !mailbox_loss {
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 async fn until(mut predicate: impl FnMut() -> bool, description: &str) {
@@ -415,6 +842,14 @@ async fn bootstrap_waits_for_reconciliation(status: &str, previous: Option<&str>
     let runtime = PtyRuntime::new(pty_root.clone()).with_binary(pty.to_string_lossy());
     let _cleanup = Cleanup(runtime.clone());
     let store = Arc::new(Store::open_memory("bootstrap").unwrap());
+    let source = format!(
+        "version 2\nagent \"eval.codex-bootstrap\" {{ host \"bootstrap\"; workspace {:?}; harness \"codex\" {{}} }}",
+        root.path()
+    );
+    let intent = st3::graph::parse_intent(&source, "bootstrap").unwrap();
+    store
+        .apply_internal(&intent, "bootstrap-declared-seat")
+        .unwrap();
     runtime_claim(&store, status, previous);
     let pending = Arc::new(AtomicUsize::new(0));
     let bound = Arc::new(AtomicUsize::new(0));
@@ -447,6 +882,9 @@ async fn bootstrap_waits_for_reconciliation(status: &str, previous: Option<&str>
                 let (parts, body) = response.into_parts();
                 let bytes = to_bytes(body, 1024 * 1024).await.unwrap();
                 let value: Value = serde_json::from_slice(&bytes).unwrap();
+                if !parts.status.is_success() {
+                    eprintln!("isolated Codex bootstrap refusal: {} {value}", parts.status);
+                }
                 if value["code"] == "mailbox-session-starting" {
                     pending.fetch_add(1, Ordering::SeqCst);
                 }

@@ -22,6 +22,15 @@ pub struct Extras {
     pub bodies: BTreeMap<String, (String, Option<String>, String)>,
     pub live: bool,
     pub offline: Option<String>,
+    /// Why the live stream to st is being replaced while st itself answers.
+    pub degraded: Option<String>,
+    /// Why a window has not loaded though st was asked (its source is not ready, or refused),
+    /// until it loads: the screen says so instead of showing a spinner forever.
+    pub window_errors: BTreeMap<String, String>,
+    /// Whether the missions window is followed and has loaded.
+    pub missions_followed: bool,
+    /// st's own counts, when it serves them.
+    pub summary: Option<st3_client::Summary>,
 }
 
 fn now() -> String {
@@ -38,6 +47,14 @@ fn loaded<T>(snapshot: bool, items: Vec<T>) -> Load<Vec<T>> {
         Load::Ready(items)
     } else {
         Load::Loading
+    }
+}
+
+/// `loaded`, but a window st keeps refusing says why rather than loading forever.
+fn loaded_or_why<T>(snapshot: bool, items: Vec<T>, why: Option<&String>) -> Load<Vec<T>> {
+    match (snapshot, why) {
+        (false, Some(why)) => Load::Failed(why.clone()),
+        _ => loaded(snapshot, items),
     }
 }
 
@@ -136,14 +153,34 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         .filter(|peer| peer.diverged_since.is_some())
         .map(|peer| peer.host_id.trim_start_matches("host/").to_owned())
         .collect();
+    let loaded_windows = [
+        ("Attention", model.now.snapshot.is_some()),
+        ("Agents", model.agents.snapshot.is_some()),
+        ("Missions", model.missions.snapshot.is_some()),
+    ];
+    let stale = extras
+        .window_errors
+        .iter()
+        .filter(|(name, _)| loaded_windows.iter().any(|(window, loaded)| *loaded && window == &name.as_str()))
+        .map(|(name, why)| format!("{name}: {why}"))
+        .chain(
+            extras
+                .degraded
+                .iter()
+                .map(|why| format!("live stream: {why} · st answers, reconnecting")),
+        )
+        .collect();
     World {
         person: person.to_owned(),
         host,
         link,
         diverged,
-        attention: loaded(model.now.snapshot.is_some(), attention),
-        agents: loaded(model.agents.snapshot.is_some(), agents(model, &missions)),
-        missions: loaded(model.missions.snapshot.is_some(), missions),
+        stale,
+        missions_followed: extras.missions_followed,
+        active_missions: extras.summary.as_ref().map(|summary| summary.active_missions as usize),
+        attention: loaded_or_why(model.now.snapshot.is_some(), attention, extras.window_errors.get("Attention")),
+        agents: loaded_or_why(model.agents.snapshot.is_some(), agents(model, &missions), extras.window_errors.get("Agents")),
+        missions: loaded_or_why(model.missions.snapshot.is_some(), missions, extras.window_errors.get("Missions")),
         machines: loaded(model.machines.snapshot.is_some(), machines(model)),
         worktrees: Load::Ready(super::demo::world().worktrees.items().to_vec()),
         devices: loaded(
@@ -834,6 +871,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn a_window_st_keeps_refusing_says_why_until_it_loads() {
+        let why = "st hit a problem: collection source is unavailable".to_owned();
+        // Not loaded, and st said why: the reason, not a spinner.
+        assert!(matches!(loaded_or_why::<u8>(false, Vec::new(), Some(&why)), Load::Failed(text) if text == why));
+        // Not loaded and nothing said: still loading. Loaded: the rows, whatever was said before.
+        assert!(matches!(loaded_or_why::<u8>(false, Vec::new(), None), Load::Loading));
+        assert!(matches!(loaded_or_why(true, vec![1u8], Some(&why)), Load::Ready(rows) if rows == vec![1u8]));
+    }
+
     const HARNESS_TAGS: &[&str] = &[
         "task-notification",
         "task-id",
@@ -1123,6 +1170,21 @@ mod tests {
             matches!(&bodies[..], [Body::Mail { body, .. }] if body == "is this a watcher?"),
             "{bodies:?}"
         );
+    }
+
+    #[test]
+    fn both_delivery_sentences_are_sts_notes_not_the_persons_words() {
+        for note in [
+            "The person reads replies in st, not in the agent's session.",
+            "Answer the person in this conversation; people have no inbox, so do not reply with st.",
+        ] {
+            let delivery = format!("<smalltalk-message id=\"e6\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/e6\">\nis this a watcher?\n</smalltalk-message>\n{note}");
+            let bodies = from_harness(true, &delivery, &BTreeSet::new());
+            assert!(
+                matches!(&bodies[..], [Body::Mail { body, .. }] if body == "is this a watcher?"),
+                "{note}: {bodies:?}"
+            );
+        }
     }
 
     #[test]
@@ -1574,6 +1636,39 @@ mod tests {
             truncated: false,
             sync: None,
         }
+    }
+
+    #[test]
+    fn a_stream_being_replaced_while_st_answers_is_never_called_offline() {
+        let model = Model::default();
+        let offline = Extras {
+            offline: Some("st stopped answering".into()),
+            ..Extras::default()
+        };
+        assert!(matches!(
+            world(&model, "person/avery", &offline).link,
+            Link::Offline(_)
+        ));
+        // st answered a fresh request: the link is being reopened, not down.
+        let degraded = Extras {
+            degraded: Some("st stopped answering".into()),
+            ..Extras::default()
+        };
+        assert!(matches!(
+            world(&model, "person/avery", &degraded).link,
+            Link::Connecting
+        ));
+        let live_degraded = Extras {
+            live: true,
+            degraded: Some("st closed the connection".into()),
+            ..Extras::default()
+        };
+        let live = world(&model, "person/avery", &live_degraded);
+        assert!(matches!(live.link, Link::Live));
+        assert_eq!(
+            live.stale,
+            ["live stream: st closed the connection · st answers, reconnecting"]
+        );
     }
 
     #[test]
