@@ -375,7 +375,7 @@ mission "orchard-crew" state="ready" {
         requester: Some("person/avery".into()), mode: Some("run".into()),
         inputs: BTreeMap::new(), idempotency_key: "orchard-crew-run".into(),
     }).unwrap();
-    for (subject, person) in [("custom/orchard-avery", "person/avery"), ("custom/orchard-robin", "person/robin")] {
+    for (subject, person) in [("custom/garden/review/v1/orchard-avery", "person/avery"), ("custom/garden/review/v1/orchard-robin", "person/robin")] {
         claim(store, subject, "custom.garden.review.v1.requested", Some("agent/garden/seed"),
             json!({"title":"Choose a seed", "detail":"Keep or discard", "recipient":person}));
     }

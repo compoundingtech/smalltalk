@@ -32,6 +32,7 @@ pub(crate) fn revision(revisions: &Revisions, collection: &str) -> u64 {
 
 impl PublishedViews {
     /// Count one more publication of `collection`'s view, after the refresher has swapped it in.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the missions, work and attention refreshers call it"))]
     pub(crate) fn publish(&self, collection: &str) {
         let Some(position) = position(collection) else {
             debug_assert!(false, "unknown published collection {collection}");
@@ -64,6 +65,7 @@ impl PublishedViews {
 impl Store {
     /// Say that `collection`'s refresher has swapped in a newer published view. Call it after
     /// every publication, including one at the same graph index after a deadline passed.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the missions, work and attention refreshers call it"))]
     pub(crate) fn publish_collection_view(&self, collection: &str) {
         self.smalltalk.published_views.publish(collection);
     }
