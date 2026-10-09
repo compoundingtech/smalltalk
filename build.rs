@@ -19,6 +19,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=AGENT_SPEC_REVISION");
     let mut explicit_clean_source = false;
     if let Some(rev) = git(&["rev-parse", "--short", "HEAD"]) {
+        let full_rev = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| rev.clone());
         let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
         explicit_clean_source = !dirty
             && std::env::var("AGENT_SPEC_REVISION")
@@ -31,7 +32,7 @@ fn main() {
         // Hand-assembled JSON: the short-sha is hex so no escaping is needed, and
         // this avoids a build-dependency just to serialize three fields.
         let stamp =
-            format!(r#"{{"type":"local","rev":"{rev}","commitTs":{commit_ts},"dirty":{dirty}}}"#);
+            format!(r#"{{"type":"local","rev":"{rev}","fullRev":"{full_rev}","commitTs":{commit_ts},"dirty":{dirty}}}"#);
         println!("cargo:rustc-env=ST_BUILD_STAMP_LOCAL={stamp}");
     }
     // Performance supplies the real full SHA for a clean checkout. Its value changes

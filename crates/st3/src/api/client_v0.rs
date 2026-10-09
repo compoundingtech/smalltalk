@@ -16,6 +16,8 @@ mod summary;
 
 #[cfg(test)]
 mod stream_start_tests;
+#[cfg(test)]
+mod agents_window_tests;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -429,6 +431,11 @@ async fn collection_items_with_windows(
                                 return Ok(Err(super::agent_roster_not_ready()));
                             }
                             None if admitted => None,
+                            // A selected projection is sufficient for a warm unfiltered
+                            // window. Do not discard its FIFO reader grant merely because
+                            // no complete roster has been folded.
+                            None if status.is_none()
+                                && client_agent_window_is_cached(&store, index, limit)? => None,
                             None => return Ok(Ok(None)),
                         },
                     }
@@ -473,15 +480,15 @@ async fn collection_items_with_windows(
                             client_attention_resources_at(&store, person.as_deref(), false, now)?
                         }
                         "agents" => {
-                            // Unfiltered windows keep one row past the limit for `has_more`.
+                            // Published cards already exist; a cold unfiltered window folds
+                            // only its visible cards and gets has_more from shallow membership.
                             let keep = if status.is_none() { limit + 1 } else { usize::MAX };
                             match &cached_agents {
                                 Some(cards) => cards.iter().take(keep).cloned().collect(),
-                                None => {
-                                    let mut cards = client_agent_resources_cached(&store, false, index)?;
-                                    cards.truncate(keep);
-                                    cards
+                                None if status.is_none() => {
+                                    return client_agent_window_cards(&store, index, limit);
                                 }
+                                None => client_agent_resources_cached(&store, false, index)?,
                             }
                         }
                         "work" => client_work_resources(
@@ -529,7 +536,7 @@ async fn collection_items_with_windows(
                     if let Some(status) = &status {
                         items.retain(|item| item["state"].as_str() == Some(status.as_str()));
                     }
-                    has_more = items.len() > limit;
+                    has_more |= items.len() > limit;
                     items.truncate(limit);
                 }
                 Ok(Ok(Some((snapshot, items, has_more))))
@@ -553,6 +560,27 @@ async fn collection_items_with_windows(
         items.truncate(end);
     }
     Ok((snapshot, items, has_more))
+}
+
+/// Membership and display order come from the existing shallow page refs. The next
+/// reference proves `has_more` without folding an invisible card.
+fn client_agent_window_cards(store: &Store, index: u64, limit: usize) -> anyhow::Result<(Vec<Value>, bool)> {
+    let refs = client_agent_page_refs(store, false, index)?;
+    let has_more = refs.len() > limit;
+    let selected = refs.iter().take(limit)
+        .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    Ok((client_agent_cards_selected(store, false, index, &selected, true)?, has_more))
+}
+
+fn client_agent_window_is_cached(store: &Store, index: u64, limit: usize) -> anyhow::Result<bool> {
+    let Some(refs) = store.agent_page_refs_cached_at(index, false) else {
+        return Ok(false);
+    };
+    let selected = refs.iter().take(limit)
+        .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    Ok(store.agent_resources_cached_at(index, false, Some(&selected))?.is_some())
 }
 
 fn collection_window_label(collection: &str) -> &'static str {
@@ -11172,6 +11200,59 @@ mission "queue-parity" state="ready" {
     }
 
     #[tokio::test]
+    async fn agent_lifecycle_declaration_updates_live_roster_rows() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let writer = state.clone();
+        let apply = |lifecycle: Option<&str>, key: &str| {
+            let field = lifecycle.map(|value| format!("lifecycle \"{value}\";")).unwrap_or_default();
+            let source = format!("version 2\nagent \"example/purpose\" {{ {field} command \"true\" }}");
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let planned = writer.store.mission(&intent, IntentInput {
+                kdl: source, source_name: None,
+            }).unwrap();
+            writer.store.apply(&intent, &planned.subject_tokens, key).unwrap();
+            signal_changed(&writer);
+        };
+        apply(Some("standing"), "lifecycle-initial");
+        let app = axum::Router::new().route("/stream", axum::routing::get(
+            move |upgrade: WebSocketUpgrade| {
+                let state = state.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| collection_stream_socket_with_reader(
+                        socket, state, ClientSession::local(None).unwrap(), None,
+                        |state, session, request, permit| async move {
+                            collection_items(&state, &session, &request, permit).await
+                        },
+                    ))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"lifecycle","collection":"agents","limit":2}).to_string().into(),
+        )).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["kind"], "snapshot");
+        assert_eq!(frame["items"][0]["lifecycle"], "standing");
+        for (lifecycle, key) in [(Some("owner"), "lifecycle-owner"), (Some("bounded"), "lifecycle-bounded"), (None, "lifecycle-removed")] {
+            apply(lifecycle, key);
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["kind"], "changes", "{frame}");
+            assert_eq!(frame["upserts"][0]["id"], "agent/example/purpose");
+            assert_eq!(frame["upserts"][0].get("lifecycle"), lifecycle.map(|value| json!(value)).as_ref());
+        }
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn agent_roster_warm_ws_read_bypasses_a_cold_builder_admission() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
@@ -11860,6 +11941,61 @@ mission "queue-parity" state="ready" {
         let (snapshot, Json(after)) = page().await.unwrap();
         assert_eq!(snapshot.0.store_index, index);
         assert!(!after.items[0]["last_activity_at"].is_null(), "{:?}", after.items[0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fresh_agent_roster_waits_only_for_claims_that_change_a_card() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/fresh-roster";
+        let append = |subject: &str, kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        append(subject, "runtime.observed", json!({"status":"running",
+            "runtime_id":"fresh-roster", "incarnation_id":"one"}));
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+        let revision = *published.borrow_and_update();
+        let (_, Json(before)) = client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(ClientListQuery::default())).await.unwrap();
+        let fresh = || async {
+            let started = std::time::Instant::now();
+            let (snapshot, Json(page)) = client_agents(State(state.clone()),
+                Extension(new_client_snapshot(&state)),
+                Query(ClientListQuery { fresh: true, ..ClientListQuery::default() })).await.unwrap();
+            (started.elapsed(), snapshot.0.store_index, page)
+        };
+
+        // Claims on subjects no card reads move the graph past the published cut. The paced
+        // refresher would publish the same cards, so a fresh read does not wait for it.
+        let cut = state.store.index().unwrap();
+        for marker in 0..3 {
+            append(&format!("custom/test/fresh-{marker}"), "custom.test.marker", json!({}));
+        }
+        assert!(state.store.index().unwrap() > cut);
+        assert!(state.store.published_agent_roster_unchanged_through(
+            state.store.index().unwrap(), false).unwrap());
+        let (waited, index, page) = fresh().await;
+        assert!(waited < Duration::from_millis(500), "waited {waited:?} for an unchanged roster");
+        assert_eq!(index, cut, "the unchanged roster is served under its own cut");
+        assert_eq!(page.items, before.items);
+
+        // A claim about the agent changes its card: the fresh read still waits for a roster
+        // at or after it, and shows it.
+        append(subject, "harness.observed", json!({"state":"working",
+            "driver":"codex", "incarnation_id":"one"}));
+        let written = state.store.index().unwrap();
+        assert!(!state.store.published_agent_roster_unchanged_through(written, false).unwrap());
+        let (_, index, page) = fresh().await;
+        assert_eq!(index, written);
+        assert_ne!(page.items, before.items, "the fresh read shows the claim it waited for");
+        assert!(*published.borrow_and_update() > revision);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -2277,7 +2277,7 @@ fn client_agent_page_refs_uncached(store: &Store, history: bool, index: u64) -> 
         let declaration = desired.get(&id);
         let name = crate::model::effective_agent_name(&id, declaration.map(|d| &d.desired));
         let queue = queues.get(&id).cloned().unwrap_or_default();
-        json!({
+        let mut reference = json!({
             "id":id, "name":name,
             "host_id":declaration.and_then(|d| d.member.as_ref()).map(|m| client_host_id(&m.host)),
             "current_work_ids":queue.current_work_ids, "active_work_count":queue.active_work_count,
@@ -2286,7 +2286,11 @@ fn client_agent_page_refs_uncached(store: &Store, history: bool, index: u64) -> 
             "current_work":queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
             "next_work":queue.next_work_id.as_ref().and_then(label),
             "upcoming_work":queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
-        })
+        });
+        if let Some(lifecycle) = crate::model::declared_agent_lifecycle(declaration.map(|d| &d.desired)) {
+            reference["lifecycle"] = json!(lifecycle);
+        }
+        reference
     }).collect::<Vec<_>>();
     refs.sort_by(|a, b| {
         a["name"]
@@ -2877,6 +2881,9 @@ fn client_agent_resources_from_status(
                     None
                 },
             });
+            if let Some(lifecycle) = crate::model::declared_agent_lifecycle(subject.desired.as_ref()) {
+                value["lifecycle"] = json!(lifecycle);
+            }
             if let Some((_, previous)) = changed.filter(|_| retain_queues)
                 && let Some(old) = previous.iter().find(|item| item["id"] == value["id"]) {
                 for field in AGENT_QUEUE_FIELDS {
@@ -4478,8 +4485,10 @@ fn client_agent_roster_head(store: &Store, index: u64) -> anyhow::Result<()> {
 }
 
 /// For a read that asked to see what was written before it: wait, briefly, for the refresher
-/// to publish a roster at or after the current cut. The read itself folds nothing.
-async fn wait_for_agent_roster(store: &Store, history: bool) {
+/// to publish a roster at or after the current cut, unless no claim since the newest
+/// publication changes a card, so that a refresh would fold nothing. The read itself folds
+/// nothing.
+async fn wait_for_agent_roster(store: &Arc<Store>, history: bool) {
     let Ok(wanted) = store.index() else { return };
     let published = |store: &Store| {
         let index = store.index().ok()?;
@@ -4491,6 +4500,14 @@ async fn wait_for_agent_roster(store: &Store, history: bool) {
     let mut publications = store.subscribe_agent_roster();
     let _ = tokio::time::timeout(AGENT_ROSTER_READ_WAIT, async {
         while published(store).is_none_or(|cut| cut < wanted) {
+            // Claims on unrelated subjects move the cut all the time; the paced refresher
+            // would publish the same cards. One bounded range read tells.
+            let reader = Arc::clone(store);
+            if let Ok(true) = blocking_store(move || {
+                reader.published_agent_roster_unchanged_through(wanted, history)
+            }).await {
+                return;
+            }
             store.request_fresh_agent_roster(history);
             if publications.changed().await.is_err() {
                 return;
@@ -6124,6 +6141,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "status": "ready",
         "node": state.node,
         "version": env!("CARGO_PKG_VERSION"),
+        "build": {"commit": st_drivers::version::build_commit()},
         "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
@@ -14238,13 +14256,24 @@ async fn work_action_response(
     // An exact retry returns the transaction's durable response even if the provider exited after
     // committing it. The store repeats this lookup under its mutation boundary; this early read
     // only prevents the live-incarnation precondition from breaking idempotent recovery.
-    if let Some(response) = state
+    if let Some(mut response) = state
         .store
         .cached_idempotency_response::<StepRunView>(&request.idempotency_key)
         .map_err(ApiError::internal)?
     {
         if let Some(input) = handoff.as_ref() {
             state.store.handoff_retry(&subject, input).map_err(ApiError::bad)?;
+        }
+        if action == "renew" {
+            // A renewal caches its view without the fields the writer no longer folds.
+            let store = state.store.clone();
+            response = blocking_action(move || {
+                store
+                    .enrich_work_response(&mut response)
+                    .map_err(|error| St3Error::new("store-read-failed", format!("{error:#}")))?;
+                Ok(response)
+            })
+            .await?;
         }
         return Ok(Json(response));
     }
@@ -16341,6 +16370,33 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         let removed = client_agent_page_refs(&state.store, false, index).unwrap();
         assert_eq!(removed.len(), 1, "a stopped undeclared runtime moves to history");
         assert_eq!(removed, client_agent_page_refs_uncached(&state.store, false, index).unwrap());
+    }
+
+    #[test]
+    fn agent_lifecycle_roster_tracks_current_declaration_without_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        for (version, lifecycle) in [None, Some("standing"), Some("owner"), Some("bounded"), None]
+            .into_iter().enumerate()
+        {
+            let field = lifecycle.map(|value| format!("lifecycle \"{value}\";")).unwrap_or_default();
+            let source = format!("version 2\nagent \"example/purpose\" {{ {field} command \"true\" }}");
+            let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+            let plan = store.mission(&intent, crate::model::IntentInput {
+                kdl: source, source_name: None,
+            }).unwrap();
+            store.apply(&intent, &plan.subject_tokens, &format!("lifecycle-{version}")).unwrap();
+            let index = store.index().unwrap();
+            for history in [false, true] {
+                let refs = client_agent_page_refs(store, history, index).unwrap();
+                let rows = checked_agent_cache(store, history, index);
+                let cards = client_agent_cards_for_page(store, history, index, &refs, "0").unwrap();
+                for row in refs.iter().chain(rows.iter()).chain(cards.iter()) {
+                    assert_eq!(row.get("lifecycle"), lifecycle.map(|value| json!(value)).as_ref());
+                }
+            }
+        }
     }
 
     #[test]
@@ -19067,6 +19123,27 @@ agent "good" {{ workspace {:?}; command "true" }}
             "pass",
             "remote placement alone is valid"
         );
+    }
+
+    #[tokio::test]
+    async fn health_build_commit_matches_version_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let (status, health) = get_request(app, "/v1/health").await;
+        assert_eq!(status, StatusCode::OK, "{health}");
+        assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+        let commit = health["build"]["commit"].as_str().unwrap();
+        assert_eq!(commit, st_drivers::version::build_commit());
+        let version = st_drivers::version::machine_version();
+        let revision = version.split_once('+').unwrap().1;
+        let revision = revision.strip_prefix("local.").unwrap_or(revision);
+        let revision = revision.strip_suffix(".dirty").unwrap_or(revision);
+        let revision = revision.strip_suffix("-dirty").unwrap_or(revision);
+        if revision == "dev" {
+            assert_eq!(commit, "unknown");
+        } else {
+            assert!(commit.starts_with(revision), "{version}: {commit}");
+        }
     }
 
     #[tokio::test]
