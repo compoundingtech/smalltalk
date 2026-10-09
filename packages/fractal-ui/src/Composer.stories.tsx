@@ -75,7 +75,7 @@ function typingDraft(mode: MentionMode): { readonly text: string; readonly draft
 const decided: ComposerPolicy = { layout: 'C2', running: 'R3', mentions: 'M2', target: 'K1' }
 const policyId = ({ layout, running, mentions, target }: ComposerPolicy) => `${layout} · ${running} · ${mentions} · ${target}`
 
-function ComposerFrame({ policy, state, effort, frameId, composerWidth }: { readonly policy: ComposerPolicy; readonly state: ComposerState; readonly effort: EffortSupport; readonly frameId: string; readonly composerWidth?: number }) {
+function ComposerFrame({ policy, state, effort, frameId, composerWidth, fill = false }: { readonly policy: ComposerPolicy; readonly state: ComposerState; readonly effort: EffortSupport; readonly frameId: string; readonly composerWidth?: number; readonly fill?: boolean }) {
   const [source] = React.useState(() => createComposerFixture(state, fixtureEffortControls[effort]))
   const snapshot = React.useSyncExternalStore(source.subscribe, source.getSnapshot, source.getSnapshot)
   const seeded = React.useMemo(() => state === 'typing multi-line' ? typingDraft(policy.mentions) : undefined, [state, policy.mentions])
@@ -85,14 +85,14 @@ function ComposerFrame({ policy, state, effort, frameId, composerWidth }: { read
     recipients, models, limitedMentions, allMentions, mentionHints, failure: snapshot.failure, offline: snapshot.offline,
     effortControl: snapshot.effortControl, queuedEffort: snapshot.queuedEffort,
   }), [snapshot, policy, source, seeded])
-  return <section aria-label={`${policyId(policy)} composer · ${state} · effort ${effort}${composerWidth === undefined ? '' : ` · ${composerWidth}px`}`} data-composer-frame={frameId} data-footer-budget-width={composerWidth} data-footer-budget-layout={composerWidth === undefined ? undefined : policy.layout} data-footer-budget-target={composerWidth === undefined ? undefined : policy.target} data-footer-budget-running={composerWidth === undefined ? undefined : policy.running} {...stylex.props(styles.frame, composerWidth !== undefined && styles.budgetFrame(composerWidth))}>
+  return <section aria-label={`${policyId(policy)} composer · ${state} · effort ${effort}${composerWidth === undefined ? '' : ` · ${composerWidth}px`}`} data-composer-frame={frameId} data-footer-budget-width={composerWidth} data-footer-budget-layout={composerWidth === undefined ? undefined : policy.layout} data-footer-budget-target={composerWidth === undefined ? undefined : policy.target} data-footer-budget-running={composerWidth === undefined ? undefined : policy.running} {...stylex.props(styles.frame, composerWidth !== undefined && styles.budgetFrame(composerWidth), fill && styles.fillFrame)}>
     <header {...stylex.props(styles.frameHeader)}>
       <h3 {...stylex.props(styles.frameTitle)}>{policyId(policy)}</h3>
       <span {...stylex.props(styles.caption)}>{state}</span>
       {snapshot.options.isRunning && <Button onPress={source.finish} {...stylex.props(styles.button)}>Finish run</Button>}
       {snapshot.offline && <Button onPress={source.reconnect} {...stylex.props(styles.button)}>Reconnect</Button>}
     </header>
-    <div {...stylex.props(styles.frameBody, composerWidth !== undefined && styles.budgetFrameBody)}>
+    <div {...stylex.props(styles.frameBody, composerWidth !== undefined && styles.budgetFrameBody, fill && styles.fillFrameBody)}>
       <ComposerSession draftKey={`kit-composer.${frameId}.${state}.${effort}`} {...session} />
       <div aria-label="Accepted fixture messages" role="log" {...stylex.props(styles.receipts)}>{snapshot.receipts.map((receipt, index) => {
         const serialized = receipt.message.runConfig?.custom?.embraceDraft as SerializedDraft | undefined
@@ -148,7 +148,7 @@ export const Geometry: StoryObj<ComposerArgs & { compareLayout?: boolean; compar
     ] as const
     const axis = axes.find(candidate => args[candidate.flag])
     const policy = { layout: args.layout, running: args.running, mentions: args.mentions, target: args.target }
-    return <Surface scheme={args.scheme}>{axis === undefined ? <div data-testid="composer-geometry-lane" {...stylex.props(styles.geometryLane(768))}><ComposerFrame policy={policy} state={args.state} effort={args.effort} frameId="single" /></div> : <section role="region" aria-label={axis.label}><div {...stylex.props(styles.gallery)}>{axis.choices.map(choice => <div key={choice} data-testid="composer-geometry-lane" {...stylex.props(styles.geometryLane(768))}><ComposerFrame policy={{ ...policy, [axis.field]: choice }} state={args.state} effort={args.effort} frameId={choice} /></div>)}</div></section>}</Surface>
+    return <Surface scheme={args.scheme}>{axis === undefined ? <div data-testid="composer-geometry-lane" {...stylex.props(styles.geometryLane(768), styles.geometryFill)}><ComposerFrame policy={policy} state={args.state} effort={args.effort} frameId="single" fill /></div> : <section role="region" aria-label={axis.label}><div {...stylex.props(styles.gallery)}>{axis.choices.map(choice => <div key={choice} data-testid="composer-geometry-lane" {...stylex.props(styles.geometryLane(768))}><ComposerFrame policy={{ ...policy, [axis.field]: choice }} state={args.state} effort={args.effort} frameId={choice} /></div>)}</div></section>}</Surface>
   },
 }
 
@@ -572,6 +572,11 @@ export const KitLabelResize: Story = {
     await expect(form.getBoundingClientRect().width).toBeCloseTo(width, 1)
     const footer = canvasElement.querySelector<HTMLElement>('[data-testid="composer-footer"]')!.getBoundingClientRect()
     await expect(footer.right).toBeLessThanOrEqual(form.getBoundingClientRect().right + 1)
+    // Leave the fixture at its short initial label, so external geometry gates measure the real growth.
+    await userEvent.click(within(canvasElement).getByRole('button', { name: 'Change recipient label' }))
+    await waitFor(() => expect(canvasElement.querySelector('[data-composer-target-readout]')).toHaveAttribute('data-composer-target-readout', 'Me'))
+    await settle()
+    await expect(form.getBoundingClientRect().width).toBeCloseTo(width, 1)
   },
 }
 
@@ -617,6 +622,10 @@ const styles = stylex.create({
   root: { minHeight: '100vh', width: '100%', boxSizing: 'border-box', padding: s.xl, display: 'flex', flexDirection: 'column', gap: s.xl, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading },
   lane: { width: '100%', maxWidth: g.modalMax, display: 'flex', flexDirection: 'column', gap: s.md },
   geometryLane: (width: number) => ({ width, maxWidth: '100%', minWidth: 0 }),
+  // The single geometry preview fills the viewport like the reviewed single preview, so popovers open above a bottom-anchored composer.
+  geometryFill: { flexGrow: 1, minHeight: 0, display: 'flex', flexDirection: 'column' },
+  fillFrame: { flexGrow: 1, minHeight: 0 },
+  fillFrameBody: { flexGrow: 1, justifyContent: 'flex-end' },
   narrow: { width: g.tooltipMax, minWidth: 0 },
   gallery: { display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: s.xl },
   budgetPreviews: { display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: s.md },
