@@ -186,7 +186,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                   </div>
                 ) : null}
                 <div {...stylex.props(styles.body)}>
-                  <WorkspaceBody current={current} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} />
+                  <WorkspaceBody current={current} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />
                 </div>
               </section>
               {diffOpen && openedTool === undefined && current !== '' ? (
@@ -218,9 +218,9 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
 }
 
 /** The selected tab decides the body; a non-thread pane never falls back to the transcript. */
-export function WorkspaceBody({ current, view, agentName, onOpenTool }: { readonly current: string; readonly view: WorkspaceView; readonly agentName: string; readonly onOpenTool: (call: WorkLogCall) => void }) {
+export function WorkspaceBody({ current, view, agentName, onOpenTool, ux }: { readonly current: string; readonly view: WorkspaceView; readonly agentName: string; readonly onOpenTool: (call: WorkLogCall) => void; readonly ux?: UxTelemetry }) {
   if (current === '') return <div {...stylex.props(styles.empty)}>Choose an agent to open its live thread.</div>
-  if (view._tag === 'Thread') return <ConversationPane key={current} agentRef={current} agentName={agentName} onOpenTool={onOpenTool} />
+  if (view._tag === 'Thread') return <ConversationPane key={current} agentRef={current} agentName={agentName} onOpenTool={onOpenTool} ux={ux} />
   return <p role="status" {...stylex.props(styles.empty)}>{workspaceViewNotice(view)}</p>
 }
 

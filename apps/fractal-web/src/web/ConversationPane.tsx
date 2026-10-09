@@ -7,19 +7,22 @@ import { createConversationTranscript, openableImageUrl, transcriptObservedAt, t
 import { composerSendBinding, type SendRefusal } from './composerSend.ts'
 import { spaceVars } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 import { LiveAgentTodos } from '../conversation/todos/AgentTodos.tsx'
+import type { UxTelemetry } from '../telemetry/ux.ts'
 
-/** The selected follow owns content; the gated kit composition owns every rendered element,
- * including the first-observation skeleton, the availability state and the older-history row. */
+/** The follow owns content and the kit owns its presentation. The display-contents host
+ * boundary observes asynchronous runtime adoption without inventing a kit commit hook. */
 export const ConversationPane = ({
   agentRef,
   agentName,
   onOpenTool,
+  ux,
 }: {
   readonly agentRef: string
   /** Roster display name: the composition header and assistant sender captions. */
   readonly agentName: string
   /** Host-owned detail surface for a tool call opened from the transcript. */
   readonly onOpenTool: (call: WorkLogCall) => void
+  readonly ux?: UxTelemetry
 }) => {
   const source = useDataSource()
   const showSystemEvents = useAtomValue(systemEventsPreference)
@@ -32,6 +35,28 @@ export const ConversationPane = ({
   const observation = useConversationSync(agentRef)
   const projectTranscript = React.useMemo(createConversationTranscript, [])
   const state = projectTranscript(feed, { agentName, showSystemEvents })
+  const boundary = React.useRef<HTMLDivElement>(null)
+  const content = state._tag !== 'Observed' ? 'waiting' : state.turns.length === 0 ? 'empty' : 'turns'
+  React.useLayoutEffect(() => {
+    const node = boundary.current
+    if (node === null || ux === undefined || content === 'waiting') return
+    let cancelPaint: (() => void) | undefined
+    const committed = () => {
+      if (cancelPaint !== undefined) return
+      const lane = node.querySelector('[data-testid="transcript-scroll"]')
+      if (lane === null || lane.querySelector('[data-testid="transcript-placeholder"]') !== null) return
+      const selector = content === 'turns' ? '[data-testid="transcript-turn"]' : '[data-testid="transcript-empty"]'
+      if (lane.querySelector(selector) === null) return
+      cancelPaint = ux.transcriptCommitted(agentRef)
+      observer.disconnect()
+    }
+    // The external-store runtime adopts messages after the parent's layout commit.
+    // Observe only this visible pane, and stop after its first real content commit.
+    const observer = new MutationObserver(committed)
+    observer.observe(node, { childList: true, subtree: true })
+    committed()
+    return () => { observer.disconnect(); cancelPaint?.() }
+  }, [agentRef, content, ux])
   const grants = useGrants()
   const [refusal, setRefusal] = React.useState<SendRefusal>()
   const binding = composerSendBinding({
@@ -41,7 +66,7 @@ export const ConversationPane = ({
     refusal, onRefused: setRefusal,
   })
   const retryConversation = source.retryConversation
-  return <div style={{ display: 'contents' }}
+  return <div ref={boundary} style={{ display: 'contents' }}
     data-wf-unavailable={state._tag === 'Unavailable' ? state.classification : undefined}
     data-wf-unavailable-code={state._tag === 'Unavailable' ? state.code : undefined}>
     <EmbraceRuntimeProvider key={agentRef} options={{ ...binding.runtime, isRunning: state._tag === 'Observed' && state.isRunning }}>

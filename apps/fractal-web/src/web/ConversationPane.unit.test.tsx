@@ -191,14 +191,14 @@ describe('ConversationPane kit composition', () => {
     expect(html).toContain('data-testid="transcript-scroll"')
   })
 
-  it('adds only a layout-neutral diagnostics wrapper, no styling, and is mounted by the workspace', () => {
+  it('owns only the structural commit boundary, not transcript presentation', () => {
     const pane = readFileSync(new URL('./ConversationPane.tsx', import.meta.url), 'utf8')
     expect(pane).not.toMatch(/stylex\.props|className/)
     expect(pane.match(/<[a-z][a-z\d]*(?:\s|>)/g)).toEqual(['<div ', '<div ', '<div '])
     expect(pane).toContain("style={{ display: 'contents' }}")
     const workspace = readFileSync(new URL('./LiveAgentWorkspace.tsx', import.meta.url), 'utf8')
-    expect(workspace).toContain('<WorkspaceBody current={current} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} />')
-    expect(workspace).toContain('<ConversationPane key={current} agentRef={current} agentName={agentName} onOpenTool={onOpenTool} />')
+    expect(workspace).toContain('<WorkspaceBody current={current} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />')
+    expect(workspace).toContain('<ConversationPane key={current} agentRef={current} agentName={agentName} onOpenTool={onOpenTool} ux={ux} />')
     expect(workspace).not.toContain('This subject has no available native view.')
   })
 })

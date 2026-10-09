@@ -163,6 +163,15 @@ remote site. With CSP enforced the route is never reached and `img-src` reports
 the violation. Browser sessions, listeners and temporary build files are closed
 and removed on exit. There is no production CSP-disable switch.
 
+## Fractal web transcript switch paint
+
+The conversation pane reports `ux.transcriptCommitted(ref)` only after its scoped DOM
+contains real turns or the authoritative empty state, without a loading placeholder.
+The external-store runtime adopts messages asynchronously; feed arrival alone is not a
+commit. The pane observes that adoption inside a display-contents host boundary and cancels
+its pending paint when hidden or unmounted. Telemetry completes after rAF plus MessageChannel,
+not inside render.
+
 ## Fractal web captured changes
 
 The Changes panel reuses `source.conversation(agentRef)`: its live source follows

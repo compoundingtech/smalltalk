@@ -15,6 +15,8 @@ import type { FeedSyncObservation } from '../data/feedSync.ts'
 import { Markdown, type WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
 import type * as Kit from '@smalltalk/fractal-ui/assistant-ui'
 import type { ConversationRuntimeOptions, TranscriptTurn } from '@smalltalk/fractal-ui/assistant-ui'
+import { Tracer } from 'effect'
+import { makeUxTelemetry, type UxTelemetry } from '../telemetry/ux.ts'
 
 // The kit compiles StyleX at build time; node tests stub only the CSS runtime, never data hooks.
 vi.mock('@stylexjs/stylex', () => ({
@@ -115,9 +117,9 @@ afterEach(async () => {
 
 const opened: WorkLogCall[] = []
 
-const mount = async () => {
+const mount = async (ux?: UxTelemetry) => {
   await act(async () => {
-    root!.render(<ConversationPane agentRef="agent/selected" agentName="Example Agent" onOpenTool={call => opened.push(call)} />)
+    root!.render(<ConversationPane agentRef="agent/selected" agentName="Example Agent" onOpenTool={call => opened.push(call)} ux={ux} />)
   })
 }
 
@@ -256,6 +258,42 @@ describe('ConversationPane composition activation', () => {
     await mount()
     expect(source.runtimeItems.at(-1)).not.toBe(idleItems)
     expect(text()).toContain('Revised prompt')
+  })
+
+  it.each(['turns', 'empty'] as const)('closes a switch after %s commit, never on the loading placeholder', async kind => {
+    const paints = new Set<() => void>()
+    const ended: Tracer.Span[] = []
+    const tracer = Tracer.make({ span: options => {
+      const span = Tracer.nativeTracer.span(options)
+      const end = span.end.bind(span)
+      span.end = (at, exit) => { end(at, exit); ended.push(span) }
+      return span
+    } })
+    const ux = makeUxTelemetry({ tracer: () => tracer, paint: callback => {
+      paints.add(callback)
+      return () => { paints.delete(callback) }
+    } })
+    try {
+      ux.beginSwitch({ ref: 'agent/selected', warm: false, slotCount: 1 })
+      source.feed = { _tag: 'Waiting' }
+      source.sync = { status: { _tag: 'Requested', since: 990 }, observedAt: 990 }
+      await mount(ux)
+      expect(container.querySelector('[data-testid="transcript-placeholder"]')).not.toBeNull()
+      expect(paints.size).toBe(0)
+      source.feed = { _tag: 'Observed', freshness: 'live', value: {
+        items: kind === 'turns' ? scenario : [], hasOlder: false, observation: { empty: kind === 'empty' },
+      } }
+      source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+      await mount(ux)
+      expect(container.querySelector('[data-testid="transcript-placeholder"]')).toBeNull()
+      expect(container.querySelector(`[data-testid="transcript-${kind === 'turns' ? 'turn' : 'empty'}"]`)).not.toBeNull()
+      expect(paints.size).toBe(1)
+      expect(ended.find(span => span.name === 'wf.ux.switch')).toBeUndefined()
+      for (const paint of paints) paint()
+      expect(ended.find(span => span.name === 'wf.ux.switch')?.attributes.get('wf.ux.painted')).toBe(true)
+    } finally {
+      ux.dispose()
+    }
   })
 
   it('reproduces the reference transcript for a scenario native page', async () => {
