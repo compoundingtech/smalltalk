@@ -832,7 +832,9 @@ impl Store {
                         accepted_at_unix_ms: row
                             .get::<_, String>(3)?
                             .parse()
-                            .unwrap_or(u128::MAX),
+                            .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                                3, rusqlite::types::Type::Text, Box::new(error),
+                            ))?,
                         records: row.get(4)?,
                     })
                 })?
@@ -895,7 +897,9 @@ impl Store {
         keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         let mut late = BTreeSet::new();
         for (key, _) in &keyed {
-            if key.1.parse::<u128>().unwrap_or_default() >= cut_unix_ms {
+            let accepted_at_unix_ms = key.1.parse::<u128>()
+                .with_context(|| format!("invalid accepted time for checkpoint claim {}", key.6))?;
+            if accepted_at_unix_ms >= cut_unix_ms {
                 late.insert(EnvelopeKey {
                     writer: key.7.clone(),
                     sequence: key.8,

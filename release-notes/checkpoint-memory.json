@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "none",
-    "detail": "No wire or response-shape change. Checkpoint agreement and reader-equivalence contracts are unchanged. Metadata and bodies are captured from one consistent snapshot, including while another checkpoint trim commits."
+    "detail": "No wire or response-shape change. Checkpoint agreement and reader-equivalence contracts are unchanged. Metadata and bodies are captured from one consistent snapshot, including while another checkpoint trim commits. Malformed accepted times now fail capture at the metadata pass rather than silently counting as early or excluding an envelope."
   },
   "downtime": {
     "status": "unknown",
