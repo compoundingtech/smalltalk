@@ -6,10 +6,10 @@ fn sent_messages(state: &AppState, accepted_at: u128) {
         state.store.append_claim(&ClaimInput {
             subject: format!("message/cursor-binding-{index}"),
             kind: "message.sent".into(),
-            actor: Some("person/cursor-sender".into()),
+            actor: Some("person/sender".into()),
             fields: BTreeMap::from([
-                ("from".into(), json!("person/cursor-sender")),
-                ("to".into(), json!("person/cursor-recipient")),
+                ("from".into(), json!("person/sender")),
+                ("to".into(), json!("person/recipient")),
                 ("content".into(), json!(format!("cursor binding body {index}"))),
                 ("status".into(), json!("sent")),
             ]),
@@ -52,7 +52,7 @@ async fn message_cursor_rejects_forged_before_index_without_leaking_later_writes
     state.store.append_claim(&ClaimInput {
         subject: "message/cursor-binding-1".into(),
         kind: "message.read".into(),
-        actor: Some("person/cursor-recipient".into()),
+        actor: Some("person/recipient".into()),
         fields: BTreeMap::from([("status".into(), json!("read"))]),
         evidence: Vec::new(), expected_subject: None, idempotency_key: None,
     }).unwrap();

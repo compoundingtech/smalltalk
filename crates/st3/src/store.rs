@@ -18943,7 +18943,19 @@ fn desired_row_at(
     let Some(at_index) = at_index else {
         return current_desired_row(connection, subject);
     };
-    if owned_sets::owner(connection, subject, Some(at_index)).map_err(anyhow::Error::new)?.is_some() {
+    // Owned sets admit only top-level agents, missions and schedules, never messages.
+    // Keep the hot message-page path on the desired primary key; older cuts only
+    // fold this subject's declaration claims, not every owned-set receipt.
+    if subject.starts_with("message/") {
+        if let Some(row) = current_desired_row(connection, subject)? {
+            let unchanged: bool = connection.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM claims INDEXED BY claims_subject_kind_index
+                 WHERE subject=?1 AND kind='intent.desired' AND store_index>?2)",
+                params![subject,at_index], |row| row.get(0),
+            )?;
+            if unchanged { return Ok(Some(row)); }
+        }
+    } else if owned_sets::owner(connection, subject, Some(at_index)).map_err(anyhow::Error::new)?.is_some() {
         return owned_sets::desired_at(connection, subject, at_index);
     }
     let mut statement = connection.prepare_cached(&canonical_sql(

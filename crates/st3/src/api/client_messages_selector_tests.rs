@@ -8,7 +8,7 @@ use std::hint::black_box;
 const LIMIT: usize = 20;
 const SAMPLES: usize = 5;
 const BASE_TIME: u128 = 1_800_000_000_000;
-const PERSON: &str = "person/selector-alex";
+const PERSON: &str = "person/alex";
 const ACTOR: &str = "agent/selector-narrow";
 const METADATA: usize = 32;
 
@@ -494,8 +494,8 @@ fn all_selector_page_items(store: &Store, case: Case) -> Vec<Value> {
 
 fn assert_complete_selector_pages_match_oracle(store: &Store) {
     for case in CASES.into_iter().chain([
-        Case { name: "edited_person_history", person: Some("person/edited"), actor: None, history: true },
-        Case { name: "edited_person_open", person: Some("person/edited"), actor: Some("agent/edited"), history: false },
+        Case { name: "edited_person_history", person: Some("person/blair"), actor: None, history: true },
+        Case { name: "edited_person_open", person: Some("person/blair"), actor: Some("agent/edited"), history: false },
     ]) {
         let expected = client_message_resources_at(store, case.person, case.history, case.actor,
             BASE_TIME + 100_000).unwrap();
@@ -517,7 +517,7 @@ fn client_messages_selector_claim_edits_and_deletes_match_fresh_canonical_pages(
         let mut writer = store.connection.write();
         let tx = writer.transaction().unwrap();
         tx.execute(
-            "UPDATE claims SET body=json_set(body,'$.fields.from','agent/edited','$.fields.to','person/edited','$.fields.content','edited canonical content','$.fields.tags',json('[\"reminder:mutation\",\"version:18446744073709551615\"]')) WHERE subject=?1",
+            "UPDATE claims SET body=json_set(body,'$.fields.from','agent/edited','$.fields.to','person/blair','$.fields.content','edited canonical content','$.fields.tags',json('[\"reminder:mutation\",\"version:18446744073709551615\"]')) WHERE subject=?1",
             [subject(0)],
         ).unwrap();
         tx.execute(
@@ -535,7 +535,7 @@ fn client_messages_selector_claim_edits_and_deletes_match_fresh_canonical_pages(
         "SELECT sender,recipient,reminder,version,global_current,recipient_current FROM local_client_message_selectors_v1 WHERE subject=?1 AND born_index>=0 AND retired_index IS NULL",
         [subject(0)], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
     ).unwrap();
-    assert_eq!(header, ("agent/edited".into(), "person/edited".into(), "mutation".into(),
+    assert_eq!(header, ("agent/edited".into(), "person/blair".into(), "mutation".into(),
         "18446744073709551615".into(), true, true));
     assert_eq!(page(&edited, CASES[1], edited.index().unwrap(), None).subjects[0], subject(7),
         "accepted-time edit must move the header before tied arrivals");
@@ -580,6 +580,7 @@ fn apply_declared_selector_fixture(store: &Store, count: usize) {
         kdl: source, source_name: None,
     }).unwrap();
     store.apply(&intent, &mission.subject_tokens, "selector-declared-fixture").unwrap();
+    while store.maintain_client_message_selectors().unwrap() {}
 }
 
 #[test]
@@ -644,10 +645,12 @@ fn client_messages_selector_canonical_settlement_replay_commits_usable_declared_
     store.connection.write().execute("DELETE FROM meta WHERE key='canonical_replay_settled'", []).unwrap();
     assert!(store.settle_runs_for_canonical_replay().unwrap().is_empty());
     assert!(store.client_messages_cut_epoch().unwrap() > epoch, "settlement must actually replay declarations");
-    assert!(!store.readers.get().query_row(
-        "SELECT EXISTS(SELECT 1 FROM local_client_message_selectors_v1 WHERE born_index=-1)",
-        [], |row| row.get::<_, bool>(0),
-    ).unwrap(), "successful settlement must drain selector maintenance before commit");
+    // Settlement itself is bounded; the committed old frontier remains usable
+    // while its remaining declarations are folded in later transactions.
+    assert_eq!(all_selector_page_items(&store, CASES[1]).len(), LIMIT + 3,
+        "fresh pages remain usable during the epoch-fenced desired-deletion replay exception");
+    while store.maintain_client_message_selectors().unwrap() {}
+    assert!(!store.client_message_selectors_pending().unwrap());
     for (case, expected) in cases.into_iter().zip(expected) {
         let actual = all_selector_page_items(&store, case);
         assert_eq!(actual, expected, "settlement changed canonical pages: {}", case.name);
@@ -656,4 +659,46 @@ fn client_messages_selector_canonical_settlement_replay_commits_usable_declared_
     }
     assert!(store.settle_runs_for_canonical_replay().unwrap().is_empty());
     assert_complete_selector_pages_match_oracle(&store);
+}
+
+#[tokio::test]
+async fn client_message_cursor_issued_during_projection_lag_pins_published_frontier_after_drain() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::state(root.path());
+    state.store.set_write_clock_at(BASE_TIME).unwrap();
+    for index in 0..(LIMIT+3) {
+        state.store.append_claim(&ClaimInput {
+            subject:subject(index),kind:"message.sent".into(),actor:Some(ACTOR.into()),fields:sent_fields(index),
+            evidence:Vec::new(),expected_subject:None,idempotency_key:None,
+        }).unwrap();
+    }
+    let published = state.store.index().unwrap();
+    let now = BASE_TIME + 100_000;
+    let expected = client_message_resources_at(&state.store,None,true,None,now).unwrap();
+    {
+        let mut connection = state.store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        append_claim_record_tx(&transaction,"node",&subject(0),"message.sent",Some(ACTOR),
+            &json!({"fields":{"from":ACTOR,"to":"person/robin","content":"new content waits for projection","status":"sent","tags":[]}}),&[],None).unwrap();
+        append_claim_record_tx(&transaction,"node","message/selector-unpublished","message.sent",Some(ACTOR),
+            &json!({"fields":{"from":ACTOR,"to":PERSON,"content":"new subject waits for projection","status":"sent","tags":[]}}),&[],None).unwrap();
+        transaction.commit().unwrap();
+    }
+    assert!(state.store.client_message_selectors_pending().unwrap());
+    let query = ClientListQuery { history:true,limit:Some(1),..Default::default() };
+    let (Extension(snapshot),Json(first)) = client_messages_sql_page_at(
+        &state,new_client_snapshot(&state),&query,now,
+    ).await.unwrap();
+    assert_eq!(first.items,expected[..1]);
+    let cursor = first.page.next_cursor.unwrap();
+    assert_eq!(decode_client_cursor(&cursor).unwrap().before_index,Some(published),
+        "a pending-era receipt must identify the projection actually served");
+    while state.store.maintain_client_message_selectors().unwrap() {}
+    assert!(!state.store.client_message_selectors_pending().unwrap());
+    let continuation = ClientListQuery { cursor:Some(cursor),..query };
+    let (_,Json(next)) = client_messages_sql_page_at(&state,snapshot,&continuation,now).await.unwrap();
+    assert_eq!(next.items,expected[1..2],
+        "later projection publication must not change an issued continuation");
+    assert!(client_message_resources_at(&state.store,None,true,None,now).unwrap()
+        .iter().any(|item|item["id"]=="message/selector-unpublished"));
 }

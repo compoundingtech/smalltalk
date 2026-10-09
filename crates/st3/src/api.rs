@@ -5162,8 +5162,8 @@ async fn client_messages_sql_page_at(
             if expected_epoch.is_some_and(|expected| expected != cut_epoch) {
                 return Ok((cut_epoch, None));
             }
-            let snapshot = if continuing { snapshot } else { client_snapshot_at(&reader, index) };
-            let through = through.unwrap_or(index);
+            let through = through.unwrap_or(reader.store.client_messages_page_cut(index)?);
+            let snapshot = if continuing { snapshot } else { client_snapshot_at(&reader, through) };
             let rows = reader.store.client_messages_page(
                 person.as_deref(), actor.as_deref(), history, through, after.as_ref(), limit,
             )?;

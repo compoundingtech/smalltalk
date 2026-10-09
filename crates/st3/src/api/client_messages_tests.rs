@@ -26,13 +26,13 @@ fn send_fixture_message(store: &Store, index: usize, seed: usize) -> String {
     let from = if index % 11 == 0 {
         "agent/sql-narrow"
     } else if index % 3 == 0 {
-        "person/sql-alex"
+        "person/alex"
     } else {
         "agent/sql-sender"
     };
     let to = match (index + seed) % 4 {
-        0 => "person/sql-alex",
-        1 => "person/sql-robin",
+        0 => "person/alex",
+        1 => "person/robin",
         2 => "agent/sql-narrow",
         _ => "agent/sql-recipient",
     };
@@ -142,8 +142,8 @@ async fn sql_message_pages_match_full_oracle_for_generated_filter_matrix() {
         let state = super::tests::state(root.path());
         generated_fixture(&state.store, 41, seed);
         for history in [false, true] {
-            for person in [None, Some("person/sql-alex"), Some("person/sql-absent")] {
-                for actor in [None, Some("agent/sql-narrow"), Some("person/sql-robin")] {
+            for person in [None, Some("person/alex"), Some("person/visitor")] {
+                for actor in [None, Some("agent/sql-narrow"), Some("person/robin")] {
                     for limit in [Some(1), Some(7), Some(999), None] {
                         let query = ClientListQuery {
                             history,
@@ -182,7 +182,7 @@ async fn sql_message_pages_preserve_snapshot_fields_and_delivery_age_after_write
     // Change an existing row still ahead of the cursor, add new mail, and supersede
     // reminder versions. Neither metadata nor selection may leak into this traversal.
     append_fixture_claim(
-        &state.store, "message/sql-0-00000", "message.staged", "person/sql-alex",
+        &state.store, "message/sql-0-00000", "message.staged", "person/alex",
         BTreeMap::from([("status".into(), json!("staged"))]),
     );
     send_fixture_message(&state.store, 115, 0);
@@ -224,7 +224,7 @@ async fn sql_message_cursors_reject_changed_filters_and_limits() {
     let cursor = first.page.next_cursor.expect("fixture spans pages");
     for changed in [
         ClientListQuery { history: false, ..query.clone() },
-        ClientListQuery { person: Some("person/sql-alex".into()), ..query.clone() },
+        ClientListQuery { person: Some("person/alex".into()), ..query.clone() },
         ClientListQuery { actor: Some("agent/sql-narrow".into()), ..query.clone() },
         ClientListQuery { limit: Some(2), ..query.clone() },
     ] {
@@ -500,7 +500,7 @@ fn seed_message_benchmark(store: &Store, path: &Path) -> Value {
     let start = Instant::now();
     for index in 0..MESSAGE_BENCHMARK_MESSAGES {
         let sender = if index % 3 == 0 { "agent/sql-narrow" } else { "agent/sql-sender" };
-        let recipient = if index % 2 == 0 { "person/sql-alex" } else { "agent/sql-recipient" };
+        let recipient = if index % 2 == 0 { "person/alex" } else { "agent/sql-recipient" };
         writer.append(
             "message.sent", &format!("message/sql-9-{index:05}"), "message.sent", sender,
             BTreeMap::from([
@@ -574,9 +574,9 @@ fn benchmark_sql_message_pages_against_full_oracle() {
     let cases = [
         ("actor_history", None, Some("agent/sql-narrow"), true),
         ("broad_history", None, None, true),
-        ("person_history", Some("person/sql-alex"), None, true),
+        ("person_history", Some("person/alex"), None, true),
         ("broad_open", None, None, false),
-        ("person_open", Some("person/sql-alex"), None, false),
+        ("person_open", Some("person/alex"), None, false),
     ];
     let mut reference_pages = BTreeMap::new();
     let mut small_narrow_within_target = true;
