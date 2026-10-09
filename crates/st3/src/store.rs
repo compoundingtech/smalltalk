@@ -3194,6 +3194,27 @@ impl Store {
         self.request_agent_roster_refresh();
     }
 
+    /// Ask the refresher, if one runs, for a roster at the newest cut on behalf of a reader that
+    /// waits for it: a refresher pausing between refreshes stops pausing once it has paused as
+    /// long as its last refresh took.
+    pub(crate) fn request_fresh_agent_roster(&self, history: bool) {
+        if self.smalltalk.agent_roster_refresh.get().is_none() {
+            return;
+        }
+        self.smalltalk.agent_roster_fresh_wanted.notify_one();
+        if history {
+            self.request_agent_roster_history();
+        } else {
+            self.request_agent_roster_refresh();
+        }
+    }
+
+    /// Resolves once a reader waits for a fresh roster, including one that asked before this
+    /// was called and was not yet answered by a refresh's pause.
+    pub(crate) async fn fresh_agent_roster_wanted(&self) {
+        self.smalltalk.agent_roster_fresh_wanted.notified().await;
+    }
+
     /// Whether a reader asked for the history roster since the last time this was taken.
     pub(crate) fn take_agent_roster_history_request(&self) -> bool {
         self.smalltalk.agent_roster_history_wanted.swap(false, std::sync::atomic::Ordering::AcqRel)

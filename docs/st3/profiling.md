@@ -12,6 +12,12 @@ An action row has a static route such as `/v1/work/renew/{*subject}`, `method: "
 route totals, so do not add counts across scopes. The seven action buckets are independent of the
 256 general-route limit.
 
+`GET /v1/client/agents` also gets `scope: "agents-read"` rows, `method: "GET"`, with `read` set to
+`first-page`, `fresh` or `continuation` (any page with a `cursor`). A `fresh=true` first page waits
+by design, up to two seconds, until the roster refresher publishes a roster at or after the
+read's own cut. The other two answer at once from a published roster. Count the fresh row against
+its own target rather than leaving it out: the route total still includes it.
+
 Each row's `count` is its completed-response count since this process started, including error
 responses. Percentiles use its last at most 512 completions (`recent_count`), in whole milliseconds.
 Renew and claim have separate counts and percentile samples. `duration_scope: "response-envelope"`
