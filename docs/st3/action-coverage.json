@@ -756,7 +756,7 @@
     },
     {
       "command": "st conversations send",
-      "description": "Send one durable normalized message to a person or agent",
+      "description": "Send one durable normalized message to an agent",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
       ],
