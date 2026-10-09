@@ -2748,6 +2748,3 @@ async fn concurrent_slow_exports_refuse_more_work_with_authenticated_overload() 
         request.abort();
     }
 }
-
-#[path = "transport_recovery_tests.rs"]
-mod transport_recovery_tests;

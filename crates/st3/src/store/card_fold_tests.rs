@@ -86,6 +86,9 @@ pub(super) fn assert_card_fold_parity(store: &Store, indexes: &[u64]) {
                 );
             }
         }
+        drop(connection);
+        assert_card_reads_parity(store, &names, index);
+        let connection = store.readers.get();
         for history in [false, true] {
             let expected = per_subject_card_status(&connection, &names, index, history);
             store.forget_current_views();
@@ -97,6 +100,57 @@ pub(super) fn assert_card_fold_parity(store: &Store, indexes: &[u64]) {
                 .map(|status| serde_json::to_value(status).unwrap())
                 .collect::<Vec<_>>();
             assert_eq!(cold, expected, "cold roster status at {index}, history={history}");
+        }
+    }
+}
+
+/// The roster's per-card reads of `names` at `index` against the one-agent readers they replace.
+fn assert_card_reads_parity(store: &Store, names: &[String], index: u64) {
+    // With each agent's selected actual claim, as the roster passes them, and without.
+    let connection = store.readers.get();
+    let selected = names
+        .iter()
+        .map(|name| {
+            let (status, _) = subject_status_at_with_mode(
+                &connection, name, Some(index), None, SubjectStatusMode::AgentCard,
+            )
+            .unwrap()
+            .unwrap();
+            (name.clone(), status.actual_claim)
+        })
+        .collect::<HashMap<_, _>>();
+    drop(connection);
+    for actual_claims in [selected, HashMap::new()] {
+        assert_card_reads_parity_with(store, names, index, &actual_claims);
+    }
+}
+
+fn assert_card_reads_parity_with(
+    store: &Store,
+    names: &[String],
+    index: u64,
+    actual_claims: &HashMap<String, Option<String>>,
+) {
+    let mut reads = store.agent_card_reads(names, index, actual_claims).unwrap();
+    for name in names {
+        let one = store.observed_harness_at(name, index).unwrap();
+        let many = reads.take_harness(store, name).unwrap();
+        assert_eq!(
+            serde_json::to_value(&many).unwrap(),
+            serde_json::to_value(&one).unwrap(),
+            "harness of {name} at {index}"
+        );
+        let incarnation = one.as_ref().map(|harness| harness.incarnation_id.as_str());
+        assert_eq!(
+            reads.last_activity_at(store, name, incarnation).unwrap(),
+            store.agent_last_activity_at(name, incarnation, index).unwrap(),
+            "last activity of {name} at {index}"
+        );
+        if !reads.may_have_suspension(name) {
+            assert!(crate::suspension::current(store, name).unwrap().is_none(), "{name}");
+        }
+        if !reads.may_have_rollout(name) {
+            assert_eq!(crate::rollout::status(store, name).unwrap(), None, "{name}");
         }
     }
 }
@@ -194,6 +248,56 @@ agent "halted" { command "true" }"#,
     declare(&store, &halted, "halt");
     append(&store, "agent/alder.halted", "runtime.observed", Some("agent/alder.halted"),
         json!({"status": "stopped", "runtime_id": "agent/alder.halted", "incarnation_id": "halted-1"}));
+    // What the card's last activity reads: replicated and local timeline entries of the
+    // incarnation, a work report the seat made, and mail it sent.
+    let timeline = |entry: &str| json!({"fields": {"operation": "append", "entry_id": entry,
+        "revision": 1, "role": "assistant", "entry_type": "content", "final": true,
+        "body": {"media_type": "text/plain", "text": entry}, "driver": "omp",
+        "incarnation_id": "plain-1", "sequence": 1}});
+    {
+        let mut writer = store.connection.write();
+        let transaction = writer.transaction().unwrap();
+        append_claim_tx(&transaction, "alder", "agent/alder.plain", "harness.timeline",
+            Some("agent/alder.plain"), &timeline("replicated"), &[], None).unwrap();
+        append_claim_tx(&transaction, "alder", "step-run/orchard/review", "work.progress",
+            Some("agent/alder.plain"), &json!({"fields": {"summary": "halfway"}}), &[], None)
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    store.append_local_observations_for_test(&[ClaimInput {
+        subject: "agent/alder.plain".into(),
+        kind: "harness.timeline".into(),
+        actor: Some("agent/alder.plain".into()),
+        fields: serde_json::from_value(timeline("local")["fields"].clone()).unwrap(),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: None,
+    }]);
+    append(&store, "message/orchard-note", "message.sent", None,
+        json!({"from": "agent/alder.plain", "to": "agent/alder.owned", "title": "Note",
+               "status": "sent"}));
+    // A suspend request for the plain seat's current declaration.
+    let token = current_desired_row(&store.readers.get(), "agent/alder.plain")
+        .unwrap()
+        .unwrap()
+        .claim_id;
+    store
+        .append_claim(&ClaimInput {
+            subject: "agent/alder.plain".into(),
+            kind: "runtime.action.requested".into(),
+            actor: Some("person/avery".into()),
+            fields: serde_json::from_value(json!({"action": "suspend",
+                "runtime_id": "alder.plain", "incarnation_id": "plain-1"}))
+            .unwrap(),
+            evidence: vec![token],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    // A refused admission keeps the stopped seat's harness view.
+    append(&store, "agent/alder.halted", "harness.diagnostic", Some("agent/alder.halted"),
+        json!({"code": "harness-admission-failed", "status": "degraded",
+               "reason": "admission failed", "incarnation_id": "halted-1"}));
     // The owning generation ends: its seat leaves the current view at this snapshot.
     append(&store, &run.generation, "run-generation.superseded", Some("person/avery"),
         json!({"status": "superseded", "successor": "run-generation/orchard-next",
@@ -214,6 +318,15 @@ fn card_fold_matches_per_subject_reductions_in_any_replication_order() {
     let alder = alder();
     let birch = birch();
     assert_card_fold_parity(&alder, &snapshots(&alder));
+    // The fixture reaches every per-card read it compares.
+    let index = alder.index().unwrap();
+    let names = ["agent/alder.plain", "agent/alder.halted"].map(str::to_owned);
+    let mut reads = alder.agent_card_reads(&names, index, &HashMap::new()).unwrap();
+    let plain = reads.take_harness(&alder, &names[0]).unwrap().unwrap();
+    assert!(reads.last_activity_at(&alder, &names[0], Some(&plain.incarnation_id)).unwrap().is_some());
+    assert!(reads.may_have_suspension(&names[0]));
+    assert!(crate::suspension::current(&alder, &names[0]).unwrap().is_some());
+    assert_eq!(reads.take_harness(&alder, &names[1]).unwrap().unwrap().state, "indeterminate");
     let from_alder = exchange_from(&alder, &ReplicationInventory::default());
     let from_birch = exchange_from(&birch, &ReplicationInventory::default());
     assert!(from_alder.envelopes.len() >= 3, "a meaningful envelope permutation");
@@ -338,4 +451,55 @@ fn card_fold_matches_across_chunk_boundaries() {
     }
     let head = store.index().unwrap();
     assert_card_fold_parity(&store, &[head]);
+}
+
+#[test]
+fn newest_claim_reads_sort_only_the_newest_millisecond() {
+    let store = Store::open_memory("alder").unwrap();
+    let connection = store.readers.get();
+    let plan = connection
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", card_fold::newest_claims_sql()))
+        .unwrap()
+        .query_map(params!["[]", 1], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join("; ");
+    assert!(plan.contains("USING INDEX claims_subject_accepted_index"), "{plan}");
+    // A sort of only the order's last terms ends at the first newer time block.
+    assert!(plan.contains("USE TEMP B-TREE FOR LAST"), "{plan}");
+}
+
+#[test]
+fn card_fold_orders_claims_that_tie_in_one_batch_by_their_position() {
+    let store = alder();
+    // Put the retired seat's running and stopped observations in one batch at one time, so
+    // only their positions in the batch, and then their ids, order them.
+    {
+        let connection = store.connection.write();
+        let (first_batch, accepted) = connection
+            .query_row(
+                "SELECT batch_id, accepted_at_unix_ms FROM claims
+                 WHERE subject='agent/retired' AND kind='runtime.observed' ORDER BY store_index LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE claims SET batch_id=?1, accepted_at_unix_ms=?2
+                 WHERE subject='agent/retired' AND kind='runtime.observed'",
+                params![first_batch, accepted],
+            )
+            .unwrap();
+    }
+    store.forget_current_views();
+    let index = store.index().unwrap();
+    assert_card_fold_parity(&store, &[index]);
+    let status = store.agent_card_status_at(None, index, true).unwrap();
+    let retired = status.subjects.iter().find(|s| s.subject == "agent/retired").unwrap();
+    assert_eq!(
+        retired.actual.as_ref().unwrap()["status"],
+        latest_actual_at(&store.readers.get(), "agent/retired", Some(index)).unwrap().unwrap()["status"]
+    );
 }

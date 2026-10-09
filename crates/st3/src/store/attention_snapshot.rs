@@ -79,6 +79,15 @@ impl Store {
         Ok(items)
     }
 
+    /// Whether `agent` is declared and not stopped or retired: the same test that lets an agent
+    /// own a fault.
+    pub(crate) fn agent_is_live(&self, agent: &str) -> Result<bool> {
+        let connection = self.readers.get();
+        Ok(agent.starts_with("agent/")
+            && current_desired_row(&connection, agent)?.is_some_and(|row| row.kind == "agent")
+            && person_work::declaration_live(&connection, agent)?)
+    }
+
     /// The fleet's fault agent: the first live agent, by subject, whose declaration carries
     /// `handles-faults`. It takes each fault that no step assignee or agent requester owns.
     pub(crate) fn fleet_fault_agent(&self) -> Result<Option<String>> {
