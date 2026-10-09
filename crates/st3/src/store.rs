@@ -4684,6 +4684,8 @@ impl Store {
                 "deadline_at_unix_ms": deadline_at_unix_ms,
             }
         });
+        let mut body = body;
+        add_run_report_fields(&mut body, &mission, None, false);
         append_receipt_claim_tx(
             &transaction,
             &self.origin,
@@ -17293,6 +17295,8 @@ fn prepare_mission_run_declaration(
                 || stored_values != creation.inputs
                 || mode != &creation.mode
                 || mission_run_after_tx(connection, run_id)? != creation.after
+                || mission_run_report_tx(connection, run_id)?
+                    != requested_run_report(connection, creation)?
             {
                 blockers.push(format!(
                     "mission run `{}` already exists with different creation fields",
@@ -17793,6 +17797,12 @@ fn create_declared_mission_run_tx(
     if let Some(after) = &creation.after {
         body["fields"]["after"] = json!(after);
     }
+    add_run_report_fields(
+        &mut body,
+        &mission,
+        creation.report_to.as_deref(),
+        creation.report_completed,
+    );
     let run_claim = append_claim_tx(
         transaction,
         origin,
@@ -17861,6 +17871,51 @@ fn awaited_mission_run_tx(connection: &Connection, run: &str) -> Result<Option<S
             |row| row.get(0),
         )
         .optional()?)
+}
+
+/// Who a new declaration of an existing run asks it to report to, resolved against the mission
+/// revision the run started from, so that it compares with what the creation claim stored.
+fn requested_run_report(
+    connection: &Connection,
+    creation: &crate::model::MissionRunCreation,
+) -> Result<Option<(String, bool)>, St3Error> {
+    let mission = connection
+        .query_row(
+            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![creation.mission, creation.revision],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .map(|body| serde_json::from_str::<MissionSpec>(&body))
+        .transpose()
+        .map_err(internal)?;
+    Ok(mission.and_then(|mission| {
+        resolved_run_report(
+            &mission,
+            creation.report_to.as_deref(),
+            creation.report_completed,
+        )
+    }))
+}
+
+/// Who a run reports to and whether it also reports completion, as its creation claim recorded
+/// them.
+fn mission_run_report_tx(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<(String, bool)>, St3Error> {
+    connection
+        .query_row(
+            "SELECT json_extract(body, '$.fields.report_to'),
+                    COALESCE(json_extract(body, '$.fields.report_completed'), 0)
+             FROM claims WHERE subject=?1 AND kind='mission-run.created' LIMIT 1",
+            [format!("mission-run/{run_id}")],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()
+        .map(|row| row.and_then(|(report_to, completed)| Some((report_to?, completed))))
+        .map_err(internal)
 }
 
 fn mission_run_after_tx(connection: &Connection, run_id: &str) -> Result<Option<String>, St3Error> {
@@ -24760,6 +24815,45 @@ pub(crate) const GATE_BROKEN_CONDITION: &str = "gate-broken";
 /// The earliest end that still counts as recent.
 pub(crate) fn recently_ended_since() -> u128 {
     now_ms().saturating_sub(RECENTLY_ENDED_MS)
+}
+
+/// Who a run reports to and whether it also reports completion: the agent whoever started the
+/// run named, else the mission's own `report-to`, and completion if either asked and there is
+/// someone to tell. `None` when nobody is named.
+fn resolved_run_report(
+    mission: &MissionSpec,
+    report_to: Option<&str>,
+    report_completed: bool,
+) -> Option<(String, bool)> {
+    let report_to = report_to.or(mission.report_to.as_deref())?;
+    Some((
+        report_to.to_owned(),
+        report_completed || mission.report_completed,
+    ))
+}
+
+/// Record on a run's creation claim who hears of its failure, cancellation or stall. A run with
+/// nobody to tell carries no report fields at all, so nothing about it changes.
+fn add_run_report_fields(
+    body: &mut Value,
+    mission: &MissionSpec,
+    report_to: Option<&str>,
+    report_completed: bool,
+) {
+    let Some((report_to, completed)) = resolved_run_report(mission, report_to, report_completed)
+    else {
+        return;
+    };
+    let fields = &mut body["fields"];
+    fields["report_to"] = json!(report_to);
+    fields["stalled_after_ms"] = json!(
+        mission
+            .stalled_after_ms
+            .unwrap_or(crate::mission::DEFAULT_STALLED_AFTER_MS)
+    );
+    if completed {
+        fields["report_completed"] = json!(true);
+    }
 }
 
 fn insert_mission_deadline_tx(
@@ -40899,6 +40993,118 @@ version 2
             "record.repaired",
         ] {
             assert!(!Store::simple_replication_kind(kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_run_started_with_a_reporter_records_it_and_an_unset_run_records_nothing() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let plain = publish_mission(
+            &store,
+            "version 2\nmission \"plain\" state=\"ready\" { concurrent-runs; goal \"Plain.\"; step \"work\" { agentless } }",
+            "publish-plain",
+        );
+        let watched = publish_mission(
+            &store,
+            "version 2\nmission \"watched\" state=\"ready\" report-to=\"agent/ops/mission-reporter\" stalled-after=\"15m\" { concurrent-runs; goal \"Watched.\"; step \"work\" { agentless } }",
+            "publish-watched",
+        );
+        let declare = |run: &str, mission: &MissionSpec, extra: &str| {
+            let source = format!(
+                "version 2\nmission-run {run:?} {{\n  mission \"mission/{}@{}\"\n  workspace {:?}\n  requester \"person/operator\"\n{extra}}}\n",
+                mission.id,
+                mission.revision,
+                workspace.path().display().to_string(),
+            );
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let preview = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            (intent, preview)
+        };
+        let start = |run: &str, mission: &MissionSpec, extra: &str| {
+            let (intent, preview) = declare(run, mission, extra);
+            assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+            store
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    &format!("start-{run}"),
+                    Some("person/operator"),
+                )
+                .unwrap();
+            store
+                .latest_claim(&format!("mission-run/{run}"), Some("mission-run.created"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]
+                .clone()
+        };
+
+        let unset = start("plain/1", &plain, "");
+        for field in ["report_to", "stalled_after_ms", "report_completed"] {
+            assert!(unset.get(field).is_none(), "{field}");
+        }
+        // Whoever starts a run names the reporter, and the default limit applies.
+        let named = start(
+            "plain/2",
+            &plain,
+            "  report-to \"agent/ops/starter\"\n  report-completed \"true\"\n",
+        );
+        assert_eq!(named["report_to"], "agent/ops/starter");
+        assert_eq!(named["stalled_after_ms"], 30 * 60_000);
+        assert_eq!(named["report_completed"], true);
+        // The mission's own reporter and limit apply when the start names none.
+        let inherited = start("watched/1", &watched, "");
+        assert_eq!(inherited["report_to"], "agent/ops/mission-reporter");
+        assert_eq!(inherited["stalled_after_ms"], 15 * 60_000);
+        assert!(inherited.get("report_completed").is_none());
+        // The start's reporter replaces the mission's.
+        let replaced = start("watched/2", &watched, "  report-to \"agent/ops/starter\"\n");
+        assert_eq!(replaced["report_to"], "agent/ops/starter");
+        assert_eq!(replaced["stalled_after_ms"], 15 * 60_000);
+
+        // Declaring the same run again with different reporting is not a retry: the stored
+        // creation claim would be left unchanged while the operator is told it was accepted.
+        let different = "mission run `mission-run/plain/2` already exists with different creation fields";
+        for (what, extra) in [
+            ("another reporter", "  report-to \"agent/ops/other\"\n  report-completed \"true\"\n"),
+            ("no reporting at all", ""),
+            ("the reporter alone, dropping completion", "  report-to \"agent/ops/starter\"\n"),
+        ] {
+            let (_, changed) = declare("plain/2", &plain, extra);
+            assert_eq!(changed.blockers, [different], "{what}");
+        }
+        // Adding completion to a run that was started without it is not a retry either.
+        let (_, added) = declare(
+            "watched/2",
+            &watched,
+            "  report-to \"agent/ops/starter\"\n  report-completed \"true\"\n",
+        );
+        assert_eq!(
+            added.blockers,
+            ["mission run `mission-run/watched/2` already exists with different creation fields"]
+        );
+        // The exact declarations, and one that leaves the mission's own reporter to apply, are.
+        for (run, mission, extra) in [
+            (
+                "plain/2",
+                &plain,
+                "  report-to \"agent/ops/starter\"\n  report-completed \"true\"\n",
+            ),
+            ("watched/1", &watched, ""),
+            ("watched/2", &watched, "  report-to \"agent/ops/starter\"\n"),
+            ("plain/1", &plain, ""),
+        ] {
+            let (_, same) = declare(run, mission, extra);
+            assert!(same.blockers.is_empty(), "{run}: {:?}", same.blockers);
         }
     }
 

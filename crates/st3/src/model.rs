@@ -550,6 +550,15 @@ pub struct MissionSpec {
     pub max_active_runs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// The agent told when a run fails, is cancelled or stalls; none unless the mission asks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_to: Option<String>,
+    /// How long a run may go without progress before it is reported as stalled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_after_ms: Option<u64>,
+    /// Whether a completed run is reported too.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub report_completed: bool,
     #[serde(default)]
     pub revision_owners: Vec<String>,
     #[serde(default)]
@@ -824,6 +833,13 @@ pub struct MissionRunCreation {
     /// The mission run that must complete before this run's work starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
+    /// The agent this run reports to, when whoever starts it names one. It replaces the
+    /// mission's own `report-to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_to: Option<String>,
+    /// Also report this run when it completes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub report_completed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
