@@ -946,8 +946,7 @@ const AGENT_CARD_STATUS_LIMIT: usize = 4096;
 /// A roster head: its cut, every agent's refs, the first cards in order, and when published.
 pub(crate) type PublishedRosterHead = (u64, Arc<Vec<Value>>, Vec<Value>, u128);
 
-/// How long a roster refresh request may go unanswered before readers stop serving published
-/// rows and say the roster is not ready.
+/// How long a roster refresh request may go unanswered before the daemon warns about it.
 const AGENT_ROSTER_OVERDUE_MS: u64 = 30_000;
 
 /// One subject's reduction, read at snapshot `read_at`, so it holds from there on.
@@ -3158,14 +3157,24 @@ impl Store {
             let _ = requested.compare_exchange(0, pending, std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Relaxed);
         }
+        if result.is_ok() {
+            self.smalltalk.agent_roster_overdue_warned.store(false, std::sync::atomic::Ordering::Release);
+        }
         result
     }
 
-    /// Whether a refresh request has gone unanswered so long that the refresher must be failing
-    /// or stopped: published rows are then no longer served, and readers are told not ready.
-    fn agent_roster_refresh_overdue(&self) -> bool {
+    /// Say once when a refresh request has gone unanswered so long that the refresher must be
+    /// slow, failing or stopped. Readers keep serving the newest publication, which carries its
+    /// own cut and publication time, rather than refusing rows that exist.
+    fn warn_if_agent_roster_overdue(&self) {
         let requested = self.smalltalk.agent_roster_requested_at.load(std::sync::atomic::Ordering::Acquire);
-        requested != 0 && (now_ms() as u64).saturating_sub(requested) > AGENT_ROSTER_OVERDUE_MS
+        let waited = (now_ms() as u64).saturating_sub(requested);
+        if requested != 0 && waited > AGENT_ROSTER_OVERDUE_MS
+            && !self.smalltalk.agent_roster_overdue_warned.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            eprintln!("st3: WARN an agents roster refresh asked for {} s ago is still unanswered; \
+                serving the newest published roster", waited / 1000);
+        }
     }
 
     /// The newest complete current roster published at or before `index`, with its own graph
@@ -3178,9 +3187,7 @@ impl Store {
         history: bool,
     ) -> Option<(u64, Arc<Vec<Value>>, u128)> {
         self.smalltalk.agent_roster_refresh.get()?;
-        if self.agent_roster_refresh_overdue() {
-            return None;
-        }
+        self.warn_if_agent_roster_overdue();
         self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
@@ -3213,9 +3220,7 @@ impl Store {
         count: usize,
     ) -> Option<PublishedRosterHead> {
         self.smalltalk.agent_roster_refresh.get()?;
-        if self.agent_roster_refresh_overdue() {
-            return None;
-        }
+        self.warn_if_agent_roster_overdue();
         let (cut, refs) = self.smalltalk.agent_page_refs_cache.lock()
             .expect("agent page refs cache poisoned").iter()
             .filter(|entry| !entry.history && entry.index <= index)
