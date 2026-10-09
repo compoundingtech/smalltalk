@@ -51,7 +51,7 @@ function TranscriptStory({ scheme = 'dark', state = 'settled', availability, his
   const [opened, setOpened] = React.useState<WorkLogCall | undefined>(undefined)
   const [retried, setRetried] = React.useState(false)
   const retry = React.useCallback(() => setRetried(true), [])
-  return <main data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><div {...stylex.props(styles.frame)}><RuntimeTranscript data={cases[state]} onOpenTool={setOpened} onRetry={retry} availability={availability} history={history} emptyState={emptyState} /></div>{opened !== undefined && <section aria-label="Opened tool detail" {...stylex.props(styles.detail)}><strong>{opened.title} {opened.argsSummary}</strong><pre>{opened.detail}</pre></section>}{retried && <p role="status">Retry requested by the host.</p>}</main>
+  return <section aria-label="Conversation example" data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><div {...stylex.props(styles.frame)}><RuntimeTranscript data={cases[state]} onOpenTool={setOpened} onRetry={retry} availability={availability} history={history} emptyState={emptyState} /></div>{opened !== undefined && <section aria-label="Opened tool detail" {...stylex.props(styles.detail)}><strong>{opened.title} {opened.argsSummary}</strong><pre>{opened.detail}</pre></section>}{retried && <p role="status">Retry requested by the host.</p>}</section>
 }
 const meta = { title: 'Fractal UI/Transcript', component: TranscriptStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', state: 'settled' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' }, state: { options: Object.keys(cases), control: 'select' } } } satisfies Meta<typeof TranscriptStory>
 export default meta
@@ -71,7 +71,11 @@ export const Expanded: Story = { args: { state: 'expanded' }, play: async ({ can
   await userEvent.click(fold)
   await expect(fold).toHaveAttribute('aria-expanded', 'true')
   await expect(canvas.getByTestId('tool-preview-remaining')).toHaveTextContent('+2 lines')
-  await waitFor(() => expect(canvas.getByTestId('tool-detail-preview').querySelector('[data-syntax-token~="keyword"]')).not.toBeNull())
+  const previews = canvas.getAllByTestId('tool-detail-preview')
+  await expect(previews).toHaveLength(2)
+  await waitFor(() => expect(previews[0]!.querySelector('[data-syntax-token~="keyword"]')).not.toBeNull())
+  await expect(previews[0]).toHaveTextContent('export const visibleRows')
+  await expect(previews[1]).toHaveTextContent('selection retained')
   await expect(canvas.getByTestId('work-log-divider')).toBeInTheDocument()
   await expect(canvas.getByRole('button', { name: 'Thinking' })).toHaveAttribute('aria-expanded', 'false')
   const empty = canvasElement.querySelector('[data-tool-status="success"]:last-child')!
@@ -124,7 +128,11 @@ export const CatchingUpLight: Story = { ...CatchingUp, args: { state: 'catching-
 export const Reconnecting: Story = { args: { state: 'reconnecting' } }
 export const SyncFailed: Story = { args: { state: 'sync-failed' } }
 export const SyncFailedLight: Story = { args: { state: 'sync-failed', scheme: 'light' } }
-export const AllStates: Story = { render: args => <main {...stylex.props(styles.all, ...baselineTheme, args.scheme === 'light' && lightTheme)}>{(['settled', 'streaming', 'failed', 'interrupted', 'unknown', 'loading', 'catching-up', 'reconnecting', 'sync-failed'] as const).map(state => <section key={state}><h2>{state}</h2><TranscriptStory scheme={args.scheme} state={state} /></section>)}</main> }
+export const AllStates: Story = { render: args => <main {...stylex.props(styles.all, ...baselineTheme, args.scheme === 'light' && lightTheme)}>{(['settled', 'streaming', 'failed', 'interrupted', 'unknown', 'loading', 'catching-up', 'reconnecting', 'sync-failed'] as const).map(state => <section key={state}><h2>{state}</h2><TranscriptStory scheme={args.scheme} state={state} /></section>)}</main>, play: async ({ canvasElement }) => {
+  await expect(within(canvasElement).getAllByRole('main')).toHaveLength(1)
+  await expect(canvasElement.querySelector('main main')).toBeNull()
+  await expect(within(canvasElement).getAllByRole('region', { name: 'Conversation example' })).toHaveLength(9)
+} }
 export const AllStatesLight: Story = { ...AllStates, args: { scheme: 'light' } }
 const metadataCases = ['known', 'unknown', 'streaming'] as const
 function AnswerMetadataStory({ scheme = 'dark' }: { scheme?: Scheme }) {
