@@ -82,7 +82,7 @@ export const Expanded: Story = { args: { state: 'expanded' }, play: async ({ can
   await expect(empty.querySelector('button')).toBeNull()
   await expect(empty).toHaveTextContent('No output')
   await userEvent.click(canvas.getByRole('button', { name: 'Open read tool detail' }))
-  await expect(canvas.getByRole('region', { name: 'Opened tool detail' })).toHaveTextContent(source)
+  await expect(canvas.getByRole('region', { name: 'Opened tool detail' }).querySelector('pre')?.textContent).toBe(source)
 } }
 export const ExpandedLight: Story = { ...Expanded, args: { state: 'expanded', scheme: 'light' } }
 export const Streaming: Story = { args: { state: 'streaming' }, play: async ({ canvasElement }) => {
