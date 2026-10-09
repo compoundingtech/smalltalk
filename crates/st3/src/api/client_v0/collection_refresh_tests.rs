@@ -256,7 +256,7 @@ async fn local_and_received_status_registers_reread_agents_without_missions_or_w
     fixture.claim(
         "agent/fixture-roster",
         "harness.usage",
-        json!({"semantics":"context_occupancy", "incarnation_id":"one",
+        json!({"semantics":"context_occupancy", "driver":"codex", "incarnation_id":"one",
             "context_used_tokens":12}),
     );
     let mut changed = BTreeSet::new();

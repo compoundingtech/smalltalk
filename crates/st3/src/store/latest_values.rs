@@ -239,6 +239,48 @@ pub(super) fn harness_sql(connection: &Connection, subject: &str, sql: &str) -> 
     })
 }
 
+/// Only this fresh connection's progress deadline can interrupt a current transaction.
+/// Preserve ownership/protocol errors; do not infer interruption from an error's text.
+fn current_transaction<T>(
+    connection: &mut Connection,
+    work: impl FnOnce(&Transaction<'_>) -> Result<T, St3Error>,
+) -> Result<T, St3Error> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let expired = Arc::new(AtomicBool::new(false));
+    let interrupted = expired.clone();
+    let deadline = std::time::Instant::now() + crate::client::LATEST_VALUE_TIMEOUT;
+    connection.progress_handler(
+        100,
+        Some(move || {
+            let due = std::time::Instant::now() >= deadline;
+            if due {
+                interrupted.store(true, Ordering::Release);
+            }
+            due
+        }),
+    );
+    let result = (|| {
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let value = work(&tx)?;
+        tx.commit().map_err(internal)?;
+        Ok(value)
+    })();
+    connection.progress_handler(0, None::<fn() -> bool>);
+    result.map_err(|error: St3Error| {
+        if expired.load(Ordering::Acquire) && error.code == "internal" {
+            St3Error::new(
+                "current-value-deadline",
+                "the current value exceeded its write deadline",
+            )
+            .with_detail("sqlite_extended_code", rusqlite::ffi::SQLITE_INTERRUPT)
+        } else {
+            error
+        }
+    })
+}
+
 pub(super) fn append(
     graph: &GraphStore,
     input: &ClaimInput,
@@ -257,251 +299,250 @@ pub(super) fn append(
     connection
         .busy_timeout(std::time::Duration::ZERO)
         .map_err(internal)?;
-    let deadline = std::time::Instant::now() + crate::client::LATEST_VALUE_TIMEOUT;
-    connection.progress_handler(100, Some(move || std::time::Instant::now() >= deadline));
-    let tx = connection
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(internal)?;
-    // A bound driver announces starting before reconciliation records runtime.running.
-    // This hint only permits mailbox startup to wait; it grants no delivery or ready authority.
-    if input.fields.get("state").and_then(Value::as_str) != Some("starting") {
-        check_harness_event_runtime(&tx, &input.subject, event_runtime)?;
-    }
-    if let Some(runtime) = event_runtime
-        && input.fields.get("incarnation_id").and_then(Value::as_str) != Some(runtime)
-    {
-        return Err(St3Error::new(
-            "stale-harness-event-session",
-            "a current value must bind to its publishing runtime",
-        ));
-    }
-    if event_runtime.is_none()
-        && input.kind != "transport.observed"
-        && input.fields.get("state").and_then(Value::as_str) != Some("starting")
-        && let Some(incarnation) = input.fields.get("incarnation_id").and_then(Value::as_str)
-    {
-        let runtime: Option<String> = tx
+    let result = current_transaction(&mut connection, |tx| {
+        // A bound driver announces starting before reconciliation records runtime.running.
+        // This hint only permits mailbox startup to wait; it grants no delivery or ready authority.
+        if input.fields.get("state").and_then(Value::as_str) != Some("starting") {
+            check_harness_event_runtime(tx, &input.subject, event_runtime)?;
+        }
+        if let Some(runtime) = event_runtime
+            && input.fields.get("incarnation_id").and_then(Value::as_str) != Some(runtime)
+        {
+            return Err(St3Error::new(
+                "stale-harness-event-session",
+                "a current value must bind to its publishing runtime",
+            ));
+        }
+        if event_runtime.is_none()
+            && input.kind != "transport.observed"
+            && input.fields.get("state").and_then(Value::as_str) != Some("starting")
+            && let Some(incarnation) = input.fields.get("incarnation_id").and_then(Value::as_str)
+        {
+            let runtime: Option<String> = tx
+                .query_row(
+                    &format!(
+                        "{} LIMIT 1",
+                        newest_claims_of_kind_query("claims.body", "runtime.observed")
+                    ),
+                    params![input.subject, i64::MAX],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(internal)?;
+            if let Some(runtime) = runtime {
+                let runtime: Value = serde_json::from_str(&runtime).map_err(internal)?;
+                if runtime["fields"]["status"] == "running"
+                    && runtime["fields"]["incarnation_id"] != incarnation
+                {
+                    return Err(St3Error::new(
+                        "stale-harness-event-session",
+                        "this is not the seat's running incarnation",
+                    ));
+                }
+            }
+        }
+        // A new incarnation replaces the previous seat's context, rather than accumulating slots.
+        let slot = if input.kind == "transport.observed" {
+            graph.origin.clone()
+        } else {
+            String::new()
+        };
+        let previous: Option<(i64, String)> = tx
             .query_row(
-                &format!(
-                    "{} LIMIT 1",
-                    newest_claims_of_kind_query("claims.body", "runtime.observed")
-                ),
-                params![input.subject, i64::MAX],
-                |row| row.get(0),
+                "SELECT local_id,body FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3",
+                params![input.subject, input.kind, slot],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(internal)?;
-        if let Some(runtime) = runtime {
-            let runtime: Value = serde_json::from_str(&runtime).map_err(internal)?;
-            if runtime["fields"]["status"] == "running"
-                && runtime["fields"]["incarnation_id"] != incarnation
+        // Idempotency belongs to durable operations. Registers keep no retry keys or receipts.
+        let mut input = input.clone();
+        input.idempotency_key = None;
+        if input.kind == "harness.observed" {
+            input
+                .fields
+                .entry("observed_at_ms".into())
+                .or_insert(json!(now));
+            if input
+                .fields
+                .get("state")
+                .and_then(Value::as_str)
+                .is_some_and(|state| matches!(state, "ended" | "indeterminate"))
             {
-                return Err(St3Error::new(
-                    "stale-harness-event-session",
-                    "this is not the seat's running incarnation",
-                ));
+                input.fields.insert("blocked_on".into(), Value::Null);
+                input.fields.insert("ask".into(), Value::Null);
             }
-        }
-    }
-    // A new incarnation replaces the previous seat's context, rather than accumulating slots.
-    let slot = if input.kind == "transport.observed" {
-        graph.origin.clone()
-    } else {
-        String::new()
-    };
-    let previous: Option<(i64, String)> = tx
-        .query_row(
-            "SELECT local_id,body FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3",
-            params![input.subject, input.kind, slot],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(internal)?;
-    // Idempotency belongs to durable operations. Registers keep no retry keys or receipts.
-    let mut input = input.clone();
-    input.idempotency_key = None;
-    if input.kind == "harness.observed" {
-        input
-            .fields
-            .entry("observed_at_ms".into())
-            .or_insert(json!(now));
-        if input
-            .fields
-            .get("state")
-            .and_then(Value::as_str)
-            .is_some_and(|state| matches!(state, "ended" | "indeterminate"))
-        {
-            input.fields.insert("blocked_on".into(), Value::Null);
-            input.fields.insert("ask".into(), Value::Null);
-        }
-        let mut transition = true;
-        let source_at = input.fields["observed_at_ms"]
-            .as_u64()
-            .map(u128::from)
-            .unwrap_or(now)
-            .min(now);
-        let mut since = input
-            .fields
-            .get("observed_since_ms")
-            .cloned()
-            .unwrap_or(json!(source_at));
-        if let Some((_, body)) = &previous {
-            let old: Value = serde_json::from_str(body).map_err(internal)?;
-            if old["fields"]["incarnation_id"]
-                == input
-                    .fields
-                    .get("incarnation_id")
-                    .cloned()
-                    .unwrap_or(Value::Null)
-            {
-                if let (Some(old_at), Some(new_at)) = (
-                    old["fields"]["observed_at_ms"].as_u64(),
-                    input.fields.get("observed_at_ms").and_then(Value::as_u64),
-                ) && new_at < old_at
-                {
-                    let id: String = tx.query_row("SELECT source_id FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3",
-                        params![input.subject, input.kind, slot], |r| r.get(0)).map_err(internal)?;
-                    return Ok((claim_by_id_tx(&tx, &id).map_err(internal)?.unwrap(), false));
-                }
-                // Old producers can send sparse activity fields. Carry their known credential
-                // and source axes forward; explicit nulls in modern snapshots clear an axis.
-                for name in [
-                    "driver",
-                    "transport",
-                    "provider_auth",
-                    "provider_auth_sequence",
-                    "reason",
-                    "blocked_on",
-                    "ask",
-                    "input_buffer",
-                    "exit",
-                ] {
-                    if (!input.fields.contains_key(name)
-                        || (name == "provider_auth" && input.fields[name].is_null()))
-                        && let Some(value) = old["fields"].get(name)
-                    {
-                        input.fields.insert(name.into(), value.clone());
-                    }
-                }
-            }
-            if (old["fields"]["state"] == input.fields["state"]
-                || (old["fields"]["provider_auth"] == false
-                    && input.fields.get("provider_auth") == Some(&json!(false))))
-                && old["fields"]["incarnation_id"]
+            let mut transition = true;
+            let source_at = input.fields["observed_at_ms"]
+                .as_u64()
+                .map(u128::from)
+                .unwrap_or(now)
+                .min(now);
+            let mut since = input
+                .fields
+                .get("observed_since_ms")
+                .cloned()
+                .unwrap_or(json!(source_at));
+            if let Some((_, body)) = &previous {
+                let old: Value = serde_json::from_str(body).map_err(internal)?;
+                if old["fields"]["incarnation_id"]
                     == input
                         .fields
                         .get("incarnation_id")
                         .cloned()
                         .unwrap_or(Value::Null)
-                && old["fields"].get("provider_auth").and_then(Value::as_bool)
-                    == input.fields.get("provider_auth").and_then(Value::as_bool)
-                && permission_blocked(&old["fields"])
-                    == (input.fields.get("blocked_on") == Some(&json!("human"))
-                        && input.fields.get("ask") == Some(&json!("permission")))
-                && (old["fields"]["provider_auth"] == false
-                    || (old["fields"]["reason"] == "providerAuth")
-                        == (input.fields.get("reason") == Some(&json!("providerAuth"))))
-            {
-                since = old["fields"]["observed_since_ms"].clone();
-                transition = false;
-            } else {
-                // Native activity may retain its raw working episode's start while an
-                // approval prompt changes the effective state. Date that transition from
-                // its own source observation, including an explicit clearing snapshot.
-                since = json!(source_at);
+                {
+                    if let (Some(old_at), Some(new_at)) = (
+                        old["fields"]["observed_at_ms"].as_u64(),
+                        input.fields.get("observed_at_ms").and_then(Value::as_u64),
+                    ) && new_at < old_at
+                    {
+                        let id: String = tx.query_row("SELECT source_id FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3",
+                        params![input.subject, input.kind, slot], |r| r.get(0)).map_err(internal)?;
+                        return Ok((claim_by_id_tx(tx, &id).map_err(internal)?.unwrap(), false));
+                    }
+                    // Old producers can send sparse activity fields. Carry their known credential
+                    // and source axes forward; explicit nulls in modern snapshots clear an axis.
+                    for name in [
+                        "driver",
+                        "transport",
+                        "provider_auth",
+                        "provider_auth_sequence",
+                        "reason",
+                        "blocked_on",
+                        "ask",
+                        "input_buffer",
+                        "exit",
+                    ] {
+                        if (!input.fields.contains_key(name)
+                            || (name == "provider_auth" && input.fields[name].is_null()))
+                            && let Some(value) = old["fields"].get(name)
+                        {
+                            input.fields.insert(name.into(), value.clone());
+                        }
+                    }
+                }
+                if (old["fields"]["state"] == input.fields["state"]
+                    || (old["fields"]["provider_auth"] == false
+                        && input.fields.get("provider_auth") == Some(&json!(false))))
+                    && old["fields"]["incarnation_id"]
+                        == input
+                            .fields
+                            .get("incarnation_id")
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    && old["fields"].get("provider_auth").and_then(Value::as_bool)
+                        == input.fields.get("provider_auth").and_then(Value::as_bool)
+                    && permission_blocked(&old["fields"])
+                        == (input.fields.get("blocked_on") == Some(&json!("human"))
+                            && input.fields.get("ask") == Some(&json!("permission")))
+                    && (old["fields"]["provider_auth"] == false
+                        || (old["fields"]["reason"] == "providerAuth")
+                            == (input.fields.get("reason") == Some(&json!("providerAuth"))))
+                {
+                    since = old["fields"]["observed_since_ms"].clone();
+                    transition = false;
+                } else {
+                    // Native activity may retain its raw working episode's start while an
+                    // approval prompt changes the effective state. Date that transition from
+                    // its own source observation, including an explicit clearing snapshot.
+                    since = json!(source_at);
+                }
             }
+            input.fields.insert("observed_since_ms".into(), since);
+            input
+                .fields
+                .insert("status_transition".into(), json!(transition));
         }
-        input.fields.insert("observed_since_ms".into(), since);
-        input
-            .fields
-            .insert("status_transition".into(), json!(transition));
-    }
-    let (mut local, _) = insert_local_observation_tx(&tx, &graph.origin, &input, now)?;
-    let epoch: String = tx
-        .query_row(
-            "SELECT value FROM meta WHERE key='current-value-epoch'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(internal)?;
-    local.body["_source_epoch"] = json!(epoch);
-    let sequence = local_observation_position(&local).unwrap();
-    local.id = format!(
-        "{LOCAL_OBSERVATION_ID_PREFIX}{}/{epoch}/{sequence}",
-        graph.origin
-    );
-    tx.execute(
-        "UPDATE local_observations SET body=?1 WHERE id=?2",
-        params![
-            canonical_json_text(&local.body).map_err(internal)?,
-            sequence
-        ],
-    )
-    .map_err(internal)?;
-    // Retire the old current-value retry slots and local history at the first modern sample.
-    // Numeric usage series keep their slots and observations.
-    if input.kind == "harness.usage" {
-        tx.execute(
-            "DELETE FROM local_latest_slots WHERE subject=?1 AND kind='harness.usage'
-            AND json_extract(published_fields,'$.semantics')='context_occupancy'",
-            [&input.subject],
-        )
-        .map_err(internal)?;
-    } else {
-        tx.execute(
-            "DELETE FROM local_latest_slots WHERE subject=?1 AND kind=?2",
-            params![input.subject, input.kind],
-        )
-        .map_err(internal)?;
-    }
-    let retired: Option<i64> = tx
-        .query_row(
-            "SELECT MAX(id) FROM local_observations WHERE subject=?1 AND kind=?2 AND id!=?3
-         AND (?2!='harness.usage' OR json_extract(body,'$.fields.semantics')='context_occupancy')",
-            params![input.subject, input.kind, sequence],
-            |row| row.get(0),
-        )
-        .map_err(internal)?;
-    if let Some(retired) = retired {
-        retire_feed_through(&tx, retired)?;
-    }
-    tx.execute(
-        "DELETE FROM local_observations WHERE subject=?1 AND kind=?2 AND id!=?3
-        AND (?2!='harness.usage' OR json_extract(body,'$.fields.semantics')='context_occupancy')",
-        params![
-            input.subject,
-            input.kind,
-            local_observation_position(&local)
-        ],
-    )
-    .map_err(internal)?;
-    if let Some((old_id, _)) = previous {
-        tx.execute("DELETE FROM local_observations WHERE id=?1", [old_id])
+        let (mut local, _) = insert_local_observation_tx(tx, &graph.origin, &input, now)?;
+        let epoch: String = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key='current-value-epoch'",
+                [],
+                |row| row.get(0),
+            )
             .map_err(internal)?;
-    }
-    tx.execute(
-        "INSERT INTO latest_values VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+        local.body["_source_epoch"] = json!(epoch);
+        let sequence = local_observation_position(&local).unwrap();
+        local.id = format!(
+            "{LOCAL_OBSERVATION_ID_PREFIX}{}/{epoch}/{sequence}",
+            graph.origin
+        );
+        tx.execute(
+            "UPDATE local_observations SET body=?1 WHERE id=?2",
+            params![
+                canonical_json_text(&local.body).map_err(internal)?,
+                sequence
+            ],
+        )
+        .map_err(internal)?;
+        // Retire the old current-value retry slots and local history at the first modern sample.
+        // Numeric usage series keep their slots and observations.
+        if input.kind == "harness.usage" {
+            tx.execute(
+                "DELETE FROM local_latest_slots WHERE subject=?1 AND kind='harness.usage'
+            AND json_extract(published_fields,'$.semantics')='context_occupancy'",
+                [&input.subject],
+            )
+            .map_err(internal)?;
+        } else {
+            tx.execute(
+                "DELETE FROM local_latest_slots WHERE subject=?1 AND kind=?2",
+                params![input.subject, input.kind],
+            )
+            .map_err(internal)?;
+        }
+        let retired: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(id) FROM local_observations WHERE subject=?1 AND kind=?2 AND id!=?3
+         AND (?2!='harness.usage' OR json_extract(body,'$.fields.semantics')='context_occupancy')",
+                params![input.subject, input.kind, sequence],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if let Some(retired) = retired {
+            retire_feed_through(tx, retired)?;
+        }
+        tx.execute(
+            "DELETE FROM local_observations WHERE subject=?1 AND kind=?2 AND id!=?3
+        AND (?2!='harness.usage' OR json_extract(body,'$.fields.semantics')='context_occupancy')",
+            params![
+                input.subject,
+                input.kind,
+                local_observation_position(&local)
+            ],
+        )
+        .map_err(internal)?;
+        if let Some((old_id, _)) = previous {
+            tx.execute("DELETE FROM local_observations WHERE id=?1", [old_id])
+                .map_err(internal)?;
+        }
+        tx.execute(
+            "INSERT INTO latest_values VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
          ON CONFLICT(subject,kind,slot) DO UPDATE SET origin=excluded.origin,
          source_at=excluded.source_at, source_id=excluded.source_id, local_id=excluded.local_id,
          store_index=excluded.store_index, actor=excluded.actor, body=excluded.body",
-        params![
-            input.subject,
-            input.kind,
-            slot,
-            graph.origin,
-            now.min(i64::MAX as u128) as i64,
-            local.id,
-            local_observation_position(&local),
-            local.store_index,
-            local.actor,
-            canonical_json_text(&local.body).map_err(internal)?
-        ],
-    )
-    .map_err(internal)?;
-    update_readiness(&tx, &input)?;
-    tx.commit().map_err(internal)?;
-    graph.runtime.current_observation_committed(&input.kind);
-    Ok((local, true))
+            params![
+                input.subject,
+                input.kind,
+                slot,
+                graph.origin,
+                now.min(i64::MAX as u128) as i64,
+                local.id,
+                local_observation_position(&local),
+                local.store_index,
+                local.actor,
+                canonical_json_text(&local.body).map_err(internal)?
+            ],
+        )
+        .map_err(internal)?;
+        update_readiness(tx, &input)?;
+        Ok((local, true))
+    })?;
+    if result.1 {
+        graph.runtime.current_observation_committed(&input.kind);
+    }
+    Ok(result)
 }
 
 fn update_readiness(tx: &Transaction<'_>, input: &ClaimInput) -> Result<(), St3Error> {
@@ -716,115 +757,116 @@ impl Store {
         connection
             .busy_timeout(std::time::Duration::ZERO)
             .map_err(internal)?;
-        let deadline = std::time::Instant::now() + crate::client::LATEST_VALUE_TIMEOUT;
-        connection.progress_handler(100, Some(move || std::time::Instant::now() >= deadline));
-        let tx = connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(internal)?;
-        let mut incarnation_bound = false;
-        if record.subject.starts_with("agent/") {
-            let runtime: Option<(String, String)> = tx
-                .query_row(
-                    &format!(
-                        "{} LIMIT 1",
-                        newest_claims_of_kind_query(
-                            "claims.origin,claims.body",
-                            "runtime.observed"
-                        )
-                    ),
-                    params![record.subject, i64::MAX],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(internal)?;
-            if let Some((owner, body)) = runtime {
-                let body: Value = serde_json::from_str(&body).map_err(internal)?;
-                let running = body["fields"]["status"] == "running";
-                // Workspace availability belongs to the host reconciler, not a native
-                // harness incarnation. It must still come from the running seat's host.
-                incarnation_bound = running && record.kind != "workspace.observed";
-                if running
-                    && (owner != record.origin
-                        || (incarnation_bound
-                            && body["fields"]["incarnation_id"]
-                                != record.body["fields"]["incarnation_id"]))
-                {
-                    return Err(St3Error::new(
-                        "stale-harness-event-session",
-                        "current value owner or incarnation is not the running seat",
-                    ));
+        let changed = current_transaction(&mut connection, |tx| {
+            let mut incarnation_bound = false;
+            if record.subject.starts_with("agent/") {
+                let runtime: Option<(String, String)> = tx
+                    .query_row(
+                        &format!(
+                            "{} LIMIT 1",
+                            newest_claims_of_kind_query(
+                                "claims.origin,claims.body",
+                                "runtime.observed"
+                            )
+                        ),
+                        params![record.subject, i64::MAX],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(internal)?;
+                if let Some((owner, body)) = runtime {
+                    let body: Value = serde_json::from_str(&body).map_err(internal)?;
+                    let running = body["fields"]["status"] == "running";
+                    // Workspace availability belongs to the host reconciler, not a native
+                    // harness incarnation. It must still come from the running seat's host.
+                    incarnation_bound = running && record.kind != "workspace.observed";
+                    if running
+                        && (owner != record.origin
+                            || (incarnation_bound
+                                && body["fields"]["incarnation_id"]
+                                    != record.body["fields"]["incarnation_id"]))
+                    {
+                        return Err(St3Error::new(
+                            "stale-harness-event-session",
+                            "current value owner or incarnation is not the running seat",
+                        ));
+                    }
                 }
             }
-        }
-        let previous: Option<(u64, String, i64, String, String)> = tx.query_row(
+            let previous: Option<(u64, String, i64, String, String)> = tx.query_row(
             "SELECT source_at,source_id,local_id,origin,body FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3",
             params![record.subject,record.kind,slot], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))
             .optional().map_err(internal)?;
-        let source_sequence = |id: &str| {
-            id.rsplit('/')
-                .next()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or_default()
-        };
-        if previous.as_ref().is_some_and(|(at, id, _, origin, body)| {
-            if origin == &record.origin
-                && id.starts_with(LOCAL_OBSERVATION_ID_PREFIX)
-                && record.id.starts_with(LOCAL_OBSERVATION_ID_PREFIX)
-            {
-                let previous: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-                // A restored database may rewind its generation and counter. A newly running
-                // incarnation, already validated against durable owner evidence above, cuts over.
-                if incarnation_bound
-                    && previous["fields"]["incarnation_id"]
-                        != record.body["fields"]["incarnation_id"]
+            let source_sequence = |id: &str| {
+                id.rsplit('/')
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or_default()
+            };
+            if previous.as_ref().is_some_and(|(at, id, _, origin, body)| {
+                if origin == &record.origin
+                    && id.starts_with(LOCAL_OBSERVATION_ID_PREFIX)
+                    && record.id.starts_with(LOCAL_OBSERVATION_ID_PREFIX)
                 {
-                    return false;
+                    let previous: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                    // A restored database may rewind its generation and counter. A newly running
+                    // incarnation, already validated against durable owner evidence above, cuts over.
+                    if incarnation_bound
+                        && previous["fields"]["incarnation_id"]
+                            != record.body["fields"]["incarnation_id"]
+                    {
+                        return false;
+                    }
+                    let epoch = |body: &Value| {
+                        body["_source_epoch"]
+                            .as_str()
+                            .and_then(|value| value.parse::<u128>().ok())
+                            .unwrap_or(0)
+                    };
+                    return (epoch(&previous), source_sequence(id))
+                        >= (epoch(&record.body), source_sequence(&record.id));
                 }
-                let epoch = |body: &Value| {
-                    body["_source_epoch"]
-                        .as_str()
-                        .and_then(|value| value.parse::<u128>().ok())
-                        .unwrap_or(0)
-                };
-                return (epoch(&previous), source_sequence(id))
-                    >= (epoch(&record.body), source_sequence(&record.id));
+                (*at, source_sequence(id), id.as_str())
+                    >= (
+                        record.accepted_at_unix_ms as u64,
+                        source_sequence(&record.id),
+                        record.id.as_str(),
+                    )
+            }) {
+                return Ok(false);
             }
-            (*at, source_sequence(id), id.as_str())
-                >= (
-                    record.accepted_at_unix_ms as u64,
-                    source_sequence(&record.id),
-                    record.id.as_str(),
-                )
-        }) {
-            return Ok(false);
-        }
-        let input = ClaimInput {
-            subject: record.subject.clone(),
-            kind: record.kind.clone(),
-            actor: record.actor.clone(),
-            fields,
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: None,
-        };
-        let (local, _) =
-            insert_local_observation_tx(&tx, &self.origin, &input, record.accepted_at_unix_ms)?;
-        if let Some((_, _, old_id, _, _)) = previous {
-            retire_feed_through(&tx, old_id)?;
-            tx.execute("DELETE FROM local_observations WHERE id=?1", [old_id])
-                .map_err(internal)?;
-        }
-        tx.execute(
+            let input = ClaimInput {
+                subject: record.subject.clone(),
+                kind: record.kind.clone(),
+                actor: record.actor.clone(),
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            };
+            let (local, _) =
+                insert_local_observation_tx(tx, &self.origin, &input, record.accepted_at_unix_ms)?;
+            if let Some((_, _, old_id, _, _)) = previous {
+                retire_feed_through(tx, old_id)?;
+                tx.execute("DELETE FROM local_observations WHERE id=?1", [old_id])
+                    .map_err(internal)?;
+            }
+            tx.execute(
             "INSERT INTO latest_values VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
              ON CONFLICT(subject,kind,slot) DO UPDATE SET origin=excluded.origin,source_at=excluded.source_at,
              source_id=excluded.source_id,local_id=excluded.local_id,store_index=excluded.store_index,actor=excluded.actor,body=excluded.body",
             params![record.subject,record.kind,slot,record.origin,record.accepted_at_unix_ms as u64,
                 record.id,local_observation_position(&local),local.store_index,record.actor,canonical_json_text(&record.body).map_err(internal)?]
         ).map_err(internal)?;
-        update_readiness(&tx, &input)?;
-        tx.commit().map_err(internal)?;
-        self.graph.runtime.current_observation_committed(&record.kind);
-        Ok(true)
+            update_readiness(tx, &input)?;
+            Ok(true)
+        })?;
+        if changed {
+            self.graph
+                .runtime
+                .current_observation_committed(&record.kind);
+        }
+        Ok(changed)
     }
 }
 
@@ -1495,6 +1537,73 @@ mod tests {
                 .body["fields"]["incarnation_id"],
             "two"
         );
+    }
+
+    #[test]
+    fn current_write_deadline_rolls_back_register_source_and_readiness() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("deadline.sqlite");
+        let store = Store::open(&path, "node").unwrap();
+        let original = store
+            .append_claim(&state("starting", "one", now_ms() as u64))
+            .unwrap();
+        let boundary = store.current_observation_boundary().unwrap();
+        let revisions = || {
+            std::iter::once("")
+                .chain(CURRENT_VALUE_KINDS)
+                .map(|kind| store.graph.runtime.current_observation_revision(kind))
+                .collect::<Vec<_>>()
+        };
+        let before = revisions();
+        let mut connection = Connection::open(&path).unwrap();
+        connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let error = current_transaction(&mut connection, |tx| {
+            tx.execute("UPDATE latest_values SET source_id='timed-out-source' WHERE subject='agent/cedar'", [])
+                .map_err(internal)?;
+            tx.execute("INSERT INTO latest_values SELECT 'agent/pine',kind,slot,origin,source_at,
+                'timed-out-new-source',local_id,store_index,actor,body FROM latest_values WHERE subject='agent/cedar'", [])
+                .map_err(internal)?;
+            update_readiness(tx, &state("working", "two", now_ms() as u64))?;
+            // The real progress handler interrupts this query at the unchanged 100ms budget.
+            tx.query_row("WITH RECURSIVE numbers(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM numbers WHERE n<1000000000)
+                SELECT sum(n) FROM numbers", [], |row| row.get::<_, i64>(0)).map_err(internal)
+        }).unwrap_err();
+        assert_eq!(error.code, "current-value-deadline");
+        assert_eq!(
+            error.details["sqlite_extended_code"],
+            rusqlite::ffi::SQLITE_INTERRUPT
+        );
+        let (source, incarnation, ready): (String, String, bool) = connection.query_row(
+            "SELECT v.source_id,r.incarnation,r.ready FROM latest_values v JOIN latest_readiness r USING(subject)
+             WHERE v.subject='agent/cedar'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(source, original.id);
+        assert_eq!((incarnation.as_str(), ready), ("one", false));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM latest_values WHERE subject='agent/pine'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.current_observation_boundary().unwrap(), boundary);
+        assert_eq!(revisions(), before);
+        // Clearing this connection's callback permits its next transaction; arbitrary faults
+        // and ownership refusals never become a deadline merely because they contain that word.
+        current_transaction(&mut connection, |tx| {
+            tx.execute("INSERT INTO meta VALUES('after-deadline','1')", [])
+                .map_err(internal)
+        })
+        .unwrap();
+        for code in ["internal", "stale-harness-event-session"] {
+            let error = current_transaction::<()>(&mut connection, |_| {
+                Err(St3Error::new(code, "interrupted"))
+            })
+            .unwrap_err();
+            assert_eq!(error.code, code);
+        }
     }
 
     #[test]

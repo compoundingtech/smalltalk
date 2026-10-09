@@ -261,6 +261,14 @@ fn signal_visible_change(state: &AppState) {
 #[cfg(test)]
 mod storage_contention_response_tests {
     #[test]
+    fn current_write_deadline_is_typed_unavailable_and_retryable() {
+        let error = super::ApiError::bad(super::St3Error::new("current-value-deadline", "write expired"));
+        assert_eq!(error.status, super::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(super::client_error_code(Some(&error.code)), "current-value-deadline");
+        assert!(super::client_error_retryable(error.status, Some(&error.code)));
+        assert!(super::client_error_retryable(super::StatusCode::UNPROCESSABLE_ENTITY, Some(&error.code)));
+    }
+    #[test]
     fn admitted_contention_is_pending_not_a_peer_error_and_other_faults_stay_errors() {
         for code in ["database-busy", "database-locked"] {
             assert_eq!(super::admitted_projection_result(Err(anyhow::Error::new(
@@ -385,7 +393,7 @@ impl ApiError {
             | "lane-approval-denied"
             | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
             "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
-            "database-busy" | "database-locked" => StatusCode::SERVICE_UNAVAILABLE,
+            "database-busy" | "database-locked" | "current-value-deadline" => StatusCode::SERVICE_UNAVAILABLE,
             "read-deadline" => StatusCode::GATEWAY_TIMEOUT,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -1337,6 +1345,7 @@ fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
         code,
         Some(
             "remote-unavailable"
+                | "current-value-deadline"
                 | "terminal-unavailable"
                 | "cursor-gap"
                 | "conversation-content-invalidated"
@@ -1399,6 +1408,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "blob-expired"
         | "database-busy"
         | "database-locked"
+        | "current-value-deadline"
         | "internal" => code.unwrap_or("internal").to_owned(),
         "too-many-attachments" | "invalid-blob-reference" => "validation-failed".into(),
         "launch-review-not-authorized"

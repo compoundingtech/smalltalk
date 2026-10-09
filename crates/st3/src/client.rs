@@ -941,6 +941,8 @@ pub fn current_publication_dropped(error: &anyhow::Error) -> bool {
             })
         || api_error_parts(error).is_some_and(|(status, code, message, _)| {
             status == 503
+                || code == "current-value-deadline"
+                // Older daemons reported their write deadline as internal interrupted.
                 || code == "internal"
                     && [
                         "database is locked",
@@ -1466,6 +1468,22 @@ fn decode_api_response<O: DeserializeOwned>(bytes: &[u8]) -> Result<O> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn current_write_deadlines_drop_once_across_daemon_versions_and_preserve_fences() {
+        for (status, code, message, dropped) in [
+            (503, "current-value-deadline", "write expired", true),
+            (422, "current-value-deadline", "write expired", true),
+            (500, "internal", "interrupted", true),
+            (422, "stale-harness-event-session", "retired native incarnation", false),
+            (500, "internal", "other error", false),
+        ] {
+            let error = anyhow::Error::new(super::ApiResponseError {
+                status, code: code.into(), message: message.into(), details: Default::default(),
+            });
+            assert_eq!(super::current_publication_dropped(&error), dropped);
+        }
+    }
+
     use super::*;
     use axum::extract::ws::{Message as AxumWsMessage, WebSocketUpgrade};
     use axum::http::{HeaderMap, StatusCode};
