@@ -200,7 +200,10 @@ pub(crate) fn render_mission_run_page(
     style: OutputStyle,
     now_unix_ms: u128,
 ) -> String {
-    let mut output = render_mission_run(selected, &[], style, now_unix_ms);
+    let mut output = String::from(
+        "TREE SCOPE  Each PROGRESS line counts its named run only; this page omits other descendants.\n\n",
+    );
+    output.push_str(&render_mission_run(selected, &[], style, now_unix_ms));
     let _ = writeln!(output, "\nTREE PAGE  {} · {} runs", selected.root_mission_run, runs.len());
     for run in runs {
         if run.subject == selected.subject {
