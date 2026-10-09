@@ -324,16 +324,13 @@ fn dormant_membership_is_physically_capped_and_overflow_fences_without_dropping_
 fn dormant_duplicate_equality_and_rollback_preserve_membership_and_generation() {
     let mut fixture = Fixture::new();
     fixture.record(mutation("gate/one", Some(facts())));
-    let root = fixture.installer.root(&fixture.db, VIEW).unwrap();
+    let before_duplicate = fixture.installer.root(&fixture.db, VIEW).unwrap();
     fixture.record(mutation("gate/one", Some(facts())));
-    assert_eq!(
-        fixture
-            .installer
-            .root(&fixture.db, VIEW)
-            .unwrap()
-            .generation,
-        root.generation
-    );
+    // An admitted duplicate advances source revision, but not semantic generation.
+    // The rollback baseline is the cut AFTER that independently committed duplicate.
+    let root = fixture.installer.root(&fixture.db, VIEW).unwrap();
+    assert_eq!(root.generation, before_duplicate.generation);
+    assert_eq!(root.revision, before_duplicate.revision + 1);
     let before = fixture.db.total_changes();
     let tx = fixture.db.transaction().unwrap();
     assert!(
@@ -343,11 +340,15 @@ fn dormant_duplicate_equality_and_rollback_preserve_membership_and_generation() 
     );
     tx.commit().unwrap();
     assert_eq!(fixture.db.total_changes(), before);
+    assert_eq!(fixture.installer.root(&fixture.db, VIEW).unwrap(), root);
     let tx = fixture.db.transaction().unwrap();
     fixture
         .installer
         .record(&tx, SOURCE, &mutation("gate/one", None))
         .unwrap();
+    let during_rollback = fixture.installer.root(&tx, VIEW).unwrap();
+    assert_eq!(during_rollback.revision, root.revision + 1);
+    assert_eq!(during_rollback.generation, root.generation + 1);
     tx.rollback().unwrap();
     assert_eq!(fixture.installer.root(&fixture.db, VIEW).unwrap(), root);
     assert_eq!(fixture.member_rows(&root.namespace), 1);
