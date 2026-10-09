@@ -216,6 +216,7 @@ export function signatureMark(provenance: unknown): string | undefined {
 
 /** The lines st adds beside a delivery for the agent (st-drivers `ding`). */
 const ST_DELIVERY_NOTES = [
+  'Answer the person in this conversation; people have no inbox, so do not reply with st.',
   "The person reads replies in st, not in the agent's session.",
   '(dictated by voice; it may contain transcription mistakes)',
 ];
