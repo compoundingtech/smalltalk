@@ -94,8 +94,9 @@ impl Fixture {
     }
 
     async fn frame(&mut self) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let message = tokio::time::timeout(Duration::from_secs(10), self.socket.next())
+            let message = tokio::time::timeout_at(deadline, self.socket.next())
                 .await
                 .expect("a collection frame")
                 .unwrap()

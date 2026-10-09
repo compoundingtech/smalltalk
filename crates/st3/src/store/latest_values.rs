@@ -499,6 +499,7 @@ pub(super) fn append(
     .map_err(internal)?;
     update_readiness(&tx, &input)?;
     tx.commit().map_err(internal)?;
+    graph.runtime.current_observation_committed();
     Ok((local, true))
 }
 
@@ -821,6 +822,7 @@ impl Store {
         ).map_err(internal)?;
         update_readiness(&tx, &input)?;
         tx.commit().map_err(internal)?;
+        self.graph.runtime.current_observation_committed();
         Ok(true)
     }
 }

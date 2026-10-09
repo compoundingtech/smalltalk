@@ -77,6 +77,7 @@ pub(super) struct ReadFence {
 /// Held by all sockets using this Store, and by physical workers until they finish.
 /// The registry and commit callback keep only weak references. No follower task is started.
 pub(super) struct Windows {
+    store: Weak<Store>,
     commits: AtomicU64,
     revisions: Mutex<Revisions>,
     /// Held while one socket weighs new commits, so sockets woken by the same commit wait for
@@ -94,7 +95,13 @@ static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 
 impl Windows {
     pub(super) fn commits(&self) -> u64 {
-        self.commits.load(Ordering::Acquire)
+        // Register commits do not enter the graph writer or run its callbacks. Combine the
+        // two monotonic hints so a same-cut register change also invalidates shared windows.
+        let current = self
+            .store
+            .upgrade()
+            .map_or(0, |store| store.runtime.current_observation_revision());
+        self.commits.load(Ordering::Acquire).wrapping_add(current)
     }
     pub(super) fn attach(store: &Arc<Store>) -> Option<Arc<Self>> {
         let mut registry = REGISTRY
@@ -113,6 +120,7 @@ impl Windows {
             return None;
         }
         let windows = Arc::new(Self {
+            store: store_key.clone(),
             commits: AtomicU64::new(0),
             revisions: Mutex::new(Revisions::default()),
             weighing: Mutex::new(()),
@@ -204,7 +212,7 @@ impl Windows {
             .observed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let commits = self.commits.load(Ordering::Acquire);
+        let commits = self.commits();
         // A slower physical reader can hold an older SQLite snapshot. It cannot update the
         // shared frontier or reuse rows from a newer one.
         if index < revisions.index

@@ -77,6 +77,16 @@ pub trait Runtime: Send + Sync {
         sql.to_owned()
     }
 
+    /// Process-local invalidation for replaceable observations committed outside the graph
+    /// writer. This is a cache hint, never an immutable graph or authority frontier.
+    fn current_observation_revision(&self) -> u64 {
+        0
+    }
+
+    /// Called only after a current-observation transaction successfully commits. The hook
+    /// must be non-blocking and do no SQL; immutable runtimes need no invalidation.
+    fn current_observation_committed(&self) {}
+
     /// Check a replicated claim's kind and fields once the graph has verified its hash and batch.
     fn classify_replicated_claim(
         &self,

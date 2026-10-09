@@ -28,6 +28,8 @@ pub struct SmalltalkRuntime {
     pub(crate) claim_registry: std::sync::OnceLock<st3_schema::Registry>,
     pub(crate) conversation_owner_generation: std::sync::atomic::AtomicU64,
     pub(crate) conversation_owners: Mutex<VecDeque<(u64, Arc<conversation_reads::Owners>)>>,
+    /// Successful register commits bypass the managed graph writer's commit callbacks.
+    current_observation_revision: std::sync::atomic::AtomicU64,
     pub(crate) actual_cache: Mutex<HashMap<String, (ActualCacheKey, Option<Value>)>>,
     /// Immutable placement ancestry, keyed by the selected declaration claim.
     pub(crate) placement_cache: Mutex<HashMap<String, Option<Arc<crate::placement::Fence>>>>,
@@ -265,6 +267,16 @@ impl Runtime for SmalltalkRuntime {
 
     fn schema_digest(&self) -> String {
         compatibility_digest(&self.claim_registry().digest())
+    }
+
+    fn current_observation_revision(&self) -> u64 {
+        self.current_observation_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn current_observation_committed(&self) {
+        self.current_observation_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     fn current_observation_sql(&self, kind: &str, sql: &str) -> String {
