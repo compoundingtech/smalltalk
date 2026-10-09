@@ -45,7 +45,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case staleFence, cursorGap, pageCursorExpired, rateLimited
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete, conversationContentInvalidated, transcriptUnavailable
-    case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired, messageTooLarge
+    case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired, messageTooLarge, messageStoreFull, longMessageSignatureUnsupported
     case unknown(String)
 
     public init(from decoder: Decoder) throws {
@@ -71,7 +71,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "terminal-unavailable": .terminalUnavailable; case "terminal-ended": .terminalEnded
         case "blob-too-large": .blobTooLarge; case "unsupported-media-type": .unsupportedMediaType; case "blob-content-mismatch": .blobContentMismatch
         case "blob-quota-exceeded": .blobQuotaExceeded; case "blob-not-found": .blobNotFound; case "blob-expired": .blobExpired
-        case "message-too-large": .messageTooLarge
+        case "message-too-large": .messageTooLarge; case "message-store-full": .messageStoreFull; case "long-message-signature-unsupported": .longMessageSignatureUnsupported
         case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
         default: .unknown(raw)
         }
@@ -98,7 +98,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .terminalUnavailable: "terminal-unavailable"; case .terminalEnded: "terminal-ended"
         case .blobTooLarge: "blob-too-large"; case .unsupportedMediaType: "unsupported-media-type"; case .blobContentMismatch: "blob-content-mismatch"
         case .blobQuotaExceeded: "blob-quota-exceeded"; case .blobNotFound: "blob-not-found"; case .blobExpired: "blob-expired"
-        case .messageTooLarge: "message-too-large"
+        case .messageTooLarge: "message-too-large"; case .messageStoreFull: "message-store-full"; case .longMessageSignatureUnsupported: "long-message-signature-unsupported"
         case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
         case .unknown(let value): value
         }

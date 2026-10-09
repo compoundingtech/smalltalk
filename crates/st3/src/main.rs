@@ -5820,6 +5820,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
     if let Some(person) = &config.person {
         let _ = st3::sekrets::daemon::PERSON.set(person.clone());
     }
+    // Long message bodies this machine owns that no claim names any longer are removed.
+    st3::message_body::spawn_reconciler(store.clone(), config.state_dir.clone());
     // Sekrets is opt-in: this records a gateway's calls once one listens on this host.
     st3::sekrets::daemon::spawn_importer(
         store.clone(),

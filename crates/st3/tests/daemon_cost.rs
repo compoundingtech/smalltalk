@@ -585,6 +585,10 @@ const PROBES: &[Probe] = &[
         "GET /v1/client/messages/{*id}",
         "/v1/client/messages/{message}",
     ),
+    get(
+        "GET /v1/client/message-bodies/{*id}",
+        "/v1/client/message-bodies/{message}",
+    ),
     get("GET /v1/client/launches", "/v1/client/launches"),
     get(
         "GET /v1/client/launches/{id}",
@@ -714,6 +718,10 @@ const PROBES: &[Probe] = &[
     get(
         "GET /v1/messages/page",
         "/v1/messages/page?include_closed=false&limit=100&to={seat}",
+    ),
+    get(
+        "GET /v1/messages/body/{*subject}",
+        "/v1/messages/body/{message}",
     ),
     get(
         "GET /v1/messages/read/{*subject}",

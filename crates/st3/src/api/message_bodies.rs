@@ -19,8 +19,8 @@ async fn whole_text(
     };
     let gone = |text: String| blob_error(St3Error::new("blob-not-found", text));
     let bytes = if body.origin == client_host_id(&state.node) {
-        message_body::directory(&state.state_dir)
-            .read(&body.sha256)
+        message_body::bodies(&state.state_dir)
+            .read(&message.from, &message.subject)
             .map_err(ApiError::internal)?
             .ok_or_else(|| {
                 gone(format!(
@@ -91,7 +91,7 @@ pub(super) async fn client_body(
     require_scope(&session, "read.projections")?;
     let subject = message_subject(&id);
     let lookup = state.clone();
-    let message = blocking_store(move || Ok(lookup.store.message(&subject)?))
+    let message = blocking_store(move || lookup.store.message(&subject))
         .await?
         .ok_or_else(|| ApiError::not_found(format!("message `{id}` does not exist")))?;
     let actor = session.authority_actor.as_str();
@@ -119,7 +119,7 @@ pub(super) async fn body(
 ) -> Result<Json<Value>, ApiError> {
     let subject = message_subject(&subject);
     let lookup = state.clone();
-    let message = blocking_store(move || Ok(lookup.store.message(&subject)?))
+    let message = blocking_store(move || lookup.store.message(&subject))
         .await?
         .ok_or_else(|| ApiError::not_found("this message does not exist"))?;
     let actor = [&message.to, &message.from]

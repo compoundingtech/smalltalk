@@ -72,7 +72,7 @@ st conversations send agent/example/worker \
   --body "$(cat catalog-context.md)"
 ```
 
-Past 4 KiB, the message holds the first kilobyte as a preview and the whole text stays on the
+Past 8 KiB, the message holds the first kilobyte as a preview and the whole text stays on the
 machine that sent it; other members ask that machine when they read it. `st conversations read`
 prints the whole text, and a seat is shown a preview with the instruction to read the rest. If the
 sending machine cannot be reached, the reader sees the preview and which machine has the rest. Over

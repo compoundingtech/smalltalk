@@ -85,6 +85,8 @@ pub enum ErrorCode {
     BlobNotFound,
     BlobExpired,
     MessageTooLarge,
+    MessageStoreFull,
+    LongMessageSignatureUnsupported,
     Internal,
     #[serde(other)]
     Unknown,

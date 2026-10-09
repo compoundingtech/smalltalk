@@ -2419,7 +2419,7 @@ mod tests {
         assert!(message.content.len() < 1100);
         // The owner holds the text as a file, and its database holds no copy of it.
         assert_eq!(
-            crate::message_body::directory(owner_root.path()).read(&hash).unwrap().unwrap(),
+            crate::message_body::bodies(owner_root.path()).read("person/avery", &message.subject).unwrap().unwrap(),
             body.as_bytes()
         );
         assert!(owner_store.get_blob(&hash).unwrap().is_none());
@@ -2501,7 +2501,7 @@ mod tests {
             assert_eq!(small["text"], smaller);
         }
         assert!(gateway_store.get_blob(&hash).unwrap().is_none());
-        assert!(!crate::message_body::directory(gateway_root.path()).path(&hash).exists());
+        assert!(!crate::message_body::bodies(gateway_root.path()).exists("person/avery", &message.subject));
         assert!(!crate::blobs::BlobDir::under(gateway_root.path()).path(&hash).exists());
         // The owner's raw blob routes do not hand a body out as an image or copy it.
         let (status, _) = {
@@ -2536,7 +2536,7 @@ mod tests {
         assert_eq!(value["value"]["text"], body.as_str());
 
         // The owner's file gone: the preview and a note saying where the text was.
-        fs::remove_file(crate::message_body::directory(owner_root.path()).path(&hash)).unwrap();
+        crate::message_body::bodies(owner_root.path()).remove("person/avery", &message.subject);
         let gone = read(message.subject.clone()).await;
         assert_eq!(gone["complete"], false);
         assert!(gone["text"].as_str().unwrap().starts_with(&on_gateway.content));

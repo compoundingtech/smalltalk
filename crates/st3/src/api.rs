@@ -1374,6 +1374,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "terminal-ended"
         | "blob-too-large"
         | "message-too-large"
+        | "message-store-full"
+        | "long-message-signature-unsupported"
         | "unsupported-media-type"
         | "blob-content-mismatch"
         | "blob-quota-exceeded"
@@ -7701,9 +7703,10 @@ async fn repair_replication_record(
 /// Spool one snapshot on a read worker; a slow downloader never holds the SQLite snapshot.
 async fn backup_export(State(state): State<AppState>) -> Result<Response, ApiError> {
     let store = state.store.clone();
+    let bodies = message_body::bodies(&state.state_dir);
     let file = blocking_store(move || {
         let mut file = tempfile::tempfile()?;
-        store.write_backup(&mut file)?;
+        store.write_backup_with_bodies(&mut file, Some(&bodies))?;
         use std::io::{Seek, SeekFrom};
         file.seek(SeekFrom::Start(0))?;
         Ok(file)
@@ -11920,6 +11923,22 @@ pub const SIGNED_MESSAGE_FIELDS: &[&str] = &[
     "to",
 ];
 
+/// The fields a device signs on a message past 8 KiB. The claim holds a preview, so it signs
+/// that: `content` is the preview, cut as [`message_body::preview`] cuts it, and `body_sha256`
+/// and `body_bytes` are the hash and length of the whole text, which every member reads from the
+/// claim's `text/plain` `attachments` entry. Sorted, as the check compares them.
+pub const SIGNED_LONG_MESSAGE_FIELDS: &[&str] = &[
+    "body_bytes",
+    "body_sha256",
+    "content",
+    "from",
+    "in_reply_to",
+    "session_id",
+    "tags",
+    "title",
+    "to",
+];
+
 /// How far a device's signing time may be from this daemon's clock when it first accepts the
 /// message. Members that receive it later check the signature, never the time.
 pub const DEVICE_SIGNATURE_WINDOW_MS: u128 = 15 * 60 * 1_000;
@@ -11936,16 +11955,17 @@ fn check_device_signature(
     subject: &str,
     from: &str,
     fields: &BTreeMap<String, Value>,
+    expected: &[&str],
 ) -> Result<(), ApiError> {
     use smallclaims::principal::{FIELDS_FORMAT, Judged, KeyGrant};
     let mut signed = signature.signed_fields.clone();
     signed.sort();
-    if signature.format.as_deref() != Some(FIELDS_FORMAT) || signed != SIGNED_MESSAGE_FIELDS {
+    if signature.format.as_deref() != Some(FIELDS_FORMAT) || signed != expected {
         return Err(device_signature_error(
             "device-signature-format",
             format!(
                 "a device signs a message in {FIELDS_FORMAT} over {}",
-                SIGNED_MESSAGE_FIELDS.join(", ")
+                expected.join(", ")
             ),
         ));
     }
@@ -12063,17 +12083,15 @@ fn accept_message_receipt_with_upload_owner(
     }
     let long_body = request.content.len() > message_body::INLINE_MAX_BYTES
         && !request.content.starts_with("doc/");
-    if long_body {
-        if request.content.len() > message_body::MAX_BYTES {
-            return Err(ApiError::bad(St3Error::new(
-                "message-too-large",
-                format!(
-                    "a message cannot be longer than {} KiB; this one is {} KiB. Shorten it or send it as several messages.",
-                    message_body::MAX_BYTES / 1024,
-                    request.content.len().div_ceil(1024)
-                ),
-            )));
-        }
+    if long_body && request.content.len() > message_body::MAX_BYTES {
+        return Err(ApiError::bad(St3Error::new(
+            "message-too-large",
+            format!(
+                "a message cannot be longer than {} KiB; this one is {} KiB. Shorten it or send it as several messages.",
+                message_body::MAX_BYTES / 1024,
+                request.content.len().div_ceil(1024)
+            ),
+        )));
     }
     if request.content.starts_with("doc/") {
         let (name, hash) = request.content.rsplit_once('@').ok_or_else(|| {
@@ -12142,15 +12160,17 @@ fn accept_message_receipt_with_upload_owner(
         fields.insert("session_id".into(), Value::String(session_id));
     }
     // A long body is a file on this member, named in the claim like an image: nothing of it but
-    // the preview and this reference enters the database or replication.
+    // the preview and this reference enters the database or replication. The file is written
+    // only after the claim that names it, so a refusal or a failed write leaves no stray file;
+    // a repeat of the same send writes it again, which heals a write that failed.
     let mut body = None;
     let mut claim_attachments = attachments.clone();
     if long_body {
-        let hash = message_body::directory(&state.state_dir)
-            .put(request.content.as_bytes())
-            .map_err(ApiError::internal)?;
+        message_body::bodies(&state.state_dir)
+            .ensure_room(&from, &subject, request.content.len())
+            .map_err(ApiError::bad)?;
         let entry = crate::model::MessageAttachment {
-            sha256: hash,
+            sha256: hex::encode(Sha256::digest(request.content.as_bytes())),
             media_type: message_body::MEDIA_TYPE.into(),
             name: None,
             size: request.content.len() as u64,
@@ -12166,12 +12186,28 @@ fn accept_message_receipt_with_upload_owner(
         );
     }
     if let Some(signature) = &device_signature {
-        // A device signs the whole text it sent, which no other member holds. This member checks
-        // that signature against the whole text, then writes the claim without it: the claim
-        // holds a preview, and a signature over other text would read as invalid everywhere else.
         let mut signed = fields.clone();
-        signed.insert("content".into(), Value::String(request.content.clone()));
-        check_device_signature(state, signature, &request, &subject, &from, &signed)?;
+        let mut expected = SIGNED_MESSAGE_FIELDS;
+        if let Some(body) = &body {
+            // The claim holds a preview, so the signature must cover the preview, the hash and
+            // the length, which every member can read from the claim. A device that signs the
+            // whole text, as it does under 8 KiB, signs something no other member can check.
+            let mut names = signature.signed_fields.clone();
+            names.sort();
+            if names == SIGNED_MESSAGE_FIELDS {
+                return Err(ApiError::bad(St3Error::new(
+                    "long-message-signature-unsupported",
+                    format!(
+                        "this device signs messages in a form that cannot cover one over {} KiB; update it, or send a shorter message",
+                        message_body::INLINE_MAX_BYTES / 1024
+                    ),
+                )));
+            }
+            signed.insert("body_sha256".into(), Value::String(body.sha256.clone()));
+            signed.insert("body_bytes".into(), json!(body.size));
+            expected = SIGNED_LONG_MESSAGE_FIELDS;
+        }
+        check_device_signature(state, signature, &request, &subject, &from, &signed, expected)?;
     }
     let input = ClaimInput {
         subject: subject.clone(),
@@ -12184,10 +12220,15 @@ fn accept_message_receipt_with_upload_owner(
     };
     // A repeated key returns the first claim and says it appended nothing.
     let (record, appended) = match &device_signature {
-        Some(signature) if body.is_none() => state.store.append_signed_message(&input, signature),
-        _ => state.store.append_claim_outcome(&input),
+        Some(signature) => state.store.append_signed_message(&input, signature),
+        None => state.store.append_claim_outcome(&input),
     }
     .map_err(ApiError::bad)?;
+    if body.is_some() {
+        message_body::bodies(&state.state_dir)
+            .put(&from, &subject, request.content.as_bytes())
+            .map_err(ApiError::internal)?;
+    }
     let mut work_wake = is_work_wake(&request.tags);
     if let Some(parent) = request.in_reply_to.as_deref() {
         // Settling the parent writes its lifecycle claims too.

@@ -76,6 +76,15 @@ impl Store {
 
     /// Run on a blocking read worker, never the writer queue. No page query scans the full log.
     pub fn write_backup(&self, output: &mut impl Write) -> Result<Header> {
+        self.write_backup_with_bodies(output, None)
+    }
+
+    /// The same archive, with the texts of the long messages this member owns after its claims.
+    pub fn write_backup_with_bodies(
+        &self,
+        output: &mut impl Write,
+        bodies: Option<&crate::message_body::Bodies>,
+    ) -> Result<Header> {
         loop {
             self.seal_local_batches()?;
             // Capture before pinning: another sealer may advance this atomic after our reader
@@ -173,6 +182,38 @@ impl Store {
                         if after.is_none() {
                             break;
                         }
+                    }
+                }
+                if let Some(bodies) = bodies {
+                    use base64::Engine as _;
+                    for file in bodies.files() {
+                        // Only a body its message's claim names, with the hash that claim gives,
+                        // belongs in the archive; anything else is a stray file.
+                        let subject = format!("message/{}", file.id);
+                        let Some(message) = self.message(&subject)? else {
+                            continue;
+                        };
+                        let Some(named) = message.body_attachment() else {
+                            continue;
+                        };
+                        let Some(bytes) = bodies.read(&message.from, &subject)? else {
+                            continue;
+                        };
+                        if hex::encode(Sha256::digest(&bytes)) != named.sha256
+                            || !bodies.holds(&message.from, &file)
+                        {
+                            continue;
+                        }
+                        write_record(
+                            output,
+                            &mut hash,
+                            &Record::MessageBody(crate::backup::MessageBodyRecord {
+                                message: subject,
+                                actor: message.from,
+                                sha256: named.sha256,
+                                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                            }),
+                        )?;
                     }
                 }
                 self.check_backup_chains()?;
@@ -368,7 +409,21 @@ impl Store {
             log_digest: actual.log_digest,
             projections_match,
             tables: actual.tables,
+            message_bodies_restored: 0,
+            message_bodies_unmatched: 0,
+            message_bodies_referenced: 0,
         })
+    }
+
+    /// How many long messages the claims here name, by the `text/plain` entry in their
+    /// `attachments`. A restore reads it once, offline, to say how many texts it could not return.
+    pub(crate) fn message_body_references(&self) -> Result<u64> {
+        Ok(self.readers.get().query_row(
+            "SELECT COUNT(*) FROM claims WHERE kind='message.sent'
+               AND json_extract(body,'$.fields.attachments') LIKE '%\"text/plain\"%'",
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     fn check_backup_chains(&self) -> Result<()> {

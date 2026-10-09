@@ -365,13 +365,22 @@ pub(super) async fn chunk(
         .await?;
     }
     let offset = query.offset.unwrap_or(0);
-    let directory = if body {
-        crate::message_body::directory(&state.state_dir)
+    let ranged = if body {
+        // The file is addressed by its message; its bytes are checked against `hash` by the reader.
+        let message = query
+            .message
+            .as_deref()
+            .map(message_subject)
+            .and_then(|subject| state.store.message(&subject).ok().flatten());
+        match message {
+            Some(message) => crate::message_body::bodies(&state.state_dir)
+                .read_range(&message.from, &message.subject, offset, blobs::CHUNK_BYTES),
+            None => Ok(None),
+        }
     } else {
-        BlobDir::under(&state.state_dir)
+        BlobDir::under(&state.state_dir).read_range(&hash, offset, blobs::CHUNK_BYTES)
     };
-    let (size, bytes) = directory
-        .read_range(&hash, offset, blobs::CHUNK_BYTES)
+    let (size, bytes) = ranged
         .map_err(ApiError::internal)?
         .ok_or_else(|| {
             if body {

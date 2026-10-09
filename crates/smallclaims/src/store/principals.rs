@@ -452,7 +452,24 @@ fn judge_claim(
         memo,
         links: RefCell::default(),
     };
-    let fields = row.body.get("fields").cloned().unwrap_or(Value::Null);
+    let mut fields = row.body.get("fields").cloned().unwrap_or(Value::Null);
+    // A long message's claim holds a preview, and names its whole text in an `attachments` entry
+    // of type text/plain. A device that signs such a message names `body_sha256` and `body_bytes`
+    // among its signed fields; they are those entry's hash and size, not stored fields.
+    if row.kind == "message.sent"
+        && let Some(body) = fields
+            .get("attachments")
+            .and_then(Value::as_array)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.get("media_type").and_then(Value::as_str) == Some("text/plain"))
+            })
+            .cloned()
+    {
+        fields["body_sha256"] = body.get("sha256").cloned().unwrap_or(Value::Null);
+        fields["body_bytes"] = body.get("size").cloned().unwrap_or(Value::Null);
+    }
     let judged = crate::principal::Judged {
         id: &row.id,
         subject: &row.subject,

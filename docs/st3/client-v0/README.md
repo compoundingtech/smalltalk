@@ -895,13 +895,15 @@ are not in the graph. [Attachments](../attachments.md) defines the limits, reten
 ### Long messages
 
 A message body can be up to `limits.max_message_bytes` (262144; absent on older daemons, which take
-4096). Past 4 KiB a message resource and a timeline message body carry `body_ref` and
+4096). Past 8 KiB a message resource and a timeline message body carry `body_ref` and
 `body_bytes`, and `content` is the first kilobyte; the whole text is a file on the machine that
 took the message. `GET /v1/client/message-bodies/{id}` (scope `read.projections`) asks that machine
 for it and answers `{message, bytes, text, complete}`; an owner that cannot be reached answers
 `remote-unavailable`, and a composer or reader then shows the preview and says where the text is.
-A send over the limit answers `message-too-large` (the text says the limit); it is a definite
-refusal that wrote nothing, so a composer keeps the person's text. See
+A send over the limit answers `message-too-large` (the text says the limit); `message-store-full`
+(the owner's quota) and `long-message-signature-unsupported` (a device that signs the whole text
+of a message; see [long messages](../long-messages.md#device-signatures)) are the other refusals.
+All are definite refusals that wrote nothing, so a composer keeps the person's text. See
 [long messages](../long-messages.md).
 
 ## Event feed and resynchronization

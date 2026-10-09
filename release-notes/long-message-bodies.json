@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "Send message bodies up to 256 KiB: past 4 KiB the whole text is a file on the sending machine and the claim keeps a preview",
+  "summary": "Send message bodies up to 256 KiB: past 8 KiB the whole text is a file on the sending machine and the claim keeps a preview",
   "replay": {
     "status": "none",
     "detail": "No projection or replay change. Existing messages read exactly as before: a message without a text/plain attachments entry has no body_ref and its content is the whole text."
@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Older builds accept the claim and read the message as its preview, because they keep only image attachments entries. Client API: optional body_ref and body_bytes on message resources and timeline message bodies, limits.max_message_bytes, GET /v1/client/message-bodies/{id}, and the error code message-too-large. Older clients keep reading the preview."
+    "detail": "Older builds accept the claim and read the message as its preview, because they keep only image attachments entries. Client API: optional body_ref and body_bytes on message resources and timeline message bodies, limits.max_message_bytes, GET /v1/client/message-bodies/{id}, and the error codes message-too-large, message-store-full and long-message-signature-unsupported. A paired device that signs the whole text of a message over 8 KiB is refused until it signs the preview, hash and size; shorter messages are unchanged. Older clients keep reading the preview."
   },
   "downtime": {
     "status": "none",
@@ -23,7 +23,7 @@
   },
   "manual": {
     "status": "none",
-    "detail": "None. The owner's message-bodies directory is outside the graph backup."
+    "detail": "None. Backups made by this build include the long bodies the member owns; restore reports how many it returned. The owner's store is limited to 256 MiB per sender and 1 GiB per machine (ST3_MESSAGE_BODIES_ACTOR_MAX_MB, ST3_MESSAGE_BODIES_MAX_MB)."
   },
   "recovery": {
     "status": "none",
