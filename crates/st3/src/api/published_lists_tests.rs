@@ -371,6 +371,20 @@ fn published_work_matches_the_direct_read_for_every_actor_as_time_passes() {
         .unwrap();
     let (_, changed) = fold_work_checked(&store);
     assert!(changed, "the moved queue reorders ash's windows");
+    // And back, so alpha's step is ash's next work again.
+    store
+        .move_seat_queue_run(&crate::model::SeatQueueMoveRequest {
+            agent: "agent/garden/ash".into(),
+            run: alpha.id.clone(),
+            placement: "top".into(),
+            anchor: None,
+            reason: Some("alpha first".into()),
+            actor: "person/operator".into(),
+            idempotency_key: "move-alpha".into(),
+        })
+        .unwrap();
+    let (_, changed) = fold_work_checked(&store);
+    assert!(changed);
 
     // A claim starts the step's execution time, which grows with the list's time while
     // unrelated claims move the cut.
