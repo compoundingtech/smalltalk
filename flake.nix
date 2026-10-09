@@ -465,6 +465,8 @@
             pkgs.which
             pkgs.cargo-nextest
             pkgs.python3
+            # stui's Cargo smoke drives disposable PTYs, including a tmux pane.
+            pkgs.tmux
             # Boot cleanup fixtures query their isolated daemon with curl.
             pkgs.curl
             pkgs.nodejs
@@ -1138,6 +1140,8 @@
             pkgs.sccache
             pkgs.cargo-nextest
             pkgs.pkg-config
+            pkgs.python3
+            pkgs.tmux
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.mold ] ++ [
             # wasm guest modules (resource-profile resolvers) link with lld; nixpkgs rustc does
             # not bundle rust-lld the way the rustup toolchain does.
