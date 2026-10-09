@@ -518,6 +518,21 @@ pub(super) fn owner(
     Ok(owners.into_iter().next())
 }
 
+/// The owning sets of every member at `at`, from one read of the set receipts. A member with
+/// more than one is what [`owner`] refuses as a conflict.
+pub(super) fn owners_at(
+    connection: &Connection,
+    at: Option<u64>,
+) -> Result<BTreeMap<String, BTreeSet<String>>, St3Error> {
+    let mut owners = BTreeMap::<String, BTreeSet<String>>::new();
+    for view in rows(connection, at)? {
+        for member in view.receipt.members.keys().chain(view.receipt.retired.keys()) {
+            owners.entry(member.clone()).or_default().insert(view.id.clone());
+        }
+    }
+    Ok(owners)
+}
+
 pub(super) fn refuse_unmanaged(connection: &Connection, member: &str) -> Result<(), St3Error> {
     if let Some(set) = owner(connection, member, None)? {
         return Err(St3Error::new(

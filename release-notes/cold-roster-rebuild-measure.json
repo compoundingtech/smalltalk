@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Measure the statements and time of a cold full agents roster rebuild in daemon_load",
+  "replay": {
+    "status": "none",
+    "detail": "Adds a gated load-test measurement and a hidden entry point that calls the existing roster fold; no production behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Adds a gated load-test measurement and a hidden entry point that calls the existing roster fold; no production behavior changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Adds a gated load-test measurement and a hidden entry point that calls the existing roster fold; no production behavior changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Adds a gated load-test measurement and a hidden entry point that calls the existing roster fold; no production behavior changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Adds a gated load-test measurement and a hidden entry point that calls the existing roster fold; no production behavior changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Adds a gated load-test measurement and a hidden entry point that calls the existing roster fold; no production behavior changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Adds a gated load-test measurement and a hidden entry point that calls the existing roster fold; no production behavior changes."
+  }
+}
