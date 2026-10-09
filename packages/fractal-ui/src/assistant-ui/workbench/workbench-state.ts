@@ -3,10 +3,10 @@ import * as Schema from 'effect/Schema'
 import { geometryNumbers as geo } from '../composition-tokens.stylex'
 import { walkSplits, type WorkbenchLayout } from './workbench-model'
 
-const PaneSchema = Schema.Struct({ uri: Schema.String, form: Schema.optionalKey(Schema.String), view: Schema.optionalKey(Schema.String) })
+const PaneSchema = Schema.Struct({ uri: Schema.String, form: Schema.optional(Schema.String), view: Schema.optional(Schema.String) })
 const LayoutSchema: Schema.Codec<WorkbenchLayout> = Schema.suspend(() => Schema.Union([
   Schema.Struct({ kind: Schema.Literal('group'), tabs: Schema.Array(PaneSchema) }),
-  Schema.Struct({ kind: Schema.Literal('split'), split: Schema.Literals(['right', 'below']), ratio: Schema.optionalKey(Schema.Number), children: Schema.Tuple([LayoutSchema, LayoutSchema]) }),
+  Schema.Struct({ kind: Schema.Literal('split'), split: Schema.Literals(['right', 'below']), ratio: Schema.optional(Schema.Number), children: Schema.Tuple([LayoutSchema, LayoutSchema]) }),
 ]))
 const StoredLayoutSchema = Schema.fromJsonString(LayoutSchema)
 
