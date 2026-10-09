@@ -140,13 +140,15 @@ State and draft codecs use the workspace's single `effect@4.0.0-rc.118` runtime 
 
 The codecs use native `Schema.optional`, preserving both absent fields and explicitly present `undefined` fields from the original Effect 3 contract. `OptionalSnapshotFields` exercises the real pane-key parser and snapshot encode/read path, including form-only, view-only and undefined-ratio inputs.
 
+The `Geometry` story is a non-interacting fixture for the reusable composer and its layout/running/target/mention matrices. It lets the source geometry assertions measure the same native composer before story play actions mutate its state; it does not ship the route's Explore controls or application chrome.
+
 The exported legacy Folio, Relay and Orbit palettes also avoid green: `good` is the direction's 80% ink foreground; `added` is a non-green wash whose luminance difference from the panel is within 20% of the direction's removed wash. Run `pnpm --filter @smalltalk/fractal-ui test:palettes` to check all six direction/scheme combinations without a browser. The public names and palette-selection API are unchanged.
 
 ## Clean-room note
 
-This kit was written fresh from behavior-only requirements. No existing design-system source, CSS, tokens, fonts, icons, logos, screenshots or microcopy was imported or consulted. Every palette value, spacing bias, type stack, corner scale and motion curve was chosen independently for this kit.
+The original kit's behavior references are listed below. The gated workbench/composer additions reuse our independently authored internal review route at `98a270d4e58a44e4c4625cf1956ad09dbabfc1a7`, with the reviewed tint cutover from `35b6922a1559b4b3bcd78b672cb6b707c5d1e108`; their host/runtime boundaries are adapted to this kit as described above. This provenance is not a claim that the later additions were authored without consulting our own source.
 
-Behavioral inspiration came only from public product documentation of coding-agent workflows. No source code, assets, branding or copy was reused:
+The original workflow requirements cited public product documentation of coding-agent workflows; those behavioral references are separate from the internal-source port described above:
 
 - [Coding-agent app workflow introduction](https://openai.com/index/introducing-the-codex-app/): parallel threads, isolated worktrees, review before landing.
 - [Zed agent panel](https://zed.dev/docs/ai/agent-panel): keyboard-first palette, per-change review, explicit execution state.
