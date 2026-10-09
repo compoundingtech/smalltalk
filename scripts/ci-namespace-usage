@@ -6,11 +6,15 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from urllib.parse import quote
 
 UTC = timezone.utc
 LOOKBACK_DAYS = 7
-API_REQUEST_LIMIT = 800
+API_REQUEST_LIMIT = 4000
+API_REMAINING_RESERVE = 500
 api_requests = 0
+rate_limit = None
+lowest_remaining = None
 
 
 def timestamp(value):
@@ -87,14 +91,28 @@ def render(report):
 
 
 def api(path):
-    global api_requests
+    global api_requests, rate_limit, lowest_remaining
     if api_requests >= API_REQUEST_LIMIT:
         raise RuntimeError(f'API request budget exhausted ({API_REQUEST_LIMIT}); remaining evidence unknown')
+    if lowest_remaining is not None and lowest_remaining <= API_REMAINING_RESERVE:
+        raise RuntimeError('credential request reserve reached; preserve quota for runner admission')
     api_requests += 1
-    result = subprocess.run(['gh', 'api', path], capture_output=True, text=True, timeout=30)
+    result = subprocess.run(['gh', 'api', '--include', path], capture_output=True, text=True, timeout=30)
+    header, separator, body = result.stdout.partition('\n\n')
+    if separator:
+        headers = dict(line.lower().split(': ', 1) for line in header.splitlines() if ': ' in line)
+        if 'x-ratelimit-limit' in headers:
+            rate_limit = int(headers['x-ratelimit-limit'])
+        if 'x-ratelimit-remaining' in headers:
+            remaining = int(headers['x-ratelimit-remaining'])
+            lowest_remaining = remaining if lowest_remaining is None else min(lowest_remaining, remaining)
     if result.returncode:
         raise RuntimeError(f"GitHub API failed for {path}: {result.stderr.strip()}")
-    return json.loads(result.stdout)
+    if not separator or rate_limit is None:
+        raise RuntimeError('GitHub rate-limit headers absent; API capacity unknown')
+    if rate_limit < API_REQUEST_LIMIT:
+        raise RuntimeError(f'credential API limit {rate_limit} is below the {API_REQUEST_LIMIT}-request budget; need existing higher-limit read token')
+    return json.loads(body)
 
 
 def pages(path, field, filtered=False):
@@ -111,6 +129,32 @@ def pages(path, field, filtered=False):
     raise RuntimeError('usage pagination exceeded 1000 pages; refuse a complete total')
 
 
+def created_runs(repo, low, high):
+    """Split saturated filtered searches; intervals are half-open UTC seconds."""
+    left = low.strftime('%Y-%m-%dT%H:%M:%SZ')
+    right = (high - timedelta(seconds=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    path = f'repos/{repo}/actions/runs?per_page=100&created={quote(left + ".." + right, safe="")}'
+    response = api(path + '&page=1')
+    if response['total_count'] >= 1000:
+        seconds = int((high - low).total_seconds())
+        if seconds <= 1:
+            raise RuntimeError('created-second search saturated; remaining coverage unknown')
+        middle = low + timedelta(seconds=seconds // 2)
+        yield from created_runs(repo, low, middle)
+        yield from created_runs(repo, middle, high)
+        return
+    for page in range(1, 11):
+        if page > 1:
+            response = api(path + f'&page={page}')
+        if response['total_count'] >= 1000:
+            raise RuntimeError('created-window search saturated during pagination; remaining coverage unknown')
+        entries = response['workflow_runs']
+        yield from entries
+        if len(entries) < 100:
+            return
+    raise RuntimeError('created-window search pagination saturated; remaining coverage unknown')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--date', default=(datetime.now(UTC) - timedelta(days=1)).date().isoformat())
@@ -125,9 +169,9 @@ def main():
     coverage_start = start - timedelta(days=LOOKBACK_DAYS)
     try:
         for offset in range(LOOKBACK_DAYS + 1):
-            day = (coverage_start + timedelta(days=offset)).date().isoformat()
-            path = f'repos/{args.repo}/actions/runs?per_page=100&created={day}'
-            for run in pages(path, 'workflow_runs', filtered=True):
+            # Reporting day first: if a budget binds, keep the most useful evidence.
+            day = start - timedelta(days=offset)
+            for run in created_runs(args.repo, day, day + timedelta(days=1)):
                 if run['id'] in seen_runs:
                     continue
                 seen_runs.add(run['id'])
@@ -147,6 +191,9 @@ def main():
     report.update(date=args.date, repository=args.repo, generated_at=datetime.now(UTC).isoformat(),
                   retained_run_metadata_scanned=all_runs, relevant_runs=relevant_runs,
                   api_requests=api_requests, api_request_limit=API_REQUEST_LIMIT,
+                  observed_primary_rate_limit=rate_limit, lowest_remaining_requests=lowest_remaining,
+                  remaining_request_reserve=API_REMAINING_RESERVE,
+                  credential_source=os.environ.get('USAGE_TOKEN_SOURCE', 'local-gh-auth'),
                   collection_errors=collection_errors, full_day_complete=False,
                   creation_window_start=coverage_start.isoformat(), creation_window_end=end.isoformat(),
                   rerun_creation_lookback_days=LOOKBACK_DAYS,

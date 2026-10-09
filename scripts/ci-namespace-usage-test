@@ -80,7 +80,7 @@ def control(collection_failure):
         g['api_requests'] += 1
         paths.append(path)
         if collection_failure:
-            raise RuntimeError('API request budget exhausted (800); remaining evidence unknown')
+            raise RuntimeError('API request budget exhausted (4000); remaining evidence unknown')
         return {'workflow_runs': [], 'total_count': 0}
     g['api_requests'] = 0
     g['api'] = fake_api
@@ -99,7 +99,7 @@ def control(collection_failure):
             sys.argv = saved
         result = json.loads(output.read_text())
     assert result['api_requests'] == len(paths)
-    assert result['api_request_limit'] == 800 and not result['full_day_complete']
+    assert result['api_request_limit'] == 4000 and not result['full_day_complete']
     assert result['rerun_creation_lookback_days'] == 7
     assert result['creation_window_start'] == '2026-10-01T00:00:00+00:00'
     assert result['creation_window_end'] == '2026-10-09T00:00:00+00:00'
@@ -111,3 +111,49 @@ def control(collection_failure):
 control(False)
 control(True)
 print('passed: queue-cancelled current/prior-day exclusions, eight-day creation window, request budget, filtered cap, retained partial failure evidence')
+
+# 1,699-run day from the review's actual volume fits split queries, without
+# treating the first 1,000-search response as the complete set. No API call here.
+from urllib.parse import parse_qs, urlsplit
+all_runs = [dict(id=i, created_at=(start + timedelta(seconds=i * 50)).isoformat()) for i in range(1699)]
+queries = []
+def split_api(path):
+    q = parse_qs(urlsplit(path).query)
+    lo, hi = q['created'][0].split('..')
+    matching = [run for run in all_runs if m['timestamp'](lo) <= m['timestamp'](run['created_at']) <= m['timestamp'](hi)]
+    page = int(q['page'][0]); queries.append(path)
+    return dict(total_count=len(matching), workflow_runs=matching[(page-1)*100:page*100])
+g['api'] = split_api
+assert [r['id'] for r in m['created_runs']('example/repo', start, end)] == list(range(1699))
+assert len(queries) < 30
+g['api'] = lambda _: {'total_count': 1000, 'workflow_runs': []}
+try:
+    list(m['created_runs']('example/repo', start, start + timedelta(seconds=1)))
+    raise AssertionError('unresolvable saturated second must fail')
+except RuntimeError as error:
+    assert 'saturated' in str(error)
+# Check real API parser with subprocess stand-ins, including lower-limit refusal.
+from types import SimpleNamespace
+original_run = g['subprocess'].run
+try:
+    for limit in (5000, 1000):
+        g['api_requests'] = 0; g['rate_limit'] = None; g['lowest_remaining'] = None
+        g['subprocess'].run = lambda *a, **k: SimpleNamespace(returncode=0, stderr='', stdout=f'HTTP/2.0 200 OK\nX-Ratelimit-Limit: {limit}\nX-Ratelimit-Remaining: 4999\n\n{{"jobs": []}}')
+        try:
+            result = original_api('stand-in')
+            assert limit == 5000 and result == {'jobs': []}
+        except RuntimeError as error:
+            assert limit == 1000 and 'below' in str(error)
+        assert g['api_requests'] == 1 and g['rate_limit'] == limit
+finally:
+    g['subprocess'].run = original_run
+print('passed: 1699-run split-day coverage, second-level cap refusal, API request/rate metadata and insufficient credential refusal')
+
+g['api_requests'] = 0; g['lowest_remaining'] = 500
+try:
+    original_api('never-requested-reserve')
+    raise AssertionError('reserve must stop before request')
+except RuntimeError as error:
+    assert 'reserve reached' in str(error)
+assert g['api_requests'] == 0
+print('passed: preserve 500 remaining shared-token requests for runner admission')

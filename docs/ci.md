@@ -831,18 +831,24 @@ by PRs and other work. Actual starts/waits decide later tuning, not those upper
 bounds alone. A dedicated capped profile requires an actual administrator receipt;
 this PR does not claim one was provisioned.
 
-`Namespace usage` runs at 06:05 UTC on GitHub-hosted capacity and reports the previous
+`Namespace usage` runs at 03:05 UTC on GitHub-hosted capacity and reports the previous
 UTC day's observed Namespace job execution minutes, split by event (merge_group,
 pull_request and other events). Cos can read the job summary and its 30-day JSON
-artifact for the morning cost check. The report has a 30-minute timeout, but request
-count is bounded separately: at most 800 GitHub API requests, leaving room below
-the standard job token's 1,000-request hourly repository limit (shared token use
-can still exhaust it). Every JSON records the actual call count and limit.
+artifact for the morning cost check. The report has a 120-minute timeout, but request
+count is bounded separately: at most 4,000 GitHub API requests. It reuses the existing
+`CI1_RUNNERS_READ_TOKEN` from the main-only picker, without a new secret. Standard
+PAT/installation tokens have a 5,000-request hourly primary limit; the 1,000/hour
+job-token fallback cannot cover this repository's measured volume. The reporter
+checks actual response rate-limit headers, refuses a limit below its budget, and
+records the observed limit, lowest remaining count and actual requests in JSON.
+The collector stops at 500 remaining requests to reserve shared quota for runner
+admission. Shared credential use can still exhaust available quota and must remain visible.
 `python3 scripts/ci-namespace-usage --date YYYY-MM-DD --output usage.json` also
 provides an on-demand report. It queries eight UTC creation days: the reporting
 day and seven prior days, so reruns of older runs are outside coverage. Each day
-is queried separately; a created-day search reaching GitHub's 1,000-result cap
-refuses completeness. Within this window it queries all attempts, includes
+is queried separately, recursively splitting saturated time ranges until each
+query is below GitHub's 1,000-result cap. A saturated one-second interval or
+changing search that reaches the cap while paging refuses completeness. Within this window it queries all attempts, includes
 failed/cancelled execution, deduplicates job IDs and clips executions across midnight.
 Every day total is explicitly a **daily lower bound**, never a complete-day or
 invoice total. “Complete window evidence” means only that this creation window
@@ -859,3 +865,16 @@ Totals are operational execution minutes, not invoice dollars or billable unit
 minutes: provisioning before the first job step and deleted GitHub history are
 outside this method. Use Namespace's billing view for an invoice; the report
 preserves raw job IDs/timestamps for reconciliation.
+
+Intake's read-only day counts for October 2–8 were 949, 1,222, 1,227, 1,437,
+1,126, 1,761 and 1,699 runs. The last day alone requires at least 1,699 jobs
+requests plus run-list pages; this invalidated the earlier 800-request/job-token
+design. The bounded 4,000-call design and earlier schedule allow this scale, but
+actual call count, credential capability and natural completion remain execution
+evidence, not a guaranteed bound on future repository volume.
+The initial historical collector ended naturally after 37m05s, scanning 14,135
+retained run records and 1,761 relevant runs. That requires at least 1,903 API
+calls (142 run-list pages plus at least one jobs page per relevant run); its exact
+request count was not instrumented. Its older identity gap makes its 38,979.28
+observed job minutes a lower bound, not current collector qualification. The new
+collector records exact request/rate evidence for its own natural outcome.
