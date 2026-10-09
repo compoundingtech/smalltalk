@@ -1,7 +1,7 @@
 import { sidebarRow } from './sidebarRow.ts'
 import { ConversationPane } from './ConversationPane.tsx'
 import { ConversationHeaderActions } from './ConversationHeaderActions.tsx'
-import { changesNotice, liveChangesState, workspaceView, workspaceViewNotice, type ChangesState, type WorkspaceView } from './workspaceView.ts'
+import { workspaceView, workspaceViewNotice, type WorkspaceView } from './workspaceView.ts'
 import { ThreadHeaderSlotContext } from '../shell/threadHeaderSlot.tsx'
 import { liveLegacyTheme } from '../ui-compat/live-theme.stylex.ts'
 import { colorVars as c, typeVars as t, spaceVars as s, geometryVars as g } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
@@ -19,6 +19,9 @@ import { persistedAtom } from '../state/persistence.ts'
 import { WorkbenchContextProvider, ResourcePanelProvider, MonitorDetailProvider, type OpenRequest } from '../shell/context.tsx'
 import type { ResourcePanelState } from '../shell/state.ts'
 import type { UxTelemetry } from '../telemetry/ux.ts'
+
+// The kit diff viewer imports Markdown; keep it outside the shell's eager graph too.
+const ChangesInspector = React.lazy(() => import('./ChangesInspector.tsx').then(module => ({ default: module.ChangesInspector })))
 
 const sidebarRatio = persistedAtom({ key: 'round2.sidebarRatio', schema: Schema.Number, defaultValue: 256 / 1440 })
 const panelRatio = persistedAtom({ key: 'round2.panelRatio', schema: Schema.Number, defaultValue: 380 / 1440 })
@@ -189,9 +192,9 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
               {diffOpen && openedTool === undefined && current !== '' ? (
                 <>
                   <ResizableSplit id="live-change-panel" reverse value={panelSize} min={240} max={maxPanel} collapsed={false} label="Change panel width" onChange={setDragPanel} onCommit={(value) => { setPanelFraction(value / viewport); setDragPanel(undefined) }} onToggle={() => setDiffOpen(false)} onReset={() => setPanelFraction(380 / viewport)} />
-                  <aside aria-label="Changes" style={{ width: panelSize }} {...stylex.props(styles.changesPanel)}>
-                    <ChangesPanelNotice state={liveChangesState} />
-                  </aside>
+                  <React.Suspense fallback={<aside aria-label="Changes" style={{ width: panelSize }} {...stylex.props(styles.changesPanel)}><p role="status" {...stylex.props(styles.notice)}>Loading captured changes…</p></aside>}>
+                    <ChangesInspector key={current} agentRef={current} width={panelSize} />
+                  </React.Suspense>
                 </>
               ) : null}
               {openedTool !== undefined && current !== '' ? (
@@ -221,9 +224,6 @@ export function WorkspaceBody({ current, view, agentName, onOpenTool }: { readon
   return <p role="status" {...stylex.props(styles.empty)}>{workspaceViewNotice(view)}</p>
 }
 
-export function ChangesPanelNotice({ state }: { readonly state: ChangesState }) {
-  return <p role="status" {...stylex.props(styles.notice)}>{changesNotice(state)}</p>
-}
 const styles = stylex.create({
   legacyBridge: { '--canvas': c.canvas, '--panel': c.raised, '--recess': c.message, '--ink': c.fg, '--muted': c.fgMuted, '--line': c.borderStrong, '--accent': c.primary, '--on-accent': c.onPrimary, '--selection': c.rowActive, '--good': c.done, '--warning': c.attention, '--danger': c.dangerFg, '--sans': t.fontSans, '--mono': t.fontMono },
   app: { display: 'flex', height: 'calc(100dvh - var(--wf-devbar-space, 0px))', width: '100%', overflow: 'hidden', backgroundColor: c.canvas, color: c.fg, fontFamily: t.fontSans, fontSize: t.uiSize, lineHeight: t.uiLeading },

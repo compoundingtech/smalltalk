@@ -11,6 +11,9 @@ import { fixtureSource } from '../data/fixtureSource.ts'
 import { observed, unavailable, type Feed } from '../data/source.ts'
 import type { ResourcePage } from '../resources/agent/model.ts'
 import { LiveAgentWorkspace } from './LiveAgentWorkspace.tsx'
+import type { ConversationPage } from '../data/source.ts'
+import { decodeConversationChunk } from '@st3/sdk/effect'
+import { LiveTimeline } from '../conversation/fromTimeline.ts'
 
 vi.mock('@stylexjs/stylex', () => ({ create: (styles: unknown) => styles, defineVars: (variables: unknown) => variables, createTheme: () => ({}), keyframes: () => 'animation', props: () => ({}) }))
 
@@ -18,11 +21,13 @@ const agent = decodeUnknownSync(Agent)({ kind: 'agent', id: 'agent/example', nam
 const queue = decodeUnknownSync(AgentQueue)({ agent_id: agent.id, current_work_ids: ['work/current'], kind: 'agent-queue', move_count: 0, moves: [], next_work_id: null, runs: [{ claimed_work_ids: [], joined_at: '2026-10-04T12:00:00.000Z', mission_run_id: 'mission-run/example', position: 1, ready_work_ids: ['work/ready'], run_state: 'running', state: 'ready', waiting_work_ids: [] }] })
 const resource = decodeUnknownSync(ResourceObservation)({ id: 'resource/example', kind: 'filesystem.file', facts: { title: 'Observed project notes', state: 'open' }, observed_at: '2026-10-04T12:00:00.000Z', opened_by: agent.id, opened_by_run: null })
 const resources = Atom.make<Feed<ResourcePage>>(observed({ value: { items: [resource], nextCursor: null } }))
+const conversation = Atom.make<Feed<ConversationPage>>(observed<ConversationPage>({ value: { items: [
+  { _tag: 'UnknownEvent', id: 'internal', eventType: 'credential_pin', data: { pin_hint: 'not-for-display' } },
+  { _tag: 'UnknownEvent', id: 'future', eventType: 'future_kind', data: {} },
+], hasOlder: false, observation: { empty: false } } }))
 const source = {
-  ...fixtureSource({ world: { now: Date.parse('2026-10-06T12:00:00.000Z'), agents: [agent], missions: [], attention: [], events: [], conversations: { [agent.id]: { items: [
-    { _tag: 'UnknownEvent', id: 'internal', eventType: 'credential_pin', data: { pin_hint: 'not-for-display' } },
-    { _tag: 'UnknownEvent', id: 'future', eventType: 'future_kind', data: {} },
-  ], hasOlder: false, observation: { empty: false } } }, terminals: {}, envelopes: {}, usage: { _tag: 'undeclared' }, subjectReads: { agentQueue: { [agent.id]: observed({ value: queue }) } } } }),
+  ...fixtureSource({ world: { now: Date.parse('2026-10-06T12:00:00.000Z'), agents: [agent], missions: [], attention: [], events: [], conversations: {}, terminals: {}, envelopes: {}, usage: { _tag: 'undeclared' }, subjectReads: { agentQueue: { [agent.id]: observed({ value: queue }) } } } }),
+  conversation: (_ref: string) => conversation,
   gateway: 'http://fixture.invalid',
   resources: { byAgent: () => resources, byId: () => Atom.make(observed({ value: resource })), subjects: Atom.make([]), loadMore: vi.fn(), refresh: vi.fn(), resolveFile: () => undefined },
 }
@@ -81,6 +86,43 @@ describe('live header parity', () => {
     expect(dialog?.textContent).toContain('mission-run/example')
     await click('Close resources')
     expect(document.querySelector('[role="dialog"][aria-label="Agent resources"]')).toBeNull()
+  })
+  it('opens successful change captures from the public conversation feed', async () => {
+    const timeline = new LiveTimeline()
+    timeline.apply(decodeConversationChunk({
+      kind: 'conversation', collection: 'conversation', id: 'follow/example',
+      session_id: 'session/example', replace: true, has_more: true, items: [
+        { id: 'timeline-entry/edit', sequence: 1, revision: 1, final: true, role: 'assistant',
+          timestamp: '2026-10-04T12:00:00.000Z', type: 'tool_call',
+          body: { call_id: 'call/edit', name: 'Edit', arguments: { file_path: 'src/example.ts', old_string: 'beforeCapture', new_string: 'afterCapture' } } },
+        { id: 'timeline-entry/result', sequence: 2, revision: 1, final: true, role: 'tool',
+          timestamp: '2026-10-04T12:00:01.000Z', type: 'tool_result',
+          body: { call_id: 'call/edit', status: 'success', media_type: 'text/plain', content: 'Edit applied' } },
+      ],
+    }))
+    expect(timeline.project().items[0]).toMatchObject({ _tag: 'ToolCall', status: 'success' })
+    // Hold the fixture atom while the lazy thread/inspector chunks acquire their own subscriptions.
+    const release = registry.mount(source.conversation(agent.id))
+    try {
+      await act(async () => registry.set(conversation, observed({ value: {
+        items: timeline.project().items, hasOlder: timeline.hasOlder,
+      } })))
+      await click('Toggle right panel')
+      await vi.waitFor(async () => {
+        await act(async () => {})
+        const inspector = host.querySelector('aside[aria-label="Changes"]')
+        expect(inspector?.textContent).toContain('Successful-tool captures · loaded transcript window')
+        expect(inspector?.textContent).toContain('older history not shown')
+        expect(inspector?.textContent).toContain('src/example.ts')
+        expect(inspector?.textContent).toContain('beforeCapture')
+        expect(inspector?.textContent).toContain('afterCapture')
+        expect(inspector?.querySelector('[data-captured-change]')).not.toBeNull()
+        expect(inspector?.querySelector('button[aria-label="Open src/example.ts"]')).not.toBeNull()
+        expect(inspector?.textContent).not.toContain('This web client does not read change data yet')
+      }, { timeout: 15_000 })
+    } finally {
+      release()
+    }
   })
   it('persists the system-event view preference without any connection or agent identity in storage keys', async () => {
     await click('Conversation menu')

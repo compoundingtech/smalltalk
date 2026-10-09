@@ -17,17 +17,3 @@ export const workspaceView = (pane: { readonly ref: string } | undefined): Works
 export const workspaceViewNotice = (view: Exclude<WorkspaceView, { _tag: 'Thread' }>): string =>
   `${view._tag === 'TerminalUnavailable' ? 'Terminal unavailable' : 'View unavailable'}. ${view.reason}`
 
-export type ChangesState =
-  | { readonly _tag: 'Loading' }
-  | { readonly _tag: 'NoObservedChanges' }
-  | { readonly _tag: 'Unavailable'; readonly reason: string }
-
-/** No data-layer port reports file changes, so the live panel is Unavailable rather than implying pending changes. */
-export const liveChangesState: ChangesState = { _tag: 'Unavailable', reason: 'This web client does not read change data yet.' }
-
-export const changesNotice = (state: ChangesState): string =>
-  state._tag === 'Loading'
-    ? 'Loading changes…'
-    : state._tag === 'NoObservedChanges'
-      ? 'No changes observed for this thread.'
-      : `Changes unavailable. ${state.reason}`

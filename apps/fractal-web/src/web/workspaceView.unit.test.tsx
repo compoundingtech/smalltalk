@@ -1,8 +1,8 @@
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
-import { ChangesPanelNotice, WorkspaceBody } from './LiveAgentWorkspace.tsx'
-import { changesNotice, liveChangesState, workspaceView } from './workspaceView.ts'
+import { WorkspaceBody } from './LiveAgentWorkspace.tsx'
+import { workspaceView } from './workspaceView.ts'
 
 vi.mock('@stylexjs/stylex', () => ({
   create: (styles: unknown) => styles,
@@ -29,15 +29,3 @@ describe('workspace body', () => {
   })
 })
 
-describe('changes panel', () => {
-  it('tells loading, no observed changes and unavailable apart', () => {
-    expect(changesNotice({ _tag: 'Loading' })).toBe('Loading changes…')
-    expect(changesNotice({ _tag: 'NoObservedChanges' })).toBe('No changes observed for this thread.')
-    expect(changesNotice({ _tag: 'Unavailable', reason: 'Reported reason.' })).toBe('Changes unavailable. Reported reason.')
-  })
-  it('renders the live panel as unavailable, never as pending on transcript observations', () => {
-    const html = renderToStaticMarkup(createElement(ChangesPanelNotice, { state: liveChangesState }))
-    expect(html).toMatch(/Changes unavailable\. This web client does not read change data yet\./)
-    expect(html).not.toMatch(/verified transcript observations/)
-  })
-})

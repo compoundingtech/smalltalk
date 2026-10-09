@@ -163,6 +163,28 @@ remote site. With CSP enforced the route is never reached and `img-src` reports
 the violation. Browser sessions, listeners and temporary build files are closed
 and removed on exit. There is no production CSP-disable switch.
 
+## Fractal web captured changes
+
+The Changes panel reuses `source.conversation(agentRef)`: its live source follows
+`/v1/client/collections/stream` with `collection: "conversation"`. Decoded `tool_call`
+arguments and successful `tool_result` content supply recorded patches or edited excerpts;
+there is no private capture fixture, repository read, or separate file-change endpoint.
+The public `/v1/client/conversations/{id}/changes` route reports conversation deltas,
+not current-worktree diffs.
+
+Only successful calls with an observed nonerror result and known changed content appear.
+The inspector preserves reported tool/sender provenance, separates repeated captures of
+the same path, and scopes counts to the shown capture and loaded transcript window.
+Missing captures do not establish that a repository is unchanged. Waiting, unavailable,
+stale observations and older-history boundaries remain visible. Resource card/chip actions
+select captured content locally; they do not fetch repository state.
+
+The panel acquires visible conversation demand while mounted and shares the thread's
+retained feed. Its kit diff viewer loads on demand to preserve the shell's eager-graph
+boundary. `LiveHeader.integration.test.tsx` exercises the actual shell and kit inspector
+with decoded public conversation frames; `capturedChanges.unit.test.ts` guards the
+capture, count, provenance and selection rules.
+
 ## Continuous integration
 
 Workspace CI runs on pull requests and merge groups. The five required checks are `linux-gate`,
