@@ -109,6 +109,9 @@ pub use smallclaims::store::{
 mod accounts;
 mod adhoc_work;
 mod attention_snapshot;
+pub(crate) mod attention_list;
+pub(crate) mod owner_lists;
+pub(crate) mod summary_list;
 // Registration stays opt-in until the shared installer certifies every source family.
 #[cfg_attr(
     not(test),

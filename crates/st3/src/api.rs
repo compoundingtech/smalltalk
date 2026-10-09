@@ -72,6 +72,10 @@ mod mailbox;
 mod mail_backlog;
 mod read_deadline;
 mod owned_sets;
+mod published_attention;
+pub use published_attention::start_attention_list;
+#[cfg(test)]
+pub(crate) use published_attention::{published_attention_rows, refresh_attention_list};
 mod request_latency;
 mod terminal_view;
 mod work_response;

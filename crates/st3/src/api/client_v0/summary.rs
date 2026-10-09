@@ -198,6 +198,41 @@ pub(super) fn retain_timestamp(items: &mut [Value], previous: &BTreeMap<String, 
     }
 }
 
+/// Publish the summary row of every selection a window read within `idle_ms`, all at one cut
+/// in one snapshot, computed as a window would compute it. Windows then serve these rows and
+/// never compute a summary themselves; each selection costs one computation per refresh, however
+/// many windows show it. Returns whether any selection's counts changed.
+pub(in crate::api) fn refresh_published(state: &AppState, idle_ms: u64) -> anyhow::Result<bool> {
+    let (generation, selections) = state.store.summary_selections(idle_ms);
+    if selections.is_empty() {
+        return Ok(false);
+    }
+    let now = client_now_ms();
+    let publication = state.store.read_snapshot(|index| {
+        let snapshot = client_snapshot_at(state, index);
+        let mut rows = std::collections::HashMap::new();
+        for person in selections {
+            // The selection alone decides the counts; a session's terminal grants change none.
+            let session = ClientSession::local(person.as_deref())
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            let request: CollectionSubscribe = serde_json::from_value(json!({
+                "kind":"subscribe", "id":"summary", "collection":"summary", "limit":1, "person":person,
+            }))?;
+            let row = native(state, &session, &request, &snapshot, now, None, None)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("a summary computes one row"))?;
+            rows.insert(person, row);
+        }
+        Ok(crate::store::summary_list::SummaryPublication {
+            cut: index,
+            published_at_unix_ms: client_now_ms(),
+            rows,
+        })
+    })?;
+    Ok(state.store.publish_summary(generation, publication))
+}
+
 #[cfg(test)]
 #[path = "summary/tests.rs"]
 mod tests;
