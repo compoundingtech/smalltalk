@@ -140,6 +140,8 @@ for variant in "${plan[@]}"; do
       if "$here/judge.sh" "$out/$variant.json" | tee "$out/$variant.txt"; then verdict=pass; else verdict=fail; fi
     fi
   fi
+  # The tokens the throwaway graph recorded for this run, kept beside the verdict (counts only).
+  st usage --hours 3 --json >"$out/$variant.usage.json" 2>/dev/null || true
   st agents stop agent/st/assistant >/dev/null 2>&1 || true
   stop_throwaway "$root"
   echo "   -> $variant: $verdict"; echo "$variant: $verdict" >>"$out/summary.txt"

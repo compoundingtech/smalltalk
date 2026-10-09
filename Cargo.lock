@@ -4410,6 +4410,7 @@ name = "st3"
 version = "0.1.0"
 dependencies = [
  "agent-spec",
+ "alacritty_terminal",
  "anyhow",
  "assert_cmd",
  "axum",
@@ -4459,6 +4460,7 @@ dependencies = [
  "st3-schema",
  "st3-terminal-direct",
  "st3-ui-model",
+ "stui",
  "tar",
  "tempfile",
  "tokio",
@@ -4654,6 +4656,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "clap",
  "crossterm",
  "flate2",
  "image",
