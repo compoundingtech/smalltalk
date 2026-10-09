@@ -136,6 +136,8 @@ Workbench pane identities survive layout changes through persistent pane slots. 
 
 The composer preserves kit send, cancellation, byte-limit and token-history contracts while adding adaptive pill/slab geometry, grouped mention/command popovers, effort selection, and the recipient/model toolbar. `ComposerSession` owns only device-local draft persistence and composer interaction policy; transports and runtime facts remain host-owned. Its tooltips retain the gated 150 ms delay and viewport-clamped, wrapping contents; Workbench/DiffPanel share the 350 ms Controls tooltip instead.
 
+The Workbench thread dock uses the reviewed route's composition composer policy, distinct from `ComposerSession`'s R3 choice: idle Enter sends immediately; during a run Enter queues and modified Enter explicitly steers. `IdleSample` seeds the route's exact `designItems('idle', 'sample')` messages with explicit idle host facts. `RunningQueueAndSteer` keeps the running case separate and asserts both actions without changing the queue. Neither fixture infers a runtime state from a header label.
+
 State and draft codecs use the workspace's single `effect@4.0.0-rc.118` runtime and the matching `@effect/atom-react@4.0.0-rc.118` binding. `react-aria@3.52.1` is declared explicitly for the separator and portal APIs already used by the kit. Performance counters and `RenderProfiler` stay internal rather than becoming package-root exports.
 
 The codecs use native `Schema.optional`, preserving both absent fields and explicitly present `undefined` fields from the original Effect 3 contract. `OptionalSnapshotFields` exercises the real pane-key parser and snapshot encode/read path, including form-only, view-only and undefined-ratio inputs.
