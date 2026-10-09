@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "st alerts replaces st attention in the CLI (the old name stays as an alias); st now leads with N alerts, says nothing when none wait, and lists unread updates apart without counting them",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill or stored data change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or client schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, retention or authority rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "st attention and all its subcommands keep working as an alias of st alerts. Human output changes: st now prints 'N alerts' (nothing when there are none) and an UPDATES section instead of NEEDS YOU; st alerts ls prints ALERTS FOR PERSON then UPDATES. JSON output is unchanged. Gate cards now suggest st alerts approve|reject; an older st binary given that argv fails to parse it, so install the same build everywhere."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment; no data conversion or extra startup work."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required. Scripts that grep st now for NEEDS YOU should read --json instead."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swap back freely; nothing is stored."
+  }
+}

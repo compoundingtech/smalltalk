@@ -24338,7 +24338,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
                 "approve",
                 &[
                     "st",
-                    "attention",
+                    "alerts",
                     "approve",
                     &review.owner,
                     "--as",
@@ -24353,7 +24353,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
                 },
                 &[
                     "st",
-                    "attention",
+                    "alerts",
                     if review.mode == "feedback" {
                         "request-changes"
                     } else {
