@@ -123,6 +123,7 @@
           type = "nix";
           inherit version;
           rev = sourceRev;
+          fullRev = self.rev or self.dirtyRev or sourceRev;
           commitTs = sourceCommitUnix;
           dirty = sourceDirty;
         };

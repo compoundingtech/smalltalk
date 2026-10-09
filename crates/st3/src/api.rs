@@ -1264,12 +1264,19 @@ fn client_request_snapshot(
 }
 
 fn client_snapshot_at(state: &AppState, store_index: u64) -> ClientSnapshot {
-    let created_at = client_timestamp(
+    client_snapshot_with_time(
+        state,
+        store_index,
         state
             .store
             .projection_time_at(store_index)
             .unwrap_or_default(),
-    );
+    )
+}
+
+/// The snapshot at `store_index` when its acceptance time (`projection_time_at`) is already known.
+fn client_snapshot_with_time(state: &AppState, store_index: u64, unix_ms: u128) -> ClientSnapshot {
+    let created_at = client_timestamp(unix_ms);
     let fingerprint = hex::encode(Sha256::digest(
         format!(
             "{CLIENT_PROJECTION_VERSION}:{}:{store_index}:{created_at}",
@@ -2273,7 +2280,7 @@ fn client_agent_page_refs_uncached(store: &Store, history: bool, index: u64) -> 
         let declaration = desired.get(&id);
         let name = crate::model::effective_agent_name(&id, declaration.map(|d| &d.desired));
         let queue = queues.get(&id).cloned().unwrap_or_default();
-        json!({
+        let mut reference = json!({
             "id":id, "name":name,
             "host_id":declaration.and_then(|d| d.member.as_ref()).map(|m| client_host_id(&m.host)),
             "current_work_ids":queue.current_work_ids, "active_work_count":queue.active_work_count,
@@ -2282,7 +2289,11 @@ fn client_agent_page_refs_uncached(store: &Store, history: bool, index: u64) -> 
             "current_work":queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
             "next_work":queue.next_work_id.as_ref().and_then(label),
             "upcoming_work":queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
-        })
+        });
+        if let Some(lifecycle) = crate::model::declared_agent_lifecycle(declaration.map(|d| &d.desired)) {
+            reference["lifecycle"] = json!(lifecycle);
+        }
+        reference
     }).collect::<Vec<_>>();
     refs.sort_by(|a, b| {
         a["name"]
@@ -2873,6 +2884,9 @@ fn client_agent_resources_from_status(
                     None
                 },
             });
+            if let Some(lifecycle) = crate::model::declared_agent_lifecycle(subject.desired.as_ref()) {
+                value["lifecycle"] = json!(lifecycle);
+            }
             if let Some((_, previous)) = changed.filter(|_| retain_queues)
                 && let Some(old) = previous.iter().find(|item| item["id"] == value["id"]) {
                 for field in AGENT_QUEUE_FIELDS {
@@ -4474,8 +4488,10 @@ fn client_agent_roster_head(store: &Store, index: u64) -> anyhow::Result<()> {
 }
 
 /// For a read that asked to see what was written before it: wait, briefly, for the refresher
-/// to publish a roster at or after the current cut. The read itself folds nothing.
-async fn wait_for_agent_roster(store: &Store, history: bool) {
+/// to publish a roster at or after the current cut, unless no claim since the newest
+/// publication changes a card, so that a refresh would fold nothing. The read itself folds
+/// nothing.
+async fn wait_for_agent_roster(store: &Arc<Store>, history: bool) {
     let Ok(wanted) = store.index() else { return };
     let published = |store: &Store| {
         let index = store.index().ok()?;
@@ -4487,6 +4503,14 @@ async fn wait_for_agent_roster(store: &Store, history: bool) {
     let mut publications = store.subscribe_agent_roster();
     let _ = tokio::time::timeout(AGENT_ROSTER_READ_WAIT, async {
         while published(store).is_none_or(|cut| cut < wanted) {
+            // Claims on unrelated subjects move the cut all the time; the paced refresher
+            // would publish the same cards. One bounded range read tells.
+            let reader = Arc::clone(store);
+            if let Ok(true) = blocking_store(move || {
+                reader.published_agent_roster_unchanged_through(wanted, history)
+            }).await {
+                return;
+            }
             if history {
                 store.request_agent_roster_history();
             } else {
@@ -6111,6 +6135,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "status": "ready",
         "node": state.node,
         "version": env!("CARGO_PKG_VERSION"),
+        "build": {"commit": st_drivers::version::build_commit()},
         "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
@@ -12050,6 +12075,8 @@ fn accept_message_receipt_with_upload_owner(
             "external sender imports require the enrolled adapter endpoint",
         )));
     }
+    crate::model::refuse_person_recipient(&normalize_message_party(&request.to))
+        .map_err(ApiError::bad)?;
     if request.content.trim().is_empty() && request.attachments.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "empty-message",
@@ -14223,13 +14250,24 @@ async fn work_action_response(
     // An exact retry returns the transaction's durable response even if the provider exited after
     // committing it. The store repeats this lookup under its mutation boundary; this early read
     // only prevents the live-incarnation precondition from breaking idempotent recovery.
-    if let Some(response) = state
+    if let Some(mut response) = state
         .store
         .cached_idempotency_response::<StepRunView>(&request.idempotency_key)
         .map_err(ApiError::internal)?
     {
         if let Some(input) = handoff.as_ref() {
             state.store.handoff_retry(&subject, input).map_err(ApiError::bad)?;
+        }
+        if action == "renew" {
+            // A renewal caches its view without the fields the writer no longer folds.
+            let store = state.store.clone();
+            response = blocking_action(move || {
+                store
+                    .enrich_work_response(&mut response)
+                    .map_err(|error| St3Error::new("store-read-failed", format!("{error:#}")))?;
+                Ok(response)
+            })
+            .await?;
         }
         return Ok(Json(response));
     }
@@ -16325,6 +16363,33 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         let removed = client_agent_page_refs(&state.store, false, index).unwrap();
         assert_eq!(removed.len(), 1, "a stopped undeclared runtime moves to history");
         assert_eq!(removed, client_agent_page_refs_uncached(&state.store, false, index).unwrap());
+    }
+
+    #[test]
+    fn agent_lifecycle_roster_tracks_current_declaration_without_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        for (version, lifecycle) in [None, Some("standing"), Some("owner"), Some("bounded"), None]
+            .into_iter().enumerate()
+        {
+            let field = lifecycle.map(|value| format!("lifecycle \"{value}\";")).unwrap_or_default();
+            let source = format!("version 2\nagent \"example/purpose\" {{ {field} command \"true\" }}");
+            let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+            let plan = store.mission(&intent, crate::model::IntentInput {
+                kdl: source, source_name: None,
+            }).unwrap();
+            store.apply(&intent, &plan.subject_tokens, &format!("lifecycle-{version}")).unwrap();
+            let index = store.index().unwrap();
+            for history in [false, true] {
+                let refs = client_agent_page_refs(store, history, index).unwrap();
+                let rows = checked_agent_cache(store, history, index);
+                let cards = client_agent_cards_for_page(store, history, index, &refs, "0").unwrap();
+                for row in refs.iter().chain(rows.iter()).chain(cards.iter()) {
+                    assert_eq!(row.get("lifecycle"), lifecycle.map(|value| json!(value)).as_ref());
+                }
+            }
+        }
     }
 
     #[test]
@@ -19054,6 +19119,27 @@ agent "good" {{ workspace {:?}; command "true" }}
     }
 
     #[tokio::test]
+    async fn health_build_commit_matches_version_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let (status, health) = get_request(app, "/v1/health").await;
+        assert_eq!(status, StatusCode::OK, "{health}");
+        assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+        let commit = health["build"]["commit"].as_str().unwrap();
+        assert_eq!(commit, st_drivers::version::build_commit());
+        let version = st_drivers::version::machine_version();
+        let revision = version.split_once('+').unwrap().1;
+        let revision = revision.strip_prefix("local.").unwrap_or(revision);
+        let revision = revision.strip_suffix(".dirty").unwrap_or(revision);
+        let revision = revision.strip_suffix("-dirty").unwrap_or(revision);
+        if revision == "dev" {
+            assert_eq!(commit, "unknown");
+        } else {
+            assert!(commit.starts_with(revision), "{version}: {commit}");
+        }
+    }
+
+    #[tokio::test]
     async fn health_and_doctor_report_runtime_metadata() {
         let root = tempfile::tempdir().unwrap();
         let app = router(state(root.path()));
@@ -21714,6 +21800,83 @@ version 2
     }
 
     #[tokio::test]
+    async fn a_send_or_reply_to_a_person_is_refused_and_an_agent_still_receives() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let message = |key: &str, from: &str, to: &str, in_reply_to: Option<&str>| {
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: key.into(),
+                from: from.into(),
+                to: to.into(),
+                content: "Hello".into(),
+                title: None,
+                in_reply_to: in_reply_to.map(str::to_owned),
+                tags: Vec::new(),
+                attachments: Vec::new(),
+            })
+            .unwrap()
+        };
+        // An agent, and a person writing to an agent, are unchanged.
+        let (status, asked) =
+            json_request(app.clone(), "/v1/messages", message("ask", "person/ada", "agent/worker", None)).await;
+        assert_eq!(status, StatusCode::OK, "{asked}");
+        let asked = asked["subject"].as_str().unwrap().to_owned();
+        let (status, relayed) =
+            json_request(app.clone(), "/v1/messages", message("relay", "agent/worker", "agent/helper", None)).await;
+        assert_eq!(status, StatusCode::OK, "{relayed}");
+        // A send to a person, a reply to a person, a bare name that means the requester, and a
+        // person writing to a person all fail with the one error, and write nothing.
+        let before = state.store.claims_for_kind_at("message.sent", None, true, 100).unwrap().claims.len();
+        for (key, from, to, parent) in [
+            ("send", "agent/worker", "person/ada", None),
+            ("reply", "agent/worker", "person/ada", Some(asked.as_str())),
+            ("requester", "agent/worker", "requester", None),
+            ("people", "person/ada", "person/robin", None),
+        ] {
+            let (status, body) =
+                json_request(app.clone(), "/v1/messages", message(key, from, to, parent)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{key}: {body}");
+            assert_eq!(body["code"], "person-has-no-inbox", "{key}");
+            let text = body["message"].as_str().unwrap();
+            assert!(text.starts_with("people do not have inboxes: print your answer in the chat"), "{text}");
+            let chat = text.find("print in the chat").unwrap();
+            assert!(chat < text.find("work ask").unwrap() && chat < text.find("work update").unwrap());
+            assert!(text.contains("only if the person asked for it"), "{text}");
+        }
+        assert_eq!(
+            state.store.claims_for_kind_at("message.sent", None, true, 100).unwrap().claims.len(),
+            before,
+            "a refused message is not written"
+        );
+        // What an older client already holds stays readable: a message to a person that is in the
+        // graph still lists, reads and settles.
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/earlier".into(),
+                kind: "message.sent".into(),
+                actor: Some("agent/worker".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("agent/worker")),
+                    ("to".into(), json!("person/ada")),
+                    ("content".into(), json!("Sent before people lost their inbox.")),
+                    ("status".into(), json!("sent")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("earlier".into()),
+            })
+            .unwrap();
+        let (status, listed) = get_request(app.clone(), "/v1/messages?to=person/ada&include_closed=true").await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert!(listed.as_array().unwrap().iter().any(|row| row["subject"] == "message/earlier"), "{listed}");
+        let (status, read) = get_request(app, "/v1/messages/read/earlier").await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(read["content"], "Sent before people lost their inbox.");
+    }
+
+    #[tokio::test]
     async fn message_lifecycle_requires_the_exact_recipient_actor() {
         let root = tempfile::tempdir().unwrap();
         let app = router(state(root.path()));
@@ -21723,7 +21886,7 @@ version 2
             serde_json::to_value(MessageSendRequest {
                 idempotency_key: "recipient-authority-message".into(),
                 from: "agent/sender".into(),
-                to: "person/receiver".into(),
+                to: "agent/receiver".into(),
                 content: "Please review this.".into(),
                 title: None,
                 in_reply_to: None,
@@ -21784,7 +21947,7 @@ version 2
             serde_json::to_value(MessageLifecycleRequest {
                 delegation: None,
                 lifecycle: "staged".into(),
-                actor: Some("person/receiver".into()),
+                actor: Some("agent/receiver".into()),
                 transport: Some("codex-app-server".into()),
                 runtime_id: Some("runtime/receiver".into()),
                 evidence: Vec::new(),
@@ -21796,7 +21959,7 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{staged}");
         assert_eq!(staged["body"]["fields"]["status"], "staged");
-        assert_eq!(staged["body"]["fields"]["recipient"], "person/receiver");
+        assert_eq!(staged["body"]["fields"]["recipient"], "agent/receiver");
         assert_eq!(staged["body"]["fields"]["transport"], "codex-app-server");
         assert_eq!(staged["body"]["fields"]["runtime_id"], "runtime/receiver");
 
@@ -21806,7 +21969,7 @@ version 2
             serde_json::to_value(MessageLifecycleRequest {
                 delegation: None,
                 lifecycle: "delivered".into(),
-                actor: Some("person/receiver".into()),
+                actor: Some("agent/receiver".into()),
                 transport: None,
                 runtime_id: None,
                 evidence: Vec::new(),
@@ -21817,7 +21980,7 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{read}");
-        assert_eq!(read["actor"], "person/receiver");
+        assert_eq!(read["actor"], "agent/receiver");
 
         let legacy = app
             .oneshot(

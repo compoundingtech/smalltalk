@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Optional TypeScript collection-stream connection and command-send callbacks",
+  "replay": {"status": "none", "detail": "No replay behavior or stored state changes."},
+  "schema": {"status": "none", "detail": "No database schema or migration changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordinated member upgrade changes."},
+  "compatibility": {"status": "changed", "detail": "Adds optional onOpen and onCommandSent callbacks to TypeScript CollectionStreamOptions. Existing callers remain unchanged; callbacks report the WebSocket open event and subscribe or unsubscribe commands after socket.send, including queued commands. No wire protocol or server capability changes."},
+  "downtime": {"status": "none", "detail": "No additional service interruption or restart required."},
+  "manual": {"status": "none", "detail": "No installation changes required. Clients may opt into the callbacks to report actual connection and command-send state."},
+  "recovery": {"status": "none", "detail": "No stored-state or runtime recovery changes; the additive client API introduces no migration."}
+}

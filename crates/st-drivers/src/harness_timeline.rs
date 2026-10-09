@@ -1148,13 +1148,19 @@ fn normalize_body(entry_type: EntryType, source_id: &str, value: Value) -> (Valu
                 .unwrap_or(source_id);
             let arguments = value.get("arguments").cloned().unwrap_or(Value::Null);
             let bytes = serde_json::to_vec(&arguments).unwrap_or_default();
+            // Keep the placeholder stable, but null represents no withheld payload.
+            let redacted_bytes = if arguments.is_null() {
+                0
+            } else {
+                bytes.len() as u64
+            };
             (
                 json!({
                     "call_id": pseudonym("call", raw_call),
                     "name": safe_tool_name(value.get("name").and_then(Value::as_str)),
                     "arguments": {"redacted": true, "sha256": hex_digest(&bytes), "bytes": bytes.len()}
                 }),
-                bytes.len() as u64,
+                redacted_bytes,
                 omitted_keys(&value, &["call_id", "name", "arguments"]),
                 0,
             )
@@ -1166,6 +1172,11 @@ fn normalize_body(entry_type: EntryType, source_id: &str, value: Value) -> (Valu
                 .unwrap_or(source_id);
             let content = value.get("content").cloned().unwrap_or(Value::Null);
             let bytes = serde_json::to_vec(&content).unwrap_or_default();
+            let redacted_bytes = if content.is_null() {
+                0
+            } else {
+                bytes.len() as u64
+            };
             (
                 json!({
                     "call_id": pseudonym("call", raw_call),
@@ -1173,7 +1184,7 @@ fn normalize_body(entry_type: EntryType, source_id: &str, value: Value) -> (Valu
                     "media_type": "application/vnd.st3.redacted+json",
                     "content": {"redacted": true, "sha256": hex_digest(&bytes), "bytes": bytes.len()}
                 }),
-                bytes.len() as u64,
+                redacted_bytes,
                 omitted_keys(&value, &["call_id", "status", "media_type", "content"]),
                 0,
             )
@@ -1449,6 +1460,137 @@ fn compact_to_bounds(record: &mut Record) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_tool_payloads_keep_outbox_operations_without_redaction_notices() {
+        let temporary = tempfile::tempdir().unwrap();
+        crate::harness_events::enable(temporary.path(), "runtime-current").unwrap();
+        crate::harness_state::claim(
+            temporary.path(),
+            "example/seat",
+            "codex",
+            "provider-current",
+        )
+        .unwrap();
+        let mut writer = Writer::new(temporary.path(), "codex", "provider-current");
+        for (source, kind, body) in [
+            ("call-absent", EntryType::ToolCall, json!({"name":"exec"})),
+            (
+                "call-null",
+                EntryType::ToolCall,
+                json!({"name":"exec","arguments":null}),
+            ),
+            (
+                "result-absent",
+                EntryType::ToolResult,
+                json!({"status":"success"}),
+            ),
+            (
+                "result-null",
+                EntryType::ToolResult,
+                json!({"status":"success","content":null}),
+            ),
+        ] {
+            writer
+                .append(source, Role::Assistant, kind, body.clone(), true)
+                .unwrap();
+            // Repeating a finalized event still produces no additional operation.
+            writer
+                .append(source, Role::Assistant, kind, body, true)
+                .unwrap();
+        }
+        drop(writer);
+        let events = crate::harness_events::pending(temporary.path(), 100).unwrap();
+        let timeline: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == "harness-timeline")
+            .collect();
+        assert_eq!(timeline.len(), 4);
+        for (event, (kind, payload)) in timeline.iter().zip([
+            ("tool_call", "arguments"),
+            ("tool_call", "arguments"),
+            ("tool_result", "content"),
+            ("tool_result", "content"),
+        ]) {
+            assert_eq!(event.payload["entryType"], kind);
+            assert_eq!(event.payload["operation"], "append");
+            assert_eq!(event.payload["finalEntry"], true);
+            assert_eq!(
+                event.payload["body"][payload],
+                json!({
+                    "redacted":true,"sha256":hex_digest(b"null"),"bytes":4
+                })
+            );
+        }
+        assert!(!timeline_path(temporary.path()).exists());
+    }
+
+    #[test]
+    fn real_tool_payloads_and_omitted_fields_still_publish_redaction_notices() {
+        let temporary = tempfile::tempdir().unwrap();
+        crate::harness_events::enable(temporary.path(), "runtime-current").unwrap();
+        crate::harness_state::claim(
+            temporary.path(),
+            "example/seat",
+            "codex",
+            "provider-current",
+        )
+        .unwrap();
+        let mut writer = Writer::new(temporary.path(), "codex", "provider-current");
+        for (source, kind, body) in [
+            (
+                "call",
+                EntryType::ToolCall,
+                json!({"name":"exec","arguments":{"private":"fixture-secret"}}),
+            ),
+            (
+                "result",
+                EntryType::ToolResult,
+                json!({"content":"fixture-secret"}),
+            ),
+            (
+                "omitted",
+                EntryType::ToolCall,
+                json!({"arguments":null,"extra":"fixture-secret"}),
+            ),
+        ] {
+            writer
+                .append(source, Role::Assistant, kind, body, true)
+                .unwrap();
+        }
+        let events = crate::harness_events::pending(temporary.path(), 100).unwrap();
+        let timeline: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == "harness-timeline")
+            .collect();
+        assert_eq!(timeline.len(), 6);
+        let notices: Vec<_> = timeline
+            .iter()
+            .filter(|event| event.payload["entryType"] == "redaction")
+            .collect();
+        assert_eq!(notices.len(), 3);
+        assert!(
+            notices[..2]
+                .iter()
+                .all(|event| event.payload["body"]["withheld_bytes"].as_u64().unwrap() > 4)
+        );
+        assert_eq!(
+            notices[2].payload["body"],
+            json!({
+                "reason":"sensitive-content","withheld_bytes":0,"withheld_items":1
+            })
+        );
+        assert!(
+            !serde_json::to_string(
+                &timeline
+                    .iter()
+                    .map(|event| &event.payload)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap()
+            .contains("fixture-secret")
+        );
+    }
 
     #[test]
     fn claude_stop_publishes_bounded_assistant_text_from_only_its_exact_transcript() {

@@ -11,6 +11,7 @@ import {
   buildEnv,
   commonSetupSteps,
   fractalWebJobs,
+  nixCacheStep,
   linuxRunner,
   linuxStageJob as namespaceStageJob,
   linuxStageRunner,
@@ -323,6 +324,8 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         runsOn: mailStageRunsOn,
         description: 'Require every harness to hold old mail across boot and reconnect',
         setup: testArchiveConsumerSetup,
+        // Restore shared fixtures, but keep main-upkeep as their single cache writer.
+        cacheSaveSetup: [nixCacheStep],
         env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_THREADS: '8' },
         extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
       }),
@@ -378,7 +381,8 @@ done`,
       defaults: { run: { shell: 'bash' } },
       env: { ...buildEnv, CI_CACHE_DEV_SHELL: 'default' },
       steps: [
-        ...testArchiveConsumerSetup,
+        // The VM's own warm cache also contains its driver; keep that primary entry.
+        ...testArchiveConsumerSetup.map((step: any) => step.id === 'nix-cache' ? nixCacheStep : step),
         { name: 'Probe KVM', run: kvmProbe },
         {
           name: 'Build the NixOS VM test driver',

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "A fresh agents roster read no longer waits for the paced refresher when no claim since the newest publication can change a card",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, schema-version changes or data rewrites. The check reads the existing claims store_index range the incremental roster fold already reads."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "none", "detail": "Response shape, snapshot cut, pagination and the 2 s fresh-read bound are unchanged. A fresh read whose roster inputs changed still waits for a roster at or after its cut; an unchanged roster is served under its own cut."},
+  "downtime": {"status": "none", "detail": "No startup work or expected interruption; refresher pacing is unchanged."},
+  "manual": {"status": "none", "detail": "No operator actions or configuration changes required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or new swap-back restrictions."}
+}
